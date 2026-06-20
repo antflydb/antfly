@@ -4828,6 +4828,9 @@ fn executeLoweredSqlSetOperationPlanAlloc(
             .order_by = lowered.order_by,
             .limit = lowered.limit,
             .offset = lowered.offset,
+            .max_rows = lowered.max_rows,
+            .max_bytes = lowered.max_bytes,
+            .spill_after_bytes = lowered.spill_after_bytes,
         }, consistency);
     }
 
@@ -4845,6 +4848,9 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         .order_by = lowered.order_by,
         .limit = lowered.limit,
         .offset = lowered.offset,
+        .max_rows = lowered.max_rows,
+        .max_bytes = lowered.max_bytes,
+        .spill_after_bytes = lowered.spill_after_bytes,
     }, left.rows, right.rows);
 }
 
@@ -20113,6 +20119,9 @@ test "lowered sql cross-table read plans execute through routed scans" {
         ) !?db_mod.types.RelationalRowsQueryResult {
             try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
             try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), plan.max_rows);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), plan.max_bytes);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), plan.spill_after_bytes);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try rowsSetOperationPlanFromRoutedScansAlloc(plan_alloc, self.source(), target.table_name, runtime_schema, plan, consistency);
         }
@@ -20271,6 +20280,9 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
         ) !?db_mod.types.RelationalRowsQueryResult {
             try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
             try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), plan.max_rows);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), plan.max_bytes);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), plan.spill_after_bytes);
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try rowsSetOperationPlanFromRoutedScansAlloc(plan_alloc, self.source(), target.table_name, runtime_schema, plan, consistency);
         }
@@ -20284,7 +20296,11 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
     );
     defer lowered.deinit(alloc);
     switch (lowered) {
-        .set_operation => {},
+        .set_operation => |set_operation| {
+            try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), set_operation.max_rows);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), set_operation.max_bytes);
+            try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), set_operation.spill_after_bytes);
+        },
         else => return error.TestUnexpectedResult,
     }
 

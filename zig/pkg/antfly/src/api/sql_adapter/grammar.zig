@@ -1495,7 +1495,7 @@ pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
     var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
     var predicate_transferred = false;
     errdefer if (!predicate_transferred) predicate.deinit(alloc);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     policy_transferred = true;
     table_transferred = true;
@@ -1534,7 +1534,7 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
     var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
     var predicate_transferred = false;
     errdefer if (!predicate_transferred) predicate.deinit(alloc);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     policy_transferred = true;
     table_transferred = true;
@@ -1568,7 +1568,7 @@ pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
     _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     policy_transferred = true;
     table_transferred = true;
     return .{ .policy_name = policy_name, .table_name = table_name, .if_exists = if_exists };
@@ -1736,7 +1736,7 @@ pub fn parseDropUpdatePolicyTriggerCatalogTailAlloc(
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
     _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     trigger_transferred = true;
     table_transferred = true;
     return .{ .trigger_name = trigger_name, .table_name = table_name, .if_exists = if_exists };
@@ -1791,7 +1791,7 @@ pub fn parseCreateUpdatePolicyTriggerCatalogTailAlloc(
     };
     var column_transferred = false;
     errdefer if (!column_transferred) alloc.free(column_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     trigger_transferred = true;
     table_transferred = true;
@@ -1841,7 +1841,7 @@ pub fn parseSetSearchPathTailAlloc(alloc: std.mem.Allocator, tokens: []const Tok
         try namespaces.append(alloc, try alloc.dupe(u8, token.text));
         if (cursor.matchToken(.comma) == null) break;
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{ .namespaces = try namespaces.toOwnedSlice(alloc), .local = local };
 }
 
@@ -1858,7 +1858,7 @@ pub fn parseSetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const
     errdefer alloc.free(name_owned);
     const value_owned = try alloc.dupe(u8, value.text);
     errdefer alloc.free(value_owned);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .name = name_owned,
         .value = value_owned,
@@ -1870,13 +1870,13 @@ pub fn parseSetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const
 pub fn parseAdapterNoopResetStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchKeyword("all")) {
-        try parseAdapterNoopStatementEnd(cursor);
+        try adapterNoopStatementEnd(cursor);
         return;
     }
 
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (!adapterNoopResetSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 pub fn parseResetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const Token, pos: *usize) !ddl_plan.ResetSessionSettingPlan {
@@ -1885,7 +1885,7 @@ pub fn parseResetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []con
     const kind = sessionSettingKindForName(setting.text) orelse return error.UnsupportedSqlShape;
     const name_owned = try alloc.dupe(u8, setting.text);
     errdefer alloc.free(name_owned);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{ .name = name_owned, .kind = kind };
 }
 
@@ -1893,33 +1893,33 @@ pub fn parseResetSearchPathTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (!std.ascii.eqlIgnoreCase(setting.text, "search_path")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 pub fn parseAdapterNoopShowStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (!adapterNoopShowSessionSettingAllowed(setting.text)) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 pub fn parseShowSearchPathTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     const setting = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (!std.ascii.eqlIgnoreCase(setting.text, "search_path")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 pub fn parseAdapterNoopDiscardStatementTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("all");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 pub fn parseDiscardAllTail(tokens: []const Token, pos: *usize) !void {
     var cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("all");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 pub fn matchAdapterNoopTransactionBoundaryTail(
@@ -1969,7 +1969,7 @@ pub fn parsePreparedTransactionTailAlloc(
     }
     const gid_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
     if (gid_token.text.len == 0) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .action = action,
         .gid = try alloc.dupe(u8, gid_token.text),
@@ -2024,6 +2024,43 @@ pub fn parseForRowClaimClauseAlloc(
     };
 }
 
+pub fn rowClaimTargetAllowed(alloc: std.mem.Allocator, target: []const u8, allowed_targets: []const []const u8) bool {
+    for (allowed_targets) |allowed| {
+        if (allowed.len > 0 and std.mem.eql(u8, target, allowed)) return true;
+    }
+    const normalized = normalizeSqlObjectIdentifierAlloc(alloc, target) catch return false;
+    defer alloc.free(normalized);
+    for (allowed_targets) |allowed| {
+        if (allowed.len > 0 and std.mem.eql(u8, normalized, allowed)) return true;
+    }
+    return false;
+}
+
+pub fn parseCheckedForRowClaimClauseAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    allowed_targets: []const []const u8,
+) !ast.SqlRowClaimClause {
+    var syntax = try parseForRowClaimClauseAlloc(alloc, tokens, pos);
+    defer syntax.deinit(alloc);
+    for (syntax.targets) |target| {
+        if (!rowClaimTargetAllowed(alloc, target, allowed_targets)) return error.UnsupportedSqlShape;
+    }
+    return syntax.clause;
+}
+
+pub fn parseExclusiveForRowClaimClauseAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    allowed_targets: []const []const u8,
+) !ast.SqlRowClaimClause {
+    const clause = try parseCheckedForRowClaimClauseAlloc(alloc, tokens, pos, allowed_targets);
+    if (!clause.mode.isExclusiveWriteClaim()) return error.UnsupportedSqlShape;
+    return clause;
+}
+
 pub fn parseDeallocatePreparedStatementTail(tokens: []const Token, pos: *usize) !NamedOrAllSyntax {
     var cursor = parser.Cursor.init(tokens, pos);
     _ = cursor.matchKeyword("prepare");
@@ -2050,7 +2087,7 @@ pub fn parseExecutePreparedStatementTail(tokens: []const Token, pos: *usize) !Ex
     var cursor = parser.Cursor.init(tokens, pos);
     const statement_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     const argument_count = try countParenthesizedUntypedValues(cursor);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .statement_name = statement_token.text,
         .argument_count = argument_count,
@@ -2132,7 +2169,7 @@ pub fn parseFetchCursorPortalTail(tokens: []const Token, pos: *usize) !FetchCurs
     }
     _ = cursor.matchKeyword("from") or cursor.matchKeyword("in");
     const portal_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .portal_name = portal_token.text,
         .direction = direction,
@@ -2166,7 +2203,7 @@ pub fn parseTableLockTailAlloc(
     try cursor.expectKeyword("in");
     const mode = try parseTableLockMode(cursor);
     try cursor.expectKeyword("mode");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .table_names = try table_names.toOwnedSlice(alloc),
         .mode = mode,
@@ -2201,7 +2238,7 @@ pub fn parseConstraintModeTailAlloc(
         .deferred
     else
         return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .all = all,
         .constraint_names = try constraint_names.toOwnedSlice(alloc),
@@ -2271,7 +2308,7 @@ pub fn parseAdvisoryLockTail(tokens: []const Token, pos: *usize) !AdvisoryLockSy
     const key1 = try parseSequenceInteger(cursor);
     const key2 = if (cursor.matchToken(.comma) != null) try parseSequenceInteger(cursor) else null;
     try cursor.expectToken(.rparen);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{
         .action = action,
         .key1 = key1,
@@ -2302,7 +2339,7 @@ pub fn parseVacuumMaintenanceTailAlloc(
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
     if (cursor.matchToken(.lparen) != null) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     table_transferred = true;
     return .{ .table_name = table_name, .full = full, .freeze = freeze, .verbose = verbose, .analyze = analyze };
 }
@@ -2326,7 +2363,7 @@ pub fn parseAnalyzeMaintenanceTailAlloc(
         }
         try cursor.expectToken(.rparen);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     table_transferred = true;
     return .{ .table_name = table_name, .verbose = verbose, .column_count = column_count };
 }
@@ -2353,7 +2390,7 @@ pub fn parseReindexMaintenanceTailAlloc(
     const name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     name_transferred = true;
     return .{ .target = target, .name = name, .concurrently = concurrently };
 }
@@ -2374,7 +2411,7 @@ pub fn parseClusterMaintenanceTailAlloc(
     if (cursor.matchKeyword("using")) {
         index_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     table_transferred = true;
     index_transferred = true;
     return .{ .table_name = table_name, .index_name = index_name, .verbose = verbose };
@@ -2398,7 +2435,7 @@ pub fn parseCreateDatabaseCatalogTailAlloc(
         cursor.peekKeyword("tablespace") or
         cursor.peekKeyword("connection"))
         return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     database_transferred = true;
     return .{ .database_name = database_name };
 }
@@ -2426,7 +2463,7 @@ pub fn parseAlterDatabaseCatalogTailAlloc(
     const value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(@constCast(value_json));
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     database_transferred = true;
     setting_transferred = true;
     value_transferred = true;
@@ -2459,7 +2496,7 @@ pub fn parseDropDatabaseCatalogTailAlloc(
         try cursor.expectToken(.rparen);
         force = true;
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     database_transferred = true;
     return .{ .database_name = database_name, .if_exists = if_exists, .force = force };
 }
@@ -2480,7 +2517,7 @@ pub fn parseCreateTablespaceCatalogTailAlloc(
     var location_transferred = false;
     errdefer if (!location_transferred) alloc.free(@constCast(location_json));
     if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     const placement_policy_json = try alloc.dupe(u8, "{}");
     errdefer alloc.free(placement_policy_json);
     tablespace_transferred = true;
@@ -2503,7 +2540,7 @@ pub fn parseRenameTablespaceCatalogTailAlloc(
     const new_tablespace_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var new_tablespace_transferred = false;
     errdefer if (!new_tablespace_transferred) alloc.free(new_tablespace_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     tablespace_transferred = true;
     new_tablespace_transferred = true;
     return .{ .tablespace_name = tablespace_name, .new_tablespace_name = new_tablespace_name };
@@ -2524,7 +2561,7 @@ pub fn parseDropTablespaceCatalogTailAlloc(
     const tablespace_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var tablespace_transferred = false;
     errdefer if (!tablespace_transferred) alloc.free(tablespace_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     tablespace_transferred = true;
     return .{ .tablespace_name = tablespace_name, .if_exists = if_exists };
 }
@@ -2546,7 +2583,7 @@ pub fn parseCreateSchemaNamespaceCatalogTailAlloc(
     var schema_transferred = false;
     errdefer if (!schema_transferred) alloc.free(schema_name);
     if (cursor.peekKeyword("authorization") or cursor.peekKeyword("create") or cursor.peekKeyword("grant")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     schema_transferred = true;
     return .{ .schema_name = schema_name, .if_not_exists = if_not_exists };
 }
@@ -2566,7 +2603,7 @@ pub fn parseRenameSchemaNamespaceCatalogTailAlloc(
     const new_schema_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var new_schema_transferred = false;
     errdefer if (!new_schema_transferred) alloc.free(new_schema_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     schema_transferred = true;
     new_schema_transferred = true;
     return .{ .schema_name = schema_name, .new_schema_name = new_schema_name };
@@ -2590,7 +2627,7 @@ pub fn parseDropSchemaNamespaceCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     schema_transferred = true;
     return .{ .schema_name = schema_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -2629,7 +2666,7 @@ pub fn parseCreateExtensionCatalogTailAlloc(
         version = try parseSqlStringLiteralValueAlloc(alloc, cursor);
     }
     if (cursor.peekKeyword("from") or cursor.peekKeyword("cascade")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     extension_transferred = true;
     schema_transferred = true;
     version_transferred = true;
@@ -2659,7 +2696,7 @@ pub fn parseUpdateExtensionCatalogTailAlloc(
     if (cursor.matchKeyword("to")) {
         target_version = try parseSqlStringLiteralValueAlloc(alloc, cursor);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     extension_transferred = true;
     version_transferred = true;
     return .{ .extension_name = extension_name, .target_version = target_version };
@@ -2682,7 +2719,7 @@ pub fn parseDropExtensionCatalogTailAlloc(
     errdefer if (!extension_transferred) alloc.free(extension_name);
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     extension_transferred = true;
     return .{ .extension_name = extension_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -2862,7 +2899,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         return error.UnsupportedSqlShape;
     }
     if (kind == .function and returns_type == null) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     const owned_settings = try settings.toOwnedSlice(alloc);
     settings_transferred = true;
     routine_transferred = true;
@@ -3174,7 +3211,7 @@ pub fn parseDropRoutineCatalogTailAlloc(
     } else if (cursor.matchKeyword("restrict")) {
         cascade = false;
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     routine_transferred = true;
     return .{
         .kind = kind,
@@ -3206,7 +3243,7 @@ pub fn parseCreateSequenceCatalogTailAlloc(
     while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
         try parseCreateSequenceOption(alloc, cursor, tokens, pos, &options);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     sequence_transferred = true;
     const out = CreateSequenceSyntax{
         .sequence_name = sequence_name,
@@ -3241,7 +3278,7 @@ pub fn parseAlterSequenceCatalogTailAlloc(
         try parseAlterSequenceOperation(alloc, cursor, tokens, pos, &operations);
     }
     if (operations.items.len == 0) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     sequence_transferred = true;
     return .{
         .sequence_name = sequence_name,
@@ -3268,7 +3305,7 @@ pub fn parseDropSequenceCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     sequence_transferred = true;
     return .{ .sequence_name = sequence_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -3345,7 +3382,7 @@ pub fn parseCreateEnumTypeCatalogTailAlloc(
     }
     if (values.items.len == 0) return error.UnsupportedSqlShape;
     try cursor.expectToken(.rparen);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     type_transferred = true;
     return .{
         .type_name = type_name,
@@ -3384,7 +3421,7 @@ pub fn parseAlterEnumTypeCatalogTailAlloc(
         position = .after;
         neighbor_value = try parseEnumLabelOwnedAlloc(alloc, cursor);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     type_transferred = true;
     value_transferred = true;
     return .{
@@ -3414,7 +3451,7 @@ pub fn parseDropEnumTypeCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     type_transferred = true;
     return .{ .type_name = type_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -3495,7 +3532,7 @@ pub fn parseAlterDomainCatalogTailAlloc(
         if (cursor.matchToken(.comma) == null) break;
     }
     if (operations.items.len == 0) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     const owned_operations = try operations.toOwnedSlice(alloc);
     var operations_transferred = false;
@@ -3527,7 +3564,7 @@ pub fn parseDropDomainCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     domain_transferred = true;
     return .{ .domain_name = domain_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -3572,7 +3609,7 @@ pub fn parseCommentMetadataCatalogTailAlloc(
     if (!cursor.matchKeyword("null")) {
         comment_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     object_transferred = true;
     parent_transferred = true;
@@ -3603,7 +3640,7 @@ pub fn parseDropTableCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     table_transferred = true;
     return .{ .table_name = table_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -3625,7 +3662,7 @@ pub fn parseDropIndexCatalogTailAlloc(
     var index_transferred = false;
     errdefer if (!index_transferred) alloc.free(index_name);
     _ = cursor.matchKeyword("cascade") or cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     index_transferred = true;
     return .{ .index_name = index_name, .if_exists = if_exists };
 }
@@ -5101,7 +5138,7 @@ pub fn parseCreateTableCloneCatalogTailAlloc(
         try parseTableCloneOption(cursor, &options, include);
     }
     try cursor.expectToken(.rparen);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     table_name_transferred = true;
     source_transferred = true;
@@ -5179,7 +5216,7 @@ pub fn parseCreateTablePartitionCatalogTailAlloc(
         var mutable_bounds = bounds;
         mutable_bounds.deinit(alloc);
     };
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     table_transferred = true;
     parent_transferred = true;
@@ -5206,7 +5243,7 @@ pub fn parseCreatePartitionedTableCatalogTailAlloc(
     const keys = try parseParenthesizedIdentifierListAlloc(alloc, cursor, tokens, pos);
     var keys_transferred = false;
     errdefer if (!keys_transferred) freeStringSlice(alloc, keys);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     keys_transferred = true;
     return .{
@@ -5237,7 +5274,7 @@ pub fn parseAlterTablePartitionCatalogTailAlloc(
             var mutable_bounds = bounds;
             mutable_bounds.deinit(alloc);
         };
-        try parseAdapterNoopStatementEnd(cursor);
+        try adapterNoopStatementEnd(cursor);
 
         parent_transferred = true;
         partition_transferred = true;
@@ -5254,7 +5291,7 @@ pub fn parseAlterTablePartitionCatalogTailAlloc(
         const partition_table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
         var partition_transferred = false;
         errdefer if (!partition_transferred) alloc.free(partition_table_name);
-        try parseAdapterNoopStatementEnd(cursor);
+        try adapterNoopStatementEnd(cursor);
 
         parent_transferred = true;
         partition_transferred = true;
@@ -5307,7 +5344,7 @@ pub fn parseCreateViewCatalogTailAlloc(
     const if_not_exists = try parseOptionalIfNotExists(cursor);
     var syntax = try parseSimpleViewDefinitionAlloc(alloc, cursor, tokens, pos);
     errdefer syntax.deinit(alloc);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     syntax.replace_existing = replace_existing;
     syntax.if_not_exists = if_not_exists;
     return syntax;
@@ -5336,7 +5373,7 @@ pub fn parseCreateMaterializedViewCatalogTailAlloc(
             populate_on_create = true;
         }
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     definition_transferred = true;
     return .{
         .view_name = definition.view_name,
@@ -5367,7 +5404,7 @@ pub fn parseDropViewCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     view_transferred = true;
     return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -5391,7 +5428,7 @@ pub fn parseDropMaterializedViewCatalogTailAlloc(
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
     const cascade = cursor.matchKeyword("cascade");
     if (!cascade) _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     view_transferred = true;
     return .{ .view_name = view_name, .if_exists = if_exists, .cascade = cascade };
 }
@@ -5418,7 +5455,7 @@ pub fn parseRefreshMaterializedViewCatalogTailAlloc(
             populate = true;
         }
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     view_transferred = true;
     return .{ .view_name = view_name, .concurrently = concurrently, .populate = populate };
 }
@@ -5438,7 +5475,7 @@ pub fn parseRenameViewCatalogTailAlloc(
     const new_view_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var new_transferred = false;
     errdefer if (!new_transferred) alloc.free(new_view_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     view_transferred = true;
     new_transferred = true;
     return .{ .view_name = view_name, .new_view_name = new_view_name };
@@ -5589,7 +5626,7 @@ pub fn parseCreateRoleCatalogTailAlloc(
     const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var role_transferred = false;
     errdefer if (!role_transferred) alloc.free(role_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     role_transferred = true;
     return .{ .role_name = role_name };
 }
@@ -5644,7 +5681,7 @@ pub fn parseAlterRoleCatalogTailAlloc(
         value_transferred = false;
         errdefer if (!value_transferred) if (setting_value) |*value| value.deinit(alloc);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     role_transferred = true;
     database_transferred = true;
     setting_transferred = true;
@@ -5674,7 +5711,7 @@ pub fn parseDropRoleCatalogTailAlloc(
     const role_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var role_transferred = false;
     errdefer if (!role_transferred) alloc.free(role_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     role_transferred = true;
     return .{ .role_name = role_name, .if_exists = if_exists };
 }
@@ -5717,7 +5754,7 @@ pub fn parsePrivilegeChangeTailAlloc(
     var principal_transferred = false;
     errdefer if (!principal_transferred) alloc.free(principal_name);
 
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     privileges_transferred = true;
     object_kind_transferred = true;
     object_name_transferred = true;
@@ -5927,7 +5964,7 @@ pub fn parseBulkIoTailAlloc(
     if (force_not_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
     if (force_null_columns.len != 0 and direction != .from) return error.UnsupportedSqlShape;
 
-    if (!cursor.peekKeyword("where")) try parseAdapterNoopStatementEnd(cursor);
+    if (!cursor.peekKeyword("where")) try adapterNoopStatementEnd(cursor);
     table_transferred = true;
     endpoint_transferred = true;
     format_transferred = true;
@@ -5982,7 +6019,7 @@ pub fn parseListenNotificationTailAlloc(
     const channel_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var channel_transferred = false;
     errdefer if (!channel_transferred) alloc.free(channel_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     channel_transferred = true;
     return .{ .channel_name = channel_name };
 }
@@ -6001,7 +6038,7 @@ pub fn parseNotifyNotificationTailAlloc(
     if (cursor.matchToken(.comma) != null) {
         payload_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
     }
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     channel_transferred = true;
     const syntax = NotifyNotificationSyntax{
         .channel_name = channel_name,
@@ -6018,13 +6055,13 @@ pub fn parseUnlistenNotificationTailAlloc(
 ) !UnlistenNotificationSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchToken(.star) != null) {
-        try parseAdapterNoopStatementEnd(cursor);
+        try adapterNoopStatementEnd(cursor);
         return .{ .all = true };
     }
     const channel_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var channel_transferred = false;
     errdefer if (!channel_transferred) alloc.free(channel_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     channel_transferred = true;
     return .{ .channel_name = channel_name };
 }
@@ -6053,7 +6090,7 @@ pub fn parseTruncateMutationSourceSqlAlloc(
     }
     if (cursor.matchKeyword("cascade")) return error.UnsupportedSqlShape;
     _ = cursor.matchKeyword("restrict");
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 
     table_transferred = true;
     return .{ .table_name = table_name, .restart_identity = restart_identity };
@@ -6081,7 +6118,7 @@ pub fn parseCreatePublicationCatalogTailAlloc(
         table_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
     }
     if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     publication_transferred = true;
     const out = CreatePublicationSyntax{
         .publication_name = publication_name,
@@ -6106,7 +6143,7 @@ pub fn parseAlterPublicationCatalogTailAlloc(
     try cursor.expectKeyword("table");
     var table_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
     errdefer freeStringSlice(alloc, table_names);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     publication_transferred = true;
     const out = AlterPublicationSyntax{
         .publication_name = publication_name,
@@ -6131,7 +6168,7 @@ pub fn parseDropPublicationCatalogTailAlloc(
     const publication_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var publication_transferred = false;
     errdefer if (!publication_transferred) alloc.free(publication_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     publication_transferred = true;
     return .{ .publication_name = publication_name, .if_exists = if_exists };
 }
@@ -6154,7 +6191,7 @@ pub fn parseCreateSubscriptionCatalogTailAlloc(
     var publication_names = try parseIdentifierListAlloc(alloc, tokens, pos);
     errdefer freeStringSlice(alloc, publication_names);
     if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     subscription_transferred = true;
     connection_transferred = true;
     const out = CreateSubscriptionSyntax{
@@ -6182,7 +6219,7 @@ pub fn parseAlterSubscriptionCatalogTailAlloc(
         false
     else
         return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     subscription_transferred = true;
     return .{ .subscription_name = subscription_name, .enabled = enabled };
 }
@@ -6202,7 +6239,7 @@ pub fn parseDropSubscriptionCatalogTailAlloc(
     const subscription_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var subscription_transferred = false;
     errdefer if (!subscription_transferred) alloc.free(subscription_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     subscription_transferred = true;
     return .{ .subscription_name = subscription_name, .if_exists = if_exists };
 }
@@ -6218,7 +6255,7 @@ pub fn parseCreateCollationCatalogTailAlloc(
     var collation_transferred = false;
     errdefer if (!collation_transferred) alloc.free(collation_name);
     const option_count = try countParenthesizedAssignments(cursor);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     collation_transferred = true;
     return .{ .collation_name = collation_name, .option_count = option_count };
 }
@@ -6238,7 +6275,7 @@ pub fn parseRenameCollationCatalogTailAlloc(
     const new_collation_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var new_collation_transferred = false;
     errdefer if (!new_collation_transferred) alloc.free(new_collation_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     collation_transferred = true;
     new_collation_transferred = true;
     return .{ .collation_name = collation_name, .new_collation_name = new_collation_name };
@@ -6259,7 +6296,7 @@ pub fn parseDropCollationCatalogTailAlloc(
     const collation_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var collation_transferred = false;
     errdefer if (!collation_transferred) alloc.free(collation_name);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     collation_transferred = true;
     return .{ .collation_name = collation_name, .if_exists = if_exists };
 }
@@ -6275,7 +6312,7 @@ pub fn parseCreateOperatorCatalogTailAlloc(
     var operator_transferred = false;
     errdefer if (!operator_transferred) alloc.free(operator_name);
     const option_count = try countParenthesizedAssignments(cursor);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     operator_transferred = true;
     return .{ .operator_name = operator_name, .option_count = option_count };
 }
@@ -6291,7 +6328,7 @@ pub fn parseDropOperatorCatalogTailAlloc(
     var operator_transferred = false;
     errdefer if (!operator_transferred) alloc.free(operator_name);
     const argument_count = try countParenthesizedTypeList(cursor);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     operator_transferred = true;
     return .{ .operator_name = operator_name, .argument_count = argument_count };
 }
@@ -6308,7 +6345,7 @@ pub fn parseCreateAggregateCatalogTailAlloc(
     errdefer if (!aggregate_transferred) alloc.free(aggregate_name);
     const argument_count = try countParenthesizedTypeList(cursor);
     const option_count = try countParenthesizedAssignments(cursor);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     aggregate_transferred = true;
     return .{ .aggregate_name = aggregate_name, .argument_count = argument_count, .option_count = option_count };
 }
@@ -6324,7 +6361,7 @@ pub fn parseDropAggregateCatalogTailAlloc(
     var aggregate_transferred = false;
     errdefer if (!aggregate_transferred) alloc.free(aggregate_name);
     const argument_count = try countParenthesizedTypeList(cursor);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     aggregate_transferred = true;
     return .{ .aggregate_name = aggregate_name, .argument_count = argument_count };
 }
@@ -6356,7 +6393,7 @@ pub fn parseCreateCastCatalogTailAlloc(
         if (cursor.matchKeyword("implicit")) break :blk false;
         return error.UnsupportedSqlShape;
     } else false;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     source_transferred = true;
     target_transferred = true;
     function_transferred = true;
@@ -6384,7 +6421,7 @@ pub fn parseDropCastCatalogTailAlloc(
     var target_transferred = false;
     errdefer if (!target_transferred) alloc.free(target_type);
     try cursor.expectToken(.rparen);
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     source_transferred = true;
     target_transferred = true;
     return .{ .source_type = source_type, .target_type = target_type };
@@ -6395,6 +6432,94 @@ pub fn parseRelationLifetimePrefix(tokens: []const Token, pos: *usize) !Relation
     if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp")) return .{ .kind = .temporary };
     if (cursor.matchKeyword("unlogged")) return .{ .kind = .unlogged };
     return error.UnsupportedSqlShape;
+}
+
+pub fn parseSelectSetOperation(tokens: []const Token, pos: *usize) !ast.SelectSetOperation {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const op: ast.SelectSetOperation = if (cursor.matchKeyword("union")) blk: {
+        if (cursor.matchKeyword("all")) break :blk .union_all;
+        break :blk .union_distinct;
+    } else if (cursor.matchKeyword("intersect"))
+        .intersect
+    else if (cursor.matchKeyword("except"))
+        .except
+    else
+        return error.UnsupportedSqlShape;
+    _ = cursor.matchKeyword("distinct");
+    return op;
+}
+
+pub fn nextIsSelectSetOperationKeyword(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "union") or
+        parser.peekKeyword(tokens, pos, "intersect") or
+        parser.peekKeyword(tokens, pos, "except");
+}
+
+pub fn peekUpdateJoinedMutationSourceAlias(tokens: []const Token, pos: usize) ?[]const u8 {
+    var depth: usize = 0;
+    var i = pos;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .identifier => {
+                if (depth != 0 or !std.ascii.eqlIgnoreCase(token.text, "from")) continue;
+                var j = i + 1;
+                if (j >= tokens.len or tokens[j].kind != .identifier) return null;
+                const table_name = tokens[j].text;
+                j += 1;
+                if (j < tokens.len and tokens[j].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[j].text, "as")) {
+                    j += 1;
+                }
+                if (j < tokens.len and tokens[j].kind == .identifier and !lower_expr.sqlJoinedSourceAliasTerminator(tokens[j].text)) {
+                    return tokens[j].text;
+                }
+                return table_name;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn peekStaticToJsonbValue(tokens: []const Token, pos: usize) bool {
+    if (parser.peekKeyword(tokens, pos, "null") or
+        parser.peekKeyword(tokens, pos, "true") or
+        parser.peekKeyword(tokens, pos, "false"))
+    {
+        return true;
+    }
+    if (pos >= tokens.len) return false;
+    if (tokens[pos].kind == .placeholder or tokens[pos].kind == .string or tokens[pos].kind == .number) return true;
+    return tokens[pos].kind == .minus and pos + 1 < tokens.len and tokens[pos + 1].kind == .number;
+}
+
+pub fn peekArrayTransformSelfAssignment(tokens: []const Token, pos: usize, field: []const u8) bool {
+    if (!(parser.peekKeyword(tokens, pos, "array_append") or parser.peekKeyword(tokens, pos, "array_remove"))) return false;
+    if (pos + 3 >= tokens.len) return false;
+    return tokens[pos + 1].kind == .lparen and
+        tokens[pos + 2].kind == .identifier and
+        std.mem.eql(u8, tokens[pos + 2].text, field) and
+        tokens[pos + 3].kind == .comma;
+}
+
+pub fn peekDdlRangeColumnDefinition(tokens: []const Token, pos: usize) bool {
+    if (pos + 1 >= tokens.len) return false;
+    return tokens[pos].kind == .identifier and
+        tokens[pos + 1].kind == .identifier and
+        ddl_plan.ddlRangeBoundTypeForName(tokens[pos + 1].text) != null;
+}
+
+pub fn nextIsSelectSetResultTailKeyword(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "order") or
+        parser.peekKeyword(tokens, pos, "limit") or
+        parser.peekKeyword(tokens, pos, "offset") or
+        parser.peekKeyword(tokens, pos, "fetch") or
+        (pos < tokens.len and tokens[pos].kind == .semicolon);
 }
 
 pub fn normalizeSqlObjectIdentifierAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
@@ -6413,6 +6538,45 @@ pub fn parseIdentifierOwnedAlloc(
 ) ![]const u8 {
     const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, token.text);
+}
+
+pub fn parseOptionalProjectionAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !?[]const u8 {
+    if (!parser.matchKeyword(tokens, pos, "as")) return null;
+    return try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+}
+
+pub fn parseProjectionOutputOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    default_output: []const u8,
+) ![]const u8 {
+    return (try parseOptionalProjectionAliasAlloc(alloc, tokens, pos)) orelse
+        try alloc.dupe(u8, default_output);
+}
+
+pub fn parseRequiredAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    _ = parser.matchKeyword(tokens, pos, "as");
+    return try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+}
+
+pub fn consumeProjectionAlias(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    field: []const u8,
+) !void {
+    const alias = (try parseOptionalProjectionAliasAlloc(alloc, tokens, pos)) orelse return;
+    defer alloc.free(alias);
+    if (!std.mem.eql(u8, alias, field)) return error.UnsupportedSqlShape;
 }
 
 pub fn parseSqlStringLiteralValueAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) ![]const u8 {
@@ -6792,16 +6956,20 @@ fn parseAdapterNoopPublicSearchPathTail(cursor: parser.Cursor) !void {
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const path = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
     if (!std.ascii.eqlIgnoreCase(path.text, "public")) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
 fn parseAdapterNoopSetValueTail(cursor: parser.Cursor, setting: []const u8) !void {
     const value = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
     if (!adapterNoopSetSessionSettingValueAllowed(setting, value.text)) return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
 }
 
-fn parseAdapterNoopStatementEnd(cursor: parser.Cursor) !void {
+pub fn parseAdapterNoopStatementEnd(tokens: []const Token, pos: *usize) !void {
+    try adapterNoopStatementEnd(parser.Cursor.init(tokens, pos));
+}
+
+fn adapterNoopStatementEnd(cursor: parser.Cursor) !void {
     if (!cursor.atEnd() and !cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
     if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
     if (!cursor.atEnd()) return error.UnsupportedSqlShape;
@@ -6822,17 +6990,17 @@ fn parseSavepointNameTail(tokens: []const Token, pos: *usize) !SavepointNameSynt
 
 fn parseSavepointNameTailFromCursor(cursor: parser.Cursor) !SavepointNameSyntax {
     const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{ .savepoint_name = name.text };
 }
 
 fn parseNamedOrAllTail(cursor: parser.Cursor) !NamedOrAllSyntax {
     if (cursor.matchKeyword("all")) {
-        try parseAdapterNoopStatementEnd(cursor);
+        try adapterNoopStatementEnd(cursor);
         return .{ .all = true };
     }
     const name = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-    try parseAdapterNoopStatementEnd(cursor);
+    try adapterNoopStatementEnd(cursor);
     return .{ .name = name.text };
 }
 
@@ -7535,6 +7703,17 @@ test "sql adapter grammar accepts allowlisted adapter session cleanup" {
     var discard_pos: usize = 0;
     try parseAdapterNoopDiscardStatementTail(discard_tokens.items, &discard_pos);
     try std.testing.expectEqual(discard_tokens.items.len, discard_pos);
+
+    var end_tokens = try lexer.tokenizeAlloc(alloc, ";");
+    defer lexer.freeTokens(alloc, &end_tokens);
+    var end_pos: usize = 0;
+    try parseAdapterNoopStatementEnd(end_tokens.items, &end_pos);
+    try std.testing.expectEqual(end_tokens.items.len, end_pos);
+
+    var extra_tokens = try lexer.tokenizeAlloc(alloc, "; SELECT 1");
+    defer lexer.freeTokens(alloc, &extra_tokens);
+    var extra_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseAdapterNoopStatementEnd(extra_tokens.items, &extra_pos));
 }
 
 test "sql adapter grammar rejects semantic session changes as noops" {
@@ -8638,11 +8817,27 @@ test "sql adapter grammar parses ddl constraint column lists" {
 }
 
 test "sql adapter grammar validates identifier lists" {
+    const alloc = std.testing.allocator;
+
     try validateSqlIdentifierListUnique(&.{ "tenant_id", "usage_id" });
     try std.testing.expectError(error.UnsupportedSqlShape, validateSqlIdentifierListUnique(&.{ "tenant_id", "TENANT_ID" }));
 
     try validateSqlIdentifierListsDisjoint(&.{ "tenant_id", "usage_id" }, &.{"status"});
     try std.testing.expectError(error.UnsupportedSqlShape, validateSqlIdentifierListsDisjoint(&.{ "tenant_id", "usage_id" }, &.{"USAGE_ID"}));
+
+    var alias_tokens = try lexer.tokenizeAlloc(alloc, "AS projected_name");
+    defer lexer.freeTokens(alloc, &alias_tokens);
+    var alias_pos: usize = 0;
+    const alias = (try parseOptionalProjectionAliasAlloc(alloc, alias_tokens.items, &alias_pos)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(alias);
+    try std.testing.expectEqualStrings("projected_name", alias);
+    try std.testing.expectEqual(alias_tokens.items.len, alias_pos);
+
+    var consume_tokens = try lexer.tokenizeAlloc(alloc, "AS status");
+    defer lexer.freeTokens(alloc, &consume_tokens);
+    var consume_pos: usize = 0;
+    try consumeProjectionAlias(alloc, consume_tokens.items, &consume_pos, "status");
+    try std.testing.expectEqual(consume_tokens.items.len, consume_pos);
 }
 
 test "sql adapter grammar parses ddl foreign key options" {
@@ -10169,6 +10364,48 @@ test "sql adapter grammar parses relation lifetime prefixes" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseRelationLifetimePrefix(durable_tokens.items, &durable_pos));
 }
 
+test "sql adapter grammar parses select set operation tokens" {
+    const alloc = std.testing.allocator;
+
+    var union_all_tokens = try lexer.tokenizeAlloc(alloc, "UNION ALL SELECT id FROM usage_archive");
+    defer lexer.freeTokens(alloc, &union_all_tokens);
+    var union_all_pos: usize = 0;
+    try std.testing.expectEqual(ast.SelectSetOperation.union_all, try parseSelectSetOperation(union_all_tokens.items, &union_all_pos));
+    try std.testing.expect(std.ascii.eqlIgnoreCase(union_all_tokens.items[union_all_pos].text, "select"));
+
+    var union_distinct_tokens = try lexer.tokenizeAlloc(alloc, "UNION DISTINCT SELECT id FROM usage_archive");
+    defer lexer.freeTokens(alloc, &union_distinct_tokens);
+    var union_distinct_pos: usize = 0;
+    try std.testing.expectEqual(ast.SelectSetOperation.union_distinct, try parseSelectSetOperation(union_distinct_tokens.items, &union_distinct_pos));
+    try std.testing.expect(std.ascii.eqlIgnoreCase(union_distinct_tokens.items[union_distinct_pos].text, "select"));
+
+    var intersect_tokens = try lexer.tokenizeAlloc(alloc, "INTERSECT SELECT id FROM usage_archive");
+    defer lexer.freeTokens(alloc, &intersect_tokens);
+    var intersect_pos: usize = 0;
+    try std.testing.expectEqual(ast.SelectSetOperation.intersect, try parseSelectSetOperation(intersect_tokens.items, &intersect_pos));
+
+    var except_tokens = try lexer.tokenizeAlloc(alloc, "EXCEPT SELECT id FROM usage_archive");
+    defer lexer.freeTokens(alloc, &except_tokens);
+    var except_pos: usize = 0;
+    try std.testing.expectEqual(ast.SelectSetOperation.except, try parseSelectSetOperation(except_tokens.items, &except_pos));
+
+    try std.testing.expect(nextIsSelectSetOperationKeyword(union_all_tokens.items, 0));
+    try std.testing.expect(!nextIsSelectSetOperationKeyword(union_all_tokens.items, union_all_pos));
+
+    var tail_tokens = try lexer.tokenizeAlloc(alloc, "ORDER BY id LIMIT 10 OFFSET 1 FETCH NEXT ROW ONLY ;");
+    defer lexer.freeTokens(alloc, &tail_tokens);
+    try std.testing.expect(nextIsSelectSetResultTailKeyword(tail_tokens.items, 0));
+    try std.testing.expect(nextIsSelectSetResultTailKeyword(tail_tokens.items, 3));
+    try std.testing.expect(nextIsSelectSetResultTailKeyword(tail_tokens.items, 5));
+    try std.testing.expect(nextIsSelectSetResultTailKeyword(tail_tokens.items, 7));
+    try std.testing.expect(nextIsSelectSetResultTailKeyword(tail_tokens.items, tail_tokens.items.len - 1));
+
+    var invalid_tokens = try lexer.tokenizeAlloc(alloc, "SELECT id FROM usage_records");
+    defer lexer.freeTokens(alloc, &invalid_tokens);
+    var invalid_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSelectSetOperation(invalid_tokens.items, &invalid_pos));
+}
+
 test "sql adapter grammar parses bulk io tails" {
     const alloc = std.testing.allocator;
 
@@ -10730,6 +10967,35 @@ test "sql adapter grammar parses row claim clauses" {
     defer lexer.freeTokens(alloc, &invalid_tokens);
     var invalid_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseForRowClaimClauseAlloc(alloc, invalid_tokens.items, &invalid_pos));
+
+    try std.testing.expect(rowClaimTargetAllowed(alloc, "public.jobs", &.{"jobs"}));
+    try std.testing.expect(rowClaimTargetAllowed(alloc, "usage_records", &.{ "usage_records", "u" }));
+    try std.testing.expect(!rowClaimTargetAllowed(alloc, "tenant.jobs", &.{"jobs"}));
+
+    var checked_tokens = try lexer.tokenizeAlloc(alloc, "UPDATE OF public.jobs NOWAIT");
+    defer lexer.freeTokens(alloc, &checked_tokens);
+    var checked_pos: usize = 0;
+    const checked_clause = try parseCheckedForRowClaimClauseAlloc(alloc, checked_tokens.items, &checked_pos, &.{"jobs"});
+    try std.testing.expectEqual(checked_tokens.items.len, checked_pos);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, checked_clause.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.nowait, checked_clause.wait_policy);
+
+    var rejected_tokens = try lexer.tokenizeAlloc(alloc, "UPDATE OF tenant.jobs");
+    defer lexer.freeTokens(alloc, &rejected_tokens);
+    var rejected_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCheckedForRowClaimClauseAlloc(alloc, rejected_tokens.items, &rejected_pos, &.{"jobs"}));
+
+    var exclusive_tokens = try lexer.tokenizeAlloc(alloc, "NO KEY UPDATE OF jobs");
+    defer lexer.freeTokens(alloc, &exclusive_tokens);
+    var exclusive_pos: usize = 0;
+    const exclusive_clause = try parseExclusiveForRowClaimClauseAlloc(alloc, exclusive_tokens.items, &exclusive_pos, &.{"jobs"});
+    try std.testing.expectEqual(exclusive_tokens.items.len, exclusive_pos);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_no_key_update, exclusive_clause.mode);
+
+    var shared_tokens = try lexer.tokenizeAlloc(alloc, "SHARE OF jobs");
+    defer lexer.freeTokens(alloc, &shared_tokens);
+    var shared_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseExclusiveForRowClaimClauseAlloc(alloc, shared_tokens.items, &shared_pos, &.{"jobs"}));
 }
 
 test "sql adapter grammar parses relation population syntax" {
@@ -10825,6 +11091,35 @@ test "sql adapter grammar normalizes public object identifiers" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, ".usage_records"));
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public."));
     try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlObjectIdentifierAlloc(alloc, "public.analytics.usage_records"));
+}
+
+test "sql adapter grammar peeks joined mutation and assignment syntax" {
+    const alloc = std.testing.allocator;
+
+    var joined_alias = try lexer.tokenizeAlloc(alloc, "set total = src.total from usage_delta as src where src.id = usage.id");
+    defer lexer.freeTokens(alloc, &joined_alias);
+    try std.testing.expectEqualStrings("src", peekUpdateJoinedMutationSourceAlias(joined_alias.items, 0).?);
+
+    var joined_table = try lexer.tokenizeAlloc(alloc, "set total = usage_delta.total from usage_delta where usage_delta.id = usage.id");
+    defer lexer.freeTokens(alloc, &joined_table);
+    try std.testing.expectEqualStrings("usage_delta", peekUpdateJoinedMutationSourceAlias(joined_table.items, 0).?);
+
+    var nested_from = try lexer.tokenizeAlloc(alloc, "set payload = jsonb_set(payload, '{x}', to_jsonb(select from nested))");
+    defer lexer.freeTokens(alloc, &nested_from);
+    try std.testing.expect(peekUpdateJoinedMutationSourceAlias(nested_from.items, 0) == null);
+
+    var static_value = try lexer.tokenizeAlloc(alloc, "-42");
+    defer lexer.freeTokens(alloc, &static_value);
+    try std.testing.expect(peekStaticToJsonbValue(static_value.items, 0));
+
+    var expression_value = try lexer.tokenizeAlloc(alloc, "source.total + 1");
+    defer lexer.freeTokens(alloc, &expression_value);
+    try std.testing.expect(!peekStaticToJsonbValue(expression_value.items, 0));
+
+    var array_append = try lexer.tokenizeAlloc(alloc, "array_append(tags, 'urgent')");
+    defer lexer.freeTokens(alloc, &array_append);
+    try std.testing.expect(peekArrayTransformSelfAssignment(array_append.items, 0, "tags"));
+    try std.testing.expect(!peekArrayTransformSelfAssignment(array_append.items, 0, "labels"));
 }
 
 test "sql adapter grammar parses owned identifiers and normalized object lists" {

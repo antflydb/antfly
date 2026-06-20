@@ -18,15 +18,23 @@ const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
+const db_mod = @import("../../storage/db/mod.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../table_catalog.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
+const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const token_mod = @import("token.zig");
 
 const Token = token_mod.Token;
+
+pub const ResolvedRowExpressionField = struct {
+    field: []const u8,
+    source: db_mod.types.RelationalRowsExpressionFieldSource,
+    schema: runtime_schema.TableSchema,
+};
 
 pub fn relationalColumnForField(
     schema: runtime_schema.TableSchema,
@@ -43,11 +51,347 @@ pub fn relationalColumnForField(
     return null;
 }
 
+pub fn joinSideForQualifier(
+    qualifier: []const u8,
+    left_alias: []const u8,
+    right_alias: []const u8,
+) !db_mod.types.RelationalRowsJoinProjectionSide {
+    if (std.mem.eql(u8, qualifier, left_alias)) return .left;
+    if (std.mem.eql(u8, qualifier, right_alias)) return .right;
+    return error.UnsupportedSqlShape;
+}
+
+pub fn joinColumnForSide(
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    side: db_mod.types.RelationalRowsJoinProjectionSide,
+    field: []const u8,
+) !runtime_schema.RelationalColumn {
+    const source_schema = if (side == .left) schema else joined_source_schema orelse schema;
+    return relationalColumnForField(source_schema, field, null) orelse error.InvalidSqlCatalog;
+}
+
+pub fn joinedMutationColumnForQualifier(
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    qualifier: []const u8,
+    field: []const u8,
+    target_alias: []const u8,
+    source_alias: []const u8,
+) !runtime_schema.RelationalColumn {
+    if (std.mem.eql(u8, qualifier, target_alias)) {
+        return relationalColumnForField(schema, field, null) orelse error.InvalidSqlCatalog;
+    }
+    if (std.mem.eql(u8, qualifier, source_alias)) {
+        return relationalColumnForField(joined_source_schema orelse schema, field, null) orelse error.InvalidSqlCatalog;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn joinedMutationTargetFieldMatches(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    target_alias: []const u8,
+    expected: []const u8,
+) !bool {
+    if (std.mem.eql(u8, field, expected)) return true;
+    var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < field.len) {
+            const qualifier = field[0..index];
+            const unqualified = field[index + 1 ..];
+            if (std.mem.eql(u8, unqualified, expected) and try returningQualifierMatches(alloc, qualifier, &.{target_alias})) return true;
+        }
+        dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+    }
+    return false;
+}
+
+pub fn validateMergeFields(
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_field: []const u8,
+    source_field: []const u8,
+) !void {
+    const target_column = relationalColumnForField(schema, target_field, null) orelse return error.InvalidSqlCatalog;
+    const source_schema = joined_source_schema orelse schema;
+    const source_column = relationalColumnForField(source_schema, source_field, null) orelse return error.InvalidSqlCatalog;
+    if (source_column.field_type != target_column.field_type) return error.InvalidSqlCatalog;
+}
+
+pub fn resolveJoinProjectionsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    raw_select: []const plan_mod.QualifiedProjection,
+    left_alias: []const u8,
+    right_alias: []const u8,
+    select: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection),
+) !void {
+    for (raw_select) |projection| {
+        const side = try joinSideForQualifier(projection.source.qualifier, left_alias, right_alias);
+        _ = try joinColumnForSide(schema, joined_source_schema, side, projection.source.field);
+        const output = try alloc.dupe(u8, projection.output);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        const field = try alloc.dupe(u8, projection.source.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try select.append(alloc, .{ .output = output, .side = side, .field = field });
+        output_transferred = true;
+        field_transferred = true;
+    }
+}
+
 pub fn relationalColumnForReturningField(schema: runtime_schema.TableSchema, field: []const u8) ?runtime_schema.RelationalColumn {
     if (relationalColumnForField(schema, field, null)) |column| return column;
     const dot_index = std.mem.indexOfScalar(u8, field, '.') orelse return null;
     if (dot_index == 0 or dot_index + 1 >= field.len) return null;
     return relationalColumnForField(schema, field[0..dot_index], .json);
+}
+
+pub fn returningQualifierMatches(
+    alloc: std.mem.Allocator,
+    qualifier: []const u8,
+    returning_qualifiers: []const []const u8,
+) !bool {
+    for (returning_qualifiers) |expected| {
+        if (std.mem.eql(u8, qualifier, expected)) return true;
+    }
+    const normalized = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, qualifier);
+    defer alloc.free(normalized);
+    for (returning_qualifiers) |expected| {
+        if (std.mem.eql(u8, normalized, expected)) return true;
+    }
+    return false;
+}
+
+pub fn matchQualifiedReturningAll(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    returning_qualifiers: []const []const u8,
+) !bool {
+    if (pos.* + 1 >= tokens.len or tokens[pos.*].kind != .identifier) return false;
+    const token = tokens[pos.*];
+    if (!std.mem.endsWith(u8, token.text, ".")) return false;
+    if (tokens[pos.* + 1].kind != .star) return false;
+    const qualifier = token.text[0 .. token.text.len - 1];
+    if (qualifier.len == 0) return error.UnsupportedSqlShape;
+    if (!try returningQualifierMatches(alloc, qualifier, returning_qualifiers)) return error.InvalidSqlCatalog;
+    pos.* += 2;
+    return true;
+}
+
+pub fn normalizeReturningFieldAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    returning_qualifiers: []const []const u8,
+) ![]const u8 {
+    if (relationalColumnForReturningField(schema, field) != null) {
+        return try alloc.dupe(u8, field);
+    }
+
+    var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < field.len) {
+            const qualifier = field[0..index];
+            const unqualified_field = field[index + 1 ..];
+            if (try returningQualifierMatches(alloc, qualifier, returning_qualifiers)) {
+                if (relationalColumnForReturningField(schema, unqualified_field) == null) return error.InvalidSqlCatalog;
+                return try alloc.dupe(u8, unqualified_field);
+            }
+        }
+        dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+    }
+
+    return error.InvalidSqlCatalog;
+}
+
+pub fn normalizeJoinedMutationReturningSourceFieldAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    field: []const u8,
+    source_alias: []const u8,
+) !?[]const u8 {
+    var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < field.len) {
+            const qualifier = field[0..index];
+            const unqualified_field = field[index + 1 ..];
+            if (try returningQualifierMatches(alloc, qualifier, &.{source_alias})) {
+                const source_schema = joined_source_schema orelse schema;
+                if (relationalColumnForReturningField(source_schema, unqualified_field) == null) return error.InvalidSqlCatalog;
+                return try alloc.dupe(u8, unqualified_field);
+            }
+        }
+        dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+    }
+    return null;
+}
+
+pub fn normalizeTargetSelectorFieldAlloc(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    target_qualifiers: []const []const u8,
+) ![]u8 {
+    var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < field.len) {
+            const qualifier = field[0..index];
+            const unqualified_field = field[index + 1 ..];
+            if (try returningQualifierMatches(alloc, qualifier, target_qualifiers)) {
+                return try alloc.dupe(u8, unqualified_field);
+            }
+        }
+        dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+    }
+    if (std.mem.indexOfScalar(u8, field, '.') != null) return error.InvalidSqlCatalog;
+    return try alloc.dupe(u8, field);
+}
+
+pub fn appendSemiJoinTargetFieldAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged([]const u8),
+    schema: runtime_schema.TableSchema,
+    parsed_target_field: []const u8,
+    target_qualifiers: []const []const u8,
+) !void {
+    const target_field = try normalizeTargetSelectorFieldAlloc(alloc, parsed_target_field, target_qualifiers);
+    var target_field_transferred = false;
+    errdefer if (!target_field_transferred) alloc.free(target_field);
+    if (relationalColumnForField(schema, target_field, null) == null) return error.InvalidSqlCatalog;
+    try fields.append(alloc, target_field);
+    target_field_transferred = true;
+}
+
+pub fn normalizeRowExpressionFieldAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) ![]const u8 {
+    const qualifiers = if (field_expression_qualifiers.len != 0)
+        field_expression_qualifiers
+    else
+        returning_expression_qualifiers;
+    if (defer_row_expression_field_validation) {
+        if (qualifiers.len == 0) return try alloc.dupe(u8, field);
+        var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+        while (dot) |index| {
+            if (index > 0 and index + 1 < field.len) {
+                const qualifier = field[0..index];
+                const unqualified_field = field[index + 1 ..];
+                if (try returningQualifierMatches(alloc, qualifier, qualifiers)) return try alloc.dupe(u8, unqualified_field);
+            }
+            dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+        }
+        if (std.mem.indexOfScalar(u8, field, '.') != null) return error.InvalidSqlCatalog;
+        return try alloc.dupe(u8, field);
+    }
+    if (qualifiers.len == 0) {
+        return try alloc.dupe(u8, field);
+    }
+    return try normalizeReturningFieldAlloc(alloc, schema, field, qualifiers);
+}
+
+pub fn normalizePeriodReferenceAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+) !?[]const u8 {
+    if (relationalPeriodForDdl(schema.periods, field) != null) {
+        return try alloc.dupe(u8, field);
+    }
+    const qualifiers = if (field_expression_qualifiers.len != 0)
+        field_expression_qualifiers
+    else
+        returning_expression_qualifiers;
+    if (qualifiers.len == 0) return null;
+    var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < field.len) {
+            const qualifier = field[0..index];
+            const unqualified_field = field[index + 1 ..];
+            if (relationalPeriodForDdl(schema.periods, unqualified_field) != null and try returningQualifierMatches(alloc, qualifier, qualifiers)) {
+                return try alloc.dupe(u8, unqualified_field);
+            }
+        }
+        dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+    }
+    return null;
+}
+
+pub fn normalizeQualifiedRowExpressionFieldAlloc(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    qualifiers: []const []const u8,
+    schema: runtime_schema.TableSchema,
+) !?[]const u8 {
+    var dot: ?usize = std.mem.indexOfScalar(u8, field, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < field.len) {
+            const qualifier = field[0..index];
+            const unqualified_field = field[index + 1 ..];
+            if (try returningQualifierMatches(alloc, qualifier, qualifiers)) {
+                if (relationalColumnForReturningField(schema, unqualified_field) == null) return error.InvalidSqlCatalog;
+                return try alloc.dupe(u8, unqualified_field);
+            }
+        }
+        dot = std.mem.indexOfScalarPos(u8, field, index + 1, '.');
+    }
+    return null;
+}
+
+pub fn resolveRowExpressionFieldAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    field: []const u8,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    joined_source_expression_qualifiers: []const []const u8,
+    joined_target_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    default_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !ResolvedRowExpressionField {
+    if (joined_source_expression_qualifiers.len != 0) {
+        const source_schema = joined_source_schema orelse schema;
+        if (try normalizeQualifiedRowExpressionFieldAlloc(alloc, field, joined_source_expression_qualifiers, source_schema)) |source_field| {
+            return .{
+                .field = source_field,
+                .source = .source,
+                .schema = source_schema,
+            };
+        }
+    }
+    if (joined_target_expression_qualifiers.len != 0) {
+        if (try normalizeQualifiedRowExpressionFieldAlloc(alloc, field, joined_target_expression_qualifiers, schema)) |target_field| {
+            return .{
+                .field = target_field,
+                .source = .row,
+                .schema = schema,
+            };
+        }
+    }
+    return .{
+        .field = try normalizeRowExpressionFieldAlloc(
+            alloc,
+            schema,
+            field,
+            field_expression_qualifiers,
+            returning_expression_qualifiers,
+            defer_row_expression_field_validation,
+        ),
+        .source = default_source,
+        .schema = if (default_source == .source) joined_source_schema orelse schema else schema,
+    };
 }
 
 pub fn findUniqueConstraintByName(schema: runtime_schema.TableSchema, name: []const u8) ?runtime_schema.UniqueConstraint {
@@ -1020,6 +1364,129 @@ test "sql adapter binder validates relational catalog lookups" {
         .child_columns = &.{"payload"},
         .parent_columns = &.{"payload"},
     }));
+}
+
+test "sql adapter binder resolves join projection bindings" {
+    const alloc = std.testing.allocator;
+    const left_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword },
+        .{ .name = "tenant", .path = "tenant", .field_type = .keyword },
+    };
+    const right_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+    };
+    const left_schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &left_columns,
+    };
+    const right_schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &right_columns,
+    };
+
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, try joinSideForQualifier("u", "u", "c"));
+    try std.testing.expectError(error.UnsupportedSqlShape, joinSideForQualifier("x", "u", "c"));
+    try std.testing.expectEqualStrings("tenant", (try joinColumnForSide(left_schema, right_schema, .left, "tenant")).name);
+    try std.testing.expectEqualStrings("status", (try joinColumnForSide(left_schema, right_schema, .right, "status")).name);
+    try std.testing.expectError(error.InvalidSqlCatalog, joinColumnForSide(left_schema, right_schema, .right, "tenant"));
+    const resolved_source = try resolveRowExpressionFieldAlloc(
+        alloc,
+        left_schema,
+        right_schema,
+        "source.status",
+        &.{},
+        &.{},
+        &.{"source"},
+        &.{"target"},
+        false,
+        .row,
+    );
+    defer alloc.free(resolved_source.field);
+    try std.testing.expectEqualStrings("status", resolved_source.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, resolved_source.source);
+    try std.testing.expectEqualStrings("status", resolved_source.schema.relational_columns[1].name);
+    const resolved_target = try resolveRowExpressionFieldAlloc(
+        alloc,
+        left_schema,
+        right_schema,
+        "target.tenant",
+        &.{},
+        &.{},
+        &.{"source"},
+        &.{"target"},
+        false,
+        .source,
+    );
+    defer alloc.free(resolved_target.field);
+    try std.testing.expectEqualStrings("tenant", resolved_target.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, resolved_target.source);
+    const resolved_default_source = try resolveRowExpressionFieldAlloc(
+        alloc,
+        left_schema,
+        right_schema,
+        "tenant",
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        false,
+        .source,
+    );
+    defer alloc.free(resolved_default_source.field);
+    try std.testing.expectEqualStrings("tenant", resolved_default_source.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, resolved_default_source.source);
+    try std.testing.expectEqualStrings("status", resolved_default_source.schema.relational_columns[1].name);
+    const source_returning = (try normalizeJoinedMutationReturningSourceFieldAlloc(alloc, left_schema, right_schema, "source.status", "source")).?;
+    defer alloc.free(source_returning);
+    try std.testing.expectEqualStrings("status", source_returning);
+    try std.testing.expect((try normalizeJoinedMutationReturningSourceFieldAlloc(alloc, left_schema, right_schema, "target.tenant", "source")) == null);
+    try std.testing.expectError(error.InvalidSqlCatalog, normalizeJoinedMutationReturningSourceFieldAlloc(alloc, left_schema, right_schema, "source.tenant", "source"));
+    try std.testing.expectEqualStrings("tenant", (try joinedMutationColumnForQualifier(left_schema, right_schema, "target", "tenant", "target", "source")).name);
+    try std.testing.expectEqualStrings("status", (try joinedMutationColumnForQualifier(left_schema, right_schema, "source", "status", "target", "source")).name);
+    try std.testing.expectError(error.UnsupportedSqlShape, joinedMutationColumnForQualifier(left_schema, right_schema, "other", "status", "target", "source"));
+    try std.testing.expect(try joinedMutationTargetFieldMatches(alloc, "tenant", "target", "tenant"));
+    try std.testing.expect(try joinedMutationTargetFieldMatches(alloc, "target.tenant", "target", "tenant"));
+    try std.testing.expect(try joinedMutationTargetFieldMatches(alloc, "public.target.tenant", "target", "tenant"));
+    try std.testing.expect(!try joinedMutationTargetFieldMatches(alloc, "source.tenant", "target", "tenant"));
+    var returning_all = try lexer.tokenizeAlloc(alloc, "target.*");
+    defer lexer.freeTokens(alloc, &returning_all);
+    var returning_all_pos: usize = 0;
+    try std.testing.expect(try matchQualifiedReturningAll(alloc, returning_all.items, &returning_all_pos, &.{ "target", "public.target" }));
+    try std.testing.expectEqual(returning_all.items.len, returning_all_pos);
+    var source_all = try lexer.tokenizeAlloc(alloc, "source.*");
+    defer lexer.freeTokens(alloc, &source_all);
+    var source_all_pos: usize = 0;
+    try std.testing.expectError(error.InvalidSqlCatalog, matchQualifiedReturningAll(alloc, source_all.items, &source_all_pos, &.{"target"}));
+    try validateMergeFields(left_schema, right_schema, "tenant", "status");
+    try std.testing.expectError(error.InvalidSqlCatalog, validateMergeFields(left_schema, right_schema, "tenant", "amount"));
+    const normalized_target = try normalizeTargetSelectorFieldAlloc(alloc, "target.tenant", &.{ "target", "public.target" });
+    defer alloc.free(normalized_target);
+    try std.testing.expectEqualStrings("tenant", normalized_target);
+    const normalized_unqualified = try normalizeTargetSelectorFieldAlloc(alloc, "tenant", &.{"target"});
+    defer alloc.free(normalized_unqualified);
+    try std.testing.expectEqualStrings("tenant", normalized_unqualified);
+    try std.testing.expectError(error.InvalidSqlCatalog, normalizeTargetSelectorFieldAlloc(alloc, "other.tenant", &.{"target"}));
+
+    const raw = [_]plan_mod.QualifiedProjection{
+        .{ .source = .{ .qualifier = "u", .field = "tenant" }, .output = "tenant" },
+        .{ .source = .{ .qualifier = "c", .field = "status" }, .output = "customer_status" },
+    };
+    var select = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection).empty;
+    defer {
+        for (select.items) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        select.deinit(alloc);
+    }
+    try resolveJoinProjectionsAlloc(alloc, left_schema, right_schema, &raw, "u", "c", &select);
+    try std.testing.expectEqual(@as(usize, 2), select.items.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, select.items[0].side);
+    try std.testing.expectEqualStrings("tenant", select.items[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, select.items[1].side);
+    try std.testing.expectEqualStrings("customer_status", select.items[1].output);
 }
 
 const TestCatalog = struct {

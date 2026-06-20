@@ -16,10 +16,16 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
+const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const strings = @import("strings.zig");
+const sql_value = @import("value.zig");
+
+const Token = lower_expr.Token;
 
 const LoweredMergeMutationPlan = plan_mod.LoweredMergeMutationPlan;
 const MergeArmPredicate = plan_mod.MergeArmPredicate;
@@ -28,6 +34,744 @@ const MergeFieldMapping = plan_mod.MergeFieldMapping;
 const MergeMatchedArm = plan_mod.MergeMatchedArm;
 const MergeNotMatchedArm = plan_mod.MergeNotMatchedArm;
 const ReturningProjection = plan_mod.ReturningProjection;
+const SelectOutputRef = plan_mod.SelectOutputRef;
+const TableAlias = plan_mod.TableAlias;
+
+const cloneExpressionAlloc = plan_mod.cloneExpressionAlloc;
+const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
+const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
+const cloneExpressionPredicateGroupsAlloc = plan_mod.cloneExpressionPredicateGroupsAlloc;
+const freeArrayLengthProjections = plan_mod.freeArrayLengthProjections;
+const freeCoalesceProjections = plan_mod.freeCoalesceProjections;
+const freeExpression = plan_mod.freeExpression;
+const freeExpressionAssignments = plan_mod.freeExpressionAssignments;
+const freeExpressionArrayContains = plan_mod.freeExpressionArrayContains;
+const freeExpressionCondition = plan_mod.freeExpressionCondition;
+const freeExpressionConditions = plan_mod.freeExpressionConditions;
+const freeExpressionPredicateGroups = plan_mod.freeExpressionPredicateGroups;
+const freeExpressionProjections = plan_mod.freeExpressionProjections;
+const freeFieldAliasProjections = plan_mod.freeFieldAliasProjections;
+const freeInPredicates = plan_mod.freeInPredicates;
+const freeJoinOn = plan_mod.freeJoinOn;
+const freeJsonExtract = plan_mod.freeJsonExtract;
+const freeRelationalChecks = plan_mod.freeRelationalChecks;
+const freeRowsJsonSetExpressionAssignments = plan_mod.freeRowsJsonSetExpressionAssignments;
+const freeTableAlias = plan_mod.freeTableAlias;
+
+pub const InsertValueRows = []const []const []const u8;
+
+pub const InsertColumnSpec = union(enum) {
+    column: []const u8,
+    period: runtime_schema.RelationalPeriod,
+};
+
+pub const FieldJsonValue = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const JoinedMutationSourceAssignment = struct {
+    field: []const u8,
+    source_qualifier: []const u8,
+    source_field: []const u8,
+};
+
+pub const FieldExpressionValue = struct {
+    field: []const u8,
+    expression: db_mod.types.RelationalRowsExpression,
+};
+
+pub const FieldPredicate = struct {
+    field: []const u8,
+    op: runtime_schema.UniquePredicateOp,
+    value_json: ?[]const u8 = null,
+};
+
+pub const JsonSetValue = struct {
+    field: []const u8,
+    path: []const []const u8,
+    value_json: ?[]const u8 = null,
+    expression: ?db_mod.types.RelationalRowsExpression = null,
+};
+
+pub const JsonSetParsedValue = struct {
+    value_json: ?[]const u8 = null,
+    expression: ?db_mod.types.RelationalRowsExpression = null,
+};
+
+pub const ArrayTransformValue = struct {
+    field: []const u8,
+    op: db_mod.types.TransformOpType,
+    value_json: []const u8,
+};
+
+pub fn validateInsertSourceAssignmentExpressionType(
+    type_context: lower_expr.RowExpressionTypeContext,
+    target_column: runtime_schema.RelationalColumn,
+    expression: db_mod.types.RelationalRowsExpression,
+) !void {
+    const expression_type = try type_context.rowExpressionOutputType(expression);
+    const compatible = if (target_column.field_type == .json or target_column.field_type == .array)
+        expression_type == target_column.field_type
+    else
+        lower_expr.sqlExpressionTypesComparable(target_column.field_type, expression_type);
+    if (!compatible) return error.UnsupportedSqlShape;
+}
+
+pub fn insertSourceSelectSourceCteSchema(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    planned_ctes: []const relational_rows.RowsPlannedCte,
+) !?runtime_schema.TableSchema {
+    if (planned_ctes.len == 0) return null;
+    const from_index = parser.findTopLevelKeyword(tokens[start..end], "from") orelse return null;
+    var source_index = start + from_index + 1;
+    _ = parser.matchKeyword(tokens, &source_index, "only");
+    if (source_index >= end or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+    return relational_rows.rowsPlannedCteSchema(planned_ctes, tokens[source_index].text);
+}
+
+pub fn insertSourceAssignmentsFromSelectAlloc(
+    alloc: std.mem.Allocator,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    type_context: lower_expr.RowExpressionTypeContext,
+    target_columns: []const []const u8,
+    source_query: db_mod.types.RelationalRowsQueryRequest,
+    source_outputs: []const SelectOutputRef,
+) ![]const db_mod.types.RelationalRowsExpressionAssignment {
+    if (target_columns.len != source_outputs.len) return error.UnsupportedSqlShape;
+    const assignments = try alloc.alloc(db_mod.types.RelationalRowsExpressionAssignment, target_columns.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (assignments[0..initialized]) |assignment| {
+            alloc.free(@constCast(assignment.field));
+            freeExpression(alloc, assignment.expression);
+        }
+        alloc.free(assignments);
+    }
+    for (target_columns, source_outputs) |target_name, output| {
+        const target_column = binder.relationalColumnForField(target_schema, target_name, null) orelse return error.InvalidSqlCatalog;
+        const expression = try insertSourceExpressionFromSelectOutputAlloc(alloc, source_schema, source_query, output);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try validateInsertSourceAssignmentExpressionType(type_context, target_column, expression);
+        const target_field = try alloc.dupe(u8, target_column.path);
+        var target_transferred = false;
+        errdefer if (!target_transferred) alloc.free(target_field);
+        assignments[initialized] = .{
+            .field = target_field,
+            .expression = expression,
+        };
+        target_transferred = true;
+        expression_transferred = true;
+        initialized += 1;
+    }
+    return assignments;
+}
+
+pub fn insertSourceExpressionFromSelectOutputAlloc(
+    alloc: std.mem.Allocator,
+    source_schema: runtime_schema.TableSchema,
+    source_query: db_mod.types.RelationalRowsQueryRequest,
+    output: SelectOutputRef,
+) !db_mod.types.RelationalRowsExpression {
+    var expression = switch (output.kind) {
+        .field => blk: {
+            if (output.index >= source_query.select.len) return error.UnsupportedSqlShape;
+            const source_column = binder.relationalColumnForField(source_schema, source_query.select[output.index], null) orelse return error.InvalidSqlCatalog;
+            break :blk db_mod.types.RelationalRowsExpression{
+                .kind = .field,
+                .field = try alloc.dupe(u8, source_column.path),
+                .field_source = .source,
+            };
+        },
+        .json_extract => blk: {
+            if (output.index >= source_query.json_extract.len) return error.UnsupportedSqlShape;
+            break :blk try lower_expr.expressionFromJsonExtractProjectionAlloc(alloc, source_query.json_extract[output.index]);
+        },
+        .array_length => blk: {
+            if (output.index >= source_query.array_length.len) return error.UnsupportedSqlShape;
+            break :blk try lower_expr.expressionFromArrayLengthProjectionAlloc(alloc, source_query.array_length[output.index]);
+        },
+        .coalesce => blk: {
+            if (output.index >= source_query.coalesce.len) return error.UnsupportedSqlShape;
+            break :blk try lower_expr.expressionFromCoalesceProjectionAlloc(alloc, source_query.coalesce[output.index]);
+        },
+        .field_alias => blk: {
+            if (output.index >= source_query.field_aliases.len) return error.UnsupportedSqlShape;
+            const source_column = binder.relationalColumnForField(source_schema, source_query.field_aliases[output.index].field, null) orelse return error.InvalidSqlCatalog;
+            break :blk db_mod.types.RelationalRowsExpression{
+                .kind = .field,
+                .field = try alloc.dupe(u8, source_column.path),
+                .field_source = .source,
+            };
+        },
+        .expression => blk: {
+            if (output.index >= source_query.expressions.len) return error.UnsupportedSqlShape;
+            break :blk try cloneExpressionAlloc(alloc, source_query.expressions[output.index].expression);
+        },
+    };
+    errdefer freeExpression(alloc, expression);
+    plan_mod.rewriteExpressionFieldsToSource(&expression);
+    return expression;
+}
+
+pub fn clearInsertSourceQueryProjection(alloc: std.mem.Allocator, query: *db_mod.types.RelationalRowsQueryRequest) void {
+    strings.freeStringSlice(alloc, query.select);
+    freeJsonExtract(alloc, query.json_extract);
+    freeArrayLengthProjections(alloc, query.array_length);
+    freeCoalesceProjections(alloc, query.coalesce);
+    freeFieldAliasProjections(alloc, query.field_aliases);
+    freeExpressionProjections(alloc, query.expressions);
+    query.select = &.{};
+    query.json_extract = &.{};
+    query.array_length = &.{};
+    query.coalesce = &.{};
+    query.field_aliases = &.{};
+    query.expressions = &.{};
+    query.select_all = true;
+}
+
+pub fn insertSourceOnConflictFromClauseAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    clause: ConflictClause,
+) !db_mod.types.RelationalRowsOnConflict {
+    const target = try insertSourceConflictTargetFromClauseAlloc(alloc, schema, clause.target);
+    var target_transferred = false;
+    errdefer if (!target_transferred) freeRowsConflictTargetValue(alloc, target);
+
+    if (clause.action == .nothing) {
+        target_transferred = true;
+        return .{
+            .target = target,
+            .action = .nothing,
+        };
+    }
+
+    const operations = try insertSourceConflictOperationsFromClauseAlloc(alloc, schema, clause);
+    var operations_transferred = false;
+    errdefer if (!operations_transferred) freeTransformOps(alloc, operations);
+
+    const patch_expressions = try insertSourceConflictExpressionAssignmentsFromClauseAlloc(alloc, schema, clause.patch_expr);
+    var patch_transferred = false;
+    errdefer if (!patch_transferred) freeExpressionAssignments(alloc, patch_expressions);
+
+    const increment_expressions = try insertSourceConflictExpressionAssignmentsFromClauseAlloc(alloc, schema, clause.increment_expr);
+    var increment_transferred = false;
+    errdefer if (!increment_transferred) freeExpressionAssignments(alloc, increment_expressions);
+
+    const json_set_expressions = try insertSourceConflictJsonSetExpressionAssignmentsFromClauseAlloc(alloc, schema, clause.json_set);
+    var json_set_transferred = false;
+    errdefer if (!json_set_transferred) freeRowsJsonSetExpressionAssignments(alloc, json_set_expressions);
+
+    const where_expression: ?db_mod.types.RelationalRowsExpressionCondition = if (clause.where_expression) |condition|
+        try cloneExpressionConditionAlloc(alloc, condition)
+    else
+        null;
+    var where_transferred = false;
+    errdefer if (!where_transferred) if (where_expression) |condition| freeExpressionCondition(alloc, condition);
+
+    const where_expressions = try cloneExpressionConditionsAlloc(alloc, clause.where_expressions);
+    var where_expressions_transferred = false;
+    errdefer if (!where_expressions_transferred) {
+        freeExpressionConditions(alloc, where_expressions);
+        if (where_expressions.len > 0) alloc.free(where_expressions);
+    };
+
+    const where_any = try cloneExpressionPredicateGroupsAlloc(alloc, clause.where_any);
+    var where_any_transferred = false;
+    errdefer if (!where_any_transferred) {
+        freeExpressionPredicateGroups(alloc, where_any);
+        if (where_any.len > 0) alloc.free(where_any);
+    };
+
+    const where_not = try cloneExpressionPredicateGroupsAlloc(alloc, clause.where_not);
+    var where_not_transferred = false;
+    errdefer if (!where_not_transferred) {
+        freeExpressionPredicateGroups(alloc, where_not);
+        if (where_not.len > 0) alloc.free(where_not);
+    };
+
+    target_transferred = true;
+    operations_transferred = true;
+    patch_transferred = true;
+    increment_transferred = true;
+    json_set_transferred = true;
+    where_transferred = true;
+    where_expressions_transferred = true;
+    where_any_transferred = true;
+    where_not_transferred = true;
+    return .{
+        .target = target,
+        .action = .update,
+        .operations = operations,
+        .patch_expressions = patch_expressions,
+        .increment_expressions = increment_expressions,
+        .json_set_expressions = json_set_expressions,
+        .where_expression = where_expression,
+        .where_expressions = where_expressions,
+        .where_any = where_any,
+        .where_not = where_not,
+    };
+}
+
+pub fn insertSourceConflictTargetFromClauseAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    target: ConflictTarget,
+) !db_mod.types.RelationalRowsConflictTarget {
+    return switch (target) {
+        .primary => .{ .kind = .primary },
+        .unique => |unique| blk: {
+            const constraint = binder.findUniqueConstraintByName(schema, unique.name) orelse return error.InvalidSqlCatalog;
+            if (unique.where_json.len > 0 and constraint.where.len == 0) return error.UnsupportedSqlShape;
+            if (unique.where_expressions.len > 0 and !lower_expr.relationalRowsExpressionConditionsEqual(constraint.where_expressions, unique.where_expressions)) return error.UnsupportedSqlShape;
+
+            const name = try alloc.dupe(u8, unique.name);
+            var name_transferred = false;
+            errdefer if (!name_transferred) alloc.free(name);
+
+            const predicates = try insertSourceUniquePredicatesFromConstraintAlloc(alloc, constraint.where);
+            var predicates_transferred = false;
+            errdefer if (!predicates_transferred) {
+                freeRelationalChecks(alloc, predicates);
+                if (predicates.len > 0) alloc.free(predicates);
+            };
+
+            const predicate_expressions = try cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
+            var predicate_expressions_transferred = false;
+            errdefer if (!predicate_expressions_transferred) {
+                freeExpressionConditions(alloc, predicate_expressions);
+                if (predicate_expressions.len > 0) alloc.free(predicate_expressions);
+            };
+
+            name_transferred = true;
+            predicates_transferred = true;
+            predicate_expressions_transferred = true;
+            break :blk .{
+                .kind = .unique,
+                .unique_name = name,
+                .unique_predicates = predicates,
+                .unique_predicate_expressions = predicate_expressions,
+            };
+        },
+    };
+}
+
+pub fn insertSourceUniquePredicatesFromConstraintAlloc(
+    alloc: std.mem.Allocator,
+    predicates: []const runtime_schema.UniquePredicate,
+) ![]const runtime_schema.RelationalCheck {
+    if (predicates.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalCheck, predicates.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeRelationalChecks(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (predicates) |predicate| {
+        out[initialized] = .{
+            .name = "",
+            .field = try alloc.dupe(u8, predicate.field),
+            .op = lower_expr.uniquePredicateAsRelationalCheckOp(predicate.op),
+            .value_json = if (predicate.value_json) |value| try alloc.dupe(u8, value) else null,
+            .validation_state = .enforced,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn insertSourceConflictOperationsFromClauseAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    clause: ConflictClause,
+) ![]const db_mod.types.TransformOp {
+    const count = clause.patch.len + clause.increment.len + clause.array_update.len + insertSourceStaticJsonSetCount(clause.json_set);
+    if (count == 0) return &.{};
+    const operations = try alloc.alloc(db_mod.types.TransformOp, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (operations[0..initialized]) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        alloc.free(operations);
+    }
+
+    for (clause.patch) |item| {
+        const column = binder.relationalColumnForField(schema, item.field, null) orelse return error.InvalidSqlCatalog;
+        operations[initialized] = .{
+            .op = .set,
+            .path = try alloc.dupe(u8, column.path),
+            .value_json = try alloc.dupe(u8, item.value_json),
+        };
+        initialized += 1;
+    }
+    for (clause.increment) |item| {
+        const column = binder.relationalColumnForField(schema, item.field, null) orelse return error.InvalidSqlCatalog;
+        operations[initialized] = .{
+            .op = .inc,
+            .path = try alloc.dupe(u8, column.path),
+            .value_json = try alloc.dupe(u8, item.value_json),
+        };
+        initialized += 1;
+    }
+    for (clause.json_set) |item| {
+        const value_json = item.value_json orelse continue;
+        const column = binder.relationalColumnForField(schema, item.field, null) orelse return error.InvalidSqlCatalog;
+        operations[initialized] = .{
+            .op = .set,
+            .path = try jsonSetTypedTransformPathAlloc(alloc, column.path, item.path),
+            .value_json = try alloc.dupe(u8, value_json),
+        };
+        initialized += 1;
+    }
+    for (clause.array_update) |item| {
+        const column = binder.relationalColumnForField(schema, item.field, null) orelse return error.InvalidSqlCatalog;
+        operations[initialized] = .{
+            .op = item.op,
+            .path = try alloc.dupe(u8, column.path),
+            .value_json = try alloc.dupe(u8, item.value_json),
+        };
+        initialized += 1;
+    }
+    return operations;
+}
+
+pub fn insertSourceConflictExpressionAssignmentsFromClauseAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    values: []const FieldExpressionValue,
+) ![]const db_mod.types.RelationalRowsExpressionAssignment {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsExpressionAssignment, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| {
+            alloc.free(@constCast(value.field));
+            freeExpression(alloc, value.expression);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        const column = binder.relationalColumnForField(schema, value.field, null) orelse return error.InvalidSqlCatalog;
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, column.path),
+            .expression = try cloneExpressionAlloc(alloc, value.expression),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn insertSourceConflictJsonSetExpressionAssignmentsFromClauseAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    values: []const JsonSetValue,
+) ![]const db_mod.types.RelationalRowsJsonSetExpressionAssignment {
+    const count = insertSourceExpressionJsonSetCount(values);
+    if (count == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsJsonSetExpressionAssignment, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| {
+            alloc.free(@constCast(value.field));
+            for (value.path) |segment| alloc.free(@constCast(segment));
+            if (value.path.len > 0) alloc.free(value.path);
+            freeExpression(alloc, value.expression);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        const expression = value.expression orelse continue;
+        const column = binder.relationalColumnForField(schema, value.field, null) orelse return error.InvalidSqlCatalog;
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, column.path),
+            .path = try strings.cloneStringSlice(alloc, value.path),
+            .expression = try cloneExpressionAlloc(alloc, expression),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn appendJoinedMutationInPredicate(
+    alloc: std.mem.Allocator,
+    in_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate),
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    values_json: []const u8,
+    negated: bool,
+) !void {
+    if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
+    try sql_value.validateSqlScalarValuesJson(alloc, column, values_json);
+    const owned_field = try alloc.dupe(u8, field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(owned_field);
+    try in_predicates.append(alloc, .{
+        .field = owned_field,
+        .values_json = values_json,
+        .negated = negated,
+    });
+    field_transferred = true;
+}
+
+pub fn appendJsonObjectConcatSetValuesAlloc(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    object_json: []const u8,
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, object_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedSqlShape;
+    if (parsed.value.object.count() == 0) return error.UnsupportedSqlShape;
+
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.indexOfScalar(u8, entry.key_ptr.*, '.') != null) return error.UnsupportedSqlShape;
+        const owned_field = try alloc.dupe(u8, field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(owned_field);
+        const path = try alloc.alloc([]const u8, 1);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        path[0] = try alloc.dupe(u8, entry.key_ptr.*);
+        var path_item_transferred = false;
+        errdefer if (!path_item_transferred) alloc.free(path[0]);
+        const value_json = try std.json.Stringify.valueAlloc(alloc, entry.value_ptr.*, .{});
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        try json_set.append(alloc, .{
+            .field = owned_field,
+            .path = path,
+            .value_json = value_json,
+        });
+        field_transferred = true;
+        path_transferred = true;
+        path_item_transferred = true;
+        value_transferred = true;
+    }
+}
+
+pub const ConflictAction = enum {
+    nothing,
+    update,
+};
+
+pub const ConflictTarget = union(enum) {
+    primary,
+    unique: UniqueConflictTarget,
+};
+
+pub const UniqueConflictTarget = struct {
+    name: []const u8,
+    where_json: []const u8 = "",
+    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+};
+
+pub const ConflictClause = struct {
+    target: ConflictTarget,
+    action: ConflictAction,
+    patch: []const FieldJsonValue = &.{},
+    patch_expr: []const FieldExpressionValue = &.{},
+    increment: []const FieldJsonValue = &.{},
+    increment_expr: []const FieldExpressionValue = &.{},
+    json_set: []const JsonSetValue = &.{},
+    array_update: []const ArrayTransformValue = &.{},
+    where_expression: ?db_mod.types.RelationalRowsExpressionCondition = null,
+    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    where_any: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    where_not: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+};
+
+pub const MergeParsedAssignment = union(enum) {
+    mapping: MergeFieldMapping,
+    expression: MergeExpressionAssignment,
+};
+
+pub const ParsedExistsSemiJoinMutationTail = struct {
+    source_table: TableAlias,
+    tail: ParsedJoinedMutationTail,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeTableAlias(alloc, self.source_table);
+        self.tail.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const SemiJoinSource = struct {
+    table: TableAlias,
+    fields: []const []const u8,
+};
+
+pub const ParsedSemiJoinSourceQuery = struct {
+    query: db_mod.types.RelationalRowsQueryRequest = .{},
+    on: []const db_mod.types.RelationalRowsJoinOn = &.{},
+    match_expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.query.deinit(alloc);
+        freeJoinOn(alloc, self.on);
+        if (self.on.len > 0) alloc.free(self.on);
+        freeExpressionConditions(alloc, self.match_expression_predicates);
+        if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
+        freeExpressionPredicateGroups(alloc, self.match_expression_or_predicates);
+        if (self.match_expression_or_predicates.len > 0) alloc.free(self.match_expression_or_predicates);
+        freeExpressionPredicateGroups(alloc, self.match_expression_not_predicates);
+        if (self.match_expression_not_predicates.len > 0) alloc.free(self.match_expression_not_predicates);
+        freeExpressionArrayContains(alloc, self.match_expression_array_contains);
+        if (self.match_expression_array_contains.len > 0) alloc.free(self.match_expression_array_contains);
+        self.* = undefined;
+    }
+};
+
+pub const ParsedJoinedMutationTail = struct {
+    join: db_mod.types.RelationalRowsJoinRequest,
+    match_expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate = &.{},
+    returning: ReturningProjection = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.join.deinit(alloc);
+        freeExpressionConditions(alloc, self.match_expression_predicates);
+        if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
+        freeExpressionPredicateGroups(alloc, self.match_expression_or_predicates);
+        if (self.match_expression_or_predicates.len > 0) alloc.free(self.match_expression_or_predicates);
+        freeExpressionPredicateGroups(alloc, self.match_expression_not_predicates);
+        if (self.match_expression_not_predicates.len > 0) alloc.free(self.match_expression_not_predicates);
+        freeExpressionArrayContains(alloc, self.match_expression_array_contains);
+        if (self.match_expression_array_contains.len > 0) alloc.free(self.match_expression_array_contains);
+        self.returning.deinit(alloc);
+    }
+};
+
+pub fn resolveJoinedMutationSourceForCtesAlloc(
+    alloc: std.mem.Allocator,
+    tail: *ParsedJoinedMutationTail,
+    source_table_name: []const u8,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: ?*?[]const u8,
+) ![]const u8 {
+    const base_ptr = base_table_name orelse return source_table_name;
+    if (plan_mod.findCteByName(ctes, source_table_name) != null) {
+        if (tail.join.right.source_cte.len != 0) return error.UnsupportedSqlShape;
+        tail.join.right.source_cte = try alloc.dupe(u8, source_table_name);
+        return base_ptr.* orelse return error.UnsupportedSqlShape;
+    }
+    if (base_ptr.*) |base| {
+        if (!std.mem.eql(u8, base, source_table_name)) return error.UnsupportedSqlShape;
+    } else {
+        base_ptr.* = try alloc.dupe(u8, source_table_name);
+    }
+    return source_table_name;
+}
+
+pub const ParsedMutationSourceQuery = struct {
+    query: db_mod.types.RelationalRowsQueryRequest,
+    returning: ReturningProjection = .{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.query.deinit(alloc);
+        self.returning.deinit(alloc);
+    }
+};
+
+pub const ParsedTemporalPortion = struct {
+    period: []const u8,
+    from_json: []const u8,
+    to_json: []const u8,
+
+    pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.period);
+        alloc.free(self.from_json);
+        alloc.free(self.to_json);
+    }
+};
+
+pub const JoinedMutationExpressionSide = union(enum) {
+    single: db_mod.types.RelationalRowsJoinProjectionSide,
+    mixed,
+};
+
+pub fn joinedMutationExpressionSideAt(
+    tokens: []const Token,
+    pos: usize,
+    target_alias: []const u8,
+    source_alias: []const u8,
+    string_to_array_predicate_is_containment: bool,
+) !?JoinedMutationExpressionSide {
+    if (!joinedMutationExpressionCanStartAt(tokens, pos, string_to_array_predicate_is_containment)) return null;
+
+    var side: ?db_mod.types.RelationalRowsJoinProjectionSide = null;
+    var mixed = false;
+    var depth: usize = 0;
+    var i = pos;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) break,
+            .identifier => {
+                if (depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "and") or
+                    std.ascii.eqlIgnoreCase(token.text, "or") or
+                    lower_expr.sqlWhereTailClauseKeyword(token.text)))
+                {
+                    break;
+                }
+                if (lower_expr.identifierContainsQualifier(token.text)) {
+                    const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse unreachable;
+                    const next_side = try binder.joinSideForQualifier(token.text[0..dot], target_alias, source_alias);
+                    if (side) |existing| {
+                        if (existing != next_side) mixed = true;
+                    } else {
+                        side = next_side;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    if (mixed) return .mixed;
+    if (side) |single| return .{ .single = single };
+    return null;
+}
+
+pub fn joinedMutationExpressionCanStartAt(
+    tokens: []const Token,
+    pos: usize,
+    string_to_array_predicate_is_containment: bool,
+) bool {
+    if (pos >= tokens.len) return false;
+    if (tokens[pos].kind == .identifier and pos + 1 < tokens.len and lower_expr.identifierContainsQualifier(tokens[pos].text)) {
+        return switch (tokens[pos + 1].kind) {
+            .plus, .minus, .star, .slash, .percent, .arrow_json, .arrow_text, .path_arrow_json, .path_arrow_text, .pipe_concat, .question_any, .question_all => true,
+            else => false,
+        };
+    }
+    if (lower_expr.expressionPredicateCanStartAt(tokens, pos)) return true;
+    if (lower_expr.canParseExpressionNotWhere(tokens, pos)) return true;
+    if (parser.peekKeyword(tokens, pos, "string_to_array") and string_to_array_predicate_is_containment) return true;
+    if (tokens[pos].kind == .lparen) {
+        const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos);
+        return lower_expr.expressionPredicateCanStartAt(tokens, inner);
+    }
+    return false;
+}
 
 pub fn sqlCanonicalMutationFieldPath(
     schema: runtime_schema.TableSchema,
@@ -35,6 +779,154 @@ pub fn sqlCanonicalMutationFieldPath(
 ) ![]const u8 {
     const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
     return column.path;
+}
+
+pub fn validateSqlUpdateTargetPaths(
+    schema: runtime_schema.TableSchema,
+    patch: []const FieldJsonValue,
+    patch_expr: []const FieldExpressionValue,
+    increment: []const FieldJsonValue,
+    increment_expr: []const FieldExpressionValue,
+    json_set: []const JsonSetValue,
+    array_update: []const ArrayTransformValue,
+) !void {
+    for (patch, 0..) |lhs, i| {
+        try validateSqlFieldDoesNotConflictFieldJson(schema, lhs.field, patch[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, patch_expr);
+        try validateSqlFieldDoesNotConflictFieldJson(schema, lhs.field, increment);
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, increment_expr);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+        try validateSqlFieldDoesNotConflictArrayUpdates(schema, lhs.field, array_update);
+    }
+    for (patch_expr, 0..) |lhs, i| {
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, patch_expr[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictFieldJson(schema, lhs.field, increment);
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, increment_expr);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+        try validateSqlFieldDoesNotConflictArrayUpdates(schema, lhs.field, array_update);
+    }
+    for (increment, 0..) |lhs, i| {
+        try validateSqlFieldDoesNotConflictFieldJson(schema, lhs.field, increment[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, increment_expr);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+        try validateSqlFieldDoesNotConflictArrayUpdates(schema, lhs.field, array_update);
+    }
+    for (increment_expr, 0..) |lhs, i| {
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, increment_expr[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+        try validateSqlFieldDoesNotConflictArrayUpdates(schema, lhs.field, array_update);
+    }
+    for (json_set, 0..) |lhs, i| {
+        for (json_set[i + 1 ..]) |rhs| {
+            if (sqlJsonSetValuesConflict(schema, lhs, rhs)) return error.InvalidRowsRequest;
+        }
+        try validateSqlJsonSetDoesNotConflictArrayUpdates(schema, lhs, array_update);
+    }
+}
+
+pub fn validateSqlJoinedMutationTargetPaths(
+    schema: runtime_schema.TableSchema,
+    source_assignments: []const JoinedMutationSourceAssignment,
+    patch: []const FieldJsonValue,
+    patch_expr: []const FieldExpressionValue,
+    json_set: []const JsonSetValue,
+) !void {
+    for (source_assignments, 0..) |lhs, i| {
+        try validateSqlJoinedAssignmentDoesNotConflictAssignments(schema, lhs.field, source_assignments[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictFieldJson(schema, lhs.field, patch);
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, patch_expr);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+    }
+    for (patch, 0..) |lhs, i| {
+        try validateSqlFieldDoesNotConflictFieldJson(schema, lhs.field, patch[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, patch_expr);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+    }
+    for (patch_expr, 0..) |lhs, i| {
+        try validateSqlFieldDoesNotConflictFieldExpressions(schema, lhs.field, patch_expr[i + 1 ..]);
+        try validateSqlFieldDoesNotConflictJsonSet(schema, lhs.field, json_set);
+    }
+    for (json_set, 0..) |lhs, i| {
+        for (json_set[i + 1 ..]) |rhs| {
+            if (sqlJsonSetValuesConflict(schema, lhs, rhs)) return error.InvalidRowsRequest;
+        }
+    }
+}
+
+fn validateSqlFieldDoesNotConflictFieldJson(
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    values: []const FieldJsonValue,
+) !void {
+    const lhs = try sqlCanonicalMutationFieldPath(schema, field);
+    for (values) |value| {
+        if (sqlDottedPathsConflict(lhs, try sqlCanonicalMutationFieldPath(schema, value.field))) return error.InvalidRowsRequest;
+    }
+}
+
+fn validateSqlFieldDoesNotConflictFieldExpressions(
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    values: []const FieldExpressionValue,
+) !void {
+    const lhs = try sqlCanonicalMutationFieldPath(schema, field);
+    for (values) |value| {
+        if (sqlDottedPathsConflict(lhs, try sqlCanonicalMutationFieldPath(schema, value.field))) return error.InvalidRowsRequest;
+    }
+}
+
+fn validateSqlFieldDoesNotConflictJsonSet(
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    values: []const JsonSetValue,
+) !void {
+    const lhs = try sqlCanonicalMutationFieldPath(schema, field);
+    for (values) |value| {
+        if (sqlDottedPathConflictsJsonSetValue(schema, lhs, value)) return error.InvalidRowsRequest;
+    }
+}
+
+fn validateSqlFieldDoesNotConflictArrayUpdates(
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    values: []const ArrayTransformValue,
+) !void {
+    const lhs = try sqlCanonicalMutationFieldPath(schema, field);
+    for (values) |value| {
+        if (sqlDottedPathsConflict(lhs, try sqlCanonicalMutationFieldPath(schema, value.field))) return error.InvalidRowsRequest;
+    }
+}
+
+fn validateSqlJsonSetDoesNotConflictArrayUpdates(
+    schema: runtime_schema.TableSchema,
+    value: JsonSetValue,
+    values: []const ArrayTransformValue,
+) !void {
+    for (values) |array_update| {
+        if (sqlDottedPathConflictsJsonSetValue(schema, try sqlCanonicalMutationFieldPath(schema, array_update.field), value)) return error.InvalidRowsRequest;
+    }
+}
+
+fn validateSqlJoinedAssignmentDoesNotConflictAssignments(
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    values: []const JoinedMutationSourceAssignment,
+) !void {
+    const lhs = try sqlCanonicalMutationFieldPath(schema, field);
+    for (values) |value| {
+        if (sqlDottedPathsConflict(lhs, try sqlCanonicalMutationFieldPath(schema, value.field))) return error.InvalidRowsRequest;
+    }
+}
+
+fn sqlJsonSetValuesConflict(schema: runtime_schema.TableSchema, lhs: JsonSetValue, rhs: JsonSetValue) bool {
+    const lhs_field = sqlCanonicalMutationFieldPath(schema, lhs.field) catch return true;
+    const rhs_field = sqlCanonicalMutationFieldPath(schema, rhs.field) catch return true;
+    return sqlJsonSetPathsConflict(lhs_field, lhs.path, rhs_field, rhs.path);
+}
+
+fn sqlDottedPathConflictsJsonSetValue(schema: runtime_schema.TableSchema, path: []const u8, value: JsonSetValue) bool {
+    const json_field = sqlCanonicalMutationFieldPath(schema, value.field) catch return true;
+    return sqlDottedPathConflictsJsonSetPath(path, json_field, value.path);
 }
 
 pub fn validateSqlInsertColumnsUnique(
@@ -106,6 +998,1190 @@ pub fn validateMergeAssignmentsUnique(
             if (std.mem.eql(u8, expression.target_field, other.target_field)) return error.UnsupportedSqlShape;
         }
     }
+}
+
+pub fn validateJoinedMutationSourceAssignments(
+    assignments: []const JoinedMutationSourceAssignment,
+    source_alias: []const u8,
+) !void {
+    for (assignments) |assignment| {
+        if (!std.mem.eql(u8, assignment.source_qualifier, source_alias)) return error.UnsupportedSqlShape;
+    }
+}
+
+pub fn arrayTransformOpToken(op: db_mod.types.TransformOpType) []const u8 {
+    return switch (op) {
+        .push => "append",
+        .pull => "remove",
+        .add_to_set => "add_to_set",
+        else => unreachable,
+    };
+}
+
+pub fn updateBodyJsonAlloc(
+    alloc: std.mem.Allocator,
+    where_json: []const u8,
+    patch: []const FieldJsonValue,
+    patch_expr: []const FieldExpressionValue,
+    increment: []const FieldJsonValue,
+    increment_expr: []const FieldExpressionValue,
+    json_set: []const JsonSetValue,
+    array_update: []const ArrayTransformValue,
+    returning: ReturningProjection,
+    expected_version: ?u64,
+    rewrite_identity: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"operations\":[{{\"op\":{f},\"where\":", .{std.json.fmt(if (rewrite_identity) "rewrite_identity" else "update", .{})});
+    try writer.writeAll(where_json);
+    if (expected_version) |version| try writer.print(",\"expected_version\":{d}", .{version});
+    try writeMutationAssignmentsJson(writer, patch, patch_expr, increment, increment_expr, json_set, array_update);
+    try writeReturningProjectionJson(writer, returning);
+    try writer.writeAll("}]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn deleteBodyJsonAlloc(
+    alloc: std.mem.Allocator,
+    where_json: []const u8,
+    returning: ReturningProjection,
+    expected_version: ?u64,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"operations\":[{\"op\":\"delete\",\"where\":");
+    try writer.writeAll(where_json);
+    if (expected_version) |version| try writer.print(",\"expected_version\":{d}", .{version});
+    try writeReturningProjectionJson(writer, returning);
+    try writer.writeAll("}]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn insertBodyJsonAlloc(
+    alloc: std.mem.Allocator,
+    columns: []const []const u8,
+    rows: InsertValueRows,
+    conflicts: []const ConflictClause,
+    returning: ReturningProjection,
+) ![]u8 {
+    if (rows.len == 0) return error.UnsupportedSqlShape;
+    if (conflicts.len != 0 and conflicts.len != rows.len) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"operations\":[");
+    for (rows, 0..) |values, row_i| {
+        if (values.len != columns.len) return error.UnsupportedSqlShape;
+        if (row_i != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"op\":\"insert\",\"row\":{");
+        for (columns, values, 0..) |column, value_json, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(column, .{})});
+            try writer.writeAll(value_json);
+        }
+        try writer.writeByte('}');
+        if (conflicts.len != 0) {
+            const clause = conflicts[row_i];
+            try writer.writeAll(",\"on_conflict\":{\"target\":");
+            try writeConflictTargetJson(writer, clause.target);
+            try writer.print(",\"action\":{f}", .{std.json.fmt(conflictActionToken(clause.action), .{})});
+            try writeMutationAssignmentsJson(writer, clause.patch, clause.patch_expr, clause.increment, clause.increment_expr, clause.json_set, clause.array_update);
+            if (clause.where_expression) |condition| {
+                try writer.writeAll(",\"where_expression\":");
+                try lower_expr.writeRowExpressionConditionJson(writer, condition);
+            }
+            if (clause.where_expressions.len > 0) {
+                try writer.writeAll(",\"where_expressions\":[");
+                for (clause.where_expressions, 0..) |condition, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try lower_expr.writeRowExpressionConditionJson(writer, condition);
+                }
+                try writer.writeByte(']');
+            }
+            if (clause.where_any.len > 0) {
+                try writer.writeByte(',');
+                try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "where_any", clause.where_any);
+            }
+            if (clause.where_not.len > 0) {
+                try writer.writeByte(',');
+                try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "where_not", clause.where_not);
+            }
+            try writer.writeByte('}');
+        }
+        try writeReturningProjectionJson(writer, returning);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
+}
+
+pub fn writeConflictTargetJson(writer: *std.Io.Writer, target: ConflictTarget) !void {
+    switch (target) {
+        .primary => try writer.writeAll("{\"primary\":true}"),
+        .unique => |unique| {
+            try writer.print("{{\"unique\":{{\"name\":{f}", .{std.json.fmt(unique.name, .{})});
+            if (unique.where_json.len > 0) {
+                try writer.writeAll(",\"where\":");
+                try writer.writeAll(unique.where_json);
+            }
+            if (unique.where_expressions.len > 0) {
+                try writer.writeAll(",\"where_expressions\":[");
+                for (unique.where_expressions, 0..) |condition, i| {
+                    if (i != 0) try writer.writeByte(',');
+                    try lower_expr.writeRowExpressionConditionJson(writer, condition);
+                }
+                try writer.writeByte(']');
+            }
+            try writer.writeAll("}}");
+        },
+    }
+}
+
+pub fn mutationSourceBodyJsonAlloc(
+    alloc: std.mem.Allocator,
+    op: []const u8,
+    source: db_mod.types.RelationalRowsQueryRequest,
+    rewrite_identity: bool,
+    temporal_portion: ?ParsedTemporalPortion,
+    patch: []const FieldJsonValue,
+    patch_expr: []const FieldExpressionValue,
+    increment: []const FieldJsonValue,
+    increment_expr: []const FieldExpressionValue,
+    json_set: []const JsonSetValue,
+    array_update: []const ArrayTransformValue,
+    returning: ReturningProjection,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"op\":{f},\"source\":", .{std.json.fmt(op, .{})});
+    try writeMutationSourceQueryJson(writer, source);
+    if (rewrite_identity) try writer.writeAll(",\"rewrite_identity\":true");
+    if (temporal_portion) |portion| {
+        try writer.print(",\"temporal_portion\":{{\"period\":{f},\"from\":", .{std.json.fmt(portion.period, .{})});
+        try writer.writeAll(portion.from_json);
+        try writer.writeAll(",\"to\":");
+        try writer.writeAll(portion.to_json);
+        try writer.writeByte('}');
+    }
+    try writeMutationAssignmentsJson(writer, patch, patch_expr, increment, increment_expr, json_set, array_update);
+    try writeReturningProjectionJson(writer, returning);
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+pub fn joinedMutationSourceBodyJsonAlloc(
+    alloc: std.mem.Allocator,
+    op: []const u8,
+    source_table: []const u8,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    tail: ParsedJoinedMutationTail,
+    rewrite_identity: bool,
+    source_assignments: []const JoinedMutationSourceAssignment,
+    patch: []const FieldJsonValue,
+    patch_expr: []const FieldExpressionValue,
+    json_set: []const JsonSetValue,
+) ![]u8 {
+    const join = tail.join;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"op\":{f},\"source_table\":{f},\"target_side\":\"left\"", .{
+        std.json.fmt(op, .{}),
+        std.json.fmt(source_table, .{}),
+    });
+    if (ctes.len > 0) {
+        try writer.writeAll(",\"ctes\":[");
+        for (ctes, 0..) |cte, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"name\":{f},\"query\":", .{std.json.fmt(cte.name, .{})});
+            try writeMutationSourceQueryJson(writer, cte.query);
+            if (cte.max_rows) |max_rows| try writer.print(",\"max_rows\":{d}", .{max_rows});
+            if (cte.max_bytes) |max_bytes| try writer.print(",\"max_bytes\":{d}", .{max_bytes});
+            if (cte.spill_after_bytes) |spill_after_bytes| try writer.print(",\"spill_after_bytes\":{d}", .{spill_after_bytes});
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeAll(",\"join\":{\"left\":");
+    try writeMutationSourceQueryJson(writer, join.left);
+    try writer.writeAll(",\"right\":");
+    try writeMutationSourceQueryJson(writer, join.right);
+    try writer.writeAll(",\"on\":[");
+    for (join.on, 0..) |predicate, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{{\"left_field\":{f},\"right_field\":{f}}}", .{
+            std.json.fmt(predicate.left_field, .{}),
+            std.json.fmt(predicate.right_field, .{}),
+        });
+    }
+    try writer.writeByte(']');
+    if (join.order_by.len > 0) {
+        try writer.writeAll(",\"order_by\":[");
+        for (join.order_by, 0..) |order, i| {
+            if (i != 0) try writer.writeByte(',');
+            if (order.expression != null) return error.UnsupportedSqlShape;
+            try writer.print("{{\"field\":{f}", .{std.json.fmt(order.field, .{})});
+            if (order.direction == .desc) try writer.writeAll(",\"direction\":\"desc\"");
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    if (join.limit) |limit| try writer.print(",\"limit\":{d}", .{limit});
+    if (join.offset != 0) try writer.print(",\"offset\":{d}", .{join.offset});
+    try writer.writeByte('}');
+    if (tail.match_expression_predicates.len > 0) {
+        try writer.writeAll(",\"match_expression_where\":[");
+        for (tail.match_expression_predicates, 0..) |condition, i| {
+            if (i != 0) try writer.writeByte(',');
+            try lower_expr.writeRowExpressionConditionJson(writer, condition);
+        }
+        try writer.writeByte(']');
+    }
+    if (tail.match_expression_or_predicates.len > 0) {
+        try writer.writeByte(',');
+        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "match_expression_any", tail.match_expression_or_predicates);
+    }
+    if (tail.match_expression_not_predicates.len > 0) {
+        try writer.writeByte(',');
+        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "match_expression_not", tail.match_expression_not_predicates);
+    }
+    if (tail.match_expression_array_contains.len > 0) {
+        try writer.writeAll(",\"match_expression_array_contains\":[");
+        for (tail.match_expression_array_contains, 0..) |predicate, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"expr\":");
+            try lower_expr.writeRowExpressionJson(writer, predicate.expression);
+            try writer.writeAll(",\"value\":");
+            try writer.writeAll(predicate.value_json);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+    if (rewrite_identity) try writer.writeAll(",\"rewrite_identity\":true");
+    if (source_assignments.len > 0) {
+        try writer.writeAll(",\"source_assignments\":[");
+        for (source_assignments, 0..) |assignment, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"target_field\":{f},\"side\":{f},\"field\":{f}}}", .{
+                std.json.fmt(assignment.field, .{}),
+                std.json.fmt("right", .{}),
+                std.json.fmt(assignment.source_field, .{}),
+            });
+        }
+        try writer.writeByte(']');
+    }
+    try writeMutationAssignmentsJson(writer, patch, patch_expr, &.{}, &.{}, json_set, &.{});
+    try writeReturningProjectionJson(writer, tail.returning);
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+fn writeMutationAssignmentsJson(
+    writer: *std.Io.Writer,
+    patch: []const FieldJsonValue,
+    patch_expr: []const FieldExpressionValue,
+    increment: []const FieldJsonValue,
+    increment_expr: []const FieldExpressionValue,
+    json_set: []const JsonSetValue,
+    array_update: []const ArrayTransformValue,
+) !void {
+    if (patch.len > 0) {
+        try writer.writeAll(",\"patch\":{");
+        for (patch, 0..) |item, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+            try writer.writeAll(item.value_json);
+        }
+        try writer.writeByte('}');
+    }
+    if (patch_expr.len > 0) {
+        try writer.writeAll(",\"patch_expr\":{");
+        for (patch_expr, 0..) |item, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+            try lower_expr.writeRowExpressionJson(writer, item.expression);
+        }
+        try writer.writeByte('}');
+    }
+    if (increment.len > 0) {
+        try writer.writeAll(",\"increment\":{");
+        for (increment, 0..) |item, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+            try writer.writeAll(item.value_json);
+        }
+        try writer.writeByte('}');
+    }
+    if (increment_expr.len > 0) {
+        try writer.writeAll(",\"increment_expr\":{");
+        for (increment_expr, 0..) |item, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
+            try lower_expr.writeRowExpressionJson(writer, item.expression);
+        }
+        try writer.writeByte('}');
+    }
+    if (json_set.len > 0) {
+        try writeJsonSetValuesJson(writer, json_set);
+    }
+    if (array_update.len > 0) {
+        try writer.writeAll(",\"array_update\":[");
+        for (array_update, 0..) |item, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"field\":{f},\"op\":{f},\"value\":", .{
+                std.json.fmt(item.field, .{}),
+                std.json.fmt(arrayTransformOpToken(item.op), .{}),
+            });
+            try writer.writeAll(item.value_json);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+    }
+}
+
+pub fn writeJsonSetValuesJson(writer: *std.Io.Writer, json_set: []const JsonSetValue) !void {
+    try writer.writeAll(",\"json_set\":[");
+    for (json_set, 0..) |item, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{{\"field\":{f},\"path\":[", .{std.json.fmt(item.field, .{})});
+        for (item.path, 0..) |segment, segment_i| {
+            if (segment_i != 0) try writer.writeByte(',');
+            try writer.print("{f}", .{std.json.fmt(segment, .{})});
+        }
+        try writer.writeByte(']');
+        if (item.expression) |expression| {
+            try writer.writeAll(",\"expr\":");
+            try lower_expr.writeRowExpressionJson(writer, expression);
+        } else if (item.value_json) |value_json| {
+            try writer.writeAll(",\"value\":");
+            try writer.writeAll(value_json);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+pub fn writeMutationSourceQueryJson(
+    writer: *std.Io.Writer,
+    source: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    try writer.writeByte('{');
+    var wrote = false;
+    if (source.source_cte.len > 0) {
+        try writer.print("\"source_cte\":{f}", .{std.json.fmt(source.source_cte, .{})});
+        wrote = true;
+    }
+    if (!source.select_all) {
+        if (source.select.len == 0) return error.UnsupportedSqlShape;
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"select\":[");
+        for (source.select, 0..) |field, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}", .{std.json.fmt(field, .{})});
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (source.predicates.len > 0 or
+        source.array_contains.len > 0 or
+        source.array_eq.len > 0 or
+        source.array_any.len > 0 or
+        source.in_predicates.len > 0 or
+        source.json_contains.len > 0 or
+        source.json_path_eq.len > 0 or
+        source.json_path_exists.len > 0 or
+        source.text_patterns.len > 0 or
+        source.or_predicates.len > 0 or
+        source.not_predicates.len > 0)
+    {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"where\":{");
+        var wrote_where = false;
+        if (source.predicates.len > 0 or source.array_contains.len > 0 or source.array_eq.len > 0 or source.array_any.len > 0 or source.in_predicates.len > 0 or source.json_contains.len > 0 or source.json_path_eq.len > 0 or source.json_path_exists.len > 0 or source.text_patterns.len > 0) {
+            try writer.writeAll("\"all\":[");
+            var wrote_atom = false;
+            try lower_expr.writeRelationalCheckAtomsJson(writer, &wrote_atom, source.predicates);
+            try lower_expr.writeInPredicateAtomsJson(writer, &wrote_atom, source.in_predicates);
+            try lower_expr.writeTextPatternPredicateAtomsJson(writer, &wrote_atom, source.text_patterns);
+            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_any", source.array_any);
+            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_contains", source.array_contains);
+            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_eq", source.array_eq);
+            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "json_contains", source.json_contains);
+            try lower_expr.writeJsonPathEqPredicateAtomsJson(writer, &wrote_atom, source.json_path_eq);
+            try lower_expr.writeJsonPathExistsPredicateAtomsJson(writer, &wrote_atom, source.json_path_exists);
+            try writer.writeByte(']');
+            wrote_where = true;
+        }
+        if (source.or_predicates.len > 0) {
+            if (wrote_where) try writer.writeByte(',');
+            try writer.writeAll("\"any\":[");
+            for (source.or_predicates, 0..) |group, group_i| {
+                if (group_i != 0) try writer.writeByte(',');
+                if (group.predicates.len == 1) {
+                    try lower_expr.writeRelationalCheckAtomJson(writer, group.predicates[0]);
+                } else {
+                    try writer.writeAll("{\"all\":[");
+                    var wrote_atom = false;
+                    try lower_expr.writeRelationalCheckAtomsJson(writer, &wrote_atom, group.predicates);
+                    try writer.writeAll("]}");
+                }
+            }
+            try writer.writeByte(']');
+            wrote_where = true;
+        }
+        if (source.not_predicates.len > 0) {
+            if (wrote_where) try writer.writeByte(',');
+            try writer.writeAll("\"not\":[");
+            for (source.not_predicates, 0..) |group, group_i| {
+                if (group_i != 0) try writer.writeByte(',');
+                if (group.predicates.len == 1) {
+                    try lower_expr.writeRelationalCheckAtomJson(writer, group.predicates[0]);
+                } else {
+                    try writer.writeAll("{\"all\":[");
+                    var wrote_atom = false;
+                    try lower_expr.writeRelationalCheckAtomsJson(writer, &wrote_atom, group.predicates);
+                    try writer.writeAll("]}");
+                }
+            }
+            try writer.writeByte(']');
+        }
+        try writer.writeByte('}');
+        wrote = true;
+    }
+    if (source.expression_predicates.len > 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"expression_where\":[");
+        for (source.expression_predicates, 0..) |condition, i| {
+            if (i != 0) try writer.writeByte(',');
+            try lower_expr.writeRowExpressionConditionJson(writer, condition);
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (source.expression_or_predicates.len > 0) {
+        if (wrote) try writer.writeByte(',');
+        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "expression_any", source.expression_or_predicates);
+        wrote = true;
+    }
+    if (source.expression_not_predicates.len > 0) {
+        if (wrote) try writer.writeByte(',');
+        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "expression_not", source.expression_not_predicates);
+        wrote = true;
+    }
+    if (source.expression_array_contains.len > 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"expression_array_contains\":[");
+        for (source.expression_array_contains, 0..) |predicate, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.writeAll("{\"expr\":");
+            try lower_expr.writeRowExpressionJson(writer, predicate.expression);
+            try writer.writeAll(",\"value\":");
+            try writer.writeAll(predicate.value_json);
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (source.order_by.len > 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("\"order_by\":[");
+        for (source.order_by, 0..) |order, i| {
+            if (i != 0) try writer.writeByte(',');
+            if (order.expression) |expression| {
+                try writer.writeAll("{\"expr\":");
+                try lower_expr.writeRowExpressionJson(writer, expression);
+            } else {
+                try writer.print("{{\"field\":{f}", .{std.json.fmt(order.field, .{})});
+            }
+            if (order.direction == .desc) try writer.writeAll(",\"direction\":\"desc\"");
+            try writer.writeByte('}');
+        }
+        try writer.writeByte(']');
+        wrote = true;
+    }
+    if (source.limit) |limit| {
+        if (wrote) try writer.writeByte(',');
+        try writer.print("\"limit\":{d}", .{limit});
+        wrote = true;
+    }
+    if (source.offset != 0) {
+        if (wrote) try writer.writeByte(',');
+        try writer.print("\"offset\":{d}", .{source.offset});
+        wrote = true;
+    }
+    if (source.row_claim) |claim| {
+        if (wrote) try writer.writeByte(',');
+        const txn_id = claim.txn_id orelse return error.UnsupportedRowsQuery;
+        const txn_hex = sql_value.encodeSqlTxnIdHex(txn_id);
+        try writer.print("\"row_claim\":{{\"mode\":\"{s}\",\"wait_policy\":\"{s}\",\"lease_ms\":{d},\"owner_id\":{f},\"transaction_id\":\"{s}\"}}", .{
+            lower_expr.sqlRowClaimModeName(claim.mode),
+            lower_expr.sqlRowClaimWaitPolicyName(claim.effectiveWaitPolicy()),
+            claim.lease_ms,
+            std.json.fmt(claim.owner_id, .{}),
+            txn_hex,
+        });
+    }
+    try writer.writeByte('}');
+}
+
+pub fn writeReturningProjectionJson(writer: *std.Io.Writer, returning: ReturningProjection) !void {
+    if (returning.fields.len > 0) try writeReturningJson(writer, returning.fields);
+    if (returning.expressions.len == 0) return;
+    try writer.writeAll(",\"returning_expressions\":[");
+    for (returning.expressions, 0..) |projection, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{{\"as\":{f},\"expr\":", .{std.json.fmt(projection.output, .{})});
+        try lower_expr.writeRowExpressionJson(writer, projection.expression);
+        try writer.writeByte('}');
+    }
+    try writer.writeByte(']');
+}
+
+fn writeReturningJson(writer: *std.Io.Writer, returning_fields: []const []const u8) !void {
+    if (returning_fields.len == 0) return;
+    try writer.writeAll(",\"returning\":[");
+    for (returning_fields, 0..) |field, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}", .{std.json.fmt(field, .{})});
+    }
+    try writer.writeByte(']');
+}
+
+pub fn conflictActionName(action: db_mod.types.RelationalRowsConflictAction) []const u8 {
+    return switch (action) {
+        .update => "update",
+        .nothing => "nothing",
+    };
+}
+
+pub fn conflictActionToken(action: ConflictAction) []const u8 {
+    return switch (action) {
+        .nothing => "nothing",
+        .update => "update",
+    };
+}
+
+pub fn conflictProposedColumnAvailable(
+    insert_columns: []const []const u8,
+    source_column: runtime_schema.RelationalColumn,
+    source: []const u8,
+) bool {
+    for (insert_columns) |insert_column| {
+        if (std.mem.eql(u8, insert_column, source)) return true;
+    }
+    return source_column.default_value != null or source_column.generated != null;
+}
+
+pub fn conflictExistingFieldName(
+    alloc: std.mem.Allocator,
+    existing_qualifiers: []const []const u8,
+    text: []const u8,
+) ?[]const u8 {
+    var dot: ?usize = std.mem.indexOfScalar(u8, text, '.');
+    while (dot) |index| {
+        if (index > 0 and index + 1 < text.len) {
+            const qualifier = text[0..index];
+            const field = text[index + 1 ..];
+            if (conflictQualifierMatches(alloc, existing_qualifiers, qualifier)) return field;
+        }
+        dot = std.mem.indexOfScalarPos(u8, text, index + 1, '.');
+    }
+    return null;
+}
+
+pub fn conflictQualifierMatches(
+    alloc: std.mem.Allocator,
+    existing_qualifiers: []const []const u8,
+    qualifier: []const u8,
+) bool {
+    for (existing_qualifiers) |expected| {
+        if (std.mem.eql(u8, qualifier, expected)) return true;
+    }
+    const normalized = grammar.normalizeSqlObjectIdentifierAlloc(alloc, qualifier) catch return false;
+    defer alloc.free(normalized);
+    for (existing_qualifiers) |expected| {
+        if (std.mem.eql(u8, normalized, expected)) return true;
+    }
+    return false;
+}
+
+pub fn canParseJoinedBooleanAssignmentExpression(
+    tokens: []const Token,
+    pos: usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    pending_joined_source_alias: ?[]const u8,
+    target_alias: []const u8,
+) bool {
+    if (!joinedBooleanExpressionCanStartAt(tokens, pos, schema, joined_source_schema, pending_joined_source_alias, target_alias)) return false;
+    return scanBooleanAssignmentTail(tokens, pos, true);
+}
+
+pub fn canParseJoinedAssignmentExpression(
+    tokens: []const Token,
+    pos: usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_alias: []const u8,
+) bool {
+    if (pos >= tokens.len) return false;
+    if (tokens[pos].kind == .minus) {
+        if (pos + 1 >= tokens.len) return false;
+        return tokens[pos + 1].kind != .number;
+    }
+    if (lower_expr.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
+    if (assignmentExpressionKeywordCanStartAt(tokens, pos, false)) return true;
+    if (tokens[pos].kind == .lparen) return true;
+    if (tokens[pos].kind != .identifier or
+        keywordAt(tokens, pos, "default") or
+        keywordAt(tokens, pos, "null") or
+        keywordAt(tokens, pos, "true") or
+        keywordAt(tokens, pos, "false"))
+    {
+        return false;
+    }
+    const token = tokens[pos];
+    const next_is_expression_operator = pos + 1 < tokens.len and switch (tokens[pos + 1].kind) {
+        .plus, .minus, .star, .slash, .percent, .arrow_json, .arrow_text, .path_arrow_json, .path_arrow_text, .pipe_concat => true,
+        else => false,
+    };
+    if (!next_is_expression_operator) return false;
+    if (lower_expr.identifierContainsQualifier(token.text)) {
+        const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
+        const qualifier = token.text[0..dot];
+        const field = token.text[dot + 1 ..];
+        if (std.mem.eql(u8, qualifier, target_alias)) return binder.relationalColumnForField(schema, field, null) != null;
+        return binder.relationalColumnForField(joined_source_schema orelse schema, field, null) != null;
+    }
+    return binder.relationalColumnForField(schema, token.text, null) != null;
+}
+
+pub fn canParseConflictBooleanAssignmentExpression(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+) bool {
+    if (!conflictBooleanExpressionCanStartAt(alloc, tokens, pos, schema, conflict_existing_qualifiers, insert_columns)) return false;
+    return scanBooleanAssignmentTail(tokens, pos, true);
+}
+
+pub fn canParseConflictAssignmentExpression(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+) bool {
+    if (pos >= tokens.len) return false;
+    if (tokens[pos].kind == .minus) {
+        if (pos + 1 >= tokens.len) return false;
+        return tokens[pos + 1].kind != .number;
+    }
+    if (lower_expr.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
+    if (assignmentExpressionKeywordCanStartAt(tokens, pos, true)) return true;
+    if (tokens[pos].kind == .lparen) return true;
+    if (tokens[pos].kind != .identifier or
+        keywordAt(tokens, pos, "default") or
+        keywordAt(tokens, pos, "null") or
+        keywordAt(tokens, pos, "true") or
+        keywordAt(tokens, pos, "false"))
+    {
+        return false;
+    }
+    const token = tokens[pos];
+    if (std.mem.startsWith(u8, token.text, "excluded.")) {
+        const source = token.text["excluded.".len..];
+        const source_column = binder.relationalColumnForField(schema, source, null) orelse return false;
+        return conflictProposedColumnAvailable(insert_columns, source_column, source);
+    }
+    if (conflictExistingFieldName(alloc, conflict_existing_qualifiers, token.text)) |field| {
+        return binder.relationalColumnForField(schema, field, null) != null;
+    }
+    return binder.relationalColumnForField(schema, token.text, null) != null;
+}
+
+pub fn canParseBareBooleanConflictExpression(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+) bool {
+    if (!conflictBooleanExpressionCanStartAt(alloc, tokens, pos, schema, conflict_existing_qualifiers, insert_columns)) return false;
+    const scan = scanBareBooleanExpressionTail(tokens, pos);
+    if (!scan.saw_token) return false;
+    return scan.saw_boolean_syntax or singleConflictBooleanExpressionCanStartAt(alloc, tokens, pos, schema, conflict_existing_qualifiers, insert_columns);
+}
+
+pub fn joinedBooleanExpressionCanStartAt(
+    tokens: []const Token,
+    index: usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    pending_joined_source_alias: ?[]const u8,
+    target_alias: []const u8,
+) bool {
+    if (index >= tokens.len) return false;
+    if (tokens[index].kind == .lparen) {
+        const inner = parser.predicateStartIndexAfterOpenParens(tokens, index);
+        return joinedBooleanExpressionCanStartAt(tokens, inner, schema, joined_source_schema, pending_joined_source_alias, target_alias);
+    }
+    return singleJoinedBooleanExpressionCanStartAt(tokens, index, schema, joined_source_schema, pending_joined_source_alias, target_alias);
+}
+
+fn singleJoinedBooleanExpressionCanStartAt(
+    tokens: []const Token,
+    index: usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    pending_joined_source_alias: ?[]const u8,
+    target_alias: []const u8,
+) bool {
+    if (index >= tokens.len) return false;
+    const token = tokens[index];
+    if (token.kind != .identifier) return false;
+    if (booleanKeywordCanStart(token.text)) return true;
+    if (lower_expr.identifierContainsQualifier(token.text)) {
+        const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
+        const qualifier = token.text[0..dot];
+        const field = token.text[dot + 1 ..];
+        if (std.mem.eql(u8, qualifier, target_alias)) {
+            return binder.relationalColumnForField(schema, field, .boolean) != null;
+        }
+        const source_alias = pending_joined_source_alias orelse return false;
+        if (std.mem.eql(u8, qualifier, source_alias)) {
+            return binder.relationalColumnForField(joined_source_schema orelse schema, field, .boolean) != null;
+        }
+        return false;
+    }
+    return binder.relationalColumnForField(schema, token.text, .boolean) != null;
+}
+
+pub fn conflictBooleanExpressionCanStartAt(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    index: usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+) bool {
+    if (index >= tokens.len) return false;
+    if (tokens[index].kind == .lparen) {
+        const inner = parser.predicateStartIndexAfterOpenParens(tokens, index);
+        return conflictBooleanExpressionCanStartAt(alloc, tokens, inner, schema, conflict_existing_qualifiers, insert_columns);
+    }
+    return singleConflictBooleanExpressionCanStartAt(alloc, tokens, index, schema, conflict_existing_qualifiers, insert_columns);
+}
+
+fn singleConflictBooleanExpressionCanStartAt(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    index: usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+) bool {
+    if (index >= tokens.len) return false;
+    const token = tokens[index];
+    if (token.kind != .identifier) return false;
+    if (booleanKeywordCanStart(token.text)) return true;
+    if (std.mem.startsWith(u8, token.text, "excluded.")) {
+        const field = token.text["excluded.".len..];
+        const source_column = binder.relationalColumnForField(schema, field, .boolean) orelse return false;
+        return conflictProposedColumnAvailable(insert_columns, source_column, field);
+    }
+    const field = conflictExistingFieldName(alloc, conflict_existing_qualifiers, token.text) orelse token.text;
+    return binder.relationalColumnForField(schema, field, .boolean) != null;
+}
+
+fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, include_md5: bool) bool {
+    return keywordAt(tokens, pos, "case") or
+        keywordAt(tokens, pos, "cast") or
+        keywordAt(tokens, pos, "coalesce") or
+        keywordAt(tokens, pos, "lower") or
+        keywordAt(tokens, pos, "upper") or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsInitcapFunction) or
+        keywordAt(tokens, pos, "trim") or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTrimVariantFunction) or
+        keywordAt(tokens, pos, "replace") or
+        keywordAt(tokens, pos, "regexp_replace") or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpSubstrFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpMatchFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpCountFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpInstrFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTranslateFunction) or
+        keywordAt(tokens, pos, "concat") or
+        keywordAt(tokens, pos, "concat_ws") or
+        keywordAt(tokens, pos, "nullif") or
+        lower_expr.peekTextLengthFunctionKeyword(tokens, pos) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsAsciiFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsChrFunction) or
+        lower_expr.peekSubstringFunctionKeyword(tokens, pos) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsOverlayFunction) or
+        lower_expr.peekSplitPartFunctionKeyword(tokens, pos) or
+        lower_expr.peekStrposFunctionKeyword(tokens, pos) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsLeftRightFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsPadFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRepeatFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsReverseFunction) or
+        (include_md5 and lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsMd5Function)) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsStartsWithFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsEndsWithFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateTruncFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateBinFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDatePartFunction) or
+        keywordAt(tokens, pos, "position") or
+        keywordAt(tokens, pos, "abs") or
+        keywordAt(tokens, pos, "round") or
+        lower_expr.peekFunctionCall(tokens, pos, "trunc") or
+        lower_expr.peekFunctionCall(tokens, pos, "floor") or
+        lower_expr.peekFunctionCall(tokens, pos, "ceil") or
+        lower_expr.peekFunctionCall(tokens, pos, "sqrt") or
+        lower_expr.peekFunctionCall(tokens, pos, "sign") or
+        lower_expr.peekFunctionCall(tokens, pos, "mod") or
+        lower_expr.peekFunctionCall(tokens, pos, "power") or
+        keywordAt(tokens, pos, "greatest") or
+        keywordAt(tokens, pos, "least") or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonExtractPathFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonTypeofFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonArrayLengthFunction) or
+        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonBuildObjectFunction) or
+        lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayLengthFunction) or
+        lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayPositionFunction) or
+        keywordAt(tokens, pos, "array_append") or
+        keywordAt(tokens, pos, "array_prepend") or
+        keywordAt(tokens, pos, "array_cat") or
+        keywordAt(tokens, pos, "array_remove") or
+        keywordAt(tokens, pos, "array_replace") or
+        keywordAt(tokens, pos, "array_to_string") or
+        keywordAt(tokens, pos, "string_to_array") or
+        keywordAt(tokens, pos, "now") or
+        keywordAt(tokens, pos, "current_timestamp") or
+        keywordAt(tokens, pos, "current_date") or
+        lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos) or
+        keywordAt(tokens, pos, "interval");
+}
+
+fn scanBooleanAssignmentTail(tokens: []const Token, pos: usize, assignment_tail: bool) bool {
+    var depth: usize = 0;
+    var i = pos;
+    var saw_boolean_operator = false;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .semicolon, .comma => if (depth == 0) break,
+            .rparen => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            .lparen => depth += 1,
+            .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return false,
+            .identifier => {
+                if (depth == 0 and assignment_tail and lower_expr.sqlAssignmentTailKeyword(token.text)) break;
+                if (lower_expr.sqlKeywordStartsScalarPredicate(token.text)) return false;
+                if (std.ascii.eqlIgnoreCase(token.text, "and") or
+                    std.ascii.eqlIgnoreCase(token.text, "or") or
+                    std.ascii.eqlIgnoreCase(token.text, "not"))
+                {
+                    saw_boolean_operator = true;
+                }
+            },
+            else => {},
+        }
+    }
+    return saw_boolean_operator;
+}
+
+const BareBooleanScan = struct {
+    saw_boolean_syntax: bool,
+    saw_token: bool,
+};
+
+fn scanBareBooleanExpressionTail(tokens: []const Token, pos: usize) BareBooleanScan {
+    var depth: usize = 0;
+    var i = pos;
+    var saw_boolean_syntax = false;
+    var saw_token = false;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .semicolon, .comma => if (depth == 0) break,
+            .rparen => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            .lparen => {
+                depth += 1;
+                saw_token = true;
+            },
+            .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return .{
+                .saw_boolean_syntax = false,
+                .saw_token = false,
+            },
+            .identifier => {
+                if (depth == 0 and lower_expr.sqlWhereTailClauseKeyword(token.text)) break;
+                if (lower_expr.sqlKeywordStartsScalarPredicate(token.text)) return .{
+                    .saw_boolean_syntax = false,
+                    .saw_token = false,
+                };
+                if (std.ascii.eqlIgnoreCase(token.text, "and") or
+                    std.ascii.eqlIgnoreCase(token.text, "or") or
+                    std.ascii.eqlIgnoreCase(token.text, "not"))
+                {
+                    saw_boolean_syntax = true;
+                }
+                saw_token = true;
+            },
+            else => saw_token = true,
+        }
+    }
+    return .{ .saw_boolean_syntax = saw_boolean_syntax, .saw_token = saw_token };
+}
+
+fn booleanKeywordCanStart(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "not") or
+        std.ascii.eqlIgnoreCase(text, "true") or
+        std.ascii.eqlIgnoreCase(text, "false") or
+        std.ascii.eqlIgnoreCase(text, "case") or
+        std.ascii.eqlIgnoreCase(text, "cast") or
+        std.ascii.eqlIgnoreCase(text, "coalesce") or
+        std.ascii.eqlIgnoreCase(text, "nullif") or
+        lower_expr.sqlKeywordIsStartsWithFunction(text);
+}
+
+fn keywordAt(tokens: []const Token, pos: usize, keyword: []const u8) bool {
+    return pos < tokens.len and tokens[pos].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[pos].text, keyword);
+}
+
+pub fn conflictParenthesizedConjunctionCanStart(tokens: []const Token, pos: usize) bool {
+    return conflictParenthesizedKeywordCanStart(tokens, pos, "and");
+}
+
+pub fn conflictParenthesizedDisjunctionCanStart(tokens: []const Token, pos: usize) bool {
+    return conflictParenthesizedKeywordCanStart(tokens, pos, "or");
+}
+
+fn conflictParenthesizedKeywordCanStart(tokens: []const Token, pos: usize, keyword: []const u8) bool {
+    if (pos >= tokens.len or tokens[pos].kind != .lparen) return false;
+
+    var depth: usize = 0;
+    var i = pos;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return false;
+                depth -= 1;
+                if (depth == 0) return false;
+            },
+            .identifier => if (depth == 1 and std.ascii.eqlIgnoreCase(token.text, keyword)) return true,
+            .semicolon => if (depth == 0) return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+pub fn expressionAssignmentComputedCount(assignments: []const db_mod.types.RelationalRowsExpressionAssignment) usize {
+    var count: usize = 0;
+    for (assignments) |assignment| {
+        if (assignment.expression.kind != .field) count += 1;
+    }
+    return count;
+}
+
+pub fn transformOperationCount(transforms: []const db_mod.types.DocumentTransform) usize {
+    var count: usize = 0;
+    for (transforms) |transform| count += transform.operations.len;
+    return count;
+}
+
+pub fn normalizedIncrementJsonAlloc(alloc: std.mem.Allocator, value_json: []const u8, negated: bool) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (!negated) {
+        switch (parsed.value) {
+            .integer, .float, .number_string => return try alloc.dupe(u8, value_json),
+            else => return error.UnsupportedSqlShape,
+        }
+    }
+    return switch (parsed.value) {
+        .integer => |value| if (value == std.math.minInt(i64))
+            error.UnsupportedSqlShape
+        else
+            try std.fmt.allocPrint(alloc, "{d}", .{-value}),
+        .float => |value| try std.fmt.allocPrint(alloc, "{d}", .{-value}),
+        .number_string => |text| blk: {
+            const value = std.fmt.parseFloat(f64, text) catch return error.UnsupportedSqlShape;
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{-value});
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+pub fn insertSourceStaticJsonSetCount(values: []const JsonSetValue) usize {
+    var count: usize = 0;
+    for (values) |value| {
+        if (value.value_json != null) count += 1;
+    }
+    return count;
+}
+
+pub fn insertSourceExpressionJsonSetCount(values: []const JsonSetValue) usize {
+    var count: usize = 0;
+    for (values) |value| {
+        if (value.expression != null) count += 1;
+    }
+    return count;
+}
+
+pub fn jsonSetHasExpression(values: []const JsonSetValue) bool {
+    for (values) |value| {
+        if (value.expression != null) return true;
+    }
+    return false;
+}
+
+pub fn freeFieldJsonValues(alloc: std.mem.Allocator, values: []const FieldJsonValue) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeFieldExpressionValues(alloc: std.mem.Allocator, values: []const FieldExpressionValue) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        freeExpression(alloc, value.expression);
+    }
+}
+
+pub fn freeTransformOps(alloc: std.mem.Allocator, values: []const db_mod.types.TransformOp) void {
+    for (values) |value| {
+        alloc.free(@constCast(value.path));
+        if (value.value_json) |json| alloc.free(@constCast(json));
+    }
+    if (values.len > 0) alloc.free(@constCast(values));
+}
+
+pub fn freeRowsOnConflictValue(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsOnConflict) void {
+    freeRowsConflictTargetValue(alloc, value.target);
+    freeTransformOps(alloc, value.operations);
+    freeExpressionAssignments(alloc, value.patch_expressions);
+    freeExpressionAssignments(alloc, value.increment_expressions);
+    freeRowsJsonSetExpressionAssignments(alloc, value.json_set_expressions);
+    if (value.where_expression) |condition| freeExpressionCondition(alloc, condition);
+    freeExpressionConditions(alloc, value.where_expressions);
+    if (value.where_expressions.len > 0) alloc.free(value.where_expressions);
+    freeExpressionPredicateGroups(alloc, value.where_any);
+    if (value.where_any.len > 0) alloc.free(value.where_any);
+    freeExpressionPredicateGroups(alloc, value.where_not);
+    if (value.where_not.len > 0) alloc.free(value.where_not);
+}
+
+pub fn freeRowsConflictTargetValue(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsConflictTarget) void {
+    if (value.unique_name.len > 0) alloc.free(@constCast(value.unique_name));
+    plan_mod.freeRelationalChecks(alloc, value.unique_predicates);
+    if (value.unique_predicates.len > 0) alloc.free(value.unique_predicates);
+    freeExpressionConditions(alloc, value.unique_predicate_expressions);
+    if (value.unique_predicate_expressions.len > 0) alloc.free(value.unique_predicate_expressions);
+}
+
+pub fn freeInsertValueRows(alloc: std.mem.Allocator, rows: InsertValueRows) void {
+    for (rows) |row| {
+        for (row) |value| alloc.free(value);
+        alloc.free(row);
+    }
+}
+
+pub fn freeJoinedMutationSourceAssignments(
+    alloc: std.mem.Allocator,
+    values: []const JoinedMutationSourceAssignment,
+) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.source_qualifier);
+        alloc.free(value.source_field);
+    }
+}
+
+pub fn freeArrayTransformValues(alloc: std.mem.Allocator, values: []const ArrayTransformValue) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        alloc.free(value.value_json);
+    }
+}
+
+pub fn freeFieldPredicates(alloc: std.mem.Allocator, values: []const FieldPredicate) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        if (value.value_json) |json| alloc.free(json);
+    }
+}
+
+pub fn freeJsonSetValues(alloc: std.mem.Allocator, values: []const JsonSetValue) void {
+    for (values) |value| {
+        alloc.free(value.field);
+        strings.freeStringSlice(alloc, value.path);
+        if (value.value_json) |json| alloc.free(json);
+        if (value.expression) |expression| freeExpression(alloc, expression);
+    }
+}
+
+pub fn freeJsonSetParsedValue(alloc: std.mem.Allocator, value: JsonSetParsedValue) void {
+    if (value.value_json) |json| alloc.free(json);
+    if (value.expression) |expression| freeExpression(alloc, expression);
+}
+
+pub fn freeConflictTarget(alloc: std.mem.Allocator, target: ConflictTarget) void {
+    switch (target) {
+        .primary => {},
+        .unique => |unique| {
+            alloc.free(unique.name);
+            if (unique.where_json.len > 0) alloc.free(unique.where_json);
+            freeExpressionConditions(alloc, unique.where_expressions);
+            if (unique.where_expressions.len > 0) alloc.free(unique.where_expressions);
+        },
+    }
+}
+
+pub fn freeConflictClause(alloc: std.mem.Allocator, clause: ConflictClause) void {
+    freeConflictTarget(alloc, clause.target);
+    freeFieldJsonValues(alloc, clause.patch);
+    if (clause.patch.len > 0) alloc.free(clause.patch);
+    freeFieldExpressionValues(alloc, clause.patch_expr);
+    if (clause.patch_expr.len > 0) alloc.free(clause.patch_expr);
+    freeFieldJsonValues(alloc, clause.increment);
+    if (clause.increment.len > 0) alloc.free(clause.increment);
+    freeFieldExpressionValues(alloc, clause.increment_expr);
+    if (clause.increment_expr.len > 0) alloc.free(clause.increment_expr);
+    freeJsonSetValues(alloc, clause.json_set);
+    if (clause.json_set.len > 0) alloc.free(clause.json_set);
+    freeArrayTransformValues(alloc, clause.array_update);
+    if (clause.array_update.len > 0) alloc.free(clause.array_update);
+    if (clause.where_expression) |condition| freeExpressionCondition(alloc, condition);
+    freeExpressionConditions(alloc, clause.where_expressions);
+    if (clause.where_expressions.len > 0) alloc.free(clause.where_expressions);
+    freeExpressionPredicateGroups(alloc, clause.where_any);
+    if (clause.where_any.len > 0) alloc.free(clause.where_any);
+    freeExpressionPredicateGroups(alloc, clause.where_not);
+    if (clause.where_not.len > 0) alloc.free(clause.where_not);
+}
+
+pub fn freeConflictClauses(alloc: std.mem.Allocator, clauses: []const ConflictClause) void {
+    for (clauses) |clause| freeConflictClause(alloc, clause);
 }
 
 pub fn mergeSourceQueryIsDefault(req: db_mod.types.RelationalRowsQueryRequest) bool {
@@ -695,6 +2771,68 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectEqualStrings("metadata.profile.status", typed_path);
     try std.testing.expectError(error.UnsupportedSqlShape, jsonSetTypedTransformPathAlloc(alloc, "metadata", &.{""}));
     try std.testing.expectError(error.UnsupportedSqlShape, jsonSetTypedTransformPathAlloc(alloc, "metadata", &.{"bad.segment"}));
+    try std.testing.expectEqualStrings("append", arrayTransformOpToken(.push));
+    try std.testing.expectEqualStrings("remove", arrayTransformOpToken(.pull));
+    try std.testing.expectEqualStrings("add_to_set", arrayTransformOpToken(.add_to_set));
+    try std.testing.expectEqualStrings("update", conflictActionName(.update));
+    try std.testing.expectEqualStrings("nothing", conflictActionName(.nothing));
+    const conjunction_tokens = [_]Token{
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "active" },
+        .{ .kind = .identifier, .text = "and" },
+        .{ .kind = .identifier, .text = "verified" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    try std.testing.expect(conflictParenthesizedConjunctionCanStart(&conjunction_tokens, 0));
+    try std.testing.expect(!conflictParenthesizedDisjunctionCanStart(&conjunction_tokens, 0));
+    const existing_qualifiers = [_][]const u8{ "usage_records", "public.usage_records" };
+    try std.testing.expect(conflictQualifierMatches(alloc, &existing_qualifiers, "usage_records"));
+    try std.testing.expect(conflictQualifierMatches(alloc, &existing_qualifiers, "public.usage_records"));
+    try std.testing.expectEqualStrings("status", conflictExistingFieldName(alloc, &existing_qualifiers, "public.usage_records.status").?);
+    try std.testing.expect(conflictExistingFieldName(alloc, &existing_qualifiers, "other.status") == null);
+    const default_column: runtime_schema.RelationalColumn = .{
+        .name = "status",
+        .path = "status",
+        .field_type = .keyword,
+        .default_value = .{ .kind = .literal, .value_json = "\"pending\"" },
+    };
+    try std.testing.expect(conflictProposedColumnAvailable(&.{}, default_column, "status"));
+    const required_column: runtime_schema.RelationalColumn = .{
+        .name = "status",
+        .path = "status",
+        .field_type = .keyword,
+    };
+    try std.testing.expect(!conflictProposedColumnAvailable(&.{}, required_column, "status"));
+    try std.testing.expect(conflictProposedColumnAvailable(&.{"status"}, required_column, "status"));
+    const source_assignments = [_]JoinedMutationSourceAssignment{
+        .{ .field = "status", .source_qualifier = "src", .source_field = "status" },
+        .{ .field = "amount", .source_qualifier = "src", .source_field = "amount" },
+    };
+    try validateJoinedMutationSourceAssignments(&source_assignments, "src");
+    try std.testing.expectError(error.UnsupportedSqlShape, validateJoinedMutationSourceAssignments(&source_assignments, "other"));
+
+    const assignments = [_]db_mod.types.RelationalRowsExpressionAssignment{
+        .{ .field = "status", .expression = .{ .kind = .field, .field = "source_status" } },
+        .{ .field = "status_lower", .expression = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "source_status" }} } },
+    };
+    try std.testing.expectEqual(@as(usize, 1), expressionAssignmentComputedCount(&assignments));
+
+    const transforms = [_]db_mod.types.DocumentTransform{
+        .{ .key = "doc-1", .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"open\"" }} },
+        .{ .key = "doc-2", .operations = &.{
+            .{ .op = .inc, .path = "count", .value_json = "1" },
+            .{ .op = .push, .path = "events", .value_json = "\"opened\"" },
+        } },
+    };
+    try std.testing.expectEqual(@as(usize, 3), transformOperationCount(&transforms));
+
+    const positive = try normalizedIncrementJsonAlloc(alloc, "3.25", false);
+    defer alloc.free(positive);
+    try std.testing.expectEqualStrings("3.25", positive);
+    const negative = try normalizedIncrementJsonAlloc(alloc, "3.25", true);
+    defer alloc.free(negative);
+    try std.testing.expectEqualStrings("-3.25", negative);
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
 test "sql adapter lower dml detects merge target row usage" {
@@ -753,4 +2891,86 @@ test "sql adapter lower dml detects merge target row usage" {
         .op = .is_not_distinct,
         .value_json = "null",
     }));
+}
+
+test "sql adapter lower dml appends joined mutation in predicates" {
+    const alloc = std.testing.allocator;
+    const status_column: runtime_schema.RelationalColumn = .{ .name = "status", .path = "status", .field_type = .keyword };
+    const tags_column: runtime_schema.RelationalColumn = .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword };
+
+    var predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate).empty;
+    defer {
+        freeInPredicates(alloc, predicates.items);
+        predicates.deinit(alloc);
+    }
+    const values_json = try alloc.dupe(u8, "[\"open\",\"closed\"]");
+    var values_transferred = false;
+    errdefer if (!values_transferred) alloc.free(values_json);
+    try appendJoinedMutationInPredicate(alloc, &predicates, "status", status_column, values_json, true);
+    values_transferred = true;
+    try std.testing.expectEqual(@as(usize, 1), predicates.items.len);
+    try std.testing.expectEqualStrings("status", predicates.items[0].field);
+    try std.testing.expectEqualStrings("[\"open\",\"closed\"]", predicates.items[0].values_json);
+    try std.testing.expect(predicates.items[0].negated);
+
+    const invalid_values_json = try alloc.dupe(u8, "[\"open\"]");
+    defer alloc.free(invalid_values_json);
+    try std.testing.expectError(
+        error.InvalidSqlCatalog,
+        appendJoinedMutationInPredicate(alloc, &predicates, "tags", tags_column, invalid_values_json, false),
+    );
+
+    var json_set = std.ArrayListUnmanaged(JsonSetValue).empty;
+    defer {
+        freeJsonSetValues(alloc, json_set.items);
+        json_set.deinit(alloc);
+    }
+    try appendJsonObjectConcatSetValuesAlloc(alloc, "metadata", "{\"tier\":\"gold\",\"score\":7}", &json_set);
+    try std.testing.expectEqual(@as(usize, 2), json_set.items.len);
+    var saw_tier = false;
+    var saw_score = false;
+    for (json_set.items) |value| {
+        try std.testing.expectEqualStrings("metadata", value.field);
+        try std.testing.expectEqual(@as(usize, 1), value.path.len);
+        if (std.mem.eql(u8, value.path[0], "tier")) {
+            try std.testing.expectEqualStrings("\"gold\"", value.value_json.?);
+            saw_tier = true;
+        } else if (std.mem.eql(u8, value.path[0], "score")) {
+            try std.testing.expectEqualStrings("7", value.value_json.?);
+            saw_score = true;
+        }
+    }
+    try std.testing.expect(saw_tier);
+    try std.testing.expect(saw_score);
+    try std.testing.expectError(error.UnsupportedSqlShape, appendJsonObjectConcatSetValuesAlloc(alloc, "metadata", "{}", &json_set));
+    try std.testing.expectError(error.UnsupportedSqlShape, appendJsonObjectConcatSetValuesAlloc(alloc, "metadata", "{\"bad.key\":1}", &json_set));
+}
+
+test "sql adapter lower dml resolves joined mutation CTE source" {
+    const alloc = std.testing.allocator;
+    const ctes = [_]db_mod.types.RelationalRowsCte{.{ .name = "recent_usage" }};
+
+    var no_cte_tail = ParsedJoinedMutationTail{ .join = .{} };
+    defer no_cte_tail.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "usage_records",
+        try resolveJoinedMutationSourceForCtesAlloc(alloc, &no_cte_tail, "usage_records", &ctes, null),
+    );
+    try std.testing.expectEqualStrings("", no_cte_tail.join.right.source_cte);
+
+    var base_table_name: ?[]const u8 = try alloc.dupe(u8, "usage_records");
+    defer if (base_table_name) |table| alloc.free(table);
+
+    var cte_tail = ParsedJoinedMutationTail{ .join = .{} };
+    defer cte_tail.deinit(alloc);
+    const resolved = try resolveJoinedMutationSourceForCtesAlloc(alloc, &cte_tail, "recent_usage", &ctes, &base_table_name);
+    try std.testing.expectEqualStrings("usage_records", resolved);
+    try std.testing.expectEqualStrings("recent_usage", cte_tail.join.right.source_cte);
+
+    var mismatch_tail = ParsedJoinedMutationTail{ .join = .{} };
+    defer mismatch_tail.deinit(alloc);
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        resolveJoinedMutationSourceForCtesAlloc(alloc, &mismatch_tail, "other_records", &ctes, &base_table_name),
+    );
 }

@@ -14,11 +14,14 @@
 
 const std = @import("std");
 
+const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+pub const TokenKind = token_mod.TokenKind;
+const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
 
 pub const SqlValue = union(enum) {
     null,
@@ -47,10 +50,523 @@ pub const SqlValue = union(enum) {
     }
 };
 
+pub fn boundSqlValue(token: Token, params: []const SqlValue) !SqlValue {
+    if (token.text.len < 2 or token.text[0] != '$') return error.UnsupportedSqlShape;
+    var end: usize = 1;
+    while (end < token.text.len and std.ascii.isDigit(token.text[end])) end += 1;
+    if (end == 1) return error.UnsupportedSqlShape;
+    const index = try std.fmt.parseInt(usize, token.text[1..end], 10);
+    if (index == 0 or index > params.len) return error.MissingSqlParameter;
+    return params[index - 1];
+}
+
+pub fn boundSqlValueJsonAlloc(alloc: std.mem.Allocator, token: Token, params: []const SqlValue) ![]const u8 {
+    const value = try boundSqlValue(token, params);
+    return try value.jsonAlloc(alloc);
+}
+
+pub fn parseJsonScalarValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) !?[]const u8 {
+    if (parser.matchKeyword(tokens, pos, "null")) return try alloc.dupe(u8, "null");
+    if (parser.matchKeyword(tokens, pos, "true")) return try alloc.dupe(u8, "true");
+    if (parser.matchKeyword(tokens, pos, "false")) return try alloc.dupe(u8, "false");
+    if (parser.matchToken(tokens, pos, .string)) |token| return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
+    if (parser.matchToken(tokens, pos, .number)) |token| return try alloc.dupe(u8, token.text);
+    if (parser.matchToken(tokens, pos, .minus) != null) return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
+    if (parser.matchToken(tokens, pos, .placeholder)) |token| return try boundSqlValueJsonAlloc(alloc, token, params);
+    return null;
+}
+
+pub fn parseJsonDocumentValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) !?[]const u8 {
+    if (parser.matchToken(tokens, pos, .placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .json => |json| blk: {
+                try validateJsonDocument(alloc, json);
+                break :blk try alloc.dupe(u8, json);
+            },
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    if (parser.matchToken(tokens, pos, .string)) |token| {
+        try validateJsonDocument(alloc, token.text);
+        return try alloc.dupe(u8, token.text);
+    }
+    return null;
+}
+
+pub fn parseConvertFromInputAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) !?[]const u8 {
+    if (parser.matchToken(tokens, pos, .placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .string => |text| try alloc.dupe(u8, text),
+            .json => |json| try alloc.dupe(u8, json),
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    if (parser.matchToken(tokens, pos, .string)) |token| return try alloc.dupe(u8, token.text);
+    return null;
+}
+
+pub fn parseJsonbBuildObjectKey(
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.string)) |token| return token.text;
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .string => |key| key,
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn peekConvertFromFunctionCall(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "convert_from") and
+        pos + 1 < tokens.len and
+        tokens[pos + 1].kind == .lparen;
+}
+
+pub fn parseConvertFromFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "convert_from");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn peekToJsonbFunctionCall(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "to_jsonb") and
+        pos + 1 < tokens.len and
+        tokens[pos + 1].kind == .lparen;
+}
+
+pub fn parseToJsonbFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "to_jsonb");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn peekJsonbBuildObjectFunctionCall(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "jsonb_build_object") and
+        pos + 1 < tokens.len and
+        tokens[pos + 1].kind == .lparen;
+}
+
+pub fn parseJsonbBuildObjectFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "jsonb_build_object");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn singleValueJsonArrayAlloc(alloc: std.mem.Allocator, value: SqlValue) ![]const u8 {
+    const value_json = try value.jsonAlloc(alloc);
+    defer alloc.free(value_json);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    try writer.writeAll(value_json);
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+pub fn booleanJson(value: bool) []const u8 {
+    return if (value) "true" else "false";
+}
+
+pub fn parseSqlBooleanIsValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    not: bool,
+) !?[]const u8 {
+    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) return null;
+    if (not) return error.UnsupportedSqlShape;
+    if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+    if (parser.matchKeyword(tokens, pos, "true")) return try alloc.dupe(u8, "true");
+    try parser.expectKeyword(tokens, pos, "false");
+    return try alloc.dupe(u8, "false");
+}
+
+pub fn parseSqlBooleanIsValue(
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+) !?bool {
+    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) return null;
+    if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+    if (parser.matchKeyword(tokens, pos, "true")) return true;
+    try parser.expectKeyword(tokens, pos, "false");
+    return false;
+}
+
+pub fn parseSqlBooleanIsUnknown(
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+) !bool {
+    if (!parser.matchKeyword(tokens, pos, "unknown")) return false;
+    if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+    return true;
+}
+
+pub fn parseJsonPathOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.string)) |token| {
+        if (token.text.len == 0) return error.UnsupportedSqlShape;
+        return try alloc.dupe(u8, token.text);
+    }
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .string => |path| if (path.len == 0) error.UnsupportedSqlShape else try alloc.dupe(u8, path),
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseJsonExtractOperatorPathOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+    operator: TokenKind,
+) ![]const u8 {
+    if (!lower_expr.tokenKindIsJsonExtractPathOperator(operator)) {
+        return try parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
+    }
+
+    const segments = try parsePostgresJsonPathAlloc(alloc, tokens, pos, params);
+    defer {
+        for (segments) |segment| alloc.free(segment);
+        alloc.free(segments);
+    }
+    return try lower_expr.jsonPathSegmentsToDottedPathAlloc(alloc, segments);
+}
+
+pub fn parseJsonExtractPathSegmentsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var path = std.ArrayListUnmanaged(u8).empty;
+    errdefer path.deinit(alloc);
+
+    var segments: usize = 0;
+    while (true) {
+        if (segments == 0) {
+            try cursor.expectToken(.comma);
+        } else if (cursor.matchToken(.comma) == null) {
+            break;
+        }
+
+        const segment = try parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
+        defer alloc.free(segment);
+        if (segment.len == 0 or std.mem.indexOfScalar(u8, segment, '.') != null) return error.UnsupportedSqlShape;
+        if (segments > 0) try path.append(alloc, '.');
+        try path.appendSlice(alloc, segment);
+        segments += 1;
+    }
+
+    if (segments == 0) return error.UnsupportedSqlShape;
+    return try path.toOwnedSlice(alloc);
+}
+
+pub fn parsePostgresJsonPathAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.string)) |token| {
+        return try lower_expr.parsePostgresJsonPathTextAlloc(alloc, token.text);
+    }
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .string => |path| try lower_expr.parsePostgresJsonPathTextAlloc(alloc, path),
+            .json => |path_json| try lower_expr.parsePostgresJsonPathJsonArrayAlloc(alloc, path_json),
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseSqlU32Value(tokens: []const Token, pos: *usize, params: []const SqlValue) !u32 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.number)) |token| {
+        return try std.fmt.parseInt(u32, token.text, 10);
+    }
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return try value.asU32();
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseArrayLengthFunctionTail(tokens: []const Token, pos: *usize, params: []const SqlValue, keyword: []const u8) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!lower_expr.sqlKeywordIsCardinalityFunction(keyword)) {
+        try cursor.expectToken(.comma);
+        const dimension = try parseSqlU32Value(tokens, pos, params);
+        if (dimension != 1) return error.UnsupportedSqlShape;
+    }
+    try cursor.expectToken(.rparen);
+}
+
+pub fn parseSqlStringValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .string => |text| try alloc.dupe(u8, text),
+            else => error.UnsupportedSqlShape,
+        };
+    }
+    if (cursor.matchToken(.string)) |token| return try alloc.dupe(u8, token.text);
+    return error.UnsupportedSqlShape;
+}
+
+pub fn peekStandaloneSqlBooleanLiteral(tokens: []const Token, pos: usize) ?bool {
+    const token = if (pos < tokens.len) tokens[pos] else return null;
+    if (token.kind != .identifier) return null;
+    const enabled = if (std.ascii.eqlIgnoreCase(token.text, "true"))
+        true
+    else if (std.ascii.eqlIgnoreCase(token.text, "false"))
+        false
+    else
+        return null;
+    if (pos + 1 >= tokens.len) return enabled;
+    const next = tokens[pos + 1];
+    return switch (next.kind) {
+        .semicolon, .rparen => enabled,
+        .identifier => if (std.ascii.eqlIgnoreCase(next.text, "and") or
+            std.ascii.eqlIgnoreCase(next.text, "or") or
+            lower_expr.sqlWhereTailClauseKeyword(next.text))
+            enabled
+        else
+            null,
+        else => null,
+    };
+}
+
+pub fn matchStandaloneSqlBooleanLiteral(tokens: []const Token, pos: *usize) ?bool {
+    const enabled = peekStandaloneSqlBooleanLiteral(tokens, pos.*) orelse return null;
+    pos.* += 1;
+    return enabled;
+}
+
+pub fn parseNullableSqlU32Value(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("null")) return null;
+    if (cursor.matchToken(.number)) |token| {
+        return try std.fmt.parseInt(u32, token.text, 10);
+    }
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        return switch (value) {
+            .null => null,
+            else => try value.asU32(),
+        };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseLimitValue(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
+    if (parser.matchKeyword(tokens, pos, "all")) return null;
+    return try parseNullableSqlU32Value(tokens, pos, params);
+}
+
+pub fn parseOffsetValue(tokens: []const Token, pos: *usize, params: []const SqlValue) !u32 {
+    const offset = (try parseNullableSqlU32Value(tokens, pos, params)) orelse 0;
+    _ = parser.matchKeyword(tokens, pos, "row") or parser.matchKeyword(tokens, pos, "rows");
+    return offset;
+}
+
+pub fn parseFetchLimitValue(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
+    if (!(parser.matchKeyword(tokens, pos, "first") or parser.matchKeyword(tokens, pos, "next"))) return error.UnsupportedSqlShape;
+    const limit: ?u32 = if (parser.peekKeyword(tokens, pos.*, "row") or parser.peekKeyword(tokens, pos.*, "rows"))
+        1
+    else
+        try parseLimitValue(tokens, pos, params);
+    if (!(parser.matchKeyword(tokens, pos, "row") or parser.matchKeyword(tokens, pos, "rows"))) return error.UnsupportedSqlShape;
+    try parser.expectKeyword(tokens, pos, "only");
+    return limit;
+}
+
 pub fn sqlStringIsJsonNumber(alloc: std.mem.Allocator, text: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
     defer parsed.deinit();
     return parsed.value == .integer or parsed.value == .float;
+}
+
+pub fn canonicalizeDiscreteDateRangeFiniteBoundAlloc(alloc: std.mem.Allocator, bound_json: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, bound_json, "null")) return error.UnsupportedSqlShape;
+    const bound_ns = std.fmt.parseInt(u64, bound_json, 10) catch return error.UnsupportedSqlShape;
+    if (std.math.maxInt(u64) - bound_ns < ns_per_day) return error.UnsupportedSqlShape;
+    return try std.fmt.allocPrint(alloc, "{d}", .{bound_ns + ns_per_day});
+}
+
+pub fn parseSqlRangeEndpointJsonAlloc(
+    alloc: std.mem.Allocator,
+    endpoint: []const u8,
+    field_type: runtime_schema.AntflyType,
+) ![]const u8 {
+    if (endpoint.len == 0) return try alloc.dupe(u8, "null");
+    return switch (field_type) {
+        .numeric => blk: {
+            if (!sqlStringIsJsonNumber(alloc, endpoint)) return error.UnsupportedSqlShape;
+            break :blk try alloc.dupe(u8, endpoint);
+        },
+        .datetime => blk: {
+            if (sqlStringIsJsonNumber(alloc, endpoint)) return try alloc.dupe(u8, endpoint);
+            const timestamp_ns = try parseSqlTimestampLiteralNs(endpoint);
+            break :blk try std.fmt.allocPrint(alloc, "{d}", .{timestamp_ns});
+        },
+        else => error.InvalidSqlCatalog,
+    };
+}
+
+pub fn parseSqlTypedDatetimeLiteralValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    if (!parser.matchKeyword(tokens, pos, "date") and
+        !parser.matchKeyword(tokens, pos, "timestamp") and
+        !parser.matchKeyword(tokens, pos, "timestamptz")) return error.UnsupportedSqlShape;
+    const token = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
+    return try parseSqlRangeEndpointJsonAlloc(alloc, token.text, .datetime);
+}
+
+pub fn sqlCurrentUtcDateStartNs(now_ns: u64) u64 {
+    return now_ns - (now_ns % ns_per_day);
+}
+
+pub fn parseSqlNowValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    realtime_ns: u64,
+) ![]const u8 {
+    try parseSqlNowCall(tokens, pos);
+    return try std.fmt.allocPrint(alloc, "{d}", .{realtime_ns});
+}
+
+pub fn parseSqlCurrentDateValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    current_date_start_ns: u64,
+) ![]const u8 {
+    try parseSqlCurrentDateKeyword(tokens, pos);
+    return try std.fmt.allocPrint(alloc, "{d}", .{current_date_start_ns});
+}
+
+pub fn parseSqlNowCall(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("now")) {
+        try cursor.expectToken(.lparen);
+        try cursor.expectToken(.rparen);
+    } else if (cursor.matchKeyword("current_timestamp")) {
+        try parseOptionalCurrentTimestampPrecision(tokens, pos);
+    } else {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+pub fn parseSqlCurrentDateKeyword(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("current_date");
+}
+
+pub fn parseSqlUuidV4Call(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    _ = cursor.matchIdentifierIf(lower_expr.sqlKeywordIsUuidV4Function) orelse return error.UnsupportedSqlShape;
+    try cursor.expectToken(.lparen);
+    try cursor.expectToken(.rparen);
+}
+
+fn parseOptionalCurrentTimestampPrecision(tokens: []const Token, pos: *usize) !void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.lparen) == null) return;
+    const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
+    const precision = std.fmt.parseUnsigned(u8, token.text, 10) catch return error.UnsupportedSqlShape;
+    if (precision > 6) return error.UnsupportedSqlShape;
+    try cursor.expectToken(.rparen);
+}
+
+pub fn parseSqlCanonicalRangeLiteralValuePairAlloc(
+    alloc: std.mem.Allocator,
+    literal: []const u8,
+    field_type: runtime_schema.AntflyType,
+    range_type: ?runtime_schema.RelationalPeriodRangeType,
+) !lower_expr.PeriodRangeValuePair {
+    if (literal.len < 3) return error.UnsupportedSqlShape;
+    const upper_bound = literal[literal.len - 1];
+    const lower_bound = literal[0];
+    if (lower_bound != '[' and lower_bound != '(') return error.UnsupportedSqlShape;
+    if (upper_bound != ')' and upper_bound != ']') return error.UnsupportedSqlShape;
+    const body = literal[1 .. literal.len - 1];
+    const comma = std.mem.indexOfScalar(u8, body, ',') orelse return error.UnsupportedSqlShape;
+    if (std.mem.indexOfScalar(u8, body[comma + 1 ..], ',') != null) return error.UnsupportedSqlShape;
+    const start_text = std.mem.trim(u8, body[0..comma], " \t\r\n");
+    const end_text = std.mem.trim(u8, body[comma + 1 ..], " \t\r\n");
+    if (start_text.len != 0 and lower_bound == '(' and range_type != .daterange) return error.UnsupportedSqlShape;
+    if (upper_bound == ']' and (range_type != .daterange or end_text.len == 0)) return error.UnsupportedSqlShape;
+
+    var start_json = try parseSqlRangeEndpointJsonAlloc(alloc, start_text, field_type);
+    var start_transferred = false;
+    errdefer if (!start_transferred) alloc.free(start_json);
+    var end_json = try parseSqlRangeEndpointJsonAlloc(alloc, end_text, field_type);
+    var end_transferred = false;
+    errdefer if (!end_transferred) alloc.free(end_json);
+    if (lower_bound == '(' and start_text.len != 0) {
+        const canonical_start_json = try canonicalizeDiscreteDateRangeFiniteBoundAlloc(alloc, start_json);
+        alloc.free(start_json);
+        start_json = canonical_start_json;
+    }
+    if (upper_bound == ']') {
+        const canonical_end_json = try canonicalizeDiscreteDateRangeFiniteBoundAlloc(alloc, end_json);
+        alloc.free(end_json);
+        end_json = canonical_end_json;
+    }
+
+    start_transferred = true;
+    end_transferred = true;
+    return .{
+        .start_json = start_json,
+        .end_json = end_json,
+    };
 }
 
 pub fn sqlArrayItemValueMatches(item_type: runtime_schema.AntflyType, value: std.json.Value) bool {
@@ -75,6 +591,45 @@ pub fn sqlScalarValueMatches(field_type: runtime_schema.AntflyType, value: std.j
         .geopoint => value == .array or value == .object,
         .json, .array, .embedding => false,
     };
+}
+
+pub fn validateSqlArrayElementValueJson(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    value_json: []const u8,
+) !void {
+    const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (!sqlArrayItemValueMatches(item_type, parsed.value)) return error.UnsupportedSqlShape;
+}
+
+pub fn validateSqlArrayValueJson(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    value_json: []const u8,
+) !void {
+    const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.UnsupportedSqlShape;
+    for (parsed.value.array.items) |item| {
+        if (!sqlArrayItemValueMatches(item_type, item)) return error.UnsupportedSqlShape;
+    }
+}
+
+pub fn validateSqlScalarValuesJson(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    values_json: []const u8,
+) !void {
+    if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, values_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.UnsupportedSqlShape;
+    for (parsed.value.array.items) |item| {
+        if (!sqlScalarValueMatches(column.field_type, item)) return error.UnsupportedSqlShape;
+    }
 }
 
 pub fn validateDefaultValueForColumnAlloc(
@@ -151,6 +706,16 @@ pub fn jsonValueIsValid(alloc: std.mem.Allocator, value: []const u8) bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return false;
     parsed.deinit();
     return true;
+}
+
+pub fn encodeSqlTxnIdHex(txn_id: [16]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    const hex = "0123456789abcdef";
+    for (txn_id, 0..) |byte, i| {
+        out[i * 2] = hex[byte >> 4];
+        out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+    return out;
 }
 
 pub fn parseSqlUntypedValueJsonAlloc(
@@ -331,6 +896,13 @@ pub fn sqlIntervalLiteral(text: []const u8) !SqlIntervalLiteral {
     };
 }
 
+pub fn parseSqlIntervalLiteral(tokens: []const Token, pos: *usize) !SqlIntervalLiteral {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("interval");
+    const token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+    return try sqlIntervalLiteral(token.text);
+}
+
 fn sqlIntervalUnitNs(unit: []const u8) ?u64 {
     if (std.ascii.eqlIgnoreCase(unit, "ns") or
         std.ascii.eqlIgnoreCase(unit, "nanosecond") or
@@ -381,10 +953,78 @@ fn sqlIntervalUnitMonths(unit: []const u8) ?u64 {
 }
 
 test "sql adapter value parses timestamp literals" {
+    const alloc = std.testing.allocator;
+
     try std.testing.expectEqual(@as(i64, 0), try parseSqlTimestampLiteralNs("1970-01-01"));
     try std.testing.expectEqual(@as(i64, 1_000_000_000), try parseSqlTimestampLiteralNs("'1970-01-01T00:00:01Z'"));
     try std.testing.expectEqual(@as(i64, 0), try parseSqlTimestampLiteralNs("1970-01-01 01:00:00+01:00"));
     try std.testing.expectError(error.UnsupportedSqlShape, parseSqlTimestampLiteralNs("2026-02-29"));
+
+    const numeric_endpoint = try parseSqlRangeEndpointJsonAlloc(alloc, "42.5", .numeric);
+    defer alloc.free(numeric_endpoint);
+    try std.testing.expectEqualStrings("42.5", numeric_endpoint);
+
+    const date_endpoint = try parseSqlRangeEndpointJsonAlloc(alloc, "1970-01-02", .datetime);
+    defer alloc.free(date_endpoint);
+    try std.testing.expectEqualStrings("86400000000000", date_endpoint);
+
+    const typed_datetime_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "timestamp" },
+        .{ .kind = .string, .text = "1970-01-01T00:00:01Z" },
+    };
+    var typed_datetime_pos: usize = 0;
+    const typed_datetime = try parseSqlTypedDatetimeLiteralValueJsonAlloc(alloc, typed_datetime_tokens[0..], &typed_datetime_pos);
+    defer alloc.free(typed_datetime);
+    try std.testing.expectEqualStrings("1000000000", typed_datetime);
+    try std.testing.expectEqual(@as(usize, 2), typed_datetime_pos);
+
+    const now_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "current_timestamp" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .number, .text = "6" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    var now_pos: usize = 0;
+    const now_json = try parseSqlNowValueJsonAlloc(alloc, now_tokens[0..], &now_pos, 123);
+    defer alloc.free(now_json);
+    try std.testing.expectEqualStrings("123", now_json);
+    try std.testing.expectEqual(@as(usize, 4), now_pos);
+
+    var now_call_pos: usize = 0;
+    try parseSqlNowCall(now_tokens[0..], &now_call_pos);
+    try std.testing.expectEqual(@as(usize, 4), now_call_pos);
+
+    const current_date_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "current_date" },
+    };
+    var current_date_pos: usize = 0;
+    const current_date_json = try parseSqlCurrentDateValueJsonAlloc(alloc, current_date_tokens[0..], &current_date_pos, 86_400_000_000_000);
+    defer alloc.free(current_date_json);
+    try std.testing.expectEqualStrings("86400000000000", current_date_json);
+    try std.testing.expectEqual(@as(usize, 1), current_date_pos);
+    try std.testing.expectEqual(@as(u64, 86_400_000_000_000), sqlCurrentUtcDateStartNs(86_400_000_000_123));
+
+    var current_date_call_pos: usize = 0;
+    try parseSqlCurrentDateKeyword(current_date_tokens[0..], &current_date_call_pos);
+    try std.testing.expectEqual(@as(usize, 1), current_date_call_pos);
+
+    const uuid_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "gen_random_uuid" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    var uuid_pos: usize = 0;
+    try parseSqlUuidV4Call(uuid_tokens[0..], &uuid_pos);
+    try std.testing.expectEqual(@as(usize, 3), uuid_pos);
+
+    const canonical = try canonicalizeDiscreteDateRangeFiniteBoundAlloc(alloc, "0");
+    defer alloc.free(canonical);
+    try std.testing.expectEqualStrings("86400000000000", canonical);
+
+    const pair = try parseSqlCanonicalRangeLiteralValuePairAlloc(alloc, "(1970-01-01,1970-01-02]", .datetime, .daterange);
+    defer lower_expr.freePeriodRangeValuePair(alloc, pair);
+    try std.testing.expectEqualStrings("86400000000000", pair.start_json);
+    try std.testing.expectEqualStrings("172800000000000", pair.end_json);
 }
 
 test "sql adapter value parses scalar json literals" {
@@ -413,6 +1053,158 @@ test "sql adapter value parses scalar json literals" {
     defer alloc.free(negative_json);
     try std.testing.expectEqualStrings("-42", negative_json);
     try std.testing.expectEqual(@as(usize, 2), negative_pos);
+
+    var scalar_string_pos: usize = 0;
+    const scalar_string_json = (try parseJsonScalarValueAlloc(alloc, tokens[1..2], &scalar_string_pos, &.{})) orelse return error.TestUnexpectedResult;
+    defer alloc.free(scalar_string_json);
+    try std.testing.expectEqualStrings("\"active\"", scalar_string_json);
+    try std.testing.expectEqual(@as(usize, 1), scalar_string_pos);
+
+    const params = [_]SqlValue{.{ .string = "literal" }};
+    const string_value_tokens = [_]Token{
+        .{ .kind = .placeholder, .text = "$1" },
+        .{ .kind = .identifier, .text = "true" },
+        .{ .kind = .identifier, .text = "and" },
+        .{ .kind = .identifier, .text = "false" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+
+    var sql_string_pos: usize = 0;
+    const parsed = try parseSqlStringValueAlloc(alloc, string_value_tokens[0..1], &sql_string_pos, params[0..]);
+    defer alloc.free(parsed);
+    try std.testing.expectEqualStrings("literal", parsed);
+    try std.testing.expectEqual(@as(usize, 1), sql_string_pos);
+
+    const json_params = [_]SqlValue{ .{ .json = "{\"ok\":true}" }, .{ .string = "{\"from\":\"text\"}" } };
+    var document_pos: usize = 0;
+    const document_json = (try parseJsonDocumentValueAlloc(alloc, string_value_tokens[0..1], &document_pos, json_params[0..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(document_json);
+    try std.testing.expectEqualStrings("{\"ok\":true}", document_json);
+    try std.testing.expectEqual(@as(usize, 1), document_pos);
+
+    var convert_pos: usize = 0;
+    const convert_input = (try parseConvertFromInputAlloc(alloc, string_value_tokens[0..1], &convert_pos, json_params[1..])) orelse return error.TestUnexpectedResult;
+    defer alloc.free(convert_input);
+    try std.testing.expectEqualStrings("{\"from\":\"text\"}", convert_input);
+    try std.testing.expectEqual(@as(usize, 1), convert_pos);
+
+    var build_key_string_pos: usize = 0;
+    const build_key_string = try parseJsonbBuildObjectKey(tokens[1..2], &build_key_string_pos, &.{});
+    try std.testing.expectEqualStrings("active", build_key_string);
+    try std.testing.expectEqual(@as(usize, 1), build_key_string_pos);
+
+    var build_key_param_pos: usize = 0;
+    const build_key_param = try parseJsonbBuildObjectKey(string_value_tokens[0..1], &build_key_param_pos, params[0..]);
+    try std.testing.expectEqualStrings("literal", build_key_param);
+    try std.testing.expectEqual(@as(usize, 1), build_key_param_pos);
+
+    const convert_from_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "convert_from" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekConvertFromFunctionCall(convert_from_tokens[0..], 0));
+    var convert_from_call_pos: usize = 0;
+    try parseConvertFromFunctionCallStart(convert_from_tokens[0..], &convert_from_call_pos);
+    try std.testing.expectEqual(@as(usize, 2), convert_from_call_pos);
+
+    const to_jsonb_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "to_jsonb" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekToJsonbFunctionCall(to_jsonb_tokens[0..], 0));
+    var to_jsonb_pos: usize = 0;
+    try parseToJsonbFunctionCallStart(to_jsonb_tokens[0..], &to_jsonb_pos);
+    try std.testing.expectEqual(@as(usize, 2), to_jsonb_pos);
+
+    const jsonb_build_object_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "jsonb_build_object" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekJsonbBuildObjectFunctionCall(jsonb_build_object_tokens[0..], 0));
+    var jsonb_build_object_pos: usize = 0;
+    try parseJsonbBuildObjectFunctionCallStart(jsonb_build_object_tokens[0..], &jsonb_build_object_pos);
+    try std.testing.expectEqual(@as(usize, 2), jsonb_build_object_pos);
+
+    const invalid_key_params = [_]SqlValue{.{ .integer = 42 }};
+    var invalid_build_key_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseJsonbBuildObjectKey(string_value_tokens[0..1], &invalid_build_key_pos, invalid_key_params[0..]));
+
+    const single_array_json = try singleValueJsonArrayAlloc(alloc, .{ .string = "literal" });
+    defer alloc.free(single_array_json);
+    try std.testing.expectEqualStrings("[\"literal\"]", single_array_json);
+
+    var true_pos: usize = 1;
+    try std.testing.expectEqual(true, matchStandaloneSqlBooleanLiteral(string_value_tokens[0..], &true_pos).?);
+    try std.testing.expectEqual(@as(usize, 2), true_pos);
+    try std.testing.expectEqual(false, peekStandaloneSqlBooleanLiteral(string_value_tokens[0..], 3).?);
+    try std.testing.expect(peekStandaloneSqlBooleanLiteral(string_value_tokens[0..], 2) == null);
+
+    const bool_column: runtime_schema.RelationalColumn = .{ .name = "enabled", .path = "enabled", .field_type = .boolean };
+    const keyword_column: runtime_schema.RelationalColumn = .{ .name = "status", .path = "status", .field_type = .keyword };
+    const bool_is_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "true" },
+        .{ .kind = .identifier, .text = "false" },
+        .{ .kind = .identifier, .text = "unknown" },
+    };
+
+    var bool_is_pos: usize = 0;
+    const bool_is_json = try parseSqlBooleanIsValueAlloc(alloc, bool_is_tokens[0..], &bool_is_pos, bool_column, false);
+    defer alloc.free(bool_is_json.?);
+    try std.testing.expectEqualStrings("true", bool_is_json.?);
+    try std.testing.expectEqual(@as(usize, 1), bool_is_pos);
+
+    var bool_not_pos: usize = 1;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSqlBooleanIsValueAlloc(alloc, bool_is_tokens[0..], &bool_not_pos, bool_column, true));
+    try std.testing.expectEqual(@as(usize, 1), bool_not_pos);
+
+    var non_bool_pos: usize = 0;
+    try std.testing.expectError(error.InvalidSqlCatalog, parseSqlBooleanIsValue(bool_is_tokens[0..], &non_bool_pos, keyword_column));
+
+    var unknown_pos: usize = 2;
+    try std.testing.expect(try parseSqlBooleanIsUnknown(bool_is_tokens[0..], &unknown_pos, bool_column));
+    try std.testing.expectEqual(@as(usize, 3), unknown_pos);
+}
+
+test "sql adapter value parses limit offset and fetch values" {
+    const params = [_]SqlValue{ .{ .integer = 7 }, .{ .null = {} } };
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .text = "all" },
+        .{ .kind = .number, .text = "42" },
+        .{ .kind = .placeholder, .text = "$1" },
+        .{ .kind = .placeholder, .text = "$2" },
+        .{ .kind = .identifier, .text = "rows" },
+        .{ .kind = .identifier, .text = "first" },
+        .{ .kind = .identifier, .text = "row" },
+        .{ .kind = .identifier, .text = "only" },
+        .{ .kind = .identifier, .text = "next" },
+        .{ .kind = .number, .text = "5" },
+        .{ .kind = .identifier, .text = "rows" },
+        .{ .kind = .identifier, .text = "only" },
+    };
+
+    var all_pos: usize = 0;
+    try std.testing.expect((try parseLimitValue(tokens[0..], &all_pos, params[0..])) == null);
+    try std.testing.expectEqual(@as(usize, 1), all_pos);
+
+    var limit_pos: usize = 1;
+    try std.testing.expectEqual(@as(?u32, 42), try parseLimitValue(tokens[0..], &limit_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 2), limit_pos);
+
+    var param_limit_pos: usize = 2;
+    try std.testing.expectEqual(@as(?u32, 7), try parseLimitValue(tokens[0..], &param_limit_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 3), param_limit_pos);
+
+    var offset_pos: usize = 3;
+    try std.testing.expectEqual(@as(u32, 0), try parseOffsetValue(tokens[0..], &offset_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 5), offset_pos);
+
+    var fetch_default_pos: usize = 5;
+    try std.testing.expectEqual(@as(?u32, 1), try parseFetchLimitValue(tokens[0..], &fetch_default_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 8), fetch_default_pos);
+
+    var fetch_number_pos: usize = 8;
+    try std.testing.expectEqual(@as(?u32, 5), try parseFetchLimitValue(tokens[0..], &fetch_number_pos, params[0..]));
+    try std.testing.expectEqual(@as(usize, 12), fetch_number_pos);
 }
 
 test "sql adapter value validates json values and defaults" {
@@ -420,11 +1212,20 @@ test "sql adapter value validates json values and defaults" {
     const keyword_column: runtime_schema.RelationalColumn = .{ .name = "status", .path = "status", .field_type = .keyword };
     const numeric_column: runtime_schema.RelationalColumn = .{ .name = "amount", .path = "amount", .field_type = .numeric };
     const array_column: runtime_schema.RelationalColumn = .{ .name = "tags", .path = "tags", .field_type = .array };
+    const text_array_column: runtime_schema.RelationalColumn = .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .text };
 
     try validateDefaultValueForColumnAlloc(alloc, keyword_column, .{ .kind = .literal, .value_json = "\"open\"" });
     try validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .now_ns, .value_json = "" });
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .literal, .value_json = "\"bad\"" }));
     try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, array_column, .{ .kind = .uuid_v4, .value_json = "" }));
+
+    try validateSqlArrayElementValueJson(alloc, text_array_column, "\"blue\"");
+    try validateSqlArrayValueJson(alloc, text_array_column, "[\"blue\",\"green\"]");
+    try validateSqlScalarValuesJson(alloc, keyword_column, "[\"open\",\"closed\"]");
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlArrayElementValueJson(alloc, text_array_column, "42"));
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlArrayValueJson(alloc, text_array_column, "[\"blue\",42]"));
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlScalarValuesJson(alloc, keyword_column, "[\"open\",42]"));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateSqlScalarValuesJson(alloc, array_column, "[\"open\"]"));
 
     try validateJsonDocument(alloc, "{\"a\":1}");
     try validateJsonArray(alloc, "[1,2]");
@@ -441,6 +1242,9 @@ test "sql adapter value validates json values and defaults" {
     try std.testing.expect(sqlScalarValueMatches(.keyword, parsed_string.value));
     try std.testing.expect(jsonValueIsValid(alloc, "{\"ok\":true}"));
     try std.testing.expect(!jsonValueIsValid(alloc, "{bad"));
+    const txn_id = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
+    const txn_hex = encodeSqlTxnIdHex(txn_id);
+    try std.testing.expectEqualStrings("0123456789abcdeffedcba9876543210", &txn_hex);
 }
 
 test "sql adapter value parses interval literals" {
@@ -455,6 +1259,16 @@ test "sql adapter value parses interval literals" {
     try std.testing.expectEqual(@as(u64, 259_200_000_000_000), mixed.fixed_ns);
     try std.testing.expect(mixed.saw_fixed);
     try std.testing.expect(mixed.saw_calendar);
+
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .text = "interval" },
+        .{ .kind = .string, .text = "1 hour" },
+    };
+    var pos: usize = 0;
+    const parsed = try parseSqlIntervalLiteral(tokens[0..], &pos);
+    try std.testing.expectEqual(@as(u64, 3_600_000_000_000), parsed.fixed_ns);
+    try std.testing.expectEqual(@as(u64, 0), parsed.calendar_months);
+    try std.testing.expectEqual(@as(usize, 2), pos);
 
     try std.testing.expectError(error.UnsupportedSqlShape, sqlIntervalLiteral("1 parsec"));
 }

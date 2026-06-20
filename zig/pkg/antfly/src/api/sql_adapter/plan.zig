@@ -16,14 +16,134 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
+const parser = @import("parser.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const strings = @import("strings.zig");
 
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
 pub const RelationPopulationMode = grammar.RelationPopulationMode;
 pub const SelectOutputRef = ast.SelectOutputRef;
 pub const SelectSetOperation = ast.SelectSetOperation;
+pub const Token = parser.Token;
+
+pub const NamedWindowSpec = struct {
+    name: []const u8,
+    partition_by: []const []const u8 = &.{},
+    order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
+    frame: ?db_mod.types.RelationalRowsWindowFrame = null,
+};
+
+pub const NamedWindowDefinition = struct {
+    partition_by: []const []const u8 = &.{},
+    order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
+    frame: ?db_mod.types.RelationalRowsWindowFrame = null,
+};
+
+pub const TableAlias = struct {
+    name: []const u8,
+    alias: []const u8,
+};
+
+pub const QualifiedField = struct {
+    qualifier: []const u8,
+    field: []const u8,
+};
+
+pub const QualifiedProjection = struct {
+    source: QualifiedField,
+    output: []const u8,
+};
+
+pub const SetOperationResultTail = struct {
+    order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+};
+
+pub const SelectList = struct {
+    fields: []const []const u8 = &.{},
+    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection = &.{},
+    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection = &.{},
+    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection = &.{},
+    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection = &.{},
+    expressions: []const db_mod.types.RelationalRowsExpressionProjection = &.{},
+    outputs: []const SelectOutputRef = &.{},
+    select_all: bool = false,
+};
+
+pub const SelectItem = union(enum) {
+    field: []const u8,
+    json_extract: db_mod.types.RelationalRowsJsonExtractProjection,
+    array_length: db_mod.types.RelationalRowsArrayLengthProjection,
+    coalesce: db_mod.types.RelationalRowsCoalesceProjection,
+    expression: db_mod.types.RelationalRowsExpressionProjection,
+    field_alias: db_mod.types.RelationalRowsFieldAliasProjection,
+};
+
+pub fn selectOutputName(select: SelectList, output: SelectOutputRef) ?[]const u8 {
+    return switch (output.kind) {
+        .field => if (output.index < select.fields.len) select.fields[output.index] else null,
+        .json_extract => if (output.index < select.json_extract.len) select.json_extract[output.index].output else null,
+        .array_length => if (output.index < select.array_length.len) select.array_length[output.index].output else null,
+        .coalesce => if (output.index < select.coalesce.len) select.coalesce[output.index].output else null,
+        .field_alias => if (output.index < select.field_aliases.len) select.field_aliases[output.index].output else null,
+        .expression => if (output.index < select.expressions.len) select.expressions[output.index].output else null,
+    };
+}
+
+pub fn selectOutputByName(name: []const u8, select: SelectList) !?SelectOutputRef {
+    var found: ?SelectOutputRef = null;
+    for (select.outputs) |output| {
+        const output_name = selectOutputName(select, output) orelse continue;
+        if (!std.ascii.eqlIgnoreCase(output_name, name)) continue;
+        if (found != null) return error.UnsupportedSqlShape;
+        found = output;
+    }
+    return found;
+}
+
+pub const WindowSelectList = struct {
+    fields: []const []const u8 = &.{},
+    windows: []const db_mod.types.RelationalRowsWindowSpec = &.{},
+    outputs: []const WindowSelectOutputRef = &.{},
+    select_all: bool = false,
+};
+
+pub const WindowSelectOutputKind = enum {
+    field,
+    window,
+};
+
+pub const WindowSelectOutputRef = struct {
+    kind: WindowSelectOutputKind,
+    index: usize,
+};
+
+pub const ParsedWindowFrameBound = struct {
+    bound: db_mod.types.RelationalRowsWindowFrameBound,
+    offset: u32 = 0,
+};
+
+pub const AggregateSelectList = struct {
+    group_fields: []const []const u8 = &.{},
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection = &.{},
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec = &.{},
+    outputs: []const AggregateSelectOutputRef = &.{},
+};
+
+pub const AggregateSelectOutputKind = enum {
+    group_field,
+    group_expression,
+    aggregation,
+};
+
+pub const AggregateSelectOutputRef = struct {
+    kind: AggregateSelectOutputKind,
+    index: usize,
+};
 
 pub const LoweredSelect = struct {
     table_name: []const u8,
@@ -49,6 +169,103 @@ pub const LoweredSelect = struct {
     }
 };
 
+pub fn applyCteColumnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredSelect,
+    aliases: []const []const u8,
+) !void {
+    if (aliases.len == 0) return;
+    if (lowered.query.select_all) return error.UnsupportedSqlShape;
+    if (aliases.len != lowered.select_outputs.len) return error.UnsupportedSqlShape;
+
+    var direct_field_outputs: usize = 0;
+    for (lowered.select_outputs) |output| {
+        if (output.kind == .field) direct_field_outputs += 1;
+    }
+    if (direct_field_outputs != lowered.query.select.len) return error.UnsupportedSqlShape;
+
+    for (lowered.select_outputs, aliases) |output, alias| {
+        if (alias.len == 0) return error.UnsupportedSqlShape;
+        try renameCteSelectOutputAlloc(alloc, lowered, output, alias);
+    }
+
+    if (direct_field_outputs == 0) return;
+
+    const old_field_aliases = lowered.query.field_aliases;
+    const new_field_aliases = try alloc.alloc(db_mod.types.RelationalRowsFieldAliasProjection, old_field_aliases.len + direct_field_outputs);
+    var initialized: usize = old_field_aliases.len;
+    errdefer {
+        for (new_field_aliases[old_field_aliases.len..initialized]) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        alloc.free(new_field_aliases);
+    }
+    for (old_field_aliases, 0..) |projection, i| new_field_aliases[i] = projection;
+
+    for (lowered.select_outputs, aliases) |output, alias| {
+        if (output.kind != .field) continue;
+        if (output.index >= lowered.query.select.len) return error.UnsupportedSqlShape;
+        const projection = db_mod.types.RelationalRowsFieldAliasProjection{
+            .output = try alloc.dupe(u8, alias),
+            .field = try alloc.dupe(u8, lowered.query.select[output.index]),
+        };
+        new_field_aliases[initialized] = projection;
+        initialized += 1;
+    }
+
+    if (old_field_aliases.len > 0) alloc.free(old_field_aliases);
+    freeStringSlice(alloc, lowered.query.select);
+    lowered.query.select = &.{};
+    lowered.query.field_aliases = new_field_aliases;
+}
+
+fn renameCteSelectOutputAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredSelect,
+    output: SelectOutputRef,
+    alias: []const u8,
+) !void {
+    switch (output.kind) {
+        .field => {},
+        .json_extract => {
+            if (output.index >= lowered.query.json_extract.len) return error.UnsupportedSqlShape;
+            try replaceOwnedStringAlloc(alloc, &lowered.query.json_extract[output.index].output, alias);
+        },
+        .array_length => {
+            if (output.index >= lowered.query.array_length.len) return error.UnsupportedSqlShape;
+            try replaceOwnedStringAlloc(alloc, &lowered.query.array_length[output.index].output, alias);
+        },
+        .coalesce => {
+            if (output.index >= lowered.query.coalesce.len) return error.UnsupportedSqlShape;
+            const old_output = lowered.query.coalesce[output.index].output;
+            try replaceOwnedStringAlloc(alloc, &lowered.query.coalesce[output.index].output, alias);
+            for (lowered.query.expressions) |*projection_const| {
+                const projection = @constCast(projection_const);
+                if (projection.expression.kind != .coalesce) continue;
+                if (!std.mem.eql(u8, projection.output, old_output)) continue;
+                try replaceOwnedStringAlloc(alloc, &projection.output, alias);
+                break;
+            }
+        },
+        .field_alias => {
+            if (output.index >= lowered.query.field_aliases.len) return error.UnsupportedSqlShape;
+            try replaceOwnedStringAlloc(alloc, &lowered.query.field_aliases[output.index].output, alias);
+        },
+        .expression => {
+            if (output.index >= lowered.query.expressions.len) return error.UnsupportedSqlShape;
+            try replaceOwnedStringAlloc(alloc, &lowered.query.expressions[output.index].output, alias);
+        },
+    }
+}
+
+fn replaceOwnedStringAlloc(alloc: std.mem.Allocator, target_const: *const []const u8, replacement: []const u8) !void {
+    const target = @constCast(target_const);
+    const next = try alloc.dupe(u8, replacement);
+    alloc.free(target.*);
+    target.* = next;
+}
+
 pub const LoweredQueryPlan = struct {
     table_name: []const u8,
     plan: db_mod.types.RelationalRowsQueryPlan,
@@ -68,6 +285,9 @@ pub const LoweredSetOperationPlan = struct {
     order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
     limit: ?u32 = null,
     offset: u32 = 0,
+    max_rows: ?u32 = db_mod.types.default_relational_rows_cte_max_rows,
+    max_bytes: ?u64 = db_mod.types.default_relational_rows_cte_max_bytes,
+    spill_after_bytes: ?u64 = db_mod.types.default_relational_rows_cte_spill_after_bytes,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.left.deinit(alloc);
@@ -294,6 +514,93 @@ pub const LoweredWritePlan = union(enum) {
     }
 };
 
+pub fn mergeMatchedPredicateCount(arms: []const MergeMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.predicates.len;
+    return total;
+}
+
+pub fn mergeMatchedUpdateCount(arms: []const MergeMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.update.len;
+    return total;
+}
+
+pub fn mergeMatchedUpdateExpressionCount(arms: []const MergeMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.update_expressions.len;
+    return total;
+}
+
+pub fn mergeMatchedExpressionPredicateCount(arms: []const MergeMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.expression_predicates.len;
+    return total;
+}
+
+pub fn mergeMatchedExpressionOrPredicateCount(arms: []const MergeMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.expression_or_predicates.len;
+    return total;
+}
+
+pub fn mergeMatchedExpressionNotPredicateCount(arms: []const MergeMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.expression_not_predicates.len;
+    return total;
+}
+
+pub fn mergeMatchedHasDelete(arms: []const MergeMatchedArm) bool {
+    for (arms) |arm| if (arm.delete) return true;
+    return false;
+}
+
+pub fn mergeMatchedHasDoNothing(arms: []const MergeMatchedArm) bool {
+    for (arms) |arm| if (arm.do_nothing) return true;
+    return false;
+}
+
+pub fn mergeNotMatchedPredicateCount(arms: []const MergeNotMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.predicates.len;
+    return total;
+}
+
+pub fn mergeNotMatchedInsertCount(arms: []const MergeNotMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.insert.len;
+    return total;
+}
+
+pub fn mergeNotMatchedInsertExpressionCount(arms: []const MergeNotMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.insert_expressions.len;
+    return total;
+}
+
+pub fn mergeNotMatchedExpressionPredicateCount(arms: []const MergeNotMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.expression_predicates.len;
+    return total;
+}
+
+pub fn mergeNotMatchedExpressionOrPredicateCount(arms: []const MergeNotMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.expression_or_predicates.len;
+    return total;
+}
+
+pub fn mergeNotMatchedExpressionNotPredicateCount(arms: []const MergeNotMatchedArm) usize {
+    var total: usize = 0;
+    for (arms) |arm| total += arm.expression_not_predicates.len;
+    return total;
+}
+
+pub fn mergeNotMatchedHasDoNothing(arms: []const MergeNotMatchedArm) bool {
+    for (arms) |arm| if (arm.do_nothing) return true;
+    return false;
+}
+
 pub const LoweredAggregate = struct {
     table_name: []const u8,
     aggregate: db_mod.types.RelationalRowsAggregateRequest,
@@ -353,6 +660,130 @@ pub const LoweredLateralPlan = struct {
         self.plan.deinit(alloc);
         self.* = undefined;
     }
+};
+
+pub fn findCteByName(ctes: []const db_mod.types.RelationalRowsCte, name: []const u8) ?db_mod.types.RelationalRowsCte {
+    for (ctes) |cte| {
+        if (std.mem.eql(u8, cte.name, name)) return cte;
+    }
+    return null;
+}
+
+pub fn resolveSelectSourceForPlanAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredSelect,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    if (findCteByName(ctes, lowered.table_name) != null) {
+        lowered.query.source_cte = try alloc.dupe(u8, lowered.table_name);
+        return;
+    }
+    try resolveBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
+}
+
+pub fn resolveAggregateSourceForPlanAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredAggregate,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    if (findCteByName(ctes, lowered.table_name) != null) {
+        lowered.aggregate.source.source_cte = try alloc.dupe(u8, lowered.table_name);
+        return;
+    }
+    try resolveBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
+}
+
+pub fn resolveWindowSourceForPlanAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredWindowPlan,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    if (findCteByName(ctes, lowered.table_name) != null) {
+        lowered.plan.window.source.source_cte = try alloc.dupe(u8, lowered.table_name);
+        return;
+    }
+    try resolveBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
+}
+
+pub fn resolveJoinSourcesForPlanAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredJoin,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    try resolveJoinSideSourceForPlanAlloc(alloc, &lowered.join.left, &lowered.left_table_name, ctes, base_table_name);
+    try resolveJoinSideSourceForPlanAlloc(alloc, &lowered.join.right, &lowered.right_table_name, ctes, base_table_name);
+}
+
+pub fn resolveLateralSourcesForPlanAlloc(
+    alloc: std.mem.Allocator,
+    lowered: *LoweredLateralPlan,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    try resolveJoinSideSourceForPlanAlloc(alloc, &lowered.plan.lateral.left, &lowered.left_table_name, ctes, base_table_name);
+    try resolveJoinSideSourceForPlanAlloc(alloc, &lowered.plan.lateral.right, &lowered.right_table_name, ctes, base_table_name);
+    if (lowered.plan.left_table.len > 0) alloc.free(lowered.plan.left_table);
+    lowered.plan.left_table = try alloc.dupe(u8, lowered.left_table_name);
+    if (lowered.plan.right_table.len > 0) alloc.free(lowered.plan.right_table);
+    lowered.plan.right_table = try alloc.dupe(u8, lowered.right_table_name);
+}
+
+fn resolveJoinSideSourceForPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: *db_mod.types.RelationalRowsQueryRequest,
+    table_name: *[]const u8,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: *?[]const u8,
+) !void {
+    if (findCteByName(ctes, table_name.*) != null) {
+        source.source_cte = try alloc.dupe(u8, table_name.*);
+        const base = base_table_name.* orelse return error.UnsupportedSqlShape;
+        const physical_table_name = try alloc.dupe(u8, base);
+        alloc.free(table_name.*);
+        table_name.* = physical_table_name;
+        return;
+    }
+    try resolveBaseSourceTableAlloc(alloc, table_name.*, base_table_name);
+}
+
+fn resolveBaseSourceTableAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    base_table_name: *?[]const u8,
+) !void {
+    if (base_table_name.*) |base| {
+        if (!std.mem.eql(u8, base, table_name)) return error.UnsupportedSqlShape;
+    } else {
+        base_table_name.* = try alloc.dupe(u8, table_name);
+    }
+}
+
+pub const LateralSubquery = struct {
+    table: TableAlias,
+    output_columns: []const runtime_schema.RelationalColumn = &.{},
+    predicates: []const runtime_schema.RelationalCheck = &.{},
+    json_contains: []const db_mod.types.RelationalRowsJsonContainsPredicate = &.{},
+    json_path_exists: []const db_mod.types.RelationalRowsJsonPathExistsPredicate = &.{},
+    array_contains: []const db_mod.types.RelationalRowsArrayContainsPredicate = &.{},
+    array_eq: []const db_mod.types.RelationalRowsArrayEqPredicate = &.{},
+    in_predicates: []const db_mod.types.RelationalRowsInPredicate = &.{},
+    text_patterns: []const db_mod.types.RelationalRowsTextPatternPredicate = &.{},
+    expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    expression_array_contains: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate = &.{},
+    match_expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate = &.{},
+    correlations: []const db_mod.types.RelationalRowsLateralCorrelation = &.{},
+    order_by: []const db_mod.types.RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
 };
 
 pub const LoweredReadPlan = union(enum) {
@@ -654,6 +1085,47 @@ pub fn cloneOrderByAlloc(
     return out;
 }
 
+pub fn cloneNamedWindowDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    value: NamedWindowSpec,
+) !NamedWindowDefinition {
+    const partition_by = try strings.cloneStringSlice(alloc, value.partition_by);
+    var partition_transferred = false;
+    errdefer if (!partition_transferred) strings.freeStringSlice(alloc, partition_by);
+    const order_by = try cloneOrderByAlloc(alloc, value.order_by);
+    var order_transferred = false;
+    errdefer if (!order_transferred) {
+        freeOrderBy(alloc, order_by);
+        if (order_by.len > 0) alloc.free(order_by);
+    };
+
+    partition_transferred = true;
+    order_transferred = true;
+    return .{
+        .partition_by = partition_by,
+        .order_by = order_by,
+        .frame = value.frame,
+    };
+}
+
+pub fn freeNamedWindowDefinition(alloc: std.mem.Allocator, value: NamedWindowDefinition) void {
+    strings.freeStringSlice(alloc, value.partition_by);
+    freeOrderBy(alloc, value.order_by);
+    if (value.order_by.len > 0) alloc.free(value.order_by);
+}
+
+pub fn freeNamedWindowSpec(alloc: std.mem.Allocator, value: NamedWindowSpec) void {
+    alloc.free(value.name);
+    strings.freeStringSlice(alloc, value.partition_by);
+    freeOrderBy(alloc, value.order_by);
+    if (value.order_by.len > 0) alloc.free(value.order_by);
+}
+
+pub fn freeNamedWindowSpecs(alloc: std.mem.Allocator, values: []const NamedWindowSpec) void {
+    for (values) |value| freeNamedWindowSpec(alloc, value);
+    if (values.len > 0) alloc.free(values);
+}
+
 pub fn freeExpression(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsExpression) void {
     if (value.field.len > 0) alloc.free(value.field);
     if (value.value_json.len > 0) alloc.free(value.value_json);
@@ -705,6 +1177,24 @@ pub fn freeExpressionProjections(alloc: std.mem.Allocator, values: []const db_mo
     if (values.len > 0) alloc.free(values);
 }
 
+pub fn freeExpressionAssignments(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsExpressionAssignment) void {
+    for (values) |value| {
+        alloc.free(@constCast(value.field));
+        freeExpression(alloc, value.expression);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn freeRowsJsonSetExpressionAssignments(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonSetExpressionAssignment) void {
+    for (values) |value| {
+        alloc.free(@constCast(value.field));
+        for (value.path) |segment| alloc.free(@constCast(segment));
+        if (value.path.len > 0) alloc.free(value.path);
+        freeExpression(alloc, value.expression);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
 pub fn freeJsonExtract(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonExtractProjection) void {
     for (values) |value| {
         alloc.free(value.output);
@@ -746,6 +1236,19 @@ pub fn freeCoalesceProjection(alloc: std.mem.Allocator, value: db_mod.types.Rela
 pub fn freeCoalesceProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsCoalesceProjection) void {
     for (values) |value| freeCoalesceProjection(alloc, value);
     if (values.len > 0) alloc.free(values);
+}
+
+pub fn buildCoalesceProjectionFromOperandListAlloc(
+    alloc: std.mem.Allocator,
+    output: []const u8,
+    operands: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsCoalesceOperand),
+) !db_mod.types.RelationalRowsCoalesceProjection {
+    const owned_operands = try operands.toOwnedSlice(alloc);
+    operands.* = .empty;
+    return .{
+        .output = output,
+        .operands = owned_operands,
+    };
 }
 
 pub fn expressionProjectionFromCoalesceAlloc(
@@ -963,6 +1466,46 @@ pub fn freeWindowSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.Re
     for (values) |value| freeWindowSpec(alloc, value);
 }
 
+pub fn freeAggregateSpec(alloc: std.mem.Allocator, spec: db_mod.types.RelationalRowsAggregateSpec) void {
+    alloc.free(spec.name);
+    if (spec.field) |field| alloc.free(field);
+    if (spec.expression) |expression| freeExpression(alloc, expression);
+    if (spec.percentiles.len > 0) alloc.free(spec.percentiles);
+    if (spec.string_delimiter) |delimiter| alloc.free(delimiter);
+    freeOrderBy(alloc, spec.array_order_by);
+    if (spec.array_order_by.len > 0) alloc.free(spec.array_order_by);
+    freeRelationalChecks(alloc, spec.filter_predicates);
+    if (spec.filter_predicates.len > 0) alloc.free(spec.filter_predicates);
+    freeArrayAny(alloc, spec.filter_array_any);
+    if (spec.filter_array_any.len > 0) alloc.free(spec.filter_array_any);
+    freeArrayContains(alloc, spec.filter_array_contains);
+    if (spec.filter_array_contains.len > 0) alloc.free(spec.filter_array_contains);
+    freeArrayEq(alloc, spec.filter_array_eq);
+    if (spec.filter_array_eq.len > 0) alloc.free(spec.filter_array_eq);
+    freeInPredicates(alloc, spec.filter_in_predicates);
+    if (spec.filter_in_predicates.len > 0) alloc.free(spec.filter_in_predicates);
+    freeJsonContains(alloc, spec.filter_json_contains);
+    if (spec.filter_json_contains.len > 0) alloc.free(spec.filter_json_contains);
+    freeJsonPathEq(alloc, spec.filter_json_path_eq);
+    if (spec.filter_json_path_eq.len > 0) alloc.free(spec.filter_json_path_eq);
+    freeJsonPathExists(alloc, spec.filter_json_path_exists);
+    if (spec.filter_json_path_exists.len > 0) alloc.free(spec.filter_json_path_exists);
+    freeTextPatterns(alloc, spec.filter_text_patterns);
+    if (spec.filter_text_patterns.len > 0) alloc.free(spec.filter_text_patterns);
+    freeExpressionConditions(alloc, spec.filter_expressions);
+    if (spec.filter_expressions.len > 0) alloc.free(spec.filter_expressions);
+    freeExpressionArrayContains(alloc, spec.filter_expression_array_contains);
+    if (spec.filter_expression_array_contains.len > 0) alloc.free(spec.filter_expression_array_contains);
+    freeExpressionPredicateGroups(alloc, spec.filter_any);
+    if (spec.filter_any.len > 0) alloc.free(spec.filter_any);
+    freeExpressionPredicateGroups(alloc, spec.filter_not);
+    if (spec.filter_not.len > 0) alloc.free(spec.filter_not);
+}
+
+pub fn freeAggregateSpecs(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsAggregateSpec) void {
+    for (values) |value| freeAggregateSpec(alloc, value);
+}
+
 pub fn cloneQueryRelationalCheckAlloc(alloc: std.mem.Allocator, value: runtime_schema.RelationalCheck) !runtime_schema.RelationalCheck {
     const field = try alloc.dupe(u8, value.field);
     errdefer alloc.free(field);
@@ -1157,6 +1700,306 @@ fn freeMergeArmPredicates(alloc: std.mem.Allocator, values: []const MergeArmPred
     if (values.len > 0) alloc.free(values);
 }
 
+pub fn freeTableAlias(alloc: std.mem.Allocator, value: TableAlias) void {
+    alloc.free(value.name);
+    alloc.free(value.alias);
+}
+
+pub fn freeQualifiedField(alloc: std.mem.Allocator, value: QualifiedField) void {
+    alloc.free(value.qualifier);
+    alloc.free(value.field);
+}
+
+pub fn freeQualifiedProjections(alloc: std.mem.Allocator, values: []const QualifiedProjection) void {
+    for (values) |value| {
+        freeQualifiedField(alloc, value.source);
+        alloc.free(value.output);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+pub fn parseTableAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TableAlias {
+    const name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const alias = if (parser.matchKeyword(tokens, pos, "as"))
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else if (parser.peekKind(tokens, pos.*, .identifier) and !nextIsJoinClauseKeyword(tokens, pos.*))
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        try alloc.dupe(u8, name);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(alias);
+    name_transferred = true;
+    alias_transferred = true;
+    return .{ .name = name, .alias = alias };
+}
+
+pub fn inferSelectSourceAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: usize,
+) !?TableAlias {
+    var depth: usize = 0;
+    var i = pos;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .identifier => {
+                if (depth != 0 or !std.ascii.eqlIgnoreCase(token.text, "from")) continue;
+                return try inferSelectSourceAliasAtAlloc(alloc, tokens, i + 1);
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn inferSelectSourceAliasAtAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    from_index: usize,
+) !?TableAlias {
+    var name_index = from_index;
+    if (name_index >= tokens.len) return null;
+    if (tokens[name_index].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[name_index].text, "only")) {
+        name_index += 1;
+    }
+    if (name_index >= tokens.len or tokens[name_index].kind != .identifier) return null;
+    const name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[name_index].text);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+
+    var alias_index = name_index + 1;
+    const alias = alias: {
+        if (alias_index < tokens.len and tokens[alias_index].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[alias_index].text, "as")) {
+            alias_index += 1;
+            if (alias_index >= tokens.len or tokens[alias_index].kind != .identifier) return error.UnsupportedSqlShape;
+            break :alias try alloc.dupe(u8, tokens[alias_index].text);
+        }
+        if (alias_index < tokens.len and tokens[alias_index].kind == .identifier and !selectSourceAliasTailKeyword(tokens[alias_index].text)) {
+            break :alias try alloc.dupe(u8, tokens[alias_index].text);
+        }
+        break :alias try alloc.dupe(u8, name);
+    };
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(alias);
+
+    name_transferred = true;
+    alias_transferred = true;
+    return .{ .name = name, .alias = alias };
+}
+
+pub fn selectSourceAliasTailKeyword(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "where") or
+        std.ascii.eqlIgnoreCase(text, "group") or
+        std.ascii.eqlIgnoreCase(text, "having") or
+        std.ascii.eqlIgnoreCase(text, "order") or
+        std.ascii.eqlIgnoreCase(text, "limit") or
+        std.ascii.eqlIgnoreCase(text, "offset") or
+        std.ascii.eqlIgnoreCase(text, "fetch") or
+        std.ascii.eqlIgnoreCase(text, "for") or
+        std.ascii.eqlIgnoreCase(text, "left") or
+        std.ascii.eqlIgnoreCase(text, "outer") or
+        std.ascii.eqlIgnoreCase(text, "inner") or
+        std.ascii.eqlIgnoreCase(text, "join") or
+        std.ascii.eqlIgnoreCase(text, "on") or
+        std.ascii.eqlIgnoreCase(text, "using") or
+        std.ascii.eqlIgnoreCase(text, "returning") or
+        std.ascii.eqlIgnoreCase(text, "set") or
+        std.ascii.eqlIgnoreCase(text, "union") or
+        std.ascii.eqlIgnoreCase(text, "intersect") or
+        std.ascii.eqlIgnoreCase(text, "except");
+}
+
+pub fn parseDmlTargetAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TableAlias {
+    const name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const alias = if (parser.matchKeyword(tokens, pos, "as"))
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else if (parser.peekKind(tokens, pos.*, .identifier) and !nextIsDmlTargetTailKeyword(tokens, pos.*))
+        try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        try alloc.dupe(u8, name);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(alias);
+    name_transferred = true;
+    alias_transferred = true;
+    return .{ .name = name, .alias = alias };
+}
+
+pub fn nextIsDmlTargetTailKeyword(tokens: []const Token, pos: usize) bool {
+    if (nextIsJoinClauseKeyword(tokens, pos)) return true;
+    if (pos >= tokens.len or tokens[pos].kind != .identifier) return false;
+    const token = tokens[pos].text;
+    return std.ascii.eqlIgnoreCase(token, "default") or
+        std.ascii.eqlIgnoreCase(token, "values") or
+        std.ascii.eqlIgnoreCase(token, "conflict") or
+        std.ascii.eqlIgnoreCase(token, "set") or
+        std.ascii.eqlIgnoreCase(token, "where") or
+        std.ascii.eqlIgnoreCase(token, "order") or
+        std.ascii.eqlIgnoreCase(token, "limit") or
+        std.ascii.eqlIgnoreCase(token, "offset") or
+        std.ascii.eqlIgnoreCase(token, "fetch") or
+        std.ascii.eqlIgnoreCase(token, "for") or
+        std.ascii.eqlIgnoreCase(token, "returning");
+}
+
+pub fn nextIsJoinClauseKeyword(tokens: []const Token, pos: usize) bool {
+    if (pos >= tokens.len or tokens[pos].kind != .identifier) return false;
+    const token = tokens[pos].text;
+    return std.ascii.eqlIgnoreCase(token, "left") or
+        std.ascii.eqlIgnoreCase(token, "outer") or
+        std.ascii.eqlIgnoreCase(token, "inner") or
+        std.ascii.eqlIgnoreCase(token, "join") or
+        std.ascii.eqlIgnoreCase(token, "on") or
+        std.ascii.eqlIgnoreCase(token, "where") or
+        std.ascii.eqlIgnoreCase(token, "set") or
+        std.ascii.eqlIgnoreCase(token, "from") or
+        std.ascii.eqlIgnoreCase(token, "using") or
+        std.ascii.eqlIgnoreCase(token, "order") or
+        std.ascii.eqlIgnoreCase(token, "limit") or
+        std.ascii.eqlIgnoreCase(token, "offset") or
+        std.ascii.eqlIgnoreCase(token, "returning") or
+        std.ascii.eqlIgnoreCase(token, "group") or
+        std.ascii.eqlIgnoreCase(token, "union") or
+        std.ascii.eqlIgnoreCase(token, "intersect") or
+        std.ascii.eqlIgnoreCase(token, "except");
+}
+
+pub fn parseQualifiedFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !QualifiedField {
+    const identifier = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(identifier);
+    const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return error.UnsupportedSqlShape;
+    if (dot == 0 or dot + 1 >= identifier.len) return error.UnsupportedSqlShape;
+    const qualifier = try alloc.dupe(u8, identifier[0..dot]);
+    var qualifier_transferred = false;
+    errdefer if (!qualifier_transferred) alloc.free(qualifier);
+    const field = try alloc.dupe(u8, identifier[dot + 1 ..]);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    if (std.mem.indexOfScalar(u8, field, '.') != null) return error.UnsupportedSqlShape;
+    qualifier_transferred = true;
+    field_transferred = true;
+    return .{ .qualifier = qualifier, .field = field };
+}
+
+pub fn parseJoinProjectionListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const QualifiedProjection {
+    var projections = std.ArrayListUnmanaged(QualifiedProjection).empty;
+    errdefer {
+        for (projections.items) |projection| {
+            freeQualifiedField(alloc, projection.source);
+            alloc.free(projection.output);
+        }
+        projections.deinit(alloc);
+    }
+    while (true) {
+        const source = try parseQualifiedFieldAlloc(alloc, tokens, pos);
+        var source_transferred = false;
+        errdefer if (!source_transferred) freeQualifiedField(alloc, source);
+        const output = if (parser.matchKeyword(tokens, pos, "as"))
+            try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
+        else
+            try alloc.dupe(u8, source.field);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        try projections.append(alloc, .{ .source = source, .output = output });
+        source_transferred = true;
+        output_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    return try projections.toOwnedSlice(alloc);
+}
+
+pub fn freeLateralCorrelations(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsLateralCorrelation) void {
+    for (values) |value| {
+        alloc.free(value.left_field);
+        alloc.free(value.right_field);
+    }
+}
+
+pub fn freeLateralSubquery(alloc: std.mem.Allocator, value: LateralSubquery) void {
+    if (value.table.name.len > 0 or value.table.alias.len > 0) freeTableAlias(alloc, value.table);
+    ddl_plan.freeDdlRelationalColumns(alloc, value.output_columns);
+    freeRelationalChecks(alloc, value.predicates);
+    if (value.predicates.len > 0) alloc.free(value.predicates);
+    freeJsonContains(alloc, value.json_contains);
+    if (value.json_contains.len > 0) alloc.free(value.json_contains);
+    freeJsonPathExists(alloc, value.json_path_exists);
+    if (value.json_path_exists.len > 0) alloc.free(value.json_path_exists);
+    freeArrayContains(alloc, value.array_contains);
+    if (value.array_contains.len > 0) alloc.free(value.array_contains);
+    freeArrayEq(alloc, value.array_eq);
+    if (value.array_eq.len > 0) alloc.free(value.array_eq);
+    freeInPredicates(alloc, value.in_predicates);
+    if (value.in_predicates.len > 0) alloc.free(value.in_predicates);
+    freeTextPatterns(alloc, value.text_patterns);
+    if (value.text_patterns.len > 0) alloc.free(value.text_patterns);
+    freeExpressionConditions(alloc, value.expression_predicates);
+    if (value.expression_predicates.len > 0) alloc.free(value.expression_predicates);
+    freeExpressionPredicateGroups(alloc, value.expression_or_predicates);
+    if (value.expression_or_predicates.len > 0) alloc.free(value.expression_or_predicates);
+    freeExpressionPredicateGroups(alloc, value.expression_not_predicates);
+    if (value.expression_not_predicates.len > 0) alloc.free(value.expression_not_predicates);
+    freeExpressionArrayContains(alloc, value.expression_array_contains);
+    if (value.expression_array_contains.len > 0) alloc.free(value.expression_array_contains);
+    freeExpressionConditions(alloc, value.match_expression_predicates);
+    if (value.match_expression_predicates.len > 0) alloc.free(value.match_expression_predicates);
+    freeExpressionPredicateGroups(alloc, value.match_expression_or_predicates);
+    if (value.match_expression_or_predicates.len > 0) alloc.free(value.match_expression_or_predicates);
+    freeExpressionPredicateGroups(alloc, value.match_expression_not_predicates);
+    if (value.match_expression_not_predicates.len > 0) alloc.free(value.match_expression_not_predicates);
+    freeExpressionArrayContains(alloc, value.match_expression_array_contains);
+    if (value.match_expression_array_contains.len > 0) alloc.free(value.match_expression_array_contains);
+    freeLateralCorrelations(alloc, value.correlations);
+    if (value.correlations.len > 0) alloc.free(value.correlations);
+    freeOrderBy(alloc, value.order_by);
+    if (value.order_by.len > 0) alloc.free(value.order_by);
+}
+
+pub fn freeSelectItem(alloc: std.mem.Allocator, item: SelectItem) void {
+    switch (item) {
+        .field => |field| alloc.free(field),
+        .json_extract => |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+            alloc.free(projection.path);
+        },
+        .array_length => |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        },
+        .coalesce => |projection| freeCoalesceProjection(alloc, projection),
+        .expression => |projection| freeExpressionProjection(alloc, projection),
+        .field_alias => |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        },
+    }
+}
+
 test "sql adapter plan clones and frees row expressions" {
     const alloc = std.testing.allocator;
 
@@ -1335,6 +2178,126 @@ test "sql adapter plan frees predicate and window ownership containers" {
         }}),
     };
     freeWindowSpec(alloc, window);
+
+    const expression_assignments = try alloc.dupe(db_mod.types.RelationalRowsExpressionAssignment, &[_]db_mod.types.RelationalRowsExpressionAssignment{.{
+        .field = try alloc.dupe(u8, "status"),
+        .expression = .{
+            .kind = .lower,
+            .operands = try alloc.dupe(db_mod.types.RelationalRowsExpression, &[_]db_mod.types.RelationalRowsExpression{.{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "source_status"),
+            }}),
+        },
+    }});
+    freeExpressionAssignments(alloc, expression_assignments);
+
+    const json_set_assignments = try alloc.dupe(db_mod.types.RelationalRowsJsonSetExpressionAssignment, &[_]db_mod.types.RelationalRowsJsonSetExpressionAssignment{.{
+        .field = try alloc.dupe(u8, "payload"),
+        .path = try alloc.dupe([]const u8, &[_][]const u8{ try alloc.dupe(u8, "audit"), try alloc.dupe(u8, "state") }),
+        .expression = .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, "status"),
+        },
+    }});
+    freeRowsJsonSetExpressionAssignments(alloc, json_set_assignments);
+
+    const aggregate = db_mod.types.RelationalRowsAggregateSpec{
+        .name = try alloc.dupe(u8, "total_amount"),
+        .op = .sum,
+        .expression = .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, "amount"),
+        },
+        .array_order_by = try alloc.dupe(db_mod.types.RelationalRowsQueryOrder, &[_]db_mod.types.RelationalRowsQueryOrder{.{
+            .field = try alloc.dupe(u8, "created_at"),
+        }}),
+        .filter_predicates = try alloc.dupe(runtime_schema.RelationalCheck, &[_]runtime_schema.RelationalCheck{.{
+            .name = "",
+            .field = try alloc.dupe(u8, "tenant_id"),
+            .op = .eq,
+            .value_json = try alloc.dupe(u8, "\"tenant-a\""),
+        }}),
+        .filter_expressions = try alloc.dupe(db_mod.types.RelationalRowsExpressionCondition, &[_]db_mod.types.RelationalRowsExpressionCondition{.{
+            .lhs = .{
+                .kind = .field,
+                .field = try alloc.dupe(u8, "status"),
+            },
+            .op = .eq,
+            .rhs = try alloc.dupe(db_mod.types.RelationalRowsExpression, &[_]db_mod.types.RelationalRowsExpression{.{
+                .kind = .value,
+                .value_json = try alloc.dupe(u8, "\"active\""),
+            }}),
+        }}),
+    };
+    freeAggregateSpec(alloc, aggregate);
+}
+
+test "sql adapter plan counts merge arm surfaces" {
+    const predicate = MergeArmPredicate{
+        .side = .target,
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    };
+    const expression_condition = db_mod.types.RelationalRowsExpressionCondition{
+        .lhs = .{ .kind = .field, .field = "status" },
+        .op = .eq,
+        .rhs = &.{.{ .kind = .value, .value_json = "\"open\"" }},
+    };
+    const expression_group = db_mod.types.RelationalRowsExpressionPredicateGroup{
+        .conditions = &.{expression_condition},
+    };
+    const mapping = MergeFieldMapping{
+        .target_field = "status",
+        .source_field = "source_status",
+    };
+    const expression_assignment = MergeExpressionAssignment{
+        .target_field = "status_lower",
+        .expression = .{ .kind = .lower, .operands = &.{.{ .kind = .field, .field = "source_status" }} },
+    };
+    const matched = [_]MergeMatchedArm{
+        .{
+            .predicates = &.{predicate},
+            .expression_predicates = &.{expression_condition},
+            .expression_or_predicates = &.{expression_group},
+            .update = &.{mapping},
+            .update_expressions = &.{expression_assignment},
+            .delete = true,
+        },
+        .{
+            .expression_not_predicates = &.{expression_group},
+            .do_nothing = true,
+        },
+    };
+    const not_matched = [_]MergeNotMatchedArm{
+        .{
+            .predicates = &.{predicate},
+            .expression_predicates = &.{expression_condition},
+            .expression_or_predicates = &.{expression_group},
+            .insert = &.{mapping},
+            .insert_expressions = &.{expression_assignment},
+        },
+        .{
+            .expression_not_predicates = &.{expression_group},
+            .do_nothing = true,
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), mergeMatchedPredicateCount(&matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeMatchedUpdateCount(&matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeMatchedUpdateExpressionCount(&matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeMatchedExpressionPredicateCount(&matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeMatchedExpressionOrPredicateCount(&matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeMatchedExpressionNotPredicateCount(&matched));
+    try std.testing.expect(mergeMatchedHasDelete(&matched));
+    try std.testing.expect(mergeMatchedHasDoNothing(&matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeNotMatchedPredicateCount(&not_matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeNotMatchedInsertCount(&not_matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeNotMatchedInsertExpressionCount(&not_matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeNotMatchedExpressionPredicateCount(&not_matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeNotMatchedExpressionOrPredicateCount(&not_matched));
+    try std.testing.expectEqual(@as(usize, 1), mergeNotMatchedExpressionNotPredicateCount(&not_matched));
+    try std.testing.expect(mergeNotMatchedHasDoNothing(&not_matched));
 }
 
 test "sql adapter plan clones query predicates" {
@@ -1405,6 +2368,57 @@ test "sql adapter plan clones query predicates" {
 test "sql adapter plan owns projection helpers" {
     const alloc = std.testing.allocator;
 
+    const select_list: SelectList = .{
+        .fields = &.{"id"},
+        .json_extract = &.{.{ .output = "tier", .field = "payload", .path = "$.tier", .as_text = true }},
+        .array_length = &.{.{ .output = "tag_count", .field = "tags" }},
+        .coalesce = &.{.{ .output = "display_name", .operands = &.{} }},
+        .field_aliases = &.{.{ .field = "tenant_id", .output = "tenant" }},
+        .expressions = &.{.{ .output = "is_active", .expression = .{ .kind = .value, .value_json = "true" } }},
+        .outputs = &.{
+            .{ .kind = .field, .index = 0 },
+            .{ .kind = .json_extract, .index = 0 },
+            .{ .kind = .array_length, .index = 0 },
+            .{ .kind = .coalesce, .index = 0 },
+            .{ .kind = .field_alias, .index = 0 },
+            .{ .kind = .expression, .index = 0 },
+        },
+    };
+    try std.testing.expectEqualStrings("id", selectOutputName(select_list, .{ .kind = .field, .index = 0 }).?);
+    try std.testing.expectEqualStrings("tier", selectOutputName(select_list, .{ .kind = .json_extract, .index = 0 }).?);
+    try std.testing.expectEqualStrings("tag_count", selectOutputName(select_list, .{ .kind = .array_length, .index = 0 }).?);
+    try std.testing.expectEqualStrings("display_name", selectOutputName(select_list, .{ .kind = .coalesce, .index = 0 }).?);
+    try std.testing.expectEqualStrings("tenant", selectOutputName(select_list, .{ .kind = .field_alias, .index = 0 }).?);
+    try std.testing.expectEqualStrings("is_active", selectOutputName(select_list, .{ .kind = .expression, .index = 0 }).?);
+    try std.testing.expect(selectOutputName(select_list, .{ .kind = .field, .index = 1 }) == null);
+    try std.testing.expectEqual(ast.SelectOutputKind.json_extract, (try selectOutputByName("TIER", select_list)).?.kind);
+    try std.testing.expect((try selectOutputByName("missing", select_list)) == null);
+
+    var lowered = LoweredSelect{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .query = .{
+            .select_all = false,
+            .select = try strings.cloneStringSlice(alloc, &.{"id"}),
+            .json_extract = try alloc.dupe(db_mod.types.RelationalRowsJsonExtractProjection, &[_]db_mod.types.RelationalRowsJsonExtractProjection{.{
+                .output = try alloc.dupe(u8, "tier"),
+                .field = try alloc.dupe(u8, "payload"),
+                .path = try alloc.dupe(u8, "$.tier"),
+                .as_text = true,
+            }}),
+        },
+        .select_outputs = try alloc.dupe(SelectOutputRef, &[_]SelectOutputRef{
+            .{ .kind = .field, .index = 0 },
+            .{ .kind = .json_extract, .index = 0 },
+        }),
+    };
+    defer lowered.deinit(alloc);
+    try applyCteColumnAliasesAlloc(alloc, &lowered, &.{ "usage_id", "account_tier" });
+    try std.testing.expectEqual(@as(usize, 0), lowered.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.query.field_aliases.len);
+    try std.testing.expectEqualStrings("usage_id", lowered.query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("id", lowered.query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("account_tier", lowered.query.json_extract[0].output);
+
     const json_extract = try alloc.dupe(db_mod.types.RelationalRowsJsonExtractProjection, &[_]db_mod.types.RelationalRowsJsonExtractProjection{.{
         .output = try alloc.dupe(u8, "tier"),
         .field = try alloc.dupe(u8, "payload"),
@@ -1466,6 +2480,87 @@ test "sql adapter plan owns projection helpers" {
     freeCoalesceProjection(alloc, coalesce_projection);
 }
 
+test "sql adapter plan parses relation aliases and qualified projections" {
+    const alloc = std.testing.allocator;
+
+    const explicit_alias_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "public.usage_records" },
+        .{ .kind = .identifier, .text = "as" },
+        .{ .kind = .identifier, .text = "u" },
+    };
+    var explicit_alias_pos: usize = 0;
+    const explicit_alias = try parseTableAliasAlloc(alloc, &explicit_alias_tokens, &explicit_alias_pos);
+    defer freeTableAlias(alloc, explicit_alias);
+    try std.testing.expectEqual(@as(usize, 3), explicit_alias_pos);
+    try std.testing.expectEqualStrings("usage_records", explicit_alias.name);
+    try std.testing.expectEqualStrings("u", explicit_alias.alias);
+
+    const implicit_alias_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "usage_records" },
+        .{ .kind = .identifier, .text = "u" },
+        .{ .kind = .identifier, .text = "where" },
+    };
+    var implicit_alias_pos: usize = 0;
+    const implicit_alias = try parseTableAliasAlloc(alloc, &implicit_alias_tokens, &implicit_alias_pos);
+    defer freeTableAlias(alloc, implicit_alias);
+    try std.testing.expectEqual(@as(usize, 2), implicit_alias_pos);
+    try std.testing.expectEqualStrings("usage_records", implicit_alias.name);
+    try std.testing.expectEqualStrings("u", implicit_alias.alias);
+
+    const no_alias_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "usage_records" },
+        .{ .kind = .identifier, .text = "join" },
+    };
+    var no_alias_pos: usize = 0;
+    const no_alias = try parseTableAliasAlloc(alloc, &no_alias_tokens, &no_alias_pos);
+    defer freeTableAlias(alloc, no_alias);
+    try std.testing.expectEqual(@as(usize, 1), no_alias_pos);
+    try std.testing.expectEqualStrings("usage_records", no_alias.alias);
+
+    const dml_target_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "usage_records" },
+        .{ .kind = .identifier, .text = "set" },
+    };
+    var dml_target_pos: usize = 0;
+    const dml_target = try parseDmlTargetAliasAlloc(alloc, &dml_target_tokens, &dml_target_pos);
+    defer freeTableAlias(alloc, dml_target);
+    try std.testing.expectEqual(@as(usize, 1), dml_target_pos);
+    try std.testing.expectEqualStrings("usage_records", dml_target.alias);
+
+    const select_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "select" },
+        .{ .kind = .identifier, .text = "id" },
+        .{ .kind = .identifier, .text = "from" },
+        .{ .kind = .identifier, .text = "public.usage_records" },
+        .{ .kind = .identifier, .text = "as" },
+        .{ .kind = .identifier, .text = "u" },
+        .{ .kind = .identifier, .text = "where" },
+    };
+    const inferred = (try inferSelectSourceAliasAlloc(alloc, &select_tokens, 0)) orelse return error.TestUnexpectedResult;
+    defer freeTableAlias(alloc, inferred);
+    try std.testing.expectEqualStrings("usage_records", inferred.name);
+    try std.testing.expectEqualStrings("u", inferred.alias);
+
+    const projection_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "u.id" },
+        .{ .kind = .identifier, .text = "as" },
+        .{ .kind = .identifier, .text = "usage_id" },
+        .{ .kind = .comma, .text = "," },
+        .{ .kind = .identifier, .text = "c.status" },
+    };
+    var projection_pos: usize = 0;
+    const projections = try parseJoinProjectionListAlloc(alloc, &projection_tokens, &projection_pos);
+    defer freeQualifiedProjections(alloc, projections);
+    try std.testing.expectEqual(@as(usize, projection_tokens.len), projection_pos);
+    try std.testing.expectEqual(@as(usize, 2), projections.len);
+    try std.testing.expectEqualStrings("u", projections[0].source.qualifier);
+    try std.testing.expectEqualStrings("id", projections[0].source.field);
+    try std.testing.expectEqualStrings("usage_id", projections[0].output);
+    try std.testing.expectEqualStrings("c", projections[1].source.qualifier);
+    try std.testing.expectEqualStrings("status", projections[1].source.field);
+    try std.testing.expectEqualStrings("status", projections[1].output);
+}
+
 test "sql adapter lowered read plans own nested storage plan memory" {
     const alloc = std.testing.allocator;
 
@@ -1482,6 +2577,60 @@ test "sql adapter lowered read plans own nested storage plan memory" {
         },
     };
     lowered.deinit(alloc);
+}
+
+test "sql adapter plan resolves CTE and base table sources" {
+    const alloc = std.testing.allocator;
+    const ctes = [_]db_mod.types.RelationalRowsCte{.{ .name = "recent_usage" }};
+
+    var cte_select = LoweredSelect{
+        .table_name = try alloc.dupe(u8, "recent_usage"),
+        .query = .{},
+    };
+    defer cte_select.deinit(alloc);
+    var no_base: ?[]const u8 = null;
+    try resolveSelectSourceForPlanAlloc(alloc, &cte_select, &ctes, &no_base);
+    try std.testing.expect(no_base == null);
+    try std.testing.expectEqualStrings("recent_usage", cte_select.query.source_cte);
+
+    var base_select = LoweredSelect{
+        .table_name = try alloc.dupe(u8, "usage_records"),
+        .query = .{},
+    };
+    defer base_select.deinit(alloc);
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    try resolveSelectSourceForPlanAlloc(alloc, &base_select, &ctes, &base_table_name);
+    try std.testing.expectEqualStrings("usage_records", base_table_name.?);
+    try std.testing.expectEqualStrings("", base_select.query.source_cte);
+
+    var mismatch_select = LoweredSelect{
+        .table_name = try alloc.dupe(u8, "other_records"),
+        .query = .{},
+    };
+    defer mismatch_select.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, resolveSelectSourceForPlanAlloc(alloc, &mismatch_select, &ctes, &base_table_name));
+}
+
+test "sql adapter plan resolves join CTE sides to physical base table" {
+    const alloc = std.testing.allocator;
+    const ctes = [_]db_mod.types.RelationalRowsCte{.{ .name = "recent_usage" }};
+
+    var base_table_name: ?[]const u8 = try alloc.dupe(u8, "usage_records");
+    defer if (base_table_name) |table| alloc.free(table);
+
+    var lowered = LoweredJoin{
+        .left_table_name = try alloc.dupe(u8, "usage_records"),
+        .right_table_name = try alloc.dupe(u8, "recent_usage"),
+        .join = .{},
+    };
+    defer lowered.deinit(alloc);
+
+    try resolveJoinSourcesForPlanAlloc(alloc, &lowered, &ctes, &base_table_name);
+    try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", lowered.right_table_name);
+    try std.testing.expectEqualStrings("", lowered.join.left.source_cte);
+    try std.testing.expectEqualStrings("recent_usage", lowered.join.right.source_cte);
 }
 
 test "sql adapter lowered write containers own nested request memory" {

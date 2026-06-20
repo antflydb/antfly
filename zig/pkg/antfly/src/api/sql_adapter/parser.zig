@@ -207,6 +207,11 @@ pub fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usiz
     return null;
 }
 
+pub fn findMatchingRParenAfterOpenIndex(tokens: []const Token, pos_after_lparen: usize) ?usize {
+    if (pos_after_lparen == 0) return null;
+    return findMatchingRParenIndex(tokens, pos_after_lparen - 1);
+}
+
 pub fn stripBalancedOuterParens(raw_tokens: []const Token) []const Token {
     var tokens = raw_tokens;
     while (tokens.len >= 2 and tokens[0].kind == .lparen and tokens[tokens.len - 1].kind == .rparen) {
@@ -272,6 +277,30 @@ pub fn hasTopLevelOrBeforeTail(
         }
     }
     return false;
+}
+
+pub fn hasTopLevelOrBeforeCloseParen(tokens: []const Token, start: usize) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "or")) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+pub fn predicateStartIndexAfterOpenParens(tokens: []const Token, index: usize) usize {
+    var out = index;
+    while (out < tokens.len and tokens[out].kind == .lparen) : (out += 1) {}
+    return out;
 }
 
 pub fn findTopLevelTailIndex(
@@ -369,6 +398,7 @@ test "sql adapter parser strips balanced outer parens and parses wrapped identif
     const stripped = stripBalancedOuterParens(tokens[0..]);
     try std.testing.expectEqual(@as(usize, 1), stripped.len);
     try std.testing.expectEqualStrings("status", stripped[0].text);
+    try std.testing.expectEqual(@as(usize, 4), findMatchingRParenAfterOpenIndex(tokens[0..], 1).?);
 
     var idx: usize = 0;
     const wrapped = try parseWrappedIdentifierOperand(tokens[1..4], &idx);
@@ -409,6 +439,30 @@ test "sql adapter parser detects top-level OR before tail clauses" {
         .{ .kind = .identifier, .text = "order" },
     };
     try std.testing.expect(!hasTopLevelOrBeforeTail(nested_tokens[0..], 0, testWhereTailKeyword));
+
+    const before_close_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "a" },
+        .{ .kind = .identifier, .text = "or" },
+        .{ .kind = .identifier, .text = "b" },
+        .{ .kind = .rparen, .text = ")" },
+    };
+    try std.testing.expect(hasTopLevelOrBeforeCloseParen(before_close_tokens[0..], 0));
+
+    const after_close_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "a" },
+        .{ .kind = .rparen, .text = ")" },
+        .{ .kind = .identifier, .text = "or" },
+        .{ .kind = .identifier, .text = "b" },
+    };
+    try std.testing.expect(!hasTopLevelOrBeforeCloseParen(after_close_tokens[0..], 0));
+
+    const wrapped_tokens = [_]Token{
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "status" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), predicateStartIndexAfterOpenParens(wrapped_tokens[0..], 0));
+    try std.testing.expectEqual(@as(usize, 2), predicateStartIndexAfterOpenParens(wrapped_tokens[0..], 2));
 }
 
 fn testWhereTailKeyword(text: []const u8) bool {

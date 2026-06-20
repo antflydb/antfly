@@ -16,6 +16,7 @@ const std = @import("std");
 const binder = @import("binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
+const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const value_mod = @import("value.zig");
@@ -475,6 +476,17 @@ pub const AlterTableOperation = union(enum) {
     validate_constraint: []const u8,
 };
 
+pub fn appendAlterTableOperation(
+    alloc: std.mem.Allocator,
+    operations: *std.ArrayListUnmanaged(AlterTableOperation),
+    operation: AlterTableOperation,
+) !void {
+    var operation_transferred = false;
+    errdefer if (!operation_transferred) freeAlterTableOperation(alloc, operation);
+    try operations.append(alloc, operation);
+    operation_transferred = true;
+}
+
 pub const AddColumnOperation = struct {
     column: runtime_schema.RelationalColumn,
     if_not_exists: bool = false,
@@ -583,6 +595,126 @@ pub const DdlIndexOpClass = enum {
     jsonb_path_ops,
     array_ops,
 };
+
+pub fn runtimeSchemaFromCreateTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    plan: CreateTablePlan,
+) !runtime_schema.TableSchema {
+    try lower_expr.validateRelationalColumnCatalog(plan.columns);
+    try binder.validateRelationalPeriodCatalog(plan.columns, plan.periods);
+    if (plan.primary_key) |primary_key| {
+        try lower_expr.validatePrimaryKeyColumns(plan.columns, primary_key);
+        try binder.validatePrimaryKeyTemporalCatalog(plan.periods, primary_key);
+    }
+    try lower_expr.validateUniqueConstraintCatalog(plan.columns, plan.periods, plan.unique_constraints);
+    try lower_expr.validateForeignKeyCatalog(plan.columns, plan.periods, plan.foreign_keys);
+    try lower_expr.validateRelationalCheckCatalog(plan.columns, plan.checks);
+    for (plan.columns) |column| {
+        if (column.default_value) |default_value| try value_mod.validateDefaultValueForColumnAlloc(alloc, column, default_value);
+        if (column.on_update_value) |on_update_value| try value_mod.validateDefaultValueForColumnAlloc(alloc, column, on_update_value);
+    }
+
+    const default_type = try alloc.dupe(u8, "_default");
+    const ttl_field = alloc.dupe(u8, "_timestamp") catch |err| {
+        alloc.free(default_type);
+        return err;
+    };
+    var schema: runtime_schema.TableSchema = .{
+        .default_type = default_type,
+        .ttl_field = ttl_field,
+        .enforce_types = true,
+        .storage_mode = .relational,
+    };
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    schema.relational_columns = try cloneDdlRelationalColumns(alloc, plan.columns);
+    schema.primary_key = try cloneDdlPrimaryKeyMaybe(alloc, plan.primary_key);
+    schema.periods = try cloneDdlPeriods(alloc, plan.periods);
+    schema.unique_constraints = try cloneDdlUniqueConstraints(alloc, plan.unique_constraints);
+    schema.foreign_keys = try cloneDdlForeignKeys(alloc, plan.foreign_keys);
+    schema.checks = try cloneDdlRelationalChecks(alloc, plan.checks);
+    return schema;
+}
+
+fn clearClonedColumnDefault(alloc: std.mem.Allocator, column: *runtime_schema.RelationalColumn) void {
+    if (column.default_value) |value| alloc.free(value.value_json);
+    column.default_value = null;
+}
+
+fn clearClonedColumnGenerated(alloc: std.mem.Allocator, column: *runtime_schema.RelationalColumn) void {
+    if (column.generated) |generated| freeDdlGeneratedValue(alloc, generated);
+    column.generated = null;
+}
+
+fn clearClonedColumnUpdatePolicy(alloc: std.mem.Allocator, column: *runtime_schema.RelationalColumn) void {
+    if (column.on_update_value) |value| alloc.free(value.value_json);
+    column.on_update_value = null;
+}
+
+fn clearClonedColumnIndexMetadata(alloc: std.mem.Allocator, column: *runtime_schema.RelationalColumn) void {
+    if (column.index_name) |index_name| alloc.free(index_name);
+    column.index_name = null;
+    freeStringSlice(alloc, column.index_include_columns);
+    column.index_include_columns = &.{};
+    column.indexed = false;
+    column.index_lifecycle = .ready;
+    column.index_generation = 0;
+    freeDdlUniquePredicates(alloc, column.index_where);
+    column.index_where = &.{};
+    freeExpressionConditions(alloc, column.index_where_expressions);
+    if (column.index_where_expressions.len > 0) alloc.free(column.index_where_expressions);
+    column.index_where_expressions = &.{};
+}
+
+pub fn createTablePlanFromTableCloneSourceAlloc(
+    alloc: std.mem.Allocator,
+    source: runtime_schema.TableSchema,
+    plan: TableClonePlan,
+) !CreateTablePlan {
+    if (source.storage_mode != .relational) return error.InvalidSqlCatalog;
+    if (!plan.options.columns or !plan.options.constraints or source.primary_key == null) return error.UnsupportedSqlShape;
+
+    const table_name = try alloc.dupe(u8, plan.table_name);
+    errdefer alloc.free(table_name);
+
+    var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer {
+        clearDdlRelationalColumns(alloc, columns.items);
+        columns.deinit(alloc);
+    }
+    for (source.relational_columns) |source_column| {
+        var column = try cloneDdlRelationalColumn(alloc, source_column);
+        var column_transferred = false;
+        errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
+        if (!plan.options.defaults) clearClonedColumnDefault(alloc, &column);
+        if (!plan.options.generated) clearClonedColumnGenerated(alloc, &column);
+        if (!plan.options.update_policies) clearClonedColumnUpdatePolicy(alloc, &column);
+        if (!plan.options.indexes) clearClonedColumnIndexMetadata(alloc, &column);
+        try columns.append(alloc, column);
+        column_transferred = true;
+    }
+
+    const primary_key = try cloneDdlPrimaryKey(alloc, source.primary_key.?);
+    errdefer freeDdlPrimaryKey(alloc, primary_key);
+    const periods = if (plan.options.periods) try cloneDdlPeriods(alloc, source.periods) else &.{};
+    errdefer freeDdlPeriods(alloc, periods);
+    const unique_constraints = if (plan.options.constraints) try cloneDdlUniqueConstraints(alloc, source.unique_constraints) else &.{};
+    errdefer freeDdlUniqueConstraints(alloc, unique_constraints);
+    const foreign_keys = if (plan.options.constraints) try cloneDdlForeignKeys(alloc, source.foreign_keys) else &.{};
+    errdefer freeDdlForeignKeys(alloc, foreign_keys);
+    const checks = if (plan.options.checks or plan.options.constraints) try cloneDdlRelationalChecks(alloc, source.checks) else &.{};
+    errdefer freeDdlRelationalChecks(alloc, checks);
+
+    return .{
+        .table_name = table_name,
+        .if_not_exists = plan.if_not_exists,
+        .columns = try columns.toOwnedSlice(alloc),
+        .primary_key = primary_key,
+        .periods = periods,
+        .unique_constraints = unique_constraints,
+        .foreign_keys = foreign_keys,
+        .checks = checks,
+    };
+}
 
 pub const AppliedDdlWorkAction = enum {
     rebuild,
@@ -2359,6 +2491,24 @@ pub fn constraintCheckModeFromSyntax(syntax: grammar.ConstraintCheckModeSyntax) 
     };
 }
 
+pub const DdlForeignKeyOptions = struct {
+    on_delete: runtime_schema.ForeignKeyAction = .restrict,
+    on_update: runtime_schema.ForeignKeyAction = .restrict,
+    deferrable: bool = false,
+    timing: runtime_schema.ForeignKeyTiming = .immediate,
+    match: runtime_schema.ForeignKeyMatch = .simple,
+};
+
+pub fn ddlForeignKeyOptionsFromSyntax(options: grammar.DdlForeignKeyOptionsSyntax) DdlForeignKeyOptions {
+    return .{
+        .on_delete = ddlForeignKeyActionFromSyntax(options.on_delete),
+        .on_update = ddlForeignKeyActionFromSyntax(options.on_update),
+        .deferrable = options.deferrable,
+        .timing = ddlForeignKeyTimingFromSyntax(options.timing),
+        .match = ddlForeignKeyMatchFromSyntax(options.match),
+    };
+}
+
 pub fn ddlForeignKeyActionFromSyntax(action: grammar.DdlForeignKeyActionSyntax) runtime_schema.ForeignKeyAction {
     return switch (action) {
         .restrict => .restrict,
@@ -2443,6 +2593,912 @@ pub fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) grammar.Priv
         .grant => .grant,
         .revoke => .revoke,
     };
+}
+
+pub fn createRoutinePlanFromSyntax(syntax: *grammar.CreateRoutineSyntax, replace_existing: bool) CreateRoutinePlan {
+    const routine_name = syntax.routine_name;
+    const returns_type = syntax.returns_type;
+    const language = syntax.language;
+    const volatility = syntax.volatility;
+    const security = syntax.security;
+    const null_input = syntax.null_input;
+    const parallel_safety = syntax.parallel_safety;
+    const leakproof = syntax.leakproof;
+    const window = syntax.window;
+    const support_function = syntax.support_function;
+    const transform_types = syntax.transform_types;
+    const settings = syntax.settings;
+    const cost = syntax.cost;
+    const rows = syntax.rows;
+    const body = syntax.body;
+    syntax.routine_name = "";
+    syntax.returns_type = null;
+    syntax.language = null;
+    syntax.support_function = null;
+    syntax.transform_types = &.{};
+    syntax.settings = &.{};
+    syntax.cost = null;
+    syntax.rows = null;
+    syntax.body = null;
+    return .{
+        .kind = routineKindFromSyntax(syntax.kind),
+        .routine_name = routine_name,
+        .replace_existing = replace_existing,
+        .argument_count = syntax.argument_count,
+        .returns_type = returns_type,
+        .language = language,
+        .volatility = volatility,
+        .security = security,
+        .null_input = null_input,
+        .parallel_safety = parallel_safety,
+        .leakproof = leakproof,
+        .window = window,
+        .support_function = support_function,
+        .transform_types = transform_types,
+        .settings = settings,
+        .cost = cost,
+        .rows = rows,
+        .body = body,
+    };
+}
+
+pub fn dropRoutinePlanFromSyntax(syntax: *grammar.DropRoutineSyntax) DropRoutinePlan {
+    const routine_name = syntax.routine_name;
+    syntax.routine_name = "";
+    return .{
+        .kind = routineKindFromSyntax(syntax.kind),
+        .routine_name = routine_name,
+        .if_exists = syntax.if_exists,
+        .argument_count = syntax.argument_count,
+        .cascade = syntax.cascade,
+    };
+}
+
+pub fn createRolePlanFromSyntax(syntax: *grammar.CreateRoleSyntax) CreateRolePlan {
+    const role_name = syntax.role_name;
+    syntax.role_name = "";
+    return .{ .role_name = role_name };
+}
+
+pub fn alterRolePlanFromSyntax(syntax: *grammar.AlterRoleSyntax) AlterRolePlan {
+    const role_name = syntax.role_name;
+    const database_name = syntax.database_name;
+    const operation = syntax.operation;
+    const setting_kind = syntax.setting_kind;
+    const setting_name = syntax.setting_name;
+    const setting_value = syntax.setting_value;
+    syntax.role_name = "";
+    syntax.database_name = null;
+    syntax.setting_name = "";
+    syntax.setting_value = null;
+    return .{
+        .role_name = role_name,
+        .database_name = database_name,
+        .operation = operation,
+        .setting_kind = setting_kind,
+        .setting_name = setting_name,
+        .setting_value = setting_value,
+    };
+}
+
+pub fn dropRolePlanFromSyntax(syntax: *grammar.DropRoleSyntax) DropRolePlan {
+    const role_name = syntax.role_name;
+    syntax.role_name = "";
+    return .{ .role_name = role_name, .if_exists = syntax.if_exists };
+}
+
+pub fn privilegeChangePlanFromSyntax(syntax: *grammar.PrivilegeChangeSyntax) PrivilegeChangePlan {
+    const privileges = syntax.privileges;
+    const object_kind = syntax.object_kind;
+    const object_name = syntax.object_name;
+    const principal_name = syntax.principal_name;
+    syntax.privileges = &.{};
+    syntax.object_kind = "";
+    syntax.object_name = "";
+    syntax.principal_name = "";
+    return .{
+        .privileges = privileges,
+        .object_kind = object_kind,
+        .object_name = object_name,
+        .principal_name = principal_name,
+    };
+}
+
+pub fn parseCreateRoutinePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    replace_existing: bool,
+) !CreateRoutinePlan {
+    var syntax = try grammar.parseCreateRoutineCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createRoutinePlanFromSyntax(&syntax, replace_existing);
+}
+
+pub fn parseDropRoutinePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropRoutinePlan {
+    var syntax = try grammar.parseDropRoutineCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropRoutinePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateRolePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateRolePlan {
+    var syntax = try grammar.parseCreateRoleCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createRolePlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterRolePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterRolePlan {
+    var syntax = try grammar.parseAlterRoleCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return alterRolePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropRolePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropRolePlan {
+    var syntax = try grammar.parseDropRoleCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropRolePlanFromSyntax(&syntax);
+}
+
+pub fn parsePrivilegeChangePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    action: PrivilegeChangeAction,
+) !PrivilegeChangePlan {
+    var syntax = try grammar.parsePrivilegeChangeTailAlloc(alloc, tokens, pos, privilegeChangeActionToSyntax(action));
+    errdefer syntax.deinit(alloc);
+    return privilegeChangePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateSchemaNamespacePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateSchemaNamespacePlan {
+    var syntax = try grammar.parseCreateSchemaNamespaceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createSchemaNamespacePlanFromSyntax(&syntax);
+}
+
+pub fn parseRenameSchemaNamespacePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !RenameSchemaNamespacePlan {
+    var syntax = try grammar.parseRenameSchemaNamespaceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return renameSchemaNamespacePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropSchemaNamespacePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropSchemaNamespacePlan {
+    var syntax = try grammar.parseDropSchemaNamespaceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropSchemaNamespacePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateExtensionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    default_namespace_name: []const u8,
+) !CreateExtensionPlan {
+    var syntax = try grammar.parseCreateExtensionCatalogTailAlloc(alloc, tokens, pos);
+    defer syntax.deinit(alloc);
+    return try createExtensionPlanFromSyntax(&syntax, default_namespace_name);
+}
+
+pub fn parseUpdateExtensionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !UpdateExtensionPlan {
+    var syntax = try grammar.parseUpdateExtensionCatalogTailAlloc(alloc, tokens, pos);
+    defer syntax.deinit(alloc);
+    return updateExtensionPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropExtensionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropExtensionPlan {
+    var syntax = try grammar.parseDropExtensionCatalogTailAlloc(alloc, tokens, pos);
+    defer syntax.deinit(alloc);
+    return dropExtensionPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateDatabasePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateDatabasePlan {
+    var syntax = try grammar.parseCreateDatabaseCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createDatabasePlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterDatabasePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterDatabasePlan {
+    var syntax = try grammar.parseAlterDatabaseCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return try alterDatabasePlanFromSyntaxAlloc(alloc, &syntax);
+}
+
+pub fn parseDropDatabasePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropDatabasePlan {
+    var syntax = try grammar.parseDropDatabaseCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropDatabasePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateTablespacePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateTablespacePlan {
+    var syntax = try grammar.parseCreateTablespaceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createTablespacePlanFromSyntax(&syntax);
+}
+
+pub fn parseRenameTablespacePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !RenameTablespacePlan {
+    var syntax = try grammar.parseRenameTablespaceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return renameTablespacePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropTablespacePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropTablespacePlan {
+    var syntax = try grammar.parseDropTablespaceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropTablespacePlanFromSyntax(&syntax);
+}
+
+pub fn parseListenNotificationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !ListenNotificationPlan {
+    var syntax = try grammar.parseListenNotificationTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return listenNotificationPlanFromSyntax(&syntax);
+}
+
+pub fn parseNotifyNotificationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !NotifyNotificationPlan {
+    var syntax = try grammar.parseNotifyNotificationTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return notifyNotificationPlanFromSyntax(&syntax);
+}
+
+pub fn parseUnlistenNotificationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !UnlistenNotificationPlan {
+    var syntax = try grammar.parseUnlistenNotificationTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return unlistenNotificationPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreatePublicationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreatePublicationPlan {
+    var syntax = try grammar.parseCreatePublicationCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createPublicationPlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterPublicationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterPublicationPlan {
+    var syntax = try grammar.parseAlterPublicationCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return alterPublicationPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropPublicationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropPublicationPlan {
+    var syntax = try grammar.parseDropPublicationCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropPublicationPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateSubscriptionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateSubscriptionPlan {
+    var syntax = try grammar.parseCreateSubscriptionCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createSubscriptionPlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterSubscriptionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterSubscriptionPlan {
+    var syntax = try grammar.parseAlterSubscriptionCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return alterSubscriptionPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropSubscriptionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropSubscriptionPlan {
+    var syntax = try grammar.parseDropSubscriptionCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropSubscriptionPlanFromSyntax(&syntax);
+}
+
+pub fn parseVacuumMaintenancePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !VacuumMaintenancePlan {
+    var syntax = try grammar.parseVacuumMaintenanceTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return vacuumMaintenancePlanFromSyntax(&syntax);
+}
+
+pub fn parseAnalyzeMaintenancePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AnalyzeMaintenancePlan {
+    var syntax = try grammar.parseAnalyzeMaintenanceTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return analyzeMaintenancePlanFromSyntax(&syntax);
+}
+
+pub fn parseReindexMaintenancePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !ReindexMaintenancePlan {
+    var syntax = try grammar.parseReindexMaintenanceTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return reindexMaintenancePlanFromSyntax(&syntax);
+}
+
+pub fn parseClusterMaintenancePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !ClusterMaintenancePlan {
+    var syntax = try grammar.parseClusterMaintenanceTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return clusterMaintenancePlanFromSyntax(&syntax);
+}
+
+pub fn parsePrepareStatementPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !PrepareStatementPlan {
+    const syntax = try grammar.parsePrepareStatementTail(tokens, pos);
+    return try prepareStatementPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseExecutePreparedStatementPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !ExecutePreparedStatementPlan {
+    const syntax = try grammar.parseExecutePreparedStatementTail(tokens, pos);
+    return try executePreparedStatementPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseDeallocatePreparedStatementPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DeallocatePreparedStatementPlan {
+    const syntax = try grammar.parseDeallocatePreparedStatementTail(tokens, pos);
+    return try deallocatePreparedStatementPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseDeclareCursorPortalPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DeclareCursorPortalPlan {
+    const syntax = try grammar.parseDeclareCursorPortalTail(tokens, pos);
+    return try declareCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseFetchCursorPortalPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !FetchCursorPortalPlan {
+    const syntax = try grammar.parseFetchCursorPortalTail(tokens, pos);
+    return try fetchCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseCloseCursorPortalPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CloseCursorPortalPlan {
+    const syntax = try grammar.parseCloseCursorPortalTail(tokens, pos);
+    return try closeCursorPortalPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseSavepointTransactionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !SavepointNamePlan {
+    const syntax = try grammar.parseSavepointTransactionTail(tokens, pos);
+    return try savepointNamePlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseReleaseSavepointPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !SavepointNamePlan {
+    const syntax = try grammar.parseReleaseSavepointTail(tokens, pos);
+    return try savepointNamePlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseRollbackToSavepointPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !SavepointNamePlan {
+    const syntax = try grammar.parseRollbackToSavepointTail(tokens, pos);
+    return try savepointNamePlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseCommentMetadataPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CommentMetadataPlan {
+    var syntax = try grammar.parseCommentMetadataCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return commentMetadataPlanFromSyntax(&syntax);
+}
+
+pub fn parseTableLockPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !TableLockPlan {
+    var syntax = try grammar.parseTableLockTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return tableLockPlanFromSyntax(&syntax);
+}
+
+pub fn parseConstraintModePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !ConstraintModePlan {
+    var syntax = try grammar.parseConstraintModeTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return constraintModePlanFromSyntax(&syntax);
+}
+
+pub fn parseTransactionModePlanTail(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    starter: TransactionModeStarter,
+) !TransactionModePlan {
+    const syntax = try grammar.parseTransactionModeTail(tokens, pos, transactionModeStarterToSyntax(starter));
+    return transactionModePlanFromSyntax(syntax);
+}
+
+pub fn parseAdvisoryLockPlanTail(
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AdvisoryLockPlan {
+    const syntax = try grammar.parseAdvisoryLockTail(tokens, pos);
+    return advisoryLockPlanFromSyntax(syntax);
+}
+
+pub fn parseCreateCollationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateCollationPlan {
+    var syntax = try grammar.parseCreateCollationCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createCollationPlanFromSyntax(&syntax);
+}
+
+pub fn parseRenameCollationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !RenameCollationPlan {
+    var syntax = try grammar.parseRenameCollationCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return renameCollationPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropCollationPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropCollationPlan {
+    var syntax = try grammar.parseDropCollationCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropCollationPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateOperatorPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateOperatorPlan {
+    var syntax = try grammar.parseCreateOperatorCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createOperatorPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropOperatorPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropOperatorPlan {
+    var syntax = try grammar.parseDropOperatorCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropOperatorPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateAggregatePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateAggregatePlan {
+    var syntax = try grammar.parseCreateAggregateCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createAggregatePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropAggregatePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropAggregatePlan {
+    var syntax = try grammar.parseDropAggregateCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropAggregatePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateCastPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateCastPlan {
+    var syntax = try grammar.parseCreateCastCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createCastPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropCastPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropCastPlan {
+    var syntax = try grammar.parseDropCastCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropCastPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropDomainPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropDomainPlan {
+    var syntax = try grammar.parseDropDomainCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropDomainPlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterDomainPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterDomainPlan {
+    return try grammar.parseAlterDomainCatalogTailAlloc(alloc, tokens, pos);
+}
+
+pub fn parseCreateSequencePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateSequencePlan {
+    var syntax = try grammar.parseCreateSequenceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createSequencePlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterSequencePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterSequencePlan {
+    var syntax = try grammar.parseAlterSequenceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return alterSequencePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropSequencePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropSequencePlan {
+    var syntax = try grammar.parseDropSequenceCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropSequencePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateEnumTypePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateEnumTypePlan {
+    var syntax = try grammar.parseCreateEnumTypeCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createEnumTypePlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterEnumTypePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AddEnumValuePlan {
+    var syntax = try grammar.parseAlterEnumTypeCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return addEnumValuePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropEnumTypePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropEnumTypePlan {
+    var syntax = try grammar.parseDropEnumTypeCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropEnumTypePlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateMaterializedViewPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    replace_existing: bool,
+) !CreateMaterializedViewPlan {
+    var syntax = try grammar.parseCreateMaterializedViewCatalogTailAlloc(alloc, tokens, pos, replace_existing);
+    errdefer syntax.deinit(alloc);
+    return createMaterializedViewPlanFromSyntax(&syntax);
+}
+
+pub fn parseRefreshMaterializedViewPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !RefreshMaterializedViewPlan {
+    var syntax = try grammar.parseRefreshMaterializedViewCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return refreshMaterializedViewPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropMaterializedViewPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropMaterializedViewPlan {
+    var syntax = try grammar.parseDropMaterializedViewCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropMaterializedViewPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateViewPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    replace_existing: bool,
+) !CreateViewPlan {
+    var syntax = try grammar.parseCreateViewCatalogTailAlloc(alloc, tokens, pos, replace_existing);
+    errdefer syntax.deinit(alloc);
+    return createViewPlanFromSyntax(&syntax);
+}
+
+pub fn parseRenameViewPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !RenameViewPlan {
+    var syntax = try grammar.parseRenameViewCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return renameViewPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropViewPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropViewPlan {
+    var syntax = try grammar.parseDropViewCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropViewPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropTablePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropTablePlan {
+    var syntax = try grammar.parseDropTableCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropTablePlanFromSyntax(&syntax);
+}
+
+pub fn parseDropIndexPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropIndexPlan {
+    var syntax = try grammar.parseDropIndexCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropIndexPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropUpdatePolicyTriggerPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterTablePlan {
+    var syntax = try grammar.parseDropUpdatePolicyTriggerCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return try dropUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &syntax);
+}
+
+pub fn parseCreateUpdatePolicyTriggerPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateUpdatePolicyPlan {
+    var syntax = try grammar.parseCreateUpdatePolicyTriggerCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return try createUpdatePolicyTriggerPlanFromSyntaxAlloc(alloc, &syntax);
+}
+
+pub fn parseAlterRowSecurityPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterRowSecurityPlan {
+    const syntax = (try grammar.parseAlterRowSecurity(tokens, pos)) orelse return error.UnsupportedSqlShape;
+    return try alterRowSecurityPlanFromSyntaxAlloc(alloc, syntax);
+}
+
+pub fn parseCreateRowSecurityPolicyPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateRowSecurityPolicyPlan {
+    var syntax = try grammar.parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return createRowSecurityPolicyPlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterRowSecurityPolicyPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !AlterRowSecurityPolicyPlan {
+    var syntax = try grammar.parseAlterRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return alterRowSecurityPolicyPlanFromSyntax(&syntax);
+}
+
+pub fn parseDropRowSecurityPolicyPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !DropRowSecurityPolicyPlan {
+    var syntax = try grammar.parseDropRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return dropRowSecurityPolicyPlanFromSyntax(&syntax);
+}
+
+pub fn parseCreateTableClonePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !TableClonePlan {
+    return try grammar.parseCreateTableCloneCatalogTailAlloc(alloc, tokens, pos);
+}
+
+pub fn parseCreateTablePartitionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateTablePartitionPlan {
+    return try grammar.parseCreateTablePartitionCatalogTailAlloc(alloc, tokens, pos);
+}
+
+pub fn parseCreatePartitionedTablePlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    create_table: CreateTablePlan,
+) !CreatePartitionedTablePlan {
+    var tail = try grammar.parseCreatePartitionedTableCatalogTailAlloc(alloc, tokens, pos);
+    var tail_transferred = false;
+    errdefer if (!tail_transferred) tail.deinit(alloc);
+    const keys = tail.keys;
+    var keys_transferred = false;
+    errdefer if (!keys_transferred) freeStringSlice(alloc, keys);
+
+    tail.keys = &.{};
+    tail_transferred = true;
+    keys_transferred = true;
+    return .{
+        .create_table = create_table,
+        .method = tail.method,
+        .keys = keys,
+    };
+}
+
+pub fn parseAlterTablePartitionPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !TablePartitionCatalogPlan {
+    return try grammar.parseAlterTablePartitionCatalogTailAlloc(alloc, tokens, pos);
 }
 
 pub fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
@@ -3353,6 +4409,163 @@ pub fn appendDdlUniqueConstraintBuilderAlloc(
     transferred = true;
 }
 
+pub fn ddlPeriodFromSyntax(syntax: *grammar.DdlPeriodSyntax) runtime_schema.RelationalPeriod {
+    const name = syntax.name;
+    const start_column = syntax.start_column;
+    const end_column = syntax.end_column;
+    syntax.name = "";
+    syntax.start_column = "";
+    syntax.end_column = "";
+    return .{
+        .name = name,
+        .start_column = start_column,
+        .end_column = end_column,
+    };
+}
+
+pub fn makeDdlForeignKeyAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    child: grammar.DdlForeignKeyColumnListSyntax,
+    parent_table: []const u8,
+    parent: grammar.DdlForeignKeyColumnListSyntax,
+    options: DdlForeignKeyOptions,
+) !runtime_schema.ForeignKey {
+    if ((child.period == null) != (parent.period == null)) return error.UnsupportedSqlShape;
+    if (child.period != null and !binder.foreignKeyActionSupportsTemporalUpdate(options.on_update)) return error.UnsupportedSqlShape;
+    return try makeDdlForeignKeyFromPartsAlloc(
+        alloc,
+        constraint_name,
+        child.columns,
+        child.period,
+        parent_table,
+        parent.columns,
+        parent.period,
+        options,
+    );
+}
+
+pub fn makeDdlInlineForeignKeyAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    child_columns: []const []const u8,
+    parent_table: []const u8,
+    parent_columns: []const []const u8,
+    options: DdlForeignKeyOptions,
+) !runtime_schema.ForeignKey {
+    return try makeDdlForeignKeyFromPartsAlloc(
+        alloc,
+        constraint_name,
+        child_columns,
+        null,
+        parent_table,
+        parent_columns,
+        null,
+        options,
+    );
+}
+
+pub fn makeDdlRelationalCheckFromExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) !runtime_schema.RelationalCheck {
+    const name = try ddlCheckConstraintNameAlloc(alloc, constraint_name, condition);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+
+    if (try simpleDdlRelationalCheckFromExpressionConditionAlloc(alloc, name, condition)) |check| {
+        alloc.free(name);
+        return check;
+    }
+
+    const field = try alloc.dupe(u8, "");
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const expression = try plan_mod.cloneExpressionConditionAlloc(alloc, condition);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) plan_mod.freeExpressionCondition(alloc, expression);
+    name_transferred = true;
+    field_transferred = true;
+    expression_transferred = true;
+    return .{ .name = name, .field = field, .expression = expression };
+}
+
+fn ddlCheckConstraintNameAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) ![]const u8 {
+    if (constraint_name) |name| return try alloc.dupe(u8, name);
+    if (condition.lhs.kind == .field and condition.lhs.field.len > 0) {
+        return try std.fmt.allocPrint(alloc, "{s}_{s}_check", .{ condition.lhs.field, relationalCheckOpToken(condition.op) });
+    }
+    return try std.fmt.allocPrint(alloc, "expression_{s}_check", .{relationalCheckOpToken(condition.op)});
+}
+
+fn simpleDdlRelationalCheckFromExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) !?runtime_schema.RelationalCheck {
+    if (condition.lhs.kind != .field or condition.lhs.field.len == 0 or condition.lhs.field_source != .row) return null;
+    const value_json: ?[]const u8 = switch (condition.op) {
+        .is_null, .is_not_null => if (condition.rhs.len == 0) null else return null,
+        else => blk: {
+            if (condition.rhs.len != 1 or condition.rhs[0].kind != .value or condition.rhs[0].value_json.len == 0) return null;
+            break :blk condition.rhs[0].value_json;
+        },
+    };
+    const owned_name = try alloc.dupe(u8, name);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(owned_name);
+    const field = try alloc.dupe(u8, condition.lhs.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const owned_value = if (value_json) |value| try alloc.dupe(u8, value) else null;
+    var value_transferred = false;
+    errdefer if (!value_transferred) if (owned_value) |value| alloc.free(value);
+    name_transferred = true;
+    field_transferred = true;
+    value_transferred = true;
+    return .{
+        .name = owned_name,
+        .field = field,
+        .op = condition.op,
+        .value_json = owned_value,
+    };
+}
+
+fn makeDdlForeignKeyFromPartsAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    child_columns: []const []const u8,
+    child_period: ?[]const u8,
+    parent_table: []const u8,
+    parent_columns: []const []const u8,
+    parent_period: ?[]const u8,
+    options: DdlForeignKeyOptions,
+) !runtime_schema.ForeignKey {
+    const name = if (constraint_name) |existing|
+        try alloc.dupe(u8, existing)
+    else
+        try std.fmt.allocPrint(alloc, "{s}_{s}_fkey", .{ parent_table, child_columns[0] });
+    errdefer alloc.free(name);
+    return .{
+        .name = name,
+        .child_columns = child_columns,
+        .child_period = child_period,
+        .parent_table = parent_table,
+        .parent_columns = parent_columns,
+        .parent_period = parent_period,
+        .on_delete = options.on_delete,
+        .on_update = options.on_update,
+        .deferrable = options.deferrable,
+        .timing = options.timing,
+        .match = options.match,
+    };
+}
+
 fn defaultUniqueConstraintNameAlloc(alloc: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(alloc);
@@ -3501,6 +4714,18 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, ddlForeignKeyActionFromSyntax(.cascade));
     try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, ddlForeignKeyTimingFromSyntax(.deferred));
     try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, ddlForeignKeyMatchFromSyntax(.full));
+    const foreign_key_options = ddlForeignKeyOptionsFromSyntax(.{
+        .on_delete = .set_null,
+        .on_update = .cascade,
+        .deferrable = true,
+        .timing = .deferred,
+        .match = .full,
+    });
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, foreign_key_options.on_delete);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, foreign_key_options.on_update);
+    try std.testing.expect(foreign_key_options.deferrable);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, foreign_key_options.timing);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key_options.match);
     try std.testing.expectEqual(grammar.TransactionModeStarterSyntax.begin, transactionModeStarterToSyntax(.begin));
     try std.testing.expectEqual(TransactionModeStarter.start_transaction, transactionModeStarterFromSyntax(.start_transaction));
     try std.testing.expectEqual(TransactionIsolationLevel.repeatable_read, transactionIsolationLevelFromSyntax(.repeatable_read).?);
@@ -3814,6 +5039,17 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         else => return error.TestExpectedEqual,
     }
 
+    var period_syntax: grammar.DdlPeriodSyntax = .{
+        .name = try alloc.dupe(u8, "system_time"),
+        .start_column = try alloc.dupe(u8, "system_from"),
+        .end_column = try alloc.dupe(u8, "system_to"),
+    };
+    const built_period = ddlPeriodFromSyntax(&period_syntax);
+    defer freeDdlPeriod(alloc, built_period);
+    try std.testing.expectEqualStrings("system_time", built_period.name);
+    try std.testing.expectEqualStrings("system_from", built_period.start_column);
+    try std.testing.expectEqualStrings("system_to", built_period.end_column);
+
     var primary_columns = try alloc.alloc([]const u8, 1);
     primary_columns[0] = try alloc.dupe(u8, "id");
     const add_primary_operation = alterTableAddPrimaryKeyOperation(.{
@@ -3880,6 +5116,102 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
         },
         else => return error.TestExpectedEqual,
     }
+
+    const source_primary_columns = [_][]const u8{ "tenant_id", "usage_id" };
+    const source_primary_include = [_][]const u8{"created_at"};
+    const built_primary = try makeDdlPrimaryKeyAlloc(
+        alloc,
+        null,
+        &source_primary_columns,
+        &source_primary_include,
+        "valid_time",
+        .{ .deferrable = true, .timing = .deferred },
+    );
+    defer freeDdlPrimaryKey(alloc, built_primary);
+    try std.testing.expectEqualStrings("tenant_id", built_primary.columns[0]);
+    try std.testing.expectEqualStrings("created_at", built_primary.include_columns[0]);
+    try std.testing.expectEqualStrings("valid_time", built_primary.without_overlaps_period.?);
+    try std.testing.expect(built_primary.deferrable);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, built_primary.timing);
+
+    const source_unique_columns = [_][]const u8{ "tenant_id", "external_id" };
+    const built_unique = try makeDdlUniqueConstraintAlloc(
+        alloc,
+        null,
+        &source_unique_columns,
+        &.{},
+        null,
+        true,
+        .{},
+    );
+    defer freeDdlUniqueConstraint(alloc, built_unique);
+    try std.testing.expectEqualStrings("tenant_id_external_id_key", built_unique.name);
+    try std.testing.expect(built_unique.nulls_not_distinct);
+
+    var built_unique_constraints = std.ArrayListUnmanaged(runtime_schema.UniqueConstraint).empty;
+    defer {
+        clearDdlUniqueConstraints(alloc, built_unique_constraints.items);
+        built_unique_constraints.deinit(alloc);
+    }
+    try appendDdlUniqueConstraintBuilderAlloc(
+        alloc,
+        &built_unique_constraints,
+        "usage_external_unique",
+        &source_unique_columns,
+        &.{},
+        null,
+        false,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 1), built_unique_constraints.items.len);
+    try std.testing.expectEqualStrings("usage_external_unique", built_unique_constraints.items[0].name);
+
+    var fk_child_columns = try alloc.alloc([]const u8, 1);
+    fk_child_columns[0] = try alloc.dupe(u8, "tenant_id");
+    var fk_parent_columns = try alloc.alloc([]const u8, 1);
+    fk_parent_columns[0] = try alloc.dupe(u8, "id");
+    const built_foreign_key = try makeDdlForeignKeyAlloc(
+        alloc,
+        null,
+        .{ .columns = fk_child_columns },
+        try alloc.dupe(u8, "tenants"),
+        .{ .columns = fk_parent_columns },
+        .{ .on_delete = .cascade },
+    );
+    defer freeDdlForeignKey(alloc, built_foreign_key);
+    try std.testing.expectEqualStrings("tenants_tenant_id_fkey", built_foreign_key.name);
+    try std.testing.expectEqualStrings("tenant_id", built_foreign_key.child_columns[0]);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, built_foreign_key.on_delete);
+
+    var inline_child_columns = try alloc.alloc([]const u8, 1);
+    inline_child_columns[0] = try alloc.dupe(u8, "account_id");
+    var inline_parent_columns = try alloc.alloc([]const u8, 1);
+    inline_parent_columns[0] = try alloc.dupe(u8, "id");
+    const built_inline_foreign_key = try makeDdlInlineForeignKeyAlloc(
+        alloc,
+        "usage_account_fk",
+        inline_child_columns,
+        try alloc.dupe(u8, "accounts"),
+        inline_parent_columns,
+        .{ .match = .full },
+    );
+    defer freeDdlForeignKey(alloc, built_inline_foreign_key);
+    try std.testing.expectEqualStrings("usage_account_fk", built_inline_foreign_key.name);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, built_inline_foreign_key.match);
+
+    const built_check = try makeDdlRelationalCheckFromExpressionConditionAlloc(
+        alloc,
+        null,
+        .{
+            .lhs = .{ .kind = .field, .field = "amount", .field_source = .row },
+            .op = .gte,
+            .rhs = &.{.{ .kind = .value, .value_json = "0" }},
+        },
+    );
+    defer freeDdlRelationalCheck(alloc, built_check);
+    try std.testing.expectEqualStrings("amount_gte_check", built_check.name);
+    try std.testing.expectEqualStrings("amount", built_check.field);
+    try std.testing.expectEqualStrings("0", built_check.value_json.?);
 
     var sequence_syntax: grammar.CreateSequenceSyntax = .{
         .sequence_name = try alloc.dupe(u8, "usage_seq"),

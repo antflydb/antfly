@@ -20,11 +20,53 @@ const ddl_plan = @import("ddl_plan.zig");
 const json_helpers = @import("../json_helpers.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const schema_api = @import("../../schema/mod.zig");
 
 pub const RelationalSchemaJsonParts = struct {
     schema: *std.json.ObjectMap,
     properties: *std.json.ObjectMap,
 };
+
+pub fn schemaJsonFromCreateTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    plan: ddl_plan.CreateTablePlan,
+) ![]u8 {
+    const runtime = try ddl_plan.runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+    defer runtime_schema.freeSchema(alloc, runtime);
+
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const root = try schemaJsonValueFromCreateTablePlanAlloc(arena, plan);
+    const schema_json = try std.json.Stringify.valueAlloc(alloc, root, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(schema_json);
+    try validateDdlAppliedSchemaJsonAlloc(alloc, schema_json);
+    return schema_json;
+}
+
+pub fn validateDdlAppliedSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !void {
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    if (runtime.storage_mode != .relational) return error.InvalidSqlCatalog;
+}
+
+pub fn schemaJsonFromTableClonePlanAlloc(
+    alloc: std.mem.Allocator,
+    source_schema_json: []const u8,
+    plan: ddl_plan.TableClonePlan,
+) ![]u8 {
+    if (source_schema_json.len == 0) return error.InvalidSqlCatalog;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed.deinit(alloc);
+    const source = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, source);
+
+    var create_table = try ddl_plan.createTablePlanFromTableCloneSourceAlloc(alloc, source, plan);
+    defer create_table.deinit(alloc);
+    return try schemaJsonFromCreateTablePlanAlloc(alloc, create_table);
+}
 
 pub fn schemaJsonValueFromCreateTablePlanAlloc(alloc: std.mem.Allocator, plan: ddl_plan.CreateTablePlan) !std.json.Value {
     var properties = std.json.ObjectMap.empty;
