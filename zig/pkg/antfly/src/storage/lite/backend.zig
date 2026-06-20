@@ -26,7 +26,7 @@ const Allocator = std.mem.Allocator;
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
 pub const StableSnapshotReport = native.StableSnapshotReport;
-pub const VacuumReport = bridge.ContainerStorage.VacuumReport;
+pub const VacuumReport = native.VacuumReport;
 
 pub const Profile = enum {
     native,
@@ -183,7 +183,7 @@ pub const Handle = struct {
 
     pub fn vacuum(self: *Handle) !VacuumReport {
         return switch (self.engine) {
-            .bridge_lsm_container => try self.bridge_storage.?.vacuum(),
+            .bridge_lsm_container => toVacuumReport(try self.bridge_storage.?.vacuum()),
             .native_single_file => try nativeVacuumReport(self),
         };
     }
@@ -250,6 +250,16 @@ fn toCheckReport(report: bridge.ContainerStorage.CheckReport) CheckReport {
         .compact_size = report.compact_size,
         .reclaimable_bytes = report.reclaimable_bytes,
         .issue = report.issue,
+    };
+}
+
+fn toVacuumReport(report: bridge.ContainerStorage.VacuumReport) VacuumReport {
+    return .{
+        .before_size = report.before_size,
+        .after_size = report.after_size,
+        .reclaimed_bytes = report.reclaimed_bytes,
+        .live_file_count = report.live_file_count,
+        .live_bytes = report.live_bytes,
     };
 }
 
