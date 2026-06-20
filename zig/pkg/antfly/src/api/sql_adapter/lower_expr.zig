@@ -624,6 +624,16 @@ pub const NullifRowExpressionParserHooks = struct {
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const RowExpressionInputDomain = enum {
+    text,
+    numeric,
+};
+
+pub const FixedUnaryRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const UnaryNegativeRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
@@ -2319,6 +2329,53 @@ pub fn parseNullifRowExpressionAlloc(
     rhs_transferred = true;
     try type_context.validateExpressionOperandDomains(expression);
     expression_transferred = true;
+    return expression;
+}
+
+pub fn parseTextLengthRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: FixedUnaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try parseTextLengthFunctionCallStart(tokens, pos);
+    return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, .text, hooks);
+}
+
+pub fn parseFixedUnaryRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: RowExpressionTypeContext,
+    input_domain: RowExpressionInputDomain,
+    hooks: FixedUnaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseFixedUnaryFunctionCallStart(tokens, pos, kind);
+    return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, input_domain, hooks);
+}
+
+fn parseUnaryRowExpressionCallRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: RowExpressionTypeContext,
+    input_domain: RowExpressionInputDomain,
+    hooks: FixedUnaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const operand = try hooks.parse_expression(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    switch (input_domain) {
+        .text => try type_context.validateTextRowExpression(operand),
+        .numeric => try type_context.validateNumericRowExpression(operand),
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    operand_transferred = true;
     return expression;
 }
 

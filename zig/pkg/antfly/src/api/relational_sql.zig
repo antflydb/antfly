@@ -3379,6 +3379,13 @@ const Parser = struct {
         };
     }
 
+    fn fixedUnaryRowExpressionParserHooks(self: *@This()) sql_adapter.FixedUnaryRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+        };
+    }
+
     fn unaryNegativeRowExpressionParserHooks(self: *@This()) sql_adapter.UnaryNegativeRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3619,6 +3626,11 @@ const Parser = struct {
     fn parseNullifRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseRowExpressionOperandAlloc();
+    }
+
+    fn parseFixedUnaryRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionAlloc();
     }
 
     fn parseUnaryNegativeRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
@@ -16566,84 +16578,30 @@ const Parser = struct {
     }
 
     fn parseLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseTextLengthFunctionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, kind, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseTextLengthRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseAsciiRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .ascii);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .ascii, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .ascii, self.rowExpressionTypeContext(), .text, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseChrRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .chr);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .chr, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .chr, self.rowExpressionTypeContext(), .numeric, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseAbsRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .abs);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .abs, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .abs, self.rowExpressionTypeContext(), .numeric, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseRoundRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .round);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .round, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .round, self.rowExpressionTypeContext(), .numeric, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseFloorCeilRowExpressionAlloc(
         self: *@This(),
         kind: db_mod.types.RelationalRowsExpressionKind,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, kind);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, kind, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, kind, self.rowExpressionTypeContext(), .numeric, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseModuloRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -34409,6 +34367,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "defaults", createTablePlanDefaultColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "generated", createTablePlanGeneratedColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "system_versioned", plan.system_versioned);
             fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, countCreateTableConstraintTimingFingerprints(plan));
             fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, countForeignKeyOptionFingerprints(plan.foreign_keys));
             break :blk fingerprint;
