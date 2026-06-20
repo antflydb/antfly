@@ -27,6 +27,12 @@ typedef enum antfly_error_code {
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
+typedef enum antfly_txn_status {
+    ANTFLY_TXN_PENDING = 0,
+    ANTFLY_TXN_COMMITTED = 1,
+    ANTFLY_TXN_ABORTED = 2,
+} antfly_txn_status;
+
 typedef struct antfly_slice {
     const uint8_t *ptr;
     size_t len;
@@ -76,6 +82,37 @@ antfly_error_code antfly_db_batch(
     size_t predicate_count,
     uint64_t timestamp_ns,
     uint8_t sync_level
+);
+antfly_error_code antfly_db_begin_transaction_with_id(
+    void *handle,
+    const uint8_t (*txn_id)[16],
+    uint64_t timestamp_ns,
+    const antfly_slice *participants,
+    size_t participant_count
+);
+antfly_error_code antfly_db_write_transaction(
+    void *handle,
+    const uint8_t (*txn_id)[16],
+    const antfly_write_intent *writes,
+    size_t write_count,
+    const antfly_version_predicate *predicates,
+    size_t predicate_count
+);
+antfly_error_code antfly_db_resolve_intents(
+    void *handle,
+    const uint8_t (*txn_id)[16],
+    uint8_t status,
+    uint64_t commit_version
+);
+antfly_error_code antfly_db_get_transaction_status(
+    void *handle,
+    const uint8_t (*txn_id)[16],
+    uint8_t *out_status
+);
+antfly_error_code antfly_db_get_commit_version(
+    void *handle,
+    const uint8_t (*txn_id)[16],
+    uint64_t *out_commit_version
 );
 antfly_error_code antfly_db_lookup_json(void *handle, antfly_slice key, antfly_buffer *out);
 antfly_error_code antfly_db_get_raw(void *handle, antfly_slice key, antfly_buffer *out);

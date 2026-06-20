@@ -5897,6 +5897,29 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &writes_b, writes_b.len, null, 0, 2_000, 0));
 
+    const lite_txn_id: [16]u8 = .{ 0x6c, 0x69, 0x74, 0x65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_begin_transaction_with_id(src_handle, &lite_txn_id, 3_000, null, 0));
+    const txn_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-lite-txn", .len = "doc:capi-lite-txn".len },
+        .value = .{ .ptr = "{\"title\":\"transactional\"}", .len = "{\"title\":\"transactional\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(src_handle, &lite_txn_id, &txn_writes, txn_writes.len, null, 0));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 4_000));
+    var lite_txn_status: u8 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(src_handle, &lite_txn_id, &lite_txn_status));
+    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), lite_txn_status);
+    var lite_txn_commit_version: u64 = 0;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(src_handle, &lite_txn_id, &lite_txn_commit_version));
+    try std.testing.expectEqual(@as(u64, 4_000), lite_txn_commit_version);
+    var lite_txn_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(src_handle, .{
+        .ptr = "doc:capi-lite-txn",
+        .len = "doc:capi-lite-txn".len,
+    }, &lite_txn_lookup));
+    defer antfly_db_buffer_free(lite_txn_lookup.ptr, lite_txn_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, lite_txn_lookup.ptr.?[0..lite_txn_lookup.len], "\"transactional\"") != null);
+
     var check_before: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(src_handle, &check_before));
     defer antfly_db_buffer_free(check_before.ptr, check_before.len);
