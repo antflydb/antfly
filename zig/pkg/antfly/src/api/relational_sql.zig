@@ -12743,13 +12743,6 @@ const Parser = struct {
         return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .coalesce, &operands);
     }
 
-    fn negateNumericExpressionAlloc(
-        self: *@This(),
-        expression: db_mod.types.RelationalRowsExpression,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.buildUnaryNegativeExpressionAlloc(self.alloc, expression);
-    }
-
     fn parseConflictIncrementAssignment(
         self: *@This(),
         field: []const u8,
