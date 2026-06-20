@@ -3267,15 +3267,16 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer plan.deinit(self.alloc);
-        const needs_public_tables = switch (plan) {
+        const needs_table_catalog = switch (plan) {
             .authorization_catalog => |authorization_plan| switch (authorization_plan) {
-                .grant_privilege => |grant| std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema"),
-                .revoke_privilege => |revoke| std.ascii.eqlIgnoreCase(revoke.object_kind, "all_tables_in_schema"),
+                .grant_privilege => |grant| std.ascii.eqlIgnoreCase(grant.object_kind, "table") or std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema"),
+                .revoke_privilege => |revoke| std.ascii.eqlIgnoreCase(revoke.object_kind, "table") or std.ascii.eqlIgnoreCase(revoke.object_kind, "all_tables_in_schema"),
                 else => false,
             },
+            .row_security_catalog => true,
             else => false,
         };
-        if (!needs_public_tables) return .{
+        if (!needs_table_catalog) return .{
             .value = .{
                 .database_name = session.currentDatabase(),
                 .search_path = session.search_path,
@@ -19632,10 +19633,12 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer created.deinit(alloc);
     var granted = try server.applyRelationalSqlDdl("GRANT SELECT ON TABLE usage_records TO app_writer;");
     defer granted.deinit(alloc);
+    try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("GRANT SELECT ON TABLE missing_records TO app_writer;"));
     var schema_granted = try server.applyRelationalSqlDdl("GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;");
     defer schema_granted.deinit(alloc);
     var row_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));");
     defer row_policy.deinit(alloc);
+    try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("CREATE POLICY missing_tenant_policy ON missing_records USING (tenant_id = 'tenant-a');"));
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read));
@@ -19660,12 +19663,20 @@ test "api http server applies SQL DDL with explicit catalog session" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         saw_session_create: bool = false,
+        tables: [1]metadata_table_manager.TableRecord = .{.{
+            .table_id = 10,
+            .name = "events",
+            .database_name = "tenant_ops",
+            .namespace_name = "analytics",
+        }},
 
         fn iface(self: *@This()) StatusSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
                     .apply_relational_sql_ddl_with_session = applyRelationalSqlDdlWithSession,
                 },
             };
@@ -19678,6 +19689,21 @@ test "api http server applies SQL DDL with explicit catalog session" {
                 .projected_stores = 1,
             };
         }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
         fn applyRelationalSqlDdlWithSession(
             ptr: *anyopaque,
@@ -19739,14 +19765,14 @@ test "api http server applies SQL DDL with explicit catalog session" {
     try std.testing.expectEqualStrings("public", session.search_path[1]);
     try std.testing.expect(!session.transaction_local_search_path);
 
+    var created_table = try server.applyRelationalSqlDdlWithSession("CREATE TABLE events (id text PRIMARY KEY);", &session);
+    defer created_table.deinit(alloc);
+    try std.testing.expect(source.saw_session_create);
+
     var granted = try server.applyRelationalSqlDdlWithSession("GRANT SELECT ON TABLE events TO app_reader;", &session);
     defer granted.deinit(alloc);
     try std.testing.expect(try auth.manager.enforce("alice", .table, "tenant_ops.analytics.events", .read));
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "default.public.events", .read)));
-
-    var created_table = try server.applyRelationalSqlDdlWithSession("CREATE TABLE events (id text PRIMARY KEY);", &session);
-    defer created_table.deinit(alloc);
-    try std.testing.expect(source.saw_session_create);
 
     var set_local = try server.applyRelationalSqlDdlWithSession("SET LOCAL search_path TO public;", &session);
     defer set_local.deinit(alloc);

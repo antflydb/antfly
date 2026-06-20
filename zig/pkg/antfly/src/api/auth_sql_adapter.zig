@@ -262,7 +262,31 @@ fn sqlAuthTableResourceNameAlloc(
     sql_object_name: []const u8,
     catalog: SqlAuthCatalog,
 ) ![]u8 {
-    return try catalog_resources.tableResourceNameFromSqlObjectWithSessionAlloc(alloc, sql_object_name, catalog.session());
+    const target = try catalog.session().tableTargetFromObjectName(sql_object_name);
+    if (catalog.tables.len > 0) {
+        for (catalog.tables) |table_ref| {
+            if (std.mem.eql(u8, table_ref.database_name, target.database_name) and
+                std.mem.eql(u8, table_ref.namespace_name, target.namespace_name) and
+                std.mem.eql(u8, table_ref.table_name, target.table_name))
+            {
+                return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            }
+        }
+        return error.TableNotFound;
+    }
+    if (catalog.public_table_names) |public_table_names| {
+        if (std.mem.eql(u8, target.database_name, catalog_resources.default_database_name) and
+            std.mem.eql(u8, target.namespace_name, catalog_resources.default_namespace_name))
+        {
+            for (public_table_names) |table_name| {
+                if (std.mem.eql(u8, table_name, target.table_name)) {
+                    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+                }
+            }
+            return error.TableNotFound;
+        }
+    }
+    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
 }
 
 const SqlPrivilegeResourceTarget = struct {
@@ -296,7 +320,7 @@ fn resourceTargetForSqlPrivilegeObject(
     if (std.ascii.eqlIgnoreCase(object_kind, "table")) {
         return .{
             .resource_type = .table,
-            .resource_name = try catalog_resources.tableResourceNameFromSqlObjectWithSessionAlloc(alloc, object_name, catalog.session()),
+            .resource_name = try sqlAuthTableResourceNameAlloc(alloc, object_name, catalog),
         };
     }
     if (std.ascii.eqlIgnoreCase(object_kind, "user")) return .{ .resource_type = .user, .resource_name = try alloc.dupe(u8, object_name) };
