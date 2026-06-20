@@ -290,6 +290,7 @@ antfly_error_code antfly_db_search_hits_json(
     antfly_slice request_json,
     antfly_dense_search_result *out_result
 );
+antfly_error_code antfly_db_aggregate_hits_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_lookup_artifact_json(void *handle, antfly_slice artifact_id_b64, antfly_buffer *out);
 antfly_error_code antfly_db_decode_artifact_id_json(antfly_slice artifact_id_b64, antfly_buffer *out);
 antfly_error_code antfly_db_extract_enrichments_json(void *handle, antfly_slice request_json, antfly_buffer *out);
@@ -304,6 +305,7 @@ antfly_error_code antfly_db_get_edges_json(
     antfly_buffer *out
 );
 antfly_error_code antfly_db_traverse_edges_json(void *handle, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_execute_graph_queries_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_get_neighbors_json(
     void *handle,
     antfly_slice index_name,
