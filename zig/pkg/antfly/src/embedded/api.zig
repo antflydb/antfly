@@ -869,11 +869,15 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     defer alloc.free(src_path);
     const dst_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-dst.aflite", .{tmp.sub_path});
     defer alloc.free(dst_path);
+    const roundtrip_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-roundtrip.aflite", .{tmp.sub_path});
+    defer alloc.free(roundtrip_path);
     const snapshot_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-snapshot.aflite", .{tmp.sub_path});
     defer alloc.free(snapshot_path);
 
     var backup = std.ArrayList(u8).empty;
     defer backup.deinit(alloc);
+    var roundtrip_backup = std.ArrayList(u8).empty;
+    defer roundtrip_backup.deinit(alloc);
 
     {
         var api = try Api.openLite(alloc, src_path, .{
@@ -1068,6 +1072,62 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         try std.testing.expect(std.mem.indexOf(u8, sparse_after, "\"doc:vec:a\"") != null);
 
         const graph_after = try restored.searchJson(
+            alloc,
+            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+        );
+        defer alloc.free(graph_after);
+        try std.testing.expect(std.mem.indexOf(u8, graph_after, "\"doc:vec:c\"") != null);
+
+        try restored.exportPortable(alloc, &roundtrip_backup);
+        try std.testing.expect(roundtrip_backup.items.len > 0);
+    }
+
+    {
+        var roundtrip = try Api.openLite(alloc, roundtrip_path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer roundtrip.close();
+
+        try roundtrip.importPortable(alloc, roundtrip_backup.items);
+
+        const schema_json = try roundtrip.getSchemaJson(alloc);
+        defer alloc.free(schema_json);
+        try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"default_type\":\"doc\"") != null);
+
+        const indexes_json = try roundtrip.listIndexesJson(alloc);
+        defer alloc.free(indexes_json);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"ft_body\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"dv_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"sv_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"gr_v1\"") != null);
+
+        const lookup_json = try roundtrip.lookupJson(
+            alloc,
+            "doc:a",
+            "{\"fields\":[\"title\"]}",
+        );
+        defer alloc.free(lookup_json);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"found\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_json, "\"second\"") != null);
+
+        const dense_after = try roundtrip.searchJson(
+            alloc,
+            "{\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"dv_v1\"],\"limit\":1}",
+        );
+        defer alloc.free(dense_after);
+        try std.testing.expect(std.mem.indexOf(u8, dense_after, "\"doc:vec:a\"") != null);
+
+        const sparse_after = try roundtrip.searchJson(
+            alloc,
+            "{\"embeddings\":{\"sv_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"indexes\":[\"sv_v1\"],\"limit\":1}",
+        );
+        defer alloc.free(sparse_after);
+        try std.testing.expect(std.mem.indexOf(u8, sparse_after, "\"doc:vec:a\"") != null);
+
+        const graph_after = try roundtrip.searchJson(
             alloc,
             "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
         );
