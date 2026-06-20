@@ -2208,6 +2208,41 @@ test "lite native check validates committed root chains" {
     try std.testing.expectEqual(@as(u64, 0), report.reclaimable_bytes);
 }
 
+test "lite native check validates committed index catalog root chain" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-index-catalog.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putCatalogRecord("schema", "{\"version\":1}");
+    try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+    try file.putDocument("doc:1", "{\"title\":\"one\"}");
+
+    const checkpoint = file.activeCheckpoint();
+    try std.testing.expect(checkpoint.catalog_root_page != 0);
+    try std.testing.expect(checkpoint.index_catalog_root_page != 0);
+    try std.testing.expect(checkpoint.document_root_page != 0);
+
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(?[]const u8, null), report.issue);
+    try std.testing.expectEqual(@as(u64, 3), report.record_count);
+    try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
+    try std.testing.expect(report.live_bytes > 0);
+    try std.testing.expectEqual(@as(u64, default_page_size * 4), report.file_size);
+    try std.testing.expectEqual(report.file_size, report.compact_size);
+
+    const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
+    defer allocator.free(index_file);
+    try std.testing.expectEqualStrings("index bytes", index_file);
+}
+
 test "lite native vacuum rewrites live catalog and document records" {
     const allocator = std.testing.allocator;
 
@@ -2290,6 +2325,67 @@ test "lite native check reports corrupted committed document page" {
         var file = try NativeFile.create(allocator, path);
         defer file.close();
         try file.putDocument("doc:1", "value");
+    }
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check reports corrupted committed index catalog page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-index-corrupt.aflite");
+    defer allocator.free(path);
+
+    const root_page = blk: {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+        break :blk file.activeCheckpoint().index_catalog_root_page;
+    };
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "X", root_page * default_page_size + page_header_size);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const report = try reopened.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("page_checksum_mismatch", report.issue.?);
+}
+
+test "lite native check reports corrupted index catalog external value page" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-index-value-corrupt.aflite");
+    defer allocator.free(path);
+
+    const large_value = try allocator.alloc(u8, default_page_size * 2);
+    defer allocator.free(large_value);
+    @memset(large_value, 'i');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", large_value);
     }
 
     {
