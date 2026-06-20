@@ -810,7 +810,7 @@ pub const NativeFile = struct {
         encodeHeader(&encoded_header, compact_header);
         @memcpy(image.items[0..header_size], &encoded_header);
 
-        try rewriteOpenFile(self.file, self.io_impl.io(), image.items, self.no_sync);
+        try self.replaceOpenFileWithImage(image.items);
         self.header = compact_header;
 
         const after_size: u64 = @intCast(image.items.len);
@@ -1268,6 +1268,29 @@ pub const NativeFile = struct {
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync) try self.file.sync(self.io_impl.io());
     }
+    fn replaceOpenFileWithImage(self: *NativeFile, contents: []const u8) !void {
+        const io = self.io_impl.io();
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-vacuum", .{self.path});
+        defer self.allocator.free(tmp_path);
+        errdefer deleteFilePath(io, tmp_path) catch {};
+
+        {
+            var tmp_file = try createSnapshotFile(io, tmp_path);
+            defer tmp_file.close(io);
+            try tmp_file.writePositionalAll(io, contents, 0);
+            try tmp_file.setLength(io, contents.len);
+            if (!self.no_sync) try tmp_file.sync(io);
+        }
+
+        try renameFilePath(io, tmp_path, self.path);
+        errdefer {
+            self.file = openDataFile(io, self.path, .writer) catch self.file;
+        }
+
+        const replacement = try openDataFile(io, self.path, .writer);
+        self.file.close(io);
+        self.file = replacement;
+    }
 };
 
 fn appendPageToImage(
@@ -1345,13 +1368,6 @@ fn setCatalogRootPage(slot: *CheckpointSlot, root: CatalogRoot, page_id: u64) vo
         .metadata => slot.catalog_root_page = page_id,
         .index => slot.index_catalog_root_page = page_id,
     }
-}
-
-fn rewriteOpenFile(file: std.Io.File, io: std.Io, contents: []const u8, no_sync: bool) !void {
-    try file.setLength(io, 0);
-    try file.writePositionalAll(io, contents, 0);
-    try file.setLength(io, contents.len);
-    if (!no_sync) try file.sync(io);
 }
 
 pub fn create(io: std.Io, path: []const u8) !void {
@@ -3040,6 +3056,48 @@ test "lite native vacuum rewrites live catalog and document records" {
     const live = (try reopened.getDocumentAlloc(allocator, "doc:live")).?;
     defer allocator.free(live);
     try std.testing.expectEqualStrings("small", live);
+}
+
+test "lite native vacuum atomically replaces file and keeps writer handle usable" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-vacuum-replace.aflite");
+    defer allocator.free(path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-vacuum", .{path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putDocument("doc:live", "old");
+        try file.putDocument("doc:live", "new");
+
+        const vacuumed = try file.vacuum();
+        try std.testing.expect(vacuumed.reclaimed_bytes > 0);
+        try std.testing.expect(!pathExists(file.io_impl.io(), tmp_path));
+
+        try file.putDocument("doc:after-vacuum", "writer still attached");
+        const after = (try file.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
+        defer allocator.free(after);
+        try std.testing.expectEqualStrings("writer still attached", after);
+
+        const report = try file.check();
+        try std.testing.expect(report.valid);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const live = (try reopened.getDocumentAlloc(allocator, "doc:live")).?;
+    defer allocator.free(live);
+    try std.testing.expectEqualStrings("new", live);
+    const after = (try reopened.getDocumentAlloc(allocator, "doc:after-vacuum")).?;
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("writer still attached", after);
 }
 
 test "lite native check validates committed free map root" {
