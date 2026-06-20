@@ -3330,8 +3330,9 @@ pub const ApiHttpServer = struct {
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
                 return applied;
             },
-            .function_catalog => |function_plan| {
-                try self.sql_routine_runtime.apply(function_plan);
+            .function_catalog => |*function_plan| {
+                try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session.session());
+                try self.sql_routine_runtime.apply(function_plan.*);
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                 errdefer applied.deinit(self.alloc);
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -3380,6 +3381,72 @@ pub const ApiHttpServer = struct {
         applied.noop = true;
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         return applied;
+    }
+
+    fn resolveRoutineSettingsFromCurrentInPlace(
+        self: *ApiHttpServer,
+        plan: *relational_sql.FunctionCatalogPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !void {
+        switch (plan.*) {
+            .create => |*create| try self.resolveCreateRoutineSettingsFromCurrentInPlace(create, session),
+            .drop => {},
+        }
+    }
+
+    fn resolveCreateRoutineSettingsFromCurrentInPlace(
+        self: *ApiHttpServer,
+        create: *relational_sql.CreateRoutinePlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !void {
+        if (create.settings.len == 0) return;
+        const settings = @constCast(create.settings);
+        for (settings) |*setting| {
+            if (!setting.from_current) continue;
+            if (setting.values.len != 0) return error.InvalidRoleSetting;
+            const values = try self.currentRoutineSettingValuesAlloc(session, setting.name);
+            setting.values = values;
+            setting.from_current = false;
+        }
+    }
+
+    fn currentRoutineSettingValuesAlloc(
+        self: *ApiHttpServer,
+        session: catalog_resources.SqlCatalogSession,
+        name: []const u8,
+    ) ![]const []const u8 {
+        if (std.ascii.eqlIgnoreCase(name, "search_path")) {
+            const default_search_path: []const []const u8 = &.{catalog_resources.default_namespace_name};
+            const source = if (session.search_path.len == 0)
+                default_search_path
+            else
+                session.search_path;
+            return try cloneStringSliceConstAlloc(self.alloc, source);
+        }
+
+        const value = session.settingValue(name) orelse return error.RoleSettingNotFound;
+        try relational_sql.validateSqlDatabaseSettingValue(name, value);
+        const values = try self.alloc.alloc([]const u8, 1);
+        errdefer self.alloc.free(values);
+        values[0] = try self.alloc.dupe(u8, value);
+        return values;
+    }
+
+    fn cloneStringSliceConstAlloc(
+        alloc: std.mem.Allocator,
+        values: []const []const u8,
+    ) ![]const []const u8 {
+        const out = try alloc.alloc([]const u8, values.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (out[0..initialized]) |value| alloc.free(@constCast(value));
+            alloc.free(out);
+        }
+        for (values, 0..) |value, i| {
+            out[i] = try alloc.dupe(u8, value);
+            initialized += 1;
+        }
+        return out;
     }
 
     fn loweredDdlPlanMayDropTrigger(plan: relational_sql.LoweredDdlPlan) bool {
@@ -22063,6 +22130,74 @@ test "api http server exposes SQL routine bindings to catalog read planning" {
     try std.testing.expectEqual(@as(usize, 1), expression.operands.len);
     try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.field, expression.operands[0].kind);
     try std.testing.expectEqualStrings("status", expression.operands[0].field);
+}
+
+test "api http server freezes routine settings from current SQL session" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl = applyRelationalSqlDdl,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdl(_: *anyopaque, _: std.mem.Allocator, _: []const u8) !tables_api.AppliedRelationalSqlDdlRecord {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var set_path = try server.applyRelationalSqlDdlWithSession("SET search_path TO tenant_schema, public;", &session);
+    defer set_path.deinit(alloc);
+    var set_timeout = try server.applyRelationalSqlDdlWithSession("SET statement_timeout = '5ms';", &session);
+    defer set_timeout.deinit(alloc);
+
+    var created = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION freeze_current(text) RETURNS text LANGUAGE sql SET search_path FROM CURRENT SET statement_timeout FROM CURRENT AS 'SELECT lower($1)';",
+        &session,
+    );
+    defer created.deinit(alloc);
+
+    const settings = try server.sql_routine_runtime.routineSettingsForTestAlloc(alloc, .function, "freeze_current", 1);
+    defer {
+        for (settings) |*setting| setting.deinit(alloc);
+        if (settings.len > 0) alloc.free(settings);
+    }
+    try std.testing.expectEqual(@as(usize, 2), settings.len);
+    try std.testing.expectEqualStrings("search_path", settings[0].name);
+    try std.testing.expect(!settings[0].from_current);
+    try std.testing.expectEqual(@as(usize, 2), settings[0].values.len);
+    try std.testing.expectEqualStrings("tenant_schema", settings[0].values[0]);
+    try std.testing.expectEqualStrings("public", settings[0].values[1]);
+    try std.testing.expectEqualStrings("statement_timeout", settings[1].name);
+    try std.testing.expect(!settings[1].from_current);
+    try std.testing.expectEqual(@as(usize, 1), settings[1].values.len);
+    try std.testing.expectEqualStrings("5ms", settings[1].values[0]);
+
+    try std.testing.expectError(
+        error.RoleSettingNotFound,
+        server.applyRelationalSqlDdlWithSession(
+            "CREATE FUNCTION missing_current(text) RETURNS text LANGUAGE sql SET work_mem FROM CURRENT AS 'SELECT lower($1)';",
+            &session,
+        ),
+    );
 }
 
 test "api http server passes SQL routine bindings to source-backed schema DDL" {

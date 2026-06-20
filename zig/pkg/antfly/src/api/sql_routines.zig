@@ -168,6 +168,19 @@ pub const Runtime = struct {
         return self.routines.items.len;
     }
 
+    pub fn routineSettingsForTestAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        kind: relational_sql.RoutineKind,
+        name: []const u8,
+        argument_count: usize,
+    ) ![]relational_sql.RoutineSetting {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const routine = self.findRoutineLocked(kind, name, argument_count) orelse return error.RoutineNotFound;
+        return try cloneRoutineSettingsAlloc(alloc, routine.settings);
+    }
+
     pub fn triggerCountForTest(self: *@This()) usize {
         self.mutex.lock();
         defer self.mutex.unlock();

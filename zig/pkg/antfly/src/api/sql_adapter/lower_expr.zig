@@ -2675,6 +2675,9 @@ pub fn parseTextBinaryRowExpressionAlloc(
     switch (kind) {
         .starts_with => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsStartsWithFunction),
         .ends_with => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsEndsWithFunction),
+        .regexp_substr => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction),
+        .regexp_count => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpCountFunction),
+        .regexp_instr => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpInstrFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -2693,6 +2696,110 @@ pub fn parseTextBinaryRowExpressionAlloc(
     lhs_transferred = true;
     rhs_transferred = true;
     return expression;
+}
+
+pub fn parseTextTernaryRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    switch (kind) {
+        .replace => try parseReplaceFunctionCallStart(tokens, pos),
+        .translate => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsTranslateFunction),
+        else => return error.UnsupportedSqlShape,
+    }
+
+    const first = try hooks.parse_expression(hooks.ptr);
+    var first_transferred = false;
+    errdefer if (!first_transferred) freeExpression(alloc, first);
+    try type_context.validateTextRowExpression(first);
+    try parser.expectToken(tokens, pos, .comma);
+
+    const second = try hooks.parse_expression(hooks.ptr);
+    var second_transferred = false;
+    errdefer if (!second_transferred) freeExpression(alloc, second);
+    try type_context.validateTextRowExpression(second);
+    try parser.expectToken(tokens, pos, .comma);
+
+    const third = try hooks.parse_expression(hooks.ptr);
+    var third_transferred = false;
+    errdefer if (!third_transferred) freeExpression(alloc, third);
+    try type_context.validateTextRowExpression(third);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildTernaryFunctionExpressionAlloc(alloc, kind, first, second, third);
+    first_transferred = true;
+    second_transferred = true;
+    third_transferred = true;
+    return expression;
+}
+
+pub fn parseRegexpListRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    switch (kind) {
+        .regexp_replace => try parseRegexpReplaceFunctionCallStart(tokens, pos),
+        .regexp_match => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpMatchFunction),
+        else => return error.UnsupportedSqlShape,
+    }
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+
+    switch (kind) {
+        .regexp_replace => {
+            while (true) {
+                const operand = try hooks.parse_expression(hooks.ptr);
+                var operand_transferred = false;
+                errdefer if (!operand_transferred) freeExpression(alloc, operand);
+                try type_context.validateTextRowExpression(operand);
+                try operands.append(alloc, operand);
+                operand_transferred = true;
+                if (parser.matchToken(tokens, pos, .comma) == null) break;
+            }
+            if (operands.items.len != 3 and operands.items.len != 4) return error.UnsupportedSqlShape;
+        },
+        .regexp_match => {
+            const source = try hooks.parse_expression(hooks.ptr);
+            var source_transferred = false;
+            errdefer if (!source_transferred) freeExpression(alloc, source);
+            try type_context.validateTextRowExpression(source);
+            try operands.append(alloc, source);
+            source_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const pattern = try hooks.parse_expression(hooks.ptr);
+            var pattern_transferred = false;
+            errdefer if (!pattern_transferred) freeExpression(alloc, pattern);
+            try type_context.validateTextRowExpression(pattern);
+            try operands.append(alloc, pattern);
+            pattern_transferred = true;
+
+            if (parser.matchToken(tokens, pos, .comma) != null) {
+                const case_insensitive = try hooks.parse_expression(hooks.ptr);
+                var case_transferred = false;
+                errdefer if (!case_transferred) freeExpression(alloc, case_insensitive);
+                try type_context.validateBooleanRowExpression(case_insensitive);
+                try operands.append(alloc, case_insensitive);
+                case_transferred = true;
+            }
+        },
+        else => unreachable,
+    }
+
+    try parser.expectToken(tokens, pos, .rparen);
+    return try buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
 }
 
 pub fn parseLeftRightRowExpressionAlloc(
