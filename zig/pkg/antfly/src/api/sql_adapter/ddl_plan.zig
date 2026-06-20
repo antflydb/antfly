@@ -3234,6 +3234,137 @@ pub fn alterTableColumnTypeOperationFromSyntax(
     } };
 }
 
+pub fn alterTableAddColumnOperationFromParts(
+    column: runtime_schema.RelationalColumn,
+    if_not_exists: bool,
+    unique_constraints: []const runtime_schema.UniqueConstraint,
+    foreign_keys: []const runtime_schema.ForeignKey,
+    checks: []const runtime_schema.RelationalCheck,
+) AlterTableOperation {
+    return .{ .add_column = .{
+        .column = column,
+        .if_not_exists = if_not_exists,
+        .unique_constraints = unique_constraints,
+        .foreign_keys = foreign_keys,
+        .checks = checks,
+    } };
+}
+
+pub fn alterTableAddPeriodOperation(period: runtime_schema.RelationalPeriod) AlterTableOperation {
+    return .{ .add_period = period };
+}
+
+pub fn alterTableAddPrimaryKeyOperation(primary_key: runtime_schema.PrimaryKey) AlterTableOperation {
+    return .{ .add_primary_key = primary_key };
+}
+
+pub fn alterTableAddUniqueConstraintOperation(constraint: runtime_schema.UniqueConstraint) AlterTableOperation {
+    return .{ .add_unique_constraint = constraint };
+}
+
+pub fn alterTableAddForeignKeyOperation(foreign_key: runtime_schema.ForeignKey) AlterTableOperation {
+    return .{ .add_foreign_key = foreign_key };
+}
+
+pub fn alterTableAddCheckOperation(check: runtime_schema.RelationalCheck) AlterTableOperation {
+    return .{ .add_check = check };
+}
+
+pub fn makeDdlPrimaryKeyAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    columns: []const []const u8,
+    include_columns: []const []const u8,
+    without_overlaps_period: ?[]const u8,
+    timing: grammar.DdlConstraintTimingSyntax,
+) !runtime_schema.PrimaryKey {
+    const name = if (constraint_name) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (name) |value| alloc.free(value);
+    const cloned_columns = try cloneStringSlice(alloc, columns);
+    errdefer freeStringSlice(alloc, cloned_columns);
+    const cloned_include_columns = try cloneStringSlice(alloc, include_columns);
+    errdefer freeStringSlice(alloc, cloned_include_columns);
+    const period = if (without_overlaps_period) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (period) |value| alloc.free(value);
+    return .{
+        .name = name,
+        .columns = cloned_columns,
+        .include_columns = cloned_include_columns,
+        .without_overlaps_period = period,
+        .deferrable = timing.deferrable,
+        .timing = timing.timing,
+    };
+}
+
+pub fn makeDdlUniqueConstraintAlloc(
+    alloc: std.mem.Allocator,
+    constraint_name: ?[]const u8,
+    columns: []const []const u8,
+    include_columns: []const []const u8,
+    without_overlaps_period: ?[]const u8,
+    nulls_not_distinct: bool,
+    timing: grammar.DdlConstraintTimingSyntax,
+) !runtime_schema.UniqueConstraint {
+    if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
+    const owned_columns = try cloneStringSlice(alloc, columns);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) freeStringSlice(alloc, owned_columns);
+    const owned_include_columns = try cloneStringSlice(alloc, include_columns);
+    var include_columns_transferred = false;
+    errdefer if (!include_columns_transferred) freeStringSlice(alloc, owned_include_columns);
+    const name = if (constraint_name) |existing|
+        try alloc.dupe(u8, existing)
+    else
+        try defaultUniqueConstraintNameAlloc(alloc, columns);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const owned_period = if (without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
+    var period_transferred = false;
+    errdefer if (!period_transferred) if (owned_period) |period| alloc.free(period);
+    columns_transferred = true;
+    include_columns_transferred = true;
+    name_transferred = true;
+    period_transferred = true;
+    return .{
+        .name = name,
+        .columns = owned_columns,
+        .include_columns = owned_include_columns,
+        .without_overlaps_period = owned_period,
+        .nulls_not_distinct = nulls_not_distinct,
+        .deferrable = timing.deferrable,
+        .timing = timing.timing,
+    };
+}
+
+pub fn appendDdlUniqueConstraintBuilderAlloc(
+    alloc: std.mem.Allocator,
+    unique_constraints: *std.ArrayListUnmanaged(runtime_schema.UniqueConstraint),
+    constraint_name: ?[]const u8,
+    columns: []const []const u8,
+    include_columns: []const []const u8,
+    without_overlaps_period: ?[]const u8,
+    nulls_not_distinct: bool,
+    timing: grammar.DdlConstraintTimingSyntax,
+) !void {
+    const constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, columns, include_columns, without_overlaps_period, nulls_not_distinct, timing);
+    var transferred = false;
+    errdefer if (!transferred) freeDdlUniqueConstraint(alloc, constraint);
+    try unique_constraints.append(alloc, constraint);
+    transferred = true;
+}
+
+fn defaultUniqueConstraintNameAlloc(alloc: std.mem.Allocator, columns: []const []const u8) ![]const u8 {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(alloc);
+    try buf.appendSlice(alloc, columns[0]);
+    for (columns[1..]) |column| {
+        try buf.append(alloc, '_');
+        try buf.appendSlice(alloc, column);
+    }
+    try buf.appendSlice(alloc, "_key");
+    return try buf.toOwnedSlice(alloc);
+}
+
 pub fn routineKindFromSyntax(syntax: grammar.RoutineKindSyntax) RoutineKind {
     return switch (syntax) {
         .function => .function,
@@ -3654,6 +3785,98 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
             try std.testing.expectEqualStrings("amount_text", type_change.column_name);
             try std.testing.expectEqual(runtime_schema.AntflyType.text, type_change.field_type);
             try std.testing.expectEqualStrings("C", type_change.collation.?);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    const add_column_operation = alterTableAddColumnOperationFromParts(.{
+        .name = try alloc.dupe(u8, "note"),
+        .path = try alloc.dupe(u8, "note"),
+        .field_type = .text,
+    }, true, &.{}, &.{}, &.{});
+    defer freeAlterTableOperation(alloc, add_column_operation);
+    switch (add_column_operation) {
+        .add_column => |add_column| {
+            try std.testing.expectEqualStrings("note", add_column.column.name);
+            try std.testing.expect(add_column.if_not_exists);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    const add_period_operation = alterTableAddPeriodOperation(.{
+        .name = try alloc.dupe(u8, "valid_time"),
+        .start_column = try alloc.dupe(u8, "valid_from"),
+        .end_column = try alloc.dupe(u8, "valid_to"),
+    });
+    defer freeAlterTableOperation(alloc, add_period_operation);
+    switch (add_period_operation) {
+        .add_period => |period| try std.testing.expectEqualStrings("valid_time", period.name),
+        else => return error.TestExpectedEqual,
+    }
+
+    var primary_columns = try alloc.alloc([]const u8, 1);
+    primary_columns[0] = try alloc.dupe(u8, "id");
+    const add_primary_operation = alterTableAddPrimaryKeyOperation(.{
+        .name = try alloc.dupe(u8, "usage_pkey"),
+        .columns = primary_columns,
+    });
+    defer freeAlterTableOperation(alloc, add_primary_operation);
+    switch (add_primary_operation) {
+        .add_primary_key => |primary_key| {
+            try std.testing.expectEqualStrings("usage_pkey", primary_key.name.?);
+            try std.testing.expectEqualStrings("id", primary_key.columns[0]);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var unique_columns = try alloc.alloc([]const u8, 1);
+    unique_columns[0] = try alloc.dupe(u8, "external_id");
+    const add_unique_operation = alterTableAddUniqueConstraintOperation(.{
+        .name = try alloc.dupe(u8, "usage_external_id_key"),
+        .columns = unique_columns,
+        .validation_state = .unvalidated,
+    });
+    defer freeAlterTableOperation(alloc, add_unique_operation);
+    switch (add_unique_operation) {
+        .add_unique_constraint => |constraint| {
+            try std.testing.expectEqualStrings("usage_external_id_key", constraint.name);
+            try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var child_columns = try alloc.alloc([]const u8, 1);
+    child_columns[0] = try alloc.dupe(u8, "tenant_id");
+    var parent_columns = try alloc.alloc([]const u8, 1);
+    parent_columns[0] = try alloc.dupe(u8, "id");
+    const add_foreign_key_operation = alterTableAddForeignKeyOperation(.{
+        .name = try alloc.dupe(u8, "usage_tenant_fk"),
+        .child_columns = child_columns,
+        .parent_table = try alloc.dupe(u8, "tenants"),
+        .parent_columns = parent_columns,
+        .validation_state = .unvalidated,
+    });
+    defer freeAlterTableOperation(alloc, add_foreign_key_operation);
+    switch (add_foreign_key_operation) {
+        .add_foreign_key => |foreign_key| {
+            try std.testing.expectEqualStrings("usage_tenant_fk", foreign_key.name);
+            try std.testing.expectEqualStrings("tenants", foreign_key.parent_table);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    const add_check_operation = alterTableAddCheckOperation(.{
+        .name = try alloc.dupe(u8, "usage_amount_check"),
+        .field = try alloc.dupe(u8, "amount"),
+        .op = .gte,
+        .value_json = try alloc.dupe(u8, "0"),
+        .validation_state = .unvalidated,
+    });
+    defer freeAlterTableOperation(alloc, add_check_operation);
+    switch (add_check_operation) {
+        .add_check => |check| {
+            try std.testing.expectEqualStrings("usage_amount_check", check.name);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, check.validation_state);
         },
         else => return error.TestExpectedEqual,
     }
