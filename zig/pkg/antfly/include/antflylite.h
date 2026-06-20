@@ -55,6 +55,87 @@ typedef struct antfly_version_predicate {
     uint64_t expected_version;
 } antfly_version_predicate;
 
+typedef struct antfly_dense_search_hit {
+    uint8_t *id_ptr;
+    size_t id_len;
+    float score;
+} antfly_dense_search_hit;
+
+typedef struct antfly_dense_search_result {
+    antfly_dense_search_hit *hits_ptr;
+    size_t hit_count;
+    uint32_t total_hits;
+    uint64_t identity_read_generation;
+} antfly_dense_search_result;
+
+typedef struct antfly_packed_dense_search_hit {
+    size_t id_offset;
+    size_t id_len;
+    float score;
+} antfly_packed_dense_search_hit;
+
+typedef struct antfly_packed_dense_search_result {
+    antfly_packed_dense_search_hit *hits_ptr;
+    size_t hit_count;
+    uint32_t total_hits;
+    uint8_t *ids_ptr;
+    size_t ids_len;
+    uint64_t identity_read_generation;
+} antfly_packed_dense_search_result;
+
+typedef struct antfly_dense_search_profile {
+    uint64_t total_ns;
+    uint64_t index_lookup_ns;
+    uint64_t search_ns;
+    uint64_t hits_ns;
+    uint64_t fallback_ns;
+    uint64_t hbc_total_ns;
+    uint64_t hbc_setup_ns;
+    uint64_t hbc_root_load_ns;
+    uint64_t hbc_node_cache_miss_ns;
+    uint64_t hbc_node_cache_misses;
+    uint64_t hbc_quantized_cache_miss_ns;
+    uint64_t hbc_quantized_cache_misses;
+    uint64_t hbc_child_expand_ns;
+    uint64_t hbc_leaf_score_ns;
+    uint64_t hbc_rerank_ns;
+    uint64_t hbc_rerank_vector_load_ns;
+    uint64_t hbc_rerank_distance_ns;
+    uint64_t hbc_nodes_visited;
+    uint64_t hbc_leaves_explored;
+    uint64_t hbc_reranked_vectors;
+    uint32_t hit_count;
+    uint32_t total_hits;
+    bool used_fast_path;
+} antfly_dense_search_profile;
+
+typedef struct antfly_dense_wire_search_profile {
+    uint64_t total_ns;
+    uint64_t decode_ns;
+    uint64_t search_ns;
+    uint64_t resolve_ns;
+    uint64_t encode_ns;
+    uint64_t fallback_ns;
+    uint64_t hbc_total_ns;
+    uint64_t hbc_setup_ns;
+    uint64_t hbc_root_load_ns;
+    uint64_t hbc_node_cache_miss_ns;
+    uint64_t hbc_node_cache_misses;
+    uint64_t hbc_quantized_cache_miss_ns;
+    uint64_t hbc_quantized_cache_misses;
+    uint64_t hbc_child_expand_ns;
+    uint64_t hbc_leaf_score_ns;
+    uint64_t hbc_rerank_ns;
+    uint64_t hbc_rerank_vector_load_ns;
+    uint64_t hbc_rerank_distance_ns;
+    uint64_t hbc_nodes_visited;
+    uint64_t hbc_leaves_explored;
+    uint64_t hbc_reranked_vectors;
+    uint32_t hit_count;
+    uint32_t total_hits;
+    bool used_fast_path;
+} antfly_dense_wire_search_profile;
+
 uint32_t antfly_lite_abi_version(void);
 const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
@@ -80,6 +161,8 @@ antfly_error_code antfly_lite_vacuum_json(void *handle, antfly_buffer *out);
 void antfly_db_close(void *handle);
 void antfly_buffer_free(antfly_buffer *buffer);
 void antfly_db_buffer_free(uint8_t *ptr, size_t len);
+void antfly_db_dense_search_result_free(antfly_dense_search_result *result);
+void antfly_db_packed_dense_search_result_free(antfly_packed_dense_search_result *result);
 
 antfly_error_code antfly_db_batch(
     void *handle,
@@ -141,6 +224,54 @@ antfly_error_code antfly_db_delete_enrichment(
 antfly_error_code antfly_db_scan_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_stats_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_search_json(void *handle, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_search_dense(
+    void *handle,
+    antfly_slice index_name,
+    const float *vector_ptr,
+    size_t vector_len,
+    uint32_t k,
+    uint32_t limit,
+    uint32_t offset,
+    antfly_packed_dense_search_result *out_result
+);
+antfly_error_code antfly_db_search_dense_profile(
+    void *handle,
+    antfly_slice index_name,
+    const float *vector_ptr,
+    size_t vector_len,
+    uint32_t k,
+    uint32_t limit,
+    uint32_t offset,
+    antfly_dense_search_profile *out_profile
+);
+antfly_error_code antfly_db_search_dense_wire(
+    void *handle,
+    antfly_slice request_buf,
+    antfly_buffer *out
+);
+antfly_error_code antfly_db_search_dense_wire_profile(
+    void *handle,
+    antfly_slice request_buf,
+    antfly_buffer *out,
+    antfly_dense_wire_search_profile *out_profile
+);
+antfly_error_code antfly_db_search_text_match(
+    void *handle,
+    antfly_slice index_name,
+    antfly_slice field,
+    antfly_slice text,
+    uint32_t limit,
+    uint32_t offset,
+    antfly_dense_search_result *out_result
+);
+antfly_error_code antfly_db_search_text_match_wire(void *handle, antfly_slice request_buf, antfly_buffer *out);
+antfly_error_code antfly_db_search_text_term_wire(void *handle, antfly_slice request_buf, antfly_buffer *out);
+antfly_error_code antfly_db_search_text_match_phrase_wire(void *handle, antfly_slice request_buf, antfly_buffer *out);
+antfly_error_code antfly_db_search_hits_json(
+    void *handle,
+    antfly_slice request_json,
+    antfly_dense_search_result *out_result
+);
 antfly_error_code antfly_db_lookup_artifact_json(void *handle, antfly_slice artifact_id_b64, antfly_buffer *out);
 antfly_error_code antfly_db_decode_artifact_id_json(antfly_slice artifact_id_b64, antfly_buffer *out);
 antfly_error_code antfly_db_extract_enrichments_json(void *handle, antfly_slice request_json, antfly_buffer *out);
