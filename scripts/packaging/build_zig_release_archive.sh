@@ -9,6 +9,8 @@ Builds the native Antfly Zig runtime and writes a release archive whose root
 contains:
   antfly
   share/
+  lib/
+  include/
   README.md
   LICENSE
 EOF
@@ -93,6 +95,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 work_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/antfly-zig-release-${target}"
 prefix="${work_root}/zig-out"
 stage="${work_root}/stage"
+local_cache="${work_root}/zig-cache"
 cache_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/zig-cache"
 
 if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
@@ -100,9 +103,9 @@ if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
 fi
 
 rm -rf "$work_root"
-mkdir -p "$prefix" "$stage" "$cache_root/global" "$out_dir"
+mkdir -p "$prefix" "$stage" "$local_cache" "$cache_root/global" "$out_dir"
 
-zig_build_args=(
+zig_build_options=(
   -Dtarget="$target"
   -Doptimize="$optimize"
   -Dcpu=baseline
@@ -112,24 +115,36 @@ zig_build_args=(
   -Donnx=false
   -Dmetal="$metal"
   -Dsystem-blas="$system_blas"
-  install
+)
+
+zig_install_args=(
   --prefix "$prefix"
+  --cache-dir "$local_cache"
   --global-cache-dir "$cache_root/global"
 )
 
 (
   cd "$repo_root/zig"
   if [ -n "$jobs" ]; then
-    zig build "-j$jobs" "${zig_build_args[@]}"
+    zig build "-j$jobs" "${zig_build_options[@]}" install "${zig_install_args[@]}"
+    zig build "-j$jobs" "${zig_build_options[@]}" lite-capi "${zig_install_args[@]}"
   else
-    zig build "${zig_build_args[@]}"
+    zig build "${zig_build_options[@]}" install "${zig_install_args[@]}"
+    zig build "${zig_build_options[@]}" lite-capi "${zig_install_args[@]}"
   fi
 )
 
 test -x "$prefix/bin/antfly"
+test -f "$prefix/include/antflylite.h"
 cp "$prefix/bin/antfly" "$stage/antfly"
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
+fi
+if [ -d "$prefix/lib" ]; then
+  cp -R "$prefix/lib" "$stage/lib"
+fi
+if [ -d "$prefix/include" ]; then
+  cp -R "$prefix/include" "$stage/include"
 fi
 cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
