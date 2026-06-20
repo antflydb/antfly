@@ -59,6 +59,12 @@ const aggregateInputExpressionCount = sql_adapter.aggregateInputExpressionCount;
 const aggregateModeCount = sql_adapter.aggregateModeCount;
 const aggregatePercentileArrayCount = sql_adapter.aggregatePercentileArrayCount;
 const antflyTypeSchemaName = sql_adapter.antflyTypeSchemaName;
+const appendBoolFingerprintAlloc = sql_adapter.appendBoolFingerprintAlloc;
+const appendNamedNonZeroUsizeFingerprintAlloc = sql_adapter.appendNamedNonZeroUsizeFingerprintAlloc;
+const appendNonZeroU32FingerprintAlloc = sql_adapter.appendNonZeroU32FingerprintAlloc;
+const appendNonZeroUsizeFingerprintAlloc = sql_adapter.appendNonZeroUsizeFingerprintAlloc;
+const appendStringFingerprintAlloc = sql_adapter.appendStringFingerprintAlloc;
+const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
 const cloneExpressionAlloc = sql_adapter.cloneExpressionAlloc;
@@ -7922,12 +7928,12 @@ const Parser = struct {
         if (!std.mem.eql(u8, lhs.source_cte, rhs.source_cte)) return error.UnsupportedSqlShape;
         switch (op) {
             .union_distinct, .union_all => {
-                if (!querySupportsSimpleUnionRewrite(lhs)) return error.UnsupportedSqlShape;
-                if (!querySupportsSimpleUnionRewrite(rhs)) return error.UnsupportedSqlShape;
+                if (!sql_adapter.querySupportsSimpleUnionRewrite(lhs)) return error.UnsupportedSqlShape;
+                if (!sql_adapter.querySupportsSimpleUnionRewrite(rhs)) return error.UnsupportedSqlShape;
             },
             .intersect, .except => {
-                if (!querySupportsSimpleIntersectExceptRewrite(lhs)) return error.UnsupportedSqlShape;
-                if (!querySupportsSimpleIntersectExceptRewrite(rhs)) return error.UnsupportedSqlShape;
+                if (!sql_adapter.querySupportsSimpleIntersectExceptRewrite(lhs)) return error.UnsupportedSqlShape;
+                if (!sql_adapter.querySupportsSimpleIntersectExceptRewrite(rhs)) return error.UnsupportedSqlShape;
             },
         }
     }
@@ -7937,7 +7943,7 @@ const Parser = struct {
         lhs: *LoweredSelect,
         rhs: db_mod.types.RelationalRowsQueryRequest,
     ) !void {
-        if (queryHasNoSimpleSetPredicates(lhs.query) or queryHasNoSimpleSetPredicates(rhs)) {
+        if (sql_adapter.queryHasNoSimpleSetPredicates(lhs.query) or sql_adapter.queryHasNoSimpleSetPredicates(rhs)) {
             freeRelationalChecks(self.alloc, lhs.query.predicates);
             if (lhs.query.predicates.len > 0) self.alloc.free(lhs.query.predicates);
             lhs.query.predicates = &.{};
@@ -38751,49 +38757,13 @@ fn freeSelectItem(alloc: std.mem.Allocator, item: Parser.SelectItem) void {
     }
 }
 
-fn queryHasNoSimpleSetPredicates(query: db_mod.types.RelationalRowsQueryRequest) bool {
-    return query.predicates.len == 0 and
-        query.or_predicates.len == 0 and
-        query.in_predicates.len == 0 and
-        query.access_or_predicates.len == 0 and
-        query.expression_predicates.len == 0 and
-        query.expression_or_predicates.len == 0;
-}
-
-fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
-    if (!queryHasOnlySimpleUnionPredicateSurface(query)) return false;
-    if (query.or_predicates.len > 0 and
-        (query.predicates.len > 0 or query.in_predicates.len > 0 or query.expression_predicates.len > 0 or query.expression_or_predicates.len > 0))
-    {
-        return false;
-    }
-    if (query.in_predicates.len > 0 and query.or_predicates.len > 0) return false;
-    if (query.expression_or_predicates.len != 0) {
-        if (query.or_predicates.len != 0) return false;
-    }
-    return true;
-}
-
-fn querySupportsSimpleIntersectExceptRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
-    if (!queryHasOnlySimpleIntersectExceptPredicateSurface(query)) return false;
-    if (query.expression_or_predicates.len != 0) {
-        if (query.or_predicates.len != 0) return false;
-    }
-    if (query.or_predicates.len != 0 and
-        (query.predicates.len != 0 or query.in_predicates.len != 0 or query.expression_predicates.len != 0))
-    {
-        return false;
-    }
-    return true;
-}
-
 fn simpleSetQueriesProvablyDisjoint(
     alloc: std.mem.Allocator,
     lhs: db_mod.types.RelationalRowsQueryRequest,
     rhs: db_mod.types.RelationalRowsQueryRequest,
 ) !bool {
     if (lhs.in_predicates.len > 0 or rhs.in_predicates.len > 0) {
-        if (!querySupportsSimpleUnionRewrite(lhs) or !querySupportsSimpleUnionRewrite(rhs)) return false;
+        if (!sql_adapter.querySupportsSimpleUnionRewrite(lhs) or !sql_adapter.querySupportsSimpleUnionRewrite(rhs)) return false;
         if (lhs.expression_predicates.len > 0 or rhs.expression_predicates.len > 0 or
             lhs.expression_or_predicates.len > 0 or rhs.expression_or_predicates.len > 0)
         {
@@ -38818,7 +38788,7 @@ fn simpleSetQueriesProvablyDisjoint(
     }
 
     if (lhs.or_predicates.len > 0 or rhs.or_predicates.len > 0) {
-        if (!querySupportsSimpleUnionRewrite(lhs) or !querySupportsSimpleUnionRewrite(rhs)) return false;
+        if (!sql_adapter.querySupportsSimpleUnionRewrite(lhs) or !sql_adapter.querySupportsSimpleUnionRewrite(rhs)) return false;
         if (lhs.expression_predicates.len > 0 or rhs.expression_predicates.len > 0) return false;
         const lhs_branch_count = simpleScalarSetQueryBranchCount(lhs);
         const rhs_branch_count = simpleScalarSetQueryBranchCount(rhs);
@@ -38834,7 +38804,7 @@ fn simpleSetQueriesProvablyDisjoint(
     }
 
     if (lhs.expression_or_predicates.len > 0 or rhs.expression_or_predicates.len > 0) {
-        if (!querySupportsSimpleUnionRewrite(lhs) or !querySupportsSimpleUnionRewrite(rhs)) return false;
+        if (!sql_adapter.querySupportsSimpleUnionRewrite(lhs) or !sql_adapter.querySupportsSimpleUnionRewrite(rhs)) return false;
         return try simpleSetQueriesExpressionBranchesProvablyDisjoint(alloc, lhs, rhs);
     }
 
@@ -39122,7 +39092,7 @@ fn expressionGroupsFromSimpleIntersectQueryAlloc(
     alloc: std.mem.Allocator,
     query: db_mod.types.RelationalRowsQueryRequest,
 ) ![]db_mod.types.RelationalRowsExpressionPredicateGroup {
-    if (queryHasNoSimpleSetPredicates(query)) return &.{};
+    if (sql_adapter.queryHasNoSimpleSetPredicates(query)) return &.{};
     if (query.in_predicates.len > 0) return try expressionGroupsFromInSetQueryAlloc(alloc, query);
     return try cloneSimpleExpressionSetQueryBranchesAlloc(alloc, query);
 }
@@ -55830,61 +55800,6 @@ fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerpri
         .validate_constraint => counts.validate_constraint += 1,
     };
     return counts;
-}
-
-fn appendNonZeroU32FingerprintAlloc(
-    alloc: std.mem.Allocator,
-    owned_base: []u8,
-    label: []const u8,
-    value: u32,
-) ![]u8 {
-    return sql_adapter.appendNonZeroU32FingerprintAlloc(alloc, owned_base, label, value);
-}
-
-fn appendNonZeroUsizeFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    owned_base: []u8,
-    label: []const u8,
-    value: usize,
-) ![]u8 {
-    return sql_adapter.appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, label, value);
-}
-
-fn appendNamedNonZeroUsizeFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    owned_base: []u8,
-    prefix: []const u8,
-    label: []const u8,
-    value: usize,
-) ![]u8 {
-    return sql_adapter.appendNamedNonZeroUsizeFingerprintAlloc(alloc, owned_base, prefix, label, value);
-}
-
-fn appendTrueBoolFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    owned_base: []u8,
-    label: []const u8,
-    value: bool,
-) ![]u8 {
-    return sql_adapter.appendTrueBoolFingerprintAlloc(alloc, owned_base, label, value);
-}
-
-fn appendBoolFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    owned_base: []u8,
-    label: []const u8,
-    value: bool,
-) ![]u8 {
-    return sql_adapter.appendBoolFingerprintAlloc(alloc, owned_base, label, value);
-}
-
-fn appendStringFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    owned_base: []u8,
-    label: []const u8,
-    value: []const u8,
-) ![]u8 {
-    return sql_adapter.appendStringFingerprintAlloc(alloc, owned_base, label, value);
 }
 
 fn sqlRowClaimForClause(clause: SqlRowClaimClause) db_mod.types.RowClaimRequest {

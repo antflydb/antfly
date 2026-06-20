@@ -1766,6 +1766,42 @@ pub fn queryHasOnlySimpleIntersectExceptPredicateSurface(query: db_mod.types.Rel
     return true;
 }
 
+pub fn queryHasNoSimpleSetPredicates(query: db_mod.types.RelationalRowsQueryRequest) bool {
+    return query.predicates.len == 0 and
+        query.or_predicates.len == 0 and
+        query.in_predicates.len == 0 and
+        query.access_or_predicates.len == 0 and
+        query.expression_predicates.len == 0 and
+        query.expression_or_predicates.len == 0;
+}
+
+pub fn querySupportsSimpleUnionRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
+    if (!queryHasOnlySimpleUnionPredicateSurface(query)) return false;
+    if (query.or_predicates.len > 0 and
+        (query.predicates.len > 0 or query.in_predicates.len > 0 or query.expression_predicates.len > 0 or query.expression_or_predicates.len > 0))
+    {
+        return false;
+    }
+    if (query.in_predicates.len > 0 and query.or_predicates.len > 0) return false;
+    if (query.expression_or_predicates.len != 0) {
+        if (query.or_predicates.len != 0) return false;
+    }
+    return true;
+}
+
+pub fn querySupportsSimpleIntersectExceptRewrite(query: db_mod.types.RelationalRowsQueryRequest) bool {
+    if (!queryHasOnlySimpleIntersectExceptPredicateSurface(query)) return false;
+    if (query.expression_or_predicates.len != 0) {
+        if (query.or_predicates.len != 0) return false;
+    }
+    if (query.or_predicates.len != 0 and
+        (query.predicates.len != 0 or query.in_predicates.len != 0 or query.expression_predicates.len != 0))
+    {
+        return false;
+    }
+    return true;
+}
+
 pub fn simpleSelectProjectionsEqual(
     lhs: db_mod.types.RelationalRowsQueryRequest,
     rhs: db_mod.types.RelationalRowsQueryRequest,
@@ -2675,6 +2711,22 @@ test "sql adapter lower expr compares query projection and set operation surface
         .expressions = &.{projection},
         .limit = 10,
     };
+    const status_predicate: runtime_schema.RelationalCheck = .{
+        .name = "status_active",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"active\"",
+    };
+    const grouped_predicate: db_mod.types.RelationalRowsPredicateGroup = .{
+        .predicates = &.{status_predicate},
+    };
+    const scalar_or_query: db_mod.types.RelationalRowsQueryRequest = .{
+        .or_predicates = &.{grouped_predicate},
+    };
+    const mixed_or_query: db_mod.types.RelationalRowsQueryRequest = .{
+        .predicates = &.{status_predicate},
+        .or_predicates = &.{grouped_predicate},
+    };
     const left_outputs = [_]ast.SelectOutputRef{.{ .kind = .field, .index = 0 }};
     const right_outputs = [_]ast.SelectOutputRef{.{ .kind = .field, .index = 0 }};
     const mismatched_outputs = [_]ast.SelectOutputRef{.{ .kind = .expression, .index = 0 }};
@@ -2686,6 +2738,12 @@ test "sql adapter lower expr compares query projection and set operation surface
     try std.testing.expect(queryHasOnlySimpleIntersectExceptPredicateSurface(simple_query));
     try std.testing.expect(!queryHasOnlySimpleUnionPredicateSurface(limited_query));
     try std.testing.expect(!queryHasOnlySimpleIntersectExceptPredicateSurface(limited_query));
+    try std.testing.expect(queryHasNoSimpleSetPredicates(simple_query));
+    try std.testing.expect(!queryHasNoSimpleSetPredicates(scalar_or_query));
+    try std.testing.expect(querySupportsSimpleUnionRewrite(scalar_or_query));
+    try std.testing.expect(querySupportsSimpleIntersectExceptRewrite(scalar_or_query));
+    try std.testing.expect(!querySupportsSimpleUnionRewrite(mixed_or_query));
+    try std.testing.expect(!querySupportsSimpleIntersectExceptRewrite(mixed_or_query));
     try std.testing.expect(expressionProjectionsEqual(&.{projection}, &.{projection}));
     try std.testing.expect(simpleSelectProjectionsEqual(simple_query, same_query, &left_outputs, &right_outputs));
     try std.testing.expect(!simpleSelectProjectionsEqual(simple_query, same_query, &left_outputs, &mismatched_outputs));
