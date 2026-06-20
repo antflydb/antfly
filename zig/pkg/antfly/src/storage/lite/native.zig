@@ -87,6 +87,34 @@ const ValuePage = struct {
     chunk: []const u8,
 };
 
+const FreeMap = struct {
+    covered_page_count: u64,
+    free_pages: []u64,
+};
+
+const PageAllocator = struct {
+    file: *NativeFile,
+    free_pages: []u64,
+    next_free_index: usize = 0,
+    next_page_id: u64,
+
+    fn deinit(self: *PageAllocator) void {
+        self.file.allocator.free(self.free_pages);
+    }
+
+    fn allocate(self: *PageAllocator) !u64 {
+        if (self.next_free_index < self.free_pages.len) {
+            const page_id = self.free_pages[self.next_free_index];
+            self.next_free_index += 1;
+            return page_id;
+        }
+
+        const page_id = self.next_page_id;
+        self.next_page_id = try std.math.add(u64, self.next_page_id, 1);
+        return page_id;
+    }
+};
+
 pub const DocumentMutation = struct {
     key: []const u8,
     value: []const u8 = "",
@@ -278,23 +306,31 @@ pub const NativeFile = struct {
     pub fn allocatePage(self: *NativeFile, contents: []const u8) !u64 {
         if (self.read_only) return error.ReadOnly;
         const previous = self.activeCheckpoint();
-        const page_id = previous.page_count;
-        var next_page_id = page_id;
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        const page_id = try page_allocator.allocate();
         try self.writePage(page_id, .data, contents);
-        next_page_id += 1;
-        const free_map_root_page = try self.appendFreeMapPageForCommit(&next_page_id);
-        try self.file.sync(self.io_impl.io());
 
         var next = previous;
         next.commit_sequence += 1;
-        next.free_map_root_page = free_map_root_page;
-        next.page_count = next_page_id;
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.file.sync(self.io_impl.io());
+
         try self.publishCheckpoint(next);
         return page_id;
     }
 
     pub fn readPageAlloc(self: *NativeFile, allocator: Allocator, page_id: u64) ![]u8 {
-        const checkpoint = self.activeCheckpoint();
+        return try self.readPageAllocForCheckpoint(allocator, page_id, self.activeCheckpoint());
+    }
+
+    fn readPageAllocForCheckpoint(self: *NativeFile, allocator: Allocator, page_id: u64, checkpoint: CheckpointSlot) ![]u8 {
         if (page_id == 0 or page_id >= checkpoint.page_count) return error.InvalidPageId;
 
         const page_size: usize = @intCast(self.header.page_size);
@@ -342,16 +378,16 @@ pub const NativeFile = struct {
 
         const previous = self.activeCheckpoint();
         var next_root_page = catalogRootPage(previous, root);
-        var next_page_id = previous.page_count;
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
 
         for (mutations) |mutation| {
             var external_value_root_page: u64 = 0;
             if (!mutation.is_delete and !self.catalogEntryFitsInline(mutation.key, mutation.value)) {
-                external_value_root_page = next_page_id;
-                next_page_id = try self.writeValuePages(next_page_id, mutation.value);
+                external_value_root_page = try self.writeValuePagesAllocated(&page_allocator, mutation.value);
             }
 
-            const page_id = next_page_id;
+            const page_id = try page_allocator.allocate();
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeCatalogEntry(self.allocator, &payload, .{
@@ -363,17 +399,19 @@ pub const NativeFile = struct {
             });
             try self.writePage(page_id, .catalog, payload.items);
             next_root_page = page_id;
-            next_page_id += 1;
         }
-
-        const free_map_root_page = try self.appendFreeMapPageForCommit(&next_page_id);
-        try self.file.sync(self.io_impl.io());
 
         var next = previous;
         next.commit_sequence += 1;
         setCatalogRootPage(&next, root, next_root_page);
-        next.free_map_root_page = free_map_root_page;
-        next.page_count = next_page_id;
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.file.sync(self.io_impl.io());
+
         try self.publishCheckpoint(next);
     }
 
@@ -490,16 +528,16 @@ pub const NativeFile = struct {
 
         const previous = self.activeCheckpoint();
         var next_root_page = previous.document_root_page;
-        var next_page_id = previous.page_count;
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
 
         for (mutations) |mutation| {
             var external_value_root_page: u64 = 0;
             if (!mutation.is_delete and !self.documentEntryFitsInline(mutation.key, mutation.value)) {
-                external_value_root_page = next_page_id;
-                next_page_id = try self.writeValuePages(next_page_id, mutation.value);
+                external_value_root_page = try self.writeValuePagesAllocated(&page_allocator, mutation.value);
             }
 
-            const page_id = next_page_id;
+            const page_id = try page_allocator.allocate();
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(self.allocator);
             try encodeDocumentEntry(self.allocator, &payload, .{
@@ -511,17 +549,19 @@ pub const NativeFile = struct {
             });
             try self.writePage(page_id, .document, payload.items);
             next_root_page = page_id;
-            next_page_id += 1;
         }
-
-        const free_map_root_page = try self.appendFreeMapPageForCommit(&next_page_id);
-        try self.file.sync(self.io_impl.io());
 
         var next = previous;
         next.commit_sequence += 1;
         next.document_root_page = next_root_page;
-        next.free_map_root_page = free_map_root_page;
-        next.page_count = next_page_id;
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.file.sync(self.io_impl.io());
+
         try self.publishCheckpoint(next);
     }
 
@@ -685,7 +725,7 @@ pub const NativeFile = struct {
             live_bytes +|= doc.key.len + doc.value.len;
         }
 
-        free_map_root_page = try appendFreeMapPageToImage(self.allocator, &image, page_size, &next_page_id, next_page_id + 1);
+        free_map_root_page = try appendFreeMapPageToImage(self.allocator, &image, page_size, &next_page_id, next_page_id + 1, &.{});
 
         const checkpoint = CheckpointSlot{
             .commit_sequence = previous.commit_sequence + 1,
@@ -818,61 +858,85 @@ pub const NativeFile = struct {
     }
 
     fn readPagePayloadByKindAlloc(self: *NativeFile, allocator: Allocator, page_id: u64, kind: PageKind) ![]u8 {
-        const page = try self.readPageAlloc(allocator, page_id);
+        return try self.readPagePayloadByKindAllocForCheckpoint(allocator, page_id, kind, self.activeCheckpoint());
+    }
+
+    fn readPagePayloadByKindAllocForCheckpoint(
+        self: *NativeFile,
+        allocator: Allocator,
+        page_id: u64,
+        kind: PageKind,
+        checkpoint: CheckpointSlot,
+    ) ![]u8 {
+        const page = try self.readPageAllocForCheckpoint(allocator, page_id, checkpoint);
         defer allocator.free(page);
         return try decodePagePayloadAlloc(allocator, page, kind);
     }
 
     const ReachablePageSet = std.AutoHashMapUnmanaged(u64, void);
 
-    fn markReachablePage(self: *NativeFile, reachable_pages: *ReachablePageSet, page_id: u64) !void {
-        if (page_id == 0 or page_id >= self.activeCheckpoint().page_count) return error.InvalidPageId;
+    fn markReachablePage(self: *NativeFile, reachable_pages: *ReachablePageSet, page_id: u64, page_count: u64) !void {
+        if (page_id == 0 or page_id >= page_count) return error.InvalidPageId;
         const entry = try reachable_pages.getOrPut(self.allocator, page_id);
         if (entry.found_existing) return error.InvalidNativePageChain;
     }
 
     fn countReachableChainPages(self: *NativeFile, kind: PageKind, root_page_id: u64, reachable_pages: *ReachablePageSet) !u64 {
+        return try self.countReachableChainPagesForCheckpoint(kind, root_page_id, self.activeCheckpoint(), reachable_pages);
+    }
+
+    fn countReachableChainPagesForCheckpoint(
+        self: *NativeFile,
+        kind: PageKind,
+        root_page_id: u64,
+        checkpoint: CheckpointSlot,
+        reachable_pages: *ReachablePageSet,
+    ) !u64 {
         var count: u64 = 0;
         var page_id = root_page_id;
         while (page_id != 0) {
-            try self.markReachablePage(reachable_pages, page_id);
-            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, kind);
+            try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, kind, checkpoint);
             defer self.allocator.free(payload);
             page_id = switch (kind) {
                 .catalog => blk: {
                     const entry = try decodeCatalogEntry(payload);
                     if (entry.external_value_root_page != 0) {
-                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, reachable_pages);
+                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
                     }
                     break :blk entry.previous_page;
                 },
                 .document => blk: {
                     const entry = try decodeDocumentEntry(payload);
                     if (entry.external_value_root_page != 0) {
-                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, reachable_pages);
+                        try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
                     }
                     break :blk entry.previous_page;
                 },
                 .data, .value, .free_map => return error.UnexpectedNativePageKind,
             };
             count += 1;
-            if (count > self.activeCheckpoint().page_count) return error.InvalidNativePageChain;
+            if (count > checkpoint.page_count) return error.InvalidNativePageChain;
         }
         return count;
     }
 
-    fn writeValuePages(self: *NativeFile, first_page_id: u64, value: []const u8) !u64 {
+    fn writeValuePagesAllocated(self: *NativeFile, page_allocator: *PageAllocator, value: []const u8) !u64 {
         if (value.len == 0) return error.InvalidNativeValueChain;
         const chunk_size = self.maxValuePagePayloadBytes();
         if (chunk_size == 0) return error.InvalidNativePageLength;
         const page_count = std.math.divCeil(usize, value.len, chunk_size) catch unreachable;
 
-        var page_id = first_page_id;
+        const page_ids = try self.allocator.alloc(u64, page_count);
+        defer self.allocator.free(page_ids);
+        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
+
         var offset: usize = 0;
         var page_index: usize = 0;
         while (offset < value.len) : (page_index += 1) {
             const len = @min(chunk_size, value.len - offset);
-            const next_page = if (page_index + 1 < page_count) page_id + 1 else 0;
+            const page_id = page_ids[page_index];
+            const next_page = if (page_index + 1 < page_count) page_ids[page_index + 1] else 0;
 
             const payload = try self.allocator.alloc(u8, value_page_header_size + len);
             defer self.allocator.free(payload);
@@ -880,24 +944,73 @@ pub const NativeFile = struct {
             @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
 
             try self.writePage(page_id, .value, payload);
-            page_id += 1;
             offset += len;
         }
 
-        return page_id;
+        return page_ids[0];
     }
 
-    fn appendFreeMapPageForCommit(self: *NativeFile, next_page_id: *u64) !u64 {
-        const free_map_root_page = next_page_id.*;
-        try self.writeFreeMapPage(free_map_root_page, free_map_root_page + 1);
-        next_page_id.* += 1;
-        return free_map_root_page;
+    fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
+        return .{
+            .file = self,
+            .free_pages = try self.readFreePagesAlloc(checkpoint),
+            .next_page_id = checkpoint.page_count,
+        };
     }
 
-    fn writeFreeMapPage(self: *NativeFile, page_id: u64, covered_page_count: u64) !void {
-        var payload: [free_map_header_size]u8 = undefined;
-        encodeFreeMap(&payload, covered_page_count, 0);
-        try self.writePage(page_id, .free_map, &payload);
+    fn readFreePagesAlloc(self: *NativeFile, checkpoint: CheckpointSlot) ![]u64 {
+        if (checkpoint.free_map_root_page == 0) return try self.allocator.alloc(u64, 0);
+
+        const payload = try self.readPagePayloadByKindAlloc(self.allocator, checkpoint.free_map_root_page, .free_map);
+        defer self.allocator.free(payload);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        return free_map.free_pages;
+    }
+
+    fn writeFreeMapPage(self: *NativeFile, page_id: u64, covered_page_count: u64, free_pages: []const u64) !void {
+        const payload = try encodeFreeMapAlloc(self.allocator, self.header.page_size, covered_page_count, free_pages);
+        defer self.allocator.free(payload);
+        try self.writePage(page_id, .free_map, payload);
+    }
+
+    fn computeFreePagesForPublishedCheckpoint(self: *NativeFile, next: CheckpointSlot, fallback: CheckpointSlot) ![]u64 {
+        var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer reachable_pages.deinit(self.allocator);
+
+        try self.collectCheckpointReachablePages(next, &reachable_pages);
+        if (validCheckpointSlot(fallback)) {
+            try self.collectCheckpointReachablePages(fallback, &reachable_pages);
+        }
+
+        var free_pages = std.ArrayListUnmanaged(u64).empty;
+        errdefer free_pages.deinit(self.allocator);
+
+        const max_entries = maxFreeMapEntries(self.header.page_size);
+        var page_id: u64 = 1;
+        while (page_id < next.page_count and free_pages.items.len < max_entries) : (page_id += 1) {
+            if (!reachable_pages.contains(page_id)) {
+                try free_pages.append(self.allocator, page_id);
+            }
+        }
+
+        return try free_pages.toOwnedSlice(self.allocator);
+    }
+
+    fn collectCheckpointReachablePages(self: *NativeFile, checkpoint: CheckpointSlot, out: *ReachablePageSet) !void {
+        var checkpoint_pages = std.AutoHashMapUnmanaged(u64, void){};
+        defer checkpoint_pages.deinit(self.allocator);
+
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.catalog_root_page, checkpoint, &checkpoint_pages);
+        _ = try self.countReachableChainPagesForCheckpoint(.catalog, checkpoint.index_catalog_root_page, checkpoint, &checkpoint_pages);
+        _ = try self.countReachableChainPagesForCheckpoint(.document, checkpoint.document_root_page, checkpoint, &checkpoint_pages);
+        if (checkpoint.free_map_root_page != 0) {
+            try self.markReachablePage(&checkpoint_pages, checkpoint.free_map_root_page, checkpoint.page_count);
+        }
+
+        var it = checkpoint_pages.iterator();
+        while (it.next()) |entry| {
+            try out.put(self.allocator, entry.key_ptr.*, {});
+        }
     }
 
     fn readValuePagesAlloc(self: *NativeFile, allocator: Allocator, root_page_id: u64, value_len: usize) ![]u8 {
@@ -928,7 +1041,13 @@ pub const NativeFile = struct {
         return value;
     }
 
-    fn validateReachableValuePages(self: *NativeFile, root_page_id: u64, value_len: usize, reachable_pages: *ReachablePageSet) !void {
+    fn validateReachableValuePages(
+        self: *NativeFile,
+        root_page_id: u64,
+        value_len: usize,
+        checkpoint: CheckpointSlot,
+        reachable_pages: *ReachablePageSet,
+    ) !void {
         if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
 
         var remaining = value_len;
@@ -936,10 +1055,10 @@ pub const NativeFile = struct {
         var pages_seen: u64 = 0;
         while (page_id != 0) {
             pages_seen += 1;
-            if (pages_seen > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+            if (pages_seen > checkpoint.page_count) return error.InvalidNativeValueChain;
 
-            try self.markReachablePage(reachable_pages, page_id);
-            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .value);
+            try self.markReachablePage(reachable_pages, page_id, checkpoint.page_count);
+            const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, page_id, .value, checkpoint);
             defer self.allocator.free(payload);
 
             const page = try decodeValuePage(payload);
@@ -955,11 +1074,16 @@ pub const NativeFile = struct {
 
     fn validateReachableFreeMap(self: *NativeFile, checkpoint: CheckpointSlot, reachable_pages: *ReachablePageSet) !void {
         if (checkpoint.free_map_root_page == 0) return;
-        try self.markReachablePage(reachable_pages, checkpoint.free_map_root_page);
+        try self.markReachablePage(reachable_pages, checkpoint.free_map_root_page, checkpoint.page_count);
 
         const payload = try self.readPagePayloadByKindAlloc(self.allocator, checkpoint.free_map_root_page, .free_map);
         defer self.allocator.free(payload);
-        try decodeFreeMap(payload, checkpoint.page_count);
+        const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
+        defer self.allocator.free(free_map.free_pages);
+
+        for (free_map.free_pages) |page_id| {
+            if (reachable_pages.contains(page_id)) return error.InvalidNativeFreeMap;
+        }
     }
 
     const LiveStats = struct {
@@ -1028,7 +1152,11 @@ pub const NativeFile = struct {
         defer self.allocator.free(page);
         encodePage(page, kind, contents);
 
-        try self.file.setLength(self.io_impl.io(), page_offset + self.header.page_size);
+        const page_end = page_offset + self.header.page_size;
+        const file_size = (try self.file.stat(self.io_impl.io())).size;
+        if (file_size < page_end) {
+            try self.file.setLength(self.io_impl.io(), page_end);
+        }
         try self.file.writePositionalAll(self.io_impl.io(), page, page_offset);
     }
 
@@ -1105,10 +1233,11 @@ fn appendFreeMapPageToImage(
     page_size: usize,
     next_page_id: *u64,
     covered_page_count: u64,
+    free_pages: []const u64,
 ) !u64 {
-    var payload: [free_map_header_size]u8 = undefined;
-    encodeFreeMap(&payload, covered_page_count, 0);
-    return try appendPageToImage(allocator, image, page_size, next_page_id, .free_map, &payload);
+    const payload = try encodeFreeMapAlloc(allocator, @intCast(page_size), covered_page_count, free_pages);
+    defer allocator.free(payload);
+    return try appendPageToImage(allocator, image, page_size, next_page_id, .free_map, payload);
 }
 
 fn catalogRootPage(slot: CheckpointSlot, root: CatalogRoot) u64 {
@@ -1612,21 +1741,58 @@ fn decodeValuePage(raw: []const u8) !ValuePage {
     };
 }
 
-fn encodeFreeMap(out: *[free_map_header_size]u8, covered_page_count: u64, free_page_count: u32) void {
-    std.mem.writeInt(u32, out[0..4], free_map_format_version, .little);
-    std.mem.writeInt(u32, out[4..8], free_page_count, .little);
-    std.mem.writeInt(u64, out[8..16], covered_page_count, .little);
+fn encodeFreeMapAlloc(allocator: Allocator, page_size: u32, covered_page_count: u64, free_pages: []const u64) ![]u8 {
+    if (free_pages.len > maxFreeMapEntries(page_size)) return error.NativeFreeMapTooLarge;
+    if (free_pages.len > std.math.maxInt(u32)) return error.NativeFreeMapTooLarge;
+
+    var previous_page_id: u64 = 0;
+    for (free_pages) |page_id| {
+        if (page_id == 0 or page_id >= covered_page_count) return error.InvalidNativeFreeMap;
+        if (page_id <= previous_page_id) return error.InvalidNativeFreeMap;
+        previous_page_id = page_id;
+    }
+
+    const payload = try allocator.alloc(u8, free_map_header_size + free_pages.len * 8);
+    errdefer allocator.free(payload);
+    std.mem.writeInt(u32, payload[0..4], free_map_format_version, .little);
+    std.mem.writeInt(u32, payload[4..8], @intCast(free_pages.len), .little);
+    std.mem.writeInt(u64, payload[8..16], covered_page_count, .little);
+    for (free_pages, 0..) |page_id, index| {
+        const offset = free_map_header_size + index * 8;
+        std.mem.writeInt(u64, payload[offset..][0..8], page_id, .little);
+    }
+    return payload;
 }
 
-fn decodeFreeMap(raw: []const u8, checkpoint_page_count: u64) !void {
+fn decodeFreeMapAlloc(allocator: Allocator, raw: []const u8, checkpoint_page_count: u64) !FreeMap {
     if (raw.len < free_map_header_size) return error.TruncatedNativeFreeMap;
     const version = std.mem.readInt(u32, raw[0..4], .little);
     if (version != free_map_format_version) return error.InvalidNativeFreeMap;
     const free_page_count = std.mem.readInt(u32, raw[4..8], .little);
     const covered_page_count = std.mem.readInt(u64, raw[8..16], .little);
     if (covered_page_count != checkpoint_page_count) return error.InvalidNativeFreeMap;
-    if (free_page_count != 0) return error.UnsupportedNativeFreeMap;
-    if (raw.len != free_map_header_size) return error.UnsupportedNativeFreeMap;
+    const expected_len = free_map_header_size + @as(usize, free_page_count) * 8;
+    if (raw.len != expected_len) return error.InvalidNativeFreeMap;
+
+    const free_pages = try allocator.alloc(u64, free_page_count);
+    errdefer allocator.free(free_pages);
+    var previous_page_id: u64 = 0;
+    for (free_pages, 0..) |*page_id, index| {
+        const offset = free_map_header_size + index * 8;
+        page_id.* = std.mem.readInt(u64, raw[offset..][0..8], .little);
+        if (page_id.* == 0 or page_id.* >= checkpoint_page_count) return error.InvalidNativeFreeMap;
+        if (page_id.* <= previous_page_id) return error.InvalidNativeFreeMap;
+        previous_page_id = page_id.*;
+    }
+    return .{
+        .covered_page_count = covered_page_count,
+        .free_pages = free_pages,
+    };
+}
+
+fn maxFreeMapEntries(page_size: u32) usize {
+    std.debug.assert(page_size >= page_header_size + free_map_header_size);
+    return (@as(usize, @intCast(page_size)) - page_header_size - free_map_header_size) / 8;
 }
 
 fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
@@ -2138,6 +2304,39 @@ test "lite native document store returns newest overwrite" {
     try std.testing.expectEqualStrings("new", value);
 }
 
+test "lite native free map reuses pages released by checkpoint rotation" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-reuse.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "v1");
+    try file.putDocument("doc:1", "v2");
+    try file.putDocument("doc:1", "v3");
+
+    const reusable = try file.readFreePagesAlloc(file.activeCheckpoint());
+    defer allocator.free(reusable);
+    try std.testing.expect(reusable.len > 0);
+
+    const before_size = (try file.file.stat(file.io_impl.io())).size;
+    try file.putDocument("doc:1", "v4");
+    const after_size = (try file.file.stat(file.io_impl.io())).size;
+
+    try std.testing.expectEqual(before_size + default_page_size, after_size);
+    const report = try file.check();
+    try std.testing.expect(report.valid);
+
+    const value = (try file.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("v4", value);
+}
+
 test "lite native document store spills large values into value pages" {
     const allocator = std.testing.allocator;
 
@@ -2578,10 +2777,10 @@ test "lite native check validates committed free map root" {
     const checkpoint = file.activeCheckpoint();
     try std.testing.expect(checkpoint.free_map_root_page != 0);
 
-    var payload: [free_map_header_size]u8 = undefined;
-    encodeFreeMap(&payload, checkpoint.page_count + 1, 0);
+    const payload = try encodeFreeMapAlloc(allocator, default_page_size, checkpoint.page_count + 1, &.{});
+    defer allocator.free(payload);
     var page: [default_page_size]u8 = undefined;
-    encodePage(&page, .free_map, &payload);
+    encodePage(&page, .free_map, payload);
     try file.file.writePositionalAll(file.io_impl.io(), &page, checkpoint.free_map_root_page * default_page_size);
     try file.file.sync(file.io_impl.io());
 
