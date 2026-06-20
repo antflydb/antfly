@@ -1402,6 +1402,70 @@ test "sql adapter plan clones query predicates" {
     try std.testing.expect(cloned_in[1].negated);
 }
 
+test "sql adapter plan owns projection helpers" {
+    const alloc = std.testing.allocator;
+
+    const json_extract = try alloc.dupe(db_mod.types.RelationalRowsJsonExtractProjection, &[_]db_mod.types.RelationalRowsJsonExtractProjection{.{
+        .output = try alloc.dupe(u8, "tier"),
+        .field = try alloc.dupe(u8, "payload"),
+        .path = try alloc.dupe(u8, "$.tier"),
+        .as_text = true,
+    }});
+    freeJsonExtract(alloc, json_extract);
+
+    const array_lengths = try alloc.dupe(db_mod.types.RelationalRowsArrayLengthProjection, &[_]db_mod.types.RelationalRowsArrayLengthProjection{.{
+        .output = try alloc.dupe(u8, "tag_count"),
+        .field = try alloc.dupe(u8, "tags"),
+    }});
+    freeArrayLengthProjections(alloc, array_lengths);
+
+    const aliases = try alloc.dupe(db_mod.types.RelationalRowsFieldAliasProjection, &[_]db_mod.types.RelationalRowsFieldAliasProjection{.{
+        .output = try alloc.dupe(u8, "tenant"),
+        .field = try alloc.dupe(u8, "tenant_id"),
+    }});
+    freeFieldAliasProjections(alloc, aliases);
+
+    const join_on = try alloc.dupe(db_mod.types.RelationalRowsJoinOn, &[_]db_mod.types.RelationalRowsJoinOn{.{
+        .left_field = try alloc.dupe(u8, "id"),
+        .right_field = try alloc.dupe(u8, "tenant_id"),
+    }});
+    freeJoinOn(alloc, join_on);
+    alloc.free(join_on);
+
+    const join_select = try alloc.dupe(db_mod.types.RelationalRowsJoinProjection, &[_]db_mod.types.RelationalRowsJoinProjection{.{
+        .output = try alloc.dupe(u8, "tenant_status"),
+        .side = .right,
+        .field = try alloc.dupe(u8, "status"),
+    }});
+    freeJoinProjections(alloc, join_select);
+    alloc.free(join_select);
+
+    const coalesce_operands = try alloc.dupe(db_mod.types.RelationalRowsCoalesceOperand, &[_]db_mod.types.RelationalRowsCoalesceOperand{
+        .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, "nickname"),
+        },
+        .{
+            .kind = .value,
+            .value_json = try alloc.dupe(u8, "\"anonymous\""),
+        },
+    });
+    const coalesce_projection: db_mod.types.RelationalRowsCoalesceProjection = .{
+        .output = try alloc.dupe(u8, "display_name"),
+        .operands = coalesce_operands,
+    };
+
+    const expression_projection = try expressionProjectionFromCoalesceAlloc(alloc, coalesce_projection);
+    defer freeExpressionProjection(alloc, expression_projection);
+    try std.testing.expectEqualStrings("display_name", expression_projection.output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, expression_projection.expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression_projection.expression.operands.len);
+    try std.testing.expectEqualStrings("nickname", expression_projection.expression.operands[0].field);
+    try std.testing.expect(expression_projection.expression.operands.ptr != coalesce_projection.operands.ptr);
+
+    freeCoalesceProjection(alloc, coalesce_projection);
+}
+
 test "sql adapter lowered read plans own nested storage plan memory" {
     const alloc = std.testing.allocator;
 

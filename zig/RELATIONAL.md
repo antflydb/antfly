@@ -1000,8 +1000,9 @@ moves behind a `api/sql_adapter/` package:
   deinit helpers.
 - `plan.zig`: adapter public plan structs, fingerprints, and ownership helpers
   that callers already consume, including shared row-expression clone, rewrite,
-  query-order clone, predicate clone/deinit, window deinit, and deinit helpers
-  used by read, write, DDL, and compatibility wrappers.
+  query-order clone, predicate clone/deinit, projection conversion/deinit, join
+  projection deinit, window deinit, and deinit helpers used by read, write, DDL,
+  and compatibility wrappers.
 - `ddl_plan.zig`: adapter public DDL/catalog plan containers and ownership
   helpers, including table, partition, index, relation-lifetime, identity
   allocator, domain, and catalog plans, plus grammar-syntax to plan-enum
@@ -1395,8 +1396,10 @@ aggregate, join, lateral, window, CTE, insert, update/delete, insert-source,
 mutation-source, joined-mutation-source, and merge mutation plans, plus shared
 row-expression clone, source-rewrite, query-order clone, predicate-group,
 access-predicate-group, query-predicate clone, window-spec, and deinit helpers
-used across parser cleanup paths and lowered-plan ownership, while preserving
-the existing public entrypoints through facade aliases;
+used across parser cleanup paths and lowered-plan ownership, plus projection
+and join deinit/conversion helpers that operate only on Antfly-native storage
+plan structs, while preserving the existing public entrypoints through facade
+aliases;
 `api/sql_adapter/ddl_plan.zig` owns the adapter-noop DDL, enum-type catalog,
 domain catalog, identity-allocator catalog,
 schema-namespace catalog, extension catalog, function/routine catalog, and

@@ -3862,6 +3862,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter plan clones and frees row expressions",
             "sql adapter plan frees predicate and window ownership containers",
             "sql adapter plan clones query predicates",
+            "sql adapter plan owns projection helpers",
             "SQL adapter DDL syntax conversions map grammar enums to plan enums",
             "sql adapter value parses timestamp literals",
             "sql adapter value parses scalar json literals",
