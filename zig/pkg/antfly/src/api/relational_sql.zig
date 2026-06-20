@@ -62,6 +62,7 @@ const relationalColumnHasIndexName = sql_adapter.relationalColumnHasIndexName;
 const relationalColumnIndex = sql_adapter.relationalColumnIndex;
 const relationalColumnIndexForIndexName = sql_adapter.relationalColumnIndexForIndexName;
 const relationalConstraintNameExists = sql_adapter.relationalConstraintNameExists;
+const relationalFieldTypeSupportsCollation = sql_adapter.relationalFieldTypeSupportsCollation;
 const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
@@ -75,8 +76,14 @@ const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionFor
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
 const validateGeneratedColumnForColumns = sql_adapter.validateGeneratedColumnForColumns;
 const validateForeignKeyForColumns = sql_adapter.validateForeignKeyForColumns;
+const validateForeignKeyCatalog = sql_adapter.validateForeignKeyCatalog;
+const validatePrimaryKeyColumns = sql_adapter.validatePrimaryKeyColumns;
 const validatePrimaryKeyTemporalCatalog = sql_adapter.validatePrimaryKeyTemporalCatalog;
+const validateRelationalCheckCatalog = sql_adapter.validateRelationalCheckCatalog;
+const validateRelationalColumnCatalog = sql_adapter.validateRelationalColumnCatalog;
+const validateRelationalColumnIndexIncludes = sql_adapter.validateRelationalColumnIndexIncludes;
 const validateRelationalPeriodCatalog = sql_adapter.validateRelationalPeriodCatalog;
+const validateUniqueConstraintCatalog = sql_adapter.validateUniqueConstraintCatalog;
 const validateUniqueConstraintForColumns = sql_adapter.validateUniqueConstraintForColumns;
 const validateUniquePredicatesForColumns = sql_adapter.validateUniquePredicatesForColumns;
 const validateUniquePredicateExpressionsForColumns = sql_adapter.validateUniquePredicateExpressionsForColumns;
@@ -36882,13 +36889,6 @@ fn alterColumnTypeInSchemaJsonValue(
     if (operation.collation) |collation| try putJsonString(alloc, &property.object, "collation", collation);
 }
 
-fn relationalFieldTypeSupportsCollation(field_type: runtime_schema.AntflyType) bool {
-    return switch (field_type) {
-        .keyword, .text => true,
-        else => false,
-    };
-}
-
 fn appendUniqueJsonString(
     alloc: std.mem.Allocator,
     array: *std.json.Array,
@@ -38980,65 +38980,6 @@ fn setColumnOnUpdatePolicyAlloc(
     errdefer alloc.free(cloned_value.value_json);
     if (columns[index].on_update_value) |existing| alloc.free(existing.value_json);
     columns[index].on_update_value = cloned_value;
-}
-
-fn validateRelationalColumnCatalog(columns: []const runtime_schema.RelationalColumn) !void {
-    for (columns, 0..) |column, i| {
-        if (relationalColumnIndex(columns[0..i], column.name) != null) return error.InvalidSqlCatalog;
-        if (!std.mem.eql(u8, column.name, column.path)) return error.InvalidSqlCatalog;
-        if (column.collation != null and !relationalFieldTypeSupportsCollation(column.field_type)) return error.InvalidSqlCatalog;
-        if (column.generated) |_| try validateGeneratedColumnForColumns(columns, column);
-        try validateUniquePredicatesForColumns(columns, column.index_where);
-        try validateUniquePredicateExpressionsForColumns(columns, column.index_where_expressions);
-        try validateRelationalColumnIndexIncludes(columns, column);
-        if (column.on_update_value) |_| {
-            if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
-        }
-    }
-}
-
-fn validateRelationalColumnIndexIncludes(columns: []const runtime_schema.RelationalColumn, column: runtime_schema.RelationalColumn) !void {
-    if (column.index_include_columns.len == 0) return;
-    if (!column.indexed or column.index_name == null) return error.InvalidSqlCatalog;
-    for (column.index_include_columns) |field| {
-        _ = relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
-    }
-    const index_name = column.index_name.?;
-    for (columns) |peer| {
-        if (!relationalColumnHasDeclaredIndexName(peer, index_name)) continue;
-        if (!stringSlicesEqual(peer.index_include_columns, column.index_include_columns)) return error.InvalidSqlCatalog;
-        if (stringSlicesContains(column.index_include_columns, peer.name)) return error.InvalidSqlCatalog;
-    }
-}
-
-fn validateUniqueConstraintCatalog(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod, constraints: []const runtime_schema.UniqueConstraint) !void {
-    for (constraints, 0..) |constraint, i| {
-        if (uniqueConstraintNameExists(constraints[0..i], constraint.name)) return error.InvalidSqlCatalog;
-        try validateUniqueConstraintForColumns(columns, periods, constraint);
-    }
-}
-
-fn validateForeignKeyCatalog(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod, foreign_keys: []const runtime_schema.ForeignKey) !void {
-    for (foreign_keys, 0..) |foreign_key, i| {
-        if (foreignKeyNameExists(foreign_keys[0..i], foreign_key.name)) return error.InvalidSqlCatalog;
-        try validateForeignKeyForColumns(columns, periods, foreign_key);
-    }
-}
-
-fn validateRelationalCheckCatalog(columns: []const runtime_schema.RelationalColumn, checks: []const runtime_schema.RelationalCheck) !void {
-    for (checks, 0..) |check, i| {
-        if (relationalCheckNameExists(checks[0..i], check.name)) return error.InvalidSqlCatalog;
-        try validateCheckForColumns(columns, check);
-    }
-}
-
-fn validatePrimaryKeyColumns(columns: []const runtime_schema.RelationalColumn, primary_key: runtime_schema.PrimaryKey) !void {
-    if (primary_key.columns.len == 0) return error.InvalidSqlCatalog;
-    for (primary_key.columns) |column| {
-        const found = relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
-        if (found.nullable) return error.InvalidSqlCatalog;
-    }
-    try validateCreateIndexIncludeColumns(columns, primary_key.columns, primary_key.include_columns);
 }
 
 fn conflictActionToken(action: Parser.ConflictAction) []const u8 {

@@ -23794,6 +23794,22 @@ test "api http server executes public relational row plan endpoints" {
     };
     defer identity.deinit(alloc);
 
+    var rejected_filtered_insert_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t2\",\"id\":\"o10\",\"customer_id\":\"c9\",\"status\":\"open\",\"amount\":1000,\"created_at\":100}}]}", identity);
+    defer rejected_filtered_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), rejected_filtered_insert_resp.status);
+
+    var allowed_filtered_insert_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o4\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":40,\"created_at\":40}}]}", identity);
+    defer allowed_filtered_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), allowed_filtered_insert_resp.status);
+
+    var rejected_filtered_delete_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"delete\",\"where\":{\"primary\":{\"kind\":\"order\",\"tenant\":\"t2\",\"id\":\"o9\"}}}]}", identity);
+    defer rejected_filtered_delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), rejected_filtered_delete_resp.status);
+
+    var rejected_filtered_update_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o4\"}},\"patch\":{\"tenant\":\"t2\"}}]}", identity);
+    defer rejected_filtered_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), rejected_filtered_update_resp.status);
+
     var filtered_query_resp = try server.handlePublicTableRowsQuery("records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"tenant\",\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}", identity);
     defer filtered_query_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), filtered_query_resp.status);

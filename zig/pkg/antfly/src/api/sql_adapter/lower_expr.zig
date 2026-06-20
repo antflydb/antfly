@@ -827,6 +827,73 @@ pub fn validateUniqueConstraintForColumns(columns: []const runtime_schema.Relati
     try validateUniquePredicateExpressionsForColumns(columns, constraint.where_expressions);
 }
 
+pub fn validateRelationalColumnCatalog(columns: []const runtime_schema.RelationalColumn) !void {
+    for (columns, 0..) |column, i| {
+        if (binder.relationalColumnIndex(columns[0..i], column.name) != null) return error.InvalidSqlCatalog;
+        if (!std.mem.eql(u8, column.name, column.path)) return error.InvalidSqlCatalog;
+        if (column.collation != null and !binder.relationalFieldTypeSupportsCollation(column.field_type)) return error.InvalidSqlCatalog;
+        if (column.generated) |_| try validateGeneratedColumnForColumns(columns, column);
+        try validateUniquePredicatesForColumns(columns, column.index_where);
+        try validateUniquePredicateExpressionsForColumns(columns, column.index_where_expressions);
+        try validateRelationalColumnIndexIncludes(columns, column);
+        if (column.on_update_value) |_| {
+            if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
+        }
+    }
+}
+
+pub fn validateRelationalColumnIndexIncludes(columns: []const runtime_schema.RelationalColumn, column: runtime_schema.RelationalColumn) !void {
+    if (column.index_include_columns.len == 0) return;
+    if (!column.indexed or column.index_name == null) return error.InvalidSqlCatalog;
+    for (column.index_include_columns) |field| {
+        _ = binder.relationalColumnForDdl(columns, field) orelse return error.InvalidSqlCatalog;
+    }
+    const index_name = column.index_name.?;
+    for (columns) |peer| {
+        if (!binder.relationalColumnHasDeclaredIndexName(peer, index_name)) continue;
+        if (!stringSlicesEqual(peer.index_include_columns, column.index_include_columns)) return error.InvalidSqlCatalog;
+        if (stringSlicesContains(column.index_include_columns, peer.name)) return error.InvalidSqlCatalog;
+    }
+}
+
+pub fn validateUniqueConstraintCatalog(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod, constraints: []const runtime_schema.UniqueConstraint) !void {
+    for (constraints, 0..) |constraint, i| {
+        if (binder.uniqueConstraintNameExists(constraints[0..i], constraint.name)) return error.InvalidSqlCatalog;
+        try validateUniqueConstraintForColumns(columns, periods, constraint);
+    }
+}
+
+pub fn validateForeignKeyCatalog(columns: []const runtime_schema.RelationalColumn, periods: []const runtime_schema.RelationalPeriod, foreign_keys: []const runtime_schema.ForeignKey) !void {
+    for (foreign_keys, 0..) |foreign_key, i| {
+        if (binder.foreignKeyNameExists(foreign_keys[0..i], foreign_key.name)) return error.InvalidSqlCatalog;
+        try binder.validateForeignKeyForColumns(columns, periods, foreign_key);
+    }
+}
+
+pub fn validateRelationalCheckCatalog(columns: []const runtime_schema.RelationalColumn, checks: []const runtime_schema.RelationalCheck) !void {
+    for (checks, 0..) |check, i| {
+        if (binder.relationalCheckNameExists(checks[0..i], check.name)) return error.InvalidSqlCatalog;
+        try validateCheckForColumns(columns, check);
+    }
+}
+
+pub fn validatePrimaryKeyColumns(columns: []const runtime_schema.RelationalColumn, primary_key: runtime_schema.PrimaryKey) !void {
+    if (primary_key.columns.len == 0) return error.InvalidSqlCatalog;
+    for (primary_key.columns) |column| {
+        const found = binder.relationalColumnForDdl(columns, column) orelse return error.InvalidSqlCatalog;
+        if (found.nullable) return error.InvalidSqlCatalog;
+    }
+    try validateCreateIndexIncludeColumns(columns, primary_key.columns, primary_key.include_columns);
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
 fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
     for (values) |candidate| {
         if (std.mem.eql(u8, candidate, value)) return true;

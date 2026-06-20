@@ -132,6 +132,13 @@ pub fn relationalCheckNameExists(checks: []const runtime_schema.RelationalCheck,
     return false;
 }
 
+pub fn relationalFieldTypeSupportsCollation(field_type: runtime_schema.AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .text => true,
+        else => false,
+    };
+}
+
 pub fn relationalPeriodColumnType(field_type: runtime_schema.AntflyType) bool {
     return field_type == .numeric or field_type == .datetime;
 }
