@@ -5060,6 +5060,34 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expectEqual(@as(usize, 2), generated.work_items.len);
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, generated.work_items[0].action);
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rewrite, generated.work_items[1].action);
+    try std.testing.expect(generated.work_items[1].rewrite_expression == null);
+
+    var default_backfill = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &altered.table,
+        "ALTER TABLE users ADD COLUMN status_default text DEFAULT 'pending';",
+    );
+    defer default_backfill.deinit(std.testing.allocator);
+    try std.testing.expect(default_backfill.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 2), default_backfill.work_items.len);
+    const default_rewrite = default_backfill.work_items[1].rewrite_expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("status_default", default_rewrite.target_column);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.value, default_rewrite.expression.kind);
+    try std.testing.expectEqualStrings("\"pending\"", default_rewrite.expression.value_json);
+
+    var generated_backfill = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &altered.table,
+        "ALTER TABLE users ADD COLUMN status_lower text GENERATED ALWAYS AS (lower(status)) STORED;",
+    );
+    defer generated_backfill.deinit(std.testing.allocator);
+    try std.testing.expect(generated_backfill.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 2), generated_backfill.work_items.len);
+    const generated_rewrite = generated_backfill.work_items[1].rewrite_expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("status_lower", generated_rewrite.target_column);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.lower, generated_rewrite.expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_rewrite.expression.operands.len);
+    try std.testing.expectEqualStrings("status", generated_rewrite.expression.operands[0].field);
 
     var indexed = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,

@@ -657,6 +657,17 @@ pub const UnaryNegativeRowExpressionParserHooks = struct {
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const ArithmeticExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_parenthesized_boolean: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const BooleanExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub fn sqlRowClaimForClause(clause: ast.SqlRowClaimClause) db_mod.types.RowClaimRequest {
     return .{
         .mode = clause.mode,
@@ -3172,6 +3183,161 @@ fn parseDatePartUnitLiteralExpressionAlloc(
         .kind = .value,
         .value_json = try std.json.Stringify.valueAlloc(alloc, token.text, .{}),
     };
+}
+
+pub fn parseConcatRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try parseConcatFunctionCallStart(tokens, pos);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try hooks.parse_operand(hooks.ptr);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if ((kind == .concat and operands.items.len == 0) or (kind == .concat_ws and operands.items.len < 2)) return error.UnsupportedSqlShape;
+    if (kind == .concat_ws) {
+        for (operands.items) |operand| try type_context.validateTextRowExpression(operand);
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+
+    return try buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+}
+
+pub fn parsePipeConcatExpressionRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    left: db_mod.types.RelationalRowsExpression,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var left_transferred = false;
+    errdefer if (!left_transferred) freeExpression(alloc, left);
+    try type_context.validateTextRowExpression(left);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    try operands.append(alloc, left);
+    left_transferred = true;
+
+    while (parser.matchToken(tokens, pos, .pipe_concat) != null) {
+        const rhs = try hooks.parse_operand(hooks.ptr);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+        try type_context.validateTextRowExpression(rhs);
+        try operands.append(alloc, rhs);
+        rhs_transferred = true;
+    }
+    if (operands.items.len < 2) return error.UnsupportedSqlShape;
+    return try buildFunctionExpressionFromOperandListAlloc(alloc, .concat, &operands);
+}
+
+pub fn parseArithmeticExpressionRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    lhs: db_mod.types.RelationalRowsExpression,
+    min_precedence: u8,
+    type_context: RowExpressionTypeContext,
+    hooks: ArithmeticExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var current = lhs;
+    var current_owned = true;
+    errdefer if (current_owned) freeExpression(alloc, current);
+
+    while (peekArithmeticOperator(tokens, pos.*)) |op| {
+        if (op.precedence < min_precedence) break;
+        _ = parser.matchToken(tokens, pos, op.token) orelse unreachable;
+        if (peekSqlIntervalExpressionSyntax(tokens, pos.*)) {
+            try type_context.validateNumericOrDatetimeRowExpression(current);
+            const interval = try value_mod.parseSqlIntervalLiteral(tokens, pos);
+            const next = try buildIntervalLiteralArithmeticAlloc(alloc, current, op.kind, interval);
+            current_owned = false;
+            current = next;
+            current_owned = true;
+            continue;
+        }
+
+        var rhs = if (peekParenthesizedExpressionSyntax(tokens, pos.*))
+            try hooks.parse_parenthesized_boolean(hooks.ptr)
+        else
+            try hooks.parse_operand(hooks.ptr);
+        var rhs_owned = true;
+        errdefer if (rhs_owned) freeExpression(alloc, rhs);
+        try type_context.validateNumericRowExpression(rhs);
+
+        while (peekArithmeticOperator(tokens, pos.*)) |next_op| {
+            if (next_op.precedence <= op.precedence) break;
+            rhs_owned = false;
+            rhs = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, rhs, next_op.precedence, type_context, hooks);
+            rhs_owned = true;
+        }
+
+        const expression = try buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
+        current_owned = false;
+        rhs_owned = false;
+        current = expression;
+        current_owned = true;
+    }
+
+    current_owned = false;
+    return current;
+}
+
+pub fn parseBooleanExpressionRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    lhs: db_mod.types.RelationalRowsExpression,
+    min_precedence: u8,
+    type_context: RowExpressionTypeContext,
+    hooks: BooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try type_context.validateBooleanRowExpression(lhs);
+    var current = lhs;
+    var current_owned = true;
+    errdefer if (current_owned) freeExpression(alloc, current);
+
+    while (peekBooleanOperator(tokens, pos.*)) |op| {
+        if (op.precedence < min_precedence) break;
+        if (!parser.matchKeyword(tokens, pos, op.keyword)) unreachable;
+        var rhs = try hooks.parse_operand(hooks.ptr);
+        var rhs_owned = true;
+        errdefer if (rhs_owned) freeExpression(alloc, rhs);
+        try type_context.validateBooleanRowExpression(rhs);
+
+        while (peekBooleanOperator(tokens, pos.*)) |next_op| {
+            if (next_op.precedence <= op.precedence) break;
+            rhs_owned = false;
+            rhs = try parseBooleanExpressionRestAlloc(alloc, tokens, pos, rhs, next_op.precedence, type_context, hooks);
+            rhs_owned = true;
+        }
+
+        const expression = try buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
+        current_owned = false;
+        rhs_owned = false;
+        current = expression;
+        current_owned = true;
+    }
+
+    current_owned = false;
+    return current;
 }
 
 fn parseTextNumericBinaryRowExpressionRestAlloc(

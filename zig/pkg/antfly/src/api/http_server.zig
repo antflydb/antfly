@@ -1392,6 +1392,7 @@ fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
     var ordinal: u32 = 0;
     for (applied.work_items) |item| {
         if (item.action != .rewrite) continue;
+        if (item.rewrite_expression == null) return error.UnsupportedSqlShape;
         ordinal += 1;
         for (snapshot.ranges) |range| {
             if (range.table_id != applied.table.table_id) continue;
@@ -1702,6 +1703,57 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     try std.testing.expect(service.jobs.items[1].end_row_key == null);
 }
 
+test "api http server rejects schema rewrite jobs without typed row operation" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        ranges: [1]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9001, .range_id = 9101, .table_id = 77, .start_key = "", .end_key = null },
+        },
+        upsert_count: usize = 0,
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertSchemaRewriteJob(self: *@This(), _: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            self.upsert_count += 1;
+        }
+    };
+
+    const table = try metadata_table_manager.cloneTable(alloc, .{
+        .table_id = 77,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+    });
+    errdefer metadata_table_manager.freeTable(alloc, table);
+    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    work_items[0] = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+    };
+    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+        .table = table,
+        .rewrite_required = true,
+        .work_items = work_items,
+    };
+    defer applied.deinit(alloc);
+
+    var service = FakeService{};
+    try std.testing.expectError(error.UnsupportedSqlShape, scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied));
+    try std.testing.expectEqual(@as(usize, 0), service.upsert_count);
+}
+
 test "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL" {
     const alloc = std.testing.allocator;
 
@@ -1751,10 +1803,21 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
             errdefer metadata_table_manager.freeTable(allocator, table);
             const work_items = try allocator.alloc(relational_sql.AppliedDdlWorkItem, 1);
             errdefer allocator.free(work_items);
+            const target_column = try allocator.dupe(u8, "amount");
+            errdefer allocator.free(target_column);
+            const rewrite_expression = try runtime_schema_mod.cloneRelationalRowsExpressionAlloc(allocator, .{
+                .kind = .value,
+                .value_json = "0",
+            });
+            errdefer runtime_schema_mod.freeRelationalRowsExpression(allocator, rewrite_expression);
             work_items[0] = .{
                 .action = .rewrite,
                 .subject = .table,
                 .reason = .row_images,
+                .rewrite_expression = .{
+                    .target_column = target_column,
+                    .expression = rewrite_expression,
+                },
             };
             return .{
                 .table = table,

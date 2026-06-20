@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "81938c31922aee7879b1d27c01bf8564b82b7ee6279532a7d24128864c33c9de",
+  "source_sha256": "d93121fb58021c45209cb7b68765c651587e2cbd6d244c52236ec3ea5f9cc214",
   "source_entry_count": 1006,
   "entry_count": 1006,
   "skipped_entries": [
@@ -7747,7 +7747,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_generated=1",
-      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,rewrite/table/row_images",
+      "applied_plan": "applied:rebuild=true:validation=false:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,rewrite/table/row_images(target=email_upper_key:expr=upper[field[row:email]])",
       "sql": "ALTER TABLE usage_records ADD COLUMN email_upper_key text GENERATED ALWAYS AS (upper(email)) STORED;"
     },
     {
@@ -7772,7 +7772,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_col=1:add_col_default=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(target=billing_status:expr=value[2261637469766522])",
       "sql": "ALTER TABLE usage_records ADD COLUMN billing_status text DEFAULT 'active' NOT NULL;"
     },
     {

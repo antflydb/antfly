@@ -3379,6 +3379,14 @@ const Parser = struct {
         };
     }
 
+    fn arithmeticExpressionParserHooks(self: *@This()) sql_adapter.ArithmeticExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseNullifRowExpressionOperandHook,
+            .parse_parenthesized_boolean = parseParenthesizedBooleanRowExpressionHook,
+        };
+    }
+
     fn jsonBuildObjectRowExpressionParserHooks(self: *@This()) sql_adapter.JsonBuildObjectRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -15284,47 +15292,7 @@ const Parser = struct {
         lhs: db_mod.types.RelationalRowsExpression,
         min_precedence: u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        var current = lhs;
-        var current_owned = true;
-        errdefer if (current_owned) freeExpression(self.alloc, current);
-
-        while (sql_adapter.peekArithmeticOperator(self.tokens, self.pos)) |op| {
-            if (op.precedence < min_precedence) break;
-            _ = self.match(op.token) orelse unreachable;
-            if (sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos)) {
-                try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(current);
-                const interval = try sql_adapter.parseSqlIntervalLiteral(self.tokens, &self.pos);
-                const next = try sql_adapter.buildIntervalLiteralArithmeticAlloc(self.alloc, current, op.kind, interval);
-                current_owned = false;
-                current = next;
-                current_owned = true;
-                continue;
-            }
-
-            var rhs = if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos))
-                try self.parseParenthesizedBooleanRowExpressionAlloc()
-            else
-                try self.parseRowExpressionOperandAlloc();
-            var rhs_owned = true;
-            errdefer if (rhs_owned) freeExpression(self.alloc, rhs);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(rhs);
-
-            while (sql_adapter.peekArithmeticOperator(self.tokens, self.pos)) |next_op| {
-                if (next_op.precedence <= op.precedence) break;
-                rhs_owned = false;
-                rhs = try self.parseArithmeticExpressionRestAlloc(rhs, next_op.precedence);
-                rhs_owned = true;
-            }
-
-            const expression = try sql_adapter.buildBinaryExpressionAlloc(self.alloc, op.kind, current, rhs);
-            current_owned = false;
-            rhs_owned = false;
-            current = expression;
-            current_owned = true;
-        }
-
-        current_owned = false;
-        return current;
+        return try sql_adapter.parseArithmeticExpressionRestAlloc(self.alloc, self.tokens, &self.pos, lhs, min_precedence, self.rowExpressionTypeContext(), self.arithmeticExpressionParserHooks());
     }
 
     fn rowExpressionTypeContext(self: *@This()) sql_adapter.RowExpressionTypeContext {
@@ -15598,39 +15566,15 @@ const Parser = struct {
     }
 
     fn parseConcatExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const kind = try sql_adapter.parseConcatFunctionCallStart(self.tokens, &self.pos);
-
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        while (true) {
-            const operand = try self.parseRowExpressionOperandAlloc();
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-            try operands.append(self.alloc, operand);
-            operand_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if ((kind == .concat and operands.items.len == 0) or (kind == .concat_ws and operands.items.len < 2)) return error.UnsupportedSqlShape;
-        if (kind == .concat_ws) {
-            for (operands.items) |operand| try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        }
-        try self.expect(.rparen);
-
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, rowExpressionOpName(kind));
-        errdefer self.alloc.free(output);
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
+        const expression = try self.parseConcatRowExpressionAlloc();
         errdefer freeExpression(self.alloc, expression);
+        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, rowExpressionOpName(expression.kind));
+        errdefer self.alloc.free(output);
         return sql_adapter.buildExpressionProjection(output, expression);
     }
 
     fn parseConcatRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        var projection = try self.parseConcatExpressionProjectionAlloc();
-        self.alloc.free(projection.output);
-        projection.output = "";
-        return projection.expression;
+        return try sql_adapter.parseConcatRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseNullifExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15823,23 +15767,7 @@ const Parser = struct {
         self: *@This(),
         left: db_mod.types.RelationalRowsExpression,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.rowExpressionTypeContext().validateTextRowExpression(left);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        try operands.append(self.alloc, left);
-        while (self.match(.pipe_concat) != null) {
-            const rhs = try self.parseRowExpressionOperandAlloc();
-            var rhs_transferred = false;
-            errdefer if (!rhs_transferred) freeExpression(self.alloc, rhs);
-            try self.rowExpressionTypeContext().validateTextRowExpression(rhs);
-            try operands.append(self.alloc, rhs);
-            rhs_transferred = true;
-        }
-        if (operands.items.len < 2) return error.UnsupportedSqlShape;
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .concat, &operands);
+        return try sql_adapter.parsePipeConcatExpressionRestAlloc(self.alloc, self.tokens, &self.pos, left, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseRowExpressionOperandAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {

@@ -636,18 +636,135 @@ const AppliedDdlRewriteExpressionSource = struct {
     expression: db_mod.types.RelationalRowsExpression,
 };
 
-fn alterTableRewriteExpressionSource(plan: ddl_plan.AlterTablePlan) ?AppliedDdlRewriteExpressionSource {
+fn valueRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+) !db_mod.types.RelationalRowsExpression {
+    const field = try alloc.dupe(u8, "");
+    errdefer alloc.free(field);
+    const owned_value_json = try alloc.dupe(u8, value_json);
+    errdefer alloc.free(owned_value_json);
+    const json_path = try alloc.dupe(u8, "");
+    errdefer alloc.free(json_path);
+    return .{
+        .kind = .value,
+        .field = field,
+        .value_json = owned_value_json,
+        .json_path = json_path,
+    };
+}
+
+fn fieldRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+) !db_mod.types.RelationalRowsExpression {
+    const owned_field = try alloc.dupe(u8, field);
+    errdefer alloc.free(owned_field);
+    const value_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(value_json);
+    const json_path = try alloc.dupe(u8, "");
+    errdefer alloc.free(json_path);
+    return .{
+        .kind = .field,
+        .field = owned_field,
+        .value_json = value_json,
+        .json_path = json_path,
+    };
+}
+
+fn unaryGeneratedRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    field: []const u8,
+) !db_mod.types.RelationalRowsExpression {
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    errdefer alloc.free(operands);
+    operands[0] = try fieldRowExpressionAlloc(alloc, field);
+    errdefer runtime_schema.freeRelationalRowsExpression(alloc, operands[0]);
+    const owned_field = try alloc.dupe(u8, "");
+    errdefer alloc.free(owned_field);
+    const value_json = try alloc.dupe(u8, "");
+    errdefer alloc.free(value_json);
+    const json_path = try alloc.dupe(u8, "");
+    errdefer alloc.free(json_path);
+    return .{
+        .kind = kind,
+        .field = owned_field,
+        .value_json = value_json,
+        .json_path = json_path,
+        .operands = operands,
+    };
+}
+
+fn generatedBackfillRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    generated: runtime_schema.RelationalGeneratedValue,
+) !db_mod.types.RelationalRowsExpression {
+    return switch (generated.op) {
+        .lower => try unaryGeneratedRowExpressionAlloc(alloc, .lower, generated.field orelse return error.UnsupportedSqlShape),
+        .upper => try unaryGeneratedRowExpressionAlloc(alloc, .upper, generated.field orelse return error.UnsupportedSqlShape),
+        .md5 => try unaryGeneratedRowExpressionAlloc(alloc, .md5, generated.field orelse return error.UnsupportedSqlShape),
+        .expression => try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, generated.expression orelse return error.UnsupportedSqlShape),
+        .concat, .concat_ws => error.UnsupportedSqlShape,
+    };
+}
+
+fn addColumnRewriteExpressionSourceAlloc(
+    alloc: std.mem.Allocator,
+    add_column: ddl_plan.AddColumnOperation,
+) !?AppliedDdlRewriteExpressionSource {
+    if (add_column.column.generated) |generated| {
+        const expression = generatedBackfillRowExpressionAlloc(alloc, generated) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return null,
+            else => return err,
+        };
+        return .{
+            .target_column = add_column.column.name,
+            .expression = expression,
+        };
+    }
+    if (add_column.column.default_value) |default_value| {
+        if (default_value.kind != .literal) return null;
+        return .{
+            .target_column = add_column.column.name,
+            .expression = try valueRowExpressionAlloc(alloc, default_value.value_json),
+        };
+    }
+    return null;
+}
+
+fn freeAppliedDdlRewriteExpressionSource(
+    alloc: std.mem.Allocator,
+    source: AppliedDdlRewriteExpressionSource,
+) void {
+    runtime_schema.freeRelationalRowsExpression(alloc, source.expression);
+}
+
+fn alterTableRewriteExpressionSourceAlloc(alloc: std.mem.Allocator, plan: ddl_plan.AlterTablePlan) !?AppliedDdlRewriteExpressionSource {
+    var out: ?AppliedDdlRewriteExpressionSource = null;
+    errdefer if (out) |source| freeAppliedDdlRewriteExpressionSource(alloc, source);
     for (plan.operations) |operation| switch (operation) {
         .alter_column_type => |alter_type| {
             const rewrite = alter_type.rewrite_expression orelse continue;
-            return .{
+            if (out != null) return error.UnsupportedSqlShape;
+            out = .{
                 .target_column = alter_type.column_name,
-                .expression = rewrite.expression,
+                .expression = try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, rewrite.expression),
             };
+        },
+        .add_column => |add_column| {
+            const rewrite = (try addColumnRewriteExpressionSourceAlloc(alloc, add_column)) orelse continue;
+            if (out != null) {
+                freeAppliedDdlRewriteExpressionSource(alloc, rewrite);
+                return error.UnsupportedSqlShape;
+            }
+            out = rewrite;
         },
         else => {},
     };
-    return null;
+    const result = out;
+    out = null;
+    return result;
 }
 
 pub fn applyDdlPlanToSchemaJsonAlloc(
@@ -814,9 +931,10 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
     }
     const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
     const rewrite_source = switch (plan) {
-        .alter_table => |alter_table| alterTableRewriteExpressionSource(alter_table),
+        .alter_table => |alter_table| try alterTableRewriteExpressionSourceAlloc(alloc, alter_table),
         else => null,
     };
+    defer if (rewrite_source) |source| freeAppliedDdlRewriteExpressionSource(alloc, source);
     result = try appliedDdlSchemaJsonWithFlagsAlloc(
         alloc,
         updated_schema_json,
