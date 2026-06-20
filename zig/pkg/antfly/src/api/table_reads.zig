@@ -20197,6 +20197,7 @@ test "lowered sql set operation plans preserve overlapping union all rows" {
                     .scan = scan,
                     .query = query,
                     .rows_query_plan = rowsQueryPlan,
+                    .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalog,
                 },
             };
         }

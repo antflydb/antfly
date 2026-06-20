@@ -18,6 +18,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
 const plan_mod = @import("plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const value_mod = @import("value.zig");
 
 pub const AdapterNoopDdlReason = enum {
     schema_namespace,
@@ -2620,6 +2621,666 @@ pub fn appendRelationalCheckAlloc(
     out[len] = try cloneDdlRelationalCheck(alloc, check);
     if (len > 0) alloc.free(schema.checks);
     schema.checks = out;
+}
+
+pub fn renameRelationalColumnAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    operation: RenameColumnOperation,
+) !void {
+    if (std.mem.eql(u8, operation.old_name, operation.new_name)) return error.InvalidSqlCatalog;
+    const index = binder.relationalColumnIndex(schema.relational_columns, operation.old_name) orelse return error.InvalidSqlCatalog;
+    if (binder.relationalColumnIndex(schema.relational_columns, operation.new_name) != null) return error.InvalidSqlCatalog;
+
+    const columns = @constCast(schema.relational_columns);
+    const new_name = try alloc.dupe(u8, operation.new_name);
+    errdefer alloc.free(new_name);
+    const new_path = try alloc.dupe(u8, operation.new_name);
+    errdefer alloc.free(new_path);
+    alloc.free(columns[index].name);
+    alloc.free(columns[index].path);
+    columns[index].name = new_name;
+    columns[index].path = new_path;
+
+    for (columns) |*column| {
+        if (column.generated) |*generated| try renameGeneratedValueFieldsAlloc(alloc, generated, operation.old_name, operation.new_name);
+        try renameUniquePredicatesAlloc(alloc, column.index_where, operation.old_name, operation.new_name);
+        try renameExpressionConditionsAlloc(alloc, column.index_where_expressions, operation.old_name, operation.new_name);
+    }
+    if (schema.primary_key) |*primary_key| try renameStringSliceValuesAlloc(alloc, primary_key.columns, operation.old_name, operation.new_name);
+    if (schema.primary_key) |*primary_key| try renameStringSliceValuesAlloc(alloc, primary_key.include_columns, operation.old_name, operation.new_name);
+    for (@constCast(schema.unique_constraints)) |*constraint| {
+        try renameStringSliceValuesAlloc(alloc, constraint.columns, operation.old_name, operation.new_name);
+        for (@constCast(constraint.expressions)) |*expression| {
+            try replaceOwnedStringIfEqualAlloc(alloc, &expression.field, operation.old_name, operation.new_name);
+            if (expression.expression) |*row_expression| try renameRowExpressionFieldsAlloc(alloc, row_expression, operation.old_name, operation.new_name);
+        }
+        try renameStringSliceValuesAlloc(alloc, constraint.include_columns, operation.old_name, operation.new_name);
+        try renameUniquePredicatesAlloc(alloc, constraint.where, operation.old_name, operation.new_name);
+        try renameExpressionConditionsAlloc(alloc, constraint.where_expressions, operation.old_name, operation.new_name);
+    }
+    for (@constCast(schema.foreign_keys)) |*foreign_key| {
+        try renameStringSliceValuesAlloc(alloc, foreign_key.child_columns, operation.old_name, operation.new_name);
+    }
+    for (@constCast(schema.checks)) |*check| {
+        try replaceOwnedStringIfEqualAlloc(alloc, &check.field, operation.old_name, operation.new_name);
+        if (check.expression) |*expression| try renameExpressionConditionAlloc(alloc, expression, operation.old_name, operation.new_name);
+    }
+}
+
+pub fn renameRelationalConstraintAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    table_name: []const u8,
+    operation: RenameConstraintOperation,
+) !void {
+    if (std.mem.eql(u8, operation.old_name, operation.new_name)) return error.InvalidSqlCatalog;
+    if (binder.relationalConstraintNameExists(schema.*, table_name, operation.new_name)) return error.InvalidSqlCatalog;
+    if (try renamePrimaryKeyConstraintByNameAlloc(alloc, schema, table_name, operation.old_name, operation.new_name)) return;
+    if (try renameUniqueConstraintByNameAlloc(alloc, schema, operation.old_name, operation.new_name)) return;
+    if (try renameForeignKeyByNameAlloc(alloc, schema, operation.old_name, operation.new_name)) return;
+    if (try renameRelationalCheckByNameAlloc(alloc, schema, operation.old_name, operation.new_name)) return;
+    return error.InvalidSqlCatalog;
+}
+
+fn renameGeneratedValueFieldsAlloc(
+    alloc: std.mem.Allocator,
+    generated: *runtime_schema.RelationalGeneratedValue,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (generated.field) |*field| try replaceOwnedStringIfEqualAlloc(alloc, field, old_name, new_name);
+    try renameStringSliceValuesAlloc(alloc, generated.fields, old_name, new_name);
+    if (generated.expression) |*expression| try renameRowExpressionFieldsAlloc(alloc, expression, old_name, new_name);
+}
+
+fn renameUniquePredicatesAlloc(
+    alloc: std.mem.Allocator,
+    predicates: []const runtime_schema.UniquePredicate,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    for (@constCast(predicates)) |*predicate| {
+        try replaceOwnedStringIfEqualAlloc(alloc, &predicate.field, old_name, new_name);
+    }
+}
+
+fn renameExpressionConditionsAlloc(
+    alloc: std.mem.Allocator,
+    conditions: []const db_mod.types.RelationalRowsExpressionCondition,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    for (@constCast(conditions)) |*condition| {
+        try renameExpressionConditionAlloc(alloc, condition, old_name, new_name);
+    }
+}
+
+fn renameExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    condition: *db_mod.types.RelationalRowsExpressionCondition,
+    old_name: []const u8,
+    new_name: []const u8,
+) anyerror!void {
+    try renameRowExpressionFieldsAlloc(alloc, &condition.lhs, old_name, new_name);
+    for (@constCast(condition.rhs)) |*rhs| {
+        try renameRowExpressionFieldsAlloc(alloc, rhs, old_name, new_name);
+    }
+}
+
+fn renameRowExpressionFieldsAlloc(
+    alloc: std.mem.Allocator,
+    expression: *db_mod.types.RelationalRowsExpression,
+    old_name: []const u8,
+    new_name: []const u8,
+) anyerror!void {
+    if (expression.field_source == .row) try replaceOwnedStringIfEqualAlloc(alloc, &expression.field, old_name, new_name);
+    for (@constCast(expression.operands)) |*operand| {
+        try renameRowExpressionFieldsAlloc(alloc, operand, old_name, new_name);
+    }
+    for (@constCast(expression.case_branches)) |*branch| {
+        try renameExpressionConditionAlloc(alloc, &branch.when, old_name, new_name);
+        try renameRowExpressionFieldsAlloc(alloc, &branch.then, old_name, new_name);
+    }
+    for (@constCast(expression.case_else)) |*case_else| {
+        try renameRowExpressionFieldsAlloc(alloc, case_else, old_name, new_name);
+    }
+}
+
+fn renameStringSliceValuesAlloc(
+    alloc: std.mem.Allocator,
+    values: []const []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    for (@constCast(values)) |*value| {
+        try replaceOwnedStringIfEqualAlloc(alloc, value, old_name, new_name);
+    }
+}
+
+fn renamePrimaryKeyConstraintByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    table_name: []const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) !bool {
+    if (schema.primary_key) |*primary_key| {
+        if (primary_key.name) |*name| {
+            if (!std.mem.eql(u8, name.*, old_name)) return false;
+            try replaceOwnedStringIfEqualAlloc(alloc, name, old_name, new_name);
+            return true;
+        }
+        if (!binder.defaultPrimaryKeyNameEquals(table_name, old_name)) return false;
+        primary_key.name = try alloc.dupe(u8, new_name);
+        return true;
+    }
+    return false;
+}
+
+fn renameUniqueConstraintByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    old_name: []const u8,
+    new_name: []const u8,
+) !bool {
+    for (@constCast(schema.unique_constraints)) |*constraint| {
+        if (!std.mem.eql(u8, constraint.name, old_name)) continue;
+        try replaceOwnedStringIfEqualAlloc(alloc, &constraint.name, old_name, new_name);
+        return true;
+    }
+    return false;
+}
+
+fn renameForeignKeyByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    old_name: []const u8,
+    new_name: []const u8,
+) !bool {
+    for (@constCast(schema.foreign_keys)) |*foreign_key| {
+        if (!std.mem.eql(u8, foreign_key.name, old_name)) continue;
+        try replaceOwnedStringIfEqualAlloc(alloc, &foreign_key.name, old_name, new_name);
+        return true;
+    }
+    return false;
+}
+
+fn renameRelationalCheckByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    old_name: []const u8,
+    new_name: []const u8,
+) !bool {
+    for (@constCast(schema.checks)) |*check| {
+        if (!std.mem.eql(u8, check.name, old_name)) continue;
+        try replaceOwnedStringIfEqualAlloc(alloc, &check.name, old_name, new_name);
+        return true;
+    }
+    return false;
+}
+
+fn replaceOwnedStringIfEqualAlloc(
+    alloc: std.mem.Allocator,
+    value: *[]const u8,
+    old_name: []const u8,
+    new_name: []const u8,
+) !void {
+    if (!std.mem.eql(u8, value.*, old_name)) return;
+    const replacement = try alloc.dupe(u8, new_name);
+    alloc.free(value.*);
+    value.* = replacement;
+}
+
+pub fn dropRelationalColumnAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    drop_column: DropColumnOperation,
+) !void {
+    if (binder.relationalColumnIndex(schema.relational_columns, drop_column.name) == null) {
+        if (drop_column.if_exists) return;
+        return error.InvalidSqlCatalog;
+    }
+
+    var dropped = std.ArrayListUnmanaged([]const u8).empty;
+    defer dropped.deinit(alloc);
+    try appendUniqueBorrowedString(alloc, &dropped, drop_column.name);
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (schema.relational_columns) |column| {
+            if (stringSlicesContains(dropped.items, column.name)) continue;
+            if (generatedColumnReferencesAny(column, dropped.items)) {
+                try appendUniqueBorrowedString(alloc, &dropped, column.name);
+                changed = true;
+            }
+        }
+    }
+
+    if (schema.primary_key) |primary_key| {
+        if (stringSlicesIntersect(primary_key.columns, dropped.items)) return error.UnsupportedSqlShape;
+    }
+    if (drop_column.dependency_mode == .restrict and schemaHasDropDependencies(schema.*, dropped.items)) {
+        return error.InvalidSqlCatalog;
+    }
+
+    try dropRelationalColumnsAlloc(alloc, schema, dropped.items);
+    try dropDependentUniqueConstraintsAlloc(alloc, schema, dropped.items);
+    try dropDependentForeignKeysAlloc(alloc, schema, dropped.items);
+    try dropDependentChecksAlloc(alloc, schema, dropped.items);
+}
+
+pub fn dropRelationalConstraintAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    table_name: []const u8,
+    drop_constraint: DropConstraintOperation,
+) !void {
+    if (try dropPrimaryKeyByNameAlloc(alloc, schema, table_name, drop_constraint.name)) return;
+    if (try dropUniqueConstraintByNameAlloc(alloc, schema, drop_constraint.name)) return;
+    if (try dropForeignKeyByNameAlloc(alloc, schema, drop_constraint.name)) return;
+    if (try dropRelationalCheckByNameAlloc(alloc, schema, drop_constraint.name)) return;
+    if (drop_constraint.if_exists) return;
+    return error.InvalidSqlCatalog;
+}
+
+pub fn dropIndexFromRuntimeSchemaAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    plan: DropIndexPlan,
+) !void {
+    if (try dropUniqueConstraintByNameAlloc(alloc, schema, plan.index_name)) return;
+    if (try dropSecondaryIndexByNameAlloc(alloc, schema, plan.index_name)) return;
+    if (plan.if_exists) return;
+    return error.InvalidSqlCatalog;
+}
+
+pub fn validateConstraintByName(schema: *runtime_schema.TableSchema, table_name: []const u8, constraint_name: []const u8) !void {
+    if (binder.primaryKeyNameEquals(schema.primary_key, table_name, constraint_name)) return;
+    {
+        const constraints = @constCast(schema.unique_constraints);
+        for (constraints) |*constraint| {
+            if (!std.mem.eql(u8, constraint.name, constraint_name)) continue;
+            constraint.validation_state = .enforced;
+            return;
+        }
+    }
+    {
+        const foreign_keys = @constCast(schema.foreign_keys);
+        for (foreign_keys) |*foreign_key| {
+            if (!std.mem.eql(u8, foreign_key.name, constraint_name)) continue;
+            foreign_key.validation_state = .enforced;
+            return;
+        }
+    }
+    {
+        const checks = @constCast(schema.checks);
+        for (checks) |*check| {
+            if (!std.mem.eql(u8, check.name, constraint_name)) continue;
+            check.validation_state = .enforced;
+            return;
+        }
+    }
+    return error.InvalidSqlCatalog;
+}
+
+pub fn alterRelationalColumnDefaultAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    operation: AlterColumnDefaultOperation,
+) !void {
+    const index = binder.relationalColumnIndex(schema.relational_columns, operation.column_name) orelse return error.InvalidSqlCatalog;
+    const columns = @constCast(schema.relational_columns);
+    if (columns[index].generated != null) return error.InvalidSqlCatalog;
+    if (operation.default_value) |default_value| {
+        try value_mod.validateDefaultValueForColumnAlloc(alloc, columns[index], default_value);
+    }
+    if (columns[index].default_value) |existing| {
+        alloc.free(existing.value_json);
+        columns[index].default_value = null;
+    }
+    if (operation.default_value) |default_value| {
+        columns[index].default_value = try cloneDdlDefaultValue(alloc, default_value);
+    }
+}
+
+pub fn alterRelationalColumnNullability(
+    schema: *runtime_schema.TableSchema,
+    operation: AlterColumnNullabilityOperation,
+) !void {
+    const index = binder.relationalColumnIndex(schema.relational_columns, operation.column_name) orelse return error.InvalidSqlCatalog;
+    if (operation.nullable) {
+        if (schema.primary_key) |primary_key| {
+            if (binder.primaryKeyContains(primary_key, operation.column_name)) return error.UnsupportedSqlShape;
+        }
+    }
+    const columns = @constCast(schema.relational_columns);
+    columns[index].nullable = operation.nullable;
+}
+
+fn schemaHasDropDependencies(schema: runtime_schema.TableSchema, dropped: []const []const u8) bool {
+    if (dropped.len > 1) return true;
+    for (schema.unique_constraints) |constraint| {
+        if (uniqueConstraintReferencesAny(constraint, dropped)) return true;
+    }
+    for (schema.foreign_keys) |foreign_key| {
+        if (stringSlicesIntersect(foreign_key.child_columns, dropped)) return true;
+    }
+    for (schema.checks) |check| {
+        if (stringSlicesContains(dropped, check.field)) return true;
+    }
+    return false;
+}
+
+fn dropRelationalColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    dropped: []const []const u8,
+) !void {
+    var kept: usize = 0;
+    for (schema.relational_columns) |column| {
+        if (!stringSlicesContains(dropped, column.name)) kept += 1;
+    }
+    const out: []runtime_schema.RelationalColumn = if (kept > 0) try alloc.alloc(runtime_schema.RelationalColumn, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.relational_columns) |column| {
+        if (stringSlicesContains(dropped, column.name)) {
+            freeDdlRelationalColumn(alloc, column);
+        } else {
+            out[out_i] = column;
+            out_i += 1;
+        }
+    }
+    if (schema.relational_columns.len > 0) alloc.free(schema.relational_columns);
+    schema.relational_columns = out;
+}
+
+fn dropDependentUniqueConstraintsAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    dropped: []const []const u8,
+) !void {
+    var kept: usize = 0;
+    for (schema.unique_constraints) |constraint| {
+        if (!uniqueConstraintReferencesAny(constraint, dropped)) kept += 1;
+    }
+    const out: []runtime_schema.UniqueConstraint = if (kept > 0) try alloc.alloc(runtime_schema.UniqueConstraint, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.unique_constraints) |constraint| {
+        if (uniqueConstraintReferencesAny(constraint, dropped)) {
+            freeDdlUniqueConstraint(alloc, constraint);
+        } else {
+            out[out_i] = constraint;
+            out_i += 1;
+        }
+    }
+    if (schema.unique_constraints.len > 0) alloc.free(schema.unique_constraints);
+    schema.unique_constraints = out;
+}
+
+fn dropDependentForeignKeysAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    dropped: []const []const u8,
+) !void {
+    var kept: usize = 0;
+    for (schema.foreign_keys) |foreign_key| {
+        if (!stringSlicesIntersect(foreign_key.child_columns, dropped)) kept += 1;
+    }
+    const out: []runtime_schema.ForeignKey = if (kept > 0) try alloc.alloc(runtime_schema.ForeignKey, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.foreign_keys) |foreign_key| {
+        if (stringSlicesIntersect(foreign_key.child_columns, dropped)) {
+            freeDdlForeignKey(alloc, foreign_key);
+        } else {
+            out[out_i] = foreign_key;
+            out_i += 1;
+        }
+    }
+    if (schema.foreign_keys.len > 0) alloc.free(schema.foreign_keys);
+    schema.foreign_keys = out;
+}
+
+fn dropDependentChecksAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    dropped: []const []const u8,
+) !void {
+    var kept: usize = 0;
+    for (schema.checks) |check| {
+        if (!stringSlicesContains(dropped, check.field)) kept += 1;
+    }
+    const out: []runtime_schema.RelationalCheck = if (kept > 0) try alloc.alloc(runtime_schema.RelationalCheck, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.checks) |check| {
+        if (stringSlicesContains(dropped, check.field)) {
+            freeDdlRelationalCheck(alloc, check);
+        } else {
+            out[out_i] = check;
+            out_i += 1;
+        }
+    }
+    if (schema.checks.len > 0) alloc.free(schema.checks);
+    schema.checks = out;
+}
+
+fn dropPrimaryKeyByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    table_name: []const u8,
+    constraint_name: []const u8,
+) !bool {
+    const primary_key = schema.primary_key orelse return false;
+    if (!binder.primaryKeyNameEquals(primary_key, table_name, constraint_name)) return false;
+    freeDdlPrimaryKey(alloc, primary_key);
+    schema.primary_key = null;
+    return true;
+}
+
+fn dropSecondaryIndexByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    index_name: []const u8,
+) !bool {
+    const index = binder.relationalColumnIndexForIndexName(schema.relational_columns, index_name) orelse return false;
+    if (schema.relational_columns[index].generated != null) {
+        const column_name = schema.relational_columns[index].name;
+        try dropRelationalColumnAlloc(alloc, schema, .{ .name = column_name, .if_exists = false, .dependency_mode = .cascade });
+        return true;
+    }
+
+    const columns = @constCast(schema.relational_columns);
+    var removed = false;
+    for (columns) |*column| {
+        if (!binder.relationalColumnHasIndexName(column.*, index_name)) continue;
+        if (column.generated != null) return error.InvalidSqlCatalog;
+        column.indexed = false;
+        column.index_lifecycle = .ready;
+        column.index_generation = 0;
+        if (column.index_name) |existing| {
+            alloc.free(existing);
+            column.index_name = null;
+        }
+        freeStringSlice(alloc, column.index_include_columns);
+        column.index_include_columns = &.{};
+        freeDdlUniquePredicates(alloc, column.index_where);
+        column.index_where = &.{};
+        freeExpressionConditions(alloc, column.index_where_expressions);
+        if (column.index_where_expressions.len > 0) alloc.free(column.index_where_expressions);
+        column.index_where_expressions = &.{};
+        removed = true;
+    }
+    return removed;
+}
+
+fn dropUniqueConstraintByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    constraint_name: []const u8,
+) !bool {
+    var found = false;
+    for (schema.unique_constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, constraint_name)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    const kept = schema.unique_constraints.len - 1;
+    const out: []runtime_schema.UniqueConstraint = if (kept > 0) try alloc.alloc(runtime_schema.UniqueConstraint, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.unique_constraints) |constraint| {
+        if (std.mem.eql(u8, constraint.name, constraint_name)) {
+            freeDdlUniqueConstraint(alloc, constraint);
+        } else {
+            out[out_i] = constraint;
+            out_i += 1;
+        }
+    }
+    if (schema.unique_constraints.len > 0) alloc.free(schema.unique_constraints);
+    schema.unique_constraints = out;
+    return true;
+}
+
+fn dropForeignKeyByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    constraint_name: []const u8,
+) !bool {
+    var found = false;
+    for (schema.foreign_keys) |foreign_key| {
+        if (std.mem.eql(u8, foreign_key.name, constraint_name)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    const kept = schema.foreign_keys.len - 1;
+    const out: []runtime_schema.ForeignKey = if (kept > 0) try alloc.alloc(runtime_schema.ForeignKey, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.foreign_keys) |foreign_key| {
+        if (std.mem.eql(u8, foreign_key.name, constraint_name)) {
+            freeDdlForeignKey(alloc, foreign_key);
+        } else {
+            out[out_i] = foreign_key;
+            out_i += 1;
+        }
+    }
+    if (schema.foreign_keys.len > 0) alloc.free(schema.foreign_keys);
+    schema.foreign_keys = out;
+    return true;
+}
+
+fn dropRelationalCheckByNameAlloc(
+    alloc: std.mem.Allocator,
+    schema: *runtime_schema.TableSchema,
+    constraint_name: []const u8,
+) !bool {
+    var found = false;
+    for (schema.checks) |check| {
+        if (std.mem.eql(u8, check.name, constraint_name)) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    const kept = schema.checks.len - 1;
+    const out: []runtime_schema.RelationalCheck = if (kept > 0) try alloc.alloc(runtime_schema.RelationalCheck, kept) else &.{};
+    var out_i: usize = 0;
+    for (schema.checks) |check| {
+        if (std.mem.eql(u8, check.name, constraint_name)) {
+            freeDdlRelationalCheck(alloc, check);
+        } else {
+            out[out_i] = check;
+            out_i += 1;
+        }
+    }
+    if (schema.checks.len > 0) alloc.free(schema.checks);
+    schema.checks = out;
+    return true;
+}
+
+fn appendUniqueBorrowedString(
+    alloc: std.mem.Allocator,
+    values: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    if (stringSlicesContains(values.items, value)) return;
+    try values.append(alloc, value);
+}
+
+fn generatedColumnReferencesAny(column: runtime_schema.RelationalColumn, fields: []const []const u8) bool {
+    const generated = column.generated orelse return false;
+    if (generated.field) |field| {
+        if (stringSlicesContains(fields, field)) return true;
+    }
+    if (generated.expression) |expression| {
+        if (expressionReferencesAny(expression, fields)) return true;
+    }
+    return stringSlicesIntersect(generated.fields, fields);
+}
+
+fn uniqueConstraintReferencesAny(
+    constraint: runtime_schema.UniqueConstraint,
+    fields: []const []const u8,
+) bool {
+    if (stringSlicesIntersect(constraint.columns, fields)) return true;
+    for (constraint.expressions) |expression| {
+        switch (expression.op) {
+            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
+            .expression => if (expression.expression) |row_expression| {
+                if (expressionReferencesAny(row_expression, fields)) return true;
+            },
+        }
+    }
+    for (constraint.where) |predicate| {
+        if (stringSlicesContains(fields, predicate.field)) return true;
+    }
+    for (constraint.where_expressions) |condition| {
+        if (expressionConditionReferencesAny(condition, fields)) return true;
+    }
+    return false;
+}
+
+fn expressionReferencesAny(expression: runtime_schema.RelationalRowsExpression, fields: []const []const u8) bool {
+    if (expression.kind == .field and stringSlicesContains(fields, expression.field)) return true;
+    for (expression.operands) |operand| {
+        if (expressionReferencesAny(operand, fields)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (expressionConditionReferencesAny(branch.when, fields)) return true;
+        if (expressionReferencesAny(branch.then, fields)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (expressionReferencesAny(case_else, fields)) return true;
+    }
+    return false;
+}
+
+fn expressionConditionReferencesAny(condition: runtime_schema.RelationalRowsExpressionCondition, fields: []const []const u8) bool {
+    if (expressionReferencesAny(condition.lhs, fields)) return true;
+    for (condition.rhs) |rhs| {
+        if (expressionReferencesAny(rhs, fields)) return true;
+    }
+    return false;
+}
+
+fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| {
+        if (std.mem.eql(u8, candidate, value)) return true;
+    }
+    return false;
+}
+
+fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
+    for (a) |value| {
+        if (stringSlicesContains(b, value)) return true;
+    }
+    return false;
 }
 
 pub fn cloneDdlRelationalColumn(alloc: std.mem.Allocator, column: runtime_schema.RelationalColumn) !runtime_schema.RelationalColumn {
