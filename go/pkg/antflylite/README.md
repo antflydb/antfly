@@ -22,6 +22,8 @@ The binding exposes raw JSON methods such as `StatusJSON` and `CapabilitiesJSON`
 for parity with the C ABI. It also exposes typed `Status` and `Capabilities`
 helpers for stable Lite control fields, including storage identity, inference
 mode, caller-supplied artifact support, and distributed-only capability flags.
+Typed `Check`, `Vacuum`, and `CopyStableSnapshot` helpers cover the stable Lite
+maintenance reports while keeping the raw JSON methods available.
 
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application

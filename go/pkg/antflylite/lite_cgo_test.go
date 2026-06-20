@@ -12,6 +12,7 @@ package antflylite
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -90,6 +91,34 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if typedCaps.RaftReplication || typedCaps.ClusterPlacement || typedCaps.DistributedTransactionCoordination {
 		t.Fatalf("typed capabilities should not advertise distributed features: %#v", typedCaps)
+	}
+
+	checkReport, err := db.Check()
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !checkReport.Valid || checkReport.FileSize == 0 || checkReport.CompactSize == 0 || checkReport.Issue != nil {
+		t.Fatalf("unexpected check report: %#v", checkReport)
+	}
+
+	snapshotPath := filepath.Join(t.TempDir(), "go-snapshot.aflite")
+	snapshotReport, err := db.CopyStableSnapshot(snapshotPath, false)
+	if err != nil {
+		t.Fatalf("copy stable snapshot: %v", err)
+	}
+	if snapshotReport.SnapshotSize == 0 || snapshotReport.PageCount == 0 {
+		t.Fatalf("unexpected snapshot report: %#v", snapshotReport)
+	}
+	if _, err := os.Stat(snapshotPath); err != nil {
+		t.Fatalf("snapshot file: %v", err)
+	}
+
+	vacuumReport, err := db.Vacuum()
+	if err != nil {
+		t.Fatalf("vacuum: %v", err)
+	}
+	if vacuumReport.BeforeSize == 0 || vacuumReport.AfterSize == 0 {
+		t.Fatalf("unexpected vacuum report: %#v", vacuumReport)
 	}
 
 	hostedPath := filepath.Join(t.TempDir(), "go-hosted.aflite")
