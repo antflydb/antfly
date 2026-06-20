@@ -2157,9 +2157,9 @@ fn requiredRetrievalTools(retrieval_query: RetrievalQueryRequest) RequiredRetrie
     if (retrieval_query.semantic_search != null or retrieval_query.embeddings != null) required.add(.semantic_search);
     if (retrieval_query.full_text_search != null) required.add(.full_text_search);
     if (hasMetadataRetrievalFields(retrieval_query)) required.add(.add_filter);
-    if (retrieval_query.aggregations != null) required.add(.aggregate);
+    if (hasAggregationRetrievalFields(retrieval_query)) required.add(.aggregate);
     if (retrieval_query.tree_search != null) required.add(.tree_search);
-    if (retrieval_query.graph_searches != null) required.add(.graph_search);
+    if (hasGraphRetrievalFields(retrieval_query)) required.add(.graph_search);
     if (required.len == 0) required.add(.add_filter);
     return required;
 }
@@ -2188,6 +2188,16 @@ fn hasMetadataRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
         retrieval_query.exclusion_query != null or
         retrieval_query.order_by != null or
         (retrieval_query.count orelse false);
+}
+
+fn hasAggregationRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
+    const aggregations = retrieval_query.aggregations orelse return false;
+    return aggregations.map.count() > 0;
+}
+
+fn hasGraphRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
+    const graph_searches = retrieval_query.graph_searches orelse return false;
+    return graph_searches.map.count() > 0;
 }
 
 fn buildToolModeStepDetails(
@@ -5935,7 +5945,7 @@ fn detectAggregateStrategy(strategies: []const RetrievalStrategy) ?RetrievalStra
 
 fn detectStrategy(retrieval_query: RetrievalQueryRequest) RetrievalStrategy {
     if (retrieval_query.tree_search != null) return .tree;
-    if (retrieval_query.graph_searches != null) return .graph;
+    if (hasGraphRetrievalFields(retrieval_query)) return .graph;
     const has_semantic = retrieval_query.semantic_search != null or retrieval_query.embeddings != null;
     const has_full_text = retrieval_query.full_text_search != null;
     if (has_semantic and has_full_text) return .hybrid;
@@ -5987,6 +5997,61 @@ test "retrieval agent requires every tool used by a combined retrieval query" {
         error.UnsupportedRetrievalAgentRequest,
         executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, tree_seed_body),
     );
+}
+
+test "retrieval agent ignores empty map-valued tool fields for policy and strategy" {
+    const FakeRunner = struct {
+        call_count: usize = 0,
+
+        fn ifaceWithState(self: *@This()) QueryRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, query_json: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            var parsed_query = try parseQueryRequestBody(alloc, query_json);
+            defer parsed_query.deinit();
+            if (parsed_query.value.aggregations) |aggregations| {
+                try std.testing.expectEqual(@as(usize, 0), aggregations.map.count());
+            }
+            if (parsed_query.value.graph_searches) |graph_searches| {
+                try std.testing.expectEqual(@as(usize, 0), graph_searches.map.count());
+            }
+
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                ),
+            };
+        }
+    };
+
+    var runner = FakeRunner{};
+    const empty_aggregations_body =
+        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["full_text_search"]},"queries":[{"table":"docs","full_text_search":{"query":"alpha"},"aggregations":{},"limit":5}]}
+    ;
+    const empty_aggregations_encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, empty_aggregations_body);
+    defer std.testing.allocator.free(empty_aggregations_encoded);
+    var empty_aggregations_result = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, empty_aggregations_encoded, .{});
+    defer empty_aggregations_result.deinit();
+    try std.testing.expectEqual(AgentStatus.completed, empty_aggregations_result.value.status);
+    try std.testing.expectEqual(RetrievalStrategy.bm25, empty_aggregations_result.value.strategy_used.?);
+
+    const empty_graph_body =
+        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_searches":{},"limit":5}]}
+    ;
+    const empty_graph_encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, empty_graph_body);
+    defer std.testing.allocator.free(empty_graph_encoded);
+    var empty_graph_result = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, empty_graph_encoded, .{});
+    defer empty_graph_result.deinit();
+    try std.testing.expectEqual(AgentStatus.completed, empty_graph_result.value.status);
+    try std.testing.expectEqual(RetrievalStrategy.semantic, empty_graph_result.value.strategy_used.?);
+    try std.testing.expectEqual(@as(usize, 2), runner.call_count);
 }
 
 test "retrieval agent rejects out of range max tool iterations" {
