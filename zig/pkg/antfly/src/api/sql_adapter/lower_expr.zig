@@ -250,6 +250,100 @@ pub fn parseComparisonOp(tokens: []const Token, pos: *usize) !runtime_schema.Rel
     return error.UnsupportedSqlShape;
 }
 
+pub fn parseBulkIoWhereExpressionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) ![]const db_mod.types.RelationalRowsExpressionCondition {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("where")) return &.{};
+
+    var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+    errdefer {
+        plan_mod.freeExpressionConditions(alloc, conditions.items);
+        conditions.deinit(alloc);
+    }
+    while (true) {
+        const condition = try parseBulkIoWhereExpressionConditionAlloc(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            field_expression_qualifiers,
+            returning_expression_qualifiers,
+            defer_row_expression_field_validation,
+        );
+        var condition_transferred = false;
+        errdefer if (!condition_transferred) plan_mod.freeExpressionCondition(alloc, condition);
+        try conditions.append(alloc, condition);
+        condition_transferred = true;
+        if (!cursor.matchKeyword("and")) break;
+    }
+    if (cursor.matchToken(.semicolon) != null and !cursor.atEnd()) return error.UnsupportedSqlShape;
+    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+    return try conditions.toOwnedSlice(alloc);
+}
+
+fn parseBulkIoWhereExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    defer alloc.free(parsed_field);
+    const field = try binder.normalizeRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+
+    const op = try parseComparisonOp(tokens, pos);
+    const value_json = try value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) alloc.free(rhs);
+    rhs[0] = .{
+        .kind = .value,
+        .value_json = value_json,
+    };
+
+    field_transferred = true;
+    value_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = .{
+            .kind = .field,
+            .field = field,
+        },
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
 pub fn parseExpressionCastType(tokens: []const Token, pos: *usize) !db_mod.types.RelationalRowsExpressionCastType {
     const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
     if (std.ascii.eqlIgnoreCase(token.text, "text")) return .text;
@@ -10165,6 +10259,36 @@ test "sql adapter expression keyword predicates classify function and tail token
     var to_jsonb_pos: usize = 0;
     try parseFixedUnaryFunctionCallStart(to_jsonb_tokens[0..], &to_jsonb_pos, .to_jsonb);
     try std.testing.expectEqual(@as(usize, 2), to_jsonb_pos);
+}
+
+test "sql adapter lower expr parses bulk io where expressions" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        },
+    };
+
+    var tokens = try lexer.tokenizeAlloc(alloc, "where status = 'active' and amount > 10;");
+    defer lexer.freeTokens(alloc, &tokens);
+    var pos: usize = 0;
+    const conditions = try parseBulkIoWhereExpressionsAlloc(alloc, tokens.items, &pos, schema, &.{}, &.{}, false);
+    defer {
+        plan_mod.freeExpressionConditions(alloc, conditions);
+        if (conditions.len > 0) alloc.free(conditions);
+    }
+
+    try std.testing.expectEqual(tokens.items.len, pos);
+    try std.testing.expectEqual(@as(usize, 2), conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, conditions[0].op);
+    try std.testing.expectEqualStrings("\"active\"", conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("amount", conditions[1].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, conditions[1].op);
+    try std.testing.expectEqualStrings("10", conditions[1].rhs[0].value_json);
 }
 
 test "sql adapter expression grammar distinguishes grouped predicates from scalar expression predicates" {

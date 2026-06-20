@@ -2679,7 +2679,15 @@ const Parser = struct {
         const null_marker = syntax.null_marker;
         const default_marker = syntax.default_marker;
         const encoding = syntax.encoding;
-        const where_expressions = try self.parseBulkIoWhereExpressionsAlloc();
+        const where_expressions = try sql_adapter.parseBulkIoWhereExpressionsAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+        );
         var where_expressions_transferred = false;
         errdefer if (!where_expressions_transferred) {
             freeExpressionConditions(self.alloc, where_expressions);
@@ -2722,60 +2730,6 @@ const Parser = struct {
             .default_marker = default_marker,
             .encoding = encoding,
             .where_expressions = where_expressions,
-        };
-    }
-
-    fn parseBulkIoWhereExpressionsAlloc(self: *@This()) ![]const db_mod.types.RelationalRowsExpressionCondition {
-        if (!self.matchKeyword("where")) return &.{};
-
-        var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
-        errdefer {
-            freeExpressionConditions(self.alloc, conditions.items);
-            conditions.deinit(self.alloc);
-        }
-        while (true) {
-            const condition = try self.parseBulkIoWhereExpressionConditionAlloc();
-            var condition_transferred = false;
-            errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-            try conditions.append(self.alloc, condition);
-            condition_transferred = true;
-            if (!self.matchKeyword("and")) break;
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        return try conditions.toOwnedSlice(self.alloc);
-    }
-
-    fn parseBulkIoWhereExpressionConditionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionCondition {
-        const parsed_field = try self.parseFieldExpressionOwned();
-        defer self.alloc.free(parsed_field);
-        const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-
-        const op = try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
-        const value_json = try sql_adapter.parseSqlUntypedValueJsonAlloc(self.alloc, self.tokens, &self.pos);
-        var value_transferred = false;
-        errdefer if (!value_transferred) self.alloc.free(value_json);
-
-        const rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred) self.alloc.free(rhs);
-        rhs[0] = .{
-            .kind = .value,
-            .value_json = value_json,
-        };
-
-        field_transferred = true;
-        value_transferred = true;
-        rhs_transferred = true;
-        return .{
-            .lhs = .{
-                .kind = .field,
-                .field = field,
-            },
-            .op = op,
-            .rhs = rhs,
         };
     }
 
@@ -3092,7 +3046,7 @@ const Parser = struct {
         const table_name = try sql_adapter.parseSqlObjectIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
         var table_transferred = false;
         errdefer if (!table_transferred) self.alloc.free(table_name);
-        const role_targets = try self.parseOptionalRowSecurityPolicyRoleTargetsAlloc();
+        const role_targets = try sql_adapter.parseOptionalRowSecurityPolicyRoleTargetsAlloc(self.alloc, self.tokens, &self.pos);
         var role_targets_transferred = false;
         errdefer if (!role_targets_transferred) freeStringSlice(self.alloc, role_targets);
         try self.expectKeyword("using");
@@ -3122,7 +3076,7 @@ const Parser = struct {
         const table_name = try sql_adapter.parseSqlObjectIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
         var table_transferred = false;
         errdefer if (!table_transferred) self.alloc.free(table_name);
-        const role_targets = try self.parseOptionalRowSecurityPolicyRoleTargetsAlloc();
+        const role_targets = try sql_adapter.parseOptionalRowSecurityPolicyRoleTargetsAlloc(self.alloc, self.tokens, &self.pos);
         var role_targets_transferred = false;
         errdefer if (!role_targets_transferred) freeStringSlice(self.alloc, role_targets);
         try self.expectKeyword("using");
@@ -3141,24 +3095,6 @@ const Parser = struct {
             .role_targets = role_targets,
             .predicate = predicate,
         };
-    }
-
-    fn parseOptionalRowSecurityPolicyRoleTargetsAlloc(self: *@This()) ![]const []const u8 {
-        if (!self.matchKeyword("to")) return &.{};
-        var roles = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (roles.items) |role| self.alloc.free(role);
-            roles.deinit(self.alloc);
-        }
-        while (true) {
-            const role = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-            var role_transferred = false;
-            errdefer if (!role_transferred) self.alloc.free(role);
-            try roles.append(self.alloc, role);
-            role_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        return try roles.toOwnedSlice(self.alloc);
     }
 
     fn parseRowSecurityPolicyExpressionBindingPredicateAlloc(self: *@This()) !RowSecurityPolicyPredicate {
@@ -28147,6 +28083,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     var app_setting_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_app_setting_plan);
     defer app_setting_session.deinit(alloc);
     try std.testing.expectEqualStrings("tenant-a", app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    var set_local_app_setting = try lowerDdlPlanAlloc(alloc, "SET LOCAL app.tenant_id = 'tenant-b';");
+    defer set_local_app_setting.deinit(alloc);
+    const set_local_app_setting_fingerprint = try ddlFingerprintAlloc(alloc, set_local_app_setting);
+    defer alloc.free(set_local_app_setting_fingerprint);
+    try std.testing.expectEqualStrings("ddl:session:set_setting:setting=app.tenant_id:setting_kind=app:local=true", set_local_app_setting_fingerprint);
+    const set_local_app_setting_plan = switch (set_local_app_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_app_setting_session = try applyOwnedSessionCatalogPlanAlloc(alloc, app_setting_session, set_local_app_setting_plan);
+    defer local_app_setting_session.deinit(alloc);
+    try std.testing.expect(local_app_setting_session.transaction_local_settings);
+    try std.testing.expectEqualStrings("tenant-b", local_app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+    try local_app_setting_session.clearTransactionLocalState(alloc);
+    try std.testing.expect(!local_app_setting_session.transaction_local_settings);
+    try std.testing.expect(local_app_setting_session.transaction_local_settings_base == null);
+    try std.testing.expectEqualStrings("tenant-a", local_app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 
     var set_runtime_setting = try lowerDdlPlanAlloc(alloc, "SET statement_timeout = '1ms';");
     defer set_runtime_setting.deinit(alloc);

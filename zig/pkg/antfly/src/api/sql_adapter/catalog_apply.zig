@@ -147,7 +147,9 @@ pub const OwnedSqlCatalogSession = struct {
     search_path: []const []const u8,
     transaction_local_search_path_base: ?[]const []const u8 = null,
     settings: []const catalog_resources.SqlSessionSetting = &.{},
+    transaction_local_settings_base: ?[]const catalog_resources.SqlSessionSetting = null,
     transaction_local_search_path: bool = false,
+    transaction_local_settings: bool = false,
     notification_session_id: u64 = 0,
 
     pub fn fromSessionAlloc(alloc: std.mem.Allocator, source_session: catalog_resources.SqlCatalogSession) !OwnedSqlCatalogSession {
@@ -186,7 +188,9 @@ pub const OwnedSqlCatalogSession = struct {
             .search_path = search_path,
             .transaction_local_search_path_base = null,
             .settings = settings,
+            .transaction_local_settings_base = null,
             .transaction_local_search_path = false,
+            .transaction_local_settings = false,
             .notification_session_id = 0,
         };
     }
@@ -207,6 +211,16 @@ pub const OwnedSqlCatalogSession = struct {
             self.transaction_local_search_path_base = null;
         }
         self.transaction_local_search_path = false;
+        if (self.transaction_local_settings_base) |base| {
+            for (self.settings) |setting| {
+                alloc.free(@constCast(setting.name));
+                alloc.free(@constCast(setting.value));
+            }
+            if (self.settings.len > 0) alloc.free(self.settings);
+            self.settings = base;
+            self.transaction_local_settings_base = null;
+        }
+        self.transaction_local_settings = false;
     }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -222,6 +236,13 @@ pub const OwnedSqlCatalogSession = struct {
             alloc.free(@constCast(setting.value));
         }
         if (self.settings.len > 0) alloc.free(self.settings);
+        if (self.transaction_local_settings_base) |base| {
+            for (base) |setting| {
+                alloc.free(@constCast(setting.name));
+                alloc.free(@constCast(setting.value));
+            }
+            if (base.len > 0) alloc.free(base);
+        }
         self.* = undefined;
     }
 };
@@ -242,6 +263,37 @@ fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]con
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(values);
+}
+
+fn cloneSessionSettings(
+    alloc: std.mem.Allocator,
+    values: []const catalog_resources.SqlSessionSetting,
+) ![]const catalog_resources.SqlSessionSetting {
+    const out = try alloc.alloc(catalog_resources.SqlSessionSetting, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |setting| {
+            alloc.free(@constCast(setting.name));
+            alloc.free(@constCast(setting.value));
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |setting, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, setting.name),
+            .value = try alloc.dupe(u8, setting.value),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeSessionSettings(alloc: std.mem.Allocator, values: []const catalog_resources.SqlSessionSetting) void {
+    for (values) |setting| {
+        alloc.free(@constCast(setting.name));
+        alloc.free(@constCast(setting.value));
+    }
     if (values.len > 0) alloc.free(values);
 }
 
@@ -466,6 +518,13 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
                 updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 updated.transaction_local_search_path = session.transaction_local_search_path;
             }
+            if (set.local) {
+                if (session.transaction_local_settings_base) |base| {
+                    updated.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
+                } else {
+                    updated.transaction_local_settings_base = try cloneSessionSettings(alloc, session.settings);
+                }
+            }
             const settings = try replaceSessionSettingAlloc(alloc, updated.settings, set.name, set.value);
             for (updated.settings) |setting| {
                 alloc.free(@constCast(setting.name));
@@ -473,6 +532,11 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             }
             if (updated.settings.len > 0) alloc.free(updated.settings);
             updated.settings = settings;
+            updated.transaction_local_settings = set.local;
+            if (!set.local) {
+                if (updated.transaction_local_settings_base) |base| freeSessionSettings(alloc, base);
+                updated.transaction_local_settings_base = null;
+            }
             return updated;
         },
         .reset_setting => |reset| {
@@ -481,6 +545,10 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             if (session.transaction_local_search_path_base) |base| {
                 updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 updated.transaction_local_search_path = session.transaction_local_search_path;
+            }
+            if (session.transaction_local_settings_base) |base| {
+                updated.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
+                updated.transaction_local_settings = session.transaction_local_settings;
             }
             const settings = try removeSessionSettingAlloc(alloc, updated.settings, reset.name);
             for (updated.settings) |setting| {
@@ -503,6 +571,10 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
             if (session.transaction_local_search_path_base) |base| {
                 updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
                 updated.transaction_local_search_path = session.transaction_local_search_path;
+            }
+            if (session.transaction_local_settings_base) |base| {
+                updated.transaction_local_settings_base = try cloneSessionSettings(alloc, base);
+                updated.transaction_local_settings = session.transaction_local_settings;
             }
             return updated;
         },

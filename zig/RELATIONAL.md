@@ -4692,7 +4692,10 @@ session used by table/schema resolution. `SET [SESSION] search_path` preserves
 the ordered namespace list in the typed plan; `SET LOCAL search_path` preserves
 the same ordered namespace list plus transaction-local intent on the owned
 session state, including the prior base path so `COMMIT` and `ROLLBACK` can
-clear the local override without losing the session path. The source parity corpus pins public-only, multi-namespace, and
+clear the local override without losing the session path. Typed `SET LOCAL`
+runtime/app settings preserve the same transaction-local base-state contract,
+so transaction boundaries restore the prior setting map rather than leaking
+local overrides. The source parity corpus pins public-only, multi-namespace, and
 transaction-local search paths so schema-resolution metadata cannot collapse
 back into an adapter-only no-op. Role/session
 authorization changes, arbitrary settings, timeout settings, default storage

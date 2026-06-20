@@ -1485,13 +1485,9 @@ pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
     const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
-    var role_targets: []const []const u8 = &.{};
-    var role_targets_transferred = true;
-    if (cursor.matchKeyword("to")) {
-        role_targets = try parseIdentifierListAlloc(alloc, tokens, pos);
-        role_targets_transferred = false;
-        errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
-    }
+    const role_targets = try parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
+    var role_targets_transferred = false;
+    errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
     try cursor.expectKeyword("using");
     var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
     var predicate_transferred = false;
@@ -1524,13 +1520,9 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
     const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
-    var role_targets: []const []const u8 = &.{};
-    var role_targets_transferred = true;
-    if (cursor.matchKeyword("to")) {
-        role_targets = try parseIdentifierListAlloc(alloc, tokens, pos);
-        role_targets_transferred = false;
-        errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
-    }
+    const role_targets = try parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
+    var role_targets_transferred = false;
+    errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
     try cursor.expectKeyword("using");
     var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
     var predicate_transferred = false;
@@ -1547,6 +1539,16 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
         .role_targets = role_targets,
         .predicate = predicate,
     };
+}
+
+pub fn parseOptionalRowSecurityPolicyRoleTargetsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("to")) return &.{};
+    return try parseIdentifierListAlloc(alloc, tokens, pos);
 }
 
 pub fn parseDropRowSecurityPolicyCatalogTailAlloc(
@@ -7533,6 +7535,16 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqual(@as(usize, 2), targeted.role_targets.len);
     try std.testing.expectEqualStrings("app_reader", targeted.role_targets[0]);
     try std.testing.expectEqualStrings("app_writer", targeted.role_targets[1]);
+
+    var role_tokens = try lexer.tokenizeAlloc(alloc, "TO app_reader, app_writer USING");
+    defer lexer.freeTokens(alloc, &role_tokens);
+    var role_pos: usize = 0;
+    const role_targets = try parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, role_tokens.items, &role_pos);
+    defer freeStringSlice(alloc, role_targets);
+    try std.testing.expectEqual(@as(usize, 2), role_targets.len);
+    try std.testing.expectEqualStrings("app_reader", role_targets[0]);
+    try std.testing.expectEqualStrings("app_writer", role_targets[1]);
+    try std.testing.expectEqualStrings("USING", role_tokens.items[role_pos].text);
 
     var literal_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy_literal ON usage_records USING (tenant_id = 'tenant-a');");
     defer lexer.freeTokens(alloc, &literal_tokens);

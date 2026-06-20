@@ -20300,13 +20300,22 @@ test "api http server applies SQL DDL with explicit catalog session" {
     defer local_table.deinit(alloc);
     try std.testing.expectEqualStrings("public", local_table.table.namespace_name);
 
+    var set_local_tenant = try server.applyRelationalSqlDdlWithSession("SET LOCAL app.tenant_id = 'tenant-b';", &session);
+    defer set_local_tenant.deinit(alloc);
+    try std.testing.expect(set_local_tenant.noop);
+    try std.testing.expect(session.transaction_local_settings);
+    try std.testing.expectEqualStrings("tenant-b", session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
     var committed = try server.applyRelationalSqlDdlWithSession("COMMIT;", &session);
     defer committed.deinit(alloc);
     try std.testing.expect(committed.noop);
     try std.testing.expect(!session.transaction_local_search_path);
     try std.testing.expect(session.transaction_local_search_path_base == null);
+    try std.testing.expect(!session.transaction_local_settings);
+    try std.testing.expect(session.transaction_local_settings_base == null);
     try std.testing.expectEqualStrings("analytics", session.search_path[0]);
     try std.testing.expectEqualStrings("public", session.search_path[1]);
+    try std.testing.expectEqualStrings("tenant-a", session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 }
 
 test "api http server enforces SQL statement timeout on session-backed DDL" {
