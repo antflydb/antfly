@@ -4549,6 +4549,17 @@ test "table catalog identity applies SQL database and namespace catalog lifecycl
         defer parsed_settings.deinit();
         try std.testing.expectEqualStrings("tenant-a", parsed_settings.value.object.get("app.tenant_id").?.string);
     }
+    var altered_runtime_database = try service.apply(std.testing.allocator, "ALTER DATABASE tenant_ops SET statement_timeout TO '5s';");
+    defer altered_runtime_database.deinit(std.testing.allocator);
+    {
+        const databases = try service.manager.listDatabases(std.testing.allocator);
+        defer service.manager.freeDatabases(std.testing.allocator, databases);
+        var parsed_settings = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, databases[0].settings_json, .{});
+        defer parsed_settings.deinit();
+        try std.testing.expectEqualStrings("5s", parsed_settings.value.object.get("statement_timeout").?.string);
+    }
+    try std.testing.expectError(error.UnsupportedRoleSetting, service.apply(std.testing.allocator, "ALTER DATABASE tenant_ops SET unknown_guc TO 'on';"));
+    try std.testing.expectError(error.InvalidRoleSetting, service.apply(std.testing.allocator, "ALTER DATABASE tenant_ops SET statement_timeout TO 'five seconds';"));
 
     var created_tablespace = try service.apply(std.testing.allocator, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
     defer created_tablespace.deinit(std.testing.allocator);

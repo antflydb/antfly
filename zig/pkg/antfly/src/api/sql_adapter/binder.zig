@@ -43,6 +43,54 @@ pub fn relationalColumnForField(
     return null;
 }
 
+pub fn relationalColumnForReturningField(schema: runtime_schema.TableSchema, field: []const u8) ?runtime_schema.RelationalColumn {
+    if (relationalColumnForField(schema, field, null)) |column| return column;
+    const dot_index = std.mem.indexOfScalar(u8, field, '.') orelse return null;
+    if (dot_index == 0 or dot_index + 1 >= field.len) return null;
+    return relationalColumnForField(schema, field[0..dot_index], .json);
+}
+
+pub fn findUniqueConstraintByName(schema: runtime_schema.TableSchema, name: []const u8) ?runtime_schema.UniqueConstraint {
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        if (std.mem.eql(u8, constraint.name, name)) return constraint;
+    }
+    return null;
+}
+
+pub fn findUniqueConstraintByColumns(schema: runtime_schema.TableSchema, columns: []const []const u8, require_partial: bool) ?runtime_schema.UniqueConstraint {
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        if (constraint.expressions.len != 0) continue;
+        if (require_partial and constraint.where.len == 0) continue;
+        if (!require_partial and constraint.where.len != 0) continue;
+        if (stringSlicesEqual(constraint.columns, columns)) return constraint;
+    }
+    return null;
+}
+
+pub fn findUniqueConstraintByExpression(
+    schema: runtime_schema.TableSchema,
+    op: runtime_schema.UniqueExpressionOp,
+    field: []const u8,
+) ?runtime_schema.UniqueConstraint {
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) continue;
+        if (constraint.columns.len != 0 or constraint.expressions.len != 1) continue;
+        const expression = constraint.expressions[0];
+        if (expression.op == op and std.mem.eql(u8, expression.field, field)) return constraint;
+    }
+    return null;
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
 pub fn tableSchemaCatalogExists(current: runtime_schema.TableSchema) bool {
     return current.storage_mode == .relational or
         current.dynamic_templates.len != 0 or

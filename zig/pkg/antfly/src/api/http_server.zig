@@ -13274,7 +13274,7 @@ fn freeStringSliceConst(alloc: std.mem.Allocator, values: []const []const u8) vo
 
 test "api http server maps runtime role settings into SQL catalog session defaults" {
     const alloc = std.testing.allocator;
-    var database_settings = try sqlDatabaseSettingsFromJsonAlloc(alloc, "{\"statement_timeout\":\"30s\",\"search_path\":\"database_default, public\",\"app.tenant_id\":\"tenant-db\"}");
+    const database_settings = try sqlDatabaseSettingsFromJsonAlloc(alloc, "{\"statement_timeout\":\"30s\",\"search_path\":\"database_default, public\",\"app.tenant_id\":\"tenant-db\"}");
     defer {
         for (database_settings) |*setting| setting.deinit(alloc);
         alloc.free(database_settings);
