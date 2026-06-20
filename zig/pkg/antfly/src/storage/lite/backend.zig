@@ -364,7 +364,11 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(!native_caps.inference_required);
     try std.testing.expect(native_caps.no_inference_configured_ok);
     try std.testing.expect(native_caps.caller_supplied_artifacts);
+    try std.testing.expect(native_caps.caller_supplied_embeddings);
     try std.testing.expect(!native_caps.local_inference_runtime);
+    try std.testing.expect(native_caps.text_search);
+    try std.testing.expect(native_caps.hybrid_search);
+    try std.testing.expect(native_caps.graph_search);
     try std.testing.expect(!native_caps.distributed_shard_ownership);
     try std.testing.expect(!native_caps.raft_replication);
     try std.testing.expect(!native_caps.cluster_placement);
@@ -401,11 +405,15 @@ test "lite backend capabilities contract is stable" {
         "inference_required",
         "no_inference_configured_ok",
         "caller_supplied_artifacts",
+        "caller_supplied_embeddings",
         "remote_inference_providers",
         "local_inference_runtime",
         "generated_enrichment_planning",
+        "text_search",
         "dense_vector_search",
         "sparse_vector_search",
+        "hybrid_search",
+        "graph_search",
         "distributed_shard_ownership",
         "raft_replication",
         "cluster_placement",
@@ -434,7 +442,7 @@ test "lite backend capabilities contract is stable" {
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]";
     const supported_modes_json = "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]";
-    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         !freestanding,
@@ -455,7 +463,7 @@ test "lite backend capabilities contract is stable" {
             "[\"caller_supplied_artifacts\",\"manual_maintenance\",\"disabled_deferred\"]"
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"manual_maintenance\",\"disabled_deferred\"]";
-    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         freestanding,

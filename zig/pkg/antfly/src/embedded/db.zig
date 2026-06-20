@@ -384,8 +384,12 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expect(status.storage.active_checkpoint != null);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_count);
     try std.testing.expect(!status.pending_work.has_async_indexes);
+    try std.testing.expect(status.capabilities.text_search);
     try std.testing.expect(status.capabilities.dense_vector_search);
     try std.testing.expect(status.capabilities.sparse_vector_search);
+    try std.testing.expect(status.capabilities.hybrid_search);
+    try std.testing.expect(status.capabilities.graph_search);
+    try std.testing.expect(status.capabilities.caller_supplied_embeddings);
     try std.testing.expect(status.capabilities.ttl_cleanup_runtime);
     try std.testing.expect(status.capabilities.no_inference_configured_ok);
     try std.testing.expect(!status.capabilities.raft_replication);

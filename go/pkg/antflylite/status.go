@@ -54,11 +54,15 @@ type Capabilities struct {
 	InferenceRequired                  bool     `json:"inference_required"`
 	NoInferenceConfiguredOK            bool     `json:"no_inference_configured_ok"`
 	CallerSuppliedArtifacts            bool     `json:"caller_supplied_artifacts"`
+	CallerSuppliedEmbeddings           bool     `json:"caller_supplied_embeddings"`
 	RemoteInferenceProviders           bool     `json:"remote_inference_providers"`
 	LocalInferenceRuntime              bool     `json:"local_inference_runtime"`
 	GeneratedEnrichmentPlanning        bool     `json:"generated_enrichment_planning"`
+	TextSearch                         bool     `json:"text_search"`
 	DenseVectorSearch                  bool     `json:"dense_vector_search"`
 	SparseVectorSearch                 bool     `json:"sparse_vector_search"`
+	HybridSearch                       bool     `json:"hybrid_search"`
+	GraphSearch                        bool     `json:"graph_search"`
 	DistributedShardOwnership          bool     `json:"distributed_shard_ownership"`
 	RaftReplication                    bool     `json:"raft_replication"`
 	ClusterPlacement                   bool     `json:"cluster_placement"`

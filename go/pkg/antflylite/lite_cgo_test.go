@@ -222,6 +222,10 @@ func TestLiteCAPI(t *testing.T) {
 	if typedCaps.InferenceMode != InferenceModeCallerSuppliedOrDisabled || !typedCaps.CallerSuppliedArtifacts || !typedCaps.NoInferenceConfiguredOK {
 		t.Fatalf("typed capabilities inference fields = %#v", typedCaps)
 	}
+	if !typedCaps.CallerSuppliedEmbeddings || !typedCaps.TextSearch || !typedCaps.DenseVectorSearch ||
+		!typedCaps.SparseVectorSearch || !typedCaps.HybridSearch || !typedCaps.GraphSearch {
+		t.Fatalf("typed capabilities retrieval fields = %#v", typedCaps)
+	}
 	if !containsString(typedCaps.SupportedInferenceModes, InferenceModeLocalEmbedded) ||
 		!containsString(typedCaps.AvailableInferenceModes, InferenceModeCallerSuppliedArtifacts) ||
 		!containsString(typedCaps.AvailableInferenceModes, InferenceModeDisabledDeferred) {
