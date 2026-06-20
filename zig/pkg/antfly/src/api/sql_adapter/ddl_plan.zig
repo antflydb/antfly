@@ -3790,6 +3790,7 @@ pub fn parseAlterTablePrefixOperationAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
 ) !?AlterTableOperation {
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.peekKeyword("validate")) {
@@ -3859,7 +3860,7 @@ pub fn parseAlterTablePrefixOperationAlloc(
     const collation = try parseOptionalSupportedDdlCollationAlloc(alloc, tokens, pos, ddl_type.field_type);
     var collation_transferred = false;
     errdefer if (!collation_transferred) if (collation) |value| alloc.free(value);
-    var rewrite_expression = try parseOptionalDdlAlterColumnRewriteExpressionAlloc(alloc, tokens, pos);
+    var rewrite_expression = try parseOptionalDdlAlterColumnRewriteExpressionAlloc(alloc, tokens, pos, hooks);
     var rewrite_transferred = false;
     errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(alloc);
     const operation = alterTableColumnTypeOperationFromSyntax(&type_header, ddl_type, collation, rewrite_expression);
@@ -3967,7 +3968,7 @@ pub fn parseAlterTableOperationAlloc(
     operations: *std.ArrayListUnmanaged(AlterTableOperation),
 ) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (try parseAlterTablePrefixOperationAlloc(alloc, tokens, pos)) |operation| {
+    if (try parseAlterTablePrefixOperationAlloc(alloc, tokens, pos, hooks)) |operation| {
         try appendAlterTableOperation(alloc, operations, operation);
         return;
     }
@@ -5077,10 +5078,19 @@ pub fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
     pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
 ) !?AlterColumnRewriteExpression {
     const cursor = parser.Cursor.init(tokens, pos);
     if (!cursor.matchKeyword("using")) return null;
-    const expression = try grammar.parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    const expression_start = pos.*;
+    const expression = if (hooks.parse_rewrite_expression) |parse_rewrite_expression| blk: {
+        const expression = parse_rewrite_expression(hooks.ptr) catch |err| {
+            pos.* = expression_start;
+            if (err == error.OutOfMemory) return err;
+            break :blk try grammar.parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+        };
+        break :blk expression;
+    } else try grammar.parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
     errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
     return .{ .expression = expression };
 }
@@ -5458,6 +5468,7 @@ pub const DdlColumnDefinitionHooks = struct {
     parse_default_value: *const fn (*anyopaque, runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue,
     parse_generated_value: *const fn (*anyopaque) anyerror!runtime_schema.RelationalGeneratedValue,
     parse_check_constraint: *const fn (*anyopaque, ?[]const u8) anyerror!runtime_schema.RelationalCheck,
+    parse_rewrite_expression: ?*const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression = null,
 };
 
 pub const DdlDomainHooks = struct {

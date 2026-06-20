@@ -4318,6 +4318,9 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_sql_expression_named_arg_body: bool = false,
     ddl_function_sql_expression_nested_body: bool = false,
     ddl_function_sql_expression_minmax_body: bool = false,
+    ddl_function_trigger_return_new: bool = false,
+    ddl_function_trigger_return_null: bool = false,
+    ddl_function_trigger_return_old: bool = false,
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
@@ -6013,6 +6016,12 @@ pub const AppParityCorpusCoverage = struct {
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "greatest[") != null and
                             std.mem.indexOf(u8, entry.plan, "least[") != null);
+                    self.ddl_function_trigger_return_new = self.ddl_function_trigger_return_new or
+                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_new") != null;
+                    self.ddl_function_trigger_return_null = self.ddl_function_trigger_return_null or
+                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_null") != null;
+                    self.ddl_function_trigger_return_old = self.ddl_function_trigger_return_old or
+                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_old") != null;
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;

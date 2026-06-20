@@ -4700,6 +4700,17 @@
       "sql": "CREATE FUNCTION audit_old_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$"
     },
     {
+      "name": "create trigger return null function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_null_body",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_null_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_null",
+      "sql": "CREATE FUNCTION audit_null_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$"
+    },
+    {
       "name": "unsupported create function side-effect body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",

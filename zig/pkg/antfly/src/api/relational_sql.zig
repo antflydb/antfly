@@ -933,7 +933,7 @@ fn lowerReadPlanWithOptionalSourceSchemaAlloc(
         else => return err,
     }
 
-    if (lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params)) |lowered| {
+    if (lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, function_bindings)) |lowered| {
         return .{ .set_operation = lowered };
     } else |err| switch (err) {
         error.UnsupportedSqlShape => if (saw_invalid_catalog) return error.InvalidSqlCatalog else return error.UnsupportedSqlShape,
@@ -969,7 +969,17 @@ pub fn lowerSetOperationPlanAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredSetOperationPlan {
-    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params);
+    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, .{});
+}
+
+pub fn lowerSetOperationPlanWithFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, function_bindings);
 }
 
 pub fn lowerSetOperationPlanWithSchemasAlloc(
@@ -979,7 +989,18 @@ pub fn lowerSetOperationPlanWithSchemasAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredSetOperationPlan {
-    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params);
+    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, .{});
+}
+
+pub fn lowerSetOperationPlanWithSchemasAndFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredSetOperationPlan {
+    return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, source_schema, params, function_bindings);
 }
 
 fn lowerSetOperationPlanWithOptionalSourceSchemaAlloc(
@@ -988,6 +1009,7 @@ fn lowerSetOperationPlanWithOptionalSourceSchemaAlloc(
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
 ) !LoweredSetOperationPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema) |joined_source_schema| {
@@ -1002,6 +1024,7 @@ fn lowerSetOperationPlanWithOptionalSourceSchemaAlloc(
         .schema = schema,
         .joined_source_schema = source_schema,
         .params = params,
+        .function_bindings = function_bindings,
     };
     return try parser.parseSetOperationPlan();
 }
@@ -2613,6 +2636,7 @@ const Parser = struct {
             .parse_default_value = parseDdlDefaultValueHook,
             .parse_generated_value = parseDdlGeneratedValueHook,
             .parse_check_constraint = parseDdlCheckConstraintHook,
+            .parse_rewrite_expression = parseDdlRewriteExpressionHook,
         };
     }
 
@@ -3289,6 +3313,22 @@ const Parser = struct {
         };
     }
 
+    fn selectFieldItemParserHooks(self: *@This()) sql_adapter.SelectFieldItemParserHooks {
+        return .{
+            .ptr = self,
+            .parse_json_array_value = parseConflictJsonArrayValueHook,
+            .parse_arithmetic_projection_from_field = parseSelectFieldArithmeticProjectionHook,
+            .parse_boolean_projection_from_field = parseSelectFieldBooleanProjectionHook,
+        };
+    }
+
+    fn rowExpressionFieldOperandParserHooks(self: *@This()) sql_adapter.RowExpressionFieldOperandParserHooks {
+        return .{
+            .ptr = self,
+            .parse_json_array_value = parseConflictJsonArrayValueHook,
+        };
+    }
+
     fn conflictCoalesceExpressionParserHooks(self: *@This()) sql_adapter.ConflictCoalesceExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3466,6 +3506,22 @@ const Parser = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseConflictExpressionOperandAlloc(column, insert_columns, expected_type);
+    }
+
+    fn parseSelectFieldArithmeticProjectionHook(
+        ptr: *anyopaque,
+        field: []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpressionProjection {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseArithmeticExpressionProjectionFromFieldAlloc(field);
+    }
+
+    fn parseSelectFieldBooleanProjectionHook(
+        ptr: *anyopaque,
+        field: []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpressionProjection {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseBooleanExpressionProjectionFromFieldAlloc(field);
     }
 
     fn parseConflictCoalesceExpressionOperandHook(
@@ -3888,6 +3944,14 @@ const Parser = struct {
     fn parseDdlRowExpressionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.function_bindings.routine_expressions.len == 0) return error.UnsupportedSqlShape;
+        const previous_defer_field_validation = self.defer_row_expression_field_validation;
+        self.defer_row_expression_field_validation = true;
+        defer self.defer_row_expression_field_validation = previous_defer_field_validation;
+        return try self.parseRowExpressionAlloc();
+    }
+
+    fn parseDdlRewriteExpressionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
         const previous_defer_field_validation = self.defer_row_expression_field_validation;
         self.defer_row_expression_field_validation = true;
         defer self.defer_row_expression_field_validation = previous_defer_field_validation;
@@ -14814,166 +14878,89 @@ const Parser = struct {
     }
 
     fn parseSelectItem(self: *@This()) !SelectItem {
-        if (sql_adapter.rowExpressionHasTopLevelPipeConcat(self.tokens, self.pos)) return .{ .expression = try self.parseTextExpressionProjectionAlloc() };
-        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseGenericExpressionProjectionAlloc() };
-        if (sql_adapter.peekBooleanNotExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseBooleanExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsUuidV4Function)) return .{ .expression = try self.parseUuidV4ExpressionProjectionAlloc() };
-        if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseNowExpressionProjectionAlloc() };
-        if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseCurrentDateExpressionProjectionAlloc() };
-        if (sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos)) return .{ .expression = try self.parseTypedDatetimeLiteralExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction)) return .{ .expression = try self.parseJsonExtractPathExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonTypeofFunction)) return .{ .expression = try self.parseJsonTypeofExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonArrayLengthFunction)) return .{ .expression = try self.parseJsonArrayLengthExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonBuildObjectFunction)) return .{ .expression = try self.parseJsonBuildObjectExpressionProjectionAlloc() };
-        if (sql_adapter.peekConvertFromFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseJsonValueExpressionProjectionAlloc("convert_from") };
-        if (sql_adapter.peekToJsonbFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseToJsonbExpressionProjectionAlloc() };
-        if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction)) return .{ .expression = try self.parseArrayLengthExpressionProjectionAlloc() };
-        if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction)) return .{ .expression = try self.parseArrayPositionExpressionProjectionAlloc() };
-        if (sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseArrayElementTransformExpressionProjectionAlloc() };
-        if (sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseArrayToStringExpressionProjectionAlloc() };
-        if (sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseStringToArrayExpressionProjectionAlloc() };
-        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseCoalesceExpressionProjectionAlloc() };
-        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseCaseFoldExpressionProjectionAlloc() };
-        if (sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseReplaceExpressionProjectionAlloc() };
-        if (sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseRegexpReplaceExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction)) return .{ .expression = try self.parseRegexpSubstrExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction)) return .{ .expression = try self.parseRegexpMatchExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction)) return .{ .expression = try self.parseRegexpCountExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction)) return .{ .expression = try self.parseRegexpInstrExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction)) return .{ .expression = try self.parseTranslateExpressionProjectionAlloc() };
-        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseConcatExpressionProjectionAlloc() };
-        if (sql_adapter.peekNullifFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseNullifExpressionProjectionAlloc() };
-        if (sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos)) return .{ .expression = try self.parseLengthExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction)) return .{ .expression = try self.parseAsciiExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction)) return .{ .expression = try self.parseChrExpressionProjectionAlloc() };
-        if (sql_adapter.peekSubstringFunctionKeyword(self.tokens, self.pos)) return .{ .expression = try self.parseSubstringExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsOverlayFunction)) return .{ .expression = try self.parseOverlayExpressionProjectionAlloc() };
-        if (sql_adapter.peekSplitPartFunctionKeyword(self.tokens, self.pos)) return .{ .expression = try self.parseSplitPartExpressionProjectionAlloc() };
-        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseStrposExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsLeftRightFunction)) return .{ .expression = try self.parseLeftRightExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsPadFunction)) return .{ .expression = try self.parsePadExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRepeatFunction)) return .{ .expression = try self.parseRepeatExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsReverseFunction)) return .{ .expression = try self.parseReverseExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsMd5Function)) return .{ .expression = try self.parseMd5ExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsStartsWithFunction)) return .{ .expression = try self.parseStartsWithExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsEndsWithFunction)) return .{ .expression = try self.parseEndsWithExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction)) return .{ .expression = try self.parseDateTruncExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction)) return .{ .expression = try self.parseDateBinExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction)) return .{ .expression = try self.parseDatePartExpressionProjectionAlloc() };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs)) return .{ .expression = try self.parseAbsExpressionProjectionAlloc() };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round)) return .{ .expression = try self.parseRoundExpressionProjectionAlloc() };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.trunc) };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.floor) };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.ceil) };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sqrt) };
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sign) };
-        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod)) return .{ .expression = try self.parseModuloExpressionProjectionAlloc() };
-        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power)) return .{ .expression = try self.parsePowerExpressionProjectionAlloc() };
-        if (sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseGreatestLeastExpressionProjectionAlloc() };
-        if (sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseCaseExpressionProjectionAlloc() };
-        if (sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseCastExpressionProjectionAlloc() };
+        if (sql_adapter.selectItemStartAt(self.tokens, self.pos)) |start| {
+            switch (start) {
+                .pipe_concat => return .{ .expression = try self.parseTextExpressionProjectionAlloc() },
+                .unary_negative => return .{ .expression = try self.parseGenericExpressionProjectionAlloc() },
+                .boolean_not => return .{ .expression = try self.parseBooleanExpressionProjectionAlloc() },
+                .uuid_v4 => return .{ .expression = try self.parseUuidV4ExpressionProjectionAlloc() },
+                .now => return .{ .expression = try self.parseNowExpressionProjectionAlloc() },
+                .current_date => return .{ .expression = try self.parseCurrentDateExpressionProjectionAlloc() },
+                .typed_datetime_literal => return .{ .expression = try self.parseTypedDatetimeLiteralExpressionProjectionAlloc() },
+                .json_extract_path => return .{ .expression = try self.parseJsonExtractPathExpressionProjectionAlloc() },
+                .json_typeof => return .{ .expression = try self.parseJsonTypeofExpressionProjectionAlloc() },
+                .json_array_length => return .{ .expression = try self.parseJsonArrayLengthExpressionProjectionAlloc() },
+                .json_build_object => return .{ .expression = try self.parseJsonBuildObjectExpressionProjectionAlloc() },
+                .convert_from => return .{ .expression = try self.parseJsonValueExpressionProjectionAlloc("convert_from") },
+                .to_jsonb => return .{ .expression = try self.parseToJsonbExpressionProjectionAlloc() },
+                .array_length => return .{ .expression = try self.parseArrayLengthExpressionProjectionAlloc() },
+                .array_position => return .{ .expression = try self.parseArrayPositionExpressionProjectionAlloc() },
+                .array_element_transform => return .{ .expression = try self.parseArrayElementTransformExpressionProjectionAlloc() },
+                .array_to_string => return .{ .expression = try self.parseArrayToStringExpressionProjectionAlloc() },
+                .string_to_array => return .{ .expression = try self.parseStringToArrayExpressionProjectionAlloc() },
+                .coalesce => return .{ .expression = try self.parseCoalesceExpressionProjectionAlloc() },
+                .case_fold => return .{ .expression = try self.parseCaseFoldExpressionProjectionAlloc() },
+                .replace => return .{ .expression = try self.parseReplaceExpressionProjectionAlloc() },
+                .regexp_replace => return .{ .expression = try self.parseRegexpReplaceExpressionProjectionAlloc() },
+                .regexp_substr => return .{ .expression = try self.parseRegexpSubstrExpressionProjectionAlloc() },
+                .regexp_match => return .{ .expression = try self.parseRegexpMatchExpressionProjectionAlloc() },
+                .regexp_count => return .{ .expression = try self.parseRegexpCountExpressionProjectionAlloc() },
+                .regexp_instr => return .{ .expression = try self.parseRegexpInstrExpressionProjectionAlloc() },
+                .translate => return .{ .expression = try self.parseTranslateExpressionProjectionAlloc() },
+                .concat => return .{ .expression = try self.parseConcatExpressionProjectionAlloc() },
+                .nullif => return .{ .expression = try self.parseNullifExpressionProjectionAlloc() },
+                .text_length => return .{ .expression = try self.parseLengthExpressionProjectionAlloc() },
+                .ascii => return .{ .expression = try self.parseAsciiExpressionProjectionAlloc() },
+                .chr => return .{ .expression = try self.parseChrExpressionProjectionAlloc() },
+                .substring => return .{ .expression = try self.parseSubstringExpressionProjectionAlloc() },
+                .overlay => return .{ .expression = try self.parseOverlayExpressionProjectionAlloc() },
+                .split_part => return .{ .expression = try self.parseSplitPartExpressionProjectionAlloc() },
+                .strpos => return .{ .expression = try self.parseStrposExpressionProjectionAlloc() },
+                .left_right => return .{ .expression = try self.parseLeftRightExpressionProjectionAlloc() },
+                .pad => return .{ .expression = try self.parsePadExpressionProjectionAlloc() },
+                .repeat => return .{ .expression = try self.parseRepeatExpressionProjectionAlloc() },
+                .reverse => return .{ .expression = try self.parseReverseExpressionProjectionAlloc() },
+                .md5 => return .{ .expression = try self.parseMd5ExpressionProjectionAlloc() },
+                .starts_with => return .{ .expression = try self.parseStartsWithExpressionProjectionAlloc() },
+                .ends_with => return .{ .expression = try self.parseEndsWithExpressionProjectionAlloc() },
+                .date_trunc => return .{ .expression = try self.parseDateTruncExpressionProjectionAlloc() },
+                .date_bin => return .{ .expression = try self.parseDateBinExpressionProjectionAlloc() },
+                .date_part => return .{ .expression = try self.parseDatePartExpressionProjectionAlloc() },
+                .abs => return .{ .expression = try self.parseAbsExpressionProjectionAlloc() },
+                .round => return .{ .expression = try self.parseRoundExpressionProjectionAlloc() },
+                .trunc => return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.trunc) },
+                .floor => return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.floor) },
+                .ceil => return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.ceil) },
+                .sqrt => return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sqrt) },
+                .sign => return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sign) },
+                .mod => return .{ .expression = try self.parseModuloExpressionProjectionAlloc() },
+                .power => return .{ .expression = try self.parsePowerExpressionProjectionAlloc() },
+                .greatest_least => return .{ .expression = try self.parseGreatestLeastExpressionProjectionAlloc() },
+                .case => return .{ .expression = try self.parseCaseExpressionProjectionAlloc() },
+                .cast => return .{ .expression = try self.parseCastExpressionProjectionAlloc() },
+                .parenthesized => {
+                    if (sql_adapter.peekParenthesizedNullTestProjection(self.tokens, self.pos)) {
+                        return .{ .expression = try self.parseParenthesizedNullTestExpressionProjectionAlloc() };
+                    }
+                    return .{ .expression = try self.parseParenthesizedExpressionProjectionAlloc() };
+                },
+            }
+        }
         if (sql_adapter.peekExtensionFunctionCall(self.tokens, self.pos, self.function_bindings.extension_functions)) return .{ .expression = try self.parseExtensionFunctionExpressionProjectionAlloc() };
         if (sql_adapter.peekRoutineExpressionCall(self.tokens, self.pos, self.function_bindings.routine_expressions)) return .{ .expression = try self.parseRoutineExpressionProjectionAlloc() };
-        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
-            if (sql_adapter.peekParenthesizedNullTestProjection(self.tokens, self.pos)) {
-                return .{ .expression = try self.parseParenthesizedNullTestExpressionProjectionAlloc() };
-            }
-            return .{ .expression = try self.parseParenthesizedExpressionProjectionAlloc() };
-        }
 
-        const parsed_field = try self.parseFieldExpressionOwned();
-        defer self.alloc.free(parsed_field);
-        const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
-        var field_owned = true;
-        errdefer if (field_owned) self.alloc.free(field);
-        if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
-        if (sql_adapter.matchJsonExtractOperator(self.tokens, &self.pos)) |operator| {
-            const as_text = tokenKindIsJsonExtractTextOperator(operator);
-            if (relationalColumnForField(self.schema, field, .json) == null) return error.InvalidSqlCatalog;
-            const path = try sql_adapter.parseJsonExtractOperatorPathOwnedAlloc(self.alloc, self.tokens, &self.pos, self.params, operator);
-            var path_owned = true;
-            errdefer if (path_owned) self.alloc.free(path);
-            const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, path);
-            var output_owned = true;
-            errdefer if (output_owned) self.alloc.free(output);
-            const expression = try sql_adapter.buildJsonExtractExpressionAlloc(
-                self.alloc,
-                .{ .kind = .field, .field = field, .field_source = self.rowExpressionFieldSource() },
-                path,
-                as_text,
-            );
-            errdefer freeExpression(self.alloc, expression);
-            field_owned = false;
-            path_owned = false;
-            output_owned = false;
-            return .{ .expression = sql_adapter.buildExpressionProjection(output, expression) };
-        }
-        if (self.match(.question) != null) {
-            if (relationalColumnForField(self.schema, field, .json) == null) return error.InvalidSqlCatalog;
-            const path = try sql_adapter.parseJsonPathOwnedAlloc(self.alloc, self.tokens, &self.pos, self.params);
-            var path_owned = true;
-            errdefer if (path_owned) self.alloc.free(path);
-            const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, path);
-            var output_owned = true;
-            errdefer if (output_owned) self.alloc.free(output);
-            const expression = try sql_adapter.buildJsonPathExistsExpressionAlloc(
-                self.alloc,
-                .{ .kind = .field, .field = field, .field_source = self.rowExpressionFieldSource() },
-                path,
-            );
-            errdefer freeExpression(self.alloc, expression);
-            field_owned = false;
-            path_owned = false;
-            output_owned = false;
-            return .{ .expression = sql_adapter.buildExpressionProjection(output, expression) };
-        }
-        if (self.match(.question_any) != null or self.match(.question_all) != null) {
-            const match_all = self.tokens[self.pos - 1].kind == .question_all;
-            if (relationalColumnForField(self.schema, field, .json) == null) return error.InvalidSqlCatalog;
-            const values_json = try self.parseJsonArrayValueAlloc();
-            defer self.alloc.free(values_json);
-            const expression = try sql_adapter.buildJsonKeySetExistsExpressionAlloc(self.alloc, field, self.rowExpressionFieldSource(), match_all, values_json);
-            errdefer freeExpression(self.alloc, expression);
-            const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, if (match_all) "json_keys_all" else "json_keys_any");
-            var output_owned = true;
-            errdefer if (output_owned) self.alloc.free(output);
-            output_owned = false;
-            self.alloc.free(field);
-            field_owned = false;
-            return .{ .expression = sql_adapter.buildExpressionProjection(output, expression) };
-        }
-        const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
-        if (sql_adapter.peekArithmeticOperator(self.tokens, self.pos)) |_| {
-            if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
-            field_owned = false;
-            return .{ .expression = try self.parseArithmeticExpressionProjectionFromFieldAlloc(field) };
-        }
-        if (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |_| {
-            if (column.field_type != .boolean) return error.InvalidSqlCatalog;
-            field_owned = false;
-            return .{ .expression = try self.parseBooleanExpressionProjectionFromFieldAlloc(field) };
-        }
-        const alias = try sql_adapter.parseOptionalProjectionAliasAlloc(self.alloc, self.tokens, &self.pos);
-        var alias_transferred = false;
-        errdefer if (!alias_transferred) if (alias) |owned| self.alloc.free(owned);
-        if (alias) |output| {
-            if (!std.mem.eql(u8, output, field)) {
-                alias_transferred = true;
-                field_owned = false;
-                return .{ .expression = .{
-                    .output = output,
-                    .expression = .{
-                        .kind = .field,
-                        .field = field,
-                        .field_source = self.rowExpressionFieldSource(),
-                    },
-                } };
-            }
-            self.alloc.free(output);
-            alias_transferred = true;
-        }
-        field_owned = false;
-        return .{ .field = field };
+        return try sql_adapter.parseSelectFieldItemAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.params,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
+            self.selectFieldItemParserHooks(),
+        );
     }
 
     fn parseTextExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -16178,184 +16165,72 @@ const Parser = struct {
     }
 
     fn parseRowExpressionOperandAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
-            return try self.parseParenthesizedRowExpressionAlloc();
-        }
-        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) {
-            return try self.parseUnaryNegativeRowExpressionAlloc();
-        }
-        if (sql_adapter.peekBooleanNotExpressionSyntax(self.tokens, self.pos)) {
-            return try self.parseBooleanNotRowExpressionAlloc();
-        }
-        if (sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos)) {
-            return try self.parseCastRowExpressionAlloc();
-        }
-        if (sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos)) {
-            return try self.parseCaseRowExpressionAlloc();
-        }
-        if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) {
-            return try sql_adapter.parseSqlNowRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        }
-        if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) {
-            return try sql_adapter.parseSqlCurrentDateRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        }
-        if (sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos)) {
-            return try sql_adapter.parseSqlTypedDatetimeLiteralRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsUuidV4Function)) {
-            return try sql_adapter.parseSqlUuidV4RowExpression(self.tokens, &self.pos);
-        }
-        if (sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos)) {
-            return try sql_adapter.parseSqlIntervalRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        }
-        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) {
-            return try self.parseCaseFoldRowExpressionAlloc();
-        }
-        if (sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos)) {
-            return try self.parseReplaceRowExpressionAlloc();
-        }
-        if (sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos)) {
-            return try self.parseRegexpReplaceRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction)) {
-            return try self.parseRegexpSubstrRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction)) {
-            return try self.parseRegexpMatchRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction)) {
-            return try self.parseRegexpCountRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction)) {
-            return try self.parseRegexpInstrRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction)) {
-            return try self.parseTranslateRowExpressionAlloc();
-        }
-        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) {
-            return try self.parseConcatRowExpressionAlloc();
-        }
-        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
-            return try self.parseCoalesceRowExpressionAlloc();
-        }
-        if (sql_adapter.peekNullifFunctionCall(self.tokens, self.pos)) {
-            return try self.parseNullifRowExpressionAlloc();
-        }
-        if (sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos)) {
-            return try self.parseLengthRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction)) {
-            return try self.parseAsciiRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction)) {
-            return try self.parseChrRowExpressionAlloc();
-        }
-        if (sql_adapter.peekSubstringFunctionKeyword(self.tokens, self.pos)) {
-            return try self.parseSubstringRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsOverlayFunction)) {
-            return try self.parseOverlayRowExpressionAlloc();
-        }
-        if (sql_adapter.peekSplitPartFunctionKeyword(self.tokens, self.pos)) {
-            return try self.parseSplitPartRowExpressionAlloc();
-        }
-        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos)) {
-            return try self.parseStrposRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsLeftRightFunction)) {
-            return try self.parseLeftRightRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsPadFunction)) {
-            return try self.parsePadRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRepeatFunction)) {
-            return try self.parseRepeatRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsReverseFunction)) {
-            return try self.parseReverseRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsMd5Function)) {
-            return try self.parseMd5RowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsStartsWithFunction)) {
-            return try self.parseStartsWithRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsEndsWithFunction)) {
-            return try self.parseEndsWithRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction)) {
-            return try self.parseDateTruncRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction)) {
-            return try self.parseDateBinRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction)) {
-            return try self.parseDatePartRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs)) {
-            return try self.parseAbsRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round)) {
-            return try self.parseRoundRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc)) {
-            return try self.parseFloorCeilRowExpressionAlloc(.trunc);
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor)) {
-            return try self.parseFloorCeilRowExpressionAlloc(.floor);
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil)) {
-            return try self.parseFloorCeilRowExpressionAlloc(.ceil);
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt)) {
-            return try self.parseFloorCeilRowExpressionAlloc(.sqrt);
-        }
-        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign)) {
-            return try self.parseFloorCeilRowExpressionAlloc(.sign);
-        }
-        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod)) {
-            return try self.parseModuloRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power)) {
-            return try self.parsePowerRowExpressionAlloc();
-        }
-        if (sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos)) {
-            return try self.parseGreatestLeastRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction)) {
-            return try self.parseJsonExtractPathRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonTypeofFunction)) {
-            return try self.parseJsonTypeofRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonArrayLengthFunction)) {
-            return try self.parseJsonArrayLengthRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonBuildObjectFunction)) {
-            return try self.parseJsonBuildObjectRowExpressionAlloc();
-        }
-        if (sql_adapter.peekToJsonbFunctionCall(self.tokens, self.pos)) {
-            return try self.parseToJsonbRowExpressionAlloc();
-        }
-        if (sql_adapter.peekConvertFromFunctionCall(self.tokens, self.pos)) {
-            const value_json = try self.parseJsonValueAlloc();
-            errdefer self.alloc.free(value_json);
-            return .{ .kind = .value, .value_json = value_json };
-        }
-        if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction)) {
-            return try self.parseArrayLengthRowExpressionAlloc();
-        }
-        if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction)) {
-            return try self.parseArrayPositionRowExpressionAlloc();
-        }
-        if (sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos)) {
-            return try self.parseArrayElementTransformRowExpressionAlloc();
-        }
-        if (sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos)) {
-            return try self.parseArrayToStringRowExpressionAlloc();
-        }
-        if (sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) {
-            return try self.parseStringToArrayRowExpressionAlloc();
+        if (sql_adapter.rowExpressionOperandStartAt(self.tokens, self.pos)) |start| {
+            switch (start) {
+                .parenthesized => return try self.parseParenthesizedRowExpressionAlloc(),
+                .unary_negative => return try self.parseUnaryNegativeRowExpressionAlloc(),
+                .boolean_not => return try self.parseBooleanNotRowExpressionAlloc(),
+                .cast => return try self.parseCastRowExpressionAlloc(),
+                .case => return try self.parseCaseRowExpressionAlloc(),
+                .now => return try sql_adapter.parseSqlNowRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
+                .current_date => return try sql_adapter.parseSqlCurrentDateRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
+                .typed_datetime_literal => return try sql_adapter.parseSqlTypedDatetimeLiteralRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
+                .uuid_v4 => return try sql_adapter.parseSqlUuidV4RowExpression(self.tokens, &self.pos),
+                .interval => return try sql_adapter.parseSqlIntervalRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
+                .case_fold => return try self.parseCaseFoldRowExpressionAlloc(),
+                .replace => return try self.parseReplaceRowExpressionAlloc(),
+                .regexp_replace => return try self.parseRegexpReplaceRowExpressionAlloc(),
+                .regexp_substr => return try self.parseRegexpSubstrRowExpressionAlloc(),
+                .regexp_match => return try self.parseRegexpMatchRowExpressionAlloc(),
+                .regexp_count => return try self.parseRegexpCountRowExpressionAlloc(),
+                .regexp_instr => return try self.parseRegexpInstrRowExpressionAlloc(),
+                .translate => return try self.parseTranslateRowExpressionAlloc(),
+                .concat => return try self.parseConcatRowExpressionAlloc(),
+                .coalesce => return try self.parseCoalesceRowExpressionAlloc(),
+                .nullif => return try self.parseNullifRowExpressionAlloc(),
+                .text_length => return try self.parseLengthRowExpressionAlloc(),
+                .ascii => return try self.parseAsciiRowExpressionAlloc(),
+                .chr => return try self.parseChrRowExpressionAlloc(),
+                .substring => return try self.parseSubstringRowExpressionAlloc(),
+                .overlay => return try self.parseOverlayRowExpressionAlloc(),
+                .split_part => return try self.parseSplitPartRowExpressionAlloc(),
+                .strpos => return try self.parseStrposRowExpressionAlloc(),
+                .left_right => return try self.parseLeftRightRowExpressionAlloc(),
+                .pad => return try self.parsePadRowExpressionAlloc(),
+                .repeat => return try self.parseRepeatRowExpressionAlloc(),
+                .reverse => return try self.parseReverseRowExpressionAlloc(),
+                .md5 => return try self.parseMd5RowExpressionAlloc(),
+                .starts_with => return try self.parseStartsWithRowExpressionAlloc(),
+                .ends_with => return try self.parseEndsWithRowExpressionAlloc(),
+                .date_trunc => return try self.parseDateTruncRowExpressionAlloc(),
+                .date_bin => return try self.parseDateBinRowExpressionAlloc(),
+                .date_part => return try self.parseDatePartRowExpressionAlloc(),
+                .abs => return try self.parseAbsRowExpressionAlloc(),
+                .round => return try self.parseRoundRowExpressionAlloc(),
+                .trunc => return try self.parseFloorCeilRowExpressionAlloc(.trunc),
+                .floor => return try self.parseFloorCeilRowExpressionAlloc(.floor),
+                .ceil => return try self.parseFloorCeilRowExpressionAlloc(.ceil),
+                .sqrt => return try self.parseFloorCeilRowExpressionAlloc(.sqrt),
+                .sign => return try self.parseFloorCeilRowExpressionAlloc(.sign),
+                .mod => return try self.parseModuloRowExpressionAlloc(),
+                .power => return try self.parsePowerRowExpressionAlloc(),
+                .greatest_least => return try self.parseGreatestLeastRowExpressionAlloc(),
+                .json_extract_path => return try self.parseJsonExtractPathRowExpressionAlloc(),
+                .json_typeof => return try self.parseJsonTypeofRowExpressionAlloc(),
+                .json_array_length => return try self.parseJsonArrayLengthRowExpressionAlloc(),
+                .json_build_object => return try self.parseJsonBuildObjectRowExpressionAlloc(),
+                .to_jsonb => return try self.parseToJsonbRowExpressionAlloc(),
+                .convert_from => {
+                    const value_json = try self.parseJsonValueAlloc();
+                    errdefer self.alloc.free(value_json);
+                    return .{ .kind = .value, .value_json = value_json };
+                },
+                .array_length => return try self.parseArrayLengthRowExpressionAlloc(),
+                .array_position => return try self.parseArrayPositionRowExpressionAlloc(),
+                .array_element_transform => return try self.parseArrayElementTransformRowExpressionAlloc(),
+                .array_to_string => return try self.parseArrayToStringRowExpressionAlloc(),
+                .string_to_array => return try self.parseStringToArrayRowExpressionAlloc(),
+            }
         }
         if (try self.parseExtensionFunctionRowExpressionAlloc()) |expression| {
             return expression;
@@ -16363,72 +16238,21 @@ const Parser = struct {
         if (try self.parseRoutineExpressionRowExpressionAlloc()) |expression| {
             return expression;
         }
-        if (self.peekKind(.identifier) and
-            !self.peekKeyword("null") and
-            !self.peekKeyword("true") and
-            !self.peekKeyword("false"))
-        {
-            if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lparen) return error.UnsupportedSqlShape;
-            const parsed_field = try self.parseFieldExpressionOwned();
-            defer self.alloc.free(parsed_field);
-            const resolved = try sql_adapter.resolveRowExpressionFieldAlloc(
-                self.alloc,
-                self.schema,
-                self.joined_source_schema,
-                parsed_field,
-                self.field_expression_qualifiers,
-                self.returning_expression_qualifiers,
-                self.joined_source_expression_qualifiers,
-                self.joined_target_expression_qualifiers,
-                self.defer_row_expression_field_validation,
-                self.rowExpressionFieldSource(),
-            );
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(resolved.field);
-            if (sql_adapter.matchJsonExtractOperator(self.tokens, &self.pos)) |operator| {
-                const as_text = tokenKindIsJsonExtractTextOperator(operator);
-                if (!self.defer_row_expression_field_validation and relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
-                const path = try sql_adapter.parseJsonExtractOperatorPathOwnedAlloc(self.alloc, self.tokens, &self.pos, self.params, operator);
-                var path_transferred = false;
-                errdefer if (!path_transferred) self.alloc.free(path);
-                const expression = try sql_adapter.buildJsonExtractExpressionAlloc(
-                    self.alloc,
-                    .{ .kind = .field, .field = resolved.field, .field_source = resolved.source },
-                    path,
-                    as_text,
-                );
-                field_transferred = true;
-                path_transferred = true;
-                return expression;
-            }
-            if (self.match(.question) != null) {
-                if (!self.defer_row_expression_field_validation and relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
-                const path = try sql_adapter.parseJsonPathOwnedAlloc(self.alloc, self.tokens, &self.pos, self.params);
-                var path_transferred = false;
-                errdefer if (!path_transferred) self.alloc.free(path);
-                const expression = try sql_adapter.buildJsonPathExistsExpressionAlloc(
-                    self.alloc,
-                    .{ .kind = .field, .field = resolved.field, .field_source = resolved.source },
-                    path,
-                );
-                field_transferred = true;
-                path_transferred = true;
-                return expression;
-            }
-            if (self.match(.question_any) != null or self.match(.question_all) != null) {
-                const match_all = self.tokens[self.pos - 1].kind == .question_all;
-                if (!self.defer_row_expression_field_validation and relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
-                const values_json = try self.parseJsonArrayValueAlloc();
-                defer self.alloc.free(values_json);
-                const expression = try sql_adapter.buildJsonKeySetExistsExpressionAlloc(self.alloc, resolved.field, resolved.source, match_all, values_json);
-                field_transferred = true;
-                self.alloc.free(resolved.field);
-                return expression;
-            }
-            if (!self.defer_row_expression_field_validation and relationalColumnForField(resolved.schema, resolved.field, null) == null) return error.InvalidSqlCatalog;
-            field_transferred = true;
-            return .{ .kind = .field, .field = resolved.field, .field_source = resolved.source };
-        }
+        if (try sql_adapter.parseRowExpressionFieldOperandOrNullAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.joined_source_schema,
+            self.params,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.joined_source_expression_qualifiers,
+            self.joined_target_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
+            self.rowExpressionFieldOperandParserHooks(),
+        )) |expression| return expression;
 
         const value_json = try self.parseJsonValueAlloc();
         errdefer self.alloc.free(value_json);
@@ -22225,6 +22049,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const old_trigger_body_function_fingerprint = try ddlFingerprintAlloc(alloc, old_trigger_body_function);
     defer alloc.free(old_trigger_body_function_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_function:name=old_audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_old", old_trigger_body_function_fingerprint);
+
+    var null_trigger_body_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION null_audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$;");
+    defer null_trigger_body_function.deinit(alloc);
+    const null_trigger_body_function_plan = switch (null_trigger_body_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineBodyKind.plpgsql_trigger, null_trigger_body_function_plan.body.?.kind);
+    try std.testing.expectEqual(RoutineExecutionHook.trigger_return_null, null_trigger_body_function_plan.body.?.hook);
+    try std.testing.expect(null_trigger_body_function_plan.body.?.expression == null);
+    const null_trigger_body_function_fingerprint = try ddlFingerprintAlloc(alloc, null_trigger_body_function);
+    defer alloc.free(null_trigger_body_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=null_audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_null", null_trigger_body_function_fingerprint);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
 
@@ -33412,6 +33253,22 @@ test "postgres sql adapter lowers routine expression bindings into row expressio
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[0].kind);
     try std.testing.expectEqualStrings("status", expression.operands[0].field);
 
+    var set_operation = try lowerSetOperationPlanWithFunctionBindingsAlloc(
+        alloc,
+        "SELECT normalize_status(status) AS status_key FROM usage_records WHERE status = 'open' UNION ALL SELECT normalize_status(status) AS status_key FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+        .{ .routine_expressions = &bindings },
+    );
+    defer set_operation.deinit(alloc);
+    try std.testing.expectEqual(SelectSetOperation.union_all, set_operation.operation);
+    try std.testing.expectEqual(@as(usize, 1), set_operation.left.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), set_operation.right.plan.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, set_operation.left.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, set_operation.right.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", set_operation.left.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", set_operation.right.plan.query.expressions[0].expression.operands[0].field);
+
     const overloaded_operands = [_]db_mod.types.RelationalRowsExpression{
         .{ .kind = .field, .field = "arg1" },
         .{ .kind = .field, .field = "arg2" },
@@ -33504,6 +33361,25 @@ test "postgres sql adapter lowers routine expression bindings into row expressio
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_expression.kind);
     try std.testing.expectEqual(@as(usize, 1), generated_expression.operands.len);
     try std.testing.expectEqualStrings("status", generated_expression.operands[0].field);
+
+    var rewrite_table = try lowerDdlPlanWithFunctionBindingsAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER COLUMN status TYPE text USING normalize_status(status);",
+        .{ .routine_expressions = &bindings },
+    );
+    defer rewrite_table.deinit(alloc);
+    const rewrite_alter = switch (rewrite_table) {
+        .alter_table => |alter| alter,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), rewrite_alter.operations.len);
+    const rewrite_expression = switch (rewrite_alter.operations[0]) {
+        .alter_column_type => |operation| (operation.rewrite_expression orelse return error.TestUnexpectedResult).expression,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, rewrite_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), rewrite_expression.operands.len);
+    try std.testing.expectEqualStrings("status", rewrite_expression.operands[0].field);
 
     var checked_table = try lowerDdlPlanWithFunctionBindingsAlloc(
         alloc,

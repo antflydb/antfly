@@ -1033,7 +1033,12 @@ moves behind a `api/sql_adapter/` package:
   compatibility and predicate-disjointness proof helpers. Golden-plan
   fingerprints for row rewrite expressions and row-security predicates also
   live here, so corpus evidence is derived from the adapter-owned expression
-  surface rather than duplicated SQL facade helpers.
+  surface rather than duplicated SQL facade helpers. SQL select-list start
+  classification and general row-expression operand start classification also
+  live here as typed enum dispatch helpers; `relational_sql.zig` can still own
+  the temporary parser methods that build each expression, but it should no
+  longer carry long PostgreSQL-token predicate chains for deciding which
+  expression family starts at the current token.
 - `lower_select.zig`, `lower_dml.zig`, and `lower_ddl.zig`: statement-family
   lowering into Antfly typed read plans, write plans, and catalog/schema plans.
 - `diagnostics.zig`: span-aware unsupported-shape diagnostics and stable

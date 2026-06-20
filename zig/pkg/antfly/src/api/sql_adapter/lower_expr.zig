@@ -9307,6 +9307,467 @@ pub fn peekGeneralOrderRowExpression(tokens: []const Token, pos: usize) bool {
         peekGreatestLeastFunctionCall(tokens, pos);
 }
 
+pub const SelectItemStart = enum {
+    pipe_concat,
+    unary_negative,
+    boolean_not,
+    uuid_v4,
+    now,
+    current_date,
+    typed_datetime_literal,
+    json_extract_path,
+    json_typeof,
+    json_array_length,
+    json_build_object,
+    convert_from,
+    to_jsonb,
+    array_length,
+    array_position,
+    array_element_transform,
+    array_to_string,
+    string_to_array,
+    coalesce,
+    case_fold,
+    replace,
+    regexp_replace,
+    regexp_substr,
+    regexp_match,
+    regexp_count,
+    regexp_instr,
+    translate,
+    concat,
+    nullif,
+    text_length,
+    ascii,
+    chr,
+    substring,
+    overlay,
+    split_part,
+    strpos,
+    left_right,
+    pad,
+    repeat,
+    reverse,
+    md5,
+    starts_with,
+    ends_with,
+    date_trunc,
+    date_bin,
+    date_part,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    mod,
+    power,
+    greatest_least,
+    case,
+    cast,
+    parenthesized,
+};
+
+pub const SelectFieldItemParserHooks = struct {
+    ptr: *anyopaque,
+    parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
+    parse_arithmetic_projection_from_field: *const fn (*anyopaque, []const u8) anyerror!db_mod.types.RelationalRowsExpressionProjection,
+    parse_boolean_projection_from_field: *const fn (*anyopaque, []const u8) anyerror!db_mod.types.RelationalRowsExpressionProjection,
+};
+
+pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
+    if (rowExpressionHasTopLevelPipeConcat(tokens, pos)) return .pipe_concat;
+    if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
+    if (peekBooleanNotExpressionSyntax(tokens, pos)) return .boolean_not;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsUuidV4Function)) return .uuid_v4;
+    if (peekSqlNowExpressionSyntax(tokens, pos)) return .now;
+    if (peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
+    if (peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction)) return .json_extract_path;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction)) return .json_typeof;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction)) return .json_array_length;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction)) return .json_build_object;
+    if (value_mod.peekConvertFromFunctionCall(tokens, pos)) return .convert_from;
+    if (value_mod.peekToJsonbFunctionCall(tokens, pos)) return .to_jsonb;
+    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction)) return .array_length;
+    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction)) return .array_position;
+    if (peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
+    if (peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
+    if (peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
+    if (peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
+    if (peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
+    if (peekReplaceFunctionCall(tokens, pos)) return .replace;
+    if (peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction)) return .regexp_substr;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction)) return .regexp_match;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction)) return .regexp_count;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction)) return .regexp_instr;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction)) return .translate;
+    if (peekConcatFunctionCall(tokens, pos)) return .concat;
+    if (peekNullifFunctionCall(tokens, pos)) return .nullif;
+    if (peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction)) return .ascii;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction)) return .chr;
+    if (peekSubstringFunctionKeyword(tokens, pos)) return .substring;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction)) return .overlay;
+    if (peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
+    if (peekStrposFunctionKeyword(tokens, pos) or peekPositionFunctionSyntax(tokens, pos)) return .strpos;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction)) return .left_right;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction)) return .pad;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction)) return .repeat;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction)) return .reverse;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) return .md5;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction)) return .starts_with;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction)) return .ends_with;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction)) return .date_trunc;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction)) return .date_bin;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction)) return .date_part;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .floor)) return .floor;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .ceil)) return .ceil;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .sqrt)) return .sqrt;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .sign)) return .sign;
+    if (peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
+    if (peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
+    if (peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
+    if (peekCaseExpressionSyntax(tokens, pos)) return .case;
+    if (peekCastExpressionSyntax(tokens, pos)) return .cast;
+    if (peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
+    return null;
+}
+
+pub fn parseSelectFieldItemAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    hooks: SelectFieldItemParserHooks,
+) !plan_mod.SelectItem {
+    const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
+    defer alloc.free(parsed_field);
+    const field = try binder.normalizeRowExpressionFieldAlloc(alloc, schema, parsed_field, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
+    var field_owned = true;
+    errdefer if (field_owned) alloc.free(field);
+    if (parser.peekKind(tokens, pos.*, .lparen)) return error.UnsupportedSqlShape;
+    if (matchJsonExtractOperator(tokens, pos)) |operator| {
+        const as_text = tokenKindIsJsonExtractTextOperator(operator);
+        if (binder.relationalColumnForField(schema, field, .json) == null) return error.InvalidSqlCatalog;
+        const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
+        var path_owned = true;
+        errdefer if (path_owned) alloc.free(path);
+        const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, path);
+        var output_owned = true;
+        errdefer if (output_owned) alloc.free(output);
+        const expression = try buildJsonExtractExpressionAlloc(
+            alloc,
+            .{ .kind = .field, .field = field, .field_source = field_source },
+            path,
+            as_text,
+        );
+        errdefer freeExpression(alloc, expression);
+        field_owned = false;
+        path_owned = false;
+        output_owned = false;
+        return .{ .expression = buildExpressionProjection(output, expression) };
+    }
+    if (parser.matchToken(tokens, pos, .question) != null) {
+        if (binder.relationalColumnForField(schema, field, .json) == null) return error.InvalidSqlCatalog;
+        const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
+        var path_owned = true;
+        errdefer if (path_owned) alloc.free(path);
+        const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, path);
+        var output_owned = true;
+        errdefer if (output_owned) alloc.free(output);
+        const expression = try buildJsonPathExistsExpressionAlloc(
+            alloc,
+            .{ .kind = .field, .field = field, .field_source = field_source },
+            path,
+        );
+        errdefer freeExpression(alloc, expression);
+        field_owned = false;
+        path_owned = false;
+        output_owned = false;
+        return .{ .expression = buildExpressionProjection(output, expression) };
+    }
+    if (parser.matchToken(tokens, pos, .question_any) != null or parser.matchToken(tokens, pos, .question_all) != null) {
+        const match_all = tokens[pos.* - 1].kind == .question_all;
+        if (binder.relationalColumnForField(schema, field, .json) == null) return error.InvalidSqlCatalog;
+        const values_json = try hooks.parse_json_array_value(hooks.ptr);
+        defer alloc.free(values_json);
+        const expression = try buildJsonKeySetExistsExpressionAlloc(alloc, field, field_source, match_all, values_json);
+        errdefer freeExpression(alloc, expression);
+        const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, if (match_all) "json_keys_all" else "json_keys_any");
+        var output_owned = true;
+        errdefer if (output_owned) alloc.free(output);
+        output_owned = false;
+        alloc.free(field);
+        field_owned = false;
+        return .{ .expression = buildExpressionProjection(output, expression) };
+    }
+    const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+    if (peekArithmeticOperator(tokens, pos.*)) |_| {
+        if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
+        field_owned = false;
+        return .{ .expression = try hooks.parse_arithmetic_projection_from_field(hooks.ptr, field) };
+    }
+    if (peekBooleanOperator(tokens, pos.*)) |_| {
+        if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+        field_owned = false;
+        return .{ .expression = try hooks.parse_boolean_projection_from_field(hooks.ptr, field) };
+    }
+    const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) if (alias) |owned| alloc.free(owned);
+    if (alias) |output| {
+        if (!std.mem.eql(u8, output, field)) {
+            alias_transferred = true;
+            field_owned = false;
+            return .{ .expression = .{
+                .output = output,
+                .expression = .{
+                    .kind = .field,
+                    .field = field,
+                    .field_source = field_source,
+                },
+            } };
+        }
+        alloc.free(output);
+        alias_transferred = true;
+    }
+    field_owned = false;
+    return .{ .field = field };
+}
+
+pub const RowExpressionOperandStart = enum {
+    parenthesized,
+    unary_negative,
+    boolean_not,
+    cast,
+    case,
+    now,
+    current_date,
+    typed_datetime_literal,
+    uuid_v4,
+    interval,
+    case_fold,
+    replace,
+    regexp_replace,
+    regexp_substr,
+    regexp_match,
+    regexp_count,
+    regexp_instr,
+    translate,
+    concat,
+    coalesce,
+    nullif,
+    text_length,
+    ascii,
+    chr,
+    substring,
+    overlay,
+    split_part,
+    strpos,
+    left_right,
+    pad,
+    repeat,
+    reverse,
+    md5,
+    starts_with,
+    ends_with,
+    date_trunc,
+    date_bin,
+    date_part,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    mod,
+    power,
+    greatest_least,
+    json_extract_path,
+    json_typeof,
+    json_array_length,
+    json_build_object,
+    to_jsonb,
+    convert_from,
+    array_length,
+    array_position,
+    array_element_transform,
+    array_to_string,
+    string_to_array,
+};
+
+pub const RowExpressionFieldOperandParserHooks = struct {
+    ptr: *anyopaque,
+    parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
+};
+
+pub fn rowExpressionOperandStartAt(tokens: []const Token, pos: usize) ?RowExpressionOperandStart {
+    if (peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
+    if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
+    if (peekBooleanNotExpressionSyntax(tokens, pos)) return .boolean_not;
+    if (peekCastExpressionSyntax(tokens, pos)) return .cast;
+    if (peekCaseExpressionSyntax(tokens, pos)) return .case;
+    if (peekSqlNowExpressionSyntax(tokens, pos)) return .now;
+    if (peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
+    if (peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsUuidV4Function)) return .uuid_v4;
+    if (peekSqlIntervalExpressionSyntax(tokens, pos)) return .interval;
+    if (peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
+    if (peekReplaceFunctionCall(tokens, pos)) return .replace;
+    if (peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction)) return .regexp_substr;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction)) return .regexp_match;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction)) return .regexp_count;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction)) return .regexp_instr;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction)) return .translate;
+    if (peekConcatFunctionCall(tokens, pos)) return .concat;
+    if (peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
+    if (peekNullifFunctionCall(tokens, pos)) return .nullif;
+    if (peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction)) return .ascii;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction)) return .chr;
+    if (peekSubstringFunctionKeyword(tokens, pos)) return .substring;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction)) return .overlay;
+    if (peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
+    if (peekStrposFunctionKeyword(tokens, pos) or peekPositionFunctionSyntax(tokens, pos)) return .strpos;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction)) return .left_right;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction)) return .pad;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction)) return .repeat;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction)) return .reverse;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) return .md5;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction)) return .starts_with;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction)) return .ends_with;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction)) return .date_trunc;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction)) return .date_bin;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction)) return .date_part;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .floor)) return .floor;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .ceil)) return .ceil;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .sqrt)) return .sqrt;
+    if (peekFixedUnaryFunctionCall(tokens, pos, .sign)) return .sign;
+    if (peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
+    if (peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
+    if (peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction)) return .json_extract_path;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction)) return .json_typeof;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction)) return .json_array_length;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction)) return .json_build_object;
+    if (value_mod.peekToJsonbFunctionCall(tokens, pos)) return .to_jsonb;
+    if (value_mod.peekConvertFromFunctionCall(tokens, pos)) return .convert_from;
+    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction)) return .array_length;
+    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction)) return .array_position;
+    if (peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
+    if (peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
+    if (peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
+    return null;
+}
+
+pub fn parseRowExpressionFieldOperandOrNullAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    joined_source_expression_qualifiers: []const []const u8,
+    joined_target_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    hooks: RowExpressionFieldOperandParserHooks,
+) !?db_mod.types.RelationalRowsExpression {
+    if (!parser.peekKind(tokens, pos.*, .identifier) or
+        parser.peekKeyword(tokens, pos.*, "null") or
+        parser.peekKeyword(tokens, pos.*, "true") or
+        parser.peekKeyword(tokens, pos.*, "false"))
+    {
+        return null;
+    }
+    if (pos.* + 1 < tokens.len and tokens[pos.* + 1].kind == .lparen) return error.UnsupportedSqlShape;
+    const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    defer alloc.free(parsed_field);
+    const resolved = try binder.resolveRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        joined_source_schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        joined_source_expression_qualifiers,
+        joined_target_expression_qualifiers,
+        defer_row_expression_field_validation,
+        field_source,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(resolved.field);
+    if (matchJsonExtractOperator(tokens, pos)) |operator| {
+        const as_text = tokenKindIsJsonExtractTextOperator(operator);
+        if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
+        const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        const expression = try buildJsonExtractExpressionAlloc(
+            alloc,
+            .{ .kind = .field, .field = resolved.field, .field_source = resolved.source },
+            path,
+            as_text,
+        );
+        field_transferred = true;
+        path_transferred = true;
+        return expression;
+    }
+    if (parser.matchToken(tokens, pos, .question) != null) {
+        if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
+        const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        const expression = try buildJsonPathExistsExpressionAlloc(
+            alloc,
+            .{ .kind = .field, .field = resolved.field, .field_source = resolved.source },
+            path,
+        );
+        field_transferred = true;
+        path_transferred = true;
+        return expression;
+    }
+    if (parser.matchToken(tokens, pos, .question_any) != null or parser.matchToken(tokens, pos, .question_all) != null) {
+        const match_all = tokens[pos.* - 1].kind == .question_all;
+        if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
+        const values_json = try hooks.parse_json_array_value(hooks.ptr);
+        defer alloc.free(values_json);
+        const expression = try buildJsonKeySetExistsExpressionAlloc(alloc, resolved.field, resolved.source, match_all, values_json);
+        field_transferred = true;
+        alloc.free(resolved.field);
+        return expression;
+    }
+    if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, null) == null) return error.InvalidSqlCatalog;
+    field_transferred = true;
+    return .{ .kind = .field, .field = resolved.field, .field_source = resolved.source };
+}
+
 pub fn peekWindowOutputOrderExpression(tokens: []const Token, pos: usize) bool {
     return peekAggregateOutputOrderExpression(tokens, pos);
 }
