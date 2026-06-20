@@ -1349,6 +1349,91 @@ test "lite restore publishes staged aflite from aflite source" {
     }
 }
 
+test "lite backup output restores schema indexes enrichments and documents" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-roundtrip-src.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const backup_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-roundtrip.afb", .{tmp.sub_path});
+    defer allocator.free(backup_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-roundtrip-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+
+        try source.db.setSchemaJson(allocator,
+            \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","required":["title"]}}}}
+        );
+        try source.db.addEnrichment(.{
+            .name = "body_chunks_v1",
+            .kind = .chunk,
+            .field = "body",
+            .chunk_size = 8,
+            .chunk_overlap = 2,
+        });
+        try source.db.addIndex(.{
+            .name = "ft_body_v1",
+            .kind = .full_text,
+            .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+        });
+
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:backup-roundtrip\":{\"title\":\"portable backup restore\",\"body\":\"schema and catalog survive\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    const src_path_z = try allocator.dupeZ(u8, src_path);
+    defer allocator.free(src_path_z);
+    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    defer allocator.free(backup_path_z);
+    const backup_argv = [_][*:0]const u8{ src_path_z.ptr, "--out", backup_path_z.ptr };
+    var backup_args = std.process.Args.Iterator.init(.{ .vector = backup_argv[0..] });
+    try backup(allocator, io, &backup_args);
+    try std.testing.expect(pathExists(io, backup_path));
+
+    try restoreFromSourceFile(allocator, io, backup_path, dst_path, false);
+
+    {
+        var restored = try LiteDb.open(allocator, dst_path, .status_only);
+        defer restored.close();
+
+        const schema = (try restored.db.getSchemaJson(allocator)) orelse return error.MissingLiteSchemaJson;
+        defer allocator.free(schema);
+        try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"title\"]") != null);
+
+        const indexes = try restored.db.listIndexes(allocator);
+        defer db_types.freeIndexConfigs(allocator, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings("ft_body_v1", indexes[0].name);
+        try std.testing.expectEqual(db_types.IndexKind.full_text, indexes[0].kind);
+        try std.testing.expect(std.mem.indexOf(u8, indexes[0].config_json, "body_chunks_v1") != null);
+
+        const enrichments = try restored.db.listEnrichments(allocator);
+        defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
+        try std.testing.expectEqual(db_types.EnrichmentKind.chunk, enrichments[0].kind);
+        try std.testing.expectEqualStrings("body", enrichments[0].field);
+    }
+
+    {
+        var restored = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer restored.close();
+        const json = try lookupJson(allocator, &restored.db, "doc:backup-roundtrip", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"portable backup restore\"") != null);
+    }
+}
+
 test "lite restore replace fails before truncating active writer target" {
     const allocator = std.testing.allocator;
 
