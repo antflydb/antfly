@@ -1756,6 +1756,12 @@ pub export fn antfly_db_buffer_free(ptr: ?[*]u8, len: usize) void {
     std.heap.c_allocator.free(ptr.?[0..len]);
 }
 
+pub export fn antfly_buffer_free(buffer: ?*capi.Buffer) void {
+    const out = buffer orelse return;
+    antfly_db_buffer_free(out.ptr, out.len);
+    out.* = .{};
+}
+
 pub export fn antfly_db_dense_search_result_free(result: *capi.DenseSearchResult) void {
     if (result.hits_ptr) |hits_ptr| {
         const hits = hits_ptr[0..result.hit_count];
@@ -5902,7 +5908,6 @@ test "capi lite opens exports imports checks and vacuums aflite" {
 
     var status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(src_handle, &status));
-    defer antfly_db_buffer_free(status.ptr, status.len);
     const status_json = status.ptr.?[0..status.len];
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"storage\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format\":\"aflite\"") != null);
@@ -5911,6 +5916,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
+    antfly_buffer_free(&status);
+    try std.testing.expect(status.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), status.len);
 
     var capabilities: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));

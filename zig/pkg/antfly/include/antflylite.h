@@ -78,6 +78,7 @@ antfly_error_code antfly_lite_copy_stable_snapshot_json(
 antfly_error_code antfly_lite_vacuum_json(void *handle, antfly_buffer *out);
 
 void antfly_db_close(void *handle);
+void antfly_buffer_free(antfly_buffer *buffer);
 void antfly_db_buffer_free(uint8_t *ptr, size_t len);
 
 antfly_error_code antfly_db_batch(
