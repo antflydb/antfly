@@ -805,30 +805,9 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
 }
 
 fn statusJson(allocator: Allocator, lite: *LiteDb, profile: antfly.lite.backend.Profile) ![]u8 {
-    const stats_value = try lite.db.stats(allocator);
-    defer db_types.freeDBStats(allocator, stats_value);
-
-    const storage_json = try std.json.Stringify.valueAlloc(allocator, lite.backend.storageStatus(), .{});
-    defer allocator.free(storage_json);
-    const stats_json = try std.json.Stringify.valueAlloc(allocator, stats_value, .{});
-    defer allocator.free(stats_json);
-    const pending_json = try std.json.Stringify.valueAlloc(allocator, lite.db.maintenanceDriver().pendingWorkStats(), .{});
-    defer allocator.free(pending_json);
-    const capabilities_json = try std.json.Stringify.valueAlloc(allocator, antfly.lite.backend.capabilitiesForProfile(profile), .{});
-    defer allocator.free(capabilities_json);
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    defer out.deinit(allocator);
-    try out.appendSlice(allocator, "{\"storage\":");
-    try out.appendSlice(allocator, storage_json);
-    try out.appendSlice(allocator, ",\"stats\":");
-    try out.appendSlice(allocator, stats_json);
-    try out.appendSlice(allocator, ",\"pending_work\":");
-    try out.appendSlice(allocator, pending_json);
-    try out.appendSlice(allocator, ",\"capabilities\":");
-    try out.appendSlice(allocator, capabilities_json);
-    try out.append(allocator, '}');
-    return try out.toOwnedSlice(allocator);
+    var status_value = try lite.backend.fullStatus(allocator, &lite.db, profile);
+    defer status_value.deinit(allocator);
+    return try std.json.Stringify.valueAlloc(allocator, status_value, .{});
 }
 
 fn parseLookupRequest(alloc: Allocator, body: []const u8) !OwnedLookupRequest {

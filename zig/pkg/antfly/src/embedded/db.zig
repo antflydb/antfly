@@ -32,6 +32,7 @@ pub const LiteCheckReport = support.lite.backend.CheckReport;
 pub const LiteStableSnapshotReport = support.lite.backend.StableSnapshotReport;
 pub const LiteVacuumReport = support.lite.backend.VacuumReport;
 pub const LiteStorageStatus = support.lite.backend.StorageStatus;
+pub const LiteStatus = support.lite.backend.FullStatus;
 
 pub const OpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -45,18 +46,6 @@ pub const OpenOptions = struct {
 
 pub const Profile = support.lite.backend.Profile;
 pub const Capabilities = support.lite.backend.Capabilities;
-
-pub const LiteStatus = struct {
-    storage: LiteStorageStatus,
-    stats: types.DBStats,
-    pending_work: db_core.PendingWorkStats,
-    capabilities: Capabilities,
-
-    pub fn deinit(self: *LiteStatus, alloc: Allocator) void {
-        types.freeDBStats(alloc, self.stats);
-        self.* = undefined;
-    }
-};
 
 pub const DB = struct {
     allocator: Allocator,
@@ -139,16 +128,8 @@ pub const DB = struct {
     }
 
     pub fn liteStatus(self: *DB, alloc: Allocator) !LiteStatus {
-        const storage_status = try self.liteStorageStatus();
-        const stats_value = try self.stats(alloc);
-        errdefer types.freeDBStats(alloc, stats_value);
-
-        return .{
-            .storage = storage_status,
-            .stats = stats_value,
-            .pending_work = self.pendingWorkStats(),
-            .capabilities = self.capabilities(),
-        };
+        const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
+        return try backend.fullStatus(alloc, &self.inner, self.profile);
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) !void {

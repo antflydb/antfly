@@ -16,6 +16,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform_sync = @import("antfly_platform").sync;
 const db_mod = @import("../db/db.zig");
+const db_core = @import("../db/core.zig");
+const db_types = @import("../db/types.zig");
 const backend_erased = @import("../backend_erased.zig");
 const bridge = @import("bridge.zig");
 const docstore = @import("docstore.zig");
@@ -129,6 +131,24 @@ pub const StorageStatus = struct {
     page_count: ?u64 = null,
 };
 
+pub fn Status(comptime Stats: type) type {
+    return struct {
+        storage: StorageStatus,
+        stats: Stats,
+        pending_work: db_core.PendingWorkStats,
+        capabilities: Capabilities,
+
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            if (Stats == db_types.DBStats) {
+                db_types.freeDBStats(allocator, self.stats);
+            }
+            self.* = undefined;
+        }
+    };
+}
+
+pub const FullStatus = Status(db_types.DBStats);
+
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     if (!isAflitePath(path)) return error.InvalidArgument;
     return try native.checkFile(allocator, path);
@@ -237,6 +257,18 @@ pub const Handle = struct {
                 .format = "aflite-internal",
                 .engine = @tagName(self.engine),
             },
+        };
+    }
+
+    pub fn fullStatus(self: *Handle, allocator: Allocator, db: *db_mod.DB, profile: Profile) !FullStatus {
+        const stats_value = try db.stats(allocator);
+        errdefer db_types.freeDBStats(allocator, stats_value);
+
+        return .{
+            .storage = self.storageStatus(),
+            .stats = stats_value,
+            .pending_work = db.pendingWorkStats(),
+            .capabilities = capabilitiesForProfile(profile),
         };
     }
 
