@@ -3358,6 +3358,27 @@ const Parser = struct {
         };
     }
 
+    fn castRowExpressionParserHooks(self: *@This()) sql_adapter.CastRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseCastRowExpressionOperandHook,
+        };
+    }
+
+    fn coalesceRowExpressionParserHooks(self: *@This()) sql_adapter.CoalesceRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseCoalesceRowExpressionOperandHook,
+        };
+    }
+
+    fn nullifRowExpressionParserHooks(self: *@This()) sql_adapter.NullifRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseNullifRowExpressionOperandHook,
+        };
+    }
+
     fn unaryNegativeRowExpressionParserHooks(self: *@This()) sql_adapter.UnaryNegativeRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3581,6 +3602,21 @@ const Parser = struct {
     }
 
     fn parseBooleanNotRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionOperandAlloc();
+    }
+
+    fn parseCastRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionAlloc();
+    }
+
+    fn parseCoalesceRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionAlloc();
+    }
+
+    fn parseNullifRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseRowExpressionOperandAlloc();
     }
@@ -16358,16 +16394,7 @@ const Parser = struct {
     }
 
     fn parseCastRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseCastExpressionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try sql_adapter.parseCastExpressionAs(self.tokens, &self.pos);
-        const cast_type = try sql_adapter.parseExpressionCastType(self.tokens, &self.pos);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildCastExpressionAlloc(self.alloc, operand, cast_type);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseCastRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.castRowExpressionParserHooks());
     }
 
     fn parseCaseRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -16531,49 +16558,11 @@ const Parser = struct {
     }
 
     fn parseCoalesceRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
-
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        while (true) {
-            const operand = try self.parseRowExpressionAlloc();
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-            try operands.append(self.alloc, operand);
-            operand_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (operands.items.len == 0) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .coalesce, &operands);
-        errdefer freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateExpressionOperandDomains(expression);
-        return expression;
+        return try sql_adapter.parseCoalesceRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.coalesceRowExpressionParserHooks());
     }
 
     fn parseNullifRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseNullifFunctionCallStart(self.tokens, &self.pos);
-        const lhs = try self.parseRowExpressionOperandAlloc();
-        var lhs_transferred = false;
-        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
-        try self.expect(.comma);
-        const rhs = try self.parseRowExpressionOperandAlloc();
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred) freeExpression(self.alloc, rhs);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .nullif, lhs, rhs);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        lhs_transferred = true;
-        rhs_transferred = true;
-        try self.rowExpressionTypeContext().validateExpressionOperandDomains(expression);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseNullifRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.nullifRowExpressionParserHooks());
     }
 
     fn parseLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {

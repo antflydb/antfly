@@ -609,6 +609,21 @@ pub const BooleanNotRowExpressionParserHooks = struct {
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const CastRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const CoalesceRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const NullifRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const UnaryNegativeRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
@@ -2228,6 +2243,82 @@ pub fn parseUnaryNegativeRowExpressionAlloc(
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     const expression = try buildUnaryNegativeExpressionAlloc(alloc, operand);
     operand_transferred = true;
+    return expression;
+}
+
+pub fn parseCastRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: CastRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseCastExpressionCallStart(tokens, pos);
+    const operand = try hooks.parse_operand(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try parseCastExpressionAs(tokens, pos);
+    const cast_type = try parseExpressionCastType(tokens, pos);
+    try parser.expectToken(tokens, pos, .rparen);
+    const expression = try buildCastExpressionAlloc(alloc, operand, cast_type);
+    operand_transferred = true;
+    return expression;
+}
+
+pub fn parseCoalesceRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: CoalesceRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseCoalesceFunctionCallStart(tokens, pos);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try hooks.parse_expression(hooks.ptr);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (operands.items.len == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildFunctionExpressionFromOperandListAlloc(alloc, .coalesce, &operands);
+    errdefer freeExpression(alloc, expression);
+    try type_context.validateExpressionOperandDomains(expression);
+    return expression;
+}
+
+pub fn parseNullifRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: NullifRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseNullifFunctionCallStart(tokens, pos);
+    const lhs = try hooks.parse_operand(hooks.ptr);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+    try parser.expectToken(tokens, pos, .comma);
+    const rhs = try hooks.parse_operand(hooks.ptr);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildBinaryFunctionExpressionAlloc(alloc, .nullif, lhs, rhs);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    lhs_transferred = true;
+    rhs_transferred = true;
+    try type_context.validateExpressionOperandDomains(expression);
+    expression_transferred = true;
     return expression;
 }
 
