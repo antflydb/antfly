@@ -26,6 +26,7 @@ const db_mod = antfly.db;
 const db_types = db_mod.types;
 const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
+const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 
 const LiteDb = struct {
@@ -470,6 +471,7 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
     try portable_backup.exportPortable(allocator, lite.db.core.store, &out);
+    try portable_backup.validatePortable(allocator, out.items);
     try writeFileAtomically(allocator, io, out_path, out.items);
 
     cli.writeStdout(io, "{\"format\":\"afb\",\"path\":");
@@ -584,6 +586,7 @@ fn restoreFromSourceFile(
 
     const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
     defer allocator.free(body);
+    try portable_backup.validatePortable(allocator, body);
 
     const tmp_path = try restoreTempPathAlloc(allocator, out_path);
     defer allocator.free(tmp_path);
@@ -1489,6 +1492,8 @@ test "lite restore malformed backup leaves target untouched" {
 
     const backup_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/malformed.afb", .{tmp.sub_path});
     defer allocator.free(backup_path);
+    const logical_malformed_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/logical-malformed.afb", .{tmp.sub_path});
+    defer allocator.free(logical_malformed_path);
     const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-malformed-dst.aflite", .{tmp.sub_path});
     defer allocator.free(dst_path);
     const missing_dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-malformed-missing.aflite", .{tmp.sub_path});
@@ -1500,6 +1505,21 @@ test "lite restore malformed backup leaves target untouched" {
 
     try writeFileAtomically(allocator, io, backup_path, "not an afb");
     {
+        var malformed = std.ArrayList(u8).empty;
+        defer malformed.deinit(allocator);
+        try backup_codec.writeHeader(&malformed, allocator, .{
+            .format_version = backup_codec.format_version,
+            .flags = 0,
+            .created_at_ns = 0,
+            .backup_id = [_]u8{0} ** 16,
+            .table_count = 1,
+            .shard_count = 1,
+        });
+        const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+        try backup_codec.writeBlock(&malformed, allocator, .document_batch, &malformed_doc_payload);
+        try writeFileAtomically(allocator, io, logical_malformed_path, malformed.items);
+    }
+    {
         var target = try LiteDb.create(allocator, dst_path, true);
         defer target.close();
         const json = try batchJson(allocator, &target.db, "{\"inserts\":{\"doc:target\":{\"title\":\"target survives malformed restore\"}}}");
@@ -1507,6 +1527,17 @@ test "lite restore malformed backup leaves target untouched" {
     }
 
     try std.testing.expectError(error.EndOfStream, restoreFromSourceFile(allocator, io, backup_path, dst_path, true));
+    try std.testing.expect(!pathExists(io, dst_tmp_path));
+
+    {
+        var reopened = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer reopened.close();
+        const json = try lookupJson(allocator, &reopened.db, "doc:target", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"target survives malformed restore\"") != null);
+    }
+
+    try std.testing.expectError(error.Truncated, restoreFromSourceFile(allocator, io, logical_malformed_path, dst_path, true));
     try std.testing.expect(!pathExists(io, dst_tmp_path));
 
     {
