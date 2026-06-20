@@ -1923,6 +1923,17 @@ test "lite native header rejects corrupted checksum" {
     try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
 }
 
+test "lite native header rejects unsupported format version" {
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, .{});
+    std.mem.writeInt(u32, encoded[version_offset..][0..4], format_version + 1, .little);
+
+    const report = inspectBytes(&encoded);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("unsupported_format_version", report.issue.?);
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, decodeHeader(&encoded));
+}
+
 test "lite native header selects newest valid checkpoint slot" {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{
@@ -1992,6 +2003,27 @@ test "lite native create writes inspectable aflite file" {
     try std.testing.expectEqual(@as(u8, 0), report.active_checkpoint);
     try std.testing.expectEqual(@as(u64, 0), report.commit_sequence);
     try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native open rejects unsupported format version" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-unsupported-version.aflite");
+    defer allocator.free(path);
+
+    try create(std.testing.io, path);
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        var raw_version: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw_version, format_version + 1, .little);
+        try file.writePositionalAll(std.testing.io, &raw_version, version_offset);
+    }
+
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, true));
 }
 
 test "lite native inspect reads only the header page" {
