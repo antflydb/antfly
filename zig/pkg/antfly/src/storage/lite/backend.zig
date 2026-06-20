@@ -130,6 +130,7 @@ pub const StorageStatus = struct {
 };
 
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
+    if (!isAflitePath(path)) return error.InvalidArgument;
     return try native.checkFile(allocator, path);
 }
 
@@ -254,6 +255,7 @@ pub const Handle = struct {
     }
 
     pub fn copyStableSnapshot(self: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+        if (!isAflitePath(dest_path)) return error.InvalidArgument;
         return switch (self.engine) {
             .bridge_lsm_container => error.UnsupportedLiteSnapshot,
             .native_single_file => try nativeStableSnapshot(self, dest_path, replace),
@@ -511,9 +513,18 @@ test "lite backend rejects non-aflite paths" {
 
     const path = try testPath(allocator, tmp, "not-lite.db");
     defer allocator.free(path);
+    const snapshot_path = try testPath(allocator, tmp, "not-lite-copy.db");
+    defer allocator.free(snapshot_path);
+    const lite_path = try testPath(allocator, tmp, "valid-source.aflite");
+    defer allocator.free(lite_path);
 
     try std.testing.expect(!isAflitePath(path));
     try std.testing.expectError(error.InvalidArgument, Handle.open(allocator, path, .{}));
+    try std.testing.expectError(error.InvalidArgument, checkFile(allocator, path));
+
+    var handle = try Handle.open(allocator, lite_path, .{ .engine = .native_single_file });
+    defer handle.deinit();
+    try std.testing.expectError(error.InvalidArgument, handle.copyStableSnapshot(snapshot_path, false));
 }
 
 test "lite backend auto rejects internal bridge aflite files" {

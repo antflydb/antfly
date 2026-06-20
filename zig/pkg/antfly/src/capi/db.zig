@@ -5856,16 +5856,20 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(dst_path);
     const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
+    const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
+    defer alloc.free(invalid_snapshot_path);
     cleanupTestDir(plain_path);
     cleanupTestFile(invalid_lite_path);
     cleanupTestFile(src_path);
     cleanupTestFile(dst_path);
     cleanupTestFile(snapshot_path);
+    cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestDir(plain_path);
     defer cleanupTestFile(invalid_lite_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(snapshot_path);
+    defer cleanupTestFile(invalid_snapshot_path);
 
     try std.testing.expectEqual(@as(u32, 1), antfly_lite_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
@@ -6061,6 +6065,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         const source_size = (try file.stat(io)).size;
         try file.writePositionalAll(io, "tail", source_size);
     }
+
+    var invalid_snapshot_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, invalid_snapshot_path, false, &invalid_snapshot_report));
 
     var snapshot_report: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_json(src_handle, snapshot_path, false, &snapshot_report));
