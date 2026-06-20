@@ -27,6 +27,33 @@ const sql_value = @import("value.zig");
 
 const Token = lower_expr.Token;
 
+pub const InsertSourceParserHooks = struct {
+    ptr: *anyopaque,
+    parse_insert_source: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+        ?*?[]const u8,
+    ) anyerror!plan_mod.LoweredInsertSource,
+};
+
+pub const MergeMutationParserHooks = struct {
+    ptr: *anyopaque,
+    parse_merge_mutation: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+        ?*?[]const u8,
+    ) anyerror!plan_mod.LoweredMergeMutationPlan,
+};
+
+pub const JoinedMutationSourceParserHooks = struct {
+    ptr: *anyopaque,
+    parse_joined_mutation_source: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+        ?*?[]const u8,
+    ) anyerror!plan_mod.LoweredJoinedMutationSource,
+};
+
 const LoweredMergeMutationPlan = plan_mod.LoweredMergeMutationPlan;
 const MergeArmPredicate = plan_mod.MergeArmPredicate;
 const MergeExpressionAssignment = plan_mod.MergeExpressionAssignment;
@@ -69,6 +96,71 @@ pub const FieldJsonValue = struct {
     field: []const u8,
     value_json: []const u8,
 };
+
+pub fn parseInsertSourceAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: plan_mod.CteSelectParserHooks,
+    hooks: InsertSourceParserHooks,
+) !plan_mod.LoweredInsertSource {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_insert_source(hooks.ptr, &.{}, null);
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try plan_mod.parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer plan_mod.freePlanCtes(alloc, ctes);
+
+    var lowered = try hooks.parse_insert_source(hooks.ptr, ctes, &base_table_name);
+    errdefer lowered.deinit(alloc);
+    lowered.ctes = ctes;
+    ctes = &.{};
+    return lowered;
+}
+
+pub fn parseMergeMutationPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: plan_mod.CteSelectParserHooks,
+    hooks: MergeMutationParserHooks,
+) !plan_mod.LoweredMergeMutationPlan {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_merge_mutation(hooks.ptr, &.{}, null);
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try plan_mod.parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer plan_mod.freePlanCtes(alloc, ctes);
+
+    var final = try hooks.parse_merge_mutation(hooks.ptr, ctes, &base_table_name);
+    errdefer final.deinit(alloc);
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    _ = base_table_name orelse return error.UnsupportedSqlShape;
+    final.ctes = ctes;
+    ctes = &.{};
+    return final;
+}
+
+pub fn parseJoinedMutationSourceAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: plan_mod.CteSelectParserHooks,
+    hooks: JoinedMutationSourceParserHooks,
+) !plan_mod.LoweredJoinedMutationSource {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_joined_mutation_source(hooks.ptr, &.{}, null);
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try plan_mod.parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer plan_mod.freePlanCtes(alloc, ctes);
+
+    const lowered = try hooks.parse_joined_mutation_source(hooks.ptr, ctes, &base_table_name);
+    plan_mod.freePlanCtes(alloc, ctes);
+    ctes = &.{};
+    return lowered;
+}
 
 pub const JoinedMutationSourceAssignment = struct {
     field: []const u8,

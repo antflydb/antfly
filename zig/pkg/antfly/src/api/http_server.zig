@@ -26,6 +26,7 @@ const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 const linear_merge_api = @import("linear_merge.zig");
 const relational_rows_api = @import("relational_rows.zig");
 const relational_sql = @import("relational_sql.zig");
+const sql_adapter = @import("sql_adapter/mod.zig");
 const sql_notifications = @import("sql_notifications.zig");
 const sql_routines = @import("sql_routines.zig");
 const cluster = @import("cluster.zig");
@@ -1394,25 +1395,27 @@ fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
         ordinal += 1;
         for (snapshot.ranges) |range| {
             if (range.table_id != applied.table.table_id) continue;
-            const job = schemaRewriteJobForAppliedDdlWorkItem(applied.table, range, item, ordinal);
+            const job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, range, item, ordinal);
             try svc.upsertSchemaRewriteJob(job);
         }
     }
-    _ = alloc;
 }
 
 fn schemaRewriteJobForAppliedDdlWorkItem(
+    alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
     range: metadata_table_manager.RangeRecord,
     item: relational_sql.AppliedDdlWorkItem,
     ordinal: u32,
-) metadata_table_manager.SchemaRewriteJobRecord {
+) !metadata_table_manager.SchemaRewriteJobRecord {
     var hasher = std.hash.Wyhash.init(0x5352514a);
     hasher.update(std.mem.asBytes(&table.table_id));
     hasher.update(&[_]u8{0});
     hasher.update(table.schema_json);
     hasher.update(&[_]u8{0});
     hasher.update(@tagName(item.action));
+    hasher.update(&[_]u8{0});
+    hasher.update(@tagName(item.subject));
     hasher.update(&[_]u8{0});
     hasher.update(@tagName(item.reason));
     hasher.update(&[_]u8{0});
@@ -1423,6 +1426,14 @@ fn schemaRewriteJobForAppliedDdlWorkItem(
     if (range.end_key) |end_key| hasher.update(end_key);
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&ordinal));
+    hasher.update(&[_]u8{0});
+    if (item.rewrite_expression) |rewrite| {
+        hasher.update(rewrite.target_column);
+        hasher.update(&[_]u8{0});
+        const expression = try sql_adapter.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
+        defer alloc.free(expression);
+        hasher.update(expression);
+    }
     const job_id = nonZeroId(hasher.final());
     const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
     return .{
@@ -1573,6 +1584,25 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     defer service.deinit(alloc);
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
+
+    const same_expression_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
+    const alternate_expression = try runtime_schema_mod.cloneRelationalRowsExpressionAlloc(alloc, .{
+        .kind = .upper,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    });
+    defer runtime_schema_mod.freeRelationalRowsExpression(alloc, alternate_expression);
+    const alternate_item: relational_sql.AppliedDdlWorkItem = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+        .rewrite_expression = .{
+            .target_column = applied.work_items[0].rewrite_expression.?.target_column,
+            .expression = alternate_expression,
+        },
+    };
+    const alternate_expression_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], alternate_item, 1);
+    try std.testing.expect(same_expression_job.job_id != alternate_expression_job.job_id);
+
     applied.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), service.jobs.items.len);

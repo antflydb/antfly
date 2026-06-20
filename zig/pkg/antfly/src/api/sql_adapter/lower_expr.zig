@@ -18,6 +18,7 @@ const ast = @import("ast.zig");
 const binder = @import("binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
@@ -29,6 +30,19 @@ const value_mod = @import("value.zig");
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 pub const max_scalar_or_expanded_branches: usize = 32;
+
+pub const QueryPlanParserHooks = struct {
+    ptr: *anyopaque,
+    parse_select_with_set_boundary: *const fn (
+        *anyopaque,
+        bool,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!plan_mod.LoweredSelect,
+    parse_select_with_set_result_tail_boundary: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!plan_mod.LoweredSelect,
+};
 
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
@@ -3112,6 +3126,23 @@ pub fn selectOutputColumnsAlloc(
     return out;
 }
 
+pub fn loweredSelectOutputColumnsAlloc(
+    alloc: std.mem.Allocator,
+    type_context: RowExpressionTypeContext,
+    lowered: plan_mod.LoweredSelect,
+) ![]runtime_schema.RelationalColumn {
+    return try selectOutputColumnsAlloc(alloc, type_context, .{
+        .fields = lowered.query.select,
+        .json_extract = lowered.query.json_extract,
+        .array_length = lowered.query.array_length,
+        .coalesce = lowered.query.coalesce,
+        .field_aliases = lowered.query.field_aliases,
+        .expressions = lowered.query.expressions,
+        .outputs = lowered.select_outputs,
+        .select_all = lowered.query.select_all,
+    });
+}
+
 fn selectOutputColumnAlloc(
     alloc: std.mem.Allocator,
     type_context: RowExpressionTypeContext,
@@ -4053,6 +4084,41 @@ pub fn joinProjectionOutputIsUnique(select: []const db_mod.types.RelationalRowsJ
     return matches == 1;
 }
 
+pub fn joinOutputFieldByOrdinalAlloc(
+    alloc: std.mem.Allocator,
+    select: []const db_mod.types.RelationalRowsJoinProjection,
+    ordinal: u32,
+) ![]const u8 {
+    if (ordinal == 0) return error.UnsupportedSqlShape;
+    const index: usize = @intCast(ordinal - 1);
+    if (index >= select.len) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, select[index].output);
+}
+
+pub fn joinOutputColumnsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    select: []const db_mod.types.RelationalRowsJoinProjection,
+) ![]runtime_schema.RelationalColumn {
+    if (select.len == 0) return &.{};
+    const out = try alloc.alloc(runtime_schema.RelationalColumn, select.len);
+    var initialized: usize = 0;
+    errdefer alloc.free(out);
+    for (select) |projection| {
+        if (aggregateOutputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
+        const column = binder.relationalColumnForField(schema, projection.field, null) orelse return error.InvalidSqlCatalog;
+        out[initialized] = .{
+            .name = projection.output,
+            .path = projection.output,
+            .field_type = column.field_type,
+            .array_item_type = column.array_item_type,
+            .nullable = true,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
 pub fn identifierContainsQualifier(identifier: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return false;
     return dot > 0 and dot + 1 < identifier.len;
@@ -4314,6 +4380,141 @@ pub fn writeRowExpressionConditionJson(writer: *std.Io.Writer, condition: db_mod
         try writeRowExpressionJson(writer, condition.rhs[0]);
     }
     try writer.writeByte('}');
+}
+
+pub fn rowRewriteExpressionFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    expression: db_mod.types.RelationalRowsExpression,
+) ![]u8 {
+    switch (expression.kind) {
+        .field => return try std.fmt.allocPrint(
+            alloc,
+            "field[{s}:{s}]",
+            .{ @tagName(expression.field_source), expression.field },
+        ),
+        .value => return try std.fmt.allocPrint(
+            alloc,
+            "value[{x}]",
+            .{expression.value_json},
+        ),
+        .cast => {
+            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
+            const operand = try rowRewriteExpressionFingerprintAlloc(alloc, expression.operands[0]);
+            defer alloc.free(operand);
+            return try std.fmt.allocPrint(
+                alloc,
+                "cast[{s}|{s}]",
+                .{ if (expression.cast_type) |cast_type| @tagName(cast_type) else "none", operand },
+            );
+        },
+        .json_extract => {
+            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
+            const operand = try rowRewriteExpressionFingerprintAlloc(alloc, expression.operands[0]);
+            defer alloc.free(operand);
+            return try std.fmt.allocPrint(
+                alloc,
+                "json_extract[{x}|text={}|{s}]",
+                .{ expression.json_path, expression.json_as_text, operand },
+            );
+        },
+        .case => {
+            if (expression.case_branches.len == 0) return error.UnsupportedSqlShape;
+            return try std.fmt.allocPrint(
+                alloc,
+                "case[branches={d}:else={d}]",
+                .{ expression.case_branches.len, expression.case_else.len },
+            );
+        },
+        else => {
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            errdefer out.deinit();
+            const writer = &out.writer;
+            try writer.print("{s}[", .{@tagName(expression.kind)});
+            for (expression.operands, 0..) |operand, i| {
+                const operand_fingerprint = try rowRewriteExpressionFingerprintAlloc(alloc, operand);
+                defer alloc.free(operand_fingerprint);
+                if (i != 0) try writer.writeByte('+');
+                try writer.writeAll(operand_fingerprint);
+            }
+            try writer.writeByte(']');
+            return try out.toOwnedSlice();
+        },
+    }
+}
+
+pub fn rowSecurityPredicateFingerprintSuffixAlloc(
+    alloc: std.mem.Allocator,
+    predicate: ddl_plan.RowSecurityPolicyPredicate,
+) ![]u8 {
+    return switch (predicate) {
+        .current_setting_equals => |current_setting| try std.fmt.allocPrint(
+            alloc,
+            "kind=current_setting_eq:field={s}:setting={s}",
+            .{ current_setting.field, current_setting.setting_name },
+        ),
+        .literal_equals => |literal| blk: {
+            const value_json_hex = try fingerprintStringOptionHexAlloc(alloc, literal.value_json);
+            defer alloc.free(value_json_hex);
+            break :blk try std.fmt.allocPrint(
+                alloc,
+                "kind=literal_eq:field={s}:value_json_hex={s}",
+                .{ literal.field, value_json_hex },
+            );
+        },
+        .expression => |expression| blk: {
+            const expression_json = try rowSecurityExpressionConditionJsonAlloc(alloc, expression);
+            defer alloc.free(expression_json);
+            const expression_json_hex = try fingerprintStringOptionHexAlloc(alloc, expression_json);
+            defer alloc.free(expression_json_hex);
+            break :blk try std.fmt.allocPrint(alloc, "kind=expression:json_hex={s}", .{expression_json_hex});
+        },
+        .conjunction => |conjunction| blk: {
+            var out = try std.fmt.allocPrint(alloc, "kind=and:terms={d}", .{conjunction.predicates.len});
+            errdefer alloc.free(out);
+            for (conjunction.predicates) |term| {
+                const term_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, term);
+                defer alloc.free(term_suffix);
+                const next = try std.fmt.allocPrint(alloc, "{s}:term={s}", .{ out, term_suffix });
+                alloc.free(out);
+                out = next;
+            }
+            break :blk out;
+        },
+        .disjunction => |disjunction| blk: {
+            var out = try std.fmt.allocPrint(alloc, "kind=or:terms={d}", .{disjunction.predicates.len});
+            errdefer alloc.free(out);
+            for (disjunction.predicates) |term| {
+                const term_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, term);
+                defer alloc.free(term_suffix);
+                const next = try std.fmt.allocPrint(alloc, "{s}:term={s}", .{ out, term_suffix });
+                alloc.free(out);
+                out = next;
+            }
+            break :blk out;
+        },
+    };
+}
+
+fn rowSecurityExpressionConditionJsonAlloc(
+    alloc: std.mem.Allocator,
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeRowExpressionConditionJson(&out.writer, condition);
+    return try out.toOwnedSlice();
+}
+
+fn fingerprintStringOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {
+    const value = option orelse return try alloc.dupe(u8, "default");
+    if (value.len == 0) return try alloc.dupe(u8, "empty");
+    const out = try alloc.alloc(u8, value.len * 2);
+    const hex = "0123456789abcdef";
+    for (value, 0..) |byte, i| {
+        out[i * 2] = hex[byte >> 4];
+        out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+    return out;
 }
 
 pub fn writeRowExpressionPredicateGroupsJson(
@@ -7165,6 +7366,69 @@ pub fn simpleSelectProjectionsEqual(
         if (left.kind != right.kind or left.index != right.index) return false;
     }
     return true;
+}
+
+pub fn parseQueryPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    cte_hooks: plan_mod.CteSelectParserHooks,
+    query_hooks: QueryPlanParserHooks,
+    tail_hooks: plan_mod.SimpleSelectSetTailHooks,
+) !plan_mod.LoweredQueryPlan {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) {
+        var lowered = try query_hooks.parse_select_with_set_boundary(query_hooks.ptr, true, &.{});
+        errdefer lowered.deinit(alloc);
+        if (!parser.atEnd(tokens, pos.*)) {
+            const op = try grammar.parseSelectSetOperation(tokens, pos);
+            var rhs = try query_hooks.parse_select_with_set_result_tail_boundary(query_hooks.ptr, &.{});
+            defer rhs.deinit(alloc);
+            try applySimpleSelectSetOperationAlloc(alloc, &lowered, rhs, op);
+            try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, &lowered, tail_hooks);
+        }
+        const table_name = lowered.table_name;
+        lowered.table_name = "";
+        lowered.clearSelectOutputs(alloc);
+        return .{
+            .table_name = table_name,
+            .plan = .{ .query = lowered.query },
+        };
+    }
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    const ctes = try plan_mod.parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    var ctes_transferred = false;
+    errdefer if (!ctes_transferred) plan_mod.freePlanCtes(alloc, ctes);
+
+    var final = try query_hooks.parse_select_with_set_boundary(query_hooks.ptr, true, ctes);
+    errdefer final.deinit(alloc);
+    try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &final, ctes, &base_table_name);
+    if (!parser.atEnd(tokens, pos.*)) {
+        const op = try grammar.parseSelectSetOperation(tokens, pos);
+        var rhs = try query_hooks.parse_select_with_set_result_tail_boundary(query_hooks.ptr, ctes);
+        defer rhs.deinit(alloc);
+        try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &rhs, ctes, &base_table_name);
+        try applySimpleSelectSetOperationAlloc(alloc, &final, rhs, op);
+        try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, &final, tail_hooks);
+    }
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+
+    const table_name = base_table_name orelse return error.UnsupportedSqlShape;
+    base_table_name = null;
+    alloc.free(final.table_name);
+    final.table_name = "";
+    final.clearSelectOutputs(alloc);
+    ctes_transferred = true;
+    return .{
+        .table_name = table_name,
+        .plan = .{
+            .ctes = ctes,
+            .query = final.query,
+        },
+    };
 }
 
 pub fn applySimpleSelectSetOperationAlloc(

@@ -229,7 +229,7 @@ pub const Runtime = struct {
                 .expression => {
                     if (plan.kind != .function or body.kind != .sql_expression or body.expression == null) return error.UnsupportedSqlShape;
                 },
-                .trigger_return_new => {
+                .trigger_return_new, .trigger_return_old => {
                     if (plan.kind != .function or body.kind != .plpgsql_trigger or body.expression != null) return error.UnsupportedSqlShape;
                     const returns_type = plan.returns_type orelse return error.UnsupportedSqlShape;
                     if (!std.ascii.eqlIgnoreCase(returns_type, "trigger")) return error.UnsupportedSqlShape;
@@ -971,6 +971,18 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectEqual(@as(usize, 4), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "audit_body", &.{}));
 
+    var old_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
+    );
+    defer old_trigger_plan.deinit(alloc);
+    try runtime.apply(switch (old_trigger_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 5), runtime.routineCountForTest());
+    try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "old_audit_body", &.{}));
+
     var noop_procedure_plan = try relational_sql.lowerDdlPlanAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
@@ -980,11 +992,11 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         .function_catalog => |function_plan| function_plan,
         else => return error.TestUnexpectedResult,
     });
-    try std.testing.expectEqual(@as(usize, 5), runtime.routineCountForTest());
+    try std.testing.expectEqual(@as(usize, 6), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "rotate_usage", &.{}));
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';"),
+        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';"),
     );
 }
 

@@ -4821,6 +4821,16 @@ fn takeLoweredSqlReadRows(result: *LoweredSqlReadPlanResult) TakenLoweredSqlRead
     };
 }
 
+pub const RecursiveCteMaterializedRows = struct {
+    rows: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
 fn executeLoweredSqlRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
@@ -4830,6 +4840,34 @@ fn executeLoweredSqlRecursiveCtePlanAlloc(
     lowered: relational_sql_api.LoweredRecursiveCtePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsQueryResult {
+    var materialized = (try materializeLoweredSqlRecursiveCteRowsAlloc(
+        alloc,
+        source,
+        catalog,
+        default_table_name,
+        default_schema,
+        lowered,
+        consistency,
+    )) orelse return null;
+    defer materialized.deinit(alloc);
+
+    var cte_schema = default_schema;
+    cte_schema.relational_columns = lowered.output_columns;
+    cte_schema.primary_key = null;
+    var final_query = lowered.final_query;
+    final_query.source_cte = "";
+    return try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, final_query, materialized.rows);
+}
+
+pub fn materializeLoweredSqlRecursiveCteRowsAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    lowered: relational_sql_api.LoweredRecursiveCtePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?RecursiveCteMaterializedRows {
     if (lowered.output_columns.len == 0) return error.UnsupportedRowsQuery;
     const join_member = switch (lowered.recursive_member) {
         .join => |join| join,
@@ -4866,7 +4904,10 @@ fn executeLoweredSqlRecursiveCtePlanAlloc(
         const owned = try alloc.dupe(u8, row);
         errdefer alloc.free(owned);
         if (distinct) {
-            if (seen.contains(owned)) continue;
+            if (seen.contains(owned)) {
+                alloc.free(owned);
+                continue;
+            }
             try seen.put(owned, {});
         }
         try materialized.append(alloc, owned);
@@ -4898,15 +4939,7 @@ fn executeLoweredSqlRecursiveCtePlanAlloc(
         frontier = next_frontier;
     }
 
-    var cte_schema = default_schema;
-    cte_schema.relational_columns = lowered.output_columns;
-    cte_schema.primary_key = null;
-    var final_query = lowered.final_query;
-    final_query.source_cte = "";
-    var final = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, final_query, materialized.items);
-    errdefer final.deinit(alloc);
-    deinitRecursiveCteRows(alloc, &materialized);
-    return final;
+    return .{ .rows = try materialized.toOwnedSlice(alloc) };
 }
 
 fn deinitRecursiveCteRows(alloc: std.mem.Allocator, rows: *std.ArrayListUnmanaged([]const u8)) void {
@@ -20571,6 +20604,23 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     }
 
     var catalog = FakeCatalog{};
+    var materialized_fake = FakeSource{};
+    var materialized = (try materializeLoweredSqlRecursiveCteRowsAlloc(
+        alloc,
+        materialized_fake.source(),
+        catalog.iface(),
+        "nodes",
+        schema,
+        switch (lowered) {
+            .recursive_cte => |recursive| recursive,
+            else => return error.TestUnexpectedResult,
+        },
+        .read_index,
+    )) orelse return error.TestUnexpectedResult;
+    defer materialized.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), materialized_fake.calls);
+    try std.testing.expectEqual(@as(usize, 4), materialized.rows.len);
+
     var fake = FakeSource{};
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,

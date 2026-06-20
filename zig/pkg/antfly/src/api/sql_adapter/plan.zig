@@ -729,6 +729,38 @@ pub const CteSelectParserHooks = struct {
     ) anyerror!LoweredSelect,
 };
 
+pub const WindowPlanParserHooks = struct {
+    ptr: *anyopaque,
+    parse_window: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredWindowPlan,
+};
+
+pub const AggregatePlanParserHooks = struct {
+    ptr: *anyopaque,
+    parse_aggregate: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredAggregate,
+};
+
+pub const JoinPlanParserHooks = struct {
+    ptr: *anyopaque,
+    parse_join: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredJoin,
+};
+
+pub const LateralPlanParserHooks = struct {
+    ptr: *anyopaque,
+    parse_lateral: *const fn (
+        *anyopaque,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredLateralPlan,
+};
+
 pub const RecursiveCteParserHooks = struct {
     ptr: *anyopaque,
     parse_select_with_set_boundary: *const fn (
@@ -850,6 +882,139 @@ pub fn parseCtesForPlanAlloc(
     return try ctes.toOwnedSlice(alloc);
 }
 
+pub fn freePlanCtes(alloc: std.mem.Allocator, ctes: []const db_mod.types.RelationalRowsCte) void {
+    for (ctes) |cte| {
+        var owned = cte;
+        owned.deinit(alloc);
+    }
+    if (ctes.len > 0) alloc.free(ctes);
+}
+
+pub fn parseWindowPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: CteSelectParserHooks,
+    hooks: WindowPlanParserHooks,
+) !LoweredWindowPlan {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_window(hooks.ptr, &.{});
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer freePlanCtes(alloc, ctes);
+
+    var final = try hooks.parse_window(hooks.ptr, ctes);
+    errdefer final.deinit(alloc);
+    try resolveWindowSourceForPlanAlloc(alloc, &final, ctes, &base_table_name);
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+
+    const table_name = base_table_name orelse return error.UnsupportedSqlShape;
+    base_table_name = null;
+    alloc.free(final.table_name);
+    final.table_name = table_name;
+    final.plan.ctes = ctes;
+    ctes = &.{};
+    return final;
+}
+
+pub fn parseAggregatePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: CteSelectParserHooks,
+    hooks: AggregatePlanParserHooks,
+) !LoweredAggregatePlan {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) {
+        var lowered = try hooks.parse_aggregate(hooks.ptr, &.{});
+        errdefer lowered.deinit(alloc);
+        const table_name = lowered.table_name;
+        lowered.table_name = "";
+        return .{
+            .table_name = table_name,
+            .plan = .{ .aggregate = lowered.aggregate },
+        };
+    }
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer freePlanCtes(alloc, ctes);
+
+    var final = try hooks.parse_aggregate(hooks.ptr, ctes);
+    errdefer final.deinit(alloc);
+    try resolveAggregateSourceForPlanAlloc(alloc, &final, ctes, &base_table_name);
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+
+    const table_name = base_table_name orelse return error.UnsupportedSqlShape;
+    base_table_name = null;
+    alloc.free(final.table_name);
+    final.table_name = "";
+    const owned_ctes = ctes;
+    ctes = &.{};
+    return .{
+        .table_name = table_name,
+        .plan = .{
+            .ctes = owned_ctes,
+            .aggregate = final.aggregate,
+        },
+    };
+}
+
+pub fn parseLateralPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: CteSelectParserHooks,
+    hooks: LateralPlanParserHooks,
+) !LoweredLateralPlan {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_lateral(hooks.ptr, &.{});
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer freePlanCtes(alloc, ctes);
+
+    var final = try hooks.parse_lateral(hooks.ptr, ctes);
+    errdefer final.deinit(alloc);
+    try resolveLateralSourcesForPlanAlloc(alloc, &final, ctes, &base_table_name);
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    _ = base_table_name orelse return error.UnsupportedSqlShape;
+
+    final.plan.ctes = ctes;
+    ctes = &.{};
+    return final;
+}
+
+pub fn parseJoinPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    cte_hooks: CteSelectParserHooks,
+    hooks: JoinPlanParserHooks,
+) !LoweredJoin {
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_join(hooks.ptr, &.{});
+
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |table| alloc.free(table);
+    var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
+    errdefer freePlanCtes(alloc, ctes);
+
+    var final = try hooks.parse_join(hooks.ptr, ctes);
+    errdefer final.deinit(alloc);
+    try resolveJoinSourcesForPlanAlloc(alloc, &final, ctes, &base_table_name);
+    if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+    _ = base_table_name orelse return error.UnsupportedSqlShape;
+
+    final.ctes = ctes;
+    ctes = &.{};
+    return final;
+}
+
 pub fn parseSimpleSelectSetResultTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -898,6 +1063,63 @@ pub fn parseSimpleSelectSetResultTailAlloc(
     if (order_by.items.len > 0) {
         lowered.query.order_by = try order_by.toOwnedSlice(alloc);
     }
+}
+
+pub fn parseSetOperationResultTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    lowered: LoweredSelect,
+    hooks: SimpleSelectSetTailHooks,
+) !SetOperationResultTail {
+    var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+    errdefer {
+        freeOrderBy(alloc, order_by.items);
+        order_by.deinit(alloc);
+    }
+    const select = SelectList{
+        .fields = lowered.query.select,
+        .json_extract = lowered.query.json_extract,
+        .array_length = lowered.query.array_length,
+        .coalesce = lowered.query.coalesce,
+        .field_aliases = lowered.query.field_aliases,
+        .expressions = lowered.query.expressions,
+        .outputs = lowered.select_outputs,
+        .select_all = lowered.query.select_all,
+    };
+    var limit: ?u32 = null;
+    var offset: u32 = 0;
+
+    while (!parser.atEnd(tokens, pos.*)) {
+        if (parser.matchKeyword(tokens, pos, "order")) {
+            if (order_by.items.len > 0) return error.UnsupportedSqlShape;
+            try parser.expectKeyword(tokens, pos, "by");
+            try hooks.parse_order_by(hooks.ptr, &order_by, select);
+            for (order_by.items) |order| {
+                if (order.expression != null) return error.UnsupportedSqlShape;
+            }
+        } else if (parser.matchKeyword(tokens, pos, "limit")) {
+            if (limit != null) return error.UnsupportedSqlShape;
+            limit = try value_mod.parseLimitValue(tokens, pos, params);
+        } else if (parser.matchKeyword(tokens, pos, "offset")) {
+            if (offset != 0) return error.UnsupportedSqlShape;
+            offset = try value_mod.parseOffsetValue(tokens, pos, params);
+        } else if (parser.matchKeyword(tokens, pos, "fetch")) {
+            if (limit != null) return error.UnsupportedSqlShape;
+            limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
+        } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
+            if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    return .{
+        .order_by = try order_by.toOwnedSlice(alloc),
+        .limit = limit,
+        .offset = offset,
+    };
 }
 
 pub fn parseSetOperationPlanAlloc(

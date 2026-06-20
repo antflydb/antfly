@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "0c3fb3138eb7f480552232ab588dc22f389e755f3b5aa727d33e10854c0848b7",
-  "source_entry_count": 1004,
-  "entry_count": 1004,
+  "source_sha256": "fe13e6b25dfc5a87791fa1048db230884fccbd23238701976bb90546de26140c",
+  "source_entry_count": 1005,
+  "entry_count": 1005,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4266,11 +4266,22 @@
       "sql": "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$"
     },
     {
-      "name": "unsupported create function old-row body",
+      "name": "create trigger return old function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_old_body",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_old_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_old",
+      "sql": "CREATE FUNCTION audit_old_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$"
+    },
+    {
+      "name": "unsupported create function side-effect body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE FUNCTION audit_old_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$"
+      "sql": "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$"
     },
     {
       "name": "unsupported create function routine option",

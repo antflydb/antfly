@@ -1030,7 +1030,10 @@ moves behind a `api/sql_adapter/` package:
 - `lower_expr.zig`: shared expression lowering into Antfly row-expression,
   check, index-predicate, default, conflict-action, returning-expression ASTs,
   query predicate-surface checks, and set-operation projection/column
-  compatibility and predicate-disjointness proof helpers.
+  compatibility and predicate-disjointness proof helpers. Golden-plan
+  fingerprints for row rewrite expressions and row-security predicates also
+  live here, so corpus evidence is derived from the adapter-owned expression
+  surface rather than duplicated SQL facade helpers.
 - `lower_select.zig`, `lower_dml.zig`, and `lower_ddl.zig`: statement-family
   lowering into Antfly typed read plans, write plans, and catalog/schema plans.
 - `diagnostics.zig`: span-aware unsupported-shape diagnostics and stable
@@ -5305,15 +5308,16 @@ text. `STRICT` / `RETURNS NULL ON NULL INPUT` routines only plan when a null
 result is statically known from a literal null argument; dynamic strict calls
 fail closed until the row-expression AST has a native null-guard node that can
 preserve PostgreSQL null-input semantics for nullable row fields.
-The routine body model also admits the narrow safe PL/pgSQL trigger body
-`BEGIN RETURN NEW; END` as a `plpgsql_trigger` / `trigger_return_new` hook.
+The routine body model also admits narrow safe PL/pgSQL trigger bodies:
+`BEGIN RETURN NEW; END` as a `plpgsql_trigger` / `trigger_return_new` hook and
+`BEGIN RETURN OLD; END` as a `plpgsql_trigger` / `trigger_return_old` hook.
 It also admits the side-effect-free PL/pgSQL procedure body
 `BEGIN NULL; END` as a `plpgsql_procedure` / `procedure_noop` hook. Both hooks
 are stored as durable routine metadata and are intentionally not executable
 through the expression-function path. Other PL/pgSQL bodies, such as
-`RETURN OLD`, `RAISE`, dynamic SQL, or procedural statements with side effects,
-still fail closed under `routine_body_plan` until their row inputs, side
-effects, dependency tracking, replay behavior, and repair semantics have native
+`RAISE`, dynamic SQL, or procedural statements with side effects, still fail
+closed under `routine_body_plan` until their row inputs, side effects,
+dependency tracking, replay behavior, and repair semantics have native
 contracts.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.

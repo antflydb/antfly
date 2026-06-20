@@ -2495,10 +2495,81 @@ const Parser = struct {
         };
     }
 
+    fn insertSourceParserHooks(self: *@This()) sql_adapter.InsertSourceParserHooks {
+        return .{
+            .ptr = self,
+            .parse_insert_source = parseInsertSourceWithCtesHook,
+        };
+    }
+
+    fn updateJoinedMutationSourceParserHooks(self: *@This()) sql_adapter.JoinedMutationSourceParserHooks {
+        return .{
+            .ptr = self,
+            .parse_joined_mutation_source = parseUpdateJoinedMutationSourceWithCtesHook,
+        };
+    }
+
+    fn deleteJoinedMutationSourceParserHooks(self: *@This()) sql_adapter.JoinedMutationSourceParserHooks {
+        return .{
+            .ptr = self,
+            .parse_joined_mutation_source = parseDeleteJoinedMutationSourceWithCtesHook,
+        };
+    }
+
+    fn mergeMutationParserHooks(self: *@This()) sql_adapter.MergeMutationParserHooks {
+        return .{
+            .ptr = self,
+            .parse_merge_mutation = parseMergeMutationBodyHook,
+        };
+    }
+
     fn cteSelectParserHooks(self: *@This()) sql_adapter.CteSelectParserHooks {
         return .{
             .ptr = self,
             .parse_select = parseCteSelectHook,
+        };
+    }
+
+    fn joinCteSelectParserHooks(self: *@This()) sql_adapter.CteSelectParserHooks {
+        return .{
+            .ptr = self,
+            .parse_select = parseJoinCteSelectHook,
+        };
+    }
+
+    fn queryPlanParserHooks(self: *@This()) sql_adapter.QueryPlanParserHooks {
+        return .{
+            .ptr = self,
+            .parse_select_with_set_boundary = parseQueryPlanSelectWithSetBoundaryHook,
+            .parse_select_with_set_result_tail_boundary = parseQueryPlanSelectWithSetResultTailBoundaryHook,
+        };
+    }
+
+    fn windowPlanParserHooks(self: *@This()) sql_adapter.WindowPlanParserHooks {
+        return .{
+            .ptr = self,
+            .parse_window = parseWindowPlanHook,
+        };
+    }
+
+    fn aggregatePlanParserHooks(self: *@This()) sql_adapter.AggregatePlanParserHooks {
+        return .{
+            .ptr = self,
+            .parse_aggregate = parseAggregatePlanHook,
+        };
+    }
+
+    fn joinPlanParserHooks(self: *@This()) sql_adapter.JoinPlanParserHooks {
+        return .{
+            .ptr = self,
+            .parse_join = parseJoinPlanHook,
+        };
+    }
+
+    fn lateralPlanParserHooks(self: *@This()) sql_adapter.LateralPlanParserHooks {
+        return .{
+            .ptr = self,
+            .parse_lateral = parseLateralPlanHook,
         };
     }
 
@@ -2554,6 +2625,130 @@ const Parser = struct {
         return try sub.parseSelect();
     }
 
+    fn parseJoinCteSelectHook(
+        ptr: *anyopaque,
+        tokens: []const Token,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredSelect {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var sub = Parser{
+            .alloc = self.alloc,
+            .tokens = tokens,
+            .schema = self.joined_source_schema orelse self.schema,
+            .params = self.params,
+            .function_bindings = self.function_bindings,
+            .unique_resolver = self.unique_resolver,
+            .available_ctes = available_ctes,
+        };
+        return try sub.parseSelect();
+    }
+
+    fn parseWindowPlanHook(
+        ptr: *anyopaque,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredWindowPlan {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = available_ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseWindowSelect();
+    }
+
+    fn parseAggregatePlanHook(
+        ptr: *anyopaque,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredAggregate {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = available_ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseAggregate();
+    }
+
+    fn parseJoinPlanHook(
+        ptr: *anyopaque,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredJoin {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = available_ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseJoin();
+    }
+
+    fn parseLateralPlanHook(
+        ptr: *anyopaque,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredLateralPlan {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = available_ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseLateral();
+    }
+
+    fn parseQueryPlanSelectWithSetBoundaryHook(
+        ptr: *anyopaque,
+        allow_boundary: bool,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredSelect {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = available_ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseSelectWithSetBoundary(allow_boundary);
+    }
+
+    fn parseQueryPlanSelectWithSetResultTailBoundaryHook(
+        ptr: *anyopaque,
+        available_ctes: []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredSelect {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = available_ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseSelectWithSetResultTailBoundary();
+    }
+
+    fn parseInsertSourceWithCtesHook(
+        ptr: *anyopaque,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) anyerror!LoweredInsertSource {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseInsertSourceWithCtes(ctes, base_table_name);
+    }
+
+    fn parseUpdateJoinedMutationSourceWithCtesHook(
+        ptr: *anyopaque,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) anyerror!LoweredJoinedMutationSource {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseUpdateJoinedMutationSourceWithCtes(ctes, base_table_name);
+    }
+
+    fn parseDeleteJoinedMutationSourceWithCtesHook(
+        ptr: *anyopaque,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) anyerror!LoweredJoinedMutationSource {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseDeleteJoinedMutationSourceWithCtes(ctes, base_table_name);
+    }
+
+    fn parseMergeMutationBodyHook(
+        ptr: *anyopaque,
+        ctes: []const db_mod.types.RelationalRowsCte,
+        base_table_name: ?*?[]const u8,
+    ) anyerror!LoweredMergeMutationPlan {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_available_ctes = self.available_ctes;
+        self.available_ctes = ctes;
+        defer self.available_ctes = previous_available_ctes;
+        return try self.parseMergeMutationBody(ctes, base_table_name);
+    }
+
     fn parseRecursiveCteSelectWithSetBoundaryHook(
         ptr: *anyopaque,
         tokens: []const Token,
@@ -2581,7 +2776,7 @@ const Parser = struct {
         lowered: LoweredSelect,
     ) anyerror![]runtime_schema.RelationalColumn {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.setOperationOutputColumnsAlloc(lowered);
+        return try sql_adapter.loweredSelectOutputColumnsAlloc(self.alloc, self.rowExpressionTypeContext(), lowered);
     }
 
     fn parseRecursiveCteMemberHook(
@@ -2748,7 +2943,7 @@ const Parser = struct {
         lowered: LoweredSelect,
     ) anyerror![]runtime_schema.RelationalColumn {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.setOperationOutputColumnsAlloc(lowered);
+        return try sql_adapter.loweredSelectOutputColumnsAlloc(self.alloc, self.rowExpressionTypeContext(), lowered);
     }
 
     fn parseSetOperationResultTailHook(
@@ -2756,7 +2951,7 @@ const Parser = struct {
         lowered: LoweredSelect,
     ) anyerror!SetOperationResultTail {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseSetOperationResultTail(lowered);
+        return try sql_adapter.parseSetOperationResultTailAlloc(self.alloc, self.tokens, &self.pos, self.params, lowered, self.simpleSelectSetTailHooks());
     }
 
     fn parseSimpleSelectSetTailOrderByHook(
@@ -2838,68 +3033,15 @@ const Parser = struct {
     }
 
     fn parseQueryPlan(self: *@This()) !LoweredQueryPlan {
-        if (!self.peekKeyword("with")) {
-            var lowered = try self.parseSelectWithSetBoundary(true);
-            errdefer lowered.deinit(self.alloc);
-            if (!self.atEnd()) {
-                const op = try sql_adapter.parseSelectSetOperation(self.tokens, &self.pos);
-                var rhs = try self.parseSelectWithSetResultTailBoundary();
-                defer rhs.deinit(self.alloc);
-                try self.applySimpleSelectSetOperation(&lowered, rhs, op);
-                try self.parseSimpleSelectSetResultTail(&lowered);
-            }
-            const table_name = lowered.table_name;
-            lowered.table_name = "";
-            lowered.clearSelectOutputs(self.alloc);
-            return .{
-                .table_name = table_name,
-                .plan = .{ .query = lowered.query },
-            };
-        }
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        const ctes = try sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks());
-        var ctes_transferred = false;
-        errdefer if (!ctes_transferred) {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            self.alloc.free(ctes);
-        };
-
-        const previous_available_ctes = self.available_ctes;
-        self.available_ctes = ctes;
-        defer self.available_ctes = previous_available_ctes;
-
-        var final = try self.parseSelectWithSetBoundary(true);
-        errdefer final.deinit(self.alloc);
-        try sql_adapter.resolveSelectSourceForPlanAlloc(self.alloc, &final, ctes, &base_table_name);
-        if (!self.atEnd()) {
-            const op = try sql_adapter.parseSelectSetOperation(self.tokens, &self.pos);
-            var rhs = try self.parseSelectWithSetResultTailBoundary();
-            defer rhs.deinit(self.alloc);
-            try sql_adapter.resolveSelectSourceForPlanAlloc(self.alloc, &rhs, ctes, &base_table_name);
-            try self.applySimpleSelectSetOperation(&final, rhs, op);
-            try self.parseSimpleSelectSetResultTail(&final);
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-
-        const table_name = base_table_name orelse return error.UnsupportedSqlShape;
-        base_table_name = null;
-        self.alloc.free(final.table_name);
-        final.table_name = "";
-        final.clearSelectOutputs(self.alloc);
-        ctes_transferred = true;
-        return .{
-            .table_name = table_name,
-            .plan = .{
-                .ctes = ctes,
-                .query = final.query,
-            },
-        };
+        return try sql_adapter.parseQueryPlanAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.params,
+            self.cteSelectParserHooks(),
+            self.queryPlanParserHooks(),
+            self.simpleSelectSetTailHooks(),
+        );
     }
 
     fn parseRecursiveCtePlan(self: *@This()) !LoweredRecursiveCtePlan {
@@ -2918,70 +3060,6 @@ const Parser = struct {
         );
     }
 
-    fn parseSetOperationResultTail(self: *@This(), lowered: LoweredSelect) !SetOperationResultTail {
-        var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
-        errdefer {
-            freeOrderBy(self.alloc, order_by.items);
-            order_by.deinit(self.alloc);
-        }
-        const select = SelectList{
-            .fields = lowered.query.select,
-            .json_extract = lowered.query.json_extract,
-            .array_length = lowered.query.array_length,
-            .coalesce = lowered.query.coalesce,
-            .field_aliases = lowered.query.field_aliases,
-            .expressions = lowered.query.expressions,
-            .outputs = lowered.select_outputs,
-            .select_all = lowered.query.select_all,
-        };
-        var limit: ?u32 = null;
-        var offset: u32 = 0;
-
-        while (!self.atEnd()) {
-            if (self.matchKeyword("order")) {
-                if (order_by.items.len > 0) return error.UnsupportedSqlShape;
-                try self.expectKeyword("by");
-                try self.parseSelectOutputOrderBy(&order_by, select);
-                for (order_by.items) |order| {
-                    if (order.expression != null) return error.UnsupportedSqlShape;
-                }
-            } else if (self.matchKeyword("limit")) {
-                if (limit != null) return error.UnsupportedSqlShape;
-                limit = try sql_adapter.parseLimitValue(self.tokens, &self.pos, self.params);
-            } else if (self.matchKeyword("offset")) {
-                if (offset != 0) return error.UnsupportedSqlShape;
-                offset = try sql_adapter.parseOffsetValue(self.tokens, &self.pos, self.params);
-            } else if (self.matchKeyword("fetch")) {
-                if (limit != null) return error.UnsupportedSqlShape;
-                limit = try sql_adapter.parseFetchLimitValue(self.tokens, &self.pos, self.params);
-            } else if (self.match(.semicolon) != null) {
-                if (!self.atEnd()) return error.UnsupportedSqlShape;
-            } else {
-                return error.UnsupportedSqlShape;
-            }
-        }
-
-        return .{
-            .order_by = try order_by.toOwnedSlice(self.alloc),
-            .limit = limit,
-            .offset = offset,
-        };
-    }
-
-    fn setOperationOutputColumnsAlloc(self: *@This(), lowered: LoweredSelect) ![]runtime_schema.RelationalColumn {
-        const select = SelectList{
-            .fields = lowered.query.select,
-            .json_extract = lowered.query.json_extract,
-            .array_length = lowered.query.array_length,
-            .coalesce = lowered.query.coalesce,
-            .field_aliases = lowered.query.field_aliases,
-            .expressions = lowered.query.expressions,
-            .outputs = lowered.select_outputs,
-            .select_all = lowered.query.select_all,
-        };
-        return try sql_adapter.selectOutputColumnsAlloc(self.alloc, self.rowExpressionTypeContext(), select);
-    }
-
     fn parseSelectWithSetBoundary(self: *@This(), allow_boundary: bool) !LoweredSelect {
         const previous = self.allow_select_set_boundary;
         self.allow_select_set_boundary = allow_boundary;
@@ -2996,164 +3074,20 @@ const Parser = struct {
         return try self.parseSelect();
     }
 
-    fn applySimpleSelectSetOperation(
-        self: *@This(),
-        lhs: *LoweredSelect,
-        rhs: LoweredSelect,
-        op: SelectSetOperation,
-    ) !void {
-        return try sql_adapter.applySimpleSelectSetOperationAlloc(self.alloc, lhs, rhs, op);
-    }
-
-    fn parseSimpleSelectSetResultTail(self: *@This(), lowered: *LoweredSelect) !void {
-        return try sql_adapter.parseSimpleSelectSetResultTailAlloc(self.alloc, self.tokens, &self.pos, self.params, lowered, self.simpleSelectSetTailHooks());
-    }
-
     fn parseWindowPlan(self: *@This()) !LoweredWindowPlan {
-        if (!self.peekKeyword("with")) return try self.parseWindowSelect();
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        var ctes = try sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks());
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const previous_available_ctes = self.available_ctes;
-        self.available_ctes = ctes;
-        defer self.available_ctes = previous_available_ctes;
-
-        var final = try self.parseWindowSelect();
-        errdefer final.deinit(self.alloc);
-        try sql_adapter.resolveWindowSourceForPlanAlloc(self.alloc, &final, ctes, &base_table_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-
-        const table_name = base_table_name orelse return error.UnsupportedSqlShape;
-        base_table_name = null;
-        self.alloc.free(final.table_name);
-        final.table_name = table_name;
-        final.plan.ctes = ctes;
-        ctes = &.{};
-        return final;
+        return try sql_adapter.parseWindowPlanAlloc(self.alloc, self.tokens, &self.pos, self.cteSelectParserHooks(), self.windowPlanParserHooks());
     }
 
     fn parseAggregatePlan(self: *@This()) !LoweredAggregatePlan {
-        if (!self.peekKeyword("with")) {
-            var lowered = try self.parseAggregate();
-            errdefer lowered.deinit(self.alloc);
-            const table_name = lowered.table_name;
-            lowered.table_name = "";
-            return .{
-                .table_name = table_name,
-                .plan = .{ .aggregate = lowered.aggregate },
-            };
-        }
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        var ctes = try sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks());
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const previous_available_ctes = self.available_ctes;
-        self.available_ctes = ctes;
-        defer self.available_ctes = previous_available_ctes;
-
-        var final = try self.parseAggregate();
-        errdefer final.deinit(self.alloc);
-        try sql_adapter.resolveAggregateSourceForPlanAlloc(self.alloc, &final, ctes, &base_table_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-
-        const table_name = base_table_name orelse return error.UnsupportedSqlShape;
-        base_table_name = null;
-        self.alloc.free(final.table_name);
-        final.table_name = "";
-        const owned_ctes = ctes;
-        ctes = &.{};
-        return .{
-            .table_name = table_name,
-            .plan = .{
-                .ctes = owned_ctes,
-                .aggregate = final.aggregate,
-            },
-        };
+        return try sql_adapter.parseAggregatePlanAlloc(self.alloc, self.tokens, &self.pos, self.cteSelectParserHooks(), self.aggregatePlanParserHooks());
     }
 
     fn parseJoinPlan(self: *@This()) !LoweredJoin {
-        if (!self.peekKeyword("with")) return try self.parseJoin();
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        const previous_schema = self.schema;
-        self.schema = self.joined_source_schema orelse self.schema;
-        var ctes = sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks()) catch |err| {
-            self.schema = previous_schema;
-            return err;
-        };
-        self.schema = previous_schema;
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const previous_available_ctes = self.available_ctes;
-        self.available_ctes = ctes;
-        defer self.available_ctes = previous_available_ctes;
-
-        var final = try self.parseJoin();
-        errdefer final.deinit(self.alloc);
-        try sql_adapter.resolveJoinSourcesForPlanAlloc(self.alloc, &final, ctes, &base_table_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        _ = base_table_name orelse return error.UnsupportedSqlShape;
-
-        final.ctes = ctes;
-        ctes = &.{};
-        return final;
+        return try sql_adapter.parseJoinPlanAlloc(self.alloc, self.tokens, &self.pos, self.joinCteSelectParserHooks(), self.joinPlanParserHooks());
     }
 
     fn parseLateralPlan(self: *@This()) !LoweredLateralPlan {
-        if (!self.peekKeyword("with")) return try self.parseLateral();
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        var ctes = try sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks());
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const previous_available_ctes = self.available_ctes;
-        self.available_ctes = ctes;
-        defer self.available_ctes = previous_available_ctes;
-
-        var final = try self.parseLateral();
-        errdefer final.deinit(self.alloc);
-        try sql_adapter.resolveLateralSourcesForPlanAlloc(self.alloc, &final, ctes, &base_table_name);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        _ = base_table_name orelse return error.UnsupportedSqlShape;
-
-        final.plan.ctes = ctes;
-        ctes = &.{};
-        return final;
+        return try sql_adapter.parseLateralPlanAlloc(self.alloc, self.tokens, &self.pos, self.cteSelectParserHooks(), self.lateralPlanParserHooks());
     }
 
     fn parseSelect(self: *@This()) !LoweredSelect {
@@ -4776,29 +4710,7 @@ const Parser = struct {
     }
 
     fn parseInsertSource(self: *@This()) !LoweredInsertSource {
-        if (!self.peekKeyword("with")) return try self.parseInsertSourceWithCtes(&.{}, null);
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        const previous_schema = self.schema;
-        self.schema = self.joined_source_schema orelse self.schema;
-        var ctes = sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks()) catch |err| {
-            self.schema = previous_schema;
-            return err;
-        };
-        self.schema = previous_schema;
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        var lowered = try self.parseInsertSourceWithCtes(ctes, &base_table_name);
-        lowered.ctes = ctes;
-        ctes = &.{};
-        return lowered;
+        return try sql_adapter.parseInsertSourceAlloc(self.alloc, self.tokens, &self.pos, self.joinCteSelectParserHooks(), self.insertSourceParserHooks());
     }
 
     fn parseInsertSourceWithCtes(
@@ -5262,37 +5174,7 @@ const Parser = struct {
     }
 
     fn parseMergeMutationPlan(self: *@This()) !LoweredMergeMutationPlan {
-        if (!self.peekKeyword("with")) return try self.parseMergeMutationBody(&.{}, null);
-
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        const previous_schema = self.schema;
-        self.schema = self.joined_source_schema orelse self.schema;
-        var ctes = sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks()) catch |err| {
-            self.schema = previous_schema;
-            return err;
-        };
-        self.schema = previous_schema;
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const previous_available_ctes = self.available_ctes;
-        self.available_ctes = ctes;
-        defer self.available_ctes = previous_available_ctes;
-
-        var final = try self.parseMergeMutationBody(ctes, &base_table_name);
-        errdefer final.deinit(self.alloc);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        _ = base_table_name orelse return error.UnsupportedSqlShape;
-        final.ctes = ctes;
-        ctes = &.{};
-        return final;
+        return try sql_adapter.parseMergeMutationPlanAlloc(self.alloc, self.tokens, &self.pos, self.joinCteSelectParserHooks(), self.mergeMutationParserHooks());
     }
 
     fn parseMergeMutationBody(
@@ -5912,36 +5794,7 @@ const Parser = struct {
     }
 
     fn parseUpdateJoinedMutationSource(self: *@This()) !LoweredJoinedMutationSource {
-        if (self.peekKeyword("with")) return try self.parseUpdateJoinedMutationSourceWithCtesRoot();
-        return try self.parseUpdateJoinedMutationSourceWithCtes(&.{}, null);
-    }
-
-    fn parseUpdateJoinedMutationSourceWithCtesRoot(self: *@This()) !LoweredJoinedMutationSource {
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        const previous_schema = self.schema;
-        self.schema = self.joined_source_schema orelse self.schema;
-        var ctes = sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks()) catch |err| {
-            self.schema = previous_schema;
-            return err;
-        };
-        self.schema = previous_schema;
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const lowered = try self.parseUpdateJoinedMutationSourceWithCtes(ctes, &base_table_name);
-        for (ctes) |cte| {
-            var owned = cte;
-            owned.deinit(self.alloc);
-        }
-        if (ctes.len > 0) self.alloc.free(ctes);
-        ctes = &.{};
-        return lowered;
+        return try sql_adapter.parseJoinedMutationSourceAlloc(self.alloc, self.tokens, &self.pos, self.joinCteSelectParserHooks(), self.updateJoinedMutationSourceParserHooks());
     }
 
     fn parseUpdateJoinedMutationSourceWithCtes(
@@ -6186,36 +6039,7 @@ const Parser = struct {
     }
 
     fn parseDeleteJoinedMutationSource(self: *@This()) !LoweredJoinedMutationSource {
-        if (self.peekKeyword("with")) return try self.parseDeleteJoinedMutationSourceWithCtesRoot();
-        return try self.parseDeleteJoinedMutationSourceWithCtes(&.{}, null);
-    }
-
-    fn parseDeleteJoinedMutationSourceWithCtesRoot(self: *@This()) !LoweredJoinedMutationSource {
-        var base_table_name: ?[]const u8 = null;
-        defer if (base_table_name) |table| self.alloc.free(table);
-        const previous_schema = self.schema;
-        self.schema = self.joined_source_schema orelse self.schema;
-        var ctes = sql_adapter.parseCtesForPlanAlloc(self.alloc, self.tokens, &self.pos, &base_table_name, self.cteSelectParserHooks()) catch |err| {
-            self.schema = previous_schema;
-            return err;
-        };
-        self.schema = previous_schema;
-        errdefer {
-            for (ctes) |cte| {
-                var owned = cte;
-                owned.deinit(self.alloc);
-            }
-            if (ctes.len > 0) self.alloc.free(ctes);
-        }
-
-        const lowered = try self.parseDeleteJoinedMutationSourceWithCtes(ctes, &base_table_name);
-        for (ctes) |cte| {
-            var owned = cte;
-            owned.deinit(self.alloc);
-        }
-        if (ctes.len > 0) self.alloc.free(ctes);
-        ctes = &.{};
-        return lowered;
+        return try sql_adapter.parseJoinedMutationSourceAlloc(self.alloc, self.tokens, &self.pos, self.joinCteSelectParserHooks(), self.deleteJoinedMutationSourceParserHooks());
     }
 
     fn parseDeleteJoinedMutationSourceWithCtes(
@@ -10067,7 +9891,7 @@ const Parser = struct {
         while (true) {
             var order = if (self.match(.number)) |token| blk: {
                 const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
-                const field = try self.joinOutputFieldByOrdinalAlloc(select, ordinal);
+                const field = try sql_adapter.joinOutputFieldByOrdinalAlloc(self.alloc, select, ordinal);
                 if (!joinProjectionOutputIsUnique(select, field)) {
                     self.alloc.free(field);
                     return error.UnsupportedSqlShape;
@@ -10099,7 +9923,7 @@ const Parser = struct {
         self: *@This(),
         select: []const db_mod.types.RelationalRowsJoinProjection,
     ) !db_mod.types.RelationalRowsQueryOrder {
-        const output_columns = try self.joinOutputColumnsAlloc(select);
+        const output_columns = try sql_adapter.joinOutputColumnsAlloc(self.alloc, self.schema, select);
         defer if (output_columns.len > 0) self.alloc.free(output_columns);
         const prior_schema = self.schema;
         self.schema = .{
@@ -10108,40 +9932,6 @@ const Parser = struct {
         };
         defer self.schema = prior_schema;
         return try self.parseOrderExpressionAlloc();
-    }
-
-    fn joinOutputFieldByOrdinalAlloc(
-        self: *@This(),
-        select: []const db_mod.types.RelationalRowsJoinProjection,
-        ordinal: u32,
-    ) ![]const u8 {
-        if (ordinal == 0) return error.UnsupportedSqlShape;
-        const index: usize = @intCast(ordinal - 1);
-        if (index >= select.len) return error.UnsupportedSqlShape;
-        return try self.alloc.dupe(u8, select[index].output);
-    }
-
-    fn joinOutputColumnsAlloc(
-        self: *@This(),
-        select: []const db_mod.types.RelationalRowsJoinProjection,
-    ) ![]runtime_schema.RelationalColumn {
-        if (select.len == 0) return &.{};
-        const out = try self.alloc.alloc(runtime_schema.RelationalColumn, select.len);
-        var initialized: usize = 0;
-        errdefer self.alloc.free(out);
-        for (select) |projection| {
-            if (aggregateOutputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
-            const column = relationalColumnForField(self.schema, projection.field, null) orelse return error.InvalidSqlCatalog;
-            out[initialized] = .{
-                .name = projection.output,
-                .path = projection.output,
-                .field_type = column.field_type,
-                .array_item_type = column.array_item_type,
-                .nullable = true,
-            };
-            initialized += 1;
-        }
-        return out;
     }
 
     fn parseConflictClause(
@@ -24082,7 +23872,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const trigger_body_function_fingerprint = try ddlFingerprintAlloc(alloc, trigger_body_function);
     defer alloc.free(trigger_body_function_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_function:name=audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new", trigger_body_function_fingerprint);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$;"));
+
+    var old_trigger_body_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$;");
+    defer old_trigger_body_function.deinit(alloc);
+    const old_trigger_body_function_plan = switch (old_trigger_body_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineBodyKind.plpgsql_trigger, old_trigger_body_function_plan.body.?.kind);
+    try std.testing.expectEqual(RoutineExecutionHook.trigger_return_old, old_trigger_body_function_plan.body.?.hook);
+    try std.testing.expect(old_trigger_body_function_plan.body.?.expression == null);
+    const old_trigger_body_function_fingerprint = try ddlFingerprintAlloc(alloc, old_trigger_body_function);
+    defer alloc.free(old_trigger_body_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=old_audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_old", old_trigger_body_function_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
@@ -36736,7 +36542,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 .{ if (alter.enabled) "enable" else "disable", alter.table_name },
             ),
             .create_policy => |create| blk: {
-                const predicate_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
+                const predicate_suffix = try sql_adapter.rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
                 defer alloc.free(predicate_suffix);
                 var base = try std.fmt.allocPrint(
                     alloc,
@@ -36744,7 +36550,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     .{ create.policy_name, create.table_name, predicate_suffix },
                 );
                 if (create.check_predicate) |check_predicate| {
-                    const check_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    const check_suffix = try sql_adapter.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
                     defer alloc.free(check_suffix);
                     const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
                     alloc.free(base);
@@ -36753,7 +36559,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                 break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
             },
             .alter_policy => |alter| blk: {
-                const predicate_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, alter.predicate);
+                const predicate_suffix = try sql_adapter.rowSecurityPredicateFingerprintSuffixAlloc(alloc, alter.predicate);
                 defer alloc.free(predicate_suffix);
                 var base = try std.fmt.allocPrint(
                     alloc,
@@ -36761,7 +36567,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
                     .{ alter.policy_name, alter.table_name, predicate_suffix },
                 );
                 if (alter.check_predicate) |check_predicate| {
-                    const check_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    const check_suffix = try sql_adapter.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
                     defer alloc.free(check_suffix);
                     const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
                     alloc.free(base);
@@ -37252,7 +37058,7 @@ fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdl
         },
     );
     if (item.rewrite_expression) |rewrite| {
-        const expression = try rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
+        const expression = try sql_adapter.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
         defer alloc.free(expression);
         const with_expression = try std.fmt.allocPrint(
             alloc,
@@ -37263,66 +37069,6 @@ fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdl
         return with_expression;
     }
     return base;
-}
-
-fn rowRewriteExpressionFingerprintAlloc(
-    alloc: std.mem.Allocator,
-    expression: db_mod.types.RelationalRowsExpression,
-) ![]u8 {
-    switch (expression.kind) {
-        .field => return try std.fmt.allocPrint(
-            alloc,
-            "field[{s}:{s}]",
-            .{ @tagName(expression.field_source), expression.field },
-        ),
-        .value => return try std.fmt.allocPrint(
-            alloc,
-            "value[{x}]",
-            .{expression.value_json},
-        ),
-        .cast => {
-            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
-            const operand = try rowRewriteExpressionFingerprintAlloc(alloc, expression.operands[0]);
-            defer alloc.free(operand);
-            return try std.fmt.allocPrint(
-                alloc,
-                "cast[{s}|{s}]",
-                .{ if (expression.cast_type) |cast_type| @tagName(cast_type) else "none", operand },
-            );
-        },
-        .json_extract => {
-            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
-            const operand = try rowRewriteExpressionFingerprintAlloc(alloc, expression.operands[0]);
-            defer alloc.free(operand);
-            return try std.fmt.allocPrint(
-                alloc,
-                "json_extract[{x}|text={}|{s}]",
-                .{ expression.json_path, expression.json_as_text, operand },
-            );
-        },
-        .case => {
-            if (expression.case_branches.len == 0) return error.UnsupportedSqlShape;
-            return try std.fmt.allocPrint(
-                alloc,
-                "case[branches={d}:else={d}]",
-                .{ expression.case_branches.len, expression.case_else.len },
-            );
-        },
-        else => {
-            var out: std.Io.Writer.Allocating = .init(alloc);
-            errdefer out.deinit();
-            const writer = &out.writer;
-            try writer.print("{s}[", .{@tagName(expression.kind)});
-            for (expression.operands, 0..) |operand, i| {
-                const operand_fingerprint = try rowRewriteExpressionFingerprintAlloc(alloc, operand);
-                defer alloc.free(operand_fingerprint);
-                if (i != 0) try writer.writeByte('+');
-                try writer.writeAll(operand_fingerprint);
-            }
-            try writer.writeByte(']');
-            return try out.toOwnedSlice();
-        },
-    }
 }
 
 fn appendAppliedDdlWorkItemsFingerprintAlloc(
@@ -37445,6 +37191,7 @@ fn routineExecutionHookName(hook: RoutineExecutionHook) []const u8 {
     return switch (hook) {
         .expression => "expression",
         .trigger_return_new => "trigger_return_new",
+        .trigger_return_old => "trigger_return_old",
         .procedure_noop => "procedure_noop",
     };
 }
@@ -37618,7 +37365,7 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
         alloc.free(base);
         if (body.expression) |body_expression| {
             errdefer alloc.free(next);
-            const expression = try rowRewriteExpressionFingerprintAlloc(alloc, body_expression);
+            const expression = try sql_adapter.rowRewriteExpressionFingerprintAlloc(alloc, body_expression);
             defer alloc.free(expression);
             const with_expression = try std.fmt.allocPrint(
                 alloc,
@@ -37673,69 +37420,6 @@ fn bulkIoByteOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]co
     const value = option orelse return try alloc.dupe(u8, "default");
     if (value.len != 1) return error.UnsupportedSqlShape;
     return try std.fmt.allocPrint(alloc, "{x:0>2}", .{value[0]});
-}
-
-fn rowSecurityPredicateFingerprintSuffixAlloc(
-    alloc: std.mem.Allocator,
-    predicate: RowSecurityPolicyPredicate,
-) ![]u8 {
-    return switch (predicate) {
-        .current_setting_equals => |current_setting| try std.fmt.allocPrint(
-            alloc,
-            "kind=current_setting_eq:field={s}:setting={s}",
-            .{ current_setting.field, current_setting.setting_name },
-        ),
-        .literal_equals => |literal| blk: {
-            const value_json_hex = try bulkIoStringOptionHexAlloc(alloc, literal.value_json);
-            defer alloc.free(value_json_hex);
-            break :blk try std.fmt.allocPrint(
-                alloc,
-                "kind=literal_eq:field={s}:value_json_hex={s}",
-                .{ literal.field, value_json_hex },
-            );
-        },
-        .expression => |expression| blk: {
-            const expression_json = try rowSecurityExpressionConditionJsonAlloc(alloc, expression);
-            defer alloc.free(expression_json);
-            const expression_json_hex = try bulkIoStringOptionHexAlloc(alloc, expression_json);
-            defer alloc.free(expression_json_hex);
-            break :blk try std.fmt.allocPrint(alloc, "kind=expression:json_hex={s}", .{expression_json_hex});
-        },
-        .conjunction => |conjunction| blk: {
-            var out = try std.fmt.allocPrint(alloc, "kind=and:terms={d}", .{conjunction.predicates.len});
-            errdefer alloc.free(out);
-            for (conjunction.predicates) |term| {
-                const term_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, term);
-                defer alloc.free(term_suffix);
-                const next = try std.fmt.allocPrint(alloc, "{s}:term={s}", .{ out, term_suffix });
-                alloc.free(out);
-                out = next;
-            }
-            break :blk out;
-        },
-        .disjunction => |disjunction| blk: {
-            var out = try std.fmt.allocPrint(alloc, "kind=or:terms={d}", .{disjunction.predicates.len});
-            errdefer alloc.free(out);
-            for (disjunction.predicates) |term| {
-                const term_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, term);
-                defer alloc.free(term_suffix);
-                const next = try std.fmt.allocPrint(alloc, "{s}:term={s}", .{ out, term_suffix });
-                alloc.free(out);
-                out = next;
-            }
-            break :blk out;
-        },
-    };
-}
-
-fn rowSecurityExpressionConditionJsonAlloc(
-    alloc: std.mem.Allocator,
-    condition: db_mod.types.RelationalRowsExpressionCondition,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try writeRowExpressionConditionJson(&out.writer, condition);
-    return try out.toOwnedSlice();
 }
 
 fn appendRowSecurityRoleTargetsAlloc(

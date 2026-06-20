@@ -3042,14 +3042,19 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
     try cursor.expectKeyword("begin");
     try cursor.expectKeyword("return");
-    try cursor.expectKeyword("new");
+    const hook: ddl_plan.RoutineExecutionHook = if (cursor.matchKeyword("new"))
+        .trigger_return_new
+    else if (cursor.matchKeyword("old"))
+        .trigger_return_old
+    else
+        return error.UnsupportedSqlShape;
     try cursor.expectToken(.semicolon);
     try cursor.expectKeyword("end");
     _ = cursor.matchToken(.semicolon);
     if (!cursor.atEnd()) return error.UnsupportedSqlShape;
     return .{
         .kind = .plpgsql_trigger,
-        .hook = .trigger_return_new,
+        .hook = hook,
     };
 }
 
@@ -8762,7 +8767,17 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, trigger_body.body.?.hook);
     try std.testing.expect(trigger_body.body.?.expression == null);
 
-    var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';");
+    var old_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_old_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';");
+    defer lexer.freeTokens(alloc, &old_trigger_body_tokens);
+    var old_trigger_body_pos: usize = 0;
+    var old_trigger_body = try parseCreateRoutineCatalogTailAlloc(alloc, old_trigger_body_tokens.items, &old_trigger_body_pos);
+    defer old_trigger_body.deinit(alloc);
+    try std.testing.expectEqual(old_trigger_body_tokens.items.len, old_trigger_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, old_trigger_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_old, old_trigger_body.body.?.hook);
+    try std.testing.expect(old_trigger_body.body.?.expression == null);
+
+    var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';");
     defer lexer.freeTokens(alloc, &unsupported_trigger_body_tokens);
     var unsupported_trigger_body_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_trigger_body_tokens.items, &unsupported_trigger_body_pos));
