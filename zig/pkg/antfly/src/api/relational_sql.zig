@@ -16731,112 +16731,15 @@ const Parser = struct {
     }
 
     fn parseStringToArrayRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseStringToArrayFunctionCallStart(self.tokens, &self.pos);
-        const text_expression = try self.parseRowExpressionAlloc();
-        var text_transferred = false;
-        errdefer if (!text_transferred) freeExpression(self.alloc, text_expression);
-        try self.expect(.comma);
-        const delimiter_expression = try self.parseRowExpressionAlloc();
-        var delimiter_transferred = false;
-        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter_expression);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .string_to_array, text_expression, delimiter_expression);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        text_transferred = true;
-        delimiter_transferred = true;
-        try self.rowExpressionTypeContext().validateStringToArrayExpression(expression);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseStringToArrayRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseArrayToStringRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseArrayToStringFunctionCallStart(self.tokens, &self.pos);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const array_expression = try self.parseRowExpressionAlloc();
-        var array_transferred = false;
-        errdefer if (!array_transferred) freeExpression(self.alloc, array_expression);
-        try operands.append(self.alloc, array_expression);
-        array_transferred = true;
-
-        try self.expect(.comma);
-        const delimiter_expression = try self.parseRowExpressionAlloc();
-        var delimiter_transferred = false;
-        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter_expression);
-        try operands.append(self.alloc, delimiter_expression);
-        delimiter_transferred = true;
-
-        if (self.match(.comma) != null) {
-            const null_expression = try self.parseRowExpressionAlloc();
-            var null_transferred = false;
-            errdefer if (!null_transferred) freeExpression(self.alloc, null_expression);
-            try operands.append(self.alloc, null_expression);
-            null_transferred = true;
-        }
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .array_to_string, &operands);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateArrayToStringExpression(expression);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseArrayToStringRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseArrayElementTransformRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseArrayElementTransformFunctionCallStart(self.tokens, &self.pos);
-        const first_expression = try self.parseRowExpressionAlloc();
-        var first_transferred = false;
-        errdefer if (!first_transferred) freeExpression(self.alloc, first_expression);
-        try self.expect(.comma);
-        const second_expression = try self.parseRowExpressionAlloc();
-        var second_transferred = false;
-        errdefer if (!second_transferred) freeExpression(self.alloc, second_expression);
-        var third_expression: db_mod.types.RelationalRowsExpression = undefined;
-        var third_transferred = true;
-        if (kind == .array_replace) {
-            third_transferred = false;
-            try self.expect(.comma);
-            third_expression = try self.parseRowExpressionAlloc();
-            errdefer if (!third_transferred) freeExpression(self.alloc, third_expression);
-        }
-        try self.expect(.rparen);
-
-        const expression = if (kind == .array_prepend) blk: {
-            const out = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, second_expression, first_expression);
-            second_transferred = true;
-            first_transferred = true;
-            break :blk out;
-        } else if (kind == .array_replace) blk: {
-            const out = try sql_adapter.buildTernaryFunctionExpressionAlloc(self.alloc, kind, first_expression, second_expression, third_expression);
-            first_transferred = true;
-            second_transferred = true;
-            third_transferred = true;
-            break :blk out;
-        } else blk: {
-            const out = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, first_expression, second_expression);
-            first_transferred = true;
-            second_transferred = true;
-            break :blk out;
-        };
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        if (kind == .array_cat) {
-            try self.rowExpressionTypeContext().validateArrayCatExpression(expression);
-        } else if (kind == .array_replace) {
-            try self.rowExpressionTypeContext().validateArrayReplaceExpression(expression);
-        } else {
-            try self.rowExpressionTypeContext().validateArrayElementTransformExpression(expression);
-        }
-
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseArrayElementTransformRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseArrayElementTransformExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
