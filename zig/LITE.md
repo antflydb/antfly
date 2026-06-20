@@ -96,6 +96,11 @@ antfly lite serve app.aflite --addr 127.0.0.1:8080
 and rejects an existing database path. Destructive replacement should stay on
 explicit restore/import flows where the source and target are both known.
 
+`antfly lite status` should include a storage block that identifies the live
+file format, the selected engine, the v1 format version, page size, and active
+checkpoint sequence. That makes the public native `.aflite` path observable and
+keeps internal bridge profiles from being mistaken for the v1 contract.
+
 `antfly lite serve` is optional convenience mode. It should expose a local
 single-node HTTP API for development and migration testing, but the primary
 contract is embedded use.

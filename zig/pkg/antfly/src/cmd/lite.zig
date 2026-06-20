@@ -158,7 +158,7 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     var lite = try LiteDb.open(allocator, path, .status_only);
     defer lite.close();
 
-    const json = try statusJson(allocator, &lite.db, .native);
+    const json = try statusJson(allocator, &lite, .native);
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
@@ -764,20 +764,55 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     return try allocator.dupe(u8, response.json);
 }
 
-fn statusJson(allocator: Allocator, db: *db_mod.DB, profile: antfly.lite.backend.Profile) ![]u8 {
-    const stats_value = try db.stats(allocator);
+const StorageStatus = struct {
+    format: []const u8 = "aflite",
+    engine: []const u8,
+    format_version: ?u32 = null,
+    page_size: ?u32 = null,
+    active_checkpoint: ?u8 = null,
+    checkpoint_sequence: ?u64 = null,
+    page_count: ?u64 = null,
+};
+
+fn storageStatus(lite: *LiteDb) StorageStatus {
+    return switch (lite.backend.engine) {
+        .native_single_file => blk: {
+            const file = &lite.backend.native_docstore.?.file;
+            const checkpoint = file.activeCheckpoint();
+            break :blk .{
+                .engine = @tagName(lite.backend.engine),
+                .format_version = antfly.lite.backend.native.format_version,
+                .page_size = file.header.page_size,
+                .active_checkpoint = file.header.active_checkpoint,
+                .checkpoint_sequence = checkpoint.commit_sequence,
+                .page_count = checkpoint.page_count,
+            };
+        },
+        .bridge_lsm_container => .{
+            .format = "aflite-internal",
+            .engine = @tagName(lite.backend.engine),
+        },
+    };
+}
+
+fn statusJson(allocator: Allocator, lite: *LiteDb, profile: antfly.lite.backend.Profile) ![]u8 {
+    const stats_value = try lite.db.stats(allocator);
     defer db_types.freeDBStats(allocator, stats_value);
 
+    const storage_json = try std.json.Stringify.valueAlloc(allocator, storageStatus(lite), .{});
+    defer allocator.free(storage_json);
     const stats_json = try std.json.Stringify.valueAlloc(allocator, stats_value, .{});
     defer allocator.free(stats_json);
-    const pending_json = try std.json.Stringify.valueAlloc(allocator, db.maintenanceDriver().pendingWorkStats(), .{});
+    const pending_json = try std.json.Stringify.valueAlloc(allocator, lite.db.maintenanceDriver().pendingWorkStats(), .{});
     defer allocator.free(pending_json);
     const capabilities_json = try std.json.Stringify.valueAlloc(allocator, antfly.lite.backend.capabilitiesForProfile(profile), .{});
     defer allocator.free(capabilities_json);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
-    try out.appendSlice(allocator, "{\"stats\":");
+    try out.appendSlice(allocator, "{\"storage\":");
+    try out.appendSlice(allocator, storage_json);
+    try out.appendSlice(allocator, ",\"stats\":");
     try out.appendSlice(allocator, stats_json);
     try out.appendSlice(allocator, ",\"pending_work\":");
     try out.appendSlice(allocator, pending_json);
@@ -1197,8 +1232,13 @@ test "lite status json includes pending work" {
     defer allocator.free(batch_response);
     try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":1") != null);
 
-    const json = try statusJson(allocator, &lite.db, .native);
+    const json = try statusJson(allocator, &lite, .native);
     defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"storage\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"format\":\"aflite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"engine\":\"native_single_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"format_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"checkpoint_sequence\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pending_work\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":") != null);
