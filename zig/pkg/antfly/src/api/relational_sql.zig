@@ -2202,7 +2202,7 @@ const Parser = struct {
                     return .{ .function_catalog = .{ .create = try sql_adapter.parseCreateRoutinePlanTailAlloc(self.alloc, self.tokens, &self.pos, true) } };
                 }
                 if (!self.peekKeyword("table")) return error.UnsupportedSqlShape;
-                var create_table = try self.parseCreateTableDdl();
+                var create_table = try sql_adapter.parseCreateTablePlanAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
                 create_table.replace_existing = true;
                 return .{ .create_table = create_table };
             }
@@ -2264,7 +2264,7 @@ const Parser = struct {
                 return .{ .relation_lifetime = try self.parseRelationLifetimeDdl() };
             }
             const checkpoint = self.pos;
-            if (self.parseIdentityAllocatorDdl()) |identity| {
+            if (sql_adapter.parseIdentityAllocatorPlanAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks())) |identity| {
                 return .{ .identity_allocator_catalog = identity };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2276,7 +2276,7 @@ const Parser = struct {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
                 else => return err,
             }
-            if (self.parseCreatePartitionedTableDdl()) |partitioned| {
+            if (sql_adapter.parseCreatePartitionedTablePlanAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks())) |partitioned| {
                 return .{ .table_partition_catalog = .{ .create_partitioned = partitioned } };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2288,7 +2288,7 @@ const Parser = struct {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
                 else => return err,
             }
-            return .{ .create_table = try self.parseCreateTableDdl() };
+            return .{ .create_table = try sql_adapter.parseCreateTablePlanAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks()) };
         }
         if (self.matchKeyword("alter")) {
             if (self.peekKeyword("domain")) return .{ .domain_catalog = .{ .alter = try sql_adapter.parseAlterDomainPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
@@ -2322,7 +2322,7 @@ const Parser = struct {
                     else => return err,
                 }
             }
-            return .{ .alter_table = try self.parseAlterTableDdl() };
+            return .{ .alter_table = try sql_adapter.parseAlterTablePlanAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks()) };
         }
         if (self.matchKeyword("drop")) {
             if (self.peekKeyword("materialized")) return .{ .materialized_view_catalog = .{ .drop = try sql_adapter.parseDropMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
@@ -2607,7 +2607,7 @@ const Parser = struct {
 
     fn parseRelationLifetimeDdl(self: *@This()) !RelationLifetimePlan {
         const prefix = try sql_adapter.parseRelationLifetimePrefix(self.tokens, &self.pos);
-        var create_table = try self.parseCreateTableDdl();
+        var create_table = try sql_adapter.parseCreateTablePlanAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
         errdefer create_table.deinit(self.alloc);
         return .{ .kind = prefix.kind, .create_table = create_table };
     }
@@ -2716,38 +2716,6 @@ const Parser = struct {
             .op = op,
             .rhs = rhs,
         } };
-    }
-
-    fn parseAlterTableDdl(self: *@This()) !AlterTablePlan {
-        var header = try sql_adapter.parseAlterTableHeaderAlloc(self.alloc, self.tokens, &self.pos);
-        var header_transferred = false;
-        errdefer if (!header_transferred) header.deinit(self.alloc);
-
-        var operations = std.ArrayListUnmanaged(AlterTableOperation).empty;
-        errdefer {
-            for (operations.items) |operation| freeAlterTableOperation(self.alloc, operation);
-            operations.deinit(self.alloc);
-        }
-        while (true) {
-            try sql_adapter.parseAlterTableOperationAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks(), &operations);
-            if (self.match(.comma) == null) break;
-        }
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-
-        const owned_operations = try operations.toOwnedSlice(self.alloc);
-        var operations_transferred = false;
-        errdefer if (!operations_transferred) {
-            for (owned_operations) |operation| freeAlterTableOperation(self.alloc, operation);
-            self.alloc.free(owned_operations);
-        };
-        header_transferred = true;
-        operations_transferred = true;
-        return .{
-            .table_name = header.table_name,
-            .if_exists = header.if_exists,
-            .operations = owned_operations,
-        };
     }
 
     fn parseCreateIndexDdl(self: *@This(), unique: bool) !CreateIndexPlan {
@@ -2886,150 +2854,6 @@ const Parser = struct {
             .where = predicates,
             .where_expressions = where_expressions,
         };
-    }
-
-    fn parseIdentityAllocatorDdl(self: *@This()) !IdentityAllocatorPlan {
-        if (self.matchKeyword("temporary") or self.matchKeyword("temp") or self.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
-        var header = try sql_adapter.parseIdentityAllocatorTableHeaderAlloc(self.alloc, self.tokens, &self.pos);
-        var header_transferred = false;
-        errdefer if (!header_transferred) header.deinit(self.alloc);
-        const column_name = header.column_name;
-        const path = try self.alloc.dupe(u8, column_name);
-        var path_transferred = false;
-        errdefer if (!path_transferred) self.alloc.free(path);
-
-        var identity = try sql_adapter.parseIdentityAllocatorSpecAlloc(self.alloc, self.tokens, &self.pos);
-        var identity_transferred = false;
-        errdefer if (!identity_transferred) identity.deinit(self.alloc);
-        var primary_key = false;
-        if (self.matchKeyword("primary")) {
-            try self.expectKeyword("key");
-            primary_key = true;
-        }
-
-        const column: runtime_schema.RelationalColumn = .{
-            .name = column_name,
-            .path = path,
-            .field_type = .numeric,
-            .nullable = !primary_key,
-        };
-        var column_transferred = false;
-        errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
-
-        var additional_columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
-        errdefer {
-            clearDdlRelationalColumns(self.alloc, additional_columns.items);
-            additional_columns.deinit(self.alloc);
-        }
-        while (self.match(.comma) != null) {
-            if (self.peekKeyword("constraint") or self.peekKeyword("primary") or self.peekKeyword("unique") or self.peekKeyword("foreign") or self.peekKeyword("check") or self.peekKeyword("period")) return error.UnsupportedSqlShape;
-            const additional = try sql_adapter.parseDdlColumnDefinitionStandaloneAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks());
-            var additional_transferred = false;
-            errdefer if (!additional_transferred) freeDdlRelationalColumn(self.alloc, additional);
-            try additional_columns.append(self.alloc, additional);
-            additional_transferred = true;
-        }
-        try self.expect(.rparen);
-        try self.expectDdlEnd();
-
-        const owned_additional_columns = try additional_columns.toOwnedSlice(self.alloc);
-        var additional_columns_transferred = false;
-        errdefer if (!additional_columns_transferred) {
-            clearDdlRelationalColumns(self.alloc, owned_additional_columns);
-            self.alloc.free(owned_additional_columns);
-        };
-
-        header_transferred = true;
-        path_transferred = true;
-        column_transferred = true;
-        identity_transferred = true;
-        additional_columns_transferred = true;
-        return .{
-            .table_name = header.table_name,
-            .column = column,
-            .kind = identity.kind,
-            .options = identity.options,
-            .primary_key = primary_key,
-            .additional_columns = owned_additional_columns,
-        };
-    }
-
-    fn parseCreateTableDdl(self: *@This()) !CreateTablePlan {
-        var plan = try self.parseCreateTableDefinitionDdl();
-        errdefer plan.deinit(self.alloc);
-        if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
-        if (!self.atEnd()) return error.UnsupportedSqlShape;
-        return plan;
-    }
-
-    fn parseCreateTableDefinitionDdl(self: *@This()) !CreateTablePlan {
-        var header = try sql_adapter.parseCreateTableDefinitionHeaderAlloc(self.alloc, self.tokens, &self.pos);
-        var header_transferred = false;
-        errdefer if (!header_transferred) header.deinit(self.alloc);
-
-        var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
-        errdefer {
-            clearDdlRelationalColumns(self.alloc, columns.items);
-            columns.deinit(self.alloc);
-        }
-        var primary_key: ?runtime_schema.PrimaryKey = null;
-        errdefer if (primary_key) |pk| freeDdlPrimaryKey(self.alloc, pk);
-        var periods = std.ArrayListUnmanaged(runtime_schema.RelationalPeriod).empty;
-        errdefer {
-            for (periods.items) |period| freeDdlPeriod(self.alloc, period);
-            periods.deinit(self.alloc);
-        }
-        var unique_constraints = std.ArrayListUnmanaged(runtime_schema.UniqueConstraint).empty;
-        errdefer {
-            clearDdlUniqueConstraints(self.alloc, unique_constraints.items);
-            unique_constraints.deinit(self.alloc);
-        }
-        var foreign_keys = std.ArrayListUnmanaged(runtime_schema.ForeignKey).empty;
-        errdefer {
-            clearDdlForeignKeys(self.alloc, foreign_keys.items);
-            foreign_keys.deinit(self.alloc);
-        }
-        var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
-        errdefer {
-            clearDdlRelationalChecks(self.alloc, checks.items);
-            checks.deinit(self.alloc);
-        }
-
-        while (true) {
-            var element_prefix = try sql_adapter.parseCreateTableElementPrefixAlloc(self.alloc, self.tokens, &self.pos);
-            defer element_prefix.deinit(self.alloc);
-
-            if (element_prefix.kind == .column) {
-                try sql_adapter.parseDdlColumnDefinitionAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks(), &columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
-            } else {
-                try sql_adapter.parseDdlTableConstraintAlloc(self.alloc, self.tokens, &self.pos, self.ddlColumnDefinitionHooks(), element_prefix.constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
-            }
-
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-
-        header_transferred = true;
-        return .{
-            .table_name = header.table_name,
-            .if_not_exists = header.if_not_exists,
-            .columns = try columns.toOwnedSlice(self.alloc),
-            .primary_key = primary_key,
-            .periods = try periods.toOwnedSlice(self.alloc),
-            .unique_constraints = try unique_constraints.toOwnedSlice(self.alloc),
-            .foreign_keys = try foreign_keys.toOwnedSlice(self.alloc),
-            .checks = try checks.toOwnedSlice(self.alloc),
-        };
-    }
-
-    fn parseCreatePartitionedTableDdl(self: *@This()) !CreatePartitionedTablePlan {
-        var create_table = try self.parseCreateTableDefinitionDdl();
-        var create_table_transferred = false;
-        errdefer if (!create_table_transferred) create_table.deinit(self.alloc);
-
-        const plan = try sql_adapter.parseCreatePartitionedTablePlanTailAlloc(self.alloc, self.tokens, &self.pos, create_table);
-        create_table_transferred = true;
-        return plan;
     }
 
     fn expectDdlEnd(self: *@This()) !void {
@@ -25808,6 +25632,18 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const copy_from_header_fingerprint = try ddlFingerprintAlloc(alloc, copy_from_header);
     defer alloc.free(copy_from_header_fingerprint);
     try std.testing.expectEqualStrings("ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:reject_limit=10:log_verbosity=verbose:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:default_marker_hex=6e2f61:encoding_hex=55544638:where_expressions=0", copy_from_header_fingerprint);
+
+    var copy_oids_false = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (OIDS false, FORMAT csv);");
+    defer copy_oids_false.deinit(alloc);
+    const copy_oids_false_plan = switch (copy_oids_false) {
+        .bulk_io => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const copy_oids_false_execution = try bulkSqlIoExecutionPlanFromDdlPlan(copy_oids_false_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.import_rows, copy_oids_false_execution.operation);
+    try std.testing.expectEqual(BulkSqlIoStream.stdin, copy_oids_false_execution.stream);
+    try std.testing.expectEqual(BulkSqlIoCodec.csv, copy_oids_false_execution.codec);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (OIDS true);"));
 
     var copy_from_where = try lowerDdlPlanAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';");
     defer copy_from_where.deinit(alloc);

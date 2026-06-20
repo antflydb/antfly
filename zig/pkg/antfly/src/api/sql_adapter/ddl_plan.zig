@@ -598,6 +598,11 @@ pub const CreateIndexPlan = struct {
     }
 };
 
+pub const CreateIndexHooks = struct {
+    ptr: *anyopaque,
+    parse_where_expression_conditions: *const fn (*anyopaque) anyerror![]const db_mod.types.RelationalRowsExpressionCondition,
+};
+
 pub const DdlIndexMethod = enum {
     btree,
     gin,
@@ -3595,6 +3600,21 @@ pub fn parseCreatePartitionedTablePlanTailAlloc(
     };
 }
 
+pub fn parseCreatePartitionedTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !CreatePartitionedTablePlan {
+    var create_table = try parseCreateTableDefinitionAlloc(alloc, tokens, pos, hooks);
+    var create_table_transferred = false;
+    errdefer if (!create_table_transferred) create_table.deinit(alloc);
+
+    const plan = try parseCreatePartitionedTablePlanTailAlloc(alloc, tokens, pos, create_table);
+    create_table_transferred = true;
+    return plan;
+}
+
 pub fn parseAlterTablePartitionPlanTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -3843,6 +3863,115 @@ pub fn parseAlterTableOperationAlloc(
     }
 
     return error.UnsupportedSqlShape;
+}
+
+pub fn parseAlterTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !AlterTablePlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var header = try grammar.parseAlterTableHeaderAlloc(alloc, tokens, pos);
+    var header_transferred = false;
+    errdefer if (!header_transferred) header.deinit(alloc);
+
+    var operations = std.ArrayListUnmanaged(AlterTableOperation).empty;
+    errdefer {
+        for (operations.items) |operation| freeAlterTableOperation(alloc, operation);
+        operations.deinit(alloc);
+    }
+    while (true) {
+        try parseAlterTableOperationAlloc(alloc, tokens, pos, hooks, &operations);
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const owned_operations = try operations.toOwnedSlice(alloc);
+    var operations_transferred = false;
+    errdefer if (!operations_transferred) {
+        for (owned_operations) |operation| freeAlterTableOperation(alloc, operation);
+        alloc.free(owned_operations);
+    };
+    header_transferred = true;
+    operations_transferred = true;
+    return .{
+        .table_name = header.table_name,
+        .if_exists = header.if_exists,
+        .operations = owned_operations,
+    };
+}
+
+pub fn parseIdentityAllocatorPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !IdentityAllocatorPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("temporary") or cursor.matchKeyword("temp") or cursor.matchKeyword("unlogged")) return error.UnsupportedSqlShape;
+    var header = try grammar.parseIdentityAllocatorTableHeaderAlloc(alloc, tokens, pos);
+    var header_transferred = false;
+    errdefer if (!header_transferred) header.deinit(alloc);
+    const column_name = header.column_name;
+    const path = try alloc.dupe(u8, column_name);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(path);
+
+    var identity = try grammar.parseIdentityAllocatorSpecAlloc(alloc, tokens, pos);
+    var identity_transferred = false;
+    errdefer if (!identity_transferred) identity.deinit(alloc);
+    var primary_key = false;
+    if (cursor.matchKeyword("primary")) {
+        try cursor.expectKeyword("key");
+        primary_key = true;
+    }
+
+    const column: runtime_schema.RelationalColumn = .{
+        .name = column_name,
+        .path = path,
+        .field_type = .numeric,
+        .nullable = !primary_key,
+    };
+    var column_transferred = false;
+    errdefer if (!column_transferred) freeDdlRelationalColumn(alloc, column);
+
+    var additional_columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer {
+        clearDdlRelationalColumns(alloc, additional_columns.items);
+        additional_columns.deinit(alloc);
+    }
+    while (cursor.matchToken(.comma) != null) {
+        if (cursor.peekKeyword("constraint") or cursor.peekKeyword("primary") or cursor.peekKeyword("unique") or cursor.peekKeyword("foreign") or cursor.peekKeyword("check") or cursor.peekKeyword("period")) return error.UnsupportedSqlShape;
+        const additional = try parseDdlColumnDefinitionStandaloneAlloc(alloc, tokens, pos, hooks);
+        var additional_transferred = false;
+        errdefer if (!additional_transferred) freeDdlRelationalColumn(alloc, additional);
+        try additional_columns.append(alloc, additional);
+        additional_transferred = true;
+    }
+    try cursor.expectToken(.rparen);
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const owned_additional_columns = try additional_columns.toOwnedSlice(alloc);
+    var additional_columns_transferred = false;
+    errdefer if (!additional_columns_transferred) {
+        clearDdlRelationalColumns(alloc, owned_additional_columns);
+        alloc.free(owned_additional_columns);
+    };
+
+    header_transferred = true;
+    path_transferred = true;
+    column_transferred = true;
+    identity_transferred = true;
+    additional_columns_transferred = true;
+    return .{
+        .table_name = header.table_name,
+        .column = column,
+        .kind = identity.kind,
+        .options = identity.options,
+        .primary_key = primary_key,
+        .additional_columns = owned_additional_columns,
+    };
 }
 
 pub fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
@@ -5215,6 +5344,105 @@ pub fn parseDdlTableConstraintAlloc(
     } else {
         return error.UnsupportedSqlShape;
     }
+}
+
+pub fn parseCreateTableDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !CreateTablePlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var header = try grammar.parseCreateTableDefinitionHeaderAlloc(alloc, tokens, pos);
+    var header_transferred = false;
+    errdefer if (!header_transferred) header.deinit(alloc);
+
+    var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer {
+        clearDdlRelationalColumns(alloc, columns.items);
+        columns.deinit(alloc);
+    }
+    var primary_key: ?runtime_schema.PrimaryKey = null;
+    errdefer if (primary_key) |pk| freeDdlPrimaryKey(alloc, pk);
+    var periods = std.ArrayListUnmanaged(runtime_schema.RelationalPeriod).empty;
+    errdefer {
+        for (periods.items) |period| freeDdlPeriod(alloc, period);
+        periods.deinit(alloc);
+    }
+    var unique_constraints = std.ArrayListUnmanaged(runtime_schema.UniqueConstraint).empty;
+    errdefer {
+        clearDdlUniqueConstraints(alloc, unique_constraints.items);
+        unique_constraints.deinit(alloc);
+    }
+    var foreign_keys = std.ArrayListUnmanaged(runtime_schema.ForeignKey).empty;
+    errdefer {
+        clearDdlForeignKeys(alloc, foreign_keys.items);
+        foreign_keys.deinit(alloc);
+    }
+    var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    errdefer {
+        clearDdlRelationalChecks(alloc, checks.items);
+        checks.deinit(alloc);
+    }
+
+    while (true) {
+        var element_prefix = try grammar.parseCreateTableElementPrefixAlloc(alloc, tokens, pos);
+        defer element_prefix.deinit(alloc);
+
+        if (element_prefix.kind == .column) {
+            try parseDdlColumnDefinitionAlloc(alloc, tokens, pos, hooks, &columns, &periods, &primary_key, &unique_constraints, &foreign_keys, &checks);
+        } else {
+            try parseDdlTableConstraintAlloc(alloc, tokens, pos, hooks, element_prefix.constraint_name, &primary_key, &periods, &unique_constraints, &foreign_keys, &checks);
+        }
+
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+
+    const owned_columns = try columns.toOwnedSlice(alloc);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) freeDdlRelationalColumns(alloc, owned_columns);
+    const owned_periods = try periods.toOwnedSlice(alloc);
+    var periods_transferred = false;
+    errdefer if (!periods_transferred) freeDdlPeriods(alloc, owned_periods);
+    const owned_unique_constraints = try unique_constraints.toOwnedSlice(alloc);
+    var unique_transferred = false;
+    errdefer if (!unique_transferred) freeDdlUniqueConstraints(alloc, owned_unique_constraints);
+    const owned_foreign_keys = try foreign_keys.toOwnedSlice(alloc);
+    var foreign_transferred = false;
+    errdefer if (!foreign_transferred) freeDdlForeignKeys(alloc, owned_foreign_keys);
+    const owned_checks = try checks.toOwnedSlice(alloc);
+    var checks_transferred = false;
+    errdefer if (!checks_transferred) freeDdlRelationalChecks(alloc, owned_checks);
+
+    header_transferred = true;
+    columns_transferred = true;
+    periods_transferred = true;
+    unique_transferred = true;
+    foreign_transferred = true;
+    checks_transferred = true;
+    return .{
+        .table_name = header.table_name,
+        .if_not_exists = header.if_not_exists,
+        .columns = owned_columns,
+        .primary_key = primary_key,
+        .periods = owned_periods,
+        .unique_constraints = owned_unique_constraints,
+        .foreign_keys = owned_foreign_keys,
+        .checks = owned_checks,
+    };
+}
+
+pub fn parseCreateTablePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !CreateTablePlan {
+    var plan = try parseCreateTableDefinitionAlloc(alloc, tokens, pos, hooks);
+    errdefer plan.deinit(alloc);
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+    return plan;
 }
 
 pub fn makeDdlForeignKeyAlloc(

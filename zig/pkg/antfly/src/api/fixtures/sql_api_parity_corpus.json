@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "1b54f4cb393766a81be1a1b36a0eef2807453398edcd5f1cf3e5a26fefb8a24c",
-  "source_entry_count": 1000,
-  "entry_count": 1000,
+  "source_sha256": "dd8733655dc73b4dafc85901c6c61bf0478074128a4c5d75edc77d1cdc63c64f",
+  "source_entry_count": 1001,
+  "entry_count": 1001,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3981,6 +3981,18 @@
       "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=1",
       "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=1:requires_stream=true",
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active'"
+    },
+    {
+      "name": "copy from oids false compatibility no-op",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (OIDS false, FORMAT csv)"
     },
     {
       "name": "unsupported copy oids option",

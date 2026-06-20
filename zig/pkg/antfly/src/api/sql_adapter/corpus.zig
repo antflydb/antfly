@@ -4327,6 +4327,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_copy_freeze: bool = false,
     ddl_copy_log_verbosity: bool = false,
     ddl_copy_null_marker: bool = false,
+    ddl_copy_oids_false_noop: bool = false,
     ddl_copy_on_error_ignore: bool = false,
     ddl_copy_program_endpoint: bool = false,
     ddl_copy_reject_limit: bool = false,
@@ -6046,6 +6047,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_freeze = self.ddl_copy_freeze or sql_adapter.planHasExactBoolToken(entry.plan, ":freeze=", true);
                     self.ddl_copy_log_verbosity = self.ddl_copy_log_verbosity or sql_adapter.planHasExactStringToken(entry.plan, ":log_verbosity=", "verbose");
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
+                    self.ddl_copy_oids_false_noop = self.ddl_copy_oids_false_noop or
+                        std.mem.indexOf(u8, entry.sql, "OIDS false") != null and
+                            std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:");
                     self.ddl_copy_on_error_ignore = self.ddl_copy_on_error_ignore or sql_adapter.planHasExactStringToken(entry.plan, ":on_error=", "ignore");
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
                         std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null and

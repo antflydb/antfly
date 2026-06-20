@@ -5980,6 +5980,9 @@ pub fn parseBulkIoTailAlloc(
                     return error.UnsupportedSqlShape;
                 }
                 encoding = value;
+            } else if (cursor.matchKeyword("oids")) {
+                const value = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+                if (!std.ascii.eqlIgnoreCase(value.text, "false")) return error.UnsupportedSqlShape;
             } else return error.UnsupportedSqlShape;
             if (cursor.matchToken(.comma) != null) continue;
             break;
@@ -10728,6 +10731,20 @@ test "sql adapter grammar parses bulk io tails" {
     try std.testing.expectEqualStrings("", copy_header.null_marker.?);
     try std.testing.expectEqualStrings("n/a", copy_header.default_marker.?);
     try std.testing.expectEqualStrings("UTF8", copy_header.encoding.?);
+
+    var copy_oids_false_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (OIDS false, FORMAT csv);");
+    defer lexer.freeTokens(alloc, &copy_oids_false_tokens);
+    var copy_oids_false_pos: usize = 0;
+    var copy_oids_false = try parseBulkIoTailAlloc(alloc, copy_oids_false_tokens.items, &copy_oids_false_pos);
+    defer copy_oids_false.deinit(alloc);
+    try std.testing.expectEqual(copy_oids_false_tokens.items.len, copy_oids_false_pos);
+    try std.testing.expectEqual(BulkIoDirectionSyntax.from, copy_oids_false.direction);
+    try std.testing.expectEqualStrings("csv", copy_oids_false.format.?);
+
+    var copy_oids_true_tokens = try lexer.tokenizeAlloc(alloc, "usage_records (id, status) FROM STDIN WITH (OIDS true);");
+    defer lexer.freeTokens(alloc, &copy_oids_true_tokens);
+    var copy_oids_true_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseBulkIoTailAlloc(alloc, copy_oids_true_tokens.items, &copy_oids_true_pos));
 
     var copy_to_tokens = try lexer.tokenizeAlloc(alloc, "public.usage_records TO STDOUT WITH (FORCE_QUOTE *);");
     defer lexer.freeTokens(alloc, &copy_to_tokens);

@@ -4395,6 +4395,18 @@
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active'"
     },
     {
+      "name": "copy from oids false compatibility no-op",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (OIDS false, FORMAT csv)"
+    },
+    {
       "name": "unsupported copy oids option",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=bulk_io_plan",
