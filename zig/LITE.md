@@ -615,7 +615,8 @@ query-visible results should match within documented index rebuild semantics.
 - Expose stable error-code names and descriptions for language bindings.
 - Provide a buffer free-and-zero helper for generated bindings while retaining
   the raw pointer/length free function.
-- Add bindings for the first target languages.
+- Add Go as the first post-Zig/C binding in `go/pkg/antflylite`, backed by the
+  stable C ABI and gated C-library smoke tests.
 - Freeze the Lite open options and capabilities response.
 
 ### Phase 5: Enrichment And Inference Profiles
@@ -638,7 +639,6 @@ query-visible results should match within documented index rebuild semantics.
 
 ## Open Questions
 
-- Which language binding should be first after Zig and C?
 - Which enrichment artifacts are portable enough to backup/restore directly,
   and which should always be rebuilt?
 - What is the minimum local inference package that is small enough for Lite
