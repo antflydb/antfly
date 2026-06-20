@@ -6290,6 +6290,31 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_antfarm_assets.step);
     }
 
+    const lite_core_main_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_core_main_mod.addImport("antfly-zig", lib_mod);
+    lite_core_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    lite_core_main_mod.addImport("httpx", httpx_mod);
+    lite_core_main_mod.addImport("antfly_vellum", vellum_mod);
+    lite_core_main_mod.addImport("raft_engine", raft_engine_mod);
+    lite_core_main_mod.addImport("structlog", structlog_mod);
+    lite_core_main_mod.addImport("antfly_platform", platform_mod);
+    lite_core_main_mod.addImport("handlebars", handlebars_mod);
+    const lite_core_main = b.addExecutable(.{
+        .name = "antfly-lite-core",
+        .root_module = lite_core_main_mod,
+    });
+    const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
+
+    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantflylite C ABI");
+    lite_core_step.dependOn(&install_lite_core_main.step);
+    lite_core_step.dependOn(&install_lite_capi_lib.step);
+    lite_core_step.dependOn(&install_lite_capi_header.step);
+    lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
         run_antfly.addArgs(args);
