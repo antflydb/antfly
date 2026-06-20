@@ -23798,7 +23798,7 @@ test "api http server executes public relational row plan endpoints" {
     defer rejected_filtered_insert_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), rejected_filtered_insert_resp.status);
 
-    var allowed_filtered_insert_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o4\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":40,\"created_at\":40}}]}", identity);
+    var allowed_filtered_insert_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"insert\",\"row\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o4\",\"customer_id\":\"c1\",\"status\":\"closed\",\"amount\":40,\"created_at\":40}}]}", identity);
     defer allowed_filtered_insert_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), allowed_filtered_insert_resp.status);
 
@@ -23806,7 +23806,15 @@ test "api http server executes public relational row plan endpoints" {
     defer rejected_filtered_delete_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), rejected_filtered_delete_resp.status);
 
-    var rejected_filtered_update_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o4\"}},\"patch\":{\"tenant\":\"t2\"}}]}", identity);
+    var status_row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    status_row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "records", "{\"term\":{\"status\":\"open\"}}");
+    var status_identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "status_reader"),
+        .row_filter = status_row_filters,
+    };
+    defer status_identity.deinit(alloc);
+
+    var rejected_filtered_update_resp = try server.handlePublicTableRowsBatch("records", "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1\"}},\"patch\":{\"status\":\"closed\"}}]}", status_identity);
     defer rejected_filtered_update_resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 403), rejected_filtered_update_resp.status);
 

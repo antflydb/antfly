@@ -44,9 +44,12 @@ const SqlPatternQuantifier = sql_adapter.SqlPatternQuantifier;
 const SqlRowClaimClause = sql_adapter.SqlRowClaimClause;
 const Token = sql_adapter.Token;
 const TokenKind = sql_adapter.TokenKind;
+const aggregateSpecsEquivalent = sql_adapter.aggregateSpecsEquivalent;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
 const freeTokens = sql_adapter.freeTokens;
+const jsonValueIsValid = sql_adapter.jsonValueIsValid;
+const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
 const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
 const max_scalar_or_expanded_branches: usize = 32;
 const parseSqlTimestampLiteralNs = sql_adapter.parseSqlTimestampLiteralNs;
@@ -68,11 +71,15 @@ const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
 const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
 const tableSchemaCatalogExists = sql_adapter.tableSchemaCatalogExists;
 const sqlIntervalLiteral = sql_adapter.sqlIntervalLiteral;
+const sqlArrayItemValueMatches = sql_adapter.sqlArrayItemValueMatches;
+const sqlScalarValueMatches = sql_adapter.sqlScalarValueMatches;
+const sqlStringIsJsonNumber = sql_adapter.sqlStringIsJsonNumber;
 const tokenizeAlloc = sql_adapter.tokenizeAlloc;
 const uniqueConstraintNameExists = sql_adapter.uniqueConstraintNameExists;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
+const validateDefaultValueForColumnAlloc = sql_adapter.validateDefaultValueForColumnAlloc;
 const validateGeneratedColumnForColumns = sql_adapter.validateGeneratedColumnForColumns;
 const validateForeignKeyForColumns = sql_adapter.validateForeignKeyForColumns;
 const validateForeignKeyCatalog = sql_adapter.validateForeignKeyCatalog;
@@ -81,6 +88,9 @@ const validatePrimaryKeyTemporalCatalog = sql_adapter.validatePrimaryKeyTemporal
 const validateRelationalCheckCatalog = sql_adapter.validateRelationalCheckCatalog;
 const validateRelationalColumnCatalog = sql_adapter.validateRelationalColumnCatalog;
 const validateRelationalPeriodCatalog = sql_adapter.validateRelationalPeriodCatalog;
+const validateJsonArray = sql_adapter.validateJsonArray;
+const validateJsonDocument = sql_adapter.validateJsonDocument;
+const validateJsonStringArray = sql_adapter.validateJsonStringArray;
 const validateUniqueConstraintCatalog = sql_adapter.validateUniqueConstraintCatalog;
 const validateUniqueConstraintForColumns = sql_adapter.validateUniqueConstraintForColumns;
 const validateUniquePredicatesForColumns = sql_adapter.validateUniquePredicatesForColumns;
@@ -35171,36 +35181,6 @@ fn windowOutputFieldIsUnique(
     return matches == 1;
 }
 
-fn sqlStringIsJsonNumber(alloc: std.mem.Allocator, text: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
-    defer parsed.deinit();
-    return parsed.value == .integer or parsed.value == .float;
-}
-
-fn sqlArrayItemValueMatches(item_type: runtime_schema.AntflyType, value: std.json.Value) bool {
-    return switch (item_type) {
-        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => value == .string,
-        .numeric => value == .integer or value == .float or value == .number_string,
-        .datetime => value == .integer or value == .float or value == .number_string,
-        .boolean => value == .bool,
-        .geopoint => value == .array or value == .object,
-        .json => true,
-        .array => value == .array,
-        .embedding => false,
-    };
-}
-
-fn sqlScalarValueMatches(field_type: runtime_schema.AntflyType, value: std.json.Value) bool {
-    return switch (field_type) {
-        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => value == .string,
-        .numeric => value == .integer or value == .float or value == .number_string,
-        .datetime => value == .integer or value == .float or value == .number_string,
-        .boolean => value == .bool,
-        .geopoint => value == .array or value == .object,
-        .json, .array, .embedding => false,
-    };
-}
-
 fn generatedUnaryTextColumnForField(
     schema: runtime_schema.TableSchema,
     op: runtime_schema.RelationalGeneratedOp,
@@ -35918,169 +35898,6 @@ fn aggregateOutputColumnExists(columns: []const runtime_schema.RelationalColumn,
         if (std.mem.eql(u8, column.name, name)) return true;
     }
     return false;
-}
-
-fn aggregateSpecsEquivalent(
-    lhs: db_mod.types.RelationalRowsAggregateSpec,
-    rhs: db_mod.types.RelationalRowsAggregateSpec,
-) bool {
-    if (lhs.op != rhs.op or lhs.distinct != rhs.distinct) return false;
-    if (lhs.percentile_max_items != rhs.percentile_max_items) return false;
-    if (lhs.percentile_order != rhs.percentile_order) return false;
-    if (lhs.percentile == null or rhs.percentile == null) {
-        if (lhs.percentile != null or rhs.percentile != null) return false;
-    } else if (lhs.percentile.? != rhs.percentile.?) return false;
-    if (!floatSlicesEqual(lhs.percentiles, rhs.percentiles)) return false;
-    if (!optionalStringEqual(lhs.field, rhs.field)) return false;
-    if (!optionalStringEqual(lhs.string_delimiter, rhs.string_delimiter)) return false;
-    if (!sql_adapter.relationalRowsExpressionOptionalEqual(lhs.expression, rhs.expression)) return false;
-    if (!orderByEqual(lhs.array_order_by, rhs.array_order_by)) return false;
-    if (!relationalChecksEqual(lhs.filter_predicates, rhs.filter_predicates)) return false;
-    if (!structuredValuePredicatesEqual(lhs.filter_array_any, rhs.filter_array_any)) return false;
-    if (!structuredValuePredicatesEqual(lhs.filter_array_contains, rhs.filter_array_contains)) return false;
-    if (!structuredValuePredicatesEqual(lhs.filter_array_eq, rhs.filter_array_eq)) return false;
-    if (!inPredicatesEqual(lhs.filter_in_predicates, rhs.filter_in_predicates)) return false;
-    if (!jsonContainsEqual(lhs.filter_json_contains, rhs.filter_json_contains)) return false;
-    if (!jsonPathEqEqual(lhs.filter_json_path_eq, rhs.filter_json_path_eq)) return false;
-    if (!jsonPathExistsEqual(lhs.filter_json_path_exists, rhs.filter_json_path_exists)) return false;
-    if (!textPatternsEqual(lhs.filter_text_patterns, rhs.filter_text_patterns)) return false;
-    if (!sql_adapter.relationalRowsExpressionConditionsEqual(lhs.filter_expressions, rhs.filter_expressions)) return false;
-    if (!sql_adapter.relationalRowsExpressionArrayContainsEqual(lhs.filter_expression_array_contains, rhs.filter_expression_array_contains)) return false;
-    if (!sql_adapter.relationalRowsExpressionPredicateGroupsEqual(lhs.filter_any, rhs.filter_any)) return false;
-    if (!sql_adapter.relationalRowsExpressionPredicateGroupsEqual(lhs.filter_not, rhs.filter_not)) return false;
-    return true;
-}
-
-fn optionalStringEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return std.mem.eql(u8, lhs.?, rhs.?);
-}
-
-fn floatSlicesEqual(lhs: []const f64, rhs: []const f64) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (left != right) return false;
-    }
-    return true;
-}
-
-fn orderByEqual(lhs: []const db_mod.types.RelationalRowsQueryOrder, rhs: []const db_mod.types.RelationalRowsQueryOrder) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_order, rhs_order| {
-        if (lhs_order.direction != rhs_order.direction or
-            lhs_order.null_test != rhs_order.null_test or
-            !std.mem.eql(u8, lhs_order.field, rhs_order.field) or
-            !sql_adapter.relationalRowsExpressionOptionalEqual(lhs_order.expression, rhs_order.expression))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn relationalChecksEqual(lhs: []const runtime_schema.RelationalCheck, rhs: []const runtime_schema.RelationalCheck) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_check, rhs_check| {
-        if (!std.mem.eql(u8, lhs_check.name, rhs_check.name) or
-            !std.mem.eql(u8, lhs_check.field, rhs_check.field) or
-            lhs_check.op != rhs_check.op or
-            !optionalStringEqual(lhs_check.value_json, rhs_check.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn structuredValuePredicatesEqual(lhs: anytype, rhs: @TypeOf(lhs)) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn inPredicatesEqual(
-    lhs: []const db_mod.types.RelationalRowsInPredicate,
-    rhs: []const db_mod.types.RelationalRowsInPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.values_json, rhs_predicate.values_json) or
-            lhs_predicate.negated != rhs_predicate.negated)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn jsonContainsEqual(
-    lhs: []const db_mod.types.RelationalRowsJsonContainsPredicate,
-    rhs: []const db_mod.types.RelationalRowsJsonContainsPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn jsonPathEqEqual(
-    lhs: []const db_mod.types.RelationalRowsJsonPathEqPredicate,
-    rhs: []const db_mod.types.RelationalRowsJsonPathEqPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.path, rhs_predicate.path) or
-            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn jsonPathExistsEqual(
-    lhs: []const db_mod.types.RelationalRowsJsonPathExistsPredicate,
-    rhs: []const db_mod.types.RelationalRowsJsonPathExistsPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.path, rhs_predicate.path))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn textPatternsEqual(
-    lhs: []const db_mod.types.RelationalRowsTextPatternPredicate,
-    rhs: []const db_mod.types.RelationalRowsTextPatternPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.pattern, rhs_predicate.pattern) or
-            lhs_predicate.case_insensitive != rhs_predicate.case_insensitive or
-            lhs_predicate.negated != rhs_predicate.negated)
-        {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn joinSideForQualifier(
@@ -38740,52 +38557,6 @@ fn alterRelationalColumnTypeAlloc(
     try validateRelationalCheckCatalog(schema.relational_columns, schema.checks);
 }
 
-fn validateDefaultValueForColumnAlloc(
-    alloc: std.mem.Allocator,
-    column: runtime_schema.RelationalColumn,
-    default_value: runtime_schema.RelationalDefaultValue,
-) !void {
-    switch (default_value.kind) {
-        .uuid_v4 => {
-            if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.UnsupportedSqlShape;
-        },
-        .now_ns => {
-            if (column.field_type != .numeric and column.field_type != .datetime) return error.UnsupportedSqlShape;
-        },
-        .current_date_ns => {
-            if (column.field_type != .numeric and column.field_type != .datetime) return error.UnsupportedSqlShape;
-        },
-        .literal => try validateLiteralDefaultForColumnAlloc(alloc, column, default_value.value_json),
-    }
-}
-
-fn validateLiteralDefaultForColumnAlloc(
-    alloc: std.mem.Allocator,
-    column: runtime_schema.RelationalColumn,
-    value_json: []const u8,
-) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value == .null) return;
-    switch (column.field_type) {
-        .keyword, .text, .link, .blob, .datetime => {
-            if (parsed.value != .string) return error.UnsupportedSqlShape;
-        },
-        .numeric => switch (parsed.value) {
-            .integer, .float => {},
-            else => return error.UnsupportedSqlShape,
-        },
-        .boolean => {
-            if (parsed.value != .bool) return error.UnsupportedSqlShape;
-        },
-        .json => {},
-        .array => {
-            if (parsed.value != .array) return error.UnsupportedSqlShape;
-        },
-        else => return error.UnsupportedSqlShape,
-    }
-}
-
 fn markColumnIndexedAlloc(
     alloc: std.mem.Allocator,
     schema: *runtime_schema.TableSchema,
@@ -39044,54 +38815,6 @@ fn updateWillLookupExistingRow(schema: runtime_schema.TableSchema, returning: Re
         if (column.generated != null) return true;
     }
     return false;
-}
-
-fn validateJsonDocument(alloc: std.mem.Allocator, value: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    switch (parsed.value) {
-        .object, .array => {},
-        else => return error.UnsupportedSqlShape,
-    }
-}
-
-fn validateJsonArray(alloc: std.mem.Allocator, value: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.UnsupportedSqlShape;
-}
-
-fn validateJsonStringArray(alloc: std.mem.Allocator, value: []const u8) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value != .array) return error.UnsupportedSqlShape;
-    for (parsed.value.array.items) |item| {
-        if (item != .string) return error.UnsupportedSqlShape;
-    }
-}
-
-fn jsonSetTypedTransformPathAlloc(
-    alloc: std.mem.Allocator,
-    field: []const u8,
-    path_segments: []const []const u8,
-) ![]u8 {
-    if (field.len == 0 or path_segments.len == 0) return error.UnsupportedSqlShape;
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    try writer.writeAll(field);
-    for (path_segments) |segment| {
-        if (segment.len == 0 or std.mem.indexOfScalar(u8, segment, '.') != null) return error.UnsupportedSqlShape;
-        try writer.writeByte('.');
-        try writer.writeAll(segment);
-    }
-    return try out.toOwnedSlice();
-}
-
-fn jsonValueIsValid(alloc: std.mem.Allocator, value: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return false;
-    parsed.deinit();
-    return true;
 }
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {

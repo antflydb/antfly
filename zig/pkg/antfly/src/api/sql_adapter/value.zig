@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const parser = @import("parser.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
@@ -45,6 +46,112 @@ pub const SqlValue = union(enum) {
         };
     }
 };
+
+pub fn sqlStringIsJsonNumber(alloc: std.mem.Allocator, text: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .integer or parsed.value == .float;
+}
+
+pub fn sqlArrayItemValueMatches(item_type: runtime_schema.AntflyType, value: std.json.Value) bool {
+    return switch (item_type) {
+        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => value == .string,
+        .numeric => value == .integer or value == .float or value == .number_string,
+        .datetime => value == .integer or value == .float or value == .number_string,
+        .boolean => value == .bool,
+        .geopoint => value == .array or value == .object,
+        .json => true,
+        .array => value == .array,
+        .embedding => false,
+    };
+}
+
+pub fn sqlScalarValueMatches(field_type: runtime_schema.AntflyType, value: std.json.Value) bool {
+    return switch (field_type) {
+        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => value == .string,
+        .numeric => value == .integer or value == .float or value == .number_string,
+        .datetime => value == .integer or value == .float or value == .number_string,
+        .boolean => value == .bool,
+        .geopoint => value == .array or value == .object,
+        .json, .array, .embedding => false,
+    };
+}
+
+pub fn validateDefaultValueForColumnAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    default_value: runtime_schema.RelationalDefaultValue,
+) !void {
+    switch (default_value.kind) {
+        .uuid_v4 => {
+            if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.UnsupportedSqlShape;
+        },
+        .now_ns => {
+            if (column.field_type != .numeric and column.field_type != .datetime) return error.UnsupportedSqlShape;
+        },
+        .current_date_ns => {
+            if (column.field_type != .numeric and column.field_type != .datetime) return error.UnsupportedSqlShape;
+        },
+        .literal => try validateLiteralDefaultForColumnAlloc(alloc, column, default_value.value_json),
+    }
+}
+
+fn validateLiteralDefaultForColumnAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    value_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value == .null) return;
+    switch (column.field_type) {
+        .keyword, .text, .link, .blob, .datetime => {
+            if (parsed.value != .string) return error.UnsupportedSqlShape;
+        },
+        .numeric => switch (parsed.value) {
+            .integer, .float => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        .boolean => {
+            if (parsed.value != .bool) return error.UnsupportedSqlShape;
+        },
+        .json => {},
+        .array => {
+            if (parsed.value != .array) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+pub fn validateJsonDocument(alloc: std.mem.Allocator, value: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .object, .array => {},
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+pub fn validateJsonArray(alloc: std.mem.Allocator, value: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.UnsupportedSqlShape;
+}
+
+pub fn validateJsonStringArray(alloc: std.mem.Allocator, value: []const u8) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.UnsupportedSqlShape;
+    for (parsed.value.array.items) |item| {
+        if (item != .string) return error.UnsupportedSqlShape;
+    }
+}
+
+pub fn jsonValueIsValid(alloc: std.mem.Allocator, value: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return false;
+    parsed.deinit();
+    return true;
+}
 
 pub fn parseSqlUntypedValueJsonAlloc(
     alloc: std.mem.Allocator,
@@ -306,6 +413,34 @@ test "sql adapter value parses scalar json literals" {
     defer alloc.free(negative_json);
     try std.testing.expectEqualStrings("-42", negative_json);
     try std.testing.expectEqual(@as(usize, 2), negative_pos);
+}
+
+test "sql adapter value validates json values and defaults" {
+    const alloc = std.testing.allocator;
+    const keyword_column: runtime_schema.RelationalColumn = .{ .name = "status", .path = "status", .field_type = .keyword };
+    const numeric_column: runtime_schema.RelationalColumn = .{ .name = "amount", .path = "amount", .field_type = .numeric };
+    const array_column: runtime_schema.RelationalColumn = .{ .name = "tags", .path = "tags", .field_type = .array };
+
+    try validateDefaultValueForColumnAlloc(alloc, keyword_column, .{ .kind = .literal, .value_json = "\"open\"" });
+    try validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .now_ns, .value_json = "" });
+    try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, numeric_column, .{ .kind = .literal, .value_json = "\"bad\"" }));
+    try std.testing.expectError(error.UnsupportedSqlShape, validateDefaultValueForColumnAlloc(alloc, array_column, .{ .kind = .uuid_v4, .value_json = "" }));
+
+    try validateJsonDocument(alloc, "{\"a\":1}");
+    try validateJsonArray(alloc, "[1,2]");
+    try validateJsonStringArray(alloc, "[\"a\",\"b\"]");
+    try std.testing.expectError(error.UnsupportedSqlShape, validateJsonDocument(alloc, "\"not-doc\""));
+    try std.testing.expectError(error.UnsupportedSqlShape, validateJsonStringArray(alloc, "[\"a\",2]"));
+
+    var parsed_number = try std.json.parseFromSlice(std.json.Value, alloc, "42", .{});
+    defer parsed_number.deinit();
+    var parsed_string = try std.json.parseFromSlice(std.json.Value, alloc, "\"x\"", .{});
+    defer parsed_string.deinit();
+    try std.testing.expect(sqlStringIsJsonNumber(alloc, "42"));
+    try std.testing.expect(sqlArrayItemValueMatches(.numeric, parsed_number.value));
+    try std.testing.expect(sqlScalarValueMatches(.keyword, parsed_string.value));
+    try std.testing.expect(jsonValueIsValid(alloc, "{\"ok\":true}"));
+    try std.testing.expect(!jsonValueIsValid(alloc, "{bad"));
 }
 
 test "sql adapter value parses interval literals" {

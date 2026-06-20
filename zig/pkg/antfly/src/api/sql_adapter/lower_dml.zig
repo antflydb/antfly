@@ -94,6 +94,24 @@ pub fn sqlDottedPathConflictsJsonSetPath(
     return sqlJsonSegmentsConflictDottedPath(json_path, path[json_field_path.len + 1 ..]);
 }
 
+pub fn jsonSetTypedTransformPathAlloc(
+    alloc: std.mem.Allocator,
+    field: []const u8,
+    path_segments: []const []const u8,
+) ![]u8 {
+    if (field.len == 0 or path_segments.len == 0) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll(field);
+    for (path_segments) |segment| {
+        if (segment.len == 0 or std.mem.indexOfScalar(u8, segment, '.') != null) return error.UnsupportedSqlShape;
+        try writer.writeByte('.');
+        try writer.writeAll(segment);
+    }
+    return try out.toOwnedSlice();
+}
+
 pub fn sqlDottedPathsConflict(lhs: []const u8, rhs: []const u8) bool {
     if (std.mem.eql(u8, lhs, rhs)) return true;
     return sqlDottedPathIsAncestor(lhs, rhs) or sqlDottedPathIsAncestor(rhs, lhs);
@@ -142,6 +160,13 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expect(sqlDottedPathConflictsJsonSetPath("metadata.profile.status", "metadata", &profile_path));
     try std.testing.expect(sqlDottedPathConflictsJsonSetPath("metadata.profile.status", "metadata", &settings_path));
     try std.testing.expect(!sqlDottedPathConflictsJsonSetPath("profile.status", "metadata", &settings_path));
+
+    const alloc = std.testing.allocator;
+    const typed_path = try jsonSetTypedTransformPathAlloc(alloc, "metadata", &nested_status_path);
+    defer alloc.free(typed_path);
+    try std.testing.expectEqualStrings("metadata.profile.status", typed_path);
+    try std.testing.expectError(error.UnsupportedSqlShape, jsonSetTypedTransformPathAlloc(alloc, "metadata", &.{""}));
+    try std.testing.expectError(error.UnsupportedSqlShape, jsonSetTypedTransformPathAlloc(alloc, "metadata", &.{"bad.segment"}));
 }
 
 test "sql adapter lower dml detects merge target row usage" {

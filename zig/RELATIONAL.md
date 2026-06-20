@@ -1053,16 +1053,21 @@ partial unique-predicate token grouping and atom parsing into
 contract unchanged. Parser-local forwarding wrappers for identifier lists and
 scalar JSON literals are removed as adapter facade calls replace them, with
 negative-number JSON literal parsing owned by `api/sql_adapter/value.zig`.
+Default-value validation, JSON document/array shape checks, JSON literal
+validity checks, and scalar/array JSON type matching also live in
+`api/sql_adapter/value.zig`, so DDL, DML, and expression parsing share one
+adapter-owned value boundary.
 Case-insensitive identifier-list uniqueness and disjointness checks move with
 the list grammar into `api/sql_adapter/grammar.zig`. The validating DDL
 constraint column-list entrypoints for primary keys, unique constraints,
 temporal `WITHOUT OVERLAPS` lists, and `INCLUDE` columns also live in
 `grammar.zig`, so `relational_sql.zig` no longer needs parser-local wrappers
 that parse a list and then re-run identifier-list validation. Mutation-path
-conflict validation for insert columns, dotted field paths, and JSON set paths
-now lives in `api/sql_adapter/lower_dml.zig`, with `relational_sql.zig` only
-adapting its parser-local temporary assignment structs to that shared DML
-surface. MERGE target-row usage checks for expressions and predicate groups
+conflict validation for insert columns, dotted field paths, JSON set paths, and
+typed JSON-set transform path construction now lives in
+`api/sql_adapter/lower_dml.zig`, with `relational_sql.zig` only adapting its
+parser-local temporary assignment structs to that shared DML surface. MERGE
+target-row usage checks for expressions and predicate groups
 also live in `lower_dml.zig`, so source-only clauses fail closed through
 adapter-owned DML rules instead of parser-local recursion. Basic runtime-column
 lookup moves to `api/sql_adapter/binder.zig` so parser validation, DML lowering,
@@ -1078,8 +1083,11 @@ bind typed catalog metadata to existing relational columns and periods.
 Row-expression equality and unique-expression duplicate validation move into
 `api/sql_adapter/lower_expr.zig`, so DDL index parsing, conflict-target parsing,
 and plan/fingerprint comparisons use one adapter-owned expression comparison
-surface. Row-expression determinism and catalog check-expression type validation
-also live in `lower_expr.zig`, so partial indexes, generated columns, and
+surface. Aggregate-spec equivalence also lives in `lower_expr.zig`, so aggregate
+deduplication compares row expressions, order keys, and typed filter predicates
+through the same adapter-owned equality helpers. Row-expression determinism and
+catalog check-expression type validation also live in `lower_expr.zig`, so
+partial indexes, generated columns, and
 expression checks share the same definition of catalog-safe deterministic and
 type-compatible expression trees. DDL catalog validation for relational columns,
 primary keys, `CHECK`, foreign-key names, generated columns, unique constraints,
