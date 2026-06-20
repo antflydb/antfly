@@ -1344,6 +1344,7 @@ pub fn changeJournalOpenOptionsForPrimaryKind(
 pub fn openCoreResourcesFromPrimaryStore(
     alloc: Allocator,
     path: []const u8,
+    index_base_path: []const u8,
     map_size: usize,
     no_sync: bool,
     primary_backend_kind: PrimaryBackendKind,
@@ -1436,7 +1437,7 @@ pub fn openCoreResourcesFromPrimaryStore(
 
     index_manager.* = try index_manager_mod.IndexManager.initWithOptions(
         alloc,
-        path,
+        index_base_path,
         index_backends,
     );
     index_manager.setAppliedSequenceCheckpointPath(applied_sequence_checkpoint_path);

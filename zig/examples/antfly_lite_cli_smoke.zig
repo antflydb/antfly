@@ -113,6 +113,9 @@ pub fn main(init: std.process.Init) !void {
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", db_path, "--out", restored_snapshot_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_snapshot_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", restored_snapshot_path, "--file", dense_query_path }, "doc:cli-vec-a");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", restored_snapshot_path, "--file", sparse_query_path }, "doc:cli-vec-a");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", restored_snapshot_path, "--file", graph_query_path }, "doc:cli-vec-c");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "vacuum", restored_path }, "\"after_size\":");
 }
 

@@ -24,6 +24,7 @@ const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
 
 const Allocator = std.mem.Allocator;
+const native_index_base_path = "__antfly_lite";
 
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
@@ -244,6 +245,7 @@ pub const Handle = struct {
                 opts.index_backends.dense_lsm_options.storage = storage;
                 opts.index_backends.sparse_lsm_options.storage = storage;
                 opts.index_backends.graph_reverse_lsm_options.storage = storage;
+                opts.index_base_path = native_index_base_path;
                 opts.index_open_parallelism = 1;
                 opts.external_derived_checkpoints = false;
             },
@@ -472,6 +474,7 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.index_backends.dense_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.sparse_lsm_storage != null);
     try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
+    try std.testing.expectEqualStrings(native_index_base_path, db_opts.index_base_path.?);
     try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
 
     const vacuumed = try handle.vacuum();

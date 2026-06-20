@@ -242,6 +242,7 @@ pub const OpenOptions = struct {
     change_journal_backend: ?change_journal_mod.StorageBackend = null,
     change_journal_storage: ?lsm_backend_mod.Storage = null,
     index_backends: db_config.IndexBackendOptions = .{},
+    index_base_path: ?[]const u8 = null,
     index_open_parallelism: ?usize = null,
     identity_namespace: ?doc_identity.Namespace = null,
     prefer_existing_identity_namespace: bool = false,
@@ -2650,6 +2651,7 @@ pub const DB = struct {
             const core = try db_core.openCoreResourcesFromPrimaryStore(
                 alloc,
                 path,
+                opts.index_base_path orelse path,
                 opts.map_size,
                 opts.no_sync,
                 resolved_config.primary_backend_kind,
