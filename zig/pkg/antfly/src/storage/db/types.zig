@@ -1553,6 +1553,33 @@ pub const RelationalRowsQueryResult = struct {
     }
 };
 
+pub const RelationalRowsSetOperation = enum {
+    union_distinct,
+    union_all,
+    intersect,
+    except,
+};
+
+pub const RelationalRowsSetOperationPlan = struct {
+    operation: RelationalRowsSetOperation,
+    left: RelationalRowsQueryPlan,
+    right: RelationalRowsQueryPlan,
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+    max_rows: ?u32 = null,
+    max_bytes: ?u64 = null,
+    spill_after_bytes: ?u64 = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
+        var order_query: RelationalRowsQueryRequest = .{ .order_by = self.order_by };
+        order_query.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const RelationalRowsMutationKind = enum {
     update,
     delete,

@@ -1347,6 +1347,14 @@ pub const TableReadSource = struct {
             plan: db_mod.types.RelationalRowsQueryPlan,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_set_operation_plan: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsSetOperationPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         rows_aggregate_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1679,6 +1687,18 @@ pub const TableReadSource = struct {
     ) !?db_mod.types.RelationalRowsQueryResult {
         const fn_ptr = self.vtable.rows_query_plan_catalog orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, target, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsSetOperationPlan(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_set_operation_plan orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
     pub fn rowsAggregatePlan(
@@ -2318,6 +2338,7 @@ pub const BoundTableReadSource = struct {
                 .relational_temporal_unique_owner_lookup_group_local = BoundTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
                 .relational_temporal_unique_overlap_owner_lookup_group_local = BoundTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
+                .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -2619,6 +2640,20 @@ pub const BoundTableReadSource = struct {
         return try self.db.queryRelationalRowsPlan(alloc, runtime_schema, plan);
     }
 
+    fn rowsSetOperationPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, plan);
+    }
+
     fn rowsAggregatePlan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -2910,6 +2945,7 @@ pub const ProvisionedTableReadSource = struct {
                 .relational_temporal_unique_overlap_owner_lookup_group_local = ProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = rowsQueryPlanCatalogNative,
+                .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -3317,6 +3353,20 @@ pub const ProvisionedTableReadSource = struct {
         return try rowsQueryPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
+    fn rowsSetOperationPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        const routed_source = self.source();
+        return try rowsSetOperationPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
+    }
+
     fn rowsAggregatePlan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3627,6 +3677,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .relational_temporal_unique_overlap_owner_lookup_group_local = HostedProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = HostedProvisionedTableReadSource.rowsQueryPlanCatalogNative,
+                .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
                 .rows_join_plan = rowsJoinPlan,
@@ -3952,6 +4003,19 @@ pub const HostedProvisionedTableReadSource = struct {
         const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
         defer alloc.free(table_name);
         return try rowsQueryPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsSetOperationPlan(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsSetOperationPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const routed_source = self.source();
+        return try rowsSetOperationPlanFromRoutedScansAlloc(alloc, routed_source, table_name, runtime_schema, plan, consistency);
     }
 
     fn rowsAggregatePlan(
@@ -4703,142 +4767,64 @@ fn executeLoweredSqlSetOperationPlanAlloc(
     const left_schema = owned_left_schema orelse default_schema;
     const right_schema = owned_right_schema orelse default_schema;
 
+    const operation = loweredSqlSetOperationToRowsOperation(lowered.operation);
+    const same_table = std.mem.eql(u8, lowered.left.table_name, lowered.right.table_name);
+    if (same_table) {
+        return try source.rowsSetOperationPlan(alloc, lowered.left.table_name, left_schema, .{
+            .operation = operation,
+            .left = lowered.left.plan,
+            .right = lowered.right.plan,
+            .order_by = lowered.order_by,
+            .limit = lowered.limit,
+            .offset = lowered.offset,
+        }, consistency);
+    }
+
     var left = (try source.rowsQueryPlan(alloc, lowered.left.table_name, left_schema, lowered.left.plan, consistency)) orelse return null;
     defer left.deinit(alloc);
     var right = (try source.rowsQueryPlan(alloc, lowered.right.table_name, right_schema, lowered.right.plan, consistency)) orelse return null;
     defer right.deinit(alloc);
-
-    var rows = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (rows.items) |row| alloc.free(@constCast(row));
-        rows.deinit(alloc);
-    }
-
-    switch (lowered.operation) {
-        .union_all => {
-            try appendSetOperationRowsAlloc(alloc, &rows, left.rows);
-            try appendSetOperationRowsAlloc(alloc, &rows, right.rows);
-        },
-        .union_distinct => {
-            var seen = std.StringHashMapUnmanaged(void).empty;
-            defer freeSetOperationSeenKeys(alloc, &seen);
-            try appendDistinctSetOperationRowsAlloc(alloc, &rows, &seen, left.rows);
-            try appendDistinctSetOperationRowsAlloc(alloc, &rows, &seen, right.rows);
-        },
-        .intersect => {
-            var right_seen = std.StringHashMapUnmanaged(void).empty;
-            defer right_seen.deinit(alloc);
-            for (right.rows) |row| {
-                const gop = try right_seen.getOrPut(alloc, row);
-                if (!gop.found_existing) gop.value_ptr.* = {};
-            }
-            var emitted = std.StringHashMapUnmanaged(void).empty;
-            defer freeSetOperationSeenKeys(alloc, &emitted);
-            for (left.rows) |row| {
-                if (right_seen.contains(row)) try appendDistinctSetOperationRowAlloc(alloc, &rows, &emitted, row);
-            }
-        },
-        .except => {
-            var right_seen = std.StringHashMapUnmanaged(void).empty;
-            defer right_seen.deinit(alloc);
-            for (right.rows) |row| {
-                const gop = try right_seen.getOrPut(alloc, row);
-                if (!gop.found_existing) gop.value_ptr.* = {};
-            }
-            var emitted = std.StringHashMapUnmanaged(void).empty;
-            defer freeSetOperationSeenKeys(alloc, &emitted);
-            for (left.rows) |row| {
-                if (!right_seen.contains(row)) try appendDistinctSetOperationRowAlloc(alloc, &rows, &emitted, row);
-            }
-        },
-    }
-
-    try enforceSetOperationMaterializationAdmission(rows.items, .{ .name = "__sql_set_operation_result" });
-    const total = std.math.cast(u32, rows.items.len) orelse return error.InvalidRowsRequest;
-    const owned_rows = try rows.toOwnedSlice(alloc);
-    if (lowered.order_by.len == 0 and lowered.limit == null and lowered.offset == 0) {
-        return .{
-            .rows = owned_rows,
-            .total = total,
-        };
-    }
-
-    var combined: db_mod.types.RelationalRowsQueryResult = .{
-        .rows = owned_rows,
-        .total = total,
-    };
-    defer combined.deinit(alloc);
-    const output_schema: storage_schema.TableSchema = .{
-        .storage_mode = .relational,
-        .relational_columns = lowered.output_columns,
-    };
-    const tail_query: relational_rows_api.OwnedRowsQueryRequest = .{
-        .select_all = true,
+    return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, .{
+        .operation = operation,
+        .left = lowered.left.plan,
+        .right = lowered.right.plan,
         .order_by = lowered.order_by,
         .limit = lowered.limit,
         .offset = lowered.offset,
+    }, left.rows, right.rows);
+}
+
+fn loweredSqlSetOperationToRowsOperation(operation: relational_sql_api.SelectSetOperation) db_mod.types.RelationalRowsSetOperation {
+    return switch (operation) {
+        .union_distinct => .union_distinct,
+        .union_all => .union_all,
+        .intersect => .intersect,
+        .except => .except,
     };
-    return try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, output_schema, tail_query, combined.rows);
 }
 
-fn enforceSetOperationMaterializationAdmission(
-    rows: []const []const u8,
-    cte_admission: db_mod.types.RelationalRowsCte,
-) !void {
-    const observed_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(rows) orelse return error.UnsupportedRowsQuery;
-    switch (db_mod.types.relationalRowsCteMaterializationDecision(cte_admission, rows.len, observed_bytes)) {
-        .memory => {},
-        .spill, .reject => return error.UnsupportedRowsQuery,
-    }
-}
-
-fn appendSetOperationRowsAlloc(
+fn executeRelationalRowsSetOperationOnQueryResultsAlloc(
     alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged([]const u8),
-    rows: []const []const u8,
-) !void {
-    for (rows) |row| try out.append(alloc, try alloc.dupe(u8, row));
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    left_rows: []const []const u8,
+    right_rows: []const []const u8,
+) !db_mod.types.RelationalRowsQueryResult {
+    const combined = try db_mod.DB.relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left_rows, right_rows);
+    defer freeSetOperationOwnedRows(alloc, combined);
+    db_mod.DB.admitRelationalRowsSetOperationRows(plan, combined) catch |err| switch (err) {
+        error.UnsupportedQueryRequest => return error.UnsupportedRowsQuery,
+    };
+    return try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "set_operation", combined, .{
+        .select_all = true,
+        .order_by = plan.order_by,
+        .limit = plan.limit,
+        .offset = plan.offset,
+    });
 }
 
-fn appendDistinctSetOperationRowsAlloc(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged([]const u8),
-    seen: *std.StringHashMapUnmanaged(void),
-    rows: []const []const u8,
-) !void {
-    for (rows) |row| try appendDistinctSetOperationRowAlloc(alloc, out, seen, row);
-}
-
-fn appendDistinctSetOperationRowAlloc(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged([]const u8),
-    seen: *std.StringHashMapUnmanaged(void),
-    row: []const u8,
-) !void {
-    if (seen.contains(row)) return;
-    const key = try alloc.dupe(u8, row);
-    var key_transferred = false;
-    errdefer if (!key_transferred) alloc.free(key);
-    const gop = try seen.getOrPut(alloc, key);
-    if (gop.found_existing) {
-        alloc.free(key);
-        return;
-    }
-    gop.value_ptr.* = {};
-    key_transferred = true;
-
-    const owned = try alloc.dupe(u8, row);
-    errdefer alloc.free(owned);
-    try out.append(alloc, owned);
-}
-
-fn freeSetOperationSeenKeys(
-    alloc: std.mem.Allocator,
-    seen: *std.StringHashMapUnmanaged(void),
-) void {
-    var keys = seen.keyIterator();
-    while (keys.next()) |key| alloc.free(@constCast(key.*));
-    seen.deinit(alloc);
+fn freeSetOperationOwnedRows(alloc: std.mem.Allocator, rows: []const []const u8) void {
+    for (rows) |row| alloc.free(@constCast(row));
+    if (rows.len > 0) alloc.free(rows);
 }
 
 test "lowered sql set operation materialization admission fails closed on caps and spill" {
@@ -4848,30 +4834,38 @@ test "lowered sql set operation materialization admission fails closed on caps a
     };
     const observed_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(&rows) orelse return error.TestUnexpectedResult;
 
-    try enforceSetOperationMaterializationAdmission(&rows, .{
-        .name = "set_result",
+    try db_mod.DB.admitRelationalRowsSetOperationRows(.{
+        .operation = .union_distinct,
+        .left = .{},
+        .right = .{},
         .max_rows = 2,
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes,
-    });
-    try std.testing.expectError(error.UnsupportedRowsQuery, enforceSetOperationMaterializationAdmission(&rows, .{
-        .name = "set_result",
+    }, &rows);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db_mod.DB.admitRelationalRowsSetOperationRows(.{
+        .operation = .union_distinct,
+        .left = .{},
+        .right = .{},
         .max_rows = 1,
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes,
-    }));
-    try std.testing.expectError(error.UnsupportedRowsQuery, enforceSetOperationMaterializationAdmission(&rows, .{
-        .name = "set_result",
+    }, &rows));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db_mod.DB.admitRelationalRowsSetOperationRows(.{
+        .operation = .union_distinct,
+        .left = .{},
+        .right = .{},
         .max_rows = 2,
         .max_bytes = observed_bytes - 1,
         .spill_after_bytes = observed_bytes - 1,
-    }));
-    try std.testing.expectError(error.UnsupportedRowsQuery, enforceSetOperationMaterializationAdmission(&rows, .{
-        .name = "set_result",
+    }, &rows));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db_mod.DB.admitRelationalRowsSetOperationRows(.{
+        .operation = .union_distinct,
+        .left = .{},
+        .right = .{},
         .max_rows = 2,
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes - 1,
-    }));
+    }, &rows));
 }
 
 fn catalogRuntimeSchemaUnlessDefaultAlloc(
@@ -5085,6 +5079,21 @@ fn rowsQueryPlanFromLakeScanAlloc(
     var scan_result = (try source.lakeRowsScan(alloc, table_name, runtime_schema, lake_request.request, consistency)) orelse return null;
     defer scan_result.deinit(alloc);
     return try relational_rows_api.buildRowsQueryResultFromLakeRowsWithSchemaAlloc(alloc, runtime_schema, plan.query, scan_result);
+}
+
+fn rowsSetOperationPlanFromRoutedScansAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    runtime_schema: storage_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var left = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.left, consistency)) orelse return null;
+    defer left.deinit(alloc);
+    var right = (try rowsQueryPlanFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, plan.right, consistency)) orelse return null;
+    defer right.deinit(alloc);
+    return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, plan, left.rows, right.rows);
 }
 
 fn rowsAggregatePlanFromLakeScanAlloc(
@@ -6124,6 +6133,7 @@ pub const ExternalLakeRoutingTableReadSource = struct {
                 .relational_temporal_unique_overlap_owner_lookup_group_local = relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = rowsQueryPlanCatalog,
+                .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .lake_rows_scan = lakeRowsScan,
                 .lake_rows_expression_aggregates = lakeRowsExpressionAggregates,
@@ -6241,6 +6251,12 @@ pub const ExternalLakeRoutingTableReadSource = struct {
         var lake_source = try self.openedLakeSourceAlloc(alloc, runtime_schema);
         defer lake_source.deinit();
         return try lake_source.source().rowsQueryPlan(alloc, target.table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsSetOperationPlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsSetOperationPlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (runtime_schema.external_base_source == null) return try self.base.rowsSetOperationPlan(alloc, table_name, runtime_schema, plan, consistency);
+        return error.UnsupportedRowsQuery;
     }
 
     fn rowsAggregatePlan(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, runtime_schema: storage_schema.TableSchema, plan: db_mod.types.RelationalRowsAggregatePlan, consistency: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsAggregateResult {

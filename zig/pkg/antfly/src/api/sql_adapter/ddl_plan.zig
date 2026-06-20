@@ -2356,6 +2356,125 @@ pub fn routineKindFromSyntax(syntax: grammar.RoutineKindSyntax) RoutineKind {
     };
 }
 
+pub fn ddlRangeBoundTypeForName(name: []const u8) ?runtime_schema.AntflyType {
+    if (std.ascii.eqlIgnoreCase(name, "daterange")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "tsrange")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "tstzrange")) return .datetime;
+    if (std.ascii.eqlIgnoreCase(name, "numrange")) return .numeric;
+    return null;
+}
+
+pub fn ddlRangeTypeForName(name: []const u8) ?runtime_schema.RelationalPeriodRangeType {
+    if (std.ascii.eqlIgnoreCase(name, "numrange")) return .numrange;
+    if (std.ascii.eqlIgnoreCase(name, "daterange")) return .daterange;
+    if (std.ascii.eqlIgnoreCase(name, "tsrange")) return .tsrange;
+    if (std.ascii.eqlIgnoreCase(name, "tstzrange")) return .tstzrange;
+    return null;
+}
+
+pub fn relationalPeriodRangeTypeName(range_type: runtime_schema.RelationalPeriodRangeType) []const u8 {
+    return switch (range_type) {
+        .numrange => "numrange",
+        .daterange => "daterange",
+        .tsrange => "tsrange",
+        .tstzrange => "tstzrange",
+    };
+}
+
+pub fn relationalCheckOpToken(op: runtime_schema.RelationalCheckOp) []const u8 {
+    return switch (op) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .is_distinct => "is_distinct",
+        .is_not_distinct => "is_not_distinct",
+        .eq => "eq",
+        .ne => "ne",
+        .gt => "gt",
+        .gte => "gte",
+        .lt => "lt",
+        .lte => "lte",
+    };
+}
+
+pub fn uniqueConstraintValidationStateString(state: runtime_schema.UniqueConstraintValidationState) []const u8 {
+    return switch (state) {
+        .enforced => "enforced",
+        .unvalidated => "unvalidated",
+        .validating => "validating",
+        .invalid => "invalid",
+    };
+}
+
+pub fn relationalCheckValidationStateName(state: runtime_schema.RelationalCheckValidationState) []const u8 {
+    return switch (state) {
+        .enforced => "enforced",
+        .unvalidated => "unvalidated",
+        .validating => "validating",
+        .invalid => "invalid",
+    };
+}
+
+pub fn antflyTypeSchemaName(field_type: runtime_schema.AntflyType) []const u8 {
+    return switch (field_type) {
+        .text => "text",
+        .keyword => "keyword",
+        .numeric => "numeric",
+        .embedding => "embedding",
+        .boolean => "boolean",
+        .datetime => "datetime",
+        .geopoint => "geopoint",
+        .geoshape => "geoshape",
+        .blob => "blob",
+        .html => "html",
+        .search_as_you_type => "search_as_you_type",
+        .json => "json",
+        .array => "array",
+        .link => "link",
+    };
+}
+
+pub fn foreignKeyActionName(action: runtime_schema.ForeignKeyAction) []const u8 {
+    return switch (action) {
+        .restrict => "restrict",
+        .set_null => "set_null",
+        .cascade => "cascade",
+        .no_action => "no_action",
+    };
+}
+
+pub fn foreignKeyTimingName(timing: runtime_schema.ForeignKeyTiming) []const u8 {
+    return switch (timing) {
+        .immediate => "immediate",
+        .deferred => "deferred",
+    };
+}
+
+pub fn foreignKeyMatchName(match: runtime_schema.ForeignKeyMatch) []const u8 {
+    return switch (match) {
+        .simple => "simple",
+        .full => "full",
+        .partial => "partial",
+    };
+}
+
+pub fn foreignKeyValidationStateName(state: runtime_schema.ForeignKeyValidationState) []const u8 {
+    return switch (state) {
+        .enforced => "enforced",
+        .unvalidated => "unvalidated",
+        .validating => "validating",
+        .invalid => "invalid",
+    };
+}
+
+pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLifecycle) []const u8 {
+    return switch (lifecycle) {
+        .ready => "ready",
+        .building => "building",
+        .invalid => "invalid",
+        .dropping => "dropping",
+    };
+}
+
 test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqual(CursorScrollMode.no_scroll, cursorScrollModeFromSyntax(.no_scroll));
     try std.testing.expectEqual(CursorFetchDirection.backward, cursorFetchDirectionFromSyntax(.backward));
@@ -2376,6 +2495,19 @@ test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
     try std.testing.expectEqual(ReindexMaintenanceTarget.system, reindexMaintenanceTargetFromSyntax(.system));
     try std.testing.expectEqual(BulkIoDirection.to, bulkIoDirectionFromSyntax(.to));
     try std.testing.expectEqual(RoutineKind.procedure, routineKindFromSyntax(.procedure));
+    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, ddlRangeBoundTypeForName("tstzrange").?);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, ddlRangeBoundTypeForName("numrange").?);
+    try std.testing.expectEqual(runtime_schema.RelationalPeriodRangeType.tsrange, ddlRangeTypeForName("tsrange").?);
+    try std.testing.expectEqualStrings("daterange", relationalPeriodRangeTypeName(.daterange));
+    try std.testing.expectEqualStrings("is_not_distinct", relationalCheckOpToken(.is_not_distinct));
+    try std.testing.expectEqualStrings("validating", uniqueConstraintValidationStateString(.validating));
+    try std.testing.expectEqualStrings("invalid", relationalCheckValidationStateName(.invalid));
+    try std.testing.expectEqualStrings("search_as_you_type", antflyTypeSchemaName(.search_as_you_type));
+    try std.testing.expectEqualStrings("set_null", foreignKeyActionName(.set_null));
+    try std.testing.expectEqualStrings("deferred", foreignKeyTimingName(.deferred));
+    try std.testing.expectEqualStrings("partial", foreignKeyMatchName(.partial));
+    try std.testing.expectEqualStrings("unvalidated", foreignKeyValidationStateName(.unvalidated));
+    try std.testing.expectEqualStrings("dropping", relationalIndexLifecycleName(.dropping));
 }
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {

@@ -523,6 +523,182 @@ pub fn aggregateOutputColumnExists(columns: []const runtime_schema.RelationalCol
     return false;
 }
 
+pub fn expressionOrderCount(order_by: []const db_mod.types.RelationalRowsQueryOrder) usize {
+    var count: usize = 0;
+    for (order_by) |order| {
+        if (order.expression != null) count += 1;
+    }
+    return count;
+}
+
+pub fn aggregateFilterExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        count += aggregation.filter_expressions.len;
+    }
+    return count;
+}
+
+pub fn aggregateFilterExpressionArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        count += aggregation.filter_expression_array_contains.len;
+    }
+    return count;
+}
+
+pub fn aggregateFilterJsonAccessCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        count += aggregation.filter_json_contains.len +
+            aggregation.filter_json_path_eq.len +
+            aggregation.filter_json_path_exists.len;
+    }
+    return count;
+}
+
+pub fn aggregateFilterStructuredAccessCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        count += aggregation.filter_array_any.len +
+            aggregation.filter_array_contains.len +
+            aggregation.filter_array_eq.len +
+            aggregation.filter_in_predicates.len +
+            aggregation.filter_text_patterns.len;
+    }
+    return count;
+}
+
+pub fn aggregateFilterGroupCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        count += aggregation.filter_any.len + aggregation.filter_not.len;
+    }
+    return count;
+}
+
+pub fn aggregateInputExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (aggregation.expression != null) count += 1;
+    }
+    return count;
+}
+
+pub fn aggregateDescendingPercentileCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentile_order == .desc) count += 1;
+    }
+    return count;
+}
+
+pub fn aggregatePercentileArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentiles.len > 0) count += 1;
+    }
+    return count;
+}
+
+pub fn aggregateModeCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
+    var count: usize = 0;
+    for (aggregations) |aggregation| {
+        if (aggregation.op == .mode) count += 1;
+    }
+    return count;
+}
+
+pub fn windowValueExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        if (window.value_expression != null) count += 1;
+    }
+    return count;
+}
+
+pub fn windowDefaultCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        if (window.default_json.len > 0) count += 1;
+    }
+    return count;
+}
+
+pub fn windowFilterPredicateCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        count += window.filter_predicates.len;
+    }
+    return count;
+}
+
+pub fn windowFilterExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        count += window.filter_expressions.len;
+    }
+    return count;
+}
+
+pub fn windowFilterAccessCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        count += window.filter_array_any.len +
+            window.filter_array_contains.len +
+            window.filter_array_eq.len +
+            window.filter_in_predicates.len +
+            window.filter_json_contains.len +
+            window.filter_json_path_eq.len +
+            window.filter_json_path_exists.len +
+            window.filter_text_patterns.len +
+            window.filter_expression_array_contains.len;
+    }
+    return count;
+}
+
+pub fn windowFilterGroupCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        count += window.filter_any.len + window.filter_not.len;
+    }
+    return count;
+}
+
+pub fn windowFrameSignature(windows: []const db_mod.types.RelationalRowsWindowSpec) u64 {
+    var signature: u64 = 0;
+    for (windows) |window| {
+        if (window.frame) |frame| {
+            signature = signature *% 131 +% 17;
+            signature = signature *% 131 +% windowFrameUnitCode(frame.unit);
+            signature = signature *% 131 +% windowFrameBoundCode(frame.start);
+            signature = signature *% 131 +% @as(u64, @intCast(frame.start_offset));
+            signature = signature *% 131 +% windowFrameBoundCode(frame.end);
+            signature = signature *% 131 +% @as(u64, @intCast(frame.end_offset));
+        } else {
+            signature = signature *% 131;
+        }
+    }
+    return signature;
+}
+
+fn windowFrameUnitCode(unit: db_mod.types.RelationalRowsWindowFrameUnit) u64 {
+    return switch (unit) {
+        .rows => 1,
+        .range => 2,
+    };
+}
+
+fn windowFrameBoundCode(bound: db_mod.types.RelationalRowsWindowFrameBound) u64 {
+    return switch (bound) {
+        .unbounded_preceding => 1,
+        .offset_preceding => 2,
+        .current_row => 3,
+        .offset_following => 4,
+        .unbounded_following => 5,
+    };
+}
+
 pub fn joinSideForQualifier(
     qualifier: []const u8,
     left_alias: []const u8,
@@ -2280,6 +2456,48 @@ test "sql adapter lower expr compares aggregate specs" {
     const output_columns = [_]runtime_schema.RelationalColumn{.{ .name = "statuses", .path = "statuses", .field_type = .array }};
     try std.testing.expect(aggregateOutputColumnExists(&output_columns, "statuses"));
     try std.testing.expect(!aggregateOutputColumnExists(&output_columns, "missing"));
+    try std.testing.expectEqual(@as(usize, 1), expressionOrderCount(&order_by));
+    try std.testing.expectEqual(@as(usize, 0), aggregateFilterGroupCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), aggregateFilterExpressionCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), aggregateFilterExpressionArrayCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 1), aggregateFilterJsonAccessCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), aggregateFilterStructuredAccessCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), aggregateInputExpressionCount(&aggregate_specs));
+
+    const percentile_specs = [_]db_mod.types.RelationalRowsAggregateSpec{
+        .{ .name = "p", .op = .percentile_cont, .field = "amount", .percentile_order = .desc, .percentiles = &.{ 0.5, 0.9 } },
+        .{ .name = "m", .op = .mode, .field = "status" },
+    };
+    try std.testing.expectEqual(@as(usize, 1), aggregateDescendingPercentileCount(&percentile_specs));
+    try std.testing.expectEqual(@as(usize, 1), aggregatePercentileArrayCount(&percentile_specs));
+    try std.testing.expectEqual(@as(usize, 1), aggregateModeCount(&percentile_specs));
+
+    const window_specs = [_]db_mod.types.RelationalRowsWindowSpec{.{
+        .output = "ranked",
+        .function = .lag,
+        .value_expression = lower_status,
+        .default_json = "\"unknown\"",
+        .filter_predicates = &filters,
+        .filter_json_contains = &json_filters,
+        .filter_expressions = &.{.{
+            .lhs = lower_status,
+            .op = .eq,
+            .rhs = &.{.{ .kind = .value, .value_json = "\"open\"" }},
+        }},
+        .frame = .{
+            .unit = .rows,
+            .start = .offset_preceding,
+            .start_offset = 1,
+            .end = .current_row,
+        },
+    }};
+    try std.testing.expectEqual(@as(usize, 1), windowValueExpressionCount(&window_specs));
+    try std.testing.expectEqual(@as(usize, 1), windowDefaultCount(&window_specs));
+    try std.testing.expectEqual(@as(usize, 1), windowFilterPredicateCount(&window_specs));
+    try std.testing.expectEqual(@as(usize, 1), windowFilterExpressionCount(&window_specs));
+    try std.testing.expectEqual(@as(usize, 1), windowFilterAccessCount(&window_specs));
+    try std.testing.expectEqual(@as(usize, 0), windowFilterGroupCount(&window_specs));
+    try std.testing.expect(windowFrameSignature(&window_specs) != 0);
 
     try std.testing.expect(identifierContainsQualifier("left.status"));
     try std.testing.expect(!identifierContainsQualifier("status"));

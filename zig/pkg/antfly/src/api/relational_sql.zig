@@ -39,7 +39,7 @@ pub const SqlFunctionBindings = sql_adapter.SqlFunctionBindings;
 const SqlIntervalLiteral = sql_adapter.SqlIntervalLiteral;
 const SelectOutputKind = sql_adapter.SelectOutputKind;
 const SelectOutputRef = sql_adapter.SelectOutputRef;
-const SelectSetOperation = sql_adapter.SelectSetOperation;
+pub const SelectSetOperation = sql_adapter.SelectSetOperation;
 const SqlPatternQuantifier = sql_adapter.SqlPatternQuantifier;
 const SqlRowClaimClause = sql_adapter.SqlRowClaimClause;
 const Token = sql_adapter.Token;
@@ -49,6 +49,16 @@ const aggregateOpName = sql_adapter.aggregateOpName;
 const aggregateOutputColumnExists = sql_adapter.aggregateOutputColumnExists;
 const aggregateOutputFieldIsUnique = sql_adapter.aggregateOutputFieldIsUnique;
 const aggregateSpecsEquivalent = sql_adapter.aggregateSpecsEquivalent;
+const aggregateDescendingPercentileCount = sql_adapter.aggregateDescendingPercentileCount;
+const aggregateFilterExpressionArrayCount = sql_adapter.aggregateFilterExpressionArrayCount;
+const aggregateFilterExpressionCount = sql_adapter.aggregateFilterExpressionCount;
+const aggregateFilterGroupCount = sql_adapter.aggregateFilterGroupCount;
+const aggregateFilterJsonAccessCount = sql_adapter.aggregateFilterJsonAccessCount;
+const aggregateFilterStructuredAccessCount = sql_adapter.aggregateFilterStructuredAccessCount;
+const aggregateInputExpressionCount = sql_adapter.aggregateInputExpressionCount;
+const aggregateModeCount = sql_adapter.aggregateModeCount;
+const aggregatePercentileArrayCount = sql_adapter.aggregatePercentileArrayCount;
+const antflyTypeSchemaName = sql_adapter.antflyTypeSchemaName;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
 const cloneExpressionAlloc = sql_adapter.cloneExpressionAlloc;
@@ -71,7 +81,10 @@ const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const ddlForeignKeyActionFromSyntax = sql_adapter.ddlForeignKeyActionFromSyntax;
 const ddlForeignKeyMatchFromSyntax = sql_adapter.ddlForeignKeyMatchFromSyntax;
 const ddlForeignKeyTimingFromSyntax = sql_adapter.ddlForeignKeyTimingFromSyntax;
+const ddlRangeBoundTypeForName = sql_adapter.ddlRangeBoundTypeForName;
+const ddlRangeTypeForName = sql_adapter.ddlRangeTypeForName;
 const expressionConditionReferencesField = sql_adapter.expressionConditionReferencesField;
+const expressionOrderCount = sql_adapter.expressionOrderCount;
 const expressionReferencesField = sql_adapter.expressionReferencesField;
 const expressionProjectionFromCoalesceAlloc = sql_adapter.expressionProjectionFromCoalesceAlloc;
 const fieldValueJsonFor = sql_adapter.fieldValueJsonFor;
@@ -123,6 +136,13 @@ const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
 const joinProjectionOutputIsUnique = sql_adapter.joinProjectionOutputIsUnique;
 const joinSideForQualifier = sql_adapter.joinSideForQualifier;
+const windowDefaultCount = sql_adapter.windowDefaultCount;
+const windowFilterAccessCount = sql_adapter.windowFilterAccessCount;
+const windowFilterExpressionCount = sql_adapter.windowFilterExpressionCount;
+const windowFilterGroupCount = sql_adapter.windowFilterGroupCount;
+const windowFilterPredicateCount = sql_adapter.windowFilterPredicateCount;
+const windowFrameSignature = sql_adapter.windowFrameSignature;
+const windowValueExpressionCount = sql_adapter.windowValueExpressionCount;
 const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
 const max_scalar_or_expanded_branches: usize = 32;
 const parseSqlTimestampLiteralNs = sql_adapter.parseSqlTimestampLiteralNs;
@@ -134,8 +154,12 @@ const findUniqueConstraintByColumns = sql_adapter.findUniqueConstraintByColumns;
 const findUniqueConstraintByExpression = sql_adapter.findUniqueConstraintByExpression;
 const findUniqueConstraintByName = sql_adapter.findUniqueConstraintByName;
 const findDdlColumn = sql_adapter.relationalColumnForDdl;
+const foreignKeyActionName = sql_adapter.foreignKeyActionName;
 const foreignKeyActionSupportsTemporalUpdate = sql_adapter.foreignKeyActionSupportsTemporalUpdate;
+const foreignKeyMatchName = sql_adapter.foreignKeyMatchName;
 const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
+const foreignKeyTimingName = sql_adapter.foreignKeyTimingName;
+const foreignKeyValidationStateName = sql_adapter.foreignKeyValidationStateName;
 const preparedStatementStatementKindFromSyntax = sql_adapter.preparedStatementStatementKindFromSyntax;
 const preparedStatementSubjectKindFromSyntax = sql_adapter.preparedStatementSubjectKindFromSyntax;
 const primaryKeyContains = sql_adapter.primaryKeyContains;
@@ -151,13 +175,16 @@ const relationalColumnHasIndexName = sql_adapter.relationalColumnHasIndexName;
 const relationalColumnIndex = sql_adapter.relationalColumnIndex;
 const relationalColumnIndexForIndexName = sql_adapter.relationalColumnIndexForIndexName;
 const relationalConstraintNameExists = sql_adapter.relationalConstraintNameExists;
+const relationalCheckOpToken = sql_adapter.relationalCheckOpToken;
 const relationalCheckOpFromUniquePredicateToken = sql_adapter.relationalCheckOpFromUniquePredicateToken;
+const relationalCheckValidationStateName = sql_adapter.relationalCheckValidationStateName;
 const relationalFieldTypeSupportsCollation = sql_adapter.relationalFieldTypeSupportsCollation;
 const relationalGeneratedOpForUniqueExpressionOp = sql_adapter.relationalGeneratedOpForUniqueExpressionOp;
 const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
 const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
+const relationalPeriodRangeTypeName = sql_adapter.relationalPeriodRangeTypeName;
 const rewriteExpressionConditionFieldsToSource = sql_adapter.rewriteExpressionConditionFieldsToSource;
 const rewriteExpressionFieldsToSource = sql_adapter.rewriteExpressionFieldsToSource;
 const routineKindFromSyntax = sql_adapter.routineKindFromSyntax;
@@ -183,6 +210,7 @@ const tokenKindIsJsonExtractTextOperator = sql_adapter.tokenKindIsJsonExtractTex
 const tokenizeAlloc = sql_adapter.tokenizeAlloc;
 const uniqueConstraintNameExists = sql_adapter.uniqueConstraintNameExists;
 const uniqueConstraintReferencesAny = sql_adapter.uniqueConstraintReferencesAny;
+const uniqueConstraintValidationStateString = sql_adapter.uniqueConstraintValidationStateString;
 const uniqueExpressionOpToken = sql_adapter.uniqueExpressionOpToken;
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
 const uniquePredicateAsRelationalCheckOp = sql_adapter.uniquePredicateAsRelationalCheckOp;
@@ -35439,46 +35467,6 @@ fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
     return false;
 }
 
-fn ddlRangeBoundTypeForName(name: []const u8) ?runtime_schema.AntflyType {
-    if (std.ascii.eqlIgnoreCase(name, "daterange")) return .datetime;
-    if (std.ascii.eqlIgnoreCase(name, "tsrange")) return .datetime;
-    if (std.ascii.eqlIgnoreCase(name, "tstzrange")) return .datetime;
-    if (std.ascii.eqlIgnoreCase(name, "numrange")) return .numeric;
-    return null;
-}
-
-fn ddlRangeTypeForName(name: []const u8) ?runtime_schema.RelationalPeriodRangeType {
-    if (std.ascii.eqlIgnoreCase(name, "numrange")) return .numrange;
-    if (std.ascii.eqlIgnoreCase(name, "daterange")) return .daterange;
-    if (std.ascii.eqlIgnoreCase(name, "tsrange")) return .tsrange;
-    if (std.ascii.eqlIgnoreCase(name, "tstzrange")) return .tstzrange;
-    return null;
-}
-
-fn relationalPeriodRangeTypeName(range_type: runtime_schema.RelationalPeriodRangeType) []const u8 {
-    return switch (range_type) {
-        .numrange => "numrange",
-        .daterange => "daterange",
-        .tsrange => "tsrange",
-        .tstzrange => "tstzrange",
-    };
-}
-
-fn relationalCheckOpToken(op: runtime_schema.RelationalCheckOp) []const u8 {
-    return switch (op) {
-        .is_null => "is_null",
-        .is_not_null => "is_not_null",
-        .is_distinct => "is_distinct",
-        .is_not_distinct => "is_not_distinct",
-        .eq => "eq",
-        .ne => "ne",
-        .gt => "gt",
-        .gte => "gte",
-        .lt => "lt",
-        .lte => "lte",
-    };
-}
-
 fn schemaJsonValueFromCreateTablePlanAlloc(alloc: std.mem.Allocator, plan: CreateTablePlan) !std.json.Value {
     var properties = std.json.ObjectMap.empty;
     for (plan.columns) |column| {
@@ -36836,15 +36824,6 @@ fn schemaJsonUniqueConstraintAlloc(alloc: std.mem.Allocator, constraint: runtime
     return .{ .object = object };
 }
 
-fn uniqueConstraintValidationStateString(state: runtime_schema.UniqueConstraintValidationState) []const u8 {
-    return switch (state) {
-        .enforced => "enforced",
-        .unvalidated => "unvalidated",
-        .validating => "validating",
-        .invalid => "invalid",
-    };
-}
-
 fn schemaJsonUniqueExpressionsAlloc(alloc: std.mem.Allocator, expressions: []const runtime_schema.UniqueExpression) !std.json.Value {
     var array = std.json.Array.init(alloc);
     for (expressions) |expression| {
@@ -36965,15 +36944,6 @@ fn schemaJsonRelationalCheckAlloc(alloc: std.mem.Allocator, check: runtime_schem
     return .{ .object = object };
 }
 
-fn relationalCheckValidationStateName(state: runtime_schema.RelationalCheckValidationState) []const u8 {
-    return switch (state) {
-        .enforced => "enforced",
-        .unvalidated => "unvalidated",
-        .validating => "validating",
-        .invalid => "invalid",
-    };
-}
-
 fn schemaJsonStringArrayAlloc(alloc: std.mem.Allocator, values: []const []const u8) !std.json.Value {
     var array = std.json.Array.init(alloc);
     for (values) |value| try array.append(.{ .string = try alloc.dupe(u8, value) });
@@ -37002,58 +36972,6 @@ fn rootObjectFieldAlloc(alloc: std.mem.Allocator, object: *std.json.ObjectMap, f
 
 fn putJsonString(alloc: std.mem.Allocator, object: *std.json.ObjectMap, key: []const u8, value: []const u8) !void {
     try object.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
-}
-
-fn antflyTypeSchemaName(field_type: runtime_schema.AntflyType) []const u8 {
-    return switch (field_type) {
-        .text => "text",
-        .keyword => "keyword",
-        .numeric => "numeric",
-        .embedding => "embedding",
-        .boolean => "boolean",
-        .datetime => "datetime",
-        .geopoint => "geopoint",
-        .geoshape => "geoshape",
-        .blob => "blob",
-        .html => "html",
-        .search_as_you_type => "search_as_you_type",
-        .json => "json",
-        .array => "array",
-        .link => "link",
-    };
-}
-
-fn foreignKeyActionName(action: runtime_schema.ForeignKeyAction) []const u8 {
-    return switch (action) {
-        .restrict => "restrict",
-        .set_null => "set_null",
-        .cascade => "cascade",
-        .no_action => "no_action",
-    };
-}
-
-fn foreignKeyTimingName(timing: runtime_schema.ForeignKeyTiming) []const u8 {
-    return switch (timing) {
-        .immediate => "immediate",
-        .deferred => "deferred",
-    };
-}
-
-fn foreignKeyMatchName(match: runtime_schema.ForeignKeyMatch) []const u8 {
-    return switch (match) {
-        .simple => "simple",
-        .full => "full",
-        .partial => "partial",
-    };
-}
-
-fn foreignKeyValidationStateName(state: runtime_schema.ForeignKeyValidationState) []const u8 {
-    return switch (state) {
-        .enforced => "enforced",
-        .unvalidated => "unvalidated",
-        .validating => "validating",
-        .invalid => "invalid",
-    };
 }
 
 fn validateDdlAppliedSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !void {
@@ -55975,182 +55893,6 @@ fn appendStringFingerprintAlloc(
     value: []const u8,
 ) ![]u8 {
     return sql_adapter.appendStringFingerprintAlloc(alloc, owned_base, label, value);
-}
-
-fn expressionOrderCount(order_by: []const db_mod.types.RelationalRowsQueryOrder) usize {
-    var count: usize = 0;
-    for (order_by) |order| {
-        if (order.expression != null) count += 1;
-    }
-    return count;
-}
-
-fn aggregateFilterExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_expressions.len;
-    }
-    return count;
-}
-
-fn aggregateFilterExpressionArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_expression_array_contains.len;
-    }
-    return count;
-}
-
-fn aggregateFilterJsonAccessCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_json_contains.len +
-            aggregation.filter_json_path_eq.len +
-            aggregation.filter_json_path_exists.len;
-    }
-    return count;
-}
-
-fn aggregateFilterStructuredAccessCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_array_any.len +
-            aggregation.filter_array_contains.len +
-            aggregation.filter_array_eq.len +
-            aggregation.filter_in_predicates.len +
-            aggregation.filter_text_patterns.len;
-    }
-    return count;
-}
-
-fn aggregateFilterGroupCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_any.len + aggregation.filter_not.len;
-    }
-    return count;
-}
-
-fn aggregateInputExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (aggregation.expression != null) count += 1;
-    }
-    return count;
-}
-
-fn aggregateDescendingPercentileCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentile_order == .desc) count += 1;
-    }
-    return count;
-}
-
-fn aggregatePercentileArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentiles.len > 0) count += 1;
-    }
-    return count;
-}
-
-fn aggregateModeCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (aggregation.op == .mode) count += 1;
-    }
-    return count;
-}
-
-fn windowValueExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        if (window.value_expression != null) count += 1;
-    }
-    return count;
-}
-
-fn windowDefaultCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        if (window.default_json.len > 0) count += 1;
-    }
-    return count;
-}
-
-fn windowFilterPredicateCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_predicates.len;
-    }
-    return count;
-}
-
-fn windowFilterExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_expressions.len;
-    }
-    return count;
-}
-
-fn windowFilterAccessCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_array_any.len +
-            window.filter_array_contains.len +
-            window.filter_array_eq.len +
-            window.filter_in_predicates.len +
-            window.filter_json_contains.len +
-            window.filter_json_path_eq.len +
-            window.filter_json_path_exists.len +
-            window.filter_text_patterns.len +
-            window.filter_expression_array_contains.len;
-    }
-    return count;
-}
-
-fn windowFilterGroupCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_any.len + window.filter_not.len;
-    }
-    return count;
-}
-
-fn windowFrameSignature(windows: []const db_mod.types.RelationalRowsWindowSpec) u64 {
-    var signature: u64 = 0;
-    for (windows) |window| {
-        if (window.frame) |frame| {
-            signature = signature *% 131 +% 17;
-            signature = signature *% 131 +% windowFrameUnitCode(frame.unit);
-            signature = signature *% 131 +% windowFrameBoundCode(frame.start);
-            signature = signature *% 131 +% @as(u64, @intCast(frame.start_offset));
-            signature = signature *% 131 +% windowFrameBoundCode(frame.end);
-            signature = signature *% 131 +% @as(u64, @intCast(frame.end_offset));
-        } else {
-            signature = signature *% 131;
-        }
-    }
-    return signature;
-}
-
-fn windowFrameUnitCode(unit: db_mod.types.RelationalRowsWindowFrameUnit) u64 {
-    return switch (unit) {
-        .rows => 1,
-        .range => 2,
-    };
-}
-
-fn windowFrameBoundCode(bound: db_mod.types.RelationalRowsWindowFrameBound) u64 {
-    return switch (bound) {
-        .unbounded_preceding => 1,
-        .offset_preceding => 2,
-        .current_row => 3,
-        .offset_following => 4,
-        .unbounded_following => 5,
-    };
 }
 
 fn sqlRowClaimForClause(clause: SqlRowClaimClause) db_mod.types.RowClaimRequest {

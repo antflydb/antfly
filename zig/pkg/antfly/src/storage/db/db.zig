@@ -16962,6 +16962,32 @@ pub const DB = struct {
         return try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, plan.ranges, plan.query);
     }
 
+    pub fn queryRelationalRowsSetOperationPlan(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        plan: types.RelationalRowsSetOperationPlan,
+    ) !types.RelationalRowsQueryResult {
+        if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+
+        var left = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.left);
+        defer left.deinit(alloc);
+        var right = try self.queryRelationalRowsPlan(alloc, runtime_schema, plan.right);
+        defer right.deinit(alloc);
+
+        const combined = try relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left.rows, right.rows);
+        defer freeOwnedConstStringSlice(alloc, combined);
+        try admitRelationalRowsSetOperationRows(plan, combined);
+
+        const tail_query = types.RelationalRowsQueryRequest{
+            .order_by = plan.order_by,
+            .limit = plan.limit,
+            .offset = plan.offset,
+            .select_all = true,
+        };
+        return try self.queryRelationalRowsFromSourceRowsAlloc(alloc, "set_operation", combined, tail_query);
+    }
+
     pub fn mutateRelationalRowsFromSource(
         self: *DB,
         alloc: Allocator,
@@ -19251,6 +19277,151 @@ pub const DB = struct {
 
     fn validateRelationalRowsQueryPlanRequest(plan: types.RelationalRowsQueryPlan) !void {
         if (plan.query.row_claim != null or plan.query.doc_key_range != null) return error.UnsupportedQueryRequest;
+    }
+
+    pub fn admitRelationalRowsSetOperationRows(
+        plan: types.RelationalRowsSetOperationPlan,
+        rows: []const []const u8,
+    ) !void {
+        const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(rows) orelse return error.UnsupportedQueryRequest;
+        const admission = types.RelationalRowsCte{
+            .name = "set_operation",
+            .query = .{},
+            .max_rows = plan.max_rows,
+            .max_bytes = plan.max_bytes,
+            .spill_after_bytes = plan.spill_after_bytes,
+        };
+        switch (types.relationalRowsCteMaterializationDecision(admission, rows.len, materialized_bytes)) {
+            .memory => {},
+            .spill, .reject => return error.UnsupportedQueryRequest,
+        }
+    }
+
+    pub fn relationalRowsSetOperationRowsAlloc(
+        alloc: Allocator,
+        operation: types.RelationalRowsSetOperation,
+        left: []const []const u8,
+        right: []const []const u8,
+    ) ![]const []const u8 {
+        return switch (operation) {
+            .union_all => try relationalRowsUnionAllRowsAlloc(alloc, left, right),
+            .union_distinct => try relationalRowsUnionDistinctRowsAlloc(alloc, left, right),
+            .intersect => try relationalRowsIntersectRowsAlloc(alloc, left, right),
+            .except => try relationalRowsExceptRowsAlloc(alloc, left, right),
+        };
+    }
+
+    fn relationalRowsUnionAllRowsAlloc(
+        alloc: Allocator,
+        left: []const []const u8,
+        right: []const []const u8,
+    ) ![]const []const u8 {
+        var rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
+        try rows.ensureUnusedCapacity(alloc, left.len + right.len);
+        for (left) |row| rows.appendAssumeCapacity(try alloc.dupe(u8, row));
+        for (right) |row| rows.appendAssumeCapacity(try alloc.dupe(u8, row));
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsUnionDistinctRowsAlloc(
+        alloc: Allocator,
+        left: []const []const u8,
+        right: []const []const u8,
+    ) ![]const []const u8 {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer freeRelationalRowsSetKeyMap(alloc, &seen);
+        var rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
+        for (left) |row| try appendDistinctRelationalRowsSetRowAlloc(alloc, &seen, &rows, row);
+        for (right) |row| try appendDistinctRelationalRowsSetRowAlloc(alloc, &seen, &rows, row);
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsIntersectRowsAlloc(
+        alloc: Allocator,
+        left: []const []const u8,
+        right: []const []const u8,
+    ) ![]const []const u8 {
+        var right_set = std.StringHashMapUnmanaged(void).empty;
+        defer freeRelationalRowsSetKeyMap(alloc, &right_set);
+        for (right) |row| _ = try putRelationalRowsSetKeyAlloc(alloc, &right_set, row);
+
+        var emitted = std.StringHashMapUnmanaged(void).empty;
+        defer freeRelationalRowsSetKeyMap(alloc, &emitted);
+        var rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
+        for (left) |row| {
+            if (!right_set.contains(row)) continue;
+            try appendDistinctRelationalRowsSetRowAlloc(alloc, &emitted, &rows, row);
+        }
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsExceptRowsAlloc(
+        alloc: Allocator,
+        left: []const []const u8,
+        right: []const []const u8,
+    ) ![]const []const u8 {
+        var right_set = std.StringHashMapUnmanaged(void).empty;
+        defer freeRelationalRowsSetKeyMap(alloc, &right_set);
+        for (right) |row| _ = try putRelationalRowsSetKeyAlloc(alloc, &right_set, row);
+
+        var emitted = std.StringHashMapUnmanaged(void).empty;
+        defer freeRelationalRowsSetKeyMap(alloc, &emitted);
+        var rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer deinitRelationalRowsSetRowList(alloc, &rows);
+        for (left) |row| {
+            if (right_set.contains(row)) continue;
+            try appendDistinctRelationalRowsSetRowAlloc(alloc, &emitted, &rows, row);
+        }
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn appendDistinctRelationalRowsSetRowAlloc(
+        alloc: Allocator,
+        seen: *std.StringHashMapUnmanaged(void),
+        rows: *std.ArrayListUnmanaged([]const u8),
+        row: []const u8,
+    ) !void {
+        if (try putRelationalRowsSetKeyAlloc(alloc, seen, row)) {
+            const row_copy = try alloc.dupe(u8, row);
+            errdefer alloc.free(row_copy);
+            try rows.append(alloc, row_copy);
+        }
+    }
+
+    fn putRelationalRowsSetKeyAlloc(
+        alloc: Allocator,
+        set: *std.StringHashMapUnmanaged(void),
+        row: []const u8,
+    ) !bool {
+        if (set.contains(row)) return false;
+        const key = try alloc.dupe(u8, row);
+        errdefer alloc.free(key);
+        const gop = try set.getOrPut(alloc, key);
+        if (gop.found_existing) {
+            alloc.free(key);
+            return false;
+        }
+        return true;
+    }
+
+    fn deinitRelationalRowsSetRowList(
+        alloc: Allocator,
+        rows: *std.ArrayListUnmanaged([]const u8),
+    ) void {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    fn freeRelationalRowsSetKeyMap(
+        alloc: Allocator,
+        set: *std.StringHashMapUnmanaged(void),
+    ) void {
+        var keys = set.keyIterator();
+        while (keys.next()) |key| alloc.free(@constCast(key.*));
+        set.deinit(alloc);
     }
 
     fn validateRelationalRowsAggregatePlanCteReferences(plan: types.RelationalRowsAggregatePlan) !void {
@@ -89087,6 +89258,128 @@ test "relational rows query planner orders candidate sets by estimated cardinali
     try std.testing.expectEqual(@as(usize, 3), planned[1].ordinal);
     try std.testing.expectEqual(@as(usize, 1), planned[2].ordinal);
     try std.testing.expectEqual(@as(usize, 0), planned[3].ordinal);
+}
+
+test "relational rows set operation plan executes typed set semantics" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"side":{"type":"keyword"}},"required":["id","side"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:a", .value = "{\"id\":\"a\",\"side\":\"left\"}" },
+            .{ .key = "row:b", .value = "{\"id\":\"b\",\"side\":\"both\"}" },
+            .{ .key = "row:c", .value = "{\"id\":\"c\",\"side\":\"right\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const select = [_][]const u8{"id"};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .asc,
+    }};
+    const left_values = [_]types.RelationalRowsInPredicate{.{
+        .field = "side",
+        .values_json = "[\"left\",\"both\"]",
+    }};
+    const right_values = [_]types.RelationalRowsInPredicate{.{
+        .field = "side",
+        .values_json = "[\"right\",\"both\"]",
+    }};
+    const left_plan = types.RelationalRowsQueryPlan{ .query = .{
+        .in_predicates = left_values[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    } };
+    const right_plan = types.RelationalRowsQueryPlan{ .query = .{
+        .in_predicates = right_values[0..],
+        .select = select[0..],
+        .select_all = false,
+        .order_by = order_by[0..],
+    } };
+
+    var union_all = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_all,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer union_all.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), union_all.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", union_all.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", union_all.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", union_all.rows[2]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", union_all.rows[3]);
+
+    var union_distinct = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_distinct,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer union_distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), union_distinct.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", union_distinct.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", union_distinct.rows[1]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\"}", union_distinct.rows[2]);
+
+    var intersect = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .intersect,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), intersect.total);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", intersect.rows[0]);
+
+    var except = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .except,
+        .left = left_plan,
+        .right = right_plan,
+    });
+    defer except.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), except.total);
+    try std.testing.expectEqualStrings("{\"id\":\"a\"}", except.rows[0]);
+
+    const tail_order = [_]types.RelationalRowsQueryOrder{.{
+        .field = "id",
+        .direction = .desc,
+    }};
+    var globally_ordered = try db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_all,
+        .left = left_plan,
+        .right = right_plan,
+        .order_by = tail_order[0..],
+        .limit = 2,
+        .offset = 1,
+    });
+    defer globally_ordered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 4), globally_ordered.total);
+    try std.testing.expectEqual(@as(usize, 2), globally_ordered.rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", globally_ordered.rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"b\"}", globally_ordered.rows[1]);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsSetOperationPlan(alloc, runtime_schema, .{
+        .operation = .union_distinct,
+        .left = left_plan,
+        .right = right_plan,
+        .max_rows = 2,
+    }));
 }
 
 test "relational rows query doc key range scopes indexed and scanned candidates" {
