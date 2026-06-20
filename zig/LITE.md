@@ -131,6 +131,9 @@ The C ABI should expose a single Lite status JSON call that mirrors
 flags. Bindings should not have to reconstruct Lite status by combining several
 lower-level calls differently in each language.
 
+The embedded Zig API should expose the same status shape for Lite handles, with
+the storage identity available as a typed value on the lower-level DB wrapper.
+
 ### File Format
 
 Antfly Lite v1 should use `.aflite` as the live database format. Users should

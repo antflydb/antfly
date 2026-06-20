@@ -175,6 +175,24 @@ pub const Api = struct {
         return try std.json.Stringify.valueAlloc(alloc, self.db.capabilities(), .{});
     }
 
+    pub fn statusJson(self: *Api, alloc: Allocator) ![]u8 {
+        const storage_json = try std.json.Stringify.valueAlloc(alloc, try self.db.liteStorageStatus(), .{});
+        defer alloc.free(storage_json);
+        const stats_json = try self.statsJson(alloc);
+        defer alloc.free(stats_json);
+        const pending_json = try self.pendingWorkStatsJson(alloc);
+        defer alloc.free(pending_json);
+        const capabilities_json = try self.capabilitiesJson(alloc);
+        defer alloc.free(capabilities_json);
+
+        return try std.fmt.allocPrint(alloc, "{{\"storage\":{s},\"stats\":{s},\"pending_work\":{s},\"capabilities\":{s}}}", .{
+            storage_json,
+            stats_json,
+            pending_json,
+            capabilities_json,
+        });
+    }
+
     pub fn runUntilIdleJson(self: *Api, alloc: Allocator) ![]u8 {
         try self.db.runUntilIdle();
         return try self.pendingWorkStatsJson(alloc);
@@ -483,6 +501,8 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_template_rendering\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_template_rendering\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_template_host_callbacks\":false") != null);
+
+    try std.testing.expectError(error.NotLiteDatabase, api.statusJson(alloc));
 
     const stats_json = try api.statsJson(alloc);
     defer alloc.free(stats_json);
@@ -942,6 +962,16 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         const check_before = try api.checkLiteJson(alloc);
         defer alloc.free(check_before);
         try std.testing.expect(std.mem.indexOf(u8, check_before, "\"valid\":true") != null);
+
+        const status_json = try api.statusJson(alloc);
+        defer alloc.free(status_json);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"storage\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format\":\"aflite\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"engine\":\"native_single_file\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
 
         const vacuumed = try api.vacuumLiteJson(alloc);
         defer alloc.free(vacuumed);
