@@ -2028,7 +2028,7 @@ test "lite native header recovers from corrupted active checkpoint hint" {
     try std.testing.expectEqual(@as(u64, 2), header.checkpoints[header.active_checkpoint].commit_sequence);
 }
 
-test "lite native header falls back from a checksum-bad checkpoint slot" {
+test "lite native header recovers previous checkpoint from a checksum-bad slot" {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{
         .active_checkpoint = 1,
