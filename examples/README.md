@@ -58,6 +58,29 @@ export POSTGRES_URL="postgresql://postgres:postgres@localhost:5432/postgres"
 
 ## Memory Examples
 
+### [Antfly Lite Go](./antfly-lite-go/)
+
+Embed Antfly Lite directly in a Go process with a live `.aflite` database and
+export a portable `.afb` backup for restore or promotion.
+
+**Use cases:**
+- Local-first desktop and edge applications
+- Embedded search in Go services
+- Tests and demos that should not start a server
+
+**Features:**
+- Opens a native `.aflite` database through the Go Lite binding
+- Writes and reads JSON documents without a server process
+- Exports a portable `.afb` backup
+
+**Quick start:**
+```bash
+cd zig
+zig build lite-capi
+cd ../examples/antfly-lite-go
+GOWORK=off go run . --reset
+```
+
 ### [memoryaf + docsaf](./memoryaf/)
 
 Turn documentation into `memoryaf` records from local files, Git, S3, Google Drive, or web sources, with local watch mode for filesystem sync.
