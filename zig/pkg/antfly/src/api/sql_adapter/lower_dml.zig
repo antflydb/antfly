@@ -237,6 +237,163 @@ pub const ConflictUnaryExpressionParserHooks = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const ConflictRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_base: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictExpressionOperandParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictExpressionStart = enum {
+    cast,
+    case,
+    case_fold,
+    replace,
+    regexp_replace,
+    regexp_match,
+    regexp_substr,
+    regexp_count,
+    regexp_instr,
+    translate,
+    concat,
+    coalesce,
+    nullif,
+    text_length,
+    ascii,
+    chr,
+    substring,
+    overlay,
+    split_part,
+    strpos,
+    left_right,
+    pad,
+    repeat,
+    reverse,
+    md5,
+    starts_with,
+    ends_with,
+    date_trunc,
+    date_bin,
+    date_part,
+    abs,
+    round,
+    trunc,
+    floor,
+    ceil,
+    sqrt,
+    sign,
+    mod,
+    power,
+    greatest_least,
+    json_extract_path,
+    json_build_object,
+    json_typeof,
+    json_array_length,
+    array_length,
+    array_position,
+    array_element_transform,
+    array_to_string,
+    string_to_array,
+    uuid_v4,
+    now,
+    current_date,
+    typed_datetime_literal,
+    interval,
+};
+
+pub const ConflictExpressionOperandStart = enum {
+    unary_negative,
+    parenthesized,
+    expression,
+    field_or_json_extract,
+    value,
+};
+
+pub fn conflictExpressionStartAt(tokens: []const Token, pos: usize) ?ConflictExpressionStart {
+    if (lower_expr.peekCastExpressionSyntax(tokens, pos)) return .cast;
+    if (lower_expr.peekCaseExpressionSyntax(tokens, pos)) return .case;
+    if (lower_expr.peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
+    if (lower_expr.peekReplaceFunctionCall(tokens, pos)) return .replace;
+    if (lower_expr.peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpMatchFunction)) return .regexp_match;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpSubstrFunction)) return .regexp_substr;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpCountFunction)) return .regexp_count;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpInstrFunction)) return .regexp_instr;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTranslateFunction)) return .translate;
+    if (lower_expr.peekConcatFunctionCall(tokens, pos)) return .concat;
+    if (lower_expr.peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
+    if (lower_expr.peekNullifFunctionCall(tokens, pos)) return .nullif;
+    if (lower_expr.peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsAsciiFunction)) return .ascii;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsChrFunction)) return .chr;
+    if (lower_expr.peekSubstringFunctionKeyword(tokens, pos)) return .substring;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsOverlayFunction)) return .overlay;
+    if (lower_expr.peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
+    if (lower_expr.peekStrposFunctionKeyword(tokens, pos) or lower_expr.peekPositionFunctionSyntax(tokens, pos)) return .strpos;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsLeftRightFunction)) return .left_right;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsPadFunction)) return .pad;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRepeatFunction)) return .repeat;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsReverseFunction)) return .reverse;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsMd5Function)) return .md5;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsStartsWithFunction)) return .starts_with;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsEndsWithFunction)) return .ends_with;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateTruncFunction)) return .date_trunc;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateBinFunction)) return .date_bin;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDatePartFunction)) return .date_part;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .floor)) return .floor;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .ceil)) return .ceil;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .sqrt)) return .sqrt;
+    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .sign)) return .sign;
+    if (lower_expr.peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
+    if (lower_expr.peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
+    if (lower_expr.peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonExtractPathFunction)) return .json_extract_path;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonBuildObjectFunction)) return .json_build_object;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonTypeofFunction)) return .json_typeof;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonArrayLengthFunction)) return .json_array_length;
+    if (lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayLengthFunction)) return .array_length;
+    if (lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayPositionFunction)) return .array_position;
+    if (lower_expr.peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
+    if (lower_expr.peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
+    if (lower_expr.peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
+    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsUuidV4Function)) return .uuid_v4;
+    if (lower_expr.peekSqlNowExpressionSyntax(tokens, pos)) return .now;
+    if (lower_expr.peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
+    if (lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
+    if (lower_expr.peekSqlIntervalExpressionSyntax(tokens, pos)) return .interval;
+    return null;
+}
+
+pub fn conflictExpressionOperandStartAt(tokens: []const Token, pos: usize) ConflictExpressionOperandStart {
+    if (lower_expr.peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
+    if (lower_expr.peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
+    if (conflictExpressionStartAt(tokens, pos) != null) return .expression;
+    if (parser.peekKind(tokens, pos, .identifier) and
+        !parser.peekKeyword(tokens, pos, "null") and
+        !parser.peekKeyword(tokens, pos, "true") and
+        !parser.peekKeyword(tokens, pos, "false"))
+    {
+        return .field_or_json_extract;
+    }
+    return .value;
+}
+
 pub const ConflictJsonBuildObjectExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (
@@ -1992,6 +2149,84 @@ pub fn parseConflictAssignmentExpressionAlloc(
         try type_context.validateNumericRowExpression(expression);
     }
     expression_owned = false;
+    return expression;
+}
+
+pub fn parseConflictRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    row_hooks: ConflictRowExpressionParserHooks,
+    arithmetic_hooks: ConflictArithmeticExpressionParserHooks,
+    pipe_hooks: ConflictPipeConcatExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var expression = try row_hooks.parse_base(row_hooks.ptr, column, insert_columns, expected_type);
+    var expression_owned = true;
+    errdefer if (expression_owned) freeExpression(alloc, expression);
+    if (lower_expr.peekArithmeticOperator(tokens, pos.*)) |_| {
+        try type_context.validateNumericOrDatetimeRowExpression(expression);
+        expression_owned = false;
+        expression = try parseConflictArithmeticExpressionRestAlloc(alloc, tokens, pos, expression, column, insert_columns, 0, type_context, arithmetic_hooks);
+        expression_owned = true;
+        try type_context.validateNumericRowExpression(expression);
+    }
+    if (parser.peekKind(tokens, pos.*, .pipe_concat)) {
+        expression_owned = false;
+        expression = try parseConflictPipeConcatExpressionRestAlloc(alloc, tokens, pos, expression, column, insert_columns, type_context, pipe_hooks);
+        expression_owned = true;
+        try type_context.validateTextRowExpression(expression);
+    }
+    expression_owned = false;
+    return expression;
+}
+
+pub fn parseParenthesizedConflictExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    row_hooks: ConflictRowExpressionParserHooks,
+    arithmetic_hooks: ConflictArithmeticExpressionParserHooks,
+    pipe_hooks: ConflictPipeConcatExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parser.expectToken(tokens, pos, .lparen);
+    const expression = try parseConflictRowExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, row_hooks, arithmetic_hooks, pipe_hooks);
+    var expression_owned = true;
+    errdefer if (expression_owned) freeExpression(alloc, expression);
+    try parser.expectToken(tokens, pos, .rparen);
+    expression_owned = false;
+    return expression;
+}
+
+pub fn parseConflictUnaryNegativeExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    hooks: ConflictExpressionOperandParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    _ = parser.matchToken(tokens, pos, .minus) orelse return error.UnsupportedSqlShape;
+    if (parser.matchToken(tokens, pos, .number)) |token| {
+        return .{
+            .kind = .value,
+            .value_json = try std.fmt.allocPrint(alloc, "-{s}", .{token.text}),
+        };
+    }
+
+    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, expected_type);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    const expression = try lower_expr.buildUnaryNegativeExpressionAlloc(alloc, operand);
+    operand_transferred = true;
     return expression;
 }
 

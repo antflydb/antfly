@@ -225,6 +225,24 @@ pub const Runtime = struct {
         return null;
     }
 
+    pub fn triggerHookForTableEvent(
+        self: *@This(),
+        table_name: []const u8,
+        event: TriggerEvent,
+    ) !?relational_sql.RoutineExecutionHook {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.triggers.items) |trigger| {
+            if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table_name, table_name)) {
+                const routine = self.findRoutineLocked(.function, trigger.function_name, 0) orelse return error.RoutineNotFound;
+                const body = routine.body orelse return error.RoutineBodyNotExecutable;
+                if (body.kind != .plpgsql_trigger or body.expression != null) return error.RoutineBodyNotExecutable;
+                return body.hook;
+            }
+        }
+        return null;
+    }
+
     pub fn replaceNativeQueryFunctionBindings(
         self: *@This(),
         bindings: []const extension_domain.QueryFunctionBinding,

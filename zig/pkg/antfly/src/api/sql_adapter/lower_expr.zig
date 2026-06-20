@@ -9256,6 +9256,57 @@ pub fn peekAggregateOutputOrderExpression(tokens: []const Token, pos: usize) boo
     return false;
 }
 
+pub fn peekGeneralOrderRowExpression(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
+        value_mod.peekToJsonbFunctionCall(tokens, pos) or
+        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
+        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
+        peekArrayElementTransformFunctionCall(tokens, pos) or
+        peekArrayToStringFunctionCall(tokens, pos) or
+        peekCaseExpressionSyntax(tokens, pos) or
+        peekCastExpressionSyntax(tokens, pos) or
+        peekCoalesceFunctionCall(tokens, pos) or
+        peekRegexpReplaceFunctionCall(tokens, pos) or
+        peekReplaceFunctionCall(tokens, pos) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekNullifFunctionCall(tokens, pos) or
+        peekTextLengthFunctionKeyword(tokens, pos) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekSubstringFunctionKeyword(tokens, pos) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekSplitPartFunctionKeyword(tokens, pos) or
+        peekStrposFunctionKeyword(tokens, pos) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekPositionFunctionSyntax(tokens, pos) or
+        peekFixedUnaryFunctionCall(tokens, pos, .abs) or
+        peekFixedUnaryFunctionCall(tokens, pos, .round) or
+        peekFixedUnaryFunctionCall(tokens, pos, .trunc) or
+        peekFixedUnaryFunctionCall(tokens, pos, .floor) or
+        peekFixedUnaryFunctionCall(tokens, pos, .ceil) or
+        peekFixedUnaryFunctionCall(tokens, pos, .sqrt) or
+        peekFixedUnaryFunctionCall(tokens, pos, .sign) or
+        peekFixedBinaryFunctionCall(tokens, pos, .mod) or
+        peekFixedBinaryFunctionCall(tokens, pos, .power) or
+        peekGreatestLeastFunctionCall(tokens, pos);
+}
+
 pub fn peekWindowOutputOrderExpression(tokens: []const Token, pos: usize) bool {
     return peekAggregateOutputOrderExpression(tokens, pos);
 }
