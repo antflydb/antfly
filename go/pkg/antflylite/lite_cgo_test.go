@@ -49,6 +49,85 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("lookup JSON %q did not contain written document", lookup)
 	}
 
+	schema := []byte(`{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","required":["title"]}}}}`)
+	if err := db.SetSchemaJSON(schema); err != nil {
+		t.Fatalf("set schema: %v", err)
+	}
+	gotSchema, err := db.SchemaJSON()
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	if !bytes.Contains(gotSchema, []byte(`"required":["title"]`)) {
+		t.Fatalf("schema JSON %q did not contain configured schema", gotSchema)
+	}
+
+	enrichment := []byte(`{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":8,"chunk_overlap":2}`)
+	if err := db.AddEnrichmentJSON(enrichment); err != nil {
+		t.Fatalf("add enrichment: %v", err)
+	}
+	enrichments, err := db.EnrichmentsJSON()
+	if err != nil {
+		t.Fatalf("list enrichments: %v", err)
+	}
+	if !bytes.Contains(enrichments, []byte("body_chunks_v1")) {
+		t.Fatalf("enrichments JSON %q did not contain configured enrichment", enrichments)
+	}
+
+	index := []byte(`{"name":"ft_body_v1","kind":"full_text","config_json":"{}"}`)
+	if err := db.AddIndexJSON(index); err != nil {
+		t.Fatalf("add index: %v", err)
+	}
+	indexes, err := db.IndexesJSON()
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+	if !bytes.Contains(indexes, []byte("ft_body_v1")) {
+		t.Fatalf("indexes JSON %q did not contain configured index", indexes)
+	}
+
+	err = db.Batch([]WriteIntent{{
+		Key:   "doc:go-search",
+		Value: []byte(`{"title":"searchable","body":"go binding full text search"}`),
+	}}, 2)
+	if err != nil {
+		t.Fatalf("batch searchable document: %v", err)
+	}
+	if err := db.RunUntilIdle(); err != nil {
+		t.Fatalf("run until idle: %v", err)
+	}
+	pending, err := db.PendingWorkStatsJSON()
+	if err != nil {
+		t.Fatalf("pending work stats: %v", err)
+	}
+	if !bytes.Contains(pending, []byte("has_async_indexes")) {
+		t.Fatalf("pending work JSON %q did not include async index status", pending)
+	}
+	scan, err := db.ScanJSON([]byte(`{"from":"doc:go-","to":"doc:go~","include_documents":true,"limit":10}`))
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !bytes.Contains(scan, []byte("go binding full text search")) {
+		t.Fatalf("scan JSON %q did not contain searchable document", scan)
+	}
+	search, err := db.SearchJSON([]byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`))
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if !bytes.Contains(search, []byte("go binding full text search")) {
+		t.Fatalf("search JSON %q did not contain searchable document", search)
+	}
+
+	if deleted, err := db.DeleteIndex("missing-index"); err != nil {
+		t.Fatalf("delete missing index: %v", err)
+	} else if deleted {
+		t.Fatalf("delete missing index reported deleted")
+	}
+	if deleted, err := db.DeleteEnrichment("chunk", "missing-enrichment"); err != nil {
+		t.Fatalf("delete missing enrichment: %v", err)
+	} else if deleted {
+		t.Fatalf("delete missing enrichment reported deleted")
+	}
+
 	status, err := db.StatusJSON()
 	if err != nil {
 		t.Fatalf("status: %v", err)
