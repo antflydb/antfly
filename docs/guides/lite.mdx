@@ -61,6 +61,11 @@ The status output includes the live format and engine:
   },
   "inference": {
     "mode": "caller_supplied_or_disabled",
+    "available_modes": [
+      "caller_supplied_artifacts",
+      "remote_provider",
+      "disabled_deferred"
+    ],
     "configured": false,
     "no_inference_configured_ok": true
   }
@@ -175,8 +180,20 @@ antfly lite status app.aflite
 ```
 
 The capabilities block reports fields such as `inference_mode`,
+`supported_inference_modes`, `available_inference_modes`,
 `no_inference_configured_ok`, `caller_supplied_artifacts`, and
 `local_inference_runtime`.
+
+Supported inference modes are:
+
+- `caller_supplied_artifacts`: applications write embeddings, sparse vectors,
+  assets, chunks, graph edges, or other artifacts directly.
+- `remote_provider`: Lite may call an explicitly configured inference provider.
+- `local_embedded`: a full build may provide an embedded inference runtime.
+- `manual_maintenance`: hosted profiles expose work for the application to
+  drain with `run-until-idle`.
+- `disabled_deferred`: definitions and source documents are stored, and work can
+  resume later.
 
 The status output also includes an `inference` block. A fresh Lite database
 reports `configured: false` with `no_inference_configured_ok: true`; this means
@@ -317,6 +334,29 @@ zig build lite-capi
 cd ../go/pkg/antflylite
 go test -tags antflylite_capi ./...
 ```
+
+The Go package exposes constants such as
+`antflylite.InferenceModeCallerSuppliedArtifacts` and
+`antflylite.InferenceModeDisabledDeferred` for branching on status or
+capability responses without hard-coding JSON strings.
+
+## Build Profiles
+
+The repository exposes focused Lite build profiles:
+
+```bash
+zig build lite-core
+zig build lite-full
+zig build lite-wasm
+zig build lite-dev
+```
+
+`lite-core` builds the embedded database, CLI, narrow `/lite/v1` serve mode,
+and `libantflylite` without a heavyweight local inference runtime. `lite-full`
+builds the full Antfly CLI with Lite support. `lite-wasm` builds the
+hosted/manual-maintenance Lite profile for `wasm32-freestanding` without
+pulling in the broader server or inference WASM bundle. `lite-dev` runs the
+broader development and compatibility checks.
 
 ## Integrity And Maintenance
 

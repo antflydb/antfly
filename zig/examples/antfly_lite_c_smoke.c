@@ -129,6 +129,13 @@ int main(void) {
         (void)remove(path);
         return fail_with_buffer("status json did not describe native aflite storage", &status);
     }
+    if (!buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED) ||
+        !buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS) ||
+        !buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED)) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        return fail_with_buffer("status json did not expose expected Lite inference modes", &status);
+    }
     antfly_db_buffer_free_zero(&status);
 
     antfly_db_close(handle);

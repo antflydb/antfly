@@ -22,6 +22,9 @@ The binding exposes raw JSON methods such as `StatusJSON` and `CapabilitiesJSON`
 for parity with the C ABI. It also exposes typed `Status` and `Capabilities`
 helpers for stable Lite control fields, including storage identity, inference
 mode, caller-supplied artifact support, and distributed-only capability flags.
+Use constants such as `InferenceModeCallerSuppliedArtifacts`,
+`InferenceModeManualMaintenance`, and `InferenceModeDisabledDeferred` when
+branching on inference status or capabilities.
 Typed `Check`, `Vacuum`, and `CopyStableSnapshot` helpers cover the stable Lite
 maintenance reports while keeping the raw JSON methods available.
 
@@ -34,3 +37,6 @@ TTL cleanup.
 Use `BackupToFile` to write a portable `.afb` archive from an open Lite handle.
 Use `RestoreBackupFile` or `RestoreBackup` to stage a portable backup into a
 new `.aflite` database without publishing a partial target on import failure.
+
+The repository-level `zig build lite-core` gate builds `libantflylite` and runs
+the Go binding tests against it.
