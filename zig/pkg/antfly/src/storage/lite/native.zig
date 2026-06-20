@@ -223,7 +223,7 @@ pub const NativeFile = struct {
         errdefer file.close(io);
 
         var header_bytes: [header_size]u8 = undefined;
-        try readExactAt(file, io, &header_bytes, 0);
+        try readHeaderExactAt(file, io, &header_bytes);
         var header = try decodeHeader(&header_bytes);
         const file_size = (try file.stat(io)).size;
         header.active_checkpoint = try selectCompleteCheckpointForFile(header, file_size);
@@ -1419,7 +1419,7 @@ pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
-    try readExactAt(file, io, &header_bytes, 0);
+    try readHeaderExactAt(file, io, &header_bytes);
     return inspectBytes(&header_bytes);
 }
 
@@ -1879,6 +1879,11 @@ fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
     if (read != out.len) return error.EndOfStream;
 }
 
+fn readHeaderExactAt(file: std.Io.File, io: std.Io, out: *[header_size]u8) !void {
+    const read = try file.readPositionalAll(io, out, 0);
+    if (read != header_size) return error.TruncatedNativeHeader;
+}
+
 fn headerChecksum(raw: []const u8) u32 {
     var crc = std.hash.Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
@@ -2082,6 +2087,25 @@ test "lite native open rejects unsupported format version" {
     }
 
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, true));
+}
+
+test "lite native open rejects short files as truncated native headers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-short-header.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "not enough header bytes", 0);
+    }
+
+    try std.testing.expectError(error.TruncatedNativeHeader, NativeFile.open(allocator, path, true));
+    try std.testing.expectError(error.TruncatedNativeHeader, inspect(allocator, std.testing.io, path));
 }
 
 test "lite native inspect reads only the header page" {

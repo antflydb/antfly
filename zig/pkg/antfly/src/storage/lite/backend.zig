@@ -574,7 +574,7 @@ test "lite backend auto rejects internal bridge aflite files" {
         try std.testing.expectEqual(EngineKind.bridge_lsm_container, handle.engine);
     }
 
-    try std.testing.expectError(error.EndOfStream, Handle.open(allocator, path, .{}));
+    try std.testing.expectError(error.TruncatedNativeHeader, Handle.open(allocator, path, .{}));
 }
 
 test "lite backend native engine can back db primary documents" {
