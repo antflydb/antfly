@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "21986645d35d6f7416cffc1c3c3bf001e4212c0aca522014950d64d2531e667d",
+  "source_sha256": "882dd179321c061e14700eec9f066d2096d17679c70dd960b4d31e78c7141fa3",
   "source_entry_count": 1005,
   "entry_count": 1005,
   "skipped_entries": [
@@ -129,17 +129,26 @@
       "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) INSERT INTO archived_records (id) SELECT id FROM source_rows"
     },
     {
-      "name": "unsupported recursive cte update write plan",
-      "family": "unsupported_write",
-      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
+      "name": "recursive cte update joined source write plan",
+      "family": "update_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "update_joined_source:recursive_cte=source_rows:ctes=1:on=1:ops=1",
       "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)"
     },
     {
-      "name": "unsupported recursive cte delete write plan",
-      "family": "unsupported_write",
-      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
+      "name": "recursive cte delete joined source write plan",
+      "family": "delete_joined_source",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 1,
+        "join_on": 1
+      },
+      "plan": "delete_joined_source:recursive_cte=source_rows:ctes=1:on=1",
       "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)"
     },
     {

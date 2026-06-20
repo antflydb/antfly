@@ -119,12 +119,131 @@ pub const ConflictIncrementParserHooks = struct {
     ) anyerror![]const u8,
 };
 
+pub const JsonSetSqlValueParserHooks = struct {
+    ptr: *anyopaque,
+    insert_columns: []const []const u8,
+    parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
+    parse_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictUpdateAssignmentValueParserHooks = struct {
+    ptr: *anyopaque,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    parse_json_set_value: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!JsonSetParsedValue,
+    parse_array_element_value_json: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+    parse_json_document_value: *const fn (*anyopaque) anyerror![]const u8,
+    parse_boolean_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_assignment_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_coalesce_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_value_json: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+};
+
+pub const JoinedMutationJsonSetSqlValueParserHooks = struct {
+    ptr: *anyopaque,
+    parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
+    parse_expression: *const fn (
+        *anyopaque,
+        []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const JoinedMutationAssignmentValueParserHooks = struct {
+    ptr: *anyopaque,
+    parse_json_set_value: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const u8,
+    ) anyerror!JsonSetParsedValue,
+    parse_json_document_value: *const fn (*anyopaque) anyerror![]const u8,
+    parse_boolean_expression: *const fn (
+        *anyopaque,
+        []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_assignment_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_column_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
+};
+
+pub const SemiJoinTargetFieldsParserHooks = struct {
+    ptr: *anyopaque,
+    parse_field_expression_owned: *const fn (*anyopaque) anyerror![]const u8,
+};
+
+pub const MergeAssignmentParserHooks = struct {
+    ptr: *anyopaque,
+    parse_assignment_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        TableAlias,
+        TableAlias,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const MergeArmPredicateParserHooks = struct {
+    ptr: *anyopaque,
+    parse_column_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
+};
+
+pub const MergeArmConditionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_column_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
+    parse_expression_predicates: *const fn (
+        *anyopaque,
+        TableAlias,
+        TableAlias,
+        bool,
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) anyerror!void,
+};
+
+pub const IncrementParserHooks = struct {
+    ptr: *anyopaque,
+    parse_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
+};
+
 const LoweredMergeMutationPlan = plan_mod.LoweredMergeMutationPlan;
 const MergeArmPredicate = plan_mod.MergeArmPredicate;
 const MergeExpressionAssignment = plan_mod.MergeExpressionAssignment;
 const MergeFieldMapping = plan_mod.MergeFieldMapping;
 const MergeMatchedArm = plan_mod.MergeMatchedArm;
 const MergeNotMatchedArm = plan_mod.MergeNotMatchedArm;
+const MergePredicateSide = plan_mod.MergePredicateSide;
 const ReturningProjection = plan_mod.ReturningProjection;
 const SelectOutputRef = plan_mod.SelectOutputRef;
 const TableAlias = plan_mod.TableAlias;
@@ -146,6 +265,7 @@ const freeFieldAliasProjections = plan_mod.freeFieldAliasProjections;
 const freeInPredicates = plan_mod.freeInPredicates;
 const freeJoinOn = plan_mod.freeJoinOn;
 const freeJsonExtract = plan_mod.freeJsonExtract;
+const freeMergeArmPredicateValue = plan_mod.freeMergeArmPredicateValue;
 const freeRelationalChecks = plan_mod.freeRelationalChecks;
 const freeRowsJsonSetExpressionAssignments = plan_mod.freeRowsJsonSetExpressionAssignments;
 const freeTableAlias = plan_mod.freeTableAlias;
@@ -849,6 +969,62 @@ pub fn parseConflictArrayElementValueJsonAlloc(
     return value_json;
 }
 
+pub fn parseJsonSetSqlValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    hooks: JsonSetSqlValueParserHooks,
+) anyerror!JsonSetParsedValue {
+    if (!sql_value.peekToJsonbFunctionCall(tokens, pos.*)) {
+        return .{ .value_json = try hooks.parse_json_value(hooks.ptr) };
+    }
+
+    try sql_value.parseToJsonbFunctionCallStart(tokens, pos);
+    if (grammar.peekStaticToJsonbValue(tokens, pos.*)) {
+        const value_json = try hooks.parse_json_value(hooks.ptr);
+        errdefer alloc.free(value_json);
+        try parser.expectToken(tokens, pos, .rparen);
+        return .{ .value_json = value_json };
+    }
+
+    const expression = try hooks.parse_expression(hooks.ptr, column, hooks.insert_columns);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try parser.expectToken(tokens, pos, .rparen);
+    expression_transferred = true;
+    return .{ .expression = expression };
+}
+
+pub fn parseJoinedMutationJsonSetSqlValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    target_alias: []const u8,
+    hooks: JoinedMutationJsonSetSqlValueParserHooks,
+) anyerror!JsonSetParsedValue {
+    if (!sql_value.peekToJsonbFunctionCall(tokens, pos.*)) {
+        return .{ .value_json = try hooks.parse_json_value(hooks.ptr) };
+    }
+
+    try sql_value.parseToJsonbFunctionCallStart(tokens, pos);
+    if (grammar.peekStaticToJsonbValue(tokens, pos.*)) {
+        const value_json = try hooks.parse_json_value(hooks.ptr);
+        errdefer alloc.free(value_json);
+        try parser.expectToken(tokens, pos, .rparen);
+        return .{ .value_json = value_json };
+    }
+
+    const expression = try hooks.parse_expression(hooks.ptr, target_alias);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    _ = column;
+    try parser.expectToken(tokens, pos, .rparen);
+    expression_transferred = true;
+    return .{ .expression = expression };
+}
+
 pub fn parseConflictIncrementAssignmentAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -903,6 +1079,608 @@ pub fn parseConflictIncrementAssignmentAlloc(
     });
     field_transferred = true;
     value_transferred = true;
+}
+
+pub fn parseIncrementAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    hooks: IncrementParserHooks,
+) !void {
+    if (column.field_type != .numeric) return error.InvalidSqlCatalog;
+    const source = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(source);
+    if (!std.mem.eql(u8, source, field)) return error.UnsupportedSqlShape;
+    const negated = if (parser.matchToken(tokens, pos, .plus) != null)
+        false
+    else if (parser.matchToken(tokens, pos, .minus) != null)
+        true
+    else
+        return error.UnsupportedSqlShape;
+    const raw_value_json = try hooks.parse_value_json(hooks.ptr, column);
+    defer alloc.free(raw_value_json);
+    const value_json = try normalizedIncrementJsonAlloc(alloc, raw_value_json, negated);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    const owned_field = try alloc.dupe(u8, field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(owned_field);
+    try increment.append(alloc, .{
+        .field = owned_field,
+        .value_json = value_json,
+    });
+    field_transferred = true;
+    value_transferred = true;
+}
+
+pub fn parseConflictUpdateAssignmentValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    conflict_existing_qualifiers: []const []const u8,
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
+    field_transferred: *bool,
+    hooks: ConflictUpdateAssignmentValueParserHooks,
+) !void {
+    if (parser.matchKeyword(tokens, pos, "jsonb_set")) {
+        if (column.field_type != .json) return error.InvalidSqlCatalog;
+        try parser.expectToken(tokens, pos, .lparen);
+        const json_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(json_field);
+        if (!std.mem.eql(u8, json_field, field)) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .comma);
+        const path = try sql_value.parsePostgresJsonPathAlloc(alloc, tokens, pos, params);
+        var path_transferred = false;
+        errdefer if (!path_transferred) strings.freeStringSlice(alloc, path);
+        try parser.expectToken(tokens, pos, .comma);
+        const value = try hooks.parse_json_set_value(hooks.ptr, column, hooks.insert_columns);
+        var value_transferred = false;
+        errdefer if (!value_transferred) freeJsonSetParsedValue(alloc, value);
+        if (parser.matchToken(tokens, pos, .comma) != null) {
+            if (!parser.matchKeyword(tokens, pos, "true") and !parser.matchKeyword(tokens, pos, "false")) return error.UnsupportedSqlShape;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+        try json_set.append(alloc, .{
+            .field = field,
+            .path = path,
+            .value_json = value.value_json,
+            .expression = value.expression,
+        });
+        field_transferred.* = true;
+        path_transferred = true;
+        value_transferred = true;
+        return;
+    }
+
+    if (grammar.peekArrayTransformSelfAssignment(tokens, pos.*, field)) {
+        const op = grammar.matchArrayTransformUpdateOp(tokens, pos) orelse unreachable;
+        if (column.field_type != .array) return error.InvalidSqlCatalog;
+        try parser.expectToken(tokens, pos, .lparen);
+        const array_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(array_field);
+        if (!std.mem.eql(u8, array_field, field)) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .comma);
+        const value_json = try hooks.parse_array_element_value_json(hooks.ptr, column, hooks.insert_columns, hooks.insert_values);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        try parser.expectToken(tokens, pos, .rparen);
+        try array_update.append(alloc, .{
+            .field = field,
+            .op = op,
+            .value_json = value_json,
+        });
+        field_transferred.* = true;
+        value_transferred = true;
+        return;
+    }
+
+    if (column.field_type == .json and pos.* + 1 < tokens.len and tokens[pos.*].kind == .identifier and tokens[pos.* + 1].kind == .pipe_concat) {
+        const json_field_token = tokens[pos.*];
+        pos.* += 1;
+        if (!std.mem.eql(u8, json_field_token.text, field)) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .pipe_concat);
+        const object_json = try hooks.parse_json_document_value(hooks.ptr);
+        defer alloc.free(object_json);
+        try appendJsonObjectConcatSetValuesAlloc(alloc, field, object_json, json_set);
+        return;
+    }
+
+    if (lower_expr.peekConflictExistingFieldIncrement(tokens, pos.*, field, column)) {
+        try parseConflictIncrementAssignmentAlloc(alloc, tokens, pos, field, column, increment, increment_expr, .{
+            .ptr = hooks.ptr,
+            .insert_columns = hooks.insert_columns,
+            .insert_values = hooks.insert_values,
+            .parse_coalesce_expression = hooks.parse_coalesce_expression,
+            .parse_value_json = hooks.parse_value_json,
+        });
+        return;
+    }
+
+    if (column.field_type == .boolean and canParseConflictBooleanAssignmentExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, hooks.insert_columns)) {
+        const expression = try hooks.parse_boolean_expression(hooks.ptr, column, hooks.insert_columns);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try patch_expr.append(alloc, .{
+            .field = field,
+            .expression = expression,
+        });
+        field_transferred.* = true;
+        expression_transferred = true;
+        return;
+    }
+
+    if (canParseConflictAssignmentExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, hooks.insert_columns)) {
+        const expression = try hooks.parse_assignment_expression(hooks.ptr, column, hooks.insert_columns);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try patch_expr.append(alloc, .{
+            .field = field,
+            .expression = expression,
+        });
+        field_transferred.* = true;
+        expression_transferred = true;
+        return;
+    }
+
+    const value_json = try hooks.parse_value_json(hooks.ptr, column, hooks.insert_columns, hooks.insert_values);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    try patch.append(alloc, .{
+        .field = field,
+        .value_json = value_json,
+    });
+    field_transferred.* = true;
+    value_transferred = true;
+}
+
+pub fn parseJoinedMutationAssignmentValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    target: []const u8,
+    target_column: runtime_schema.RelationalColumn,
+    target_alias: []const u8,
+    pending_joined_source_alias: ?[]const u8,
+    source_assignments: *std.ArrayListUnmanaged(JoinedMutationSourceAssignment),
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    target_transferred: *bool,
+    hooks: JoinedMutationAssignmentValueParserHooks,
+) !void {
+    if (parser.matchKeyword(tokens, pos, "jsonb_set")) {
+        if (target_column.field_type != .json) return error.InvalidSqlCatalog;
+        try parser.expectToken(tokens, pos, .lparen);
+        const json_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(json_field);
+        if (!(try binder.joinedMutationTargetFieldMatches(alloc, json_field, target_alias, target))) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .comma);
+        const path = try sql_value.parsePostgresJsonPathAlloc(alloc, tokens, pos, params);
+        var path_transferred = false;
+        errdefer if (!path_transferred) strings.freeStringSlice(alloc, path);
+        try parser.expectToken(tokens, pos, .comma);
+        const value = try hooks.parse_json_set_value(hooks.ptr, target_column, target_alias);
+        var value_transferred = false;
+        errdefer if (!value_transferred) freeJsonSetParsedValue(alloc, value);
+        if (parser.matchToken(tokens, pos, .comma) != null) {
+            if (!parser.matchKeyword(tokens, pos, "true") and !parser.matchKeyword(tokens, pos, "false")) return error.UnsupportedSqlShape;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+        try json_set.append(alloc, .{
+            .field = target,
+            .path = path,
+            .value_json = value.value_json,
+            .expression = value.expression,
+        });
+        target_transferred.* = true;
+        path_transferred = true;
+        value_transferred = true;
+        return;
+    }
+
+    if (target_column.field_type == .json and pos.* + 1 < tokens.len and tokens[pos.*].kind == .identifier and tokens[pos.* + 1].kind == .pipe_concat) {
+        const json_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(json_field);
+        if (!(try binder.joinedMutationTargetFieldMatches(alloc, json_field, target_alias, target))) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .pipe_concat);
+        const object_json = try hooks.parse_json_document_value(hooks.ptr);
+        defer alloc.free(object_json);
+        try appendJsonObjectConcatSetValuesAlloc(alloc, target, object_json, json_set);
+        return;
+    }
+
+    if (target_column.field_type == .boolean and canParseJoinedBooleanAssignmentExpression(tokens, pos.*, schema, joined_source_schema, pending_joined_source_alias, target_alias)) {
+        const expression = try hooks.parse_boolean_expression(hooks.ptr, target_alias);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try patch_expr.append(alloc, .{
+            .field = target,
+            .expression = expression,
+        });
+        target_transferred.* = true;
+        expression_transferred = true;
+        return;
+    }
+
+    if (canParseJoinedAssignmentExpression(tokens, pos.*, schema, joined_source_schema, target_alias)) {
+        const expression = try hooks.parse_assignment_expression(hooks.ptr, target_column, target_alias);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try patch_expr.append(alloc, .{
+            .field = target,
+            .expression = expression,
+        });
+        target_transferred.* = true;
+        expression_transferred = true;
+        return;
+    }
+
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and lower_expr.identifierContainsQualifier(tokens[pos.*].text)) {
+        const source = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+        defer plan_mod.freeQualifiedField(alloc, source);
+        if (std.mem.eql(u8, source.qualifier, target_alias)) return error.UnsupportedSqlShape;
+        const source_column = binder.relationalColumnForField(joined_source_schema orelse schema, source.field, null) orelse return error.InvalidSqlCatalog;
+        if (source_column.field_type != target_column.field_type) return error.UnsupportedSqlShape;
+        const field = try alloc.dupe(u8, target);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const source_qualifier = try alloc.dupe(u8, source.qualifier);
+        var source_qualifier_transferred = false;
+        errdefer if (!source_qualifier_transferred) alloc.free(source_qualifier);
+        const source_field = try alloc.dupe(u8, source.field);
+        var source_field_transferred = false;
+        errdefer if (!source_field_transferred) alloc.free(source_field);
+        try source_assignments.append(alloc, .{
+            .field = field,
+            .source_qualifier = source_qualifier,
+            .source_field = source_field,
+        });
+        field_transferred = true;
+        source_qualifier_transferred = true;
+        source_field_transferred = true;
+        return;
+    }
+
+    const value_json = try hooks.parse_column_value_json(hooks.ptr, target_column);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    try patch.append(alloc, .{
+        .field = target,
+        .value_json = value_json,
+    });
+    target_transferred.* = true;
+    value_transferred = true;
+}
+
+pub fn parseMergeTargetFieldOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: TableAlias,
+) ![]const u8 {
+    const identifier = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    errdefer alloc.free(identifier);
+    if (std.mem.indexOfScalar(u8, identifier, '.')) |dot| {
+        if (dot == 0 or dot + 1 >= identifier.len) return error.UnsupportedSqlShape;
+        const qualifier = identifier[0..dot];
+        if (!grammar.rowClaimTargetAllowed(alloc, qualifier, &.{ target_table.name, target_table.alias })) return error.UnsupportedSqlShape;
+        const field = try alloc.dupe(u8, identifier[dot + 1 ..]);
+        alloc.free(identifier);
+        return field;
+    }
+    return identifier;
+}
+
+pub fn parseMergeQualifiedSourceMappingAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_table: TableAlias,
+    source_table: TableAlias,
+) !MergeFieldMapping {
+    const lhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+    defer plan_mod.freeQualifiedField(alloc, lhs);
+    try parser.expectToken(tokens, pos, .eq);
+    const rhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+    defer plan_mod.freeQualifiedField(alloc, rhs);
+    const lhs_is_target = grammar.rowClaimTargetAllowed(alloc, lhs.qualifier, &.{ target_table.name, target_table.alias });
+    const lhs_is_source = grammar.rowClaimTargetAllowed(alloc, lhs.qualifier, &.{ source_table.name, source_table.alias });
+    const rhs_is_target = grammar.rowClaimTargetAllowed(alloc, rhs.qualifier, &.{ target_table.name, target_table.alias });
+    const rhs_is_source = grammar.rowClaimTargetAllowed(alloc, rhs.qualifier, &.{ source_table.name, source_table.alias });
+    if (lhs_is_target and rhs_is_source) {
+        try binder.validateMergeFields(schema, joined_source_schema, lhs.field, rhs.field);
+        const target_field = try alloc.dupe(u8, lhs.field);
+        var target_transferred = false;
+        errdefer if (!target_transferred) alloc.free(target_field);
+        const source_field = try alloc.dupe(u8, rhs.field);
+        var source_transferred = false;
+        errdefer if (!source_transferred) alloc.free(source_field);
+        target_transferred = true;
+        source_transferred = true;
+        return .{
+            .target_field = target_field,
+            .source_field = source_field,
+        };
+    }
+    if (lhs_is_source and rhs_is_target) {
+        try binder.validateMergeFields(schema, joined_source_schema, rhs.field, lhs.field);
+        const target_field = try alloc.dupe(u8, rhs.field);
+        var target_transferred = false;
+        errdefer if (!target_transferred) alloc.free(target_field);
+        const source_field = try alloc.dupe(u8, lhs.field);
+        var source_transferred = false;
+        errdefer if (!source_transferred) alloc.free(source_field);
+        target_transferred = true;
+        source_transferred = true;
+        return .{
+            .target_field = target_field,
+            .source_field = source_field,
+        };
+    }
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseMergeArmPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_table: TableAlias,
+    source_table: TableAlias,
+    allow_target: bool,
+    hooks: MergeArmPredicateParserHooks,
+) !MergeArmPredicate {
+    const lhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+    defer plan_mod.freeQualifiedField(alloc, lhs);
+    const lhs_is_target = grammar.rowClaimTargetAllowed(alloc, lhs.qualifier, &.{ target_table.name, target_table.alias });
+    const lhs_is_source = grammar.rowClaimTargetAllowed(alloc, lhs.qualifier, &.{ source_table.name, source_table.alias });
+    if (lhs_is_target == lhs_is_source) return error.UnsupportedSqlShape;
+    const side: MergePredicateSide = if (lhs_is_target) .target else .source;
+    if (side == .target and !allow_target) return error.UnsupportedSqlShape;
+
+    const column = switch (side) {
+        .target => binder.relationalColumnForField(schema, lhs.field, null) orelse return error.InvalidSqlCatalog,
+        .source => blk: {
+            const source_schema = joined_source_schema orelse schema;
+            break :blk binder.relationalColumnForField(source_schema, lhs.field, null) orelse return error.InvalidSqlCatalog;
+        },
+    };
+
+    const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+        .allow_distinct = false,
+        .allow_boolean_unknown = true,
+        .allow_boolean_literal = true,
+    })) |is_tail| blk: {
+        switch (is_tail.kind) {
+            .distinct_comparison => unreachable,
+            .null_test => {},
+            .boolean_unknown => {
+                if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                break :blk is_tail.op;
+            },
+            .boolean_literal => {
+                if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                const value_json = try alloc.dupe(u8, sql_value.booleanJson(is_tail.boolean_value));
+                var value_transferred = false;
+                errdefer if (!value_transferred) alloc.free(value_json);
+                const field = try alloc.dupe(u8, lhs.field);
+                var field_transferred = false;
+                errdefer if (!field_transferred) alloc.free(field);
+                field_transferred = true;
+                value_transferred = true;
+                return MergeArmPredicate{
+                    .side = side,
+                    .field = field,
+                    .op = .eq,
+                    .value_json = value_json,
+                };
+            },
+        }
+        break :blk is_tail.op;
+    } else try lower_expr.parseComparisonOp(tokens, pos);
+    const value_json = if (op == .is_null or op == .is_not_null)
+        null
+    else
+        try hooks.parse_column_value_json(hooks.ptr, column);
+    var value_transferred = false;
+    errdefer if (!value_transferred) if (value_json) |value| alloc.free(value);
+    const field = try alloc.dupe(u8, lhs.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    field_transferred = true;
+    value_transferred = true;
+    return MergeArmPredicate{
+        .side = side,
+        .field = field,
+        .op = op,
+        .value_json = value_json,
+    };
+}
+
+pub fn parseMergeArmConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_table: TableAlias,
+    source_table: TableAlias,
+    allow_target: bool,
+    predicates: *std.ArrayListUnmanaged(MergeArmPredicate),
+    expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    hooks: MergeArmConditionParserHooks,
+) !void {
+    const checkpoint = pos.*;
+    if (parseMergeArmPredicateAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, allow_target, .{
+        .ptr = hooks.ptr,
+        .parse_column_value_json = hooks.parse_column_value_json,
+    })) |predicate| {
+        var predicate_transferred = false;
+        errdefer if (!predicate_transferred) freeMergeArmPredicateValue(alloc, predicate);
+        if (parser.peekKeyword(tokens, pos.*, "or")) {
+            freeMergeArmPredicateValue(alloc, predicate);
+            predicate_transferred = true;
+            pos.* = checkpoint;
+            try hooks.parse_expression_predicates(hooks.ptr, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates);
+            return;
+        }
+        try predicates.append(alloc, predicate);
+        predicate_transferred = true;
+        return;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => pos.* = checkpoint,
+        else => return err,
+    }
+
+    try hooks.parse_expression_predicates(hooks.ptr, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates);
+}
+
+pub fn mergeParenthesizedExpressionOrWhereCanStart(tokens: []const Token, pos: usize) bool {
+    if (!parser.peekKind(tokens, pos, .lparen)) return false;
+    const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos);
+    if (!lower_expr.expressionPredicateCanStartAt(tokens, inner)) return false;
+
+    var depth: usize = 0;
+    var i = pos;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return false;
+                depth -= 1;
+                if (depth == 0) return false;
+            },
+            .identifier => if (depth == 1 and std.ascii.eqlIgnoreCase(token.text, "or")) return true,
+            .semicolon => return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
+pub fn mergeCanParseExpressionNotWhere(tokens: []const Token, pos: usize) bool {
+    if (!parser.peekKeyword(tokens, pos, "not") or pos + 2 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
+    const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos + 1);
+    return lower_expr.expressionPredicateCanStartAt(tokens, inner);
+}
+
+pub fn parseMergeUpdateAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_table: TableAlias,
+    source_table: TableAlias,
+    hooks: MergeAssignmentParserHooks,
+) !MergeParsedAssignment {
+    const target_field = try parseMergeTargetFieldOwnedAlloc(alloc, tokens, pos, target_table);
+    errdefer alloc.free(target_field);
+    try parser.expectToken(tokens, pos, .eq);
+    const target_column = binder.relationalColumnForField(schema, target_field, null) orelse return error.InvalidSqlCatalog;
+    const expression = try hooks.parse_assignment_expression(hooks.ptr, target_column, target_table, source_table);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    if (expression.kind == .field and expression.field_source == .source) {
+        try binder.validateMergeFields(schema, joined_source_schema, target_field, expression.field);
+        const source_field = expression.field;
+        expression_transferred = true;
+        return .{ .mapping = .{
+            .target_field = target_field,
+            .source_field = source_field,
+        } };
+    }
+    expression_transferred = true;
+    return .{ .expression = .{
+        .target_field = target_field,
+        .expression = expression,
+    } };
+}
+
+pub fn parseMergeInsertMappingsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    target_table: TableAlias,
+    source_table: TableAlias,
+    mappings: *std.ArrayListUnmanaged(MergeFieldMapping),
+    expressions: *std.ArrayListUnmanaged(MergeExpressionAssignment),
+    hooks: MergeAssignmentParserHooks,
+) !void {
+    try parser.expectToken(tokens, pos, .lparen);
+    const target_fields = try grammar.parseIdentifierListAlloc(alloc, tokens, pos);
+    defer strings.freeStringSlice(alloc, target_fields);
+    if (target_fields.len == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+    try parser.expectKeyword(tokens, pos, "values");
+    try parser.expectToken(tokens, pos, .lparen);
+    for (target_fields, 0..) |target_field, i| {
+        if (i != 0) try parser.expectToken(tokens, pos, .comma);
+        const owned_target_field = try alloc.dupe(u8, target_field);
+        var target_transferred = false;
+        errdefer if (!target_transferred) alloc.free(owned_target_field);
+        const target_column = binder.relationalColumnForField(schema, owned_target_field, null) orelse return error.InvalidSqlCatalog;
+        const expression = try hooks.parse_assignment_expression(hooks.ptr, target_column, target_table, source_table);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        if (expression.kind == .field and expression.field_source == .source) {
+            try binder.validateMergeFields(schema, joined_source_schema, owned_target_field, expression.field);
+            const source_field = expression.field;
+            try mappings.append(alloc, .{
+                .target_field = owned_target_field,
+                .source_field = source_field,
+            });
+            target_transferred = true;
+            expression_transferred = true;
+        } else {
+            if (mergeExpressionUsesTargetRow(expression)) return error.UnsupportedSqlShape;
+            try expressions.append(alloc, .{
+                .target_field = owned_target_field,
+                .expression = expression,
+            });
+            target_transferred = true;
+            expression_transferred = true;
+        }
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+}
+
+pub fn parseJoinedMutationTargetFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_alias: []const u8,
+) ![]const u8 {
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and lower_expr.identifierContainsQualifier(tokens[pos.*].text)) {
+        const source = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+        defer plan_mod.freeQualifiedField(alloc, source);
+        if (!std.mem.eql(u8, source.qualifier, target_alias)) return error.UnsupportedSqlShape;
+        return try alloc.dupe(u8, source.field);
+    }
+    return try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
 }
 
 pub fn insertSourceUniquePredicatesFromConstraintAlloc(
@@ -1309,6 +2087,64 @@ pub const SemiJoinSource = struct {
     table: TableAlias,
     fields: []const []const u8,
 };
+
+pub fn parseExistsSemiJoinSourceTableAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !TableAlias {
+    var saw_select_item = false;
+    var depth: usize = 0;
+    while (!parser.atEnd(tokens, pos.*)) {
+        if (depth == 0 and parser.peekKeyword(tokens, pos.*, "from")) break;
+        const token = tokens[pos.*];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return error.UnsupportedSqlShape;
+                depth -= 1;
+            },
+            .semicolon => return error.UnsupportedSqlShape,
+            else => {},
+        }
+        saw_select_item = true;
+        pos.* += 1;
+    }
+    if (!saw_select_item) return error.UnsupportedSqlShape;
+    try parser.expectKeyword(tokens, pos, "from");
+    return try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+}
+
+pub fn parseSemiJoinTargetFieldsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_qualifiers: []const []const u8,
+    hooks: SemiJoinTargetFieldsParserHooks,
+) ![]const []const u8 {
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+
+    if (parser.matchToken(tokens, pos, .lparen) != null) {
+        while (true) {
+            const parsed_target_field = try hooks.parse_field_expression_owned(hooks.ptr);
+            defer alloc.free(parsed_target_field);
+            try binder.appendSemiJoinTargetFieldAlloc(alloc, &fields, schema, parsed_target_field, target_qualifiers);
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    } else {
+        const parsed_target_field = try hooks.parse_field_expression_owned(hooks.ptr);
+        defer alloc.free(parsed_target_field);
+        try binder.appendSemiJoinTargetFieldAlloc(alloc, &fields, schema, parsed_target_field, target_qualifiers);
+    }
+    if (fields.items.len == 0) return error.UnsupportedSqlShape;
+    return try fields.toOwnedSlice(alloc);
+}
 
 pub const ParsedSemiJoinSourceQuery = struct {
     query: db_mod.types.RelationalRowsQueryRequest = .{},

@@ -414,6 +414,17 @@ pub const LoweredRecursiveInsertSource = struct {
     }
 };
 
+pub const LoweredRecursiveJoinedMutationSource = struct {
+    recursive: LoweredRecursiveCtePlan,
+    mutation: LoweredJoinedMutationSource,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.recursive.deinit(alloc);
+        self.mutation.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredMutation = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
@@ -558,6 +569,8 @@ pub const LoweredWritePlan = union(enum) {
     truncate_source: LoweredMutationSource,
     update_joined_source: LoweredJoinedMutationSource,
     delete_joined_source: LoweredJoinedMutationSource,
+    recursive_update_joined_source: LoweredRecursiveJoinedMutationSource,
+    recursive_delete_joined_source: LoweredRecursiveJoinedMutationSource,
     merge_mutation: LoweredMergeMutationPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -572,6 +585,8 @@ pub const LoweredWritePlan = union(enum) {
             .truncate_source => |*truncate_source| truncate_source.deinit(alloc),
             .update_joined_source => |*update_joined_source| update_joined_source.deinit(alloc),
             .delete_joined_source => |*delete_joined_source| delete_joined_source.deinit(alloc),
+            .recursive_update_joined_source => |*recursive_update_joined_source| recursive_update_joined_source.deinit(alloc),
+            .recursive_delete_joined_source => |*recursive_delete_joined_source| recursive_delete_joined_source.deinit(alloc),
             .merge_mutation => |*merge_mutation| merge_mutation.deinit(alloc),
         }
         self.* = undefined;
