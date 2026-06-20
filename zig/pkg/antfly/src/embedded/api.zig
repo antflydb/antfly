@@ -879,6 +879,27 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         defer alloc.free(index_created);
         try std.testing.expect(std.mem.indexOf(u8, index_created, "\"created\":true") != null);
 
+        const dense_index_created = try api.addIndexJson(
+            alloc,
+            "{\"name\":\"dv_v1\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":3,\\\"metric\\\":\\\"l2_squared\\\",\\\"external\\\":true}\"}",
+        );
+        defer alloc.free(dense_index_created);
+        try std.testing.expect(std.mem.indexOf(u8, dense_index_created, "\"created\":true") != null);
+
+        const sparse_index_created = try api.addIndexJson(
+            alloc,
+            "{\"name\":\"sv_v1\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"sparse_embedding\\\",\\\"external\\\":true}\"}",
+        );
+        defer alloc.free(sparse_index_created);
+        try std.testing.expect(std.mem.indexOf(u8, sparse_index_created, "\"created\":true") != null);
+
+        const graph_index_created = try api.addIndexJson(
+            alloc,
+            "{\"name\":\"gr_v1\",\"kind\":\"graph\",\"config_json\":\"{}\"}",
+        );
+        defer alloc.free(graph_index_created);
+        try std.testing.expect(std.mem.indexOf(u8, graph_index_created, "\"created\":true") != null);
+
         const batch_a = try api.batchJson(
             alloc,
             "{\"inserts\":{\"doc:a\":{\"title\":\"first\"},\"doc:gone\":{\"title\":\"remove\"}}}",
@@ -889,6 +910,34 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
             "{\"inserts\":{\"doc:a\":{\"title\":\"second\"}},\"deletes\":[\"doc:gone\"]}",
         );
         defer alloc.free(batch_b);
+
+        const vector_batch = try api.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:vec:a\":{\"title\":\"vector alpha\",\"_embeddings\":{\"dv_v1\":[1,0,0],\"sv_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"_edges\":{\"gr_v1\":{\"links\":[{\"target\":\"doc:vec:c\",\"weight\":1.0}]}}},\"doc:vec:b\":{\"title\":\"vector beta\",\"_embeddings\":{\"dv_v1\":[0,1,0],\"sv_v1\":{\"indices\":[99],\"values\":[2.0]}}},\"doc:vec:c\":{\"title\":\"graph target\"}},\"sync_level\":\"full_index\"}",
+        );
+        defer alloc.free(vector_batch);
+        try std.testing.expect(std.mem.indexOf(u8, vector_batch, "\"inserted\":3") != null);
+
+        const dense_before = try api.searchJson(
+            alloc,
+            "{\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"dv_v1\"],\"limit\":1}",
+        );
+        defer alloc.free(dense_before);
+        try std.testing.expect(std.mem.indexOf(u8, dense_before, "\"doc:vec:a\"") != null);
+
+        const sparse_before = try api.searchJson(
+            alloc,
+            "{\"embeddings\":{\"sv_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"indexes\":[\"sv_v1\"],\"limit\":1}",
+        );
+        defer alloc.free(sparse_before);
+        try std.testing.expect(std.mem.indexOf(u8, sparse_before, "\"doc:vec:a\"") != null);
+
+        const graph_before = try api.searchJson(
+            alloc,
+            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+        );
+        defer alloc.free(graph_before);
+        try std.testing.expect(std.mem.indexOf(u8, graph_before, "\"doc:vec:c\"") != null);
 
         const check_before = try api.checkLiteJson(alloc);
         defer alloc.free(check_before);
@@ -946,6 +995,9 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         defer alloc.free(indexes_json);
         try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"ft_body\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, indexes_json, "body_chunks_v1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"dv_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"sv_v1\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, indexes_json, "\"gr_v1\"") != null);
 
         const enrichments_json = try restored.listEnrichmentsJson(alloc);
         defer alloc.free(enrichments_json);
@@ -964,5 +1016,26 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         const deleted_json = try restored.lookupJson(alloc, "doc:gone", "");
         defer alloc.free(deleted_json);
         try std.testing.expect(std.mem.indexOf(u8, deleted_json, "\"found\":false") != null);
+
+        const dense_after = try restored.searchJson(
+            alloc,
+            "{\"embeddings\":{\"dv_v1\":[1,0,0]},\"indexes\":[\"dv_v1\"],\"limit\":1}",
+        );
+        defer alloc.free(dense_after);
+        try std.testing.expect(std.mem.indexOf(u8, dense_after, "\"doc:vec:a\"") != null);
+
+        const sparse_after = try restored.searchJson(
+            alloc,
+            "{\"embeddings\":{\"sv_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"indexes\":[\"sv_v1\"],\"limit\":1}",
+        );
+        defer alloc.free(sparse_after);
+        try std.testing.expect(std.mem.indexOf(u8, sparse_after, "\"doc:vec:a\"") != null);
+
+        const graph_after = try restored.searchJson(
+            alloc,
+            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"gr_v1\",\"start_nodes\":{\"keys\":[\"doc:vec:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+        );
+        defer alloc.free(graph_after);
+        try std.testing.expect(std.mem.indexOf(u8, graph_after, "\"doc:vec:c\"") != null);
     }
 }
