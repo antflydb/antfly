@@ -575,7 +575,41 @@ fn importBackup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
         }
     }
     const resolved_from = from_path orelse cli.fatal("--from is required", .{});
+    if (!replace and pathExists(io, path)) {
+        if (!std.mem.endsWith(u8, resolved_from, ".afb")) {
+            cli.fatal("import into an existing Lite database requires a portable .afb source; use restore --replace for .aflite snapshots", .{});
+        }
+        importPortableIntoExistingLite(allocator, io, resolved_from, path) catch |err| switch (err) {
+            error.LiteImportTargetNotEmpty => cli.fatal("target database is not empty; pass --replace to replace it: {s}", .{path}),
+            else => return err,
+        };
+        return;
+    }
     try restoreFromSourceFile(allocator, io, resolved_from, path, replace);
+}
+
+fn importPortableIntoExistingLite(
+    allocator: Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    target_path: []const u8,
+) !void {
+    try requireAfbPath(source_path);
+    try requireAflitePath(target_path);
+    if (try pathsReferToSameExistingFile(allocator, io, source_path, target_path)) {
+        std.debug.print("error: source and target database paths must be different: {s}\n", .{source_path});
+        return error.InvalidArguments;
+    }
+
+    {
+        var lite = try LiteDb.open(allocator, target_path, .writer);
+        defer lite.close();
+        if (!(try liteImportTargetIsEmpty(allocator, &lite))) {
+            return error.LiteImportTargetNotEmpty;
+        }
+    }
+
+    try restoreFromSourceFile(allocator, io, source_path, target_path, true);
 }
 
 fn restoreFromSourceFile(
@@ -659,6 +693,29 @@ fn finishRestoredLiteImportPath(allocator: Allocator, path: []const u8) !void {
     try lite.db.runUntilIdle();
     try lite.db.sync(true);
     try lite.db.syncIndexes(true);
+}
+
+fn liteImportTargetIsEmpty(allocator: Allocator, lite: *LiteDb) !bool {
+    if (try lite.db.primaryDocCount(allocator) != 0) return false;
+    if (lite.db.core.indexCount() != 0) return false;
+
+    const enrichments = try lite.db.listEnrichments(allocator);
+    defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+    if (enrichments.len != 0) return false;
+
+    const resolvers = try lite.db.listResolvers(allocator);
+    defer {
+        for (resolvers) |*resolver| resolver.deinit(allocator);
+        if (resolvers.len > 0) allocator.free(resolvers);
+    }
+    if (resolvers.len != 0) return false;
+
+    if (try lite.db.getSchemaJson(allocator)) |schema_json| {
+        allocator.free(schema_json);
+        return false;
+    }
+
+    return true;
 }
 
 const PromoteOptions = struct {
@@ -1785,6 +1842,10 @@ test "lite backup output restores schema indexes enrichments and documents" {
     defer allocator.free(backup_path);
     const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-roundtrip-dst.aflite", .{tmp.sub_path});
     defer allocator.free(dst_path);
+    const import_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-import-empty.aflite", .{tmp.sub_path});
+    defer allocator.free(import_path);
+    const nonempty_import_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-import-nonempty.aflite", .{tmp.sub_path});
+    defer allocator.free(nonempty_import_path);
 
     {
         var source = try LiteDb.create(allocator, src_path, true);
@@ -1804,6 +1865,11 @@ test "lite backup output restores schema indexes enrichments and documents" {
             .name = "ft_body_v1",
             .kind = .full_text,
             .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
+        });
+        try source.db.addIndex(.{
+            .name = "ft_direct_v1",
+            .kind = .full_text,
+            .config_json = "{}",
         });
 
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:backup-roundtrip\":{\"title\":\"portable backup restore\",\"body\":\"schema and catalog survive\"}}}");
@@ -1832,10 +1898,21 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try restored.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 1), indexes.len);
-        try std.testing.expectEqualStrings("ft_body_v1", indexes[0].name);
-        try std.testing.expectEqual(db_types.IndexKind.full_text, indexes[0].kind);
-        try std.testing.expect(std.mem.indexOf(u8, indexes[0].config_json, "body_chunks_v1") != null);
+        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        var saw_chunk_index = false;
+        var saw_direct_index = false;
+        for (indexes) |index| {
+            if (std.mem.eql(u8, index.name, "ft_body_v1")) {
+                saw_chunk_index = true;
+                try std.testing.expectEqual(db_types.IndexKind.full_text, index.kind);
+                try std.testing.expect(std.mem.indexOf(u8, index.config_json, "body_chunks_v1") != null);
+            } else if (std.mem.eql(u8, index.name, "ft_direct_v1")) {
+                saw_direct_index = true;
+                try std.testing.expectEqual(db_types.IndexKind.full_text, index.kind);
+            }
+        }
+        try std.testing.expect(saw_chunk_index);
+        try std.testing.expect(saw_direct_index);
 
         const enrichments = try restored.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -1851,6 +1928,47 @@ test "lite backup output restores schema indexes enrichments and documents" {
         const json = try lookupJson(allocator, &restored.db, "doc:backup-roundtrip", "");
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"portable backup restore\"") != null);
+    }
+
+    {
+        var empty_target = try LiteDb.create(allocator, import_path, true);
+        empty_target.close();
+    }
+    try importPortableIntoExistingLite(allocator, io, backup_path, import_path);
+
+    {
+        var imported = try LiteDb.open(allocator, import_path, .status_only);
+        defer imported.close();
+
+        const schema = (try imported.db.getSchemaJson(allocator)) orelse return error.MissingLiteSchemaJson;
+        defer allocator.free(schema);
+        try std.testing.expect(std.mem.indexOf(u8, schema, "\"required\":[\"title\"]") != null);
+
+        const indexes = try imported.db.listIndexes(allocator);
+        defer db_types.freeIndexConfigs(allocator, indexes);
+        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+
+        const enrichments = try imported.db.listEnrichments(allocator);
+        defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
+    }
+
+    {
+        var nonempty = try LiteDb.create(allocator, nonempty_import_path, true);
+        defer nonempty.close();
+        const json = try batchJson(allocator, &nonempty.db, "{\"inserts\":{\"doc:existing\":{\"title\":\"existing import target\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+    try std.testing.expectError(error.LiteImportTargetNotEmpty, importPortableIntoExistingLite(allocator, io, backup_path, nonempty_import_path));
+
+    {
+        var nonempty = try LiteDb.open(allocator, nonempty_import_path, .query_readonly);
+        defer nonempty.close();
+        const json = try lookupJson(allocator, &nonempty.db, "doc:existing", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"existing import target\"") != null);
     }
 }
 

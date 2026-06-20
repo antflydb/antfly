@@ -23239,7 +23239,10 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsContext(
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-            var identity = (try artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key)) orelse return .@"continue";
+            var identity = (artifact_ids.decodeEmbeddingArtifactIdentityAlloc(state.ctx.alloc, key) catch |err| switch (err) {
+                error.InvalidInternalUserKey => return .@"continue",
+                else => return err,
+            }) orelse return .@"continue";
             defer identity.deinit(state.ctx.alloc);
             if (!std.mem.eql(u8, identity.embedding_name, state.expected_name)) return .@"continue";
 

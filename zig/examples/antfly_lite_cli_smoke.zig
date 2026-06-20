@@ -33,6 +33,8 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(restored_path);
     const restored_snapshot_path = try join(allocator, root, "restored-snapshot.aflite");
     defer allocator.free(restored_snapshot_path);
+    const imported_path = try join(allocator, root, "imported.aflite");
+    defer allocator.free(imported_path);
     const backup_path = try join(allocator, root, "app.afb");
     defer allocator.free(backup_path);
     const text_index_path = try join(allocator, root, "text-index.json");
@@ -111,6 +113,11 @@ pub fn main(init: std.process.Init) !void {
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "backup", db_path, "--out", backup_path }, "\"format\":\"afb\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", backup_path, "--out", restored_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "init", imported_path }, "\"format\":\"aflite\"");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "import", imported_path, "--from", backup_path }, "\"format\":\"aflite\"");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", imported_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", imported_path, "--file", text_query_path }, "doc:cli-smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", imported_path, "--file", dense_query_path }, "doc:cli-vec-a");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", db_path, "--out", restored_snapshot_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_snapshot_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", restored_snapshot_path, "--file", dense_query_path }, "doc:cli-vec-a");
