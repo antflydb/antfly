@@ -556,8 +556,10 @@ test "embedded api hosted profile drains derived indexing without native runtime
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_placement\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cross_node_joins\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_shard_fanout\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"distributed_transaction_coordination\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_heartbeat_status_aggregation\":false") != null);
 
     const idle_json = try api.runUntilIdleJson(alloc);
     defer alloc.free(idle_json);

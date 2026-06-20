@@ -1268,8 +1268,10 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"raft_replication\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cluster_placement\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cross_node_joins\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"remote_shard_fanout\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"distributed_transaction_coordination\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"cluster_heartbeat_status_aggregation\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"has_async_indexes\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
 }

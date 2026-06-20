@@ -57,8 +57,10 @@ pub const Capabilities = struct {
     distributed_shard_ownership: bool = false,
     raft_replication: bool = false,
     cluster_placement: bool = false,
+    cross_node_joins: bool = false,
     remote_shard_fanout: bool = false,
     distributed_transaction_coordination: bool = false,
+    cluster_heartbeat_status_aggregation: bool = false,
     server_side_autoscaling: bool = false,
     kubernetes_operator: bool = false,
     object_storage_primary: bool = false,
@@ -88,8 +90,10 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .distributed_shard_ownership = false,
         .raft_replication = false,
         .cluster_placement = false,
+        .cross_node_joins = false,
         .remote_shard_fanout = false,
         .distributed_transaction_coordination = false,
+        .cluster_heartbeat_status_aggregation = false,
         .server_side_autoscaling = false,
         .kubernetes_operator = false,
         .object_storage_primary = false,
@@ -399,8 +403,10 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(!native_caps.distributed_shard_ownership);
     try std.testing.expect(!native_caps.raft_replication);
     try std.testing.expect(!native_caps.cluster_placement);
+    try std.testing.expect(!native_caps.cross_node_joins);
     try std.testing.expect(!native_caps.remote_shard_fanout);
     try std.testing.expect(!native_caps.distributed_transaction_coordination);
+    try std.testing.expect(!native_caps.cluster_heartbeat_status_aggregation);
     try std.testing.expect(!native_caps.server_side_autoscaling);
     try std.testing.expect(!native_caps.kubernetes_operator);
     try std.testing.expect(!native_caps.object_storage_primary);
