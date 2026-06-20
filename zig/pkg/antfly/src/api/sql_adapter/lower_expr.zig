@@ -627,9 +627,21 @@ pub const NullifRowExpressionParserHooks = struct {
 pub const RowExpressionInputDomain = enum {
     text,
     numeric,
+    json,
+    any,
 };
 
 pub const FixedUnaryRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const FixedBinaryRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const VariadicRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
@@ -2356,6 +2368,22 @@ pub fn parseFixedUnaryRowExpressionAlloc(
     return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, input_domain, hooks);
 }
 
+pub fn parseJsonUnaryRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: RowExpressionTypeContext,
+    hooks: FixedUnaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    switch (kind) {
+        .json_array_length => try parseJsonArrayLengthFunctionCallStart(tokens, pos),
+        .json_typeof => try parseJsonTypeofFunctionCallStart(tokens, pos),
+        else => return error.UnsupportedSqlShape,
+    }
+    return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, .json, hooks);
+}
+
 fn parseUnaryRowExpressionCallRestAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2371,11 +2399,101 @@ fn parseUnaryRowExpressionCallRestAlloc(
     switch (input_domain) {
         .text => try type_context.validateTextRowExpression(operand),
         .numeric => try type_context.validateNumericRowExpression(operand),
+        .json => try type_context.validateJsonRowExpression(operand),
+        .any => _ = try type_context.rowExpressionOutputType(operand),
     }
     try parser.expectToken(tokens, pos, .rparen);
 
     const expression = try buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
     operand_transferred = true;
+    return expression;
+}
+
+pub fn parseArrayPositionRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: FixedBinaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try parseArrayPositionFunctionCallStart(tokens, pos);
+    const array_expression = try hooks.parse_expression(hooks.ptr);
+    var array_transferred = false;
+    errdefer if (!array_transferred) freeExpression(alloc, array_expression);
+    const array_type = try type_context.rowExpressionOutputType(array_expression);
+    if (array_type != .array) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .comma);
+    const needle_expression = try hooks.parse_expression(hooks.ptr);
+    var needle_transferred = false;
+    errdefer if (!needle_transferred) freeExpression(alloc, needle_expression);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildBinaryFunctionExpressionAlloc(alloc, kind, array_expression, needle_expression);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    array_transferred = true;
+    needle_transferred = true;
+    try type_context.validateArrayPositionExpression(expression);
+
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseFixedNumericBinaryRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: RowExpressionTypeContext,
+    hooks: FixedBinaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseFixedBinaryFunctionCallStart(tokens, pos, kind);
+    const lhs = try hooks.parse_expression(hooks.ptr);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+    try type_context.validateNumericRowExpression(lhs);
+    try parser.expectToken(tokens, pos, .comma);
+    const rhs = try hooks.parse_expression(hooks.ptr);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+    try type_context.validateNumericRowExpression(rhs);
+    try parser.expectToken(tokens, pos, .rparen);
+    const expression = try buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return expression;
+}
+
+pub fn parseGreatestLeastRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try parseGreatestLeastFunctionCallStart(tokens, pos);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try hooks.parse_expression(hooks.ptr);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (operands.items.len == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateExpressionOperandDomains(expression);
+    expression_transferred = true;
     return expression;
 }
 

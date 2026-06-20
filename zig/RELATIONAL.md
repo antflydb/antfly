@@ -1825,13 +1825,15 @@ delete checks, so a `FOR PORTION OF` split that preserves period coverage does
 not look like an uncovered parent delete. Remaining production work is expanded
 chaos coverage that combines `FOR PORTION OF` DML, temporal FK checks, range
 movement, repair, and catalog promotion in one generated workload.
-System-time / transaction-time history is intentionally not part of this
-application-time feature. If Antfly adds bitemporal tables later, system-time
-must be modeled as a separate catalog/runtime dimension with its own history
-retention, visibility, replay, and repair rules instead of being inferred from
-application-period rows or transaction metadata. The SQL/API parity corpus pins
-`CREATE TABLE ... WITH SYSTEM VERSIONING` as an explicit unsupported DDL shape
-until that first-class system-time catalog and storage model exists.
+System-time / transaction-time history is intentionally separate from the
+application-time interval model. `CREATE TABLE ... WITH SYSTEM VERSIONING`
+lowers to durable relational schema metadata (`system_versioned: true`) so the
+catalog records user intent and schema round trips preserve it. That marker
+does not by itself create hidden history rows or bitemporal visibility rules.
+History retention, visibility, replay, repair, and query syntax must remain a
+separate storage/runtime contract before system-time execution is enabled. The
+SQL/API parity corpus pins this distinction with a supported DDL fingerprint
+that includes the system-versioned metadata token.
 
 For SQL DML, row locking remains a typed backend contract rather than required
 surface syntax. The adapter receives the mutation-source row-claim owner,

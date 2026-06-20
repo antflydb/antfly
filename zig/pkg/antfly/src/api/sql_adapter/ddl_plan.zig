@@ -445,6 +445,7 @@ pub const CreateTablePlan = struct {
     unique_constraints: []const runtime_schema.UniqueConstraint = &.{},
     foreign_keys: []const runtime_schema.ForeignKey = &.{},
     checks: []const runtime_schema.RelationalCheck = &.{},
+    system_versioned: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -650,6 +651,7 @@ pub fn runtimeSchemaFromCreateTablePlanAlloc(
     schema.unique_constraints = try cloneDdlUniqueConstraints(alloc, plan.unique_constraints);
     schema.foreign_keys = try cloneDdlForeignKeys(alloc, plan.foreign_keys);
     schema.checks = try cloneDdlRelationalChecks(alloc, plan.checks);
+    schema.system_versioned = plan.system_versioned;
     return schema;
 }
 
@@ -731,6 +733,7 @@ pub fn createTablePlanFromTableCloneSourceAlloc(
         .unique_constraints = unique_constraints,
         .foreign_keys = foreign_keys,
         .checks = checks,
+        .system_versioned = source.system_versioned,
     };
 }
 
@@ -6063,6 +6066,7 @@ pub fn parseCreateTableDefinitionAlloc(
         if (cursor.matchToken(.comma) == null) break;
     }
     try cursor.expectToken(.rparen);
+    const system_versioned = try parseOptionalCreateTableSystemVersioning(tokens, pos);
 
     const owned_columns = try columns.toOwnedSlice(alloc);
     var columns_transferred = false;
@@ -6095,7 +6099,19 @@ pub fn parseCreateTableDefinitionAlloc(
         .unique_constraints = owned_unique_constraints,
         .foreign_keys = owned_foreign_keys,
         .checks = owned_checks,
+        .system_versioned = system_versioned,
     };
+}
+
+fn parseOptionalCreateTableSystemVersioning(
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !bool {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("with")) return false;
+    if (!cursor.matchKeyword("system")) return error.UnsupportedSqlShape;
+    if (!cursor.matchKeyword("versioning")) return error.UnsupportedSqlShape;
+    return true;
 }
 
 pub fn parseCreateTablePlanAlloc(

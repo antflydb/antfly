@@ -4565,6 +4565,7 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
+    ddl_system_versioned_table: bool = false,
     unsupported_write: bool = false,
     unsupported_write_recursive_cte_merge: bool = false,
     invalid_insert: bool = false,
@@ -4771,6 +4772,7 @@ pub const AppParityCorpusCoverage = struct {
     schema_mixed_expression_unique_conflict_target: bool = false,
     schema_nulls_not_distinct_unique: bool = false,
     schema_rich_expression_secondary_index: bool = false,
+    schema_system_versioned_table: bool = false,
     schema_temporal_numrange_insert: bool = false,
     schema_temporal_daterange_insert: bool = false,
     schema_temporal_open_daterange_insert: bool = false,
@@ -4802,7 +4804,6 @@ pub const AppParityCorpusCoverage = struct {
     migration_equivalent_schema_rebuild: bool = false,
     migration_equivalent_schema_rewrite: bool = false,
     migration_equivalent_schema_validation: bool = false,
-    unsupported_ddl_system_time_temporal_table: bool = false,
     unsupported_unvalidated_unique_conflict_target: bool = false,
     to_jsonb_value_wrapper: bool = false,
     to_jsonb_dynamic_expression: bool = false,
@@ -5211,6 +5212,9 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal_fk=") and
             std.mem.indexOf(u8, entry.sql, "PERIOD ") != null and
             std.mem.indexOf(u8, entry.sql, "FOREIGN KEY") != null);
+        self.schema_system_versioned_table = self.schema_system_versioned_table or (entry.family == .ddl and
+            sql_adapter.planHasExactUsizeToken(entry.plan, ":system_versioned=", 1) and
+            std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
         self.schema_nulls_not_distinct_unique = self.schema_nulls_not_distinct_unique or (entry.family == .ddl and
             std.mem.indexOf(u8, entry.sql, "UNIQUE ") != null and
             std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
@@ -5828,9 +5832,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE PROCEDURE ") and
                     std.mem.indexOf(u8, entry.sql, " AS ") != null);
-            self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
-                (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
-                    std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
         } else if (entry.family == .unsupported_update_source) {
             self.unsupported_update_source_row_lock_target = self.unsupported_update_source_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
@@ -5865,6 +5866,9 @@ pub const AppParityCorpusCoverage = struct {
                             sql_adapter.appliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_fk=", 0) and
                             sql_adapter.appliedPlanHasExactUsizeToken(entry.applied_plan, "unvalidated_check=", 0));
                     self.ddl_temporal_table = self.ddl_temporal_table or sql_adapter.planHasNonZeroToken(entry.plan, ":periods=");
+                    self.ddl_system_versioned_table = self.ddl_system_versioned_table or
+                        (sql_adapter.planHasExactUsizeToken(entry.plan, ":system_versioned=", 1) and
+                            std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
                     self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
                             std.mem.indexOf(u8, entry.sql, " ON DELETE SET NULL") != null);

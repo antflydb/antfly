@@ -110,6 +110,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .unique_constraints = unique_constraints,
         .checks = checks,
         .external_base_source = external_base_source,
+        .system_versioned = schema.system_versioned,
     };
 }
 
@@ -1572,6 +1573,24 @@ test "deriveRuntimeTableSchema carries external lake base source binding" {
 
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
         \\{"version":1,"storage_mode":"document","base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","schema_fingerprint":"schema-v1"},"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
+}
+
+test "deriveRuntimeTableSchema carries relational system-versioned marker" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":6,"storage_mode":"relational","default_type":"row","enforce_types":true,"system_versioned":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["id","valid_from","valid_to"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}]}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.system_versioned);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expect(runtime.system_versioned);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","system_versioned":true,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
     ));
 }
 

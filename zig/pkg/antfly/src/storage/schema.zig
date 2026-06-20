@@ -732,6 +732,7 @@ pub const TableSchema = struct {
     unique_constraints: []const UniqueConstraint = &.{},
     checks: []const RelationalCheck = &.{},
     external_base_source: ?ExternalBaseSource = null,
+    system_versioned: bool = false,
 };
 
 // ============================================================================
@@ -752,7 +753,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 42); // format version
+    try appendU32(&buf, alloc, 43); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -928,6 +929,10 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, 0);
     }
 
+    // SQL system-versioned table marker (format version 43+). This is durable
+    // catalog metadata only; temporal history execution remains separately gated.
+    try buf.append(alloc, if (schema.system_versioned) 1 else 0);
+
     // Relational check catalog (format version 20+).
     try appendU32(&buf, alloc, @intCast(schema.checks.len));
     for (schema.checks) |check| {
@@ -1001,7 +1006,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 42) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 43) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1607,6 +1612,11 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         break :source_blk null;
     };
     errdefer if (external_base_source) |source| freeExternalBaseSource(alloc, source);
+    const system_versioned = if (fmt_version >= 43) system_versioned_blk: {
+        const value = data[pos] == 1;
+        pos += 1;
+        break :system_versioned_blk value;
+    } else false;
 
     return .{
         .version = version,
@@ -1624,6 +1634,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
         .unique_constraints = unique_constraints,
         .checks = checks,
         .external_base_source = external_base_source,
+        .system_versioned = system_versioned,
     };
 }
 
@@ -2766,6 +2777,7 @@ test "schema serialize/deserialize round-trip" {
     try std.testing.expectEqual(@as(usize, 0), loaded.relational_columns.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 0), loaded.unique_constraints.len);
+    try std.testing.expect(!loaded.system_versioned);
 }
 
 test "schema serialize/deserialize round-trips relational storage mode and columns" {
@@ -2907,6 +2919,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
             .snapshot_mode = .{ .snapshot_id = "iceberg-123" },
             .schema_fingerprint = "schema-v7",
         },
+        .system_versioned = true,
     };
 
     const data = try serializeSchema(alloc, schema);
@@ -3047,6 +3060,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expectEqualStrings("iceberg-123", loaded.external_base_source.?.snapshot_mode.snapshot_id);
     try std.testing.expectEqualStrings("schema-v7", loaded.external_base_source.?.schema_fingerprint);
     try std.testing.expectEqual(ExternalWritePolicy.read_only, loaded.external_base_source.?.write_policy);
+    try std.testing.expect(loaded.system_versioned);
 }
 
 test "schema relational check clone preserves expression AST" {

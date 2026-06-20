@@ -57,6 +57,7 @@ pub const TableSchema = struct {
     unique_constraints: []UniqueConstraint = &.{},
     checks: []RelationalCheck = &.{},
     external_base_source: ?storage_schema.ExternalBaseSource = null,
+    system_versioned: bool = false,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.default_type);
@@ -1096,6 +1097,7 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("foreign_keys")) |foreign_keys| if (foreign_keys != .null) try validateForeignKeys(foreign_keys);
     if (root.get("unique_constraints")) |constraints| if (constraints != .null) try validateUniqueConstraints(constraints);
     if (root.get("checks")) |checks| if (checks != .null) try validateRelationalChecksValue(checks);
+    if (root.get("system_versioned")) |system_versioned| if (system_versioned != .null and system_versioned != .bool) return error.InvalidSchemaUpdateRequest;
     if (root.get("base_source") != null and root.get("external_base_source") != null) return error.InvalidSchemaUpdateRequest;
     if (root.get("base_source")) |base_source| if (base_source != .null) try validateExternalBaseSource(base_source);
     if (root.get("external_base_source")) |base_source| if (base_source != .null) try validateExternalBaseSource(base_source);
@@ -2335,6 +2337,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("checks")) |checks| {
         if (checks != .null) parsed.checks = try parseRelationalChecks(alloc, checks);
     }
+    if (root.get("system_versioned")) |system_versioned| {
+        if (system_versioned != .null) parsed.system_versioned = system_versioned.bool;
+    }
     if (root.get("base_source")) |base_source| {
         if (base_source != .null) parsed.external_base_source = try parseExternalBaseSource(alloc, base_source);
     } else if (root.get("external_base_source")) |base_source| {
@@ -2365,7 +2370,7 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
     if (schema.storage_mode != .relational) {
-        if (schema.primary_key != null or schema.periods.len != 0 or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0 or schema.checks.len != 0 or schema.external_base_source != null) return error.InvalidSchemaUpdateRequest;
+        if (schema.primary_key != null or schema.periods.len != 0 or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0 or schema.checks.len != 0 or schema.external_base_source != null or schema.system_versioned) return error.InvalidSchemaUpdateRequest;
         return;
     }
     if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;

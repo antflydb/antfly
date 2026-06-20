@@ -3386,6 +3386,20 @@ const Parser = struct {
         };
     }
 
+    fn fixedBinaryRowExpressionParserHooks(self: *@This()) sql_adapter.FixedBinaryRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+        };
+    }
+
+    fn variadicRowExpressionParserHooks(self: *@This()) sql_adapter.VariadicRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+        };
+    }
+
     fn unaryNegativeRowExpressionParserHooks(self: *@This()) sql_adapter.UnaryNegativeRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -16605,66 +16619,15 @@ const Parser = struct {
     }
 
     fn parseModuloRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedBinaryFunctionCallStart(self.tokens, &self.pos, .mod);
-        const lhs = try self.parseRowExpressionAlloc();
-        var lhs_transferred = false;
-        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(lhs);
-        try self.expect(.comma);
-        const rhs = try self.parseRowExpressionAlloc();
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred) freeExpression(self.alloc, rhs);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(rhs);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .mod, lhs, rhs);
-        lhs_transferred = true;
-        rhs_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedNumericBinaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .mod, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parsePowerRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedBinaryFunctionCallStart(self.tokens, &self.pos, .power);
-        const lhs = try self.parseRowExpressionAlloc();
-        var lhs_transferred = false;
-        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(lhs);
-        try self.expect(.comma);
-        const rhs = try self.parseRowExpressionAlloc();
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred) freeExpression(self.alloc, rhs);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(rhs);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .power, lhs, rhs);
-        lhs_transferred = true;
-        rhs_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedNumericBinaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .power, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseGreatestLeastRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseGreatestLeastFunctionCallStart(self.tokens, &self.pos);
-
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        while (true) {
-            const operand = try self.parseRowExpressionAlloc();
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-            try operands.append(self.alloc, operand);
-            operand_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (operands.items.len == 0) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateExpressionOperandDomains(expression);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseGreatestLeastRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseArrayLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -16689,53 +16652,15 @@ const Parser = struct {
     }
 
     fn parseArrayPositionRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseArrayPositionFunctionCallStart(self.tokens, &self.pos);
-        const array_expression = try self.parseRowExpressionAlloc();
-        var array_transferred = false;
-        errdefer if (!array_transferred) freeExpression(self.alloc, array_expression);
-        const array_type = try self.rowExpressionTypeContext().rowExpressionOutputType(array_expression);
-        if (array_type != .array) return error.UnsupportedSqlShape;
-        try self.expect(.comma);
-        const needle_expression = try self.parseRowExpressionAlloc();
-        var needle_transferred = false;
-        errdefer if (!needle_transferred) freeExpression(self.alloc, needle_expression);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, array_expression, needle_expression);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        array_transferred = true;
-        needle_transferred = true;
-        try self.rowExpressionTypeContext().validateArrayPositionExpression(expression);
-
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseArrayPositionRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseJsonArrayLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseJsonArrayLengthFunctionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateJsonRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .json_array_length, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseJsonUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .json_array_length, self.rowExpressionTypeContext(), self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseJsonTypeofRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseJsonTypeofFunctionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateJsonRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .json_typeof, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseJsonUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .json_typeof, self.rowExpressionTypeContext(), self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseJsonExtractPathRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -16837,16 +16762,7 @@ const Parser = struct {
     }
 
     fn parseToJsonbRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .to_jsonb);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        _ = try self.rowExpressionTypeContext().rowExpressionOutputType(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .to_jsonb, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseFixedUnaryRowExpressionAlloc(self.alloc, self.tokens, &self.pos, .to_jsonb, self.rowExpressionTypeContext(), .any, self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseToJsonbExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -17765,7 +17681,7 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
     try std.testing.expectEqualStrings("valid_time", temporal_update_cascade_create.foreign_keys[0].child_period.?);
     try std.testing.expectEqualStrings("valid_time", temporal_update_cascade_create.foreign_keys[0].parent_period.?);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(
+    var system_versioned_lowered = try lowerDdlPlanAlloc(
         alloc,
         \\CREATE TABLE account_prices_history (
         \\  tenant_id text NOT NULL,
@@ -17776,7 +17692,24 @@ test "postgres sql adapter lowers application-time temporal table constraints" {
         \\  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)
         \\) WITH SYSTEM VERSIONING;
         ,
-    ));
+    );
+    defer system_versioned_lowered.deinit(alloc);
+    const system_versioned_create = switch (system_versioned_lowered) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(system_versioned_create.system_versioned);
+    try std.testing.expectEqual(@as(usize, 1), system_versioned_create.periods.len);
+    const system_versioned_runtime = try runtimeSchemaFromCreateTablePlanAlloc(alloc, system_versioned_create);
+    defer runtime_schema.freeSchema(alloc, system_versioned_runtime);
+    try std.testing.expect(system_versioned_runtime.system_versioned);
+    const system_versioned_schema_json = try schemaJsonFromCreateTablePlanAlloc(alloc, system_versioned_create);
+    defer alloc.free(system_versioned_schema_json);
+    var system_versioned_parsed_schema = try schema_api.parseValidatedTableSchema(alloc, system_versioned_schema_json);
+    defer system_versioned_parsed_schema.deinit(alloc);
+    const system_versioned_derived_runtime = try schema_api.deriveRuntimeTableSchema(alloc, system_versioned_parsed_schema);
+    defer runtime_schema.freeSchema(alloc, system_versioned_derived_runtime);
+    try std.testing.expect(system_versioned_derived_runtime.system_versioned);
 
     var alter_lowered = try lowerDdlPlanAlloc(
         alloc,
@@ -39210,10 +39143,10 @@ test "app parity fixture metadata requires typed summary anchors" {
 
     try std.testing.expectError(error.TestUnexpectedResult, validateAppParityFixtureMetadata(.{
         .name = "unsupported ddl setup sql",
-        .sql = "CREATE TABLE account_prices_history (id text PRIMARY KEY) WITH SYSTEM VERSIONING",
+        .sql = "COPY usage_records TO STDIN",
         .family = .unsupported_ddl,
-        .classification_reason = "system_time_temporal_table",
-        .plan = "unsupported:ddl:requires=system_time_temporal_table",
+        .classification_reason = "bulk_io_plan",
+        .plan = "unsupported:ddl:requires=bulk_io_plan",
         .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY)"},
     }, &seen, alloc));
 

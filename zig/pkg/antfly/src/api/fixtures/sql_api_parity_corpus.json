@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "2dc8fc1fdd367d301ecb68866d94b4a601f3da23b6d187ca4c00490bcd113170",
+  "source_sha256": "81938c31922aee7879b1d27c01bf8564b82b7ee6279532a7d24128864c33c9de",
   "source_entry_count": 1006,
   "entry_count": 1006,
   "skipped_entries": [
@@ -7387,10 +7387,19 @@
       "sql": "CREATE TABLE price_adjustments_update_cascade (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON UPDATE CASCADE\n);"
     },
     {
-      "name": "unsupported system-time temporal table",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=system_time_temporal_table",
-      "classification_reason": "system_time_temporal_table",
+      "name": "create system-versioned temporal table metadata",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_table",
+        "table_name": "account_prices_history",
+        "select": 4,
+        "temporal_periods": 1,
+        "temporal_primary_key": true,
+        "temporal_unique": 0,
+        "temporal_foreign_keys": 0
+      },
+      "plan": "ddl:create_table:table=account_prices_history:columns=4:unique=0:fk=0:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=0:pk=2:system_versioned=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE account_prices_history (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)\n) WITH SYSTEM VERSIONING;"
     },
     {

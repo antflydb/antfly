@@ -101,6 +101,7 @@ pub fn schemaJsonValueFromCreateTablePlanAlloc(alloc: std.mem.Allocator, plan: d
     if (plan.unique_constraints.len > 0) try root.put(alloc, try alloc.dupe(u8, "unique_constraints"), try schemaJsonUniqueConstraintsAlloc(alloc, plan.unique_constraints));
     if (plan.foreign_keys.len > 0) try root.put(alloc, try alloc.dupe(u8, "foreign_keys"), try schemaJsonForeignKeysAlloc(alloc, plan.foreign_keys));
     if (plan.checks.len > 0) try root.put(alloc, try alloc.dupe(u8, "checks"), try schemaJsonRelationalChecksAlloc(alloc, plan.checks));
+    if (plan.system_versioned) try root.put(alloc, try alloc.dupe(u8, "system_versioned"), .{ .bool = true });
     return .{ .object = root };
 }
 

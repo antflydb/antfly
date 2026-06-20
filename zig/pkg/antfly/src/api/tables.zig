@@ -1583,6 +1583,9 @@ fn validateRelationalStorageModeUpdateAlloc(
     if (!runtime_schema_mod.relationalCheckCatalogsEqual(current_runtime.checks, next_runtime.checks)) {
         return error.InvalidSchemaUpdateRequest;
     }
+    if (current_runtime.system_versioned != next_runtime.system_versioned) {
+        return error.InvalidSchemaUpdateRequest;
+    }
     try validateConstraintCatalogTransition(current_runtime, next_runtime);
 }
 
@@ -5138,6 +5141,15 @@ test "metadata.schema update rejects relational storage mode and base column cha
             std.testing.allocator,
             &relational_table,
             "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant\"]}}",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        applySchemaUpdateRecord(
+            std.testing.allocator,
+            &relational_table,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"system_versioned\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"tenant\"],\"additionalProperties\":false}}}}",
         ),
     );
 
