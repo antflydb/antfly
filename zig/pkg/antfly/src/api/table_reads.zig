@@ -5225,6 +5225,51 @@ pub fn rowsInsertSourceBatchFromRoutedScansWithSchemasAlloc(
     );
 }
 
+pub fn rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    target_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    recursive: relational_sql_api.LoweredRecursiveCtePlan,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    consistency: raft_mod.ReadConsistency,
+    conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    if (!std.mem.eql(u8, req.source.source_cte, recursive.cte_name)) return error.InvalidRowsRequest;
+    var materialized = (try materializeLoweredSqlRecursiveCteRowsAlloc(
+        alloc,
+        source,
+        catalog,
+        default_table_name,
+        default_schema,
+        recursive,
+        consistency,
+    )) orelse return null;
+    defer materialized.deinit(alloc);
+
+    var source_schema = default_schema;
+    source_schema.relational_columns = recursive.output_columns;
+    source_schema.primary_key = null;
+
+    var source_query = req.source;
+    source_query.source_cte = "";
+    var source_result = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, source_schema, source_query, materialized.rows);
+    defer source_result.deinit(alloc);
+
+    return try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
+        alloc,
+        target_table_name,
+        target_schema,
+        source_schema,
+        req,
+        source_result.rows,
+        conflict_resolver,
+    );
+}
+
 pub fn rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
@@ -20643,6 +20688,42 @@ test "lowered sql recursive cte plans execute bounded materialization" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const recursive = switch (lowered) {
+        .recursive_cte => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const assignments = [_]db_mod.types.RelationalRowsExpressionAssignment{
+        .{ .field = "id", .expression = .{ .kind = .field, .field = "id" } },
+        .{ .field = "depth", .expression = .{ .kind = .field, .field = "depth" } },
+    };
+    const returning = [_][]const u8{ "id", "depth" };
+    var insert_fake = FakeSource{};
+    var batch = (try rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
+        alloc,
+        insert_fake.source(),
+        catalog.iface(),
+        "nodes",
+        schema,
+        "walk_copies",
+        schema,
+        recursive,
+        .{
+            .source_table = "nodes",
+            .source = recursive.final_query,
+            .assignments = assignments[0..],
+            .returning = returning[0..],
+        },
+        .read_index,
+        null,
+    )) orelse return error.TestUnexpectedResult;
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), insert_fake.calls);
+    try std.testing.expectEqual(@as(u32, 2), batch.inserted);
+    try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"depth\":2}", batch.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"d\",\"depth\":3}", batch.returning_rows[1]);
 }
 
 test "lowered sql set operation plans preserve overlapping union all rows" {

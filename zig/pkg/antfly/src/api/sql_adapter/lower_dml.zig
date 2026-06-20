@@ -453,6 +453,151 @@ pub fn insertSourceConflictTargetFromClauseAlloc(
     };
 }
 
+pub fn conflictTargetIdentityAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    insert_columns: []const []const u8,
+    row: []const []const u8,
+    target: ConflictTarget,
+) ![]const u8 {
+    return switch (target) {
+        .primary => try conflictColumnIdentityAlloc(alloc, "primary", schema.primary_key.?.columns, insert_columns, row),
+        .unique => |unique| blk: {
+            const constraint = binder.findUniqueConstraintByName(schema, unique.name) orelse return error.InvalidSqlCatalog;
+            break :blk try conflictUniqueConstraintIdentityAlloc(alloc, unique.name, constraint, insert_columns, row);
+        },
+    };
+}
+
+pub fn conflictUniqueConstraintIdentityAlloc(
+    alloc: std.mem.Allocator,
+    label: []const u8,
+    constraint: runtime_schema.UniqueConstraint,
+    insert_columns: []const []const u8,
+    row: []const []const u8,
+) ![]const u8 {
+    if (constraint.columns.len == 0 and constraint.expressions.len == 0) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{f}:[", .{std.json.fmt(label, .{})});
+    var wrote = false;
+    for (constraint.columns) |target_column| {
+        const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
+        if (!constraint.nulls_not_distinct and std.mem.eql(u8, value_json, "null")) return error.UnsupportedSqlShape;
+        if (wrote) try writer.writeByte(',');
+        try writer.print("{{\"column\":{f},\"value\":", .{std.json.fmt(target_column, .{})});
+        try writer.writeAll(value_json);
+        try writer.writeByte('}');
+        wrote = true;
+    }
+    for (constraint.expressions) |expression| {
+        const value = try conflictExpressionValueAlloc(alloc, expression, insert_columns, row);
+        defer alloc.free(value);
+        if (wrote) try writer.writeByte(',');
+        try writer.writeAll("{\"expression\":");
+        try writeUniqueExpressionIdentityJson(writer, expression);
+        try writer.print(",\"value\":{f}}}", .{std.json.fmt(value, .{})});
+        wrote = true;
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+pub fn conflictColumnIdentityAlloc(
+    alloc: std.mem.Allocator,
+    label: []const u8,
+    target_columns: []const []const u8,
+    insert_columns: []const []const u8,
+    row: []const []const u8,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{f}:[", .{std.json.fmt(label, .{})});
+    for (target_columns, 0..) |target_column, i| {
+        const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(target_column, .{})});
+        try writer.writeAll(value_json);
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+pub fn conflictExpressionValueAlloc(
+    alloc: std.mem.Allocator,
+    expression: runtime_schema.UniqueExpression,
+    insert_columns: []const []const u8,
+    row: []const []const u8,
+) ![]const u8 {
+    if (expression.op == .expression) {
+        const row_expression = expression.expression orelse return error.UnsupportedSqlShape;
+        var row_object: std.Io.Writer.Allocating = .init(alloc);
+        errdefer row_object.deinit();
+        const writer = &row_object.writer;
+        try writer.writeByte('{');
+        var wrote = false;
+        for (insert_columns, row) |column, value_json| {
+            if (column.len == 0) return error.UnsupportedSqlShape;
+            if (wrote) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(column, .{})});
+            try writer.writeAll(value_json);
+            wrote = true;
+        }
+        try writer.writeByte('}');
+        const row_json = try row_object.toOwnedSlice();
+        defer alloc.free(row_json);
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.UnsupportedSqlShape;
+        defer parsed.deinit();
+        return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, row_expression);
+    }
+    const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, row, expression.field) orelse return error.UnsupportedSqlShape;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .string) return error.UnsupportedSqlShape;
+    return switch (expression.op) {
+        .lower => try std.ascii.allocLowerString(alloc, parsed.value.string),
+        .upper => try std.ascii.allocUpperString(alloc, parsed.value.string),
+        .md5 => try lower_expr.md5HexTextAlloc(alloc, parsed.value.string),
+        .expression => unreachable,
+    };
+}
+
+pub fn writeUniqueExpressionIdentityJson(
+    writer: *std.Io.Writer,
+    expression: runtime_schema.UniqueExpression,
+) !void {
+    try writer.writeAll("{\"op\":");
+    try writer.print("{f}", .{std.json.fmt(lower_expr.uniqueExpressionOpToken(expression.op), .{})});
+    switch (expression.op) {
+        .lower, .upper, .md5 => try writer.print(",\"field\":{f}", .{std.json.fmt(expression.field, .{})}),
+        .expression => {
+            try writer.writeAll(",\"expression\":");
+            try lower_expr.writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
+        },
+    }
+    try writer.writeByte('}');
+}
+
+pub fn conflictExpressionIdentityAlloc(
+    alloc: std.mem.Allocator,
+    label: []const u8,
+    expression: runtime_schema.UniqueExpression,
+    insert_columns: []const []const u8,
+    row: []const []const u8,
+) ![]const u8 {
+    const folded = try conflictExpressionValueAlloc(alloc, expression, insert_columns, row);
+    defer alloc.free(folded);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{f}:[{{\"expression\":", .{std.json.fmt(label, .{})});
+    try writeUniqueExpressionIdentityJson(writer, expression);
+    try writer.print(",\"value\":{f}}}]", .{std.json.fmt(folded, .{})});
+    return try out.toOwnedSlice();
+}
+
 pub fn insertSourceUniquePredicatesFromConstraintAlloc(
     alloc: std.mem.Allocator,
     predicates: []const runtime_schema.UniquePredicate,
@@ -665,6 +810,47 @@ pub const UniqueConflictTarget = struct {
     where_json: []const u8 = "",
     where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
 };
+
+pub fn conflictTargetForNamedConstraintAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+    constraint_name: []const u8,
+) !ConflictTarget {
+    if (try namedConstraintIsPrimaryKeyAlloc(alloc, schema, table_name, constraint_name)) return .primary;
+
+    const constraint = binder.findUniqueConstraintByName(schema, constraint_name) orelse return error.InvalidSqlCatalog;
+    const name = try alloc.dupe(u8, constraint.name);
+    errdefer alloc.free(name);
+    const where_json = try grammar.uniquePredicateWhereJsonAlloc(alloc, constraint.where);
+    errdefer if (where_json.len > 0) alloc.free(where_json);
+    const where_expressions = try cloneExpressionConditionsAlloc(alloc, constraint.where_expressions);
+    errdefer {
+        freeExpressionConditions(alloc, where_expressions);
+        if (where_expressions.len > 0) alloc.free(where_expressions);
+    }
+    return .{ .unique = .{
+        .name = name,
+        .where_json = where_json,
+        .where_expressions = where_expressions,
+    } };
+}
+
+pub fn namedConstraintIsPrimaryKeyAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+    constraint_name: []const u8,
+) !bool {
+    if (schema.primary_key) |primary_key| {
+        if (primary_key.name) |name| {
+            if (std.mem.eql(u8, constraint_name, name)) return true;
+        }
+    }
+    const default_primary_name = try std.fmt.allocPrint(alloc, "{s}_pkey", .{table_name});
+    defer alloc.free(default_primary_name);
+    return std.mem.eql(u8, constraint_name, default_primary_name);
+}
 
 pub const ConflictClause = struct {
     target: ConflictTarget,

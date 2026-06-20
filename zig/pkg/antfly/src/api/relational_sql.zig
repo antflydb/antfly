@@ -113,7 +113,6 @@ const cloneQueryRelationalChecksAlloc = sql_adapter.cloneQueryRelationalChecksAl
 const cloneSelectOutputsAlloc = sql_adapter.cloneSelectOutputsAlloc;
 const cloneStringSlice = sql_adapter.cloneStringSlice;
 const columnsMatchPrimaryKey = sql_adapter.columnsMatchPrimaryKey;
-const conflictInsertedValueForColumn = sql_adapter.conflictInsertedValueForColumn;
 const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSyntax;
 const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const createTablePlanFromTableCloneSourceAlloc = sql_adapter.createTablePlanFromTableCloneSourceAlloc;
@@ -228,7 +227,6 @@ const sqlExpressionTypeIsTextLike = sql_adapter.sqlExpressionTypeIsTextLike;
 const sqlExpressionTypesComparable = sql_adapter.sqlExpressionTypesComparable;
 const sqlExpressionContainsInterval = sql_adapter.sqlExpressionContainsInterval;
 const sqlExpressionIsInterval = sql_adapter.sqlExpressionIsInterval;
-const md5HexTextAlloc = sql_adapter.md5HexTextAlloc;
 const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
 const joinProjectionOutputIsUnique = sql_adapter.joinProjectionOutputIsUnique;
@@ -259,7 +257,6 @@ const findUniqueConstraintByColumnSet = sql_adapter.findUniqueConstraintByColumn
 const findUniqueConstraintByColumnsExpressionsAndConflictWhere = sql_adapter.findUniqueConstraintByColumnsExpressionsAndConflictWhere;
 const findUniqueConstraintByColumns = sql_adapter.findUniqueConstraintByColumns;
 const findUniqueConstraintByExpression = sql_adapter.findUniqueConstraintByExpression;
-const findUniqueConstraintByName = sql_adapter.findUniqueConstraintByName;
 const foreignKeyActionName = sql_adapter.foreignKeyActionName;
 const foreignKeyMatchName = sql_adapter.foreignKeyMatchName;
 const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
@@ -332,7 +329,6 @@ const tokenizeAlloc = sql_adapter.tokenizeAlloc;
 const uniqueConstraintNameExists = sql_adapter.uniqueConstraintNameExists;
 const uniqueConstraintReferencesAny = sql_adapter.uniqueConstraintReferencesAny;
 const uniqueConstraintValidationStateString = sql_adapter.uniqueConstraintValidationStateString;
-const uniqueExpressionOpToken = sql_adapter.uniqueExpressionOpToken;
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
 const updateWillLookupExistingRow = sql_adapter.updateWillLookupExistingRow;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
@@ -370,7 +366,6 @@ const writeJsonPathExistsPredicateAtomsJson = sql_adapter.writeJsonPathExistsPre
 const writeRelationalCheckAtomJson = sql_adapter.writeRelationalCheckAtomJson;
 const writeRelationalCheckAtomsJson = sql_adapter.writeRelationalCheckAtomsJson;
 const writeRowExpressionConditionJson = sql_adapter.writeRowExpressionConditionJson;
-const writeRowExpressionJson = sql_adapter.writeRowExpressionJson;
 const writeStructuredValuePredicateAtomsJson = sql_adapter.writeStructuredValuePredicateAtomsJson;
 const writeTextPatternPredicateAtomsJson = sql_adapter.writeTextPatternPredicateAtomsJson;
 const ScalarOrCheckBranch = sql_adapter.ScalarOrCheckBranch;
@@ -10260,7 +10255,7 @@ const Parser = struct {
             try self.expectKeyword("constraint");
             const constraint_name = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
             defer self.alloc.free(constraint_name);
-            return try self.conflictTargetForNamedConstraintAlloc(table_name, constraint_name);
+            return try sql_adapter.conflictTargetForNamedConstraintAlloc(self.alloc, self.schema, table_name, constraint_name);
         }
 
         try self.expect(.lparen);
@@ -10331,7 +10326,7 @@ const Parser = struct {
 
         const name = try self.alloc.dupe(u8, constraint.name);
         errdefer self.alloc.free(name);
-        const out_where = try self.uniquePredicateWhereJsonAlloc(constraint.where);
+        const out_where = try sql_adapter.uniquePredicateWhereJsonAlloc(self.alloc, constraint.where);
         errdefer if (out_where.len > 0) self.alloc.free(out_where);
         const out_where_expressions = try cloneExpressionConditionsAlloc(self.alloc, constraint.where_expressions);
         errdefer {
@@ -10390,52 +10385,6 @@ const Parser = struct {
         return expression;
     }
 
-    fn conflictTargetForNamedConstraintAlloc(
-        self: *@This(),
-        table_name: []const u8,
-        constraint_name: []const u8,
-    ) !ConflictTarget {
-        if (try self.namedConstraintIsPrimaryKey(table_name, constraint_name)) return .primary;
-
-        const constraint = findUniqueConstraintByName(self.schema, constraint_name) orelse return error.InvalidSqlCatalog;
-        const name = try self.alloc.dupe(u8, constraint.name);
-        errdefer self.alloc.free(name);
-        const where_json = try self.uniquePredicateWhereJsonAlloc(constraint.where);
-        errdefer if (where_json.len > 0) self.alloc.free(where_json);
-        const where_expressions = try cloneExpressionConditionsAlloc(self.alloc, constraint.where_expressions);
-        errdefer {
-            freeExpressionConditions(self.alloc, where_expressions);
-            if (where_expressions.len > 0) self.alloc.free(where_expressions);
-        }
-        return .{ .unique = .{
-            .name = name,
-            .where_json = where_json,
-            .where_expressions = where_expressions,
-        } };
-    }
-
-    fn namedConstraintIsPrimaryKey(
-        self: *@This(),
-        table_name: []const u8,
-        constraint_name: []const u8,
-    ) !bool {
-        if (self.schema.primary_key) |primary_key| {
-            if (primary_key.name) |name| {
-                if (std.mem.eql(u8, constraint_name, name)) return true;
-            }
-        }
-        const default_primary_name = try std.fmt.allocPrint(self.alloc, "{s}_pkey", .{table_name});
-        defer self.alloc.free(default_primary_name);
-        return std.mem.eql(u8, constraint_name, default_primary_name);
-    }
-
-    fn uniquePredicateWhereJsonAlloc(
-        self: *@This(),
-        predicates: []const runtime_schema.UniquePredicate,
-    ) ![]const u8 {
-        return try sql_adapter.uniquePredicateWhereJsonAlloc(self.alloc, predicates);
-    }
-
     fn rejectDuplicateConflictUpdateTargets(
         self: *@This(),
         insert_columns: []const []const u8,
@@ -10453,7 +10402,7 @@ const Parser = struct {
 
         for (rows, conflicts) |row, conflict| {
             if (conflict.action != .update) continue;
-            const identity = try self.conflictTargetIdentityAlloc(insert_columns, row, conflict.target);
+            const identity = try sql_adapter.conflictTargetIdentityAlloc(self.alloc, self.schema, insert_columns, row, conflict.target);
             var identity_transferred = false;
             errdefer if (!identity_transferred) self.alloc.free(identity);
             for (identities.items) |existing| {
@@ -10462,152 +10411,6 @@ const Parser = struct {
             try identities.append(self.alloc, identity);
             identity_transferred = true;
         }
-    }
-
-    fn conflictTargetIdentityAlloc(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        row: []const []const u8,
-        target: ConflictTarget,
-    ) ![]const u8 {
-        return switch (target) {
-            .primary => try self.conflictColumnIdentityAlloc("primary", self.schema.primary_key.?.columns, insert_columns, row),
-            .unique => |unique| blk: {
-                const constraint = findUniqueConstraintByName(self.schema, unique.name) orelse return error.InvalidSqlCatalog;
-                break :blk try self.conflictUniqueConstraintIdentityAlloc(unique.name, constraint, insert_columns, row);
-            },
-        };
-    }
-
-    fn conflictUniqueConstraintIdentityAlloc(
-        self: *@This(),
-        label: []const u8,
-        constraint: runtime_schema.UniqueConstraint,
-        insert_columns: []const []const u8,
-        row: []const []const u8,
-    ) ![]const u8 {
-        if (constraint.columns.len == 0 and constraint.expressions.len == 0) return error.UnsupportedSqlShape;
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.print("{f}:[", .{std.json.fmt(label, .{})});
-        var wrote = false;
-        for (constraint.columns) |target_column| {
-            const value_json = conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
-            if (!constraint.nulls_not_distinct and std.mem.eql(u8, value_json, "null")) return error.UnsupportedSqlShape;
-            if (wrote) try writer.writeByte(',');
-            try writer.print("{{\"column\":{f},\"value\":", .{std.json.fmt(target_column, .{})});
-            try writer.writeAll(value_json);
-            try writer.writeByte('}');
-            wrote = true;
-        }
-        for (constraint.expressions) |expression| {
-            const value = try self.conflictExpressionValueAlloc(expression, insert_columns, row);
-            defer self.alloc.free(value);
-            if (wrote) try writer.writeByte(',');
-            try writer.writeAll("{\"expression\":");
-            try self.writeUniqueExpressionIdentityJson(writer, expression);
-            try writer.print(",\"value\":{f}}}", .{std.json.fmt(value, .{})});
-            wrote = true;
-        }
-        try writer.writeByte(']');
-        return try out.toOwnedSlice();
-    }
-
-    fn conflictColumnIdentityAlloc(
-        self: *@This(),
-        label: []const u8,
-        target_columns: []const []const u8,
-        insert_columns: []const []const u8,
-        row: []const []const u8,
-    ) ![]const u8 {
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.print("{f}:[", .{std.json.fmt(label, .{})});
-        for (target_columns, 0..) |target_column, i| {
-            const value_json = conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
-            if (i != 0) try writer.writeByte(',');
-            try writer.print("{f}:", .{std.json.fmt(target_column, .{})});
-            try writer.writeAll(value_json);
-        }
-        try writer.writeByte(']');
-        return try out.toOwnedSlice();
-    }
-
-    fn conflictExpressionValueAlloc(
-        self: *@This(),
-        expression: runtime_schema.UniqueExpression,
-        insert_columns: []const []const u8,
-        row: []const []const u8,
-    ) ![]const u8 {
-        if (expression.op == .expression) {
-            const row_expression = expression.expression orelse return error.UnsupportedSqlShape;
-            var row_object: std.Io.Writer.Allocating = .init(self.alloc);
-            errdefer row_object.deinit();
-            const writer = &row_object.writer;
-            try writer.writeByte('{');
-            var wrote = false;
-            for (insert_columns, row) |column, value_json| {
-                if (column.len == 0) return error.UnsupportedSqlShape;
-                if (wrote) try writer.writeByte(',');
-                try writer.print("{f}:", .{std.json.fmt(column, .{})});
-                try writer.writeAll(value_json);
-                wrote = true;
-            }
-            try writer.writeByte('}');
-            const row_json = try row_object.toOwnedSlice();
-            defer self.alloc.free(row_json);
-            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, row_json, .{}) catch return error.UnsupportedSqlShape;
-            defer parsed.deinit();
-            return try relational_rows.expressionValueJsonAlloc(self.alloc, parsed.value, row_expression);
-        }
-        const value_json = conflictInsertedValueForColumn(insert_columns, row, expression.field) orelse return error.UnsupportedSqlShape;
-        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-        defer parsed.deinit();
-        if (parsed.value != .string) return error.UnsupportedSqlShape;
-        return switch (expression.op) {
-            .lower => try std.ascii.allocLowerString(self.alloc, parsed.value.string),
-            .upper => try std.ascii.allocUpperString(self.alloc, parsed.value.string),
-            .md5 => try md5HexTextAlloc(self.alloc, parsed.value.string),
-            .expression => unreachable,
-        };
-    }
-
-    fn writeUniqueExpressionIdentityJson(
-        self: *@This(),
-        writer: *std.Io.Writer,
-        expression: runtime_schema.UniqueExpression,
-    ) !void {
-        _ = self;
-        try writer.writeAll("{\"op\":");
-        try writer.print("{f}", .{std.json.fmt(uniqueExpressionOpToken(expression.op), .{})});
-        switch (expression.op) {
-            .lower, .upper, .md5 => try writer.print(",\"field\":{f}", .{std.json.fmt(expression.field, .{})}),
-            .expression => {
-                try writer.writeAll(",\"expression\":");
-                try writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
-            },
-        }
-        try writer.writeByte('}');
-    }
-
-    fn conflictExpressionIdentityAlloc(
-        self: *@This(),
-        label: []const u8,
-        expression: runtime_schema.UniqueExpression,
-        insert_columns: []const []const u8,
-        row: []const []const u8,
-    ) ![]const u8 {
-        const folded = try self.conflictExpressionValueAlloc(expression, insert_columns, row);
-        defer self.alloc.free(folded);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.print("{f}:[{{\"expression\":", .{std.json.fmt(label, .{})});
-        try self.writeUniqueExpressionIdentityJson(writer, expression);
-        try writer.print(",\"value\":{f}}}]", .{std.json.fmt(folded, .{})});
-        return try out.toOwnedSlice();
     }
 
     fn parseJsonSetSqlValueAlloc(

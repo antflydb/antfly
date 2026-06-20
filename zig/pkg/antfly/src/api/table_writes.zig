@@ -3184,6 +3184,15 @@ pub const TableWriteSource = struct {
             schema: storage_schema.TableSchema,
             req: db_mod.types.RelationalRowsMutationSourceRequest,
         ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
+        mutate_rows_joined_from_source_rows: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            target_schema: storage_schema.TableSchema,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+            source_rows: []const []const u8,
+        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         begin_bulk_ingest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3591,6 +3600,19 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const fn_ptr = self.vtable.mutate_rows_from_source orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, schema, req);
+    }
+
+    pub fn mutateRowsJoinedFromSourceRows(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const fn_ptr = self.vtable.mutate_rows_joined_from_source_rows orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, target_schema, source_schema, req, source_rows);
     }
 
     pub fn beginBulkIngest(self: TableWriteSource, alloc: std.mem.Allocator, table_name: []const u8) !?void {
@@ -7299,6 +7321,7 @@ pub const BoundTableWriteSource = struct {
                 .commit_transaction_with_id = commitTransactionWithId,
                 .batch = batch,
                 .mutate_rows_from_source = mutateRowsFromSource,
+                .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
                 .abort_bulk_ingest = abortBulkIngest,
@@ -8186,6 +8209,36 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         return try self.db.mutateRelationalRowsFromSource(alloc, schema, req);
+    }
+
+    fn mutateRowsJoinedFromSourceRows(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+
+        var target_candidates = try self.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
+        errdefer {
+            for (target_candidates) |*candidate| candidate.deinit(alloc);
+            if (target_candidates.len > 0) alloc.free(target_candidates);
+        }
+
+        var candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows);
+        errdefer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            if (candidates.len > 0) alloc.free(candidates);
+        }
+
+        var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
+        defer plan.deinit(alloc);
+
+        return try self.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
     }
 
     fn beginBulkIngest(
@@ -29912,6 +29965,119 @@ test "foreign key schema controller maintenance reports failed durable action jo
     try std.testing.expectEqualStrings("invalid", retry_summary.action_jobs[0].status);
     try std.testing.expectEqualStrings("ForeignKeyViolation", retry_summary.action_jobs[0].last_error.?);
     try std.testing.expectEqual(@as(u32, summary.action_jobs[0].attempts), retry_summary.action_jobs[0].attempts);
+}
+
+test "bound table write source stages joined mutation from materialized source rows" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-bound-joined-mutation-source-rows";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"target_rows","enforce_types":true,"document_schemas":{"target_rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_target_schema = try tables_api.parseValidatedTableSchema(alloc, target_schema_json);
+    defer parsed_target_schema.deinit(alloc);
+    const target_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_target_schema);
+    defer storage_schema.freeSchema(alloc, target_schema);
+    try db.applyTableSchemaJson(alloc, target_schema_json, .{});
+
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"source_rows","enforce_types":true,"document_schemas":{"source_rows":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"state":{"type":"keyword"},"source_quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_source_schema = try tables_api.parseValidatedTableSchema(alloc, source_schema_json);
+    defer parsed_source_schema.deinit(alloc);
+    const source_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_source_schema);
+    defer storage_schema.freeSchema(alloc, source_schema);
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "target:t1",
+            .value = "{\"id\":\"t1\",\"source_id\":\"s1\",\"status\":\"ready\",\"quantity\":1}",
+        }},
+        .sync_level = .write,
+    });
+
+    const txn_id = try db.beginTransaction(10_000);
+    const target_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"ready\"",
+    }};
+    const source_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "state",
+        .op = .eq,
+        .value_json = "\"source\"",
+    }};
+    const on = [_]db_mod.types.RelationalRowsJoinOn{.{
+        .left_field = "source_id",
+        .right_field = "id",
+    }};
+    const source_assignments = [_]db_mod.types.RelationalRowsJoinedMutationFieldAssignment{.{
+        .field = "quantity",
+        .source_side = .right,
+        .source_field = "source_quantity",
+    }};
+    const returning = [_][]const u8{ "id", "quantity", "status" };
+    const req = db_mod.types.RelationalRowsJoinedMutationSourceRequest{
+        .kind = .update,
+        .source_table = "recursive_source",
+        .target_side = .left,
+        .join = .{
+            .left = .{
+                .predicates = target_predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:joined-source-rows",
+                    .txn_id = txn_id,
+                },
+            },
+            .right = .{ .predicates = source_predicates[0..] },
+            .on = on[0..],
+        },
+        .source_assignments = source_assignments[0..],
+        .returning = returning[0..],
+    };
+
+    const source_rows = [_][]const u8{
+        "{\"id\":\"s1\",\"state\":\"source\",\"source_quantity\":42}",
+    };
+    var bound = BoundTableWriteSource.init("orders", &db);
+    var result = (try bound.source().mutateRowsJoinedFromSourceRows(
+        alloc,
+        "orders",
+        target_schema,
+        source_schema,
+        req,
+        source_rows[0..],
+    )) orelse return error.TestUnexpectedResult;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.staged);
+    try std.testing.expectEqual(@as(usize, 1), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"t1\",\"quantity\":42,\"status\":\"ready\"}", result.returning_rows[0]);
+
+    try db.commitTransaction(txn_id, 10_001);
+
+    var updated = (try db.lookup(alloc, "target:t1", .{})) orelse return error.TestUnexpectedResult;
+    defer updated.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, updated.json, "\"quantity\":42") != null);
+
+    try std.testing.expect((try bound.source().mutateRowsJoinedFromSourceRows(
+        alloc,
+        "other_table",
+        target_schema,
+        source_schema,
+        req,
+        source_rows[0..],
+    )) == null);
 }
 
 test "foreign key schema controller maintenance reports incomplete when action job lease is busy" {
