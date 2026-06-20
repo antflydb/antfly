@@ -21,6 +21,7 @@ const db_types = db_mod.types;
 const backups_api = antfly.public_api.backups;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
+const query_api = antfly.public_api.query;
 const group_ids = antfly.common.group_ids;
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
@@ -478,6 +479,29 @@ fn readFileAlloc(allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8
     return try reader.interface.readAlloc(allocator, @intCast(size));
 }
 
+fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
+    var owned = try query_api.parsePublicQueryRequest(
+        allocator,
+        null,
+        "docs",
+        body,
+    );
+    defer owned.deinit(allocator);
+
+    var result = try db.search(allocator, owned.req);
+    defer result.deinit();
+
+    var response = try query_api.encodeQueryResponses(
+        allocator,
+        "docs",
+        owned.req,
+        .{},
+        result,
+    );
+    defer response.deinit(allocator);
+    return try allocator.dupe(u8, response.json);
+}
+
 fn fileExists(io: std.Io, path: []const u8) bool {
     if (std.fs.path.isAbsolute(path)) {
         std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
@@ -646,7 +670,12 @@ test "lite restore staging accepts aflite input for normal restore" {
         \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
     ;
     const enrichment_json = "{\"name\":\"restore_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":256,\"chunk_overlap\":32}";
-    const index_json = "{\"name\":\"restore_ft_body\",\"kind\":\"full_text\",\"config_json\":\"{\\\"chunk_name\\\":\\\"restore_chunks_v1\\\"}\"}";
+    const index_jsons = [_][]const u8{
+        "{\"name\":\"restore_ft_body\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+        "{\"name\":\"restore_dense\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":2,\\\"metric\\\":\\\"l2_squared\\\",\\\"external\\\":true}\"}",
+        "{\"name\":\"restore_sparse\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"sparse_embedding\\\",\\\"external\\\":true}\"}",
+        "{\"name\":\"restore_graph\",\"kind\":\"graph\",\"config_json\":\"{}\"}",
+    };
 
     {
         var source = try LiteDb.open(allocator, src_path, .writer);
@@ -660,11 +689,32 @@ test "lite restore staging accepts aflite input for normal restore" {
         defer enrichment.deinit();
         try source.db.addEnrichment(enrichment.value);
 
-        var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
-            .ignore_unknown_fields = true,
+        for (index_jsons) |index_json| {
+            var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
+                .ignore_unknown_fields = true,
+            });
+            defer index.deinit();
+            try source.db.addIndex(index.value);
+        }
+
+        try source.db.batch(.{
+            .writes = &.{
+                .{
+                    .key = "doc:restore:a",
+                    .value = "{\"title\":\"restore alpha\",\"body\":\"direct aflite restore hybrid alpha\",\"_embeddings\":{\"restore_dense\":[1,0],\"restore_sparse\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"_edges\":{\"restore_graph\":{\"links\":[{\"target\":\"doc:restore:c\",\"weight\":1.0}]}}}",
+                },
+                .{
+                    .key = "doc:restore:b",
+                    .value = "{\"title\":\"restore beta\",\"body\":\"direct aflite restore hybrid beta\",\"_embeddings\":{\"restore_dense\":[0,1],\"restore_sparse\":{\"indices\":[99],\"values\":[2.0]}}}",
+                },
+                .{
+                    .key = "doc:restore:c",
+                    .value = "{\"title\":\"restore graph target\"}",
+                },
+            },
+            .sync_level = .full_index,
         });
-        defer index.deinit();
-        try source.db.addIndex(index.value);
+        try source.db.runUntilIdle();
     }
 
     var staged = try stageInputRestoreBackup(allocator, src_path, "docs", default_backup_id, location);
@@ -685,6 +735,9 @@ test "lite restore staging accepts aflite input for normal restore" {
     try std.testing.expectEqualStrings(default_backup_id, manifest.backup_id);
     try std.testing.expectEqualStrings(staged.snapshot_path, manifest.shards[0].snapshot_path);
     try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_ft_body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_dense\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_sparse\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"enrichments\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_chunks_v1\"") != null);
 
@@ -693,4 +746,50 @@ test "lite restore staging accepts aflite input for normal restore" {
     const portable = try readFileAlloc(allocator, afb_path, max_afb_file_bytes);
     defer allocator.free(portable);
     try std.testing.expect(portable.len > 0);
+
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/normal-restore-roundtrip.aflite", .{tmp.sub_path});
+    defer allocator.free(restored_path);
+    {
+        var restored = try LiteDb.open(allocator, restored_path, .writer);
+        defer restored.close();
+        try portable_backup.importPortable(allocator, restored.db.core.store, portable);
+        try restored.db.core.loadIndexes();
+        _ = try restored.db.rebuildDenseIndexesForTargetCoverage(allocator);
+        _ = try restored.db.rebuildSparseIndexesForTargetCoverage(allocator);
+        try restored.db.rebuildGraphIndexesForTargetCoverage(allocator);
+        _ = try restored.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+        try restored.db.runUntilIdle();
+
+        const dense = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"embeddings\":{\"restore_dense\":[1,0]},\"indexes\":[\"restore_dense\"],\"limit\":1}",
+        );
+        defer allocator.free(dense);
+        try std.testing.expect(std.mem.indexOf(u8, dense, "\"doc:restore:a\"") != null);
+
+        const sparse = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"embeddings\":{\"restore_sparse\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"indexes\":[\"restore_sparse\"],\"limit\":1}",
+        );
+        defer allocator.free(sparse);
+        try std.testing.expect(std.mem.indexOf(u8, sparse, "\"doc:restore:a\"") != null);
+
+        const graph = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"restore_graph\",\"start_nodes\":{\"keys\":[\"doc:restore:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+        );
+        defer allocator.free(graph);
+        try std.testing.expect(std.mem.indexOf(u8, graph, "\"doc:restore:c\"") != null);
+
+        const hybrid = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"restore_dense\":[1,0]},\"indexes\":[\"restore_dense\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+        );
+        defer allocator.free(hybrid);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid, "\"doc:restore:a\"") != null);
+    }
 }
