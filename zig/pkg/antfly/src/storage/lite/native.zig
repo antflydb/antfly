@@ -152,6 +152,14 @@ pub const VacuumReport = struct {
     live_bytes: u64,
 };
 
+pub const StableSnapshotReport = struct {
+    source_size: u64,
+    snapshot_size: u64,
+    checkpoint_sequence: u64,
+    page_count: u64,
+    tail_bytes: u64,
+};
+
 pub const OwnedCatalogRecord = struct {
     key: []u8,
     value: []u8,
@@ -1042,6 +1050,38 @@ fn createLockedFile(io: std.Io, path: []const u8, lock_mode: LockMode, truncate:
     };
 }
 
+fn pathExists(io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
+}
+
+fn createSnapshotFile(io: std.Io, path: []const u8) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    }
+    return try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+}
+
+fn renameFilePath(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    if (std.fs.path.isAbsolute(old_path) and std.fs.path.isAbsolute(new_path)) {
+        try std.Io.Dir.renameAbsolute(old_path, new_path, io);
+    } else {
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
+    }
+}
+
+fn deleteFilePath(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        try std.Io.Dir.deleteFileAbsolute(io, path);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, path);
+    }
+}
+
 fn fileLockForMode(mode: LockMode) std.Io.File.Lock {
     return switch (mode) {
         .writer => .exclusive,
@@ -1099,6 +1139,56 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     var native_file = try NativeFile.open(allocator, path, true);
     defer native_file.close();
     return try native_file.check();
+}
+
+pub fn copyStableSnapshot(allocator: Allocator, source_path: []const u8, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+    if (std.mem.eql(u8, source_path, dest_path)) return error.InvalidNativeSnapshotPath;
+
+    var source = try NativeFile.open(allocator, source_path, true);
+    defer source.close();
+
+    const checkpoint = source.activeCheckpoint();
+    const snapshot_size = checkpoint.page_count * @as(u64, source.header.page_size);
+    const source_size = (try source.file.stat(source.io_impl.io())).size;
+    if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
+    if (!replace and pathExists(source.io_impl.io(), dest_path)) return error.PathAlreadyExists;
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
+    defer allocator.free(tmp_path);
+    errdefer deleteFilePath(source.io_impl.io(), tmp_path) catch {};
+
+    {
+        var out_file = try createSnapshotFile(source.io_impl.io(), tmp_path);
+        defer out_file.close(source.io_impl.io());
+
+        const chunk_size: usize = 1024 * 1024;
+        const buffer_len: usize = @intCast(@min(@as(u64, chunk_size), snapshot_size));
+        const buffer = try allocator.alloc(u8, @max(buffer_len, 1));
+        defer allocator.free(buffer);
+
+        var offset: u64 = 0;
+        while (offset < snapshot_size) {
+            const len: usize = @intCast(@min(@as(u64, buffer.len), snapshot_size - offset));
+            try readExactAt(source.file, source.io_impl.io(), buffer[0..len], offset);
+            try out_file.writePositionalAll(source.io_impl.io(), buffer[0..len], offset);
+            offset += len;
+        }
+        try out_file.setLength(source.io_impl.io(), snapshot_size);
+        try out_file.sync(source.io_impl.io());
+    }
+
+    renameFilePath(source.io_impl.io(), tmp_path, dest_path) catch |err| {
+        deleteFilePath(source.io_impl.io(), tmp_path) catch {};
+        return err;
+    };
+
+    return .{
+        .source_size = source_size,
+        .snapshot_size = snapshot_size,
+        .checkpoint_sequence = checkpoint.commit_sequence,
+        .page_count = checkpoint.page_count,
+        .tail_bytes = source_size - snapshot_size,
+    };
 }
 
 pub fn inspectBytes(raw: []const u8) InspectReport {
@@ -2241,6 +2331,64 @@ test "lite native check validates committed index catalog root chain" {
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
     defer allocator.free(index_file);
     try std.testing.expectEqualStrings("index bytes", index_file);
+}
+
+test "lite native stable snapshot copies committed prefix without tail bytes" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_path = try testPath(allocator, tmp, "native-snapshot-source.aflite");
+    defer allocator.free(source_path);
+    const snapshot_path = try testPath(allocator, tmp, "native-snapshot-copy.aflite");
+    defer allocator.free(snapshot_path);
+
+    const snapshot_size = blk: {
+        var file = try NativeFile.create(allocator, source_path);
+        defer file.close();
+        try file.putCatalogRecord("schema", "{\"version\":1}");
+        try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
+        try file.putDocument("doc:1", "{\"title\":\"one\"}");
+        const checkpoint = file.activeCheckpoint();
+        break :blk checkpoint.page_count * @as(u64, file.header.page_size);
+    };
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, source_path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "uncommitted tail", snapshot_size);
+    }
+
+    const source_report = try checkFile(allocator, source_path);
+    try std.testing.expect(!source_report.valid);
+    try std.testing.expectEqualStrings("tail_bytes", source_report.issue.?);
+    try std.testing.expect(source_report.tail_bytes > 0);
+
+    const snapshot_report = try copyStableSnapshot(allocator, source_path, snapshot_path, false);
+    try std.testing.expectEqual(snapshot_size, snapshot_report.snapshot_size);
+    try std.testing.expectEqual(@as(u64, "uncommitted tail".len), snapshot_report.tail_bytes);
+
+    const clean_report = try checkFile(allocator, snapshot_path);
+    try std.testing.expect(clean_report.valid);
+    try std.testing.expectEqual(@as(?[]const u8, null), clean_report.issue);
+    try std.testing.expectEqual(@as(u64, 0), clean_report.tail_bytes);
+    try std.testing.expectEqual(snapshot_report.snapshot_size, clean_report.file_size);
+
+    var reopened = try NativeFile.open(allocator, snapshot_path, true);
+    defer reopened.close();
+
+    const schema = (try reopened.getCatalogRecordAlloc(allocator, "schema")).?;
+    defer allocator.free(schema);
+    try std.testing.expectEqualStrings("{\"version\":1}", schema);
+
+    const index_file = (try reopened.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
+    defer allocator.free(index_file);
+    try std.testing.expectEqualStrings("index bytes", index_file);
+
+    const doc = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(doc);
+    try std.testing.expectEqualStrings("{\"title\":\"one\"}", doc);
 }
 
 test "lite native vacuum rewrites live catalog and document records" {
