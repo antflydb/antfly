@@ -1660,21 +1660,20 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Bu
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
 
-    const storage_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(backend.storageStatus(), .{})}) catch return .internal;
-    defer handle.alloc.free(storage_json);
-    const stats_json = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
-    defer handle.alloc.free(stats_json);
-    const pending_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(handle.db.pendingWorkStats(), .{})}) catch return .internal;
-    defer handle.alloc.free(pending_json);
-    const capabilities_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native), .{})}) catch return .internal;
-    defer handle.alloc.free(capabilities_json);
+    const stats = handle.db.stats(handle.alloc) catch |err| return capi.mapError(err);
+    defer db_mod.types.freeDBStats(handle.alloc, stats);
 
-    const bytes = std.fmt.allocPrint(handle.alloc, "{{\"storage\":{s},\"stats\":{s},\"pending_work\":{s},\"capabilities\":{s}}}", .{
-        storage_json,
-        stats_json,
-        pending_json,
-        capabilities_json,
-    }) catch return .internal;
+    const indexes = dbIndexStatsProjectionAlloc(handle.alloc, stats) catch return .internal;
+    defer if (indexes.len > 0) handle.alloc.free(indexes);
+
+    const status = lite_backend.Status(JsonDBStats){
+        .storage = backend.storageStatus(),
+        .stats = jsonDBStatsProjection(stats, indexes),
+        .pending_work = handle.db.pendingWorkStats(),
+        .capabilities = lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native),
+    };
+
+    const bytes = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(status, .{})}) catch return .internal;
     out_buf.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
@@ -3058,8 +3057,14 @@ fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
     const stats = try handle.db.stats(handle.alloc);
     defer db_mod.types.freeDBStats(handle.alloc, stats);
 
-    var indexes = try handle.alloc.alloc(JsonDBIndexStats, stats.indexes.len);
+    const indexes = try dbIndexStatsProjectionAlloc(handle.alloc, stats);
     defer if (indexes.len > 0) handle.alloc.free(indexes);
+
+    return try std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(jsonDBStatsProjection(stats, indexes), .{})});
+}
+
+fn dbIndexStatsProjectionAlloc(alloc: Allocator, stats: db_mod.types.DBStats) ![]JsonDBIndexStats {
+    var indexes = try alloc.alloc(JsonDBIndexStats, stats.indexes.len);
     for (stats.indexes, 0..) |item, i| {
         indexes[i] = .{
             .name = item.name,
@@ -3070,8 +3075,11 @@ fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
             .node_count = item.node_count,
         };
     }
+    return indexes;
+}
 
-    const json = try std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(JsonDBStats{
+fn jsonDBStatsProjection(stats: db_mod.types.DBStats, indexes: []JsonDBIndexStats) JsonDBStats {
+    return JsonDBStats{
         .doc_count = stats.doc_count,
         .index_count = stats.index_count,
         .indexes = indexes,
@@ -3153,8 +3161,7 @@ fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
         },
         .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
-    }, .{})});
-    return json;
+    };
 }
 
 pub export fn antfly_db_search_json(
