@@ -658,6 +658,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
     switch (plan) {
         .adapter_noop, .session_catalog => return .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
         .create_table => |create_table| {
+            try validateTemporalForeignKeysSupported(create_table.foreign_keys);
             if (current_schema_json.len != 0) {
                 if (create_table.replace_existing) return try appliedDdlSchemaJsonWithFlagsAlloc(
                     alloc,
@@ -920,6 +921,12 @@ fn appliedDdlSchemaJsonWithFlagsAlloc(
     };
 }
 
+fn validateTemporalForeignKeysSupported(foreign_keys: []const runtime_schema.ForeignKey) !void {
+    for (foreign_keys) |foreign_key| {
+        if (foreign_key.child_period != null or foreign_key.parent_period != null) return error.UnsupportedSqlShape;
+    }
+}
+
 const DdlWorkFlags = struct {
     requires_rebuild: bool = false,
     validation_required: bool = false,
@@ -987,6 +994,7 @@ fn applyCreateTablePlanAlloc(
     current: runtime_schema.TableSchema,
     plan: ddl_plan.CreateTablePlan,
 ) !runtime_schema.TableSchema {
+    try validateTemporalForeignKeysSupported(plan.foreign_keys);
     if (binder.tableSchemaCatalogExists(current)) {
         if (plan.replace_existing) return try ddl_plan.runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
         if (plan.if_not_exists and current.storage_mode == .relational) return try ddl_plan.cloneRelationalRuntimeSchemaAlloc(alloc, current);
@@ -1138,6 +1146,7 @@ fn applyAlterTablePlanAlloc(
                 try ddl_plan.appendUniqueConstraintAlloc(alloc, &schema, constraint);
             },
             .add_foreign_key => |foreign_key| {
+                try validateTemporalForeignKeysSupported(&.{foreign_key});
                 try binder.validateForeignKeyForColumns(schema.relational_columns, schema.periods, foreign_key);
                 try ddl_plan.appendForeignKeyAlloc(alloc, &schema, foreign_key);
             },
@@ -1202,6 +1211,7 @@ fn addRelationalColumnOperationAlloc(
         try ddl_plan.appendUniqueConstraintAlloc(alloc, schema, constraint);
     }
     for (operation.foreign_keys) |foreign_key| {
+        try validateTemporalForeignKeysSupported(&.{foreign_key});
         try binder.validateForeignKeyForColumns(schema.relational_columns, schema.periods, foreign_key);
         try ddl_plan.appendForeignKeyAlloc(alloc, schema, foreign_key);
     }

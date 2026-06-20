@@ -7768,7 +7768,6 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments:columns=6:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  amount numeric,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n);"
     },
     {
@@ -7784,7 +7783,6 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=3",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_cascade (\n  tenant_id text NOT NULL,\n  sku text NOT NULL,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE CASCADE\n);"
     },
     {
@@ -7800,7 +7798,6 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_set_null_delete:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_set_null_delete (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON DELETE SET NULL\n);"
     },
     {
@@ -7816,7 +7813,6 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_set_null:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_set_null (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON UPDATE SET NULL\n);"
     },
     {
@@ -7832,7 +7828,6 @@
         "temporal_foreign_keys": 1
       },
       "plan": "ddl:create_table:table=price_adjustments_update_cascade:columns=5:unique=0:fk=1:checks=0:if_not_exists=false:periods=1:temporal_pk=true:temporal_unique=0:temporal_fk=1:pk=1",
-      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
       "sql": "CREATE TABLE price_adjustments_update_cascade (\n  tenant_id text,\n  sku text,\n  adjustment_id text NOT NULL,\n  valid_from timestamptz NOT NULL,\n  valid_to timestamptz NOT NULL,\n  PERIOD FOR valid_time (valid_from, valid_to),\n  PRIMARY KEY (adjustment_id, valid_time WITHOUT OVERLAPS),\n  CONSTRAINT price_adjustments_price_fkey\n    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)\n    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)\n    ON UPDATE CASCADE\n);"
     },
     {

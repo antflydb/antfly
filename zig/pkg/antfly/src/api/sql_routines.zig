@@ -184,6 +184,26 @@ pub const Runtime = struct {
         return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, expression);
     }
 
+    pub fn executeTriggerRoutineAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        routine_name: []const u8,
+        new_row_json: ?[]const u8,
+        old_row_json: ?[]const u8,
+    ) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const routine = self.findRoutineLocked(.function, routine_name, 0) orelse return error.RoutineNotFound;
+        const body = routine.body orelse return error.RoutineBodyNotExecutable;
+        if (body.kind != .plpgsql_trigger or body.expression != null) return error.RoutineBodyNotExecutable;
+        const tuple_json = switch (body.hook) {
+            .trigger_return_new => new_row_json orelse return error.RoutineTriggerTupleUnavailable,
+            .trigger_return_old => old_row_json orelse return error.RoutineTriggerTupleUnavailable,
+            else => return error.RoutineBodyNotExecutable,
+        };
+        return try routineTriggerTupleJsonAlloc(alloc, tuple_json);
+    }
+
     pub fn listExpressionRoutineBindingsAlloc(
         self: *@This(),
         alloc: std.mem.Allocator,
@@ -436,6 +456,13 @@ fn routineArgumentObjectJsonAlloc(
     }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+fn routineTriggerTupleJsonAlloc(alloc: std.mem.Allocator, tuple_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, tuple_json, .{}) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
 fn cloneCreateRoutineRecordAlloc(alloc: std.mem.Allocator, plan: relational_sql.CreateRoutinePlan) !RoutineRecord {
@@ -970,6 +997,18 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     });
     try std.testing.expectEqual(@as(usize, 4), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "audit_body", &.{}));
+    const trigger_new = try runtime.executeTriggerRoutineAlloc(
+        alloc,
+        "audit_body",
+        "{\"id\":\"u1\",\"status\":\"updated\"}",
+        "{\"id\":\"u1\",\"status\":\"old\"}",
+    );
+    defer alloc.free(trigger_new);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"updated\"}", trigger_new);
+    try std.testing.expectError(
+        error.RoutineTriggerTupleUnavailable,
+        runtime.executeTriggerRoutineAlloc(alloc, "audit_body", null, "{\"id\":\"u1\"}"),
+    );
 
     var old_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
         alloc,
@@ -982,6 +1021,18 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     });
     try std.testing.expectEqual(@as(usize, 5), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "old_audit_body", &.{}));
+    const trigger_old = try runtime.executeTriggerRoutineAlloc(
+        alloc,
+        "old_audit_body",
+        "{\"id\":\"u1\",\"status\":\"updated\"}",
+        "{\"id\":\"u1\",\"status\":\"old\"}",
+    );
+    defer alloc.free(trigger_old);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"old\"}", trigger_old);
+    try std.testing.expectError(
+        error.InvalidRowsRequest,
+        runtime.executeTriggerRoutineAlloc(alloc, "old_audit_body", "{\"id\":\"u1\"}", "null"),
+    );
 
     var noop_procedure_plan = try relational_sql.lowerDdlPlanAlloc(
         alloc,

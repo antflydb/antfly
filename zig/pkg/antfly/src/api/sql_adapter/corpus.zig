@@ -1693,6 +1693,9 @@ pub fn corpusFixtureSqlParameterCoverageMatches(entry: AppParityCorpusEntry) boo
 
 pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
     if (entry.family != .ddl) return false;
+    if (entry.summary.temporal_foreign_keys) |temporal_foreign_keys| {
+        if (temporal_foreign_keys > 0) return false;
+    }
     return switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
         .drop_table => true,
         .create_view, .rename_view, .drop_view => false,
