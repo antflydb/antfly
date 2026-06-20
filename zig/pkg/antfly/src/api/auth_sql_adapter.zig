@@ -14,9 +14,11 @@
 
 const std = @import("std");
 const relational_sql = @import("relational_sql.zig");
+const sql_adapter = @import("sql_adapter/mod.zig");
 const tables_api = @import("tables.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
@@ -348,6 +350,9 @@ fn validateRowSecurityPredicateForSchema(
             const column = rowSecurityPolicyColumn(schema, literal.field) orelse return error.UnsupportedSqlShape;
             try validateRowSecurityLiteralForColumn(alloc, column, literal.value_json);
         },
+        .expression => |expression| {
+            try sql_adapter.validateCheckExpressionConditionForColumns(schema.relational_columns, expression);
+        },
         .conjunction => |conjunction| {
             for (conjunction.predicates) |term| try validateRowSecurityPredicateForSchema(alloc, schema, term);
         },
@@ -527,6 +532,7 @@ fn rowSecurityFilterJsonAlloc(
     return switch (predicate) {
         .current_setting_equals => |current_setting| try currentSettingRowFilterJsonAlloc(alloc, current_setting),
         .literal_equals => |literal| try literalRowFilterJsonAlloc(alloc, literal),
+        .expression => |expression| try expressionRowFilterJsonAlloc(alloc, expression),
         .conjunction => |conjunction| try conjunctionRowFilterJsonAlloc(alloc, conjunction),
     };
 }
@@ -552,6 +558,19 @@ fn literalRowFilterJsonAlloc(
     const field_json = try std.json.Stringify.valueAlloc(alloc, predicate.field, .{});
     defer alloc.free(field_json);
     return try std.fmt.allocPrint(alloc, "{{\"term\":{{{s}:{s}}}}}", .{ field_json, predicate.value_json });
+}
+
+fn expressionRowFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    predicate: db_mod.types.RelationalRowsExpressionCondition,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"expression_where\":[");
+    try sql_adapter.writeRowExpressionConditionJson(writer, predicate);
+    try writer.writeAll("]}");
+    return try out.toOwnedSlice();
 }
 
 fn conjunctionRowFilterJsonAlloc(
@@ -1053,6 +1072,14 @@ test "sql auth adapter applies row security policies through user manager" {
     const stored_literal = try manager.getSqlRowSecurityPolicy("usage_records_literal_policy", usage_records_resource);
     defer alloc.free(stored_literal);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", stored_literal);
+
+    var expression_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');")).?;
+    defer expression_policy.deinit(alloc);
+    const stored_expression = try manager.getSqlRowSecurityPolicy("usage_records_lower_policy", usage_records_resource);
+    defer alloc.free(stored_expression);
+    try std.testing.expect(std.mem.indexOf(u8, stored_expression, "\"expression_where\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored_expression, "\"op\":\"lower\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored_expression, "\"field\":\"status\"") != null);
 
     var compound_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');")).?;
     defer compound_policy.deinit(alloc);

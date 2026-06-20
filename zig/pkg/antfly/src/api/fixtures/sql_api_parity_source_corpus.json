@@ -6006,15 +6006,15 @@
     {
       "name": "unsupported read intersect mismatched type set operation",
       "family": "unsupported_read",
-      "plan": "unsupported:read:requires=set_operation_plan",
-      "classification_reason": "set_operation_plan",
+      "plan": "unsupported:read:requires=set_operation_output_shape",
+      "classification_reason": "set_operation_output_shape",
       "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT amount AS status_key FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "unsupported read except cross table set operation",
       "family": "unsupported_read",
-      "plan": "unsupported:read:requires=set_operation_plan",
-      "classification_reason": "set_operation_plan",
+      "plan": "unsupported:read:requires=set_operation_source_schema",
+      "classification_reason": "set_operation_source_schema",
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
     },
     {

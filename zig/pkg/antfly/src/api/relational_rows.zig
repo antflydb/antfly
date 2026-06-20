@@ -6517,7 +6517,7 @@ fn parseRowsAggregateFilterExpressionsAlloc(
     return out;
 }
 
-fn parseRowsQueryExpressionPredicatesAlloc(
+pub fn parseRowsQueryExpressionPredicatesAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
     maybe_expressions: ?std.json.Value,
@@ -15310,7 +15310,7 @@ fn freeRowsQueryExpressionArrayContainsPredicates(
     if (predicates.len > 0) alloc.free(predicates);
 }
 
-fn freeRowsQueryExpressionConditions(alloc: std.mem.Allocator, conditions: []const db_mod.types.RelationalRowsExpressionCondition) void {
+pub fn freeRowsQueryExpressionConditions(alloc: std.mem.Allocator, conditions: []const db_mod.types.RelationalRowsExpressionCondition) void {
     for (conditions) |condition| freeRowsQueryExpressionCondition(alloc, condition);
     if (conditions.len > 0) alloc.free(conditions);
 }
@@ -15320,7 +15320,7 @@ fn freeRowsQueryExpressions(alloc: std.mem.Allocator, expressions: []const db_mo
     if (expressions.len > 0) alloc.free(expressions);
 }
 
-fn freeRowsQueryExpressionPredicateGroups(alloc: std.mem.Allocator, groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+pub fn freeRowsQueryExpressionPredicateGroups(alloc: std.mem.Allocator, groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
     for (groups) |group| {
         freeRowsQueryExpressionConditions(alloc, group.conditions);
     }

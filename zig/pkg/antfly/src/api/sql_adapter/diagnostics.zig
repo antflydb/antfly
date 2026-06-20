@@ -34,10 +34,12 @@ pub const SqlAdapterClassificationReason = enum {
     role_setting_plan,
     routine_body_plan,
     routine_option_plan,
+    set_operation_output_shape,
     row_rewrite_expression_plan,
     row_lock_mode_plan,
     schema_namespace,
     session_setting,
+    set_operation_source_schema,
     set_operation_plan,
     system_time_temporal_table,
     temporal_fk_action,
@@ -111,9 +113,11 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .duplicate_output_name,
         .multi_output_subquery_delete_selector,
         .multi_output_subquery_update_selector,
+        .set_operation_output_shape,
         => .{ .category = .output_shape_validation },
         .extension,
         .schema_namespace,
+        .set_operation_source_schema,
         => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .multi_table_generation_barrier => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .prepared_transaction_plan => .{ .category = .prepared_transaction_recovery, .coordinator_recovery = true },
@@ -143,6 +147,8 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
 
 test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_plan"));
+    try std.testing.expect(classificationReasonTokenIsKnown("set_operation_output_shape"));
+    try std.testing.expect(classificationReasonTokenIsKnown("set_operation_source_schema"));
     try std.testing.expect(classificationReasonTokenIsKnown("bulk_io_plan"));
     try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
     try std.testing.expectEqual(SqlAdapterClassificationReason.prepared_transaction_plan, classificationReasonFromToken("prepared_transaction_plan").?);
@@ -173,6 +179,13 @@ test "sql adapter diagnostics map unsupported classifications to native requirem
     try std.testing.expect(set_operation.materialization);
     try std.testing.expect(set_operation.spill);
     try std.testing.expect(set_operation.backpressure);
+
+    const set_operation_shape = nativeExecutionRequirement(.set_operation_output_shape);
+    try std.testing.expectEqual(NativeRequirementCategory.output_shape_validation, set_operation_shape.category);
+
+    const set_operation_schema = nativeExecutionRequirement(.set_operation_source_schema);
+    try std.testing.expectEqual(NativeRequirementCategory.catalog_lifecycle, set_operation_schema.category);
+    try std.testing.expect(set_operation_schema.durable_metadata);
 
     const bulk = nativeExecutionRequirement(.bulk_io_plan);
     try std.testing.expectEqual(NativeRequirementCategory.bulk_io_route, bulk.category);

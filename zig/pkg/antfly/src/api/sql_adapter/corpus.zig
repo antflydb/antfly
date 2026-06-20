@@ -4556,8 +4556,8 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_read_recursive_cte_stream_plan: bool = false,
     unsupported_read_duplicate_output_name: bool = false,
     unsupported_read_aggregate_duplicate_output_name: bool = false,
-    unsupported_read_set_operation_intersect: bool = false,
-    unsupported_read_set_operation_except: bool = false,
+    unsupported_read_set_operation_output_shape: bool = false,
+    unsupported_read_set_operation_source_schema: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
@@ -5743,11 +5743,11 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
                 std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
-            self.unsupported_read_set_operation_intersect = self.unsupported_read_set_operation_intersect or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
+            self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
+                (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);
-            self.unsupported_read_set_operation_except = self.unsupported_read_set_operation_except or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_plan") and
+            self.unsupported_read_set_operation_source_schema = self.unsupported_read_set_operation_source_schema or
+                (std.mem.eql(u8, entry.classification_reason, "set_operation_source_schema") and
                     std.mem.indexOf(u8, entry.sql, " EXCEPT ") != null);
             self.unsupported_read_row_lock_target = self.unsupported_read_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and

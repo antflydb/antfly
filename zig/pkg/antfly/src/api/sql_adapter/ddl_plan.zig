@@ -2154,12 +2154,14 @@ pub const DropRowSecurityPolicyPlan = struct {
 pub const RowSecurityPolicyPredicate = union(enum) {
     current_setting_equals: RowSecurityCurrentSettingPredicate,
     literal_equals: RowSecurityLiteralPredicate,
+    expression: db_mod.types.RelationalRowsExpressionCondition,
     conjunction: RowSecurityConjunctionPredicate,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .current_setting_equals => |*predicate| predicate.deinit(alloc),
             .literal_equals => |*predicate| predicate.deinit(alloc),
+            .expression => |condition| runtime_schema.freeRelationalRowsExpressionCondition(alloc, condition),
             .conjunction => |*predicate| predicate.deinit(alloc),
         }
         self.* = undefined;

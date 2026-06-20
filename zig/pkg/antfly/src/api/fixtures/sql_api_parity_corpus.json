@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "432f81dd9ff56e8a5555f5f9c5e3dd711c1c22659fd7d4ab17cd995df278a086",
+  "source_sha256": "8b612417ef59247e748c85feaa82386ac1895461cbc4653925e880e932c4c02f",
   "source_entry_count": 997,
   "entry_count": 997,
   "skipped_entries": [
@@ -5594,15 +5594,15 @@
     {
       "name": "unsupported read intersect mismatched type set operation",
       "family": "unsupported_read",
-      "plan": "unsupported:read:requires=set_operation_plan",
-      "classification_reason": "set_operation_plan",
+      "plan": "unsupported:read:requires=set_operation_output_shape",
+      "classification_reason": "set_operation_output_shape",
       "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT amount AS status_key FROM usage_records WHERE enabled IS TRUE"
     },
     {
       "name": "unsupported read except cross table set operation",
       "family": "unsupported_read",
-      "plan": "unsupported:read:requires=set_operation_plan",
-      "classification_reason": "set_operation_plan",
+      "plan": "unsupported:read:requires=set_operation_source_schema",
+      "classification_reason": "set_operation_source_schema",
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
     },
     {

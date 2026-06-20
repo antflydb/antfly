@@ -1623,6 +1623,24 @@ fn parseRowSecurityPolicyPredicateAtomAlloc(
     tokens: []const Token,
     pos: *usize,
 ) !ddl_plan.RowSecurityPolicyPredicate {
+    const start = pos.*;
+    if (parseRowSecurityPolicySimplePredicateAtomAlloc(alloc, cursor, tokens, pos)) |predicate| {
+        return predicate;
+    } else |err| {
+        switch (err) {
+            error.UnsupportedSqlShape => pos.* = start,
+            else => return err,
+        }
+    }
+    return try parseRowSecurityPolicyExpressionPredicateAtomAlloc(alloc, cursor, tokens, pos);
+}
+
+fn parseRowSecurityPolicySimplePredicateAtomAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.RowSecurityPolicyPredicate {
     const field = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(field);
@@ -1654,6 +1672,47 @@ fn parseRowSecurityPolicyPredicateAtomAlloc(
         .field = field,
         .value_json = value_json,
     } };
+}
+
+fn parseRowSecurityPolicyExpressionPredicateAtomAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.RowSecurityPolicyPredicate {
+    _ = pos;
+    _ = tokens;
+    const lhs = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+
+    const op = try parseRowSecurityExpressionComparisonOp(cursor);
+
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer {
+        if (!rhs_transferred) alloc.free(rhs);
+    }
+    rhs[0] = try parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs[0]);
+
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{ .expression = .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    } };
+}
+
+fn parseRowSecurityExpressionComparisonOp(cursor: parser.Cursor) !runtime_schema.RelationalCheckOp {
+    if (cursor.matchToken(.eq) != null) return .eq;
+    if (cursor.matchToken(.neq) != null) return .ne;
+    if (cursor.matchToken(.gt) != null) return .gt;
+    if (cursor.matchToken(.gte) != null) return .gte;
+    if (cursor.matchToken(.lt) != null) return .lt;
+    if (cursor.matchToken(.lte) != null) return .lte;
+    return error.UnsupportedSqlShape;
 }
 
 pub fn parseDropUpdatePolicyTriggerCatalogTailAlloc(

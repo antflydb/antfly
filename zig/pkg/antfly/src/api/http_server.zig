@@ -11420,7 +11420,9 @@ pub const ApiHttpServer = struct {
         array_any: []const db_mod.types.RelationalRowsArrayAnyPredicate = &.{},
         in_predicates: []const db_mod.types.RelationalRowsInPredicate = &.{},
         json_contains: []const db_mod.types.RelationalRowsJsonContainsPredicate = &.{},
+        expression_predicates: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
         access_or_predicates: []const db_mod.types.RelationalRowsAccessPredicateGroup = &.{},
+        expression_or_predicates: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             freeRowsAuthPredicates(alloc, self.predicates);
@@ -11440,8 +11442,10 @@ pub const ApiHttpServer = struct {
                 alloc.free(predicate.value_json);
             }
             if (self.json_contains.len > 0) alloc.free(self.json_contains);
+            relational_rows_api.freeRowsQueryExpressionConditions(alloc, self.expression_predicates);
             freeRowsAuthAccessPredicateGroups(alloc, self.access_or_predicates);
             if (self.access_or_predicates.len > 0) alloc.free(self.access_or_predicates);
+            relational_rows_api.freeRowsQueryExpressionPredicateGroups(alloc, self.expression_or_predicates);
             self.* = undefined;
         }
 
@@ -11450,7 +11454,9 @@ pub const ApiHttpServer = struct {
                 self.array_any.len == 0 and
                 self.in_predicates.len == 0 and
                 self.json_contains.len == 0 and
-                self.access_or_predicates.len == 0;
+                self.expression_predicates.len == 0 and
+                self.access_or_predicates.len == 0 and
+                self.expression_or_predicates.len == 0;
         }
     };
 
@@ -11640,7 +11646,9 @@ pub const ApiHttpServer = struct {
         array_any: std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate) = .empty,
         in_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate) = .empty,
         json_contains: std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate) = .empty,
+        expression_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition) = .empty,
         access_or_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup) = .empty,
+        expression_or_predicates: std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup) = .empty,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             freeRowsAuthPredicates(alloc, self.predicates.items);
@@ -11660,8 +11668,14 @@ pub const ApiHttpServer = struct {
                 alloc.free(predicate.value_json);
             }
             self.json_contains.deinit(alloc);
+            for (self.expression_predicates.items) |condition| {
+                runtime_schema_mod.freeRelationalRowsExpressionCondition(alloc, condition);
+            }
+            self.expression_predicates.deinit(alloc);
             freeRowsAuthAccessPredicateGroups(alloc, self.access_or_predicates.items);
             self.access_or_predicates.deinit(alloc);
+            freeRowsAuthExpressionPredicateGroupsNoSlice(alloc, self.expression_or_predicates.items);
+            self.expression_or_predicates.deinit(alloc);
             self.* = undefined;
         }
 
@@ -11670,7 +11684,9 @@ pub const ApiHttpServer = struct {
                 self.array_any.items.len == 0 and
                 self.in_predicates.items.len == 0 and
                 self.json_contains.items.len == 0 and
-                self.access_or_predicates.items.len == 0;
+                self.expression_predicates.items.len == 0 and
+                self.access_or_predicates.items.len == 0 and
+                self.expression_or_predicates.items.len == 0;
         }
 
         fn toOwnedPlan(self: *@This(), alloc: std.mem.Allocator) !RowsAuthFilterPlan {
@@ -11679,7 +11695,9 @@ pub const ApiHttpServer = struct {
                 .array_any = try self.array_any.toOwnedSlice(alloc),
                 .in_predicates = try self.in_predicates.toOwnedSlice(alloc),
                 .json_contains = try self.json_contains.toOwnedSlice(alloc),
+                .expression_predicates = try self.expression_predicates.toOwnedSlice(alloc),
                 .access_or_predicates = try self.access_or_predicates.toOwnedSlice(alloc),
+                .expression_or_predicates = try self.expression_or_predicates.toOwnedSlice(alloc),
             };
         }
     };
@@ -11729,6 +11747,7 @@ pub const ApiHttpServer = struct {
         if (value.object.get("terms")) |terms| return try self.appendRowsAuthTermsFilter(schema, terms, filter);
         if (value.object.get("array_any")) |array_any| return try self.appendRowsAuthArrayAnyFilter(schema, array_any, filter);
         if (value.object.get("json_contains")) |json_contains| return try self.appendRowsAuthJsonContainsFilter(schema, json_contains, filter);
+        if (value.object.get("expression_where")) |expression_where| return try self.appendRowsAuthExpressionWhereFilter(schema, expression_where, filter);
         if (value.object.get("numeric_range")) |range_query| return try self.appendRowsAuthNumericRangeFilter(schema, range_query, filter);
         if (value.object.get("date_range")) |range_query| return try self.appendRowsAuthDateRangeFilter(schema, range_query, filter);
 
@@ -11764,9 +11783,23 @@ pub const ApiHttpServer = struct {
             var branch = RowsAuthFilterBuilder{};
             defer branch.deinit(self.alloc);
             try self.appendRowsAuthFilterValue(schema, item, &branch);
-            if (branch.empty() or branch.access_or_predicates.items.len != 0) return error.UnsupportedRowsFilter;
-            try filter.access_or_predicates.append(self.alloc, try rowsAuthAccessPredicateGroupFromBuilder(self.alloc, &branch));
+            if (branch.empty() or branch.access_or_predicates.items.len != 0 or branch.expression_or_predicates.items.len != 0) return error.UnsupportedRowsFilter;
+            const has_access = rowsAuthBuilderHasAccessPredicates(branch);
+            const has_expression = branch.expression_predicates.items.len != 0;
+            if (has_access and has_expression) return error.UnsupportedRowsFilter;
+            if (has_expression) {
+                try filter.expression_or_predicates.append(self.alloc, try rowsAuthExpressionPredicateGroupFromBuilder(self.alloc, &branch));
+            } else {
+                try filter.access_or_predicates.append(self.alloc, try rowsAuthAccessPredicateGroupFromBuilder(self.alloc, &branch));
+            }
         }
+    }
+
+    fn rowsAuthBuilderHasAccessPredicates(builder: RowsAuthFilterBuilder) bool {
+        return builder.predicates.items.len != 0 or
+            builder.array_any.items.len != 0 or
+            builder.in_predicates.items.len != 0 or
+            builder.json_contains.items.len != 0;
     }
 
     fn rowsAuthAccessPredicateGroupFromBuilder(
@@ -11778,6 +11811,15 @@ pub const ApiHttpServer = struct {
             .array_any = try builder.array_any.toOwnedSlice(alloc),
             .in_predicates = try builder.in_predicates.toOwnedSlice(alloc),
             .json_contains = try builder.json_contains.toOwnedSlice(alloc),
+        };
+    }
+
+    fn rowsAuthExpressionPredicateGroupFromBuilder(
+        alloc: std.mem.Allocator,
+        builder: *RowsAuthFilterBuilder,
+    ) !db_mod.types.RelationalRowsExpressionPredicateGroup {
+        return .{
+            .conditions = try builder.expression_predicates.toOwnedSlice(alloc),
         };
     }
 
@@ -11878,6 +11920,25 @@ pub const ApiHttpServer = struct {
             .field = field,
             .value_json = value_json,
         });
+    }
+
+    fn appendRowsAuthExpressionWhereFilter(
+        self: *ApiHttpServer,
+        schema: runtime_schema_mod.TableSchema,
+        expression_where: std.json.Value,
+        filter: *RowsAuthFilterBuilder,
+    ) !void {
+        const conditions = relational_rows_api.parseRowsQueryExpressionPredicatesAlloc(self.alloc, schema, expression_where) catch |err| switch (err) {
+            error.InvalidRowsRequest, error.UnsupportedRowsQuery => return error.UnsupportedRowsFilter,
+            else => return err,
+        };
+        defer relational_rows_api.freeRowsQueryExpressionConditions(self.alloc, conditions);
+
+        for (conditions) |condition| {
+            const cloned = try runtime_schema_mod.cloneRelationalRowsExpressionConditionAlloc(self.alloc, condition);
+            errdefer runtime_schema_mod.freeRelationalRowsExpressionCondition(self.alloc, cloned);
+            try filter.expression_predicates.append(self.alloc, cloned);
+        }
     }
 
     fn appendRowsAuthNumericRangeFilter(
@@ -12044,7 +12105,9 @@ pub const ApiHttpServer = struct {
         try self.appendRowsAuthArrayAnyToQuery(filter.array_any, query);
         try self.appendRowsAuthInPredicatesToQuery(filter.in_predicates, query);
         try self.appendRowsAuthJsonContainsToQuery(filter.json_contains, query);
+        try self.appendRowsAuthExpressionPredicatesToQuery(filter.expression_predicates, query);
         try self.appendRowsAuthAccessOrPredicatesToQuery(filter.access_or_predicates, query);
+        try self.appendRowsAuthExpressionOrPredicatesToQuery(filter.expression_or_predicates, query);
     }
 
     fn deinitRowsAuthFilterQueryAdditions(
@@ -12068,13 +12131,17 @@ pub const ApiHttpServer = struct {
             self.alloc.free(@constCast(predicate.value_json));
         }
         if (query.json_contains.len > 0) self.alloc.free(@constCast(query.json_contains));
+        relational_rows_api.freeRowsQueryExpressionConditions(self.alloc, query.expression_predicates);
         freeRowsAuthAccessPredicateGroups(self.alloc, query.access_or_predicates);
         if (query.access_or_predicates.len > 0) self.alloc.free(@constCast(query.access_or_predicates));
+        relational_rows_api.freeRowsQueryExpressionPredicateGroups(self.alloc, query.expression_or_predicates);
         query.predicates = &.{};
         query.array_any = &.{};
         query.in_predicates = &.{};
         query.json_contains = &.{};
+        query.expression_predicates = &.{};
         query.access_or_predicates = &.{};
+        query.expression_or_predicates = &.{};
     }
 
     fn appendRowsAuthPredicatesToQuery(
@@ -12195,6 +12262,56 @@ pub const ApiHttpServer = struct {
         query.json_contains = combined;
     }
 
+    fn appendRowsAuthExpressionPredicatesToQuery(
+        self: *ApiHttpServer,
+        predicates: []const db_mod.types.RelationalRowsExpressionCondition,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (predicates.len == 0) return;
+        const combined = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, query.expression_predicates.len + predicates.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (combined[query.expression_predicates.len..initialized]) |condition| {
+                runtime_schema_mod.freeRelationalRowsExpressionCondition(self.alloc, condition);
+            }
+            self.alloc.free(combined);
+        }
+        for (query.expression_predicates) |condition| {
+            combined[initialized] = condition;
+            initialized += 1;
+        }
+        for (predicates) |condition| {
+            combined[initialized] = try runtime_schema_mod.cloneRelationalRowsExpressionConditionAlloc(self.alloc, condition);
+            initialized += 1;
+        }
+        if (query.expression_predicates.len > 0) self.alloc.free(@constCast(query.expression_predicates));
+        query.expression_predicates = combined;
+    }
+
+    fn appendRowsAuthExpressionOrPredicatesToQuery(
+        self: *ApiHttpServer,
+        groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+        query: *relational_rows_api.OwnedRowsQueryRequest,
+    ) !void {
+        if (groups.len == 0) return;
+        const combined = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, query.expression_or_predicates.len + groups.len);
+        var initialized: usize = 0;
+        errdefer {
+            freeRowsAuthExpressionPredicateGroupsNoSlice(self.alloc, combined[query.expression_or_predicates.len..initialized]);
+            self.alloc.free(combined);
+        }
+        for (query.expression_or_predicates) |group| {
+            combined[initialized] = group;
+            initialized += 1;
+        }
+        for (groups) |group| {
+            combined[initialized] = try cloneRowsAuthExpressionPredicateGroup(self.alloc, group);
+            initialized += 1;
+        }
+        if (query.expression_or_predicates.len > 0) self.alloc.free(@constCast(query.expression_or_predicates));
+        query.expression_or_predicates = combined;
+    }
+
     fn appendRowsAuthAccessOrPredicatesToQuery(
         self: *ApiHttpServer,
         groups: []const db_mod.types.RelationalRowsAccessPredicateGroup,
@@ -12230,6 +12347,23 @@ pub const ApiHttpServer = struct {
             .value_json = value_json,
             .validation_state = predicate.validation_state,
         };
+    }
+
+    fn cloneRowsAuthExpressionPredicateGroup(
+        alloc: std.mem.Allocator,
+        group: db_mod.types.RelationalRowsExpressionPredicateGroup,
+    ) !db_mod.types.RelationalRowsExpressionPredicateGroup {
+        const conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, group.conditions.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (conditions[0..initialized]) |condition| runtime_schema_mod.freeRelationalRowsExpressionCondition(alloc, condition);
+            alloc.free(conditions);
+        }
+        for (group.conditions) |condition| {
+            conditions[initialized] = try runtime_schema_mod.cloneRelationalRowsExpressionConditionAlloc(alloc, condition);
+            initialized += 1;
+        }
+        return .{ .conditions = conditions };
     }
 
     fn cloneRowsAuthArrayAnyPredicate(
@@ -12364,6 +12498,10 @@ pub const ApiHttpServer = struct {
             freeRowsAuthJsonContainsPredicates(alloc, group.json_contains);
             if (group.json_contains.len > 0) alloc.free(group.json_contains);
         }
+    }
+
+    fn freeRowsAuthExpressionPredicateGroupsNoSlice(alloc: std.mem.Allocator, groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup) void {
+        for (groups) |group| relational_rows_api.freeRowsQueryExpressionConditions(alloc, group.conditions);
     }
 
     fn runtimeSchemaForPublicRows(self: *ApiHttpServer, table_name: []const u8) !runtime_schema_mod.TableSchema {
@@ -15758,6 +15896,54 @@ test "effective resolved row filter prefers table filter before wildcard" {
     defer alloc.free(resolved);
 
     try std.testing.expectEqualStrings("{\"term\":{\"owner\":\"bob\"}}", resolved);
+}
+
+test "auth row filter expression predicates apply to typed row query" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metrics = .{} };
+        }
+    };
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema_mod.freeSchema(alloc, schema);
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var parsed_filter = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"expression_where\":[{\"op\":\"eq\",\"lhs\":{\"op\":\"lower\",\"args\":[{\"field\":\"tenant_id\"}]},\"rhs\":{\"value\":\"acme\"}}]}",
+        .{},
+    );
+    defer parsed_filter.deinit();
+    var filter = try server.rowsAuthFilterPlanFromValue(schema, parsed_filter.value);
+    defer filter.deinit(alloc);
+
+    var query: relational_rows_api.OwnedRowsQueryRequest = .{};
+    defer server.deinitRowsAuthFilterQueryAdditions(&query);
+    try server.applyRowsAuthFilterToQuery(schema, filter, &query);
+
+    try std.testing.expectEqual(@as(usize, 1), query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("tenant_id", query.expression_predicates[0].lhs.operands[0].field);
 }
 
 test "join auth applies read permission and row filters to joined tables" {
