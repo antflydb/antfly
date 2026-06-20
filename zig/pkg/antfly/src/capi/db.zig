@@ -1596,6 +1596,12 @@ pub export fn antfly_error_code_description(code: c_int) [*:0]const u8 {
     return capi.errorCodeDescription(code);
 }
 
+pub export fn antfly_lite_open_options_init(options: ?*capi.LiteOpenOptions) capi.ErrorCode {
+    const opts = options orelse return .invalid_argument;
+    opts.* = .{};
+    return .ok;
+}
+
 const lite_open_known_flags = capi.lite_open_flag_no_sync | capi.lite_open_flag_ttl_cleanup;
 
 const LiteResolvedOpenOptions = struct {
@@ -6376,6 +6382,32 @@ test "capi lite open options validate and configure ttl cleanup" {
     defer alloc.free(path);
     cleanupTestFile(path);
     defer cleanupTestFile(path);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_options_init(null));
+
+    var defaults = capi.LiteOpenOptions{
+        .abi_size = 0,
+        .open_mode = 99,
+        .profile = 99,
+        .flags = std.math.maxInt(u32),
+        .map_size = std.math.maxInt(u64),
+        .ttl_cleanup_enabled = true,
+        .reserved = .{1} ** 8,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_options_init(&defaults));
+    try std.testing.expectEqual(@as(u32, @sizeOf(capi.LiteOpenOptions)), defaults.abi_size);
+    try std.testing.expectEqual(capi.lite_open_mode_writer, defaults.open_mode);
+    try std.testing.expectEqual(capi.lite_profile_native, defaults.profile);
+    try std.testing.expectEqual(@as(u32, 0), defaults.flags);
+    try std.testing.expectEqual(@as(u64, 0), defaults.map_size);
+    try std.testing.expect(!defaults.ttl_cleanup_enabled);
+    for (defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
+
+    var default_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &defaults, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    cleanupTestFile(path);
 
     var sentinel: u8 = 0;
     var invalid_handle: ?*anyopaque = &sentinel;

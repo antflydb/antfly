@@ -176,6 +176,7 @@ typedef struct antfly_scan_hash_result {
 uint32_t antfly_lite_abi_version(void);
 const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
+antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *options);
 
 antfly_error_code antfly_lite_open(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_with_options(
