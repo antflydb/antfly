@@ -501,6 +501,10 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_template_rendering\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_template_rendering\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_template_host_callbacks\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
 
     try std.testing.expectError(error.NotLiteDatabase, api.statusJson(alloc));
 
@@ -554,6 +558,10 @@ test "embedded api hosted profile drains derived indexing without native runtime
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_template_rendering\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_template_rendering\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_template_host_callbacks\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"local_inference_runtime\":false") != null);
 
     const idle_json = try api.runUntilIdleJson(alloc);
     defer alloc.free(idle_json);

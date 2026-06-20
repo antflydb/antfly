@@ -1244,6 +1244,10 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"manual_maintenance\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"background_enrichment_runtime\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"no_inference_configured_ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"caller_supplied_artifacts\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"has_async_indexes\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
 }

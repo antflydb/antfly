@@ -419,6 +419,9 @@ case:
 
 - writes still succeed if enrichment outputs are not required synchronously
 - pending work is visible in status
+- capabilities/status reports `inference_mode`,
+  `no_inference_configured_ok`, and whether caller-supplied artifacts, remote
+  providers, or a local inference runtime are available
 - queries that depend on missing index material return clear readiness/status
   information
 - backup includes pending definitions and source documents
@@ -603,6 +606,8 @@ query-visible results should match within documented index rebuild semantics.
 - Add explicit inference modes.
 - Make "no inference configured" a clean status, not an error-prone partial
   setup.
+- Expose inference profile fields in Lite status and capabilities so embedded
+  users and bindings can branch without probing errors.
 - Support caller-supplied artifacts as the default happy path.
 - Support remote inference providers.
 - Support optional local inference builds.

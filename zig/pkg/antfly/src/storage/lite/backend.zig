@@ -43,6 +43,12 @@ pub const Capabilities = struct {
     local_template_rendering: bool = true,
     remote_template_rendering: bool = true,
     remote_template_host_callbacks: bool = false,
+    inference_mode: []const u8 = "caller_supplied_or_disabled",
+    inference_required: bool = false,
+    no_inference_configured_ok: bool = true,
+    caller_supplied_artifacts: bool = true,
+    remote_inference_providers: bool = true,
+    local_inference_runtime: bool = false,
     generated_enrichment_planning: bool = true,
     dense_vector_search: bool = true,
     sparse_vector_search: bool = true,
@@ -60,6 +66,12 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .local_template_rendering = true,
         .remote_template_rendering = !freestanding,
         .remote_template_host_callbacks = freestanding,
+        .inference_mode = "caller_supplied_or_disabled",
+        .inference_required = false,
+        .no_inference_configured_ok = true,
+        .caller_supplied_artifacts = true,
+        .remote_inference_providers = !freestanding,
+        .local_inference_runtime = false,
         .generated_enrichment_planning = true,
         .dense_vector_search = true,
         .sparse_vector_search = true,
@@ -292,6 +304,11 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(native_caps.generated_enrichment_planning);
     try std.testing.expect(native_caps.dense_vector_search);
     try std.testing.expect(native_caps.sparse_vector_search);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", native_caps.inference_mode);
+    try std.testing.expect(!native_caps.inference_required);
+    try std.testing.expect(native_caps.no_inference_configured_ok);
+    try std.testing.expect(native_caps.caller_supplied_artifacts);
+    try std.testing.expect(!native_caps.local_inference_runtime);
 
     const hosted_caps = capabilitiesForProfile(.hosted);
     try std.testing.expect(hosted_caps.hosted_profile);
