@@ -367,7 +367,6 @@ const transformOperationCount = sql_adapter.transformOperationCount;
 const rowExpressionBoundaryKeyword = sql_adapter.rowExpressionBoundaryKeyword;
 const sqlAssignmentTailKeyword = sql_adapter.sqlAssignmentTailKeyword;
 const sqlJoinedSourceAliasTerminator = sql_adapter.sqlJoinedSourceAliasTerminator;
-const sqlJsonExtractPathFunctionAsText = sql_adapter.sqlJsonExtractPathFunctionAsText;
 const sqlKeywordIsAnyOrSome = sql_adapter.sqlKeywordIsAnyOrSome;
 const sqlKeywordIsArrayLengthFunction = sql_adapter.sqlKeywordIsArrayLengthFunction;
 const sqlKeywordIsArrayPositionFunction = sql_adapter.sqlKeywordIsArrayPositionFunction;
@@ -381,8 +380,6 @@ const sqlKeywordIsDateTruncFunction = sql_adapter.sqlKeywordIsDateTruncFunction;
 const sqlKeywordIsEndsWithFunction = sql_adapter.sqlKeywordIsEndsWithFunction;
 const sqlKeywordIsInitcapFunction = sql_adapter.sqlKeywordIsInitcapFunction;
 const sqlKeywordIsJsonArrayLengthFunction = sql_adapter.sqlKeywordIsJsonArrayLengthFunction;
-const sqlKeywordIsJsonBuildObjectFunction = sql_adapter.sqlKeywordIsJsonBuildObjectFunction;
-const sqlKeywordIsJsonExtractPathFunction = sql_adapter.sqlKeywordIsJsonExtractPathFunction;
 const sqlKeywordIsJsonTypeofFunction = sql_adapter.sqlKeywordIsJsonTypeofFunction;
 const sqlKeywordIsLeftRightFunction = sql_adapter.sqlKeywordIsLeftRightFunction;
 const sqlKeywordIsLengthFunction = sql_adapter.sqlKeywordIsLengthFunction;
@@ -3394,6 +3391,13 @@ const Parser = struct {
     }
 
     fn variadicRowExpressionParserHooks(self: *@This()) sql_adapter.VariadicRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+        };
+    }
+
+    fn jsonBuildObjectRowExpressionParserHooks(self: *@This()) sql_adapter.JsonBuildObjectRowExpressionParserHooks {
         return .{
             .ptr = self,
             .parse_expression = parseFixedUnaryRowExpressionOperandHook,
@@ -16664,22 +16668,7 @@ const Parser = struct {
     }
 
     fn parseJsonExtractPathRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
-        const as_text = sqlJsonExtractPathFunctionAsText(keyword);
-        try self.expect(.lparen);
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateJsonRowExpression(operand);
-        const path = try sql_adapter.parseJsonExtractPathSegmentsAlloc(self.alloc, self.tokens, &self.pos, self.params);
-        var path_transferred = false;
-        errdefer if (!path_transferred) self.alloc.free(path);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildJsonExtractExpressionAlloc(self.alloc, operand, path, as_text);
-        operand_transferred = true;
-        path_transferred = true;
-        return expression;
+        return try sql_adapter.parseJsonExtractPathRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.params, self.rowExpressionTypeContext(), self.fixedUnaryRowExpressionParserHooks());
     }
 
     fn parseJsonExtractPathExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -16707,39 +16696,7 @@ const Parser = struct {
     }
 
     fn parseJsonBuildObjectRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseJsonBuildObjectFunctionCallStart(self.tokens, &self.pos);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        if (self.match(.rparen) == null) {
-            while (true) {
-                const key = try self.parseRowExpressionAlloc();
-                var key_transferred = false;
-                errdefer if (!key_transferred) freeExpression(self.alloc, key);
-                try self.rowExpressionTypeContext().validateTextRowExpression(key);
-                try operands.append(self.alloc, key);
-                key_transferred = true;
-
-                try self.expect(.comma);
-                const value = try self.parseRowExpressionAlloc();
-                var value_transferred = false;
-                errdefer if (!value_transferred) freeExpression(self.alloc, value);
-                _ = try self.rowExpressionTypeContext().rowExpressionOutputType(value);
-                try operands.append(self.alloc, value);
-                value_transferred = true;
-
-                if (self.match(.comma) == null) break;
-            }
-            try self.expect(.rparen);
-        }
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .json_build_object, &operands);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateJsonBuildObjectExpression(expression);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseJsonBuildObjectRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.jsonBuildObjectRowExpressionParserHooks());
     }
 
     fn parseJsonBuildObjectExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {

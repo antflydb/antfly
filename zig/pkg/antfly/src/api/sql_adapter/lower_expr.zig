@@ -646,6 +646,11 @@ pub const VariadicRowExpressionParserHooks = struct {
     parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const JsonBuildObjectRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const UnaryNegativeRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
@@ -2384,6 +2389,32 @@ pub fn parseJsonUnaryRowExpressionAlloc(
     return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, .json, hooks);
 }
 
+pub fn parseJsonExtractPathRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    type_context: RowExpressionTypeContext,
+    hooks: FixedUnaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const keyword = matchFunctionKeywordText(tokens, pos, sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    const as_text = sqlJsonExtractPathFunctionAsText(keyword);
+    try parser.expectToken(tokens, pos, .lparen);
+    const operand = try hooks.parse_expression(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateJsonRowExpression(operand);
+    const path = try value_mod.parseJsonExtractPathSegmentsAlloc(alloc, tokens, pos, params);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(path);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildJsonExtractExpressionAlloc(alloc, operand, path, as_text);
+    operand_transferred = true;
+    path_transferred = true;
+    return expression;
+}
+
 fn parseUnaryRowExpressionCallRestAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2406,6 +2437,48 @@ fn parseUnaryRowExpressionCallRestAlloc(
 
     const expression = try buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
     operand_transferred = true;
+    return expression;
+}
+
+pub fn parseJsonBuildObjectRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: JsonBuildObjectRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseJsonBuildObjectFunctionCallStart(tokens, pos);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    if (parser.matchToken(tokens, pos, .rparen) == null) {
+        while (true) {
+            const key = try hooks.parse_expression(hooks.ptr);
+            var key_transferred = false;
+            errdefer if (!key_transferred) freeExpression(alloc, key);
+            try type_context.validateTextRowExpression(key);
+            try operands.append(alloc, key);
+            key_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const value = try hooks.parse_expression(hooks.ptr);
+            var value_transferred = false;
+            errdefer if (!value_transferred) freeExpression(alloc, value);
+            _ = try type_context.rowExpressionOutputType(value);
+            try operands.append(alloc, value);
+            value_transferred = true;
+
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+    const expression = try buildFunctionExpressionFromOperandListAlloc(alloc, .json_build_object, &operands);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateJsonBuildObjectExpression(expression);
+    expression_transferred = true;
     return expression;
 }
 
