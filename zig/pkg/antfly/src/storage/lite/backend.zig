@@ -20,6 +20,7 @@ const db_core = @import("../db/core.zig");
 const db_types = @import("../db/types.zig");
 const backend_erased = @import("../backend_erased.zig");
 const bridge = @import("bridge.zig");
+const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
 
@@ -31,142 +32,12 @@ pub const CheckReport = native.CheckReport;
 pub const StableSnapshotReport = native.StableSnapshotReport;
 pub const VacuumReport = native.VacuumReport;
 
-pub const Profile = enum {
-    native,
-    hosted,
-};
-
-pub const supported_inference_modes = [_][]const u8{
-    "caller_supplied_artifacts",
-    "remote_provider",
-    "local_embedded",
-    "manual_maintenance",
-    "disabled_deferred",
-};
-
-const native_available_inference_modes = [_][]const u8{
-    "caller_supplied_artifacts",
-    "remote_provider",
-    "disabled_deferred",
-};
-
-const native_freestanding_available_inference_modes = [_][]const u8{
-    "caller_supplied_artifacts",
-    "disabled_deferred",
-};
-
-const hosted_available_inference_modes = [_][]const u8{
-    "caller_supplied_artifacts",
-    "remote_provider",
-    "manual_maintenance",
-    "disabled_deferred",
-};
-
-const hosted_freestanding_available_inference_modes = [_][]const u8{
-    "caller_supplied_artifacts",
-    "manual_maintenance",
-    "disabled_deferred",
-};
-
-pub const Capabilities = struct {
-    freestanding_build: bool = builtin.os.tag == .freestanding,
-    hosted_profile: bool = false,
-    manual_maintenance: bool = false,
-    background_enrichment_runtime: bool = true,
-    ttl_cleanup_runtime: bool = true,
-    transaction_recovery_runtime: bool = true,
-    local_template_rendering: bool = true,
-    remote_template_rendering: bool = true,
-    remote_template_host_callbacks: bool = false,
-    inference_mode: []const u8 = "caller_supplied_or_disabled",
-    supported_inference_modes: []const []const u8 = &supported_inference_modes,
-    available_inference_modes: []const []const u8 = &native_available_inference_modes,
-    inference_required: bool = false,
-    no_inference_configured_ok: bool = true,
-    caller_supplied_artifacts: bool = true,
-    remote_inference_providers: bool = true,
-    local_inference_runtime: bool = false,
-    generated_enrichment_planning: bool = true,
-    dense_vector_search: bool = true,
-    sparse_vector_search: bool = true,
-    distributed_shard_ownership: bool = false,
-    raft_replication: bool = false,
-    cluster_placement: bool = false,
-    cross_node_joins: bool = false,
-    remote_shard_fanout: bool = false,
-    distributed_transaction_coordination: bool = false,
-    cluster_heartbeat_status_aggregation: bool = false,
-    server_side_autoscaling: bool = false,
-    kubernetes_operator: bool = false,
-    object_storage_primary: bool = false,
-};
-
-pub const InferenceStatus = struct {
-    mode: []const u8 = "caller_supplied_or_disabled",
-    available_modes: []const []const u8 = &native_available_inference_modes,
-    configured: bool = false,
-    remote_provider_configured: bool = false,
-    local_runtime_configured: bool = false,
-    local_runtime_available: bool = false,
-    caller_supplied_artifacts: bool = true,
-    no_inference_configured_ok: bool = true,
-};
-
-pub fn capabilitiesForProfile(profile: Profile) Capabilities {
-    const freestanding = builtin.os.tag == .freestanding;
-    const hosted = profile == .hosted;
-    const available_modes: []const []const u8 = if (hosted)
-        if (freestanding) &hosted_freestanding_available_inference_modes else &hosted_available_inference_modes
-    else if (freestanding)
-        &native_freestanding_available_inference_modes
-    else
-        &native_available_inference_modes;
-    return .{
-        .hosted_profile = hosted,
-        .manual_maintenance = hosted,
-        .background_enrichment_runtime = !hosted and !freestanding,
-        .ttl_cleanup_runtime = !hosted and !freestanding,
-        .transaction_recovery_runtime = !hosted and !freestanding,
-        .local_template_rendering = true,
-        .remote_template_rendering = !freestanding,
-        .remote_template_host_callbacks = freestanding,
-        .inference_mode = "caller_supplied_or_disabled",
-        .supported_inference_modes = &supported_inference_modes,
-        .available_inference_modes = available_modes,
-        .inference_required = false,
-        .no_inference_configured_ok = true,
-        .caller_supplied_artifacts = true,
-        .remote_inference_providers = !freestanding,
-        .local_inference_runtime = false,
-        .generated_enrichment_planning = true,
-        .dense_vector_search = true,
-        .sparse_vector_search = true,
-        .distributed_shard_ownership = false,
-        .raft_replication = false,
-        .cluster_placement = false,
-        .cross_node_joins = false,
-        .remote_shard_fanout = false,
-        .distributed_transaction_coordination = false,
-        .cluster_heartbeat_status_aggregation = false,
-        .server_side_autoscaling = false,
-        .kubernetes_operator = false,
-        .object_storage_primary = false,
-    };
-}
-
-pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
-    const caps = capabilitiesForProfile(profile);
-    return .{
-        .mode = caps.inference_mode,
-        .available_modes = caps.available_inference_modes,
-        .configured = false,
-        .remote_provider_configured = false,
-        .local_runtime_configured = false,
-        .local_runtime_available = caps.local_inference_runtime,
-        .caller_supplied_artifacts = caps.caller_supplied_artifacts,
-        .no_inference_configured_ok = caps.no_inference_configured_ok,
-    };
-}
+pub const Profile = capabilities.Profile;
+pub const supported_inference_modes = capabilities.supported_inference_modes;
+pub const Capabilities = capabilities.Capabilities;
+pub const InferenceStatus = capabilities.InferenceStatus;
+pub const capabilitiesForProfile = capabilities.capabilitiesForProfile;
+pub const inferenceStatusForProfile = capabilities.inferenceStatusForProfile;
 
 pub const EngineKind = enum {
     /// Internal LSM bridge for explicit storage-engine development.

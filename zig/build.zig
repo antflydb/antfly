@@ -6393,8 +6393,32 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
+    const lite_wasm_profile_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
+    const lite_wasm_profile = b.addExecutable(.{
+        .name = "antfly_lite_wasm_profile",
+        .root_module = lite_wasm_profile_mod,
+    });
+    lite_wasm_profile.entry = .disabled;
+    lite_wasm_profile.rdynamic = true;
+    lite_wasm_profile.export_memory = true;
+    const install_lite_wasm_profile = b.addInstallArtifact(lite_wasm_profile, .{
+        .dest_sub_path = "antfly-lite-wasm/antfly_lite_wasm_profile.wasm",
+    });
+    const lite_wasm_profile_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
     const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
-    lite_wasm_step.dependOn(wasm_step);
+    lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
+    lite_wasm_step.dependOn(&run_lite_wasm_profile_tests.step);
 
     const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
     lite_dev_step.dependOn(&install_antfly.step);
