@@ -90,6 +90,17 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         emb_batches.deinit(alloc);
     }
 
+    // Sparse embeddings keyed by index name
+    var sparse_batches = std.StringHashMapUnmanaged(SparseBatch).empty;
+    defer {
+        var it = sparse_batches.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(alloc);
+        }
+        sparse_batches.deinit(alloc);
+    }
+
     // Edges keyed by index name
     var edge_batches = std.StringHashMapUnmanaged(EdgeBatch).empty;
     defer {
@@ -149,7 +160,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
                     doc_batch_bytes = 0;
                 }
             } else if (internal_keys.isEmbeddingArtifactKey(kv.key)) {
-                try collectEmbedding(alloc, &emb_batches, kv.key, kv.value);
+                try collectEmbedding(alloc, &emb_batches, &sparse_batches, kv.key, kv.value);
             } else if (internal_keys.isGraphEdgeArtifactKey(kv.key)) {
                 try collectGraphEdgeArtifact(alloc, &edge_batches, kv.key, kv.value);
             } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
@@ -193,6 +204,19 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             const encoded = try backup_codec.encodeEmbeddingBatch(alloc, entry.key_ptr.*, dim, batch.entries.items);
             defer alloc.free(encoded);
             try backup_codec.writeBlock(out, alloc, .embedding_batch, encoded);
+            counts.embeddings += batch.entries.items.len;
+        }
+    }
+
+    // Flush sparse embedding batches
+    {
+        var it = sparse_batches.iterator();
+        while (it.next()) |entry| {
+            const batch = entry.value_ptr;
+            if (batch.entries.items.len == 0) continue;
+            const encoded = try backup_codec.encodeSparseBatch(alloc, entry.key_ptr.*, batch.entries.items);
+            defer alloc.free(encoded);
+            try backup_codec.writeBlock(out, alloc, .sparse_batch, encoded);
             counts.embeddings += batch.entries.items.len;
         }
     }
@@ -251,6 +275,23 @@ const EmbeddingBatch = struct {
         for (self.entries.items) |e| {
             alloc.free(e.doc_key);
             alloc.free(e.vector);
+        }
+        self.entries.deinit(alloc);
+    }
+};
+
+const SparseBatch = struct {
+    entries: std.ArrayListUnmanaged(backup_codec.SparseEntry),
+
+    fn init() SparseBatch {
+        return .{ .entries = .empty };
+    }
+
+    fn deinit(self: *SparseBatch, alloc: Allocator) void {
+        for (self.entries.items) |e| {
+            alloc.free(e.doc_key);
+            alloc.free(e.indices);
+            alloc.free(e.values);
         }
         self.entries.deinit(alloc);
     }
@@ -398,6 +439,7 @@ fn isPortableMetadataKey(key: []const u8) bool {
 fn collectEmbedding(
     alloc: Allocator,
     batches: *std.StringHashMapUnmanaged(EmbeddingBatch),
+    sparse_batches: *std.StringHashMapUnmanaged(SparseBatch),
     key: []const u8,
     value: []const u8,
 ) !void {
@@ -405,9 +447,17 @@ fn collectEmbedding(
     defer alloc.free(parsed_key.doc_key);
     defer alloc.free(parsed_key.artifact_name);
 
-    const vector = if (enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value)) |decoded|
-        decoded
-    else |_| blk: {
+    if (enrichment_artifact_codec.decodeDenseEmbeddingAlloc(alloc, value)) |vector| {
+        try appendDenseEmbedding(alloc, batches, parsed_key.artifact_name, parsed_key.doc_key, vector);
+        return;
+    } else |_| {}
+
+    if (enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, value)) |sparse| {
+        try appendSparseEmbedding(alloc, sparse_batches, parsed_key.artifact_name, parsed_key.doc_key, sparse);
+        return;
+    } else |_| {}
+
+    {
         // Legacy imported portable data used JSON: {"dims": N, "vector": [...]}.
         const EmbPayload = struct {
             dims: u32,
@@ -418,11 +468,21 @@ fn collectEmbedding(
             .ignore_unknown_fields = true,
         }) catch return; // skip malformed embeddings
         defer json_parsed.deinit();
-        break :blk try alloc.dupe(f32, json_parsed.value.vector);
-    };
+        const vector = try alloc.dupe(f32, json_parsed.value.vector);
+        try appendDenseEmbedding(alloc, batches, parsed_key.artifact_name, parsed_key.doc_key, vector);
+    }
+}
+
+fn appendDenseEmbedding(
+    alloc: Allocator,
+    batches: *std.StringHashMapUnmanaged(EmbeddingBatch),
+    index_name: []const u8,
+    doc_key: []const u8,
+    vector: []f32,
+) !void {
     errdefer alloc.free(vector);
 
-    const idx_name = try alloc.dupe(u8, parsed_key.artifact_name);
+    const idx_name = try alloc.dupe(u8, index_name);
     const gop = try batches.getOrPut(alloc, idx_name);
     if (!gop.found_existing) {
         gop.value_ptr.* = EmbeddingBatch.init();
@@ -431,10 +491,40 @@ fn collectEmbedding(
         alloc.free(idx_name);
     }
 
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
     try gop.value_ptr.entries.append(alloc, .{
-        .doc_key = try alloc.dupe(u8, parsed_key.doc_key),
+        .doc_key = owned_doc_key,
         .hash_id = 0, // Zig doesn't store hash_id in embedding values
         .vector = vector,
+    });
+}
+
+fn appendSparseEmbedding(
+    alloc: Allocator,
+    batches: *std.StringHashMapUnmanaged(SparseBatch),
+    index_name: []const u8,
+    doc_key: []const u8,
+    sparse: enrichment_artifact_codec.SparseEmbedding,
+) !void {
+    var owned_sparse = sparse;
+    errdefer owned_sparse.deinit(alloc);
+
+    const idx_name = try alloc.dupe(u8, index_name);
+    const gop = try batches.getOrPut(alloc, idx_name);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = SparseBatch.init();
+    } else {
+        alloc.free(idx_name);
+    }
+
+    const owned_doc_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_doc_key);
+    try gop.value_ptr.entries.append(alloc, .{
+        .doc_key = owned_doc_key,
+        .hash_id = 0,
+        .indices = owned_sparse.indices,
+        .values = owned_sparse.values,
     });
 }
 
@@ -517,7 +607,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 imported_identity = true;
             },
             .metadata_batch => try importMetadataBatch(alloc, store, block.payload),
-            // Skip: sparse, summary, chunk, transaction (rebuilt by enrichment)
+            // Skip: derived indexes in the first pass; they are restored after documents.
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
         }
@@ -537,6 +627,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
 
             switch (block.block_type) {
                 .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
+                .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
                 .edge_batch => try importEdgeBatch(alloc, store, block.payload),
                 else => {},
             }
@@ -669,6 +760,51 @@ fn importEmbeddingBatch(
 
         const source_hash = try embeddingSourceHashForDocument(alloc, store, e.doc_key, result.index_name, source_fields);
         const artifact_value = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, source_hash, e.vector);
+        try owned_vals.append(alloc, artifact_value);
+        try writes.append(alloc, .{ .key = store_key, .value = artifact_value });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importSparseBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    source_fields: []const ImportOptions.EmbeddingSourceField,
+) !void {
+    const result = try backup_codec.decodeSparseBatch(alloc, payload);
+    defer {
+        alloc.free(result.index_name);
+        for (result.entries) |e| {
+            alloc.free(e.doc_key);
+            alloc.free(e.indices);
+            alloc.free(e.values);
+        }
+        alloc.free(result.entries);
+    }
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (result.entries) |e| {
+        const store_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, e.doc_key, result.index_name);
+        try owned_keys.append(alloc, store_key);
+
+        const source_hash = try embeddingSourceHashForDocument(alloc, store, e.doc_key, result.index_name, source_fields);
+        const artifact_value = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(alloc, source_hash, e.indices, e.values);
         try owned_vals.append(alloc, artifact_value);
         try writes.append(alloc, .{ .key = store_key, .value = artifact_value });
     }
@@ -1189,6 +1325,51 @@ test "export and import embeddings round trip" {
         try std.testing.expectApproxEqAbs(@as(f32, 0.1), vector[0], 1e-6);
         try std.testing.expectApproxEqAbs(@as(f32, 0.4), vector[3], 1e-6);
     }
+}
+
+test "export and import sparse embeddings round trip" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_store_key = try internal_keys.documentKeyAlloc(alloc, "sparse-doc");
+    defer alloc.free(doc_store_key);
+    try src.putBatch(&.{.{ .key = doc_store_key, .value = "{\"id\":\"sparse-doc\",\"body\":\"alpha beta\"}" }}, &.{});
+
+    const sparse_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "sparse-doc", "sparse_idx");
+    defer alloc.free(sparse_key);
+    const sparse_val = try enrichment_artifact_codec.encodeSparseEmbeddingAlloc(
+        alloc,
+        null,
+        &.{ 2, 9, 17 },
+        &.{ 0.5, 1.25, 0.75 },
+    );
+    defer alloc.free(sparse_val);
+    try src.putBatch(&.{.{ .key = sparse_key, .value = sparse_val }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const val = try dst.get(alloc, sparse_key);
+    defer alloc.free(val);
+
+    var decoded = try enrichment_artifact_codec.decodeSparseEmbeddingAlloc(alloc, val);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 9, 17 }, decoded.indices);
+    try std.testing.expectEqual(@as(usize, 3), decoded.values.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), decoded.values[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), decoded.values[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), decoded.values[2], 1e-6);
 }
 
 test "export and import graph edge artifacts round trip with arbitrary ids" {
