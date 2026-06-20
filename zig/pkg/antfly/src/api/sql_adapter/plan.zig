@@ -303,6 +303,7 @@ pub const LoweredRecursiveCtePlan = struct {
     cte_name: []const u8,
     operation: SelectSetOperation,
     anchor: LoweredQueryPlan,
+    recursive_member: LoweredRecursiveCteMemberPlan,
     output_columns: []const runtime_schema.RelationalColumn = &.{},
     recursive_member_references_cte: bool = false,
     max_rows: ?u32 = db_mod.types.default_relational_rows_cte_max_rows,
@@ -312,7 +313,36 @@ pub const LoweredRecursiveCtePlan = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.cte_name);
         self.anchor.deinit(alloc);
+        self.recursive_member.deinit(alloc);
         freeSetOperationOutputColumns(alloc, self.output_columns);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredRecursiveCteMemberPlan = union(enum) {
+    join: LoweredRecursiveCteJoinMemberPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .join => |*join| join.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const LoweredRecursiveCteJoinMemberPlan = struct {
+    left_table_name: []const u8,
+    right_table_name: []const u8,
+    join_type: db_mod.types.RelationalRowsJoinType,
+    on: []const db_mod.types.RelationalRowsJoinOn = &.{},
+    projections: []const db_mod.types.RelationalRowsExpressionProjection = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.left_table_name);
+        alloc.free(self.right_table_name);
+        freeJoinOn(alloc, self.on);
+        if (self.on.len > 0) alloc.free(self.on);
+        freeExpressionProjections(alloc, self.projections);
         self.* = undefined;
     }
 };

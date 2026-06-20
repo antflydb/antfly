@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "9f6b88fd91b737203e2cc210075189ec04556096aa3dbb2b0c292560c7f29539",
+  "source_sha256": "74588481ad56a998cdbaf9da1cfe161f300ab658ae5cdedfcfc041a5fb5f173a",
   "source_entry_count": 997,
   "entry_count": 997,
   "skipped_entries": [
@@ -5623,6 +5623,16 @@
       "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
     },
     {
+      "name": "recursive cte read stream plan",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1
+      },
+      "plan": "read:recursive_cte:recursive_cte:name=usage_tree:op=union_all:anchor=anchor:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:member=recursive_member_join:type=inner:left=usage_records:right=usage_tree:on=1:projections=1:outputs=1:self_ref=true:max_rows=65536:max_bytes=67108864:spill_after=67108864",
+      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
+    },
+    {
       "name": "single table json expression order key query",
       "family": "query",
       "summary": {
@@ -5633,13 +5643,6 @@
       },
       "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=1:limit=5:claim=none",
       "sql": "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5"
-    },
-    {
-      "name": "unsupported recursive cte read classifier",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
-      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
     },
     {
       "name": "read json expression order key",

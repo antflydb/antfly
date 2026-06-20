@@ -4468,6 +4468,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_advisory_lock_two_keys: bool = false,
     read: bool = false,
     read_query: bool = false,
+    read_recursive_cte_stream_plan: bool = false,
     read_aggregate: bool = false,
     read_join: bool = false,
     read_lateral: bool = false,
@@ -4553,7 +4554,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_merge_mutation: bool = false,
     unsupported_query_recursive_cte_stream_plan: bool = false,
     query_calendar_interval_expression: bool = false,
-    unsupported_read_recursive_cte_stream_plan: bool = false,
     unsupported_read_duplicate_output_name: bool = false,
     unsupported_read_aggregate_duplicate_output_name: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
@@ -5685,6 +5685,7 @@ pub const AppParityCorpusCoverage = struct {
             .read => {
                 const is_read_query = std.mem.startsWith(u8, entry.plan, "read:query:");
                 const is_read_aggregate = std.mem.startsWith(u8, entry.plan, "read:aggregate:");
+                const is_read_recursive_cte = std.mem.startsWith(u8, entry.plan, "read:recursive_cte:");
                 const is_read_window = std.mem.startsWith(u8, entry.plan, "read:window:");
                 const has_cte_expression =
                     sql_adapter.planHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
@@ -5702,6 +5703,7 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_array=");
                 self.read = true;
                 self.read_query = self.read_query or is_read_query;
+                self.read_recursive_cte_stream_plan = self.read_recursive_cte_stream_plan or is_read_recursive_cte;
                 self.read_aggregate = self.read_aggregate or is_read_aggregate;
                 self.read_join = self.read_join or std.mem.startsWith(u8, entry.plan, "read:join:");
                 self.read_lateral = self.read_lateral or std.mem.startsWith(u8, entry.plan, "read:lateral:");
@@ -5739,7 +5741,6 @@ pub const AppParityCorpusCoverage = struct {
         if (entry.family == .unsupported) {
             self.unsupported_query_recursive_cte_stream_plan = self.unsupported_query_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
         } else if (entry.family == .unsupported_read) {
-            self.unsupported_read_recursive_cte_stream_plan = self.unsupported_read_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
             self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
                 std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");

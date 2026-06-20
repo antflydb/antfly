@@ -444,6 +444,8 @@ const sqlKeywordStartsScalarPredicate = sql_adapter.sqlKeywordStartsScalarPredic
 
 pub const LoweredSelect = sql_adapter.LoweredSelect;
 pub const LoweredQueryPlan = sql_adapter.LoweredQueryPlan;
+pub const LoweredRecursiveCteJoinMemberPlan = sql_adapter.LoweredRecursiveCteJoinMemberPlan;
+pub const LoweredRecursiveCteMemberPlan = sql_adapter.LoweredRecursiveCteMemberPlan;
 pub const LoweredRecursiveCtePlan = sql_adapter.LoweredRecursiveCtePlan;
 pub const LoweredSetOperationPlan = sql_adapter.LoweredSetOperationPlan;
 pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
@@ -4483,6 +4485,16 @@ const Parser = struct {
         }
         const recursive_member_references_cte = recursiveMemberReferencesCte(body.tokens[body.pos..], cte_name);
         if (!recursive_member_references_cte) return error.UnsupportedSqlShape;
+
+        const recursive_member_ctes = [_]db_mod.types.RelationalRowsCte{.{
+            .name = cte_name,
+            .query = anchor.query,
+        }};
+        body.available_ctes = recursive_member_ctes[0..];
+        var recursive_member = try body.parseRecursiveCteMemberPlan(cte_name);
+        errdefer recursive_member.deinit(self.alloc);
+        if (!body.atEnd()) return error.UnsupportedSqlShape;
+
         self.pos = close_index + 1;
         if (self.match(.comma) != null) return error.UnsupportedSqlShape;
 
@@ -4505,12 +4517,182 @@ const Parser = struct {
             .cte_name = cte_name,
             .operation = operation,
             .anchor = anchor_plan,
+            .recursive_member = recursive_member,
             .output_columns = output_columns,
             .recursive_member_references_cte = recursive_member_references_cte,
             .max_rows = db_mod.types.default_relational_rows_cte_max_rows,
             .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
             .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
         };
+    }
+
+    fn parseRecursiveCteMemberPlan(self: *@This(), cte_name: []const u8) !LoweredRecursiveCteMemberPlan {
+        try self.expectKeyword("select");
+        const projection_start = self.pos;
+        const from_index = findTopLevelFromIndex(self.tokens, projection_start) orelse return error.UnsupportedSqlShape;
+        self.pos = from_index;
+
+        try self.expectKeyword("from");
+        const left_table = try sql_adapter.parseTableAliasAlloc(self.alloc, self.tokens, &self.pos);
+        defer freeTableAlias(self.alloc, left_table);
+
+        const join_type: db_mod.types.RelationalRowsJoinType = if (self.matchKeyword("left")) blk: {
+            _ = self.matchKeyword("outer");
+            try self.expectKeyword("join");
+            break :blk .left;
+        } else blk: {
+            _ = self.matchKeyword("inner");
+            try self.expectKeyword("join");
+            break :blk .inner;
+        };
+        const right_table = try sql_adapter.parseTableAliasAlloc(self.alloc, self.tokens, &self.pos);
+        defer freeTableAlias(self.alloc, right_table);
+        if (std.mem.eql(u8, left_table.alias, right_table.alias)) return error.UnsupportedSqlShape;
+
+        const left_is_cte = std.mem.eql(u8, left_table.name, cte_name);
+        const right_is_cte = std.mem.eql(u8, right_table.name, cte_name);
+        if (left_is_cte == right_is_cte) return error.UnsupportedSqlShape;
+        if (join_type != .inner) return error.UnsupportedSqlShape;
+        const base_table = if (left_is_cte) right_table else left_table;
+        const recursive_table = if (left_is_cte) left_table else right_table;
+
+        const planned_ctes = try relational_rows.planRowsCteOutputsAlloc(self.alloc, self.schema, self.available_ctes);
+        defer relational_rows.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const cte_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, cte_name) orelse return error.UnsupportedSqlShape;
+        const target_qualifiers = [_][]const u8{ base_table.name, base_table.alias };
+        const source_qualifiers = [_][]const u8{ recursive_table.name, recursive_table.alias };
+        var projection_parser = Parser{
+            .alloc = self.alloc,
+            .tokens = self.tokens[projection_start..from_index],
+            .schema = self.schema,
+            .joined_source_schema = cte_schema,
+            .params = self.params,
+            .function_bindings = self.function_bindings,
+            .joined_target_expression_qualifiers = target_qualifiers[0..],
+            .joined_source_expression_qualifiers = source_qualifiers[0..],
+        };
+        const projections = try projection_parser.parseRecursiveCteMemberProjectionsAlloc();
+        errdefer freeExpressionProjections(self.alloc, projections);
+
+        var on = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn).empty;
+        errdefer {
+            freeJoinOn(self.alloc, on.items);
+            on.deinit(self.alloc);
+        }
+        var left_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        defer {
+            freeRelationalChecks(self.alloc, left_predicates.items);
+            left_predicates.deinit(self.alloc);
+        }
+        var right_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        defer {
+            freeRelationalChecks(self.alloc, right_predicates.items);
+            right_predicates.deinit(self.alloc);
+        }
+        var on_expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        defer {
+            freeExpressionConditions(self.alloc, on_expression_predicates.items);
+            on_expression_predicates.deinit(self.alloc);
+        }
+        var on_expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        defer {
+            freeExpressionPredicateGroups(self.alloc, on_expression_or_predicates.items);
+            on_expression_or_predicates.deinit(self.alloc);
+        }
+        var on_expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        defer {
+            freeExpressionPredicateGroups(self.alloc, on_expression_not_predicates.items);
+            on_expression_not_predicates.deinit(self.alloc);
+        }
+        var on_expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        defer {
+            freeExpressionArrayContains(self.alloc, on_expression_array_contains.items);
+            on_expression_array_contains.deinit(self.alloc);
+        }
+
+        try self.expectKeyword("on");
+        const previous_schema = self.schema;
+        const previous_joined_source_schema = self.joined_source_schema;
+        self.schema = if (left_is_cte) cte_schema else previous_schema;
+        self.joined_source_schema = if (right_is_cte) cte_schema else previous_schema;
+        defer {
+            self.schema = previous_schema;
+            self.joined_source_schema = previous_joined_source_schema;
+        }
+        try self.parseJoinOn(
+            &on,
+            &left_predicates,
+            &right_predicates,
+            &on_expression_predicates,
+            &on_expression_or_predicates,
+            &on_expression_not_predicates,
+            &on_expression_array_contains,
+            join_type,
+            left_table.alias,
+            right_table.alias,
+        );
+        if (left_predicates.items.len != 0 or right_predicates.items.len != 0 or
+            on_expression_predicates.items.len != 0 or on_expression_or_predicates.items.len != 0 or
+            on_expression_not_predicates.items.len != 0 or on_expression_array_contains.items.len != 0)
+        {
+            return error.UnsupportedSqlShape;
+        }
+
+        const left_table_name = try self.alloc.dupe(u8, left_table.name);
+        errdefer self.alloc.free(left_table_name);
+        const right_table_name = try self.alloc.dupe(u8, right_table.name);
+        errdefer self.alloc.free(right_table_name);
+        return .{ .join = .{
+            .left_table_name = left_table_name,
+            .right_table_name = right_table_name,
+            .join_type = join_type,
+            .on = try on.toOwnedSlice(self.alloc),
+            .projections = projections,
+        } };
+    }
+
+    fn parseRecursiveCteMemberProjectionsAlloc(self: *@This()) ![]const db_mod.types.RelationalRowsExpressionProjection {
+        var projections = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+        errdefer {
+            freeExpressionProjections(self.alloc, projections.items);
+            projections.deinit(self.alloc);
+        }
+        while (true) {
+            const expression = try self.parseRowExpressionAlloc();
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+            const default_output = if (expression.kind == .field and expression.field.len != 0)
+                expression.field
+            else
+                rowExpressionDefaultOutputName(expression.kind);
+            const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, default_output);
+            var output_transferred = false;
+            errdefer if (!output_transferred) self.alloc.free(output);
+            try projections.append(self.alloc, .{ .output = output, .expression = expression });
+            expression_transferred = true;
+            output_transferred = true;
+            if (self.match(.comma) == null) break;
+        }
+        if (!self.atEnd()) return error.UnsupportedSqlShape;
+        return try projections.toOwnedSlice(self.alloc);
+    }
+
+    fn findTopLevelFromIndex(tokens: []const Token, start: usize) ?usize {
+        var depth: usize = 0;
+        var i = start;
+        while (i < tokens.len) : (i += 1) {
+            const token = tokens[i];
+            switch (token.kind) {
+                .lparen => depth += 1,
+                .rparen => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                },
+                .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "from")) return i,
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn parseSetOperationPlan(self: *@This()) !LoweredSetOperationPlan {
@@ -15187,8 +15369,7 @@ const Parser = struct {
         self: *@This(),
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsArrayLengthFunction) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
+        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
         const field = try self.parseConflictFieldExpressionAlloc(insert_columns, .array);
         var field_transferred = false;
         errdefer if (!field_transferred) freeExpression(self.alloc, field);
@@ -15205,13 +15386,11 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsArrayPositionFunction) orelse return error.UnsupportedSqlShape;
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(keyword, "array_positions")) .array_positions else .array_position;
+        const kind = try sql_adapter.parseArrayPositionFunctionCallStart(self.tokens, &self.pos);
         if (expected_type) |field_type| {
             const expected_result_type: runtime_schema.AntflyType = if (kind == .array_positions) .array else .numeric;
             if (field_type != expected_result_type) return error.UnsupportedSqlShape;
         }
-        try self.expect(.lparen);
         const array_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, .array);
         var array_transferred = false;
         errdefer if (!array_transferred) freeExpression(self.alloc, array_expression);
@@ -15305,8 +15484,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (field_type != .array) return error.UnsupportedSqlShape;
-        try self.expectKeyword("string_to_array");
-        try self.expect(.lparen);
+        try sql_adapter.parseStringToArrayFunctionCallStart(self.tokens, &self.pos);
         const text_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
         var text_transferred = false;
         errdefer if (!text_transferred) freeExpression(self.alloc, text_expression);
@@ -15332,8 +15510,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try self.expectKeyword("array_to_string");
-        try self.expect(.lparen);
+        try sql_adapter.parseArrayToStringFunctionCallStart(self.tokens, &self.pos);
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
             for (operands.items) |operand| freeExpression(self.alloc, operand);
@@ -15379,19 +15556,7 @@ const Parser = struct {
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
         if (expected_type) |field_type| if (field_type != .array) return error.UnsupportedSqlShape;
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("array_append"))
-            .array_append
-        else if (self.matchKeyword("array_prepend"))
-            .array_prepend
-        else if (self.matchKeyword("array_cat"))
-            .array_cat
-        else if (self.matchKeyword("array_replace"))
-            .array_replace
-        else blk: {
-            try self.expectKeyword("array_remove");
-            break :blk .array_remove;
-        };
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseArrayElementTransformFunctionCallStart(self.tokens, &self.pos);
         const first_expected: ?runtime_schema.AntflyType = if (kind == .array_prepend) null else .array;
         const first_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, first_expected);
         var first_transferred = false;
@@ -21204,15 +21369,18 @@ const Parser = struct {
     }
 
     fn parseArrayLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsArrayLengthFunction) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const parsed_field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        defer self.alloc.free(parsed_field);
-        const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
+        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
+        const field = try sql_adapter.parseRowExpressionArrayFieldOwnedAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+        );
         var field_transferred = false;
         errdefer if (!field_transferred) self.alloc.free(field);
-        const column = relationalColumnForField(self.schema, field, .array) orelse return error.InvalidSqlCatalog;
-        _ = column;
         try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
 
         const field_expression: db_mod.types.RelationalRowsExpression = .{ .kind = .field, .field = field, .field_source = self.rowExpressionFieldSource() };
@@ -21222,9 +21390,7 @@ const Parser = struct {
     }
 
     fn parseArrayPositionRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsArrayPositionFunction) orelse return error.UnsupportedSqlShape;
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(keyword, "array_positions")) .array_positions else .array_position;
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseArrayPositionFunctionCallStart(self.tokens, &self.pos);
         const array_expression = try self.parseRowExpressionAlloc();
         var array_transferred = false;
         errdefer if (!array_transferred) freeExpression(self.alloc, array_expression);
@@ -21393,8 +21559,7 @@ const Parser = struct {
     }
 
     fn parseStringToArrayRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("string_to_array");
-        try self.expect(.lparen);
+        try sql_adapter.parseStringToArrayFunctionCallStart(self.tokens, &self.pos);
         const text_expression = try self.parseRowExpressionAlloc();
         var text_transferred = false;
         errdefer if (!text_transferred) freeExpression(self.alloc, text_expression);
@@ -21415,8 +21580,7 @@ const Parser = struct {
     }
 
     fn parseArrayToStringRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expectKeyword("array_to_string");
-        try self.expect(.lparen);
+        try sql_adapter.parseArrayToStringFunctionCallStart(self.tokens, &self.pos);
         var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
         errdefer {
             for (operands.items) |operand| freeExpression(self.alloc, operand);
@@ -21454,19 +21618,7 @@ const Parser = struct {
     }
 
     fn parseArrayElementTransformRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind: db_mod.types.RelationalRowsExpressionKind = if (self.matchKeyword("array_append"))
-            .array_append
-        else if (self.matchKeyword("array_prepend"))
-            .array_prepend
-        else if (self.matchKeyword("array_cat"))
-            .array_cat
-        else if (self.matchKeyword("array_replace"))
-            .array_replace
-        else blk: {
-            try self.expectKeyword("array_remove");
-            break :blk .array_remove;
-        };
-        try self.expect(.lparen);
+        const kind = try sql_adapter.parseArrayElementTransformFunctionCallStart(self.tokens, &self.pos);
         const first_expression = try self.parseRowExpressionAlloc();
         var first_transferred = false;
         errdefer if (!first_transferred) freeExpression(self.alloc, first_expression);
@@ -21547,13 +21699,10 @@ const Parser = struct {
     }
 
     fn parseArrayLengthProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsArrayLengthProjection {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsArrayLengthFunction) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
+        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
+        const field = try sql_adapter.parseArrayFieldOwnedAlloc(self.alloc, self.tokens, &self.pos, self.schema);
         var field_transferred = false;
         errdefer if (!field_transferred) self.alloc.free(field);
-        const column = relationalColumnForField(self.schema, field, .array) orelse return error.InvalidSqlCatalog;
-        _ = column;
         try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
         const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, arrayLengthDefaultOutput(keyword));
         var output_transferred = false;
@@ -21564,15 +21713,18 @@ const Parser = struct {
     }
 
     fn parseArrayLengthExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsArrayLengthFunction) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const parsed_field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        defer self.alloc.free(parsed_field);
-        const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
+        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
+        const field = try sql_adapter.parseRowExpressionArrayFieldOwnedAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+        );
         var field_transferred = false;
         errdefer if (!field_transferred) self.alloc.free(field);
-        const column = relationalColumnForField(self.schema, field, .array) orelse return error.InvalidSqlCatalog;
-        _ = column;
         try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
         const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, arrayLengthDefaultOutput(keyword));
         var output_transferred = false;
@@ -21636,17 +21788,15 @@ const Parser = struct {
     }
 
     fn parseCoalesceOperandAlloc(self: *@This()) !db_mod.types.RelationalRowsCoalesceOperand {
-        if (self.peekKind(.identifier) and
-            !self.peekKeyword("null") and
-            !self.peekKeyword("true") and
-            !self.peekKeyword("false"))
-        {
-            const field = try self.parseFieldExpressionOwned();
-            errdefer self.alloc.free(field);
-            if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
-            if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
-            return .{ .kind = .field, .field = field };
-        }
+        if (try sql_adapter.parseCoalesceFieldOperandOrNullOwnedAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+        )) |operand| return operand;
 
         const value_json = try self.parseJsonValueAlloc();
         errdefer self.alloc.free(value_json);
@@ -41398,13 +41548,16 @@ fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) 
 fn recursiveCteFingerprintAlloc(alloc: std.mem.Allocator, recursive_cte: LoweredRecursiveCtePlan) ![]u8 {
     const anchor = try queryFingerprintAlloc(alloc, "anchor", recursive_cte.anchor.table_name, recursive_cte.anchor.plan.query, recursive_cte.anchor.plan.ctes.len);
     defer alloc.free(anchor);
+    const member = try recursiveCteMemberFingerprintAlloc(alloc, recursive_cte.recursive_member);
+    defer alloc.free(member);
     return try std.fmt.allocPrint(
         alloc,
-        "recursive_cte:name={s}:op={s}:anchor={s}:outputs={d}:self_ref={}:max_rows={d}:max_bytes={d}:spill_after={d}",
+        "recursive_cte:name={s}:op={s}:anchor={s}:member={s}:outputs={d}:self_ref={}:max_rows={d}:max_bytes={d}:spill_after={d}",
         .{
             recursive_cte.cte_name,
             @tagName(recursive_cte.operation),
             anchor,
+            member,
             recursive_cte.output_columns.len,
             recursive_cte.recursive_member_references_cte,
             recursive_cte.max_rows orelse 0,
@@ -41412,6 +41565,16 @@ fn recursiveCteFingerprintAlloc(alloc: std.mem.Allocator, recursive_cte: Lowered
             recursive_cte.spill_after_bytes orelse 0,
         },
     );
+}
+
+fn recursiveCteMemberFingerprintAlloc(alloc: std.mem.Allocator, member: LoweredRecursiveCteMemberPlan) ![]u8 {
+    return switch (member) {
+        .join => |join| try std.fmt.allocPrint(
+            alloc,
+            "recursive_member_join:type={s}:left={s}:right={s}:on={d}:projections={d}",
+            .{ sqlJoinTypeFingerprintName(join.join_type), join.left_table_name, join.right_table_name, join.on.len, join.projections.len },
+        ),
+    };
 }
 
 fn setOperationFingerprintAlloc(alloc: std.mem.Allocator, set_operation: LoweredSetOperationPlan) ![]u8 {
@@ -41951,7 +42114,7 @@ fn expectAppParityUnsupportedPlanEntry(
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
     switch (entry.family) {
-        .unsupported => try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
+        .unsupported => try expectFailClosedUnsupported(lowerQueryPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
         .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
         .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanAlloc(alloc, entry.sql)),
         .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, unique_resolver, row_claim)),
@@ -51535,6 +51698,23 @@ test "postgres sql adapter lowers recursive cte stream contract" {
     try std.testing.expectEqualStrings("walk", recursive.cte_name);
     try std.testing.expectEqual(SelectSetOperation.union_all, recursive.operation);
     try std.testing.expect(recursive.recursive_member_references_cte);
+    const recursive_member_join = switch (recursive.recursive_member) {
+        .join => |join| join,
+    };
+    try std.testing.expectEqualStrings("nodes", recursive_member_join.left_table_name);
+    try std.testing.expectEqualStrings("walk", recursive_member_join.right_table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, recursive_member_join.join_type);
+    try std.testing.expectEqual(@as(usize, 1), recursive_member_join.on.len);
+    try std.testing.expectEqual(@as(usize, 2), recursive_member_join.projections.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, recursive_member_join.projections[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, recursive_member_join.projections[0].expression.field_source);
+    try std.testing.expectEqualStrings("id", recursive_member_join.projections[0].expression.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, recursive_member_join.projections[1].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), recursive_member_join.projections[1].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, recursive_member_join.projections[1].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("depth", recursive_member_join.projections[1].expression.operands[0].field);
+    try std.testing.expectEqualStrings("parent_id", recursive_member_join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", recursive_member_join.on[0].right_field);
     try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), recursive.max_rows);
     try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), recursive.max_bytes);
     try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), recursive.spill_after_bytes);

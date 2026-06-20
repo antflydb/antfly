@@ -7523,6 +7523,46 @@ pub fn parseJsonBuildObjectFunctionCallStart(tokens: []const Token, pos: *usize)
     try parser.expectToken(tokens, pos, .lparen);
 }
 
+pub fn parseArrayLengthFunctionCallStart(tokens: []const Token, pos: *usize) ![]const u8 {
+    const keyword = matchFunctionKeywordText(tokens, pos, sqlKeywordIsArrayLengthFunction) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    return keyword;
+}
+
+pub fn parseArrayPositionFunctionCallStart(tokens: []const Token, pos: *usize) !db_mod.types.RelationalRowsExpressionKind {
+    const keyword = matchFunctionKeywordText(tokens, pos, sqlKeywordIsArrayPositionFunction) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    return if (std.ascii.eqlIgnoreCase(keyword, "array_positions")) .array_positions else .array_position;
+}
+
+pub fn parseStringToArrayFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "string_to_array");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseArrayToStringFunctionCallStart(tokens: []const Token, pos: *usize) !void {
+    try parser.expectKeyword(tokens, pos, "array_to_string");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseArrayElementTransformFunctionCallStart(tokens: []const Token, pos: *usize) !db_mod.types.RelationalRowsExpressionKind {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (cursor.matchKeyword("array_append"))
+        .array_append
+    else if (cursor.matchKeyword("array_prepend"))
+        .array_prepend
+    else if (cursor.matchKeyword("array_cat"))
+        .array_cat
+    else if (cursor.matchKeyword("array_replace"))
+        .array_replace
+    else blk: {
+        try cursor.expectKeyword("array_remove");
+        break :blk .array_remove;
+    };
+    try cursor.expectToken(.lparen);
+    return kind;
+}
+
 fn fixedUnaryFunctionKeyword(kind: db_mod.types.RelationalRowsExpressionKind) ?[]const u8 {
     return switch (kind) {
         .ascii => "ascii",
@@ -7758,6 +7798,74 @@ pub fn parseSimpleReturningFieldOwnedAlloc(
     errdefer alloc.free(field);
     if (peekUnsupportedSimpleFieldTail(tokens, pos.*)) return error.UnsupportedSqlShape;
     if (binder.relationalColumnForReturningField(schema, field) == null) return error.InvalidSqlCatalog;
+    return field;
+}
+
+pub fn parseCoalesceFieldOperandOrNullOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) !?db_mod.types.RelationalRowsCoalesceOperand {
+    if (!parser.peekKind(tokens, pos.*, .identifier) or
+        parser.peekKeyword(tokens, pos.*, "null") or
+        parser.peekKeyword(tokens, pos.*, "true") or
+        parser.peekKeyword(tokens, pos.*, "false"))
+    {
+        return null;
+    }
+
+    const field = try parseRowExpressionFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    errdefer alloc.free(field);
+    if (parser.peekKind(tokens, pos.*, .lparen)) return error.UnsupportedSqlShape;
+    if (binder.relationalColumnForField(schema, field, null) == null) return error.InvalidSqlCatalog;
+    return .{ .kind = .field, .field = field };
+}
+
+pub fn parseArrayFieldOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+) ![]const u8 {
+    const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    errdefer alloc.free(field);
+    _ = binder.relationalColumnForField(schema, field, .array) orelse return error.InvalidSqlCatalog;
+    return field;
+}
+
+pub fn parseRowExpressionArrayFieldOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) ![]const u8 {
+    const parsed_field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(parsed_field);
+    const field = try binder.normalizeRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    errdefer alloc.free(field);
+    _ = binder.relationalColumnForField(schema, field, .array) orelse return error.InvalidSqlCatalog;
     return field;
 }
 
@@ -9652,6 +9760,47 @@ test "sql adapter expression keyword predicates classify function and tail token
     try parseJsonBuildObjectFunctionCallStart(json_build_object_tokens[0..], &json_build_object_pos);
     try std.testing.expectEqual(@as(usize, 2), json_build_object_pos);
 
+    const array_length_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "cardinality" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var array_length_pos: usize = 0;
+    const array_length_keyword = try parseArrayLengthFunctionCallStart(array_length_tokens[0..], &array_length_pos);
+    try std.testing.expectEqualStrings("cardinality", array_length_keyword);
+    try std.testing.expectEqual(@as(usize, 2), array_length_pos);
+
+    const array_position_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "array_positions" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var array_position_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_positions, try parseArrayPositionFunctionCallStart(array_position_tokens[0..], &array_position_pos));
+    try std.testing.expectEqual(@as(usize, 2), array_position_pos);
+
+    const string_to_array_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "string_to_array" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var string_to_array_pos: usize = 0;
+    try parseStringToArrayFunctionCallStart(string_to_array_tokens[0..], &string_to_array_pos);
+    try std.testing.expectEqual(@as(usize, 2), string_to_array_pos);
+
+    const array_to_string_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "array_to_string" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var array_to_string_pos: usize = 0;
+    try parseArrayToStringFunctionCallStart(array_to_string_tokens[0..], &array_to_string_pos);
+    try std.testing.expectEqual(@as(usize, 2), array_to_string_pos);
+
+    const array_replace_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "array_replace" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var array_replace_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_replace, try parseArrayElementTransformFunctionCallStart(array_replace_tokens[0..], &array_replace_pos));
+    try std.testing.expectEqual(@as(usize, 2), array_replace_pos);
+
     const position_tokens = [_]Token{
         .{ .kind = .identifier, .text = "position" },
         .{ .kind = .lparen, .text = "(" },
@@ -9736,6 +9885,69 @@ test "sql adapter lower expr peeks simple returning fields" {
     var cast_expr = try lexer.tokenizeAlloc(alloc, "cast(total as text)");
     defer lexer.freeTokens(alloc, &cast_expr);
     try std.testing.expect(!peekSimpleReturningField(cast_expr.items, 0));
+}
+
+test "sql adapter lower expr parses coalesce field operands" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{.{ .name = "status", .path = "status", .field_type = .keyword }},
+    };
+
+    var field_tokens = try lexer.tokenizeAlloc(alloc, "status, 'fallback'");
+    defer lexer.freeTokens(alloc, &field_tokens);
+    var field_pos: usize = 0;
+    const field_operand = (try parseCoalesceFieldOperandOrNullOwnedAlloc(alloc, field_tokens.items, &field_pos, schema, &.{}, &.{}, false)) orelse return error.TestUnexpectedResult;
+    defer switch (field_operand.kind) {
+        .field => if (field_operand.field.len > 0) alloc.free(field_operand.field),
+        .value => if (field_operand.value_json.len > 0) alloc.free(field_operand.value_json),
+    };
+    try std.testing.expectEqual(@as(usize, 1), field_pos);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsCoalesceOperandKind.field, field_operand.kind);
+    try std.testing.expectEqualStrings("status", field_operand.field);
+
+    var literal_tokens = try lexer.tokenizeAlloc(alloc, "'fallback'");
+    defer lexer.freeTokens(alloc, &literal_tokens);
+    var literal_pos: usize = 0;
+    try std.testing.expect((try parseCoalesceFieldOperandOrNullOwnedAlloc(alloc, literal_tokens.items, &literal_pos, schema, &.{}, &.{}, false)) == null);
+    try std.testing.expectEqual(@as(usize, 0), literal_pos);
+
+    var call_tail_tokens = try lexer.tokenizeAlloc(alloc, "status()");
+    defer lexer.freeTokens(alloc, &call_tail_tokens);
+    var call_tail_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCoalesceFieldOperandOrNullOwnedAlloc(alloc, call_tail_tokens.items, &call_tail_pos, schema, &.{}, &.{}, false));
+}
+
+test "sql adapter lower expr parses array field operands" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword },
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+        },
+    };
+
+    var raw_tokens = try lexer.tokenizeAlloc(alloc, "tags)");
+    defer lexer.freeTokens(alloc, &raw_tokens);
+    var raw_pos: usize = 0;
+    const raw_field = try parseArrayFieldOwnedAlloc(alloc, raw_tokens.items, &raw_pos, schema);
+    defer alloc.free(raw_field);
+    try std.testing.expectEqual(@as(usize, 1), raw_pos);
+    try std.testing.expectEqualStrings("tags", raw_field);
+
+    var qualified_tokens = try lexer.tokenizeAlloc(alloc, "events.tags)");
+    defer lexer.freeTokens(alloc, &qualified_tokens);
+    var qualified_pos: usize = 0;
+    const normalized_field = try parseRowExpressionArrayFieldOwnedAlloc(alloc, qualified_tokens.items, &qualified_pos, schema, &.{"events"}, &.{}, false);
+    defer alloc.free(normalized_field);
+    try std.testing.expectEqual(@as(usize, 1), qualified_pos);
+    try std.testing.expectEqualStrings("tags", normalized_field);
+
+    var scalar_tokens = try lexer.tokenizeAlloc(alloc, "status)");
+    defer lexer.freeTokens(alloc, &scalar_tokens);
+    var scalar_pos: usize = 0;
+    try std.testing.expectError(error.InvalidSqlCatalog, parseArrayFieldOwnedAlloc(alloc, scalar_tokens.items, &scalar_pos, schema));
 }
 
 fn testOwnedBooleanConditionAlloc(
