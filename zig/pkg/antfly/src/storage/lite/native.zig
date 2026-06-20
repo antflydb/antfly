@@ -1009,13 +1009,13 @@ pub const NativeFile = struct {
         try self.writePage(page_id, .free_map, payload);
     }
 
-    fn computeFreePagesForPublishedCheckpoint(self: *NativeFile, next: CheckpointSlot, fallback: CheckpointSlot) ![]u64 {
+    fn computeFreePagesForPublishedCheckpoint(self: *NativeFile, next: CheckpointSlot, previous: CheckpointSlot) ![]u64 {
         var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
         defer reachable_pages.deinit(self.allocator);
 
         try self.collectCheckpointReachablePages(next, &reachable_pages);
-        if (validCheckpointSlot(fallback)) {
-            try self.collectCheckpointReachablePages(fallback, &reachable_pages);
+        if (validCheckpointSlot(previous)) {
+            try self.collectCheckpointReachablePages(previous, &reachable_pages);
         }
 
         var free_pages = std.ArrayListUnmanaged(u64).empty;
@@ -2952,13 +2952,13 @@ test "lite native check validates committed free map root" {
     try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
 }
 
-test "lite native free map cannot reclaim fallback checkpoint pages" {
+test "lite native free map cannot reclaim previous checkpoint pages" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try testPath(allocator, tmp, "native-free-map-fallback-protected.aflite");
+    const path = try testPath(allocator, tmp, "native-free-map-previous-protected.aflite");
     defer allocator.free(path);
 
     var file = try NativeFile.create(allocator, path);
@@ -2968,12 +2968,12 @@ test "lite native free map cannot reclaim fallback checkpoint pages" {
     try file.putDocument("doc:1", "v2");
 
     const active = file.activeCheckpoint();
-    const fallback = file.header.checkpoints[if (file.header.active_checkpoint == 0) 1 else 0];
+    const previous = file.header.checkpoints[if (file.header.active_checkpoint == 0) 1 else 0];
     try std.testing.expect(active.free_map_root_page != 0);
-    try std.testing.expect(fallback.free_map_root_page != 0);
-    try std.testing.expect(active.free_map_root_page != fallback.free_map_root_page);
+    try std.testing.expect(previous.free_map_root_page != 0);
+    try std.testing.expect(active.free_map_root_page != previous.free_map_root_page);
 
-    const payload = try encodeFreeMapAlloc(allocator, default_page_size, active.page_count, &.{fallback.free_map_root_page});
+    const payload = try encodeFreeMapAlloc(allocator, default_page_size, active.page_count, &.{previous.free_map_root_page});
     defer allocator.free(payload);
     var page: [default_page_size]u8 = undefined;
     encodePage(&page, .free_map, payload);
