@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform_sync = @import("antfly_platform").sync;
 const db_mod = @import("../db/db.zig");
 const backend_erased = @import("../backend_erased.zig");
 const bridge = @import("bridge.zig");
@@ -24,6 +25,7 @@ const Allocator = std.mem.Allocator;
 
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
+pub const StableSnapshotReport = native.StableSnapshotReport;
 pub const VacuumReport = bridge.ContainerStorage.VacuumReport;
 
 pub const Profile = enum {
@@ -188,6 +190,13 @@ pub const Handle = struct {
             .native_single_file => try nativeVacuumReport(self),
         };
     }
+
+    pub fn copyStableSnapshot(self: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+        return switch (self.engine) {
+            .bridge_lsm_container => error.UnsupportedLiteSnapshot,
+            .native_single_file => try nativeStableSnapshot(self, dest_path, replace),
+        };
+    }
 };
 
 fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
@@ -266,6 +275,13 @@ fn nativeVacuumReport(handle: *Handle) !VacuumReport {
     };
 }
 
+fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+    const store = handle.native_docstore.?;
+    platform_sync.lockYielding(&store.mutex);
+    defer store.mutex.unlock();
+    return try store.file.copyStableSnapshotToPath(dest_path, replace);
+}
+
 fn hasNativeMagic(allocator: Allocator, path: []const u8) !bool {
     var io_impl = std.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
@@ -334,6 +350,48 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);
     try std.testing.expectEqual(report.file_size, vacuumed.after_size);
     try std.testing.expectEqual(@as(u64, 0), vacuumed.reclaimed_bytes);
+}
+
+test "lite backend native stable snapshot uses open handle checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-backend-snapshot.aflite");
+    defer allocator.free(path);
+    const snapshot_path = try testPath(allocator, tmp, "native-backend-snapshot-copy.aflite");
+    defer allocator.free(snapshot_path);
+
+    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    defer handle.deinit();
+
+    try handle.native_docstore.?.file.putDocument("doc:1", "value");
+    const snapshot_size = handle.native_docstore.?.file.activeCheckpoint().page_count *
+        @as(u64, handle.native_docstore.?.file.header.page_size);
+    try handle.native_docstore.?.file.file.writePositionalAll(
+        handle.native_docstore.?.file.io_impl.io(),
+        "tail",
+        snapshot_size,
+    );
+
+    const source_report = try handle.check();
+    try std.testing.expect(!source_report.valid);
+    try std.testing.expectEqualStrings("tail_bytes", source_report.issue.?);
+
+    const copied = try handle.copyStableSnapshot(snapshot_path, false);
+    try std.testing.expectEqual(snapshot_size, copied.snapshot_size);
+    try std.testing.expectEqual(@as(u64, 4), copied.tail_bytes);
+
+    const snapshot_report = try checkFile(allocator, snapshot_path);
+    try std.testing.expect(snapshot_report.valid);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_report.tail_bytes);
+
+    var snapshot = try native.NativeFile.open(allocator, snapshot_path, true);
+    defer snapshot.close();
+    const value = (try snapshot.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("value", value);
 }
 
 test "lite backend auto creates new aflite files with native engine" {

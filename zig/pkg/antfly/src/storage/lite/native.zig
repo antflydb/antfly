@@ -691,6 +691,53 @@ pub const NativeFile = struct {
         };
     }
 
+    pub fn copyStableSnapshotToPath(self: *NativeFile, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+        if (std.mem.eql(u8, self.path, dest_path)) return error.InvalidNativeSnapshotPath;
+
+        const checkpoint = self.activeCheckpoint();
+        const snapshot_size = checkpoint.page_count * @as(u64, self.header.page_size);
+        const source_size = (try self.file.stat(self.io_impl.io())).size;
+        if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
+        if (!replace and pathExists(self.io_impl.io(), dest_path)) return error.PathAlreadyExists;
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
+        defer self.allocator.free(tmp_path);
+        errdefer deleteFilePath(self.io_impl.io(), tmp_path) catch {};
+
+        {
+            var out_file = try createSnapshotFile(self.io_impl.io(), tmp_path);
+            defer out_file.close(self.io_impl.io());
+
+            const chunk_size: usize = 1024 * 1024;
+            const buffer_len: usize = @intCast(@min(@as(u64, chunk_size), snapshot_size));
+            const buffer = try self.allocator.alloc(u8, @max(buffer_len, 1));
+            defer self.allocator.free(buffer);
+
+            var offset: u64 = 0;
+            while (offset < snapshot_size) {
+                const len: usize = @intCast(@min(@as(u64, buffer.len), snapshot_size - offset));
+                try readExactAt(self.file, self.io_impl.io(), buffer[0..len], offset);
+                try out_file.writePositionalAll(self.io_impl.io(), buffer[0..len], offset);
+                offset += len;
+            }
+            try out_file.setLength(self.io_impl.io(), snapshot_size);
+            try out_file.sync(self.io_impl.io());
+        }
+
+        renameFilePath(self.io_impl.io(), tmp_path, dest_path) catch |err| {
+            deleteFilePath(self.io_impl.io(), tmp_path) catch {};
+            return err;
+        };
+
+        return .{
+            .source_size = source_size,
+            .snapshot_size = snapshot_size,
+            .checkpoint_sequence = checkpoint.commit_sequence,
+            .page_count = checkpoint.page_count,
+            .tail_bytes = source_size - snapshot_size,
+        };
+    }
+
     pub fn maxPagePayloadBytes(self: *const NativeFile) usize {
         return @as(usize, @intCast(self.header.page_size)) - page_header_size;
     }
@@ -1146,49 +1193,7 @@ pub fn copyStableSnapshot(allocator: Allocator, source_path: []const u8, dest_pa
 
     var source = try NativeFile.open(allocator, source_path, true);
     defer source.close();
-
-    const checkpoint = source.activeCheckpoint();
-    const snapshot_size = checkpoint.page_count * @as(u64, source.header.page_size);
-    const source_size = (try source.file.stat(source.io_impl.io())).size;
-    if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
-    if (!replace and pathExists(source.io_impl.io(), dest_path)) return error.PathAlreadyExists;
-
-    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
-    defer allocator.free(tmp_path);
-    errdefer deleteFilePath(source.io_impl.io(), tmp_path) catch {};
-
-    {
-        var out_file = try createSnapshotFile(source.io_impl.io(), tmp_path);
-        defer out_file.close(source.io_impl.io());
-
-        const chunk_size: usize = 1024 * 1024;
-        const buffer_len: usize = @intCast(@min(@as(u64, chunk_size), snapshot_size));
-        const buffer = try allocator.alloc(u8, @max(buffer_len, 1));
-        defer allocator.free(buffer);
-
-        var offset: u64 = 0;
-        while (offset < snapshot_size) {
-            const len: usize = @intCast(@min(@as(u64, buffer.len), snapshot_size - offset));
-            try readExactAt(source.file, source.io_impl.io(), buffer[0..len], offset);
-            try out_file.writePositionalAll(source.io_impl.io(), buffer[0..len], offset);
-            offset += len;
-        }
-        try out_file.setLength(source.io_impl.io(), snapshot_size);
-        try out_file.sync(source.io_impl.io());
-    }
-
-    renameFilePath(source.io_impl.io(), tmp_path, dest_path) catch |err| {
-        deleteFilePath(source.io_impl.io(), tmp_path) catch {};
-        return err;
-    };
-
-    return .{
-        .source_size = source_size,
-        .snapshot_size = snapshot_size,
-        .checkpoint_sequence = checkpoint.commit_sequence,
-        .page_count = checkpoint.page_count,
-        .tail_bytes = source_size - snapshot_size,
-    };
+    return try source.copyStableSnapshotToPath(dest_path, replace);
 }
 
 pub fn inspectBytes(raw: []const u8) InspectReport {
