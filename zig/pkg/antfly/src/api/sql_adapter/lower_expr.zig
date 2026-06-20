@@ -181,12 +181,14 @@ pub const ExpressionIsTailKind = enum {
 pub const ExpressionIsTailOptions = struct {
     allow_boolean_unknown: bool = false,
     allow_boolean_literal: bool = false,
+    allow_boolean_literal_negation: bool = false,
 };
 
 pub const ExpressionIsTail = struct {
     op: runtime_schema.RelationalCheckOp,
     kind: ExpressionIsTailKind,
     boolean_value: bool = false,
+    boolean_negated: bool = false,
 };
 
 pub fn parseExpressionIsTailIf(
@@ -211,19 +213,21 @@ pub fn parseExpressionIsTailIf(
     }
     if (options.allow_boolean_literal) {
         if (parser.matchKeyword(tokens, pos, "true")) {
-            if (not) return error.UnsupportedSqlShape;
+            if (not and !options.allow_boolean_literal_negation) return error.UnsupportedSqlShape;
             return .{
                 .op = .eq,
                 .kind = .boolean_literal,
                 .boolean_value = true,
+                .boolean_negated = not,
             };
         }
         if (parser.matchKeyword(tokens, pos, "false")) {
-            if (not) return error.UnsupportedSqlShape;
+            if (not and !options.allow_boolean_literal_negation) return error.UnsupportedSqlShape;
             return .{
                 .op = .eq,
                 .kind = .boolean_literal,
                 .boolean_value = false,
+                .boolean_negated = not,
             };
         }
     }
@@ -9966,6 +9970,15 @@ test "sql adapter expression keyword predicates classify function and tail token
     };
     var is_not_true_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseExpressionIsTailIf(is_not_true_tokens[0..], &is_not_true_pos, .{ .allow_boolean_literal = true }));
+    is_not_true_pos = 0;
+    const is_not_true_tail = (try parseExpressionIsTailIf(is_not_true_tokens[0..], &is_not_true_pos, .{
+        .allow_boolean_literal = true,
+        .allow_boolean_literal_negation = true,
+    })).?;
+    try std.testing.expectEqual(ExpressionIsTailKind.boolean_literal, is_not_true_tail.kind);
+    try std.testing.expect(is_not_true_tail.boolean_value);
+    try std.testing.expect(is_not_true_tail.boolean_negated);
+    try std.testing.expectEqual(@as(usize, 3), is_not_true_pos);
 
     const grouped_tokens = [_]Token{
         .{ .kind = .lparen, .text = "(" },
