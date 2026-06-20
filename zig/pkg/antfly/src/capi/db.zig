@@ -154,6 +154,7 @@ const ReadableLeaseHook = struct {
             .version_conflict => return error.VersionConflict,
             .intent_conflict => return error.IntentConflict,
             .txn_not_found => return error.TxnNotFound,
+            .busy => return error.WouldBlock,
             .internal => return error.Internal,
         }
     }
@@ -5923,6 +5924,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var concurrent_readonly_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(src_path, &concurrent_readonly_handle));
     defer antfly_db_close(concurrent_readonly_handle);
+    var second_writer_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_open(src_path, &second_writer_handle));
+    defer antfly_db_close(second_writer_handle);
     var concurrent_lookup: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
         .ptr = "doc:capi-lite",
@@ -5939,6 +5943,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
+    var blocked_vacuum: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_vacuum_json(src_handle, &blocked_vacuum));
     antfly_db_close(concurrent_status_handle);
     concurrent_status_handle = null;
     antfly_db_close(concurrent_readonly_handle);

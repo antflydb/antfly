@@ -139,6 +139,7 @@ pub const ErrorCode = enum(c_int) {
     version_conflict = 3,
     intent_conflict = 4,
     txn_not_found = 5,
+    busy = 6,
     internal = 255,
 };
 
@@ -157,6 +158,9 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.PathAlreadyExists,
         => .invalid_argument,
         error.FileNotFound => .not_found,
+        error.WouldBlock,
+        error.WriterLocked,
+        => .busy,
         else => .internal,
     };
 }

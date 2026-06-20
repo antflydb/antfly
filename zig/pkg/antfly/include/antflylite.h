@@ -24,6 +24,7 @@ typedef enum antfly_error_code {
     ANTFLY_VERSION_CONFLICT = 3,
     ANTFLY_INTENT_CONFLICT = 4,
     ANTFLY_TXN_NOT_FOUND = 5,
+    ANTFLY_BUSY = 6,
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
