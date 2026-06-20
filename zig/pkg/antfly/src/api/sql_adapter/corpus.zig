@@ -4560,8 +4560,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_write: bool = false,
-    unsupported_write_recursive_cte_update: bool = false,
-    unsupported_write_recursive_cte_delete: bool = false,
     unsupported_write_recursive_cte_merge: bool = false,
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
@@ -5786,14 +5784,6 @@ pub const AppParityCorpusCoverage = struct {
                     std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
                     std.mem.indexOf(u8, entry.sql, " INSERT INTO ") != null);
         } else if (entry.family == .unsupported_write) {
-            self.unsupported_write_recursive_cte_update = self.unsupported_write_recursive_cte_update or
-                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
-                    std.mem.indexOf(u8, entry.sql, " UPDATE ") != null);
-            self.unsupported_write_recursive_cte_delete = self.unsupported_write_recursive_cte_delete or
-                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
-                    std.mem.indexOf(u8, entry.sql, " DELETE FROM ") != null);
             self.unsupported_write_recursive_cte_merge = self.unsupported_write_recursive_cte_merge or
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and

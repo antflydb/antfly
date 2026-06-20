@@ -169,6 +169,36 @@ pub const ConflictUpdateAssignmentValueParserHooks = struct {
     ) anyerror![]const u8,
 };
 
+pub const ConflictAssignmentExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_arithmetic_rest: *const fn (
+        *anyopaque,
+        db_mod.types.RelationalRowsExpression,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_pipe_concat_rest: *const fn (
+        *anyopaque,
+        db_mod.types.RelationalRowsExpression,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictPipeConcatExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const JoinedMutationJsonSetSqlValueParserHooks = struct {
     ptr: *anyopaque,
     parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
@@ -198,6 +228,18 @@ pub const JoinedMutationAssignmentValueParserHooks = struct {
     parse_column_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
 };
 
+pub const JoinedMutationAssignmentExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_row_expression: *const fn (
+        *anyopaque,
+        []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_boolean_row_expression: *const fn (
+        *anyopaque,
+        []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const SemiJoinTargetFieldsParserHooks = struct {
     ptr: *anyopaque,
     parse_field_expression_owned: *const fn (*anyopaque) anyerror![]const u8,
@@ -213,9 +255,42 @@ pub const MergeAssignmentParserHooks = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const MergeAssignmentExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_row_expression: *const fn (
+        *anyopaque,
+        TableAlias,
+        TableAlias,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const MergeArmPredicateParserHooks = struct {
     ptr: *anyopaque,
     parse_column_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
+};
+
+pub const MergeArmExpressionPredicatesParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression_not_where: *const fn (
+        *anyopaque,
+        TableAlias,
+        TableAlias,
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) anyerror!void,
+    parse_expression_or_where: *const fn (
+        *anyopaque,
+        TableAlias,
+        TableAlias,
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) anyerror!void,
+    parse_expression_where_conditions: *const fn (
+        *anyopaque,
+        TableAlias,
+        TableAlias,
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) anyerror!void,
 };
 
 pub const MergeArmConditionParserHooks = struct {
@@ -395,6 +470,31 @@ pub fn validateInsertSourceAssignmentExpressionType(
     else
         lower_expr.sqlExpressionTypesComparable(target_column.field_type, expression_type);
     if (!compatible) return error.UnsupportedSqlShape;
+}
+
+pub const AssignmentExpressionValidationOptions = struct {
+    validate_json: bool = false,
+};
+
+pub fn validateMutationAssignmentExpressionType(
+    type_context: lower_expr.RowExpressionTypeContext,
+    target_column: runtime_schema.RelationalColumn,
+    expression: db_mod.types.RelationalRowsExpression,
+    options: AssignmentExpressionValidationOptions,
+) !void {
+    if (lower_expr.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
+    try validateInsertSourceAssignmentExpressionType(type_context, target_column, expression);
+    if (target_column.field_type == .numeric) {
+        try type_context.validateNumericRowExpression(expression);
+    } else if (target_column.field_type == .datetime) {
+        try type_context.validateNumericOrDatetimeRowExpression(expression);
+    } else if (target_column.field_type == .keyword or target_column.field_type == .text or target_column.field_type == .link) {
+        try type_context.validateTextRowExpression(expression);
+    } else if (target_column.field_type == .boolean) {
+        try type_context.validateBooleanRowExpression(expression);
+    } else if (target_column.field_type == .json and options.validate_json) {
+        try type_context.validateJsonRowExpression(expression);
+    }
 }
 
 pub fn insertSourceSelectSourceCteSchema(
@@ -1515,6 +1615,130 @@ pub fn parseMergeArmPredicateAlloc(
     };
 }
 
+pub fn parseMergeAssignmentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    target_table: TableAlias,
+    source_table: TableAlias,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: MergeAssignmentExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (parser.matchKeyword(tokens, pos, "default")) {
+        const default_value = column.default_value orelse return error.UnsupportedSqlShape;
+        const value_json = try relational_rows.relationalDefaultValueJsonAlloc(alloc, default_value);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        value_transferred = true;
+        return .{
+            .kind = .value,
+            .value_json = value_json,
+        };
+    }
+
+    const expression = try hooks.parse_row_expression(hooks.ptr, target_table, source_table);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try validateMutationAssignmentExpressionType(type_context, column, expression, .{ .validate_json = true });
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseJoinedMutationAssignmentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    target_alias: []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: JoinedMutationAssignmentExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const expression = try hooks.parse_row_expression(hooks.ptr, target_alias);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try validateMutationAssignmentExpressionType(type_context, column, expression, .{});
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseJoinedMutationBooleanAssignmentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    target_alias: []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: JoinedMutationAssignmentExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const expression = try hooks.parse_boolean_row_expression(hooks.ptr, target_alias);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateBooleanRowExpression(expression);
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictAssignmentExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictAssignmentExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var expression = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+    var expression_owned = true;
+    errdefer if (expression_owned) freeExpression(alloc, expression);
+    if (lower_expr.peekArithmeticOperator(tokens, pos.*)) |_| {
+        try type_context.validateNumericOrDatetimeRowExpression(expression);
+        expression_owned = false;
+        expression = try hooks.parse_arithmetic_rest(hooks.ptr, expression, column, insert_columns);
+        expression_owned = true;
+        try type_context.validateNumericRowExpression(expression);
+    }
+    if (parser.peekKind(tokens, pos.*, .pipe_concat)) {
+        if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog;
+        expression_owned = false;
+        expression = try hooks.parse_pipe_concat_rest(hooks.ptr, expression, column, insert_columns);
+        expression_owned = true;
+        try type_context.validateTextRowExpression(expression);
+    }
+    if (lower_expr.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
+    if (column.field_type == .datetime) {
+        try type_context.validateNumericOrDatetimeRowExpression(expression);
+    } else if (column.field_type == .numeric) {
+        try type_context.validateNumericRowExpression(expression);
+    }
+    expression_owned = false;
+    return expression;
+}
+
+pub fn parseConflictPipeConcatExpressionRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    left: db_mod.types.RelationalRowsExpression,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictPipeConcatExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try type_context.validateTextRowExpression(left);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    try operands.append(alloc, left);
+    while (parser.matchToken(tokens, pos, .pipe_concat) != null) {
+        const rhs = try hooks.parse_operand(hooks.ptr, column, insert_columns);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+        try type_context.validateTextRowExpression(rhs);
+        try operands.append(alloc, rhs);
+        rhs_transferred = true;
+    }
+    if (operands.items.len < 2) return error.UnsupportedSqlShape;
+    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .concat, &operands);
+}
+
 pub fn parseMergeArmConditionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1553,6 +1777,54 @@ pub fn parseMergeArmConditionAlloc(
     }
 
     try hooks.parse_expression_predicates(hooks.ptr, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates);
+}
+
+pub fn parseMergeArmExpressionPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: usize,
+    target_table: TableAlias,
+    source_table: TableAlias,
+    allow_target: bool,
+    expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    hooks: MergeArmExpressionPredicatesParserHooks,
+) !void {
+    var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+    defer conditions.deinit(alloc);
+    errdefer freeExpressionConditions(alloc, conditions.items);
+    var or_groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    defer or_groups.deinit(alloc);
+    errdefer freeExpressionPredicateGroups(alloc, or_groups.items);
+    var not_groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    defer not_groups.deinit(alloc);
+    errdefer freeExpressionPredicateGroups(alloc, not_groups.items);
+
+    if (mergeCanParseExpressionNotWhere(tokens, pos)) {
+        try hooks.parse_expression_not_where(hooks.ptr, target_table, source_table, &not_groups);
+    } else if (parser.hasTopLevelOrBeforeTail(tokens, pos, lower_expr.sqlWhereTailClauseKeyword) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos)) {
+        try hooks.parse_expression_or_where(hooks.ptr, target_table, source_table, &or_groups);
+    } else {
+        try hooks.parse_expression_where_conditions(hooks.ptr, target_table, source_table, &conditions, &or_groups, &not_groups);
+    }
+    if (conditions.items.len == 0 and or_groups.items.len == 0 and not_groups.items.len == 0) return error.UnsupportedSqlShape;
+    if (!allow_target) {
+        for (conditions.items) |condition| {
+            if (mergeExpressionConditionUsesTargetRow(condition)) return error.UnsupportedSqlShape;
+        }
+        if (mergeExpressionPredicateGroupsUseTargetRow(or_groups.items) or
+            mergeExpressionPredicateGroupsUseTargetRow(not_groups.items))
+        {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    try expression_predicates.appendSlice(alloc, conditions.items);
+    conditions.clearRetainingCapacity();
+    try expression_or_predicates.appendSlice(alloc, or_groups.items);
+    or_groups.clearRetainingCapacity();
+    try expression_not_predicates.appendSlice(alloc, not_groups.items);
+    not_groups.clearRetainingCapacity();
 }
 
 pub fn mergeParenthesizedExpressionOrWhereCanStart(tokens: []const Token, pos: usize) bool {

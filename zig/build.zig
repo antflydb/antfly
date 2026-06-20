@@ -4226,6 +4226,7 @@ pub fn build(b: *std.Build) void {
             "provisioned same-table foreign key action job routes runtime parent through catalog owner range",
             "provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites",
             "provisioned table write source routes cross-table rows insert source through catalog owners",
+            "recursive cte joined mutation source executes through typed read materialization and write staging",
             "provisioned table write source stages relational mutation source on single owner range",
             "provisioned table write source globally plans relational mutation source across ranges",
             "hosted provisioned table write source globally plans relational mutation source across local owner ranges",
