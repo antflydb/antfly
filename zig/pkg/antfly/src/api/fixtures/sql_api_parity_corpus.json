@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "61b42c7b3f65479dd6b031c23840c1a05279be9a071f9aada9facc765062a04d",
-  "source_entry_count": 1000,
-  "entry_count": 1000,
+  "source_sha256": "72ddf8f9a28760851c60e7333b2d9e5865c4621f03abfc248157877bc5b6fde1",
+  "source_entry_count": 999,
+  "entry_count": 999,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -5651,13 +5651,6 @@
       "plan": "unsupported:read:requires=set_operation_source_schema",
       "classification_reason": "set_operation_source_schema",
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
-    },
-    {
-      "name": "unsupported recursive cte query",
-      "family": "unsupported",
-      "plan": "unsupported:query:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
-      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
     },
     {
       "name": "recursive cte read stream plan",

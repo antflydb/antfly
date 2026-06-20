@@ -4387,6 +4387,19 @@ pub fn makeDdlPrimaryKeyAlloc(
     };
 }
 
+pub fn installDdlPrimaryKeyAlloc(
+    alloc: std.mem.Allocator,
+    primary_key: *?runtime_schema.PrimaryKey,
+    constraint_name: ?[]const u8,
+    columns: []const []const u8,
+    include_columns: []const []const u8,
+    without_overlaps_period: ?[]const u8,
+    timing: grammar.DdlConstraintTimingSyntax,
+) !void {
+    if (primary_key.* != null) return error.UnsupportedSqlShape;
+    primary_key.* = try makeDdlPrimaryKeyAlloc(alloc, constraint_name, columns, include_columns, without_overlaps_period, timing);
+}
+
 pub fn makeDdlUniqueConstraintAlloc(
     alloc: std.mem.Allocator,
     constraint_name: ?[]const u8,
@@ -4456,6 +4469,87 @@ pub fn ddlPeriodFromSyntax(syntax: *grammar.DdlPeriodSyntax) runtime_schema.Rela
         .start_column = start_column,
         .end_column = end_column,
     };
+}
+
+pub fn parseDdlPeriodConstraintPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !runtime_schema.RelationalPeriod {
+    var syntax = try grammar.parseDdlPeriodConstraintAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    return ddlPeriodFromSyntax(&syntax);
+}
+
+pub fn parseValidatedDdlForeignKeyColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !grammar.DdlForeignKeyColumnListSyntax {
+    const columns = try grammar.parseDdlForeignKeyColumnListAlloc(alloc, tokens, pos);
+    errdefer columns.deinit(alloc);
+    try grammar.validateSqlIdentifierListUnique(columns.columns);
+    return columns;
+}
+
+pub fn parseDdlForeignKeyConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    constraint_name: ?[]const u8,
+) !runtime_schema.ForeignKey {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("key");
+    const child = try parseValidatedDdlForeignKeyColumnListAlloc(alloc, tokens, pos);
+    var child_transferred = false;
+    errdefer if (!child_transferred) child.deinit(alloc);
+
+    try cursor.expectKeyword("references");
+    const parent_table = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var parent_table_transferred = false;
+    errdefer if (!parent_table_transferred) alloc.free(parent_table);
+    const parent = try parseValidatedDdlForeignKeyColumnListAlloc(alloc, tokens, pos);
+    var parent_transferred = false;
+    errdefer if (!parent_transferred) parent.deinit(alloc);
+
+    const options = ddlForeignKeyOptionsFromSyntax(try grammar.parseDdlForeignKeyOptions(tokens, pos));
+    const foreign_key = try makeDdlForeignKeyAlloc(alloc, constraint_name, child, parent_table, parent, options);
+
+    child_transferred = true;
+    parent_table_transferred = true;
+    parent_transferred = true;
+    return foreign_key;
+}
+
+pub fn parseDdlInlineForeignKeyConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    column_name: []const u8,
+    constraint_name: ?[]const u8,
+) !runtime_schema.ForeignKey {
+    const child_columns = try cloneStringSlice(alloc, &.{column_name});
+    var child_transferred = false;
+    errdefer if (!child_transferred) freeStringSlice(alloc, child_columns);
+
+    const parent_table = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var parent_table_transferred = false;
+    errdefer if (!parent_table_transferred) alloc.free(parent_table);
+
+    const parent_columns = if (parser.peekKind(tokens, pos.*, .lparen))
+        try grammar.parseDdlUniqueColumnListAlloc(alloc, tokens, pos)
+    else
+        try cloneStringSlice(alloc, &.{"id"});
+    var parent_transferred = false;
+    errdefer if (!parent_transferred) freeStringSlice(alloc, parent_columns);
+
+    const options = ddlForeignKeyOptionsFromSyntax(try grammar.parseDdlForeignKeyOptions(tokens, pos));
+    const foreign_key = try makeDdlInlineForeignKeyAlloc(alloc, constraint_name, child_columns, parent_table, parent_columns, options);
+
+    child_transferred = true;
+    parent_table_transferred = true;
+    parent_transferred = true;
+    return foreign_key;
 }
 
 pub fn makeDdlForeignKeyAlloc(

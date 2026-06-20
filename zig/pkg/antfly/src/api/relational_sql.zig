@@ -2920,7 +2920,7 @@ const Parser = struct {
         defer add_prefix.deinit(self.alloc);
         const constraint_name = add_prefix.constraint_name;
         if (add_prefix.kind == .period) {
-            const period = try self.parseDdlPeriodConstraint();
+            const period = try sql_adapter.parseDdlPeriodConstraintPlanAlloc(self.alloc, self.tokens, &self.pos);
             try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddPeriodOperation(period));
             return;
         }
@@ -2948,7 +2948,7 @@ const Parser = struct {
             return;
         }
         if (add_prefix.kind == .foreign_key and self.matchKeyword("foreign")) {
-            var foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
+            var foreign_key = try sql_adapter.parseDdlForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, constraint_name);
             foreign_key.validation_state = if (sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos)) .unvalidated else .unvalidated;
             try sql_adapter.appendAlterTableOperation(self.alloc, operations, sql_adapter.alterTableAddForeignKeyOperation(foreign_key));
             return;
@@ -3015,7 +3015,7 @@ const Parser = struct {
                 try checks.append(self.alloc, check);
                 check_transferred = true;
             } else if (constraint_prefix.kind == .references and self.matchKeyword("references")) {
-                var foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, constraint_name);
+                var foreign_key = try sql_adapter.parseDdlInlineForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, column.name, constraint_name);
                 var foreign_key_transferred = false;
                 errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
                 _ = sql_adapter.consumeOptionalDdlNotValid(self.tokens, &self.pos);
@@ -3385,7 +3385,7 @@ const Parser = struct {
                     const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, &.{column.name});
                     defer freeStringSlice(self.alloc, include_columns);
                     const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-                    try self.installDdlPrimaryKey(primary_key, constraint_name, &.{column.name}, include_columns, null, timing);
+                    try sql_adapter.installDdlPrimaryKeyAlloc(self.alloc, primary_key, constraint_name, &.{column.name}, include_columns, null, timing);
                 } else if (constraint_prefix.kind == .unique and self.matchKeyword("unique")) {
                     const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
                     const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, &.{column.name});
@@ -3399,7 +3399,7 @@ const Parser = struct {
                     try checks.append(self.alloc, check);
                     check_transferred = true;
                 } else if (constraint_prefix.kind == .references and self.matchKeyword("references")) {
-                    const foreign_key = try self.parseDdlInlineForeignKeyConstraint(column.name, constraint_name);
+                    const foreign_key = try sql_adapter.parseDdlInlineForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, column.name, constraint_name);
                     var foreign_key_transferred = false;
                     errdefer if (!foreign_key_transferred) freeDdlForeignKey(self.alloc, foreign_key);
                     try foreign_keys.append(self.alloc, foreign_key);
@@ -3597,7 +3597,7 @@ const Parser = struct {
             const include_columns = try sql_adapter.parseOptionalDdlConstraintIncludeUniqueAlloc(self.alloc, self.tokens, &self.pos, columns.columns);
             defer freeStringSlice(self.alloc, include_columns);
             const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
-            try self.installDdlPrimaryKey(primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
+            try sql_adapter.installDdlPrimaryKeyAlloc(self.alloc, primary_key, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, timing);
         } else if (self.matchKeyword("unique")) {
             const nulls_not_distinct = (try sql_adapter.parseOptionalDdlUniqueNullsDistinct(self.tokens, &self.pos)) orelse false;
             const columns = try sql_adapter.parseDdlUniqueTemporalColumnListAlloc(self.alloc, self.tokens, &self.pos);
@@ -3607,7 +3607,7 @@ const Parser = struct {
             const timing = try sql_adapter.parseOptionalDdlConstraintTiming(self.tokens, &self.pos);
             try sql_adapter.appendDdlUniqueConstraintBuilderAlloc(self.alloc, unique_constraints, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
         } else if (self.matchKeyword("foreign")) {
-            const foreign_key = try self.parseDdlForeignKeyConstraint(constraint_name);
+            const foreign_key = try sql_adapter.parseDdlForeignKeyConstraintAlloc(self.alloc, self.tokens, &self.pos, constraint_name);
             var transferred = false;
             errdefer if (!transferred) freeDdlForeignKey(self.alloc, foreign_key);
             try foreign_keys.append(self.alloc, foreign_key);
@@ -3620,7 +3620,7 @@ const Parser = struct {
             transferred = true;
         } else if (self.matchKeyword("period")) {
             if (constraint_name != null) return error.UnsupportedSqlShape;
-            const period = try self.parseDdlPeriodConstraint();
+            const period = try sql_adapter.parseDdlPeriodConstraintPlanAlloc(self.alloc, self.tokens, &self.pos);
             var transferred = false;
             errdefer if (!transferred) freeDdlPeriod(self.alloc, period);
             try periods.append(self.alloc, period);
@@ -3628,12 +3628,6 @@ const Parser = struct {
         } else {
             return error.UnsupportedSqlShape;
         }
-    }
-
-    fn parseDdlPeriodConstraint(self: *@This()) !runtime_schema.RelationalPeriod {
-        var syntax = try sql_adapter.parseDdlPeriodConstraintAlloc(self.alloc, self.tokens, &self.pos);
-        errdefer syntax.deinit(self.alloc);
-        return sql_adapter.ddlPeriodFromSyntax(&syntax);
     }
 
     fn parseDdlDefaultValue(self: *@This(), field_type: runtime_schema.AntflyType) !runtime_schema.RelationalDefaultValue {
@@ -3779,78 +3773,6 @@ const Parser = struct {
         }
         try self.parseExpressionWhereConditionAlternatives(&groups);
         return try groups.toOwnedSlice(self.alloc);
-    }
-
-    fn parseDdlForeignKeyConstraint(self: *@This(), constraint_name: ?[]const u8) !runtime_schema.ForeignKey {
-        try self.expectKeyword("key");
-        const child = try self.parseDdlForeignKeyColumnListAlloc();
-        var child_transferred = false;
-        errdefer if (!child_transferred) child.deinit(self.alloc);
-
-        try self.expectKeyword("references");
-        const parent_table = try sql_adapter.parseSqlObjectIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        var parent_table_transferred = false;
-        errdefer if (!parent_table_transferred) self.alloc.free(parent_table);
-        const parent = try self.parseDdlForeignKeyColumnListAlloc();
-        var parent_transferred = false;
-        errdefer if (!parent_transferred) parent.deinit(self.alloc);
-
-        const options = sql_adapter.ddlForeignKeyOptionsFromSyntax(try sql_adapter.parseDdlForeignKeyOptions(self.tokens, &self.pos));
-        const foreign_key = try sql_adapter.makeDdlForeignKeyAlloc(self.alloc, constraint_name, child, parent_table, parent, options);
-
-        child_transferred = true;
-        parent_table_transferred = true;
-        parent_transferred = true;
-        return foreign_key;
-    }
-
-    fn parseDdlForeignKeyColumnListAlloc(self: *@This()) !sql_adapter.DdlForeignKeyColumnListSyntax {
-        const columns = try sql_adapter.parseDdlForeignKeyColumnListAlloc(self.alloc, self.tokens, &self.pos);
-        errdefer columns.deinit(self.alloc);
-        try sql_adapter.validateSqlIdentifierListUnique(columns.columns);
-        return columns;
-    }
-
-    fn parseDdlInlineForeignKeyConstraint(
-        self: *@This(),
-        column_name: []const u8,
-        constraint_name: ?[]const u8,
-    ) !runtime_schema.ForeignKey {
-        const child_columns = try cloneStringSlice(self.alloc, &.{column_name});
-        var child_transferred = false;
-        errdefer if (!child_transferred) freeStringSlice(self.alloc, child_columns);
-
-        const parent_table = try sql_adapter.parseSqlObjectIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        var parent_table_transferred = false;
-        errdefer if (!parent_table_transferred) self.alloc.free(parent_table);
-
-        const parent_columns = if (self.peekKind(.lparen))
-            try sql_adapter.parseDdlUniqueColumnListAlloc(self.alloc, self.tokens, &self.pos)
-        else
-            try cloneStringSlice(self.alloc, &.{"id"});
-        var parent_transferred = false;
-        errdefer if (!parent_transferred) freeStringSlice(self.alloc, parent_columns);
-
-        const options = sql_adapter.ddlForeignKeyOptionsFromSyntax(try sql_adapter.parseDdlForeignKeyOptions(self.tokens, &self.pos));
-        const foreign_key = try sql_adapter.makeDdlInlineForeignKeyAlloc(self.alloc, constraint_name, child_columns, parent_table, parent_columns, options);
-
-        child_transferred = true;
-        parent_table_transferred = true;
-        parent_transferred = true;
-        return foreign_key;
-    }
-
-    fn installDdlPrimaryKey(
-        self: *@This(),
-        primary_key: *?runtime_schema.PrimaryKey,
-        constraint_name: ?[]const u8,
-        columns: []const []const u8,
-        include_columns: []const []const u8,
-        without_overlaps_period: ?[]const u8,
-        timing: sql_adapter.DdlConstraintTimingSyntax,
-    ) !void {
-        if (primary_key.* != null) return error.UnsupportedSqlShape;
-        primary_key.* = try sql_adapter.makeDdlPrimaryKeyAlloc(self.alloc, constraint_name, columns, include_columns, without_overlaps_period, timing);
     }
 
     fn parseCtesForPlanAlloc(

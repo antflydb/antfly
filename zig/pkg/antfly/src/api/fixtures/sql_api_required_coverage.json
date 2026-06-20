@@ -654,8 +654,6 @@
     "unsupported_delete_multi_output_subquery_selector",
     "unsupported_insert",
     "unsupported_merge_mutation",
-    "unsupported_query",
-    "unsupported_query_recursive_cte_stream_plan",
     "unsupported_read",
     "unsupported_read_aggregate_duplicate_output_name",
     "unsupported_read_duplicate_output_name",

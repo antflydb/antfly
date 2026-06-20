@@ -4526,7 +4526,6 @@ pub const AppParityCorpusCoverage = struct {
     delete_joined_source: bool = false,
     delete_joined_source_cte_mutation: bool = false,
     adapter_noop_ddl: bool = false,
-    unsupported_query: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
@@ -4555,7 +4554,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_update_joined_source: bool = false,
     unsupported_delete_joined_source: bool = false,
     unsupported_merge_mutation: bool = false,
-    unsupported_query_recursive_cte_stream_plan: bool = false,
     query_calendar_interval_expression: bool = false,
     unsupported_read_duplicate_output_name: bool = false,
     unsupported_read_aggregate_duplicate_output_name: bool = false,
@@ -5674,7 +5672,7 @@ pub const AppParityCorpusCoverage = struct {
                 self.invalid_update = true;
                 self.invalid_duplicate_update_target = self.invalid_duplicate_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_update_target");
             },
-            .unsupported => self.unsupported_query = true,
+            .unsupported => {},
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
             .unsupported_write => self.unsupported_write = true,
@@ -5741,9 +5739,7 @@ pub const AppParityCorpusCoverage = struct {
                     (is_read_window and has_read_source_expression);
             },
         }
-        if (entry.family == .unsupported) {
-            self.unsupported_query_recursive_cte_stream_plan = self.unsupported_query_recursive_cte_stream_plan or std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan");
-        } else if (entry.family == .unsupported_read) {
+        if (entry.family == .unsupported_read) {
             self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
                 std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");

@@ -6065,13 +6065,6 @@
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
     },
     {
-      "name": "unsupported recursive cte query",
-      "family": "unsupported",
-      "plan": "unsupported:query:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
-      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
-    },
-    {
       "name": "recursive cte read stream plan",
       "family": "read",
       "summary": {

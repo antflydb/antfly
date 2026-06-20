@@ -3918,6 +3918,7 @@ pub fn build(b: *std.Build) void {
             "sql routine runtime",
             "api http server recovers durable SQL routine catalog",
             "api http server exposes SQL routine bindings to catalog read planning",
+            "api http server enforces SQL row security WITH CHECK on row writes",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.

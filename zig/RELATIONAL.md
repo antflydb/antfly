@@ -1993,8 +1993,9 @@ contracts where a stable operator form exists; REST and SDK callers may address
 the typed aggregate filter arrays directly.
 
 The fixture-backed gate also requires supported fingerprints for point,
-claimed-source, and joined-source primary-key rewrites that lower to `rewrite_identity`, plus fail-closed
-unsupported classifications for view DDL, recursive CTE read/query/direct-write plans,
+claimed-source, joined-source primary-key rewrites that lower to `rewrite_identity`,
+and recursive CTE read streams, plus fail-closed
+unsupported classifications for view DDL and recursive CTE direct-write plans,
 duplicate physical row targets inside one SQL-lowered row batch, invalid
 conflict update targets, non-unique direct point update selectors, scalar-target
 multi-output subquery delete selectors, so recursive read streams cannot bypass
