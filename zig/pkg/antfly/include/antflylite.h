@@ -55,6 +55,8 @@ typedef struct antfly_version_predicate {
     uint64_t expected_version;
 } antfly_version_predicate;
 
+uint32_t antfly_lite_abi_version(void);
+
 antfly_error_code antfly_lite_open(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_hosted(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_readonly(const char *path, void **out_handle);

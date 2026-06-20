@@ -156,9 +156,11 @@ same way. Neither should be the public Lite v1 contract.
 
 Because this is new, unreleased code, v1 should not carry a legacy fallback or
 pre-release importer. `.aflite` readers should accept the documented v1 format
-and reject unknown versions or incomplete files loudly. Compatibility branches
-should only be added after a format has shipped and users can reasonably have
-files that need preservation.
+and reject unknown versions loudly. Recovery from an older complete checkpoint
+root inside the same v1 file is crash recovery, not legacy compatibility; a file
+with no complete v1 checkpoint should fail with an explicit integrity error.
+Compatibility branches should only be added after a format has shipped and users
+can reasonably have files that need preservation.
 
 The extension meanings should stay distinct:
 
@@ -545,7 +547,8 @@ query-visible results should match within documented index rebuild semantics.
 - Keep filesystem-backed LSM and LSM-container profiles as developer/test-only
   bridge paths.
 - Do not add legacy fallback code for pre-release Lite layouts; reject unknown
-  versions and invalid headers with explicit errors.
+  versions and invalid headers with explicit errors while preserving same-format
+  checkpoint recovery.
 
 ### Phase 2: Name And CLI Shell
 

@@ -33,6 +33,8 @@ const lite_backend = antfly.lite.backend;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
 
+const lite_abi_version: u32 = 1;
+
 fn monotonicNowNs() u64 {
     return antfly.platform_time.monotonicNs();
 }
@@ -1572,6 +1574,10 @@ pub export fn antfly_db_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi
 pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
     const handle = asHandle(handle_ptr) orelse return;
     closeHandle(handle);
+}
+
+pub export fn antfly_lite_abi_version() u32 {
+    return lite_abi_version;
 }
 
 fn openLiteHandle(
@@ -5805,6 +5811,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(snapshot_path);
+
+    try std.testing.expectEqual(@as(u32, 1), antfly_lite_abi_version());
 
     var plain_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));
