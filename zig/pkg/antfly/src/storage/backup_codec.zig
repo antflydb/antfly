@@ -44,6 +44,7 @@ pub const BlockType = enum(u8) {
     transaction_batch = 0x16,
     doc_identity_batch = 0x17,
     metadata_batch = 0x18,
+    artifact_batch = 0x19,
     shard_footer = 0xF0,
     file_footer = 0xFF,
     _,

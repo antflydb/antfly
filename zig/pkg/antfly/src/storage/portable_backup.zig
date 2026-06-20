@@ -20,6 +20,7 @@ const backup_codec = @import("backup_codec.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
 const doc_identity = @import("db/doc_identity.zig");
+const db_types = @import("db/types.zig");
 const artifact_ids = @import("db/artifact_ids.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
 const DocStore = docstore_mod.DocStore;
@@ -100,6 +101,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     var chunk_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer chunk_batch.deinit(alloc);
     var chunk_batch_bytes: usize = 0;
+
+    var artifact_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer artifact_batch.deinit(alloc);
+    var artifact_batch_bytes: usize = 0;
 
     // Embeddings keyed by index name
     var emb_batches = std.StringHashMapUnmanaged(EmbeddingBatch).empty;
@@ -195,8 +200,14 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
                 defer parsed.deinit(alloc);
                 try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
+            } else if (try appendPortableArtifactEntry(alloc, &artifact_batch, kv.key, kv.value, .asset)) {
+                artifact_batch_bytes += kv.key.len + kv.value.len;
+                if (artifact_batch_bytes >= batch_target_bytes) {
+                    try flushArtifactBatch(alloc, out, &artifact_batch);
+                    artifact_batch_bytes = 0;
+                }
             }
-            // Skip: TTL, summary, asset, resolution, and derived embedding keys
+            // Skip: TTL, summary, resolution, and derived embedding keys
             continue;
         }
 
@@ -224,6 +235,9 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     }
     if (chunk_batch.items.len > 0) {
         try flushChunkBatch(alloc, out, &chunk_batch);
+    }
+    if (artifact_batch.items.len > 0) {
+        try flushArtifactBatch(alloc, out, &artifact_batch);
     }
 
     // Flush embedding batches
@@ -480,6 +494,22 @@ fn flushChunkBatch(
     batch.clearRetainingCapacity();
 }
 
+fn flushArtifactBatch(
+    alloc: Allocator,
+    out: *ArrayList(u8),
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+) !void {
+    const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
+    defer alloc.free(encoded);
+    try backup_codec.writeBlock(out, alloc, .artifact_batch, encoded);
+
+    for (batch.items) |e| {
+        alloc.free(e.key);
+        alloc.free(e.value);
+    }
+    batch.clearRetainingCapacity();
+}
+
 fn isPortableMetadataKey(key: []const u8) bool {
     return std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
         std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
@@ -507,6 +537,31 @@ fn appendChunkArtifactEntry(
         .key = public_id,
         .value = owned_value,
     });
+}
+
+fn appendPortableArtifactEntry(
+    alloc: Allocator,
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    key: []const u8,
+    value: []const u8,
+    allowed_kind: db_types.ArtifactKind,
+) !bool {
+    var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(alloc, key) catch |err| switch (err) {
+        error.InvalidInternalUserKey => return false,
+        else => return err,
+    }) orelse return false;
+    defer artifact_ref.deinit(alloc);
+    if (artifact_ref.kind != allowed_kind) return false;
+
+    const public_id = try artifact_ids.artifactPublicIdAlloc(alloc, artifact_ref);
+    errdefer alloc.free(public_id);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try batch.append(alloc, .{
+        .key = public_id,
+        .value = owned_value,
+    });
+    return true;
 }
 
 /// Parse an embedding artifact value and collect into the appropriate batch.
@@ -701,6 +756,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
 
             switch (block.block_type) {
                 .chunk_batch => try importChunkBatch(alloc, store, block.payload),
+                .artifact_batch => try importPublicArtifactBatch(alloc, store, block.payload, .asset),
                 .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
                 .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
                 .edge_batch => try importEdgeBatch(alloc, store, block.payload),
@@ -832,6 +888,56 @@ fn importChunkBatch(
         var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
         defer artifact_ref.deinit(alloc);
         if (artifact_ref.kind != .chunk) return error.InvalidBackupRequest;
+
+        const store_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+        var store_key_owned = true;
+        errdefer if (store_key_owned) alloc.free(store_key);
+        try owned_keys.append(alloc, store_key);
+        store_key_owned = false;
+
+        const store_value = try alloc.dupe(u8, entry.value);
+        var store_value_owned = true;
+        errdefer if (store_value_owned) alloc.free(store_value);
+        try owned_vals.append(alloc, store_value);
+        store_value_owned = false;
+
+        try writes.append(alloc, .{
+            .key = store_key,
+            .value = store_value,
+        });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importPublicArtifactBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+    allowed_kind: db_types.ArtifactKind,
+) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        var artifact_ref = (try artifact_ids.decodeArtifactPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+        if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
 
         const store_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
         var store_key_owned = true;
@@ -1676,6 +1782,63 @@ test "export and import chunk artifacts round trip with public artifact ids" {
     const restored_unit_chunk = try dst.get(alloc, unit_chunk_key);
     defer alloc.free(restored_unit_chunk);
     try std.testing.expectEqualStrings(unit_chunk_value, restored_unit_chunk);
+}
+
+test "export and import asset artifacts round trip with public artifact ids" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const doc_key = "doc:asset-source";
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "asset", "document_units_v1");
+    defer alloc.free(asset_key);
+    const unit_asset_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, "document_units_v1", "page:000001");
+    defer alloc.free(unit_asset_key);
+    const asset_value = "{\"units\":[\"page:000001\"]}";
+    const unit_asset_value = "{\"text\":\"page one text\",\"page\":1}";
+
+    try src.putBatch(&.{
+        .{ .key = asset_key, .value = asset_value },
+        .{ .key = unit_asset_key, .value = unit_asset_value },
+    }, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_artifact_batch = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .artifact_batch) continue;
+        saw_artifact_batch = true;
+        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
+        defer freeKeyValueEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        for (entries) |entry| {
+            try std.testing.expect(std.mem.startsWith(u8, entry.key, "af1:asset:"));
+        }
+    }
+    try std.testing.expect(saw_artifact_batch);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_asset = try dst.get(alloc, asset_key);
+    defer alloc.free(restored_asset);
+    try std.testing.expectEqualStrings(asset_value, restored_asset);
+
+    const restored_unit_asset = try dst.get(alloc, unit_asset_key);
+    defer alloc.free(restored_unit_asset);
+    try std.testing.expectEqualStrings(unit_asset_value, restored_unit_asset);
 }
 
 test "export skips derived data" {
