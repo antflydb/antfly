@@ -273,6 +273,33 @@ func TestLiteCAPI(t *testing.T) {
 	if err := RestoreBackup(restoredFromBytesPath, backupBytes, false); err == nil {
 		t.Fatalf("restore without replace unexpectedly overwrote target")
 	}
+
+	importedPath := filepath.Join(t.TempDir(), "go-imported.aflite")
+	imported, err := Open(importedPath)
+	if err != nil {
+		t.Fatalf("open imported Lite database: %v", err)
+	}
+	if err := imported.ImportBackup(backupBytes); err != nil {
+		t.Fatalf("import backup bytes: %v", err)
+	}
+	importedSearch, err := imported.SearchJSON([]byte(`{"mode":"full_text","index_name":"ft_body_v1","text_query_type":"match","field":"body","text":"binding full text","limit":5}`))
+	if err != nil {
+		t.Fatalf("search imported document: %v", err)
+	}
+	if !bytes.Contains(importedSearch, []byte("go binding full text search")) {
+		t.Fatalf("imported search JSON %q did not contain searchable document", importedSearch)
+	}
+	importedDenseSearch, err := imported.SearchJSON([]byte(`{"mode":"dense","index_name":"dv_embedding_v1","vector":[1.0,0.0],"k":1,"limit":1}`))
+	if err != nil {
+		t.Fatalf("dense search imported document: %v", err)
+	}
+	if !bytes.Contains(importedDenseSearch, []byte("go binding full text search")) {
+		t.Fatalf("imported dense search JSON %q did not contain caller-supplied embedding document", importedDenseSearch)
+	}
+	if err := imported.Close(); err != nil {
+		t.Fatalf("close imported Lite database: %v", err)
+	}
+
 	malformedRestorePath := filepath.Join(t.TempDir(), "go-malformed-restore.aflite")
 	if err := RestoreBackup(malformedRestorePath, []byte("not an afb"), false); err == nil {
 		t.Fatalf("malformed restore unexpectedly succeeded")

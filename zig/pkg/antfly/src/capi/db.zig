@@ -1817,9 +1817,16 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
+    if (handle.db.core.indexCount() != 0) return .invalid_argument;
     const bytes = backup.bytes();
     portable_backup.validatePortable(handle.alloc, bytes) catch |err| return capi.mapError(err);
     portable_backup.importPortable(handle.alloc, handle.db.core.store, bytes) catch |err| return capi.mapError(err);
+    handle.db.core.loadIndexes() catch |err| return capi.mapError(err);
+    _ = handle.db.rebuildDenseIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
+    _ = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    handle.db.sync(true) catch |err| return capi.mapError(err);
+    handle.db.syncIndexes(true) catch |err| return capi.mapError(err);
     return .ok;
 }
 
