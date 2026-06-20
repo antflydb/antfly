@@ -14,6 +14,7 @@
 
 test {
     _ = @import("storage/lite/backend.zig");
+    _ = @import("storage/lite/conformance_test.zig");
     _ = @import("storage/lite/docstore.zig");
     _ = @import("storage/lite/index_storage.zig");
     _ = @import("storage/lite/native.zig");
