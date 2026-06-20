@@ -136,6 +136,17 @@ typedef struct antfly_dense_wire_search_profile {
     bool used_fast_path;
 } antfly_dense_wire_search_profile;
 
+typedef struct antfly_scan_hash_entry {
+    uint8_t *id_ptr;
+    size_t id_len;
+    uint64_t hash;
+} antfly_scan_hash_entry;
+
+typedef struct antfly_scan_hash_result {
+    antfly_scan_hash_entry *entries_ptr;
+    size_t entry_count;
+} antfly_scan_hash_result;
+
 uint32_t antfly_lite_abi_version(void);
 const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
@@ -163,6 +174,7 @@ void antfly_buffer_free(antfly_buffer *buffer);
 void antfly_db_buffer_free(uint8_t *ptr, size_t len);
 void antfly_db_dense_search_result_free(antfly_dense_search_result *result);
 void antfly_db_packed_dense_search_result_free(antfly_packed_dense_search_result *result);
+void antfly_db_scan_hash_result_free(antfly_scan_hash_result *result);
 
 antfly_error_code antfly_db_batch(
     void *handle,
@@ -204,6 +216,7 @@ antfly_error_code antfly_db_get_commit_version(
     const uint8_t (*txn_id)[16],
     uint64_t *out_commit_version
 );
+antfly_error_code antfly_db_get_timestamp(void *handle, antfly_slice key, uint64_t *out_timestamp);
 antfly_error_code antfly_db_lookup_json(void *handle, antfly_slice key, antfly_buffer *out);
 antfly_error_code antfly_db_get_raw(void *handle, antfly_slice key, antfly_buffer *out);
 antfly_error_code antfly_db_get_schema_json(void *handle, antfly_buffer *out);
@@ -222,6 +235,11 @@ antfly_error_code antfly_db_delete_enrichment(
     bool *out_deleted
 );
 antfly_error_code antfly_db_scan_json(void *handle, antfly_slice request_json, antfly_buffer *out);
+antfly_error_code antfly_db_scan_hashes(
+    void *handle,
+    antfly_slice request_json,
+    antfly_scan_hash_result *out_result
+);
 antfly_error_code antfly_db_stats_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_search_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_search_dense(
