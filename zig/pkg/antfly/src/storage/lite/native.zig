@@ -187,6 +187,10 @@ pub const NativeFile = struct {
         var header_bytes: [header_size]u8 = undefined;
         try readExactAt(file, io, &header_bytes, 0);
         const header = try decodeHeader(&header_bytes);
+        const checkpoint = header.checkpoints[header.active_checkpoint];
+        const expected_size = try checkpointPrefixSize(checkpoint, header.page_size);
+        const file_size = (try file.stat(io)).size;
+        if (file_size < expected_size) return error.TruncatedNativeFile;
 
         return .{
             .allocator = allocator,
@@ -221,8 +225,7 @@ pub const NativeFile = struct {
 
     pub fn check(self: *NativeFile) !CheckReport {
         const checkpoint = self.activeCheckpoint();
-        const page_size: u64 = self.header.page_size;
-        const expected_size = checkpoint.page_count * page_size;
+        const expected_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
         const file_size = (try self.file.stat(self.io_impl.io())).size;
 
         const report = CheckReport{
@@ -1200,7 +1203,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .reclaimable_bytes = 0,
         }, "truncated_header");
     }
-    _ = decodeHeader(&header_bytes) catch |err| {
+    const header = decodeHeader(&header_bytes) catch |err| {
         return invalidCheck(.{
             .valid = true,
             .file_size = file_size,
@@ -1213,6 +1216,33 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .reclaimable_bytes = 0,
         }, issueForDecodeError(err));
     };
+    const checkpoint = header.checkpoints[header.active_checkpoint];
+    const expected_size = checkpointPrefixSize(checkpoint, header.page_size) catch {
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = 0,
+            .tail_bytes = file_size,
+            .record_count = 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = 0,
+            .reclaimable_bytes = 0,
+        }, "invalid_checkpoint");
+    };
+    if (file_size < expected_size) {
+        return invalidCheck(.{
+            .valid = true,
+            .file_size = file_size,
+            .valid_prefix_size = file_size,
+            .tail_bytes = 0,
+            .record_count = if (checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
+            .live_file_count = 0,
+            .live_bytes = 0,
+            .compact_size = expected_size,
+            .reclaimable_bytes = 0,
+        }, "truncated_file");
+    }
 
     var native_file = try NativeFile.open(allocator, path, true);
     defer native_file.close();
@@ -1339,6 +1369,10 @@ fn validCheckpointSlot(slot: CheckpointSlot) bool {
     if (!validCheckpointRoot(slot.index_catalog_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.free_map_root_page, slot.page_count)) return false;
     return true;
+}
+
+fn checkpointPrefixSize(slot: CheckpointSlot, page_size: u32) !u64 {
+    return std.math.mul(u64, slot.page_count, @as(u64, page_size)) catch error.InvalidNativeCheckpoint;
 }
 
 fn validCheckpointRoot(root_page: u64, page_count: u64) bool {
@@ -2565,9 +2599,9 @@ test "lite native check reports truncated committed file" {
         try file.setLength(std.testing.io, default_page_size + 16);
     }
 
-    var reopened = try NativeFile.open(allocator, path, true);
-    defer reopened.close();
-    const report = try reopened.check();
+    try std.testing.expectError(error.TruncatedNativeFile, NativeFile.open(allocator, path, true));
+
+    const report = try checkFile(allocator, path);
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("truncated_file", report.issue.?);
 }
