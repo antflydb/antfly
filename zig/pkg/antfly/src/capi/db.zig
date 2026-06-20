@@ -1590,6 +1590,14 @@ pub export fn antfly_lite_abi_version() u32 {
     return lite_abi_version;
 }
 
+pub export fn antfly_error_code_name(code: c_int) [*:0]const u8 {
+    return capi.errorCodeName(code);
+}
+
+pub export fn antfly_error_code_description(code: c_int) [*:0]const u8 {
+    return capi.errorCodeDescription(code);
+}
+
 fn openLiteHandle(
     path: []const u8,
     open_mode: db_mod.OpenOptions.OpenMode,
@@ -5873,6 +5881,11 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(snapshot_path);
 
     try std.testing.expectEqual(@as(u32, 1), antfly_lite_abi_version());
+    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
+    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "writer") != null);
+    try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
 
     var plain_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(plain_path, &plain_handle));

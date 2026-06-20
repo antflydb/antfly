@@ -143,6 +143,34 @@ pub const ErrorCode = enum(c_int) {
     internal = 255,
 };
 
+pub fn errorCodeName(code: c_int) [*:0]const u8 {
+    return switch (code) {
+        @intFromEnum(ErrorCode.ok) => "ANTFLY_OK",
+        @intFromEnum(ErrorCode.invalid_argument) => "ANTFLY_INVALID_ARGUMENT",
+        @intFromEnum(ErrorCode.not_found) => "ANTFLY_NOT_FOUND",
+        @intFromEnum(ErrorCode.version_conflict) => "ANTFLY_VERSION_CONFLICT",
+        @intFromEnum(ErrorCode.intent_conflict) => "ANTFLY_INTENT_CONFLICT",
+        @intFromEnum(ErrorCode.txn_not_found) => "ANTFLY_TXN_NOT_FOUND",
+        @intFromEnum(ErrorCode.busy) => "ANTFLY_BUSY",
+        @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
+        else => "ANTFLY_UNKNOWN_ERROR",
+    };
+}
+
+pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
+    return switch (code) {
+        @intFromEnum(ErrorCode.ok) => "operation completed successfully",
+        @intFromEnum(ErrorCode.invalid_argument) => "an argument, request, path, or open mode is invalid",
+        @intFromEnum(ErrorCode.not_found) => "the requested database object was not found",
+        @intFromEnum(ErrorCode.version_conflict) => "a version predicate did not match the current document version",
+        @intFromEnum(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
+        @intFromEnum(ErrorCode.txn_not_found) => "the requested transaction was not found",
+        @intFromEnum(ErrorCode.busy) => "the database is temporarily busy or a writer is already active",
+        @intFromEnum(ErrorCode.internal) => "an internal error occurred",
+        else => "unknown Antfly error code",
+    };
+}
+
 pub fn mapError(err: anyerror) ErrorCode {
     return switch (err) {
         error.VersionConflict => .version_conflict,

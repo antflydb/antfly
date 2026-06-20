@@ -598,6 +598,7 @@ query-visible results should match within documented index rebuild semantics.
 
 - Define stable C ABI.
 - Add ownership/error/result conventions.
+- Expose stable error-code names and descriptions for language bindings.
 - Add bindings for the first target languages.
 - Freeze the Lite open options and capabilities response.
 
