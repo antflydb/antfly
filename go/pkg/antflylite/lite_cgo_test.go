@@ -193,11 +193,11 @@ func TestLiteCAPI(t *testing.T) {
 	if typedStatus.Storage.Format != "aflite" || typedStatus.Storage.Engine != "native_single_file" {
 		t.Fatalf("typed status storage = %#v", typedStatus.Storage)
 	}
-	if typedStatus.Inference.Mode != "caller_supplied_or_disabled" {
+	if typedStatus.Inference.Mode != InferenceModeCallerSuppliedOrDisabled {
 		t.Fatalf("typed status inference mode = %q", typedStatus.Inference.Mode)
 	}
-	if !containsString(typedStatus.Inference.AvailableModes, "caller_supplied_artifacts") ||
-		!containsString(typedStatus.Inference.AvailableModes, "disabled_deferred") {
+	if !containsString(typedStatus.Inference.AvailableModes, InferenceModeCallerSuppliedArtifacts) ||
+		!containsString(typedStatus.Inference.AvailableModes, InferenceModeDisabledDeferred) {
 		t.Fatalf("typed status inference available modes = %#v", typedStatus.Inference.AvailableModes)
 	}
 	if typedStatus.Inference.Configured || typedStatus.Inference.RemoteProviderConfigured || typedStatus.Inference.LocalRuntimeConfigured {
@@ -219,12 +219,12 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("typed capabilities: %v", err)
 	}
-	if typedCaps.InferenceMode != "caller_supplied_or_disabled" || !typedCaps.CallerSuppliedArtifacts || !typedCaps.NoInferenceConfiguredOK {
+	if typedCaps.InferenceMode != InferenceModeCallerSuppliedOrDisabled || !typedCaps.CallerSuppliedArtifacts || !typedCaps.NoInferenceConfiguredOK {
 		t.Fatalf("typed capabilities inference fields = %#v", typedCaps)
 	}
-	if !containsString(typedCaps.SupportedInferenceModes, "local_embedded") ||
-		!containsString(typedCaps.AvailableInferenceModes, "caller_supplied_artifacts") ||
-		!containsString(typedCaps.AvailableInferenceModes, "disabled_deferred") {
+	if !containsString(typedCaps.SupportedInferenceModes, InferenceModeLocalEmbedded) ||
+		!containsString(typedCaps.AvailableInferenceModes, InferenceModeCallerSuppliedArtifacts) ||
+		!containsString(typedCaps.AvailableInferenceModes, InferenceModeDisabledDeferred) {
 		t.Fatalf("typed capabilities inference modes = supported=%#v available=%#v", typedCaps.SupportedInferenceModes, typedCaps.AvailableInferenceModes)
 	}
 	if typedCaps.RaftReplication || typedCaps.ClusterPlacement || typedCaps.DistributedTransactionCoordination {
@@ -392,7 +392,7 @@ func TestLiteCAPI(t *testing.T) {
 	if !hostedCaps.HostedProfile || !hostedCaps.ManualMaintenance {
 		t.Fatalf("hosted capabilities should report manual maintenance: %#v", hostedCaps)
 	}
-	if !containsString(hostedCaps.AvailableInferenceModes, "manual_maintenance") {
+	if !containsString(hostedCaps.AvailableInferenceModes, InferenceModeManualMaintenance) {
 		t.Fatalf("hosted capabilities should advertise manual maintenance inference mode: %#v", hostedCaps.AvailableInferenceModes)
 	}
 	if hostedCaps.BackgroundEnrichmentRuntime || hostedCaps.TTLCleanupRuntime || hostedCaps.TransactionRecoveryRuntime {

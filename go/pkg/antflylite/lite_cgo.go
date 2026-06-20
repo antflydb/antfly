@@ -42,6 +42,16 @@ const (
 	ProfileHosted Profile = C.ANTFLY_LITE_PROFILE_HOSTED
 )
 
+// Inference mode strings returned by Lite status and capabilities.
+const (
+	InferenceModeCallerSuppliedOrDisabled = C.ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED
+	InferenceModeCallerSuppliedArtifacts  = C.ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS
+	InferenceModeRemoteProvider           = C.ANTFLY_LITE_INFERENCE_MODE_REMOTE_PROVIDER
+	InferenceModeLocalEmbedded            = C.ANTFLY_LITE_INFERENCE_MODE_LOCAL_EMBEDDED
+	InferenceModeManualMaintenance        = C.ANTFLY_LITE_INFERENCE_MODE_MANUAL_MAINTENANCE
+	InferenceModeDisabledDeferred         = C.ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED
+)
+
 // OpenOptions configures OpenWithOptions.
 type OpenOptions struct {
 	Mode       OpenMode
