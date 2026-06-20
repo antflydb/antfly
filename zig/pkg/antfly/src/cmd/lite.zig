@@ -2179,6 +2179,27 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
 }
 
+test "lite status rejects internal bridge aflite files" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-internal-bridge.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    {
+        var handle = try antfly.lite.backend.Handle.open(allocator, path, .{ .engine = .bridge_lsm_container });
+        defer handle.deinit();
+    }
+
+    var argv = [_][*:0]const u8{path_z.ptr};
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(error.TruncatedNativeHeader, status(allocator, std.testing.io, &args));
+}
+
 fn testLiteHttpCall(
     allocator: Allocator,
     state: ?*LiteHttpState,
