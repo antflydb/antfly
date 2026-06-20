@@ -3625,6 +3625,37 @@ pub fn parseGreatestLeastRowExpressionAlloc(
     return expression;
 }
 
+pub fn parseArrayLengthRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !db_mod.types.RelationalRowsExpression {
+    const keyword = try parseArrayLengthFunctionCallStart(tokens, pos);
+    const field = try parseRowExpressionArrayFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try value_mod.parseArrayLengthFunctionTail(tokens, pos, params, keyword);
+
+    const field_expression: db_mod.types.RelationalRowsExpression = .{ .kind = .field, .field = field, .field_source = field_source };
+    const expression = try buildUnaryFunctionExpressionAlloc(alloc, .array_length, field_expression);
+    field_transferred = true;
+    return expression;
+}
+
 pub fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
     return switch (op) {
         .lower, .upper, .md5 => true,

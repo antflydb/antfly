@@ -1279,6 +1279,7 @@ pub const parsePeriodBoundRowExpressionAlloc = lower_expr.parsePeriodBoundRowExp
 pub const VariadicRowExpressionParserHooks = lower_expr.VariadicRowExpressionParserHooks;
 pub const parseArrayToStringRowExpressionAlloc = lower_expr.parseArrayToStringRowExpressionAlloc;
 pub const parseArrayElementTransformRowExpressionAlloc = lower_expr.parseArrayElementTransformRowExpressionAlloc;
+pub const parseArrayLengthRowExpressionAlloc = lower_expr.parseArrayLengthRowExpressionAlloc;
 pub const parseGreatestLeastRowExpressionAlloc = lower_expr.parseGreatestLeastRowExpressionAlloc;
 pub const JsonBuildObjectRowExpressionParserHooks = lower_expr.JsonBuildObjectRowExpressionParserHooks;
 pub const parseJsonBuildObjectRowExpressionAlloc = lower_expr.parseJsonBuildObjectRowExpressionAlloc;

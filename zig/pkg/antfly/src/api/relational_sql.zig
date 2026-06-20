@@ -3402,6 +3402,13 @@ const Parser = struct {
         };
     }
 
+    fn caseFoldRowExpressionParserHooks(self: *@This()) sql_adapter.CaseFoldRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+        };
+    }
+
     fn jsonBuildObjectRowExpressionParserHooks(self: *@This()) sql_adapter.JsonBuildObjectRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -15889,69 +15896,35 @@ const Parser = struct {
     }
 
     fn parseCaseFoldRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseCaseFoldFunctionCallStart(self.tokens, &self.pos);
-        if (try self.parsePeriodBoundRowExpressionAlloc(kind)) |expression| return expression;
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const operand = try self.parseRowExpressionAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        try operands.append(self.alloc, operand);
-        operand_transferred = true;
-
-        if (kind == .trim or kind == .ltrim or kind == .rtrim) {
-            if (self.match(.comma) != null) {
-                const trim_operand = try self.parseRowExpressionAlloc();
-                var trim_transferred = false;
-                errdefer if (!trim_transferred) freeExpression(self.alloc, trim_operand);
-                try self.rowExpressionTypeContext().validateTextRowExpression(trim_operand);
-                try operands.append(self.alloc, trim_operand);
-                trim_transferred = true;
-            }
-        }
-        try self.expect(.rparen);
-
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
+        return try sql_adapter.parseCaseFoldRowExpressionAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
+            self.rowExpressionTypeContext(),
+            self.caseFoldRowExpressionParserHooks(),
+        );
     }
 
     fn parsePeriodBoundRowExpressionAlloc(
         self: *@This(),
         kind: db_mod.types.RelationalRowsExpressionKind,
     ) !?db_mod.types.RelationalRowsExpression {
-        if (kind != .lower and kind != .upper) return null;
-        const start_pos = self.pos;
-        const parsed_field = sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return null,
-            else => return err,
-        };
-        defer self.alloc.free(parsed_field);
-        const field = (try sql_adapter.normalizePeriodReferenceAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers)) orelse (sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation) catch |err| switch (err) {
-            error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
-                self.pos = start_pos;
-                return null;
-            },
-            else => return err,
-        });
-        defer self.alloc.free(field);
-        const period = relationalPeriodForDdl(self.schema.periods, field) orelse {
-            self.pos = start_pos;
-            return null;
-        };
-        if (!self.peekKind(.rparen)) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-        const bound_name = if (kind == .lower) period.start_column else period.end_column;
-        const bound_column = relationalColumnForField(self.schema, bound_name, null) orelse return error.InvalidSqlCatalog;
-        if (!relationalPeriodColumnType(bound_column.field_type)) return error.InvalidSqlCatalog;
-        return .{
-            .kind = .field,
-            .field = try self.alloc.dupe(u8, bound_column.name),
-            .field_source = self.rowExpressionFieldSource(),
-        };
+        return try sql_adapter.parsePeriodBoundRowExpressionAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            kind,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
+        );
     }
 
     fn parseCoalesceRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -16002,24 +15975,17 @@ const Parser = struct {
     }
 
     fn parseArrayLengthRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
-        const field = try sql_adapter.parseRowExpressionArrayFieldOwnedAlloc(
+        return try sql_adapter.parseArrayLengthRowExpressionAlloc(
             self.alloc,
             self.tokens,
             &self.pos,
+            self.params,
             self.schema,
             self.field_expression_qualifiers,
             self.returning_expression_qualifiers,
             self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
         );
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-        try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
-
-        const field_expression: db_mod.types.RelationalRowsExpression = .{ .kind = .field, .field = field, .field_source = self.rowExpressionFieldSource() };
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .array_length, field_expression);
-        field_transferred = true;
-        return expression;
     }
 
     fn parseArrayPositionRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
