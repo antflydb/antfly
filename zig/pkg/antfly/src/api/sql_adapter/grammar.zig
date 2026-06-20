@@ -40,12 +40,14 @@ pub const CreateRowSecurityPolicySyntax = struct {
     table_name: []const u8,
     role_targets: []const []const u8 = &.{},
     predicate: ddl_plan.RowSecurityPolicyPredicate,
+    check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.policy_name));
         alloc.free(@constCast(self.table_name));
         freeStringSlice(alloc, self.role_targets);
         self.predicate.deinit(alloc);
+        if (self.check_predicate) |*predicate| predicate.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -55,12 +57,14 @@ pub const AlterRowSecurityPolicySyntax = struct {
     table_name: []const u8,
     role_targets: []const []const u8 = &.{},
     predicate: ddl_plan.RowSecurityPolicyPredicate,
+    check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.policy_name));
         alloc.free(@constCast(self.table_name));
         freeStringSlice(alloc, self.role_targets);
         self.predicate.deinit(alloc);
+        if (self.check_predicate) |*predicate| predicate.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -402,6 +406,19 @@ pub const DropExtensionSyntax = struct {
 pub const RoutineKindSyntax = enum {
     function,
     procedure,
+};
+
+const RoutineSignatureSyntax = struct {
+    argument_count: usize = 0,
+    argument_names: []const []const u8 = &.{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.argument_names) |name| {
+            if (name.len > 0) alloc.free(@constCast(name));
+        }
+        if (self.argument_names.len > 0) alloc.free(@constCast(self.argument_names));
+        self.* = undefined;
+    }
 };
 
 pub const CreateRoutineSyntax = struct {
@@ -1492,17 +1509,27 @@ pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
     var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
     var predicate_transferred = false;
     errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    var check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null;
+    var check_predicate_transferred = true;
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("check");
+        check_predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
+        check_predicate_transferred = false;
+        errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
+    }
     try adapterNoopStatementEnd(cursor);
 
     policy_transferred = true;
     table_transferred = true;
     role_targets_transferred = true;
     predicate_transferred = true;
+    check_predicate_transferred = true;
     return .{
         .policy_name = policy_name,
         .table_name = table_name,
         .role_targets = role_targets,
         .predicate = predicate,
+        .check_predicate = check_predicate,
     };
 }
 
@@ -1527,17 +1554,27 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
     var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
     var predicate_transferred = false;
     errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    var check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null;
+    var check_predicate_transferred = true;
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("check");
+        check_predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
+        check_predicate_transferred = false;
+        errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
+    }
     try adapterNoopStatementEnd(cursor);
 
     policy_transferred = true;
     table_transferred = true;
     role_targets_transferred = true;
     predicate_transferred = true;
+    check_predicate_transferred = true;
     return .{
         .policy_name = policy_name,
         .table_name = table_name,
         .role_targets = role_targets,
         .predicate = predicate,
+        .check_predicate = check_predicate,
     };
 }
 
@@ -2737,7 +2774,8 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     const routine_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var routine_transferred = false;
     errdefer if (!routine_transferred) alloc.free(routine_name);
-    const argument_count = try parseRoutineSignatureArgumentCount(cursor);
+    var signature = try parseCreateRoutineSignatureAlloc(alloc, cursor);
+    defer signature.deinit(alloc);
     var returns_type: ?[]const u8 = null;
     errdefer if (returns_type) |value| alloc.free(@constCast(value));
     var language: ?[]const u8 = null;
@@ -2896,7 +2934,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         if (cursor.matchKeyword("as")) {
             if (body != null) return error.UnsupportedSqlShape;
             const body_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
-            body = try parseSqlRoutineBodyPlanAlloc(alloc, language, argument_count, body_token.text);
+            body = try parseSqlRoutineBodyPlanAlloc(alloc, language, signature.argument_count, signature.argument_names, body_token.text);
             continue;
         }
         return error.UnsupportedSqlShape;
@@ -2910,7 +2948,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     const out = CreateRoutineSyntax{
         .kind = kind,
         .routine_name = routine_name,
-        .argument_count = argument_count,
+        .argument_count = signature.argument_count,
         .returns_type = returns_type,
         .language = language,
         .volatility = volatility,
@@ -2939,6 +2977,7 @@ fn parseSqlRoutineBodyPlanAlloc(
     alloc: std.mem.Allocator,
     language: ?[]const u8,
     argument_count: usize,
+    argument_names: []const []const u8,
     body_text: []const u8,
 ) !ddl_plan.RoutineBodyPlan {
     const lang = language orelse return error.UnsupportedSqlShape;
@@ -2951,7 +2990,7 @@ fn parseSqlRoutineBodyPlanAlloc(
     }
     var expression_tokens = try lexer.tokenizeAlloc(alloc, expression);
     defer lexer.freeTokens(alloc, &expression_tokens);
-    const body_expression = try routineBodyExpressionAlloc(alloc, expression_tokens.items, argument_count);
+    const body_expression = try routineBodyExpressionAlloc(alloc, expression_tokens.items, argument_count, argument_names);
     errdefer runtime_schema.freeRelationalRowsExpression(alloc, body_expression);
     return .{
         .kind = .sql_expression,
@@ -2964,8 +3003,9 @@ fn routineBodyExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     argument_count: usize,
+    argument_names: []const []const u8,
 ) !runtime_schema.RelationalRowsExpression {
-    var normalized_tokens = try routineExpressionArgumentTokensAlloc(alloc, tokens, argument_count);
+    var normalized_tokens = try routineExpressionArgumentTokensAlloc(alloc, tokens, argument_count, argument_names);
     defer lexer.freeTokens(alloc, &normalized_tokens);
 
     var pos: usize = 0;
@@ -2980,12 +3020,19 @@ fn routineExpressionArgumentTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     argument_count: usize,
+    argument_names: []const []const u8,
 ) !std.ArrayListUnmanaged(Token) {
     var normalized = std.ArrayListUnmanaged(Token).empty;
     errdefer lexer.freeTokens(alloc, &normalized);
 
-    for (tokens) |token| {
+    for (tokens, 0..) |token, i| {
         if (token.kind != .placeholder) {
+            if (token.kind == .identifier and !routineIdentifierIsCallName(tokens, i)) {
+                if (routineNamedArgumentIndex(argument_names, token.text)) |argument_index| {
+                    try appendRoutineArgumentTokenAlloc(alloc, &normalized, token, argument_index);
+                    continue;
+                }
+            }
             try normalized.append(alloc, borrowedRoutineToken(token.kind, token.text, token));
             continue;
         }
@@ -3000,6 +3047,17 @@ fn routineExpressionArgumentTokensAlloc(
     }
 
     return normalized;
+}
+
+fn routineIdentifierIsCallName(tokens: []const Token, index: usize) bool {
+    return index + 1 < tokens.len and tokens[index + 1].kind == .lparen;
+}
+
+fn routineNamedArgumentIndex(argument_names: []const []const u8, text: []const u8) ?usize {
+    for (argument_names, 0..) |name, i| {
+        if (name.len != 0 and std.ascii.eqlIgnoreCase(name, text)) return i + 1;
+    }
+    return null;
 }
 
 fn routinePlaceholderCastType(text: []const u8) ?[]const u8 {
@@ -7097,6 +7155,103 @@ fn parseRoutineKindKeyword(cursor: parser.Cursor) !RoutineKindSyntax {
     return .procedure;
 }
 
+fn parseCreateRoutineSignatureAlloc(alloc: std.mem.Allocator, cursor: parser.Cursor) !RoutineSignatureSyntax {
+    try cursor.expectToken(.lparen);
+    if (cursor.matchToken(.rparen) != null) return .{};
+
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    var names_transferred = false;
+    errdefer if (!names_transferred) freeRoutineSignatureNameList(alloc, &names);
+
+    while (true) {
+        const start = cursor.pos.*;
+        var saw_argument_token = false;
+        while (!cursor.peekKind(.comma) and !cursor.peekKind(.rparen)) {
+            if (cursor.atEnd() or cursor.peekKind(.semicolon)) return error.UnsupportedSqlShape;
+            try cursor.advance(1);
+            saw_argument_token = true;
+        }
+        if (!saw_argument_token) return error.UnsupportedSqlShape;
+        const argument_tokens = cursor.tokens[start..cursor.pos.*];
+        const argument_name = try routineSignatureArgumentNameAlloc(alloc, argument_tokens);
+        var argument_name_transferred = false;
+        errdefer if (!argument_name_transferred and argument_name.len > 0) alloc.free(@constCast(argument_name));
+        try names.append(alloc, argument_name);
+        argument_name_transferred = true;
+        if (cursor.matchToken(.comma) != null) continue;
+        try cursor.expectToken(.rparen);
+        const owned_names = try names.toOwnedSlice(alloc);
+        names_transferred = true;
+        return .{
+            .argument_count = owned_names.len,
+            .argument_names = owned_names,
+        };
+    }
+}
+
+fn freeRoutineSignatureNameList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) void {
+    for (list.items) |name| {
+        if (name.len > 0) alloc.free(@constCast(name));
+    }
+    list.deinit(alloc);
+}
+
+fn routineSignatureArgumentNameAlloc(alloc: std.mem.Allocator, tokens: []const Token) ![]const u8 {
+    if (tokens.len < 2) return "";
+    const first = tokens[0];
+    if (first.kind != .identifier) return "";
+    if (routineSignatureLeadingMode(first.text)) return "";
+    if (routineSignatureTypeStartsWith(first.text)) return "";
+    if (!routineSignatureHasTypeAfterName(tokens[1..])) return "";
+    return try alloc.dupe(u8, first.text);
+}
+
+fn routineSignatureLeadingMode(text: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(text, "in") or
+        std.ascii.eqlIgnoreCase(text, "out") or
+        std.ascii.eqlIgnoreCase(text, "inout") or
+        std.ascii.eqlIgnoreCase(text, "variadic");
+}
+
+fn routineSignatureTypeStartsWith(text: []const u8) bool {
+    const known_type_heads = [_][]const u8{
+        "bigint",
+        "bool",
+        "boolean",
+        "character",
+        "date",
+        "double",
+        "integer",
+        "int",
+        "json",
+        "jsonb",
+        "numeric",
+        "real",
+        "smallint",
+        "text",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "uuid",
+        "varchar",
+    };
+    for (known_type_heads) |known| {
+        if (std.ascii.eqlIgnoreCase(text, known)) return true;
+    }
+    return false;
+}
+
+fn routineSignatureHasTypeAfterName(tokens: []const Token) bool {
+    for (tokens) |token| {
+        switch (token.kind) {
+            .identifier => return true,
+            .string, .number, .placeholder => return false,
+            else => {},
+        }
+    }
+    return false;
+}
+
 fn parseRoutineSignatureArgumentCount(cursor: parser.Cursor) !usize {
     try cursor.expectToken(.lparen);
     if (cursor.matchToken(.rparen) != null) return 0;
@@ -7558,6 +7713,19 @@ test "sql adapter grammar parses row security catalog tails" {
     };
     try std.testing.expectEqualStrings("tenant_id", literal_predicate.field);
     try std.testing.expectEqualStrings("\"tenant-a\"", literal_predicate.value_json);
+
+    var check_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy_check ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');");
+    defer lexer.freeTokens(alloc, &check_tokens);
+    var check_pos: usize = 0;
+    var check = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, check_tokens.items, &check_pos);
+    defer check.deinit(alloc);
+    try std.testing.expectEqual(check_tokens.items.len, check_pos);
+    const check_predicate = switch (check.check_predicate orelse return error.TestUnexpectedResult) {
+        .literal_equals => |check_predicate| check_predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", check_predicate.field);
+    try std.testing.expectEqualStrings("\"active\"", check_predicate.value_json);
 
     var alter_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (status = 'active');");
     defer lexer.freeTokens(alloc, &alter_tokens);
@@ -8384,7 +8552,12 @@ test "sql adapter grammar parses routine catalog tails" {
     var body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql AS 'select lower(input)';");
     defer lexer.freeTokens(alloc, &body_tokens);
     var body_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, body_tokens.items, &body_pos));
+    var body = try parseCreateRoutineCatalogTailAlloc(alloc, body_tokens.items, &body_pos);
+    defer body.deinit(alloc);
+    try std.testing.expectEqual(body_tokens.items.len, body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.sql_expression, body.body.?.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, body.body.?.expression.kind);
+    try std.testing.expectEqualStrings("arg1", body.body.?.expression.operands[0].field);
 
     var security_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SECURITY DEFINER;");
     defer lexer.freeTokens(alloc, &security_tokens);

@@ -30,6 +30,7 @@ pub const default_rbac_model_text =
     \\p5 = sub, database, setting, value
     \\p6 = sub, database, setting, value
     \\p7 = sub, table, target
+    \\p8 = sub, obj, filter
     \\[role_definition]
     \\g = _, _
     \\[matchers]
@@ -946,6 +947,7 @@ pub const UserManager = struct {
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("g", 1, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p8", 0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{role_subject});
         _ = try self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{role_subject});
@@ -998,6 +1000,7 @@ pub const UserManager = struct {
     pub fn roleSubjectHasDependencies(self: *const UserManager, role_subject: []const u8) !bool {
         if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p8", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p7", 2, role_subject)) return true;
         if (try self.hasFilteredPolicy("g", 0, role_subject)) return true;
 
@@ -1019,6 +1022,7 @@ pub const UserManager = struct {
         if (self.users.contains(role_subject)) return true;
         if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p8", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p5", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p6", 0, role_subject)) return true;
         if (try self.hasFilteredPolicy("p7", 2, role_subject)) return true;
@@ -1539,6 +1543,10 @@ pub const UserManager = struct {
     }
 
     pub fn createSqlRowSecurityPolicyWithTargets(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, role_targets: []const []const u8) !void {
+        try self.createSqlRowSecurityPolicyWithTargetsAndCheck(policy_name, table, filter_json, filter_json, role_targets);
+    }
+
+    pub fn createSqlRowSecurityPolicyWithTargetsAndCheck(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, check_filter_json: []const u8, role_targets: []const []const u8) !void {
         const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
         defer self.alloc.free(subject);
         if (self.getSubjectRowFilter(subject, table)) |existing| {
@@ -1549,6 +1557,8 @@ pub const UserManager = struct {
             else => return err,
         }
         try self.setSubjectRowFilter(subject, table, filter_json);
+        errdefer self.removeSubjectRowFilter(subject, table) catch {};
+        try self.setSubjectSqlRowSecurityCheckFilter(subject, table, check_filter_json);
         try self.replaceSqlRowSecurityPolicyTargets(subject, table, role_targets);
     }
 
@@ -1557,11 +1567,16 @@ pub const UserManager = struct {
     }
 
     pub fn replaceSqlRowSecurityPolicyWithTargets(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, role_targets: []const []const u8) !void {
+        try self.replaceSqlRowSecurityPolicyWithTargetsAndCheck(policy_name, table, filter_json, filter_json, role_targets);
+    }
+
+    pub fn replaceSqlRowSecurityPolicyWithTargetsAndCheck(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, check_filter_json: []const u8, role_targets: []const []const u8) !void {
         const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
         defer self.alloc.free(subject);
         const existing = try self.getSubjectRowFilter(subject, table);
         self.alloc.free(existing);
         try self.setSubjectRowFilter(subject, table, filter_json);
+        try self.setSubjectSqlRowSecurityCheckFilter(subject, table, check_filter_json);
         try self.replaceSqlRowSecurityPolicyTargets(subject, table, role_targets);
     }
 
@@ -1569,6 +1584,7 @@ pub const UserManager = struct {
         const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
         defer self.alloc.free(subject);
         try self.removeSubjectRowFilter(subject, table);
+        _ = try self.enforcer.removeFilteredNamedPolicy("p8", 0, &.{ subject, table });
         _ = try self.enforcer.removeFilteredNamedPolicy("p7", 0, &.{ subject, table });
     }
 
@@ -1576,6 +1592,12 @@ pub const UserManager = struct {
         const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
         defer self.alloc.free(subject);
         return try self.getSubjectRowFilter(subject, table);
+    }
+
+    pub fn getSqlRowSecurityPolicyCheck(self: *const UserManager, policy_name: []const u8, table: []const u8) ![]u8 {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        return try self.getSubjectSqlRowSecurityCheckFilter(subject, table);
     }
 
     fn replaceSqlRowSecurityPolicyTargets(self: *UserManager, policy_subject: []const u8, table: []const u8, role_targets: []const []const u8) !void {
@@ -1587,7 +1609,15 @@ pub const UserManager = struct {
     }
 
     fn mergeSqlRowSecurityPolicyFilters(self: *const UserManager, username: []const u8, roles: []const []const u8, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
-        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{});
+        return try self.mergeSqlRowSecurityPolicyFiltersFromPolicy("p2", username, roles, merged);
+    }
+
+    fn mergeSqlRowSecurityPolicyCheckFilters(self: *const UserManager, username: []const u8, roles: []const []const u8, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+        return try self.mergeSqlRowSecurityPolicyFiltersFromPolicy("p8", username, roles, merged);
+    }
+
+    fn mergeSqlRowSecurityPolicyFiltersFromPolicy(self: *const UserManager, ptype: []const u8, username: []const u8, roles: []const []const u8, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, ptype, 0, &.{});
         defer {
             for (rules) |*rule| rule.deinit(self.alloc);
             self.alloc.free(rules);
@@ -1744,6 +1774,7 @@ pub const UserManager = struct {
 
         try self.collectAuthSubjectsFromPolicy(&subjects, "p");
         try self.collectAuthSubjectsFromPolicy(&subjects, "p2");
+        try self.collectAuthSubjectsFromPolicy(&subjects, "p8");
         try self.collectAuthSubjectsFromPolicy(&subjects, "p7");
         try self.collectAuthSubjectsFromPolicy(&subjects, "g");
 
@@ -1788,6 +1819,13 @@ pub const UserManager = struct {
         _ = try self.enforcer.addNamedPolicy("p2", &.{ subject, table, filter_json });
     }
 
+    fn setSubjectSqlRowSecurityCheckFilter(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{});
+        parsed.deinit();
+        _ = try self.enforcer.removeFilteredNamedPolicy("p8", 0, &.{ subject, table });
+        _ = try self.enforcer.addNamedPolicy("p8", &.{ subject, table, filter_json });
+    }
+
     pub fn setRowFilter(self: *UserManager, username: []const u8, table: []const u8, filter_json: []const u8) !void {
         if (!self.users.contains(username)) return error.UserNotFound;
         try self.setSubjectRowFilter(username, table, filter_json);
@@ -1805,6 +1843,16 @@ pub const UserManager = struct {
 
     pub fn getSubjectRowFilter(self: *const UserManager, subject: []const u8, table: []const u8) ![]u8 {
         const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{ subject, table });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 3) return error.RowFilterNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[2]);
+    }
+
+    fn getSubjectSqlRowSecurityCheckFilter(self: *const UserManager, subject: []const u8, table: []const u8) ![]u8 {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p8", 0, &.{ subject, table });
         defer {
             for (rules) |*rule| rule.deinit(self.alloc);
             self.alloc.free(rules);
@@ -1842,6 +1890,19 @@ pub const UserManager = struct {
     }
 
     pub fn getRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        return try self.getEffectiveRowFiltersFromSqlPolicy(username, .read);
+    }
+
+    pub fn getWriteRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        return try self.getEffectiveRowFiltersFromSqlPolicy(username, .write);
+    }
+
+    const SqlRowSecurityFilterMode = enum {
+        read,
+        write,
+    };
+
+    fn getEffectiveRowFiltersFromSqlPolicy(self: *const UserManager, username: []const u8, mode: SqlRowSecurityFilterMode) ![]RowFilterEntry {
         if (!self.users.contains(username)) return error.UserNotFound;
         const listed = try self.listSubjectRowFilters(username);
         defer {
@@ -1865,7 +1926,10 @@ pub const UserManager = struct {
             try mergeRowFilterEntry(self.alloc, &merged, entry);
         }
 
-        try self.mergeSqlRowSecurityPolicyFilters(username, roles, &merged);
+        switch (mode) {
+            .read => try self.mergeSqlRowSecurityPolicyFilters(username, roles, &merged),
+            .write => try self.mergeSqlRowSecurityPolicyCheckFilters(username, roles, &merged),
+        }
 
         for (roles) |role| {
             const role_filters = try self.listSubjectRowFilters(role);

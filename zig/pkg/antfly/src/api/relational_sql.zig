@@ -2198,16 +2198,16 @@ const Parser = struct {
             if (self.matchKeyword("or")) {
                 try self.expectKeyword("replace");
                 if (self.peekKeyword("trigger")) {
-                    return .{ .create_update_policy = try self.parseCreateTriggerPolicyDdl() };
+                    return .{ .create_update_policy = try sql_adapter.parseCreateUpdatePolicyTriggerPlanTailAlloc(self.alloc, self.tokens, &self.pos) };
                 }
                 if (self.peekKeyword("materialized")) {
-                    return .{ .materialized_view_catalog = .{ .create = try self.parseCreateMaterializedViewDdl(true) } };
+                    return .{ .materialized_view_catalog = .{ .create = try sql_adapter.parseCreateMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos, true) } };
                 }
                 if (self.peekKeyword("view")) {
-                    return .{ .view_catalog = .{ .create = try self.parseCreateViewDdl(true) } };
+                    return .{ .view_catalog = .{ .create = try sql_adapter.parseCreateViewPlanTailAlloc(self.alloc, self.tokens, &self.pos, true) } };
                 }
                 if (self.peekKeyword("function") or self.peekKeyword("procedure")) {
-                    return .{ .function_catalog = .{ .create = try self.parseCreateRoutineDdl(true) } };
+                    return .{ .function_catalog = .{ .create = try sql_adapter.parseCreateRoutinePlanTailAlloc(self.alloc, self.tokens, &self.pos, true) } };
                 }
                 if (!self.peekKeyword("table")) return error.UnsupportedSqlShape;
                 var create_table = try self.parseCreateTableDdl();
@@ -2220,25 +2220,23 @@ const Parser = struct {
             }
             if (unique) return error.UnsupportedSqlShape;
             if (self.peekKeyword("trigger")) {
-                return .{ .create_update_policy = try self.parseCreateTriggerPolicyDdl() };
+                return .{ .create_update_policy = try sql_adapter.parseCreateUpdatePolicyTriggerPlanTailAlloc(self.alloc, self.tokens, &self.pos) };
             }
             if (self.peekKeyword("materialized")) {
-                return .{ .materialized_view_catalog = .{ .create = try self.parseCreateMaterializedViewDdl(false) } };
+                return .{ .materialized_view_catalog = .{ .create = try sql_adapter.parseCreateMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos, false) } };
             }
             if (self.peekKeyword("view")) {
-                return .{ .view_catalog = .{ .create = try self.parseCreateViewDdl(false) } };
+                return .{ .view_catalog = .{ .create = try sql_adapter.parseCreateViewPlanTailAlloc(self.alloc, self.tokens, &self.pos, false) } };
             }
             if (self.peekKeyword("domain")) {
                 return .{ .domain_catalog = .{ .create = try self.parseCreateDomainDdl() } };
             }
-            if (self.peekKeyword("sequence")) {
-                return .{ .sequence_catalog = .{ .create = try self.parseCreateSequenceDdl() } };
-            }
+            if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .create = try sql_adapter.parseCreateSequencePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
             if (self.peekKeyword("type")) {
-                return .{ .enum_type_catalog = .{ .create = try self.parseCreateEnumTypeDdl() } };
+                return .{ .enum_type_catalog = .{ .create = try sql_adapter.parseCreateEnumTypePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
             }
             if (self.peekKeyword("schema")) {
-                var create_schema = try self.parseCreateSchemaNamespaceDdl();
+                var create_schema = try sql_adapter.parseCreateSchemaNamespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
                 if (create_schema.if_not_exists and std.ascii.eqlIgnoreCase(create_schema.schema_name, "public")) {
                     create_schema.deinit(self.alloc);
                     return .{ .adapter_noop = .{ .reason = .schema_namespace } };
@@ -2246,7 +2244,7 @@ const Parser = struct {
                 return .{ .schema_namespace_catalog = .{ .create = create_schema } };
             }
             if (self.peekKeyword("extension")) {
-                var create_extension = try self.parseCreateExtensionDdl();
+                var create_extension = try sql_adapter.parseCreateExtensionPlanTailAlloc(self.alloc, self.tokens, &self.pos, catalog_resources.default_namespace_name);
                 if (create_extension.if_not_exists and sql_adapter.isAdapterNoopExtensionName(create_extension.extension_name)) {
                     create_extension.deinit(self.alloc);
                     return .{ .adapter_noop = .{ .reason = .extension } };
@@ -2254,38 +2252,22 @@ const Parser = struct {
                 return .{ .extension_catalog = .{ .create = create_extension } };
             }
             if (self.peekKeyword("function") or self.peekKeyword("procedure")) {
-                return .{ .function_catalog = .{ .create = try self.parseCreateRoutineDdl(false) } };
+                return .{ .function_catalog = .{ .create = try sql_adapter.parseCreateRoutinePlanTailAlloc(self.alloc, self.tokens, &self.pos, false) } };
             }
             if (self.peekKeyword("role")) {
-                return .{ .authorization_catalog = .{ .create_role = try self.parseCreateRoleDdl() } };
+                return .{ .authorization_catalog = .{ .create_role = try sql_adapter.parseCreateRolePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
             }
             if (self.peekKeyword("policy")) {
                 return .{ .row_security_catalog = .{ .create_policy = try self.parseCreateRowSecurityPolicyDdl() } };
             }
-            if (self.peekKeyword("database")) {
-                return .{ .database_catalog = .{ .create = try self.parseCreateDatabaseDdl() } };
-            }
-            if (self.peekKeyword("tablespace")) {
-                return .{ .tablespace_catalog = .{ .create = try self.parseCreateTablespaceDdl() } };
-            }
-            if (self.peekKeyword("publication")) {
-                return .{ .logical_replication = .{ .publication = .{ .create = try self.parseCreatePublicationDdl() } } };
-            }
-            if (self.peekKeyword("subscription")) {
-                return .{ .logical_replication = .{ .subscription = .{ .create = try self.parseCreateSubscriptionDdl() } } };
-            }
-            if (self.peekKeyword("collation")) {
-                return .{ .type_system_catalog = .{ .collation = .{ .create = try self.parseCreateCollationDdl() } } };
-            }
-            if (self.peekKeyword("operator")) {
-                return .{ .type_system_catalog = .{ .operator = .{ .create = try self.parseCreateOperatorDdl() } } };
-            }
-            if (self.peekKeyword("aggregate")) {
-                return .{ .type_system_catalog = .{ .aggregate = .{ .create = try self.parseCreateAggregateDdl() } } };
-            }
-            if (self.peekKeyword("cast")) {
-                return .{ .type_system_catalog = .{ .cast = .{ .create = try self.parseCreateCastDdl() } } };
-            }
+            if (self.peekKeyword("database")) return .{ .database_catalog = .{ .create = try sql_adapter.parseCreateDatabasePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .create = try sql_adapter.parseCreateTablespacePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("publication")) return .{ .logical_replication = .{ .publication = .{ .create = try sql_adapter.parseCreatePublicationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("subscription")) return .{ .logical_replication = .{ .subscription = .{ .create = try sql_adapter.parseCreateSubscriptionPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .create = try sql_adapter.parseCreateCollationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("operator")) return .{ .type_system_catalog = .{ .operator = .{ .create = try sql_adapter.parseCreateOperatorPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("aggregate")) return .{ .type_system_catalog = .{ .aggregate = .{ .create = try sql_adapter.parseCreateAggregatePlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("cast")) return .{ .type_system_catalog = .{ .cast = .{ .create = try sql_adapter.parseCreateCastPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
             if (self.peekKeyword("temporary") or self.peekKeyword("temp") or self.peekKeyword("unlogged")) {
                 return .{ .relation_lifetime = try self.parseRelationLifetimeDdl() };
             }
@@ -2296,7 +2278,7 @@ const Parser = struct {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
                 else => return err,
             }
-            if (self.parseCreateTablePartitionDdl()) |partition| {
+            if (sql_adapter.parseCreateTablePartitionPlanTailAlloc(self.alloc, self.tokens, &self.pos)) |partition| {
                 return .{ .table_partition_catalog = .{ .create_partition = partition } };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2308,7 +2290,7 @@ const Parser = struct {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
                 else => return err,
             }
-            if (self.parseTableCloneDdl()) |table_clone| {
+            if (sql_adapter.parseCreateTableClonePlanTailAlloc(self.alloc, self.tokens, &self.pos)) |table_clone| {
                 return .{ .table_clone = table_clone };
             } else |err| switch (err) {
                 error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2317,22 +2299,22 @@ const Parser = struct {
             return .{ .create_table = try self.parseCreateTableDdl() };
         }
         if (self.matchKeyword("alter")) {
-            if (self.peekKeyword("domain")) return .{ .domain_catalog = .{ .alter = try self.parseAlterDomainDdl() } };
-            if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .alter = try self.parseAlterSequenceDdl() } };
-            if (self.peekKeyword("type")) return .{ .enum_type_catalog = .{ .add_value = try self.parseAlterEnumTypeDdl() } };
-            if (self.peekKeyword("extension")) return .{ .extension_catalog = .{ .update = try self.parseAlterExtensionDdl() } };
-            if (self.peekKeyword("schema")) return .{ .schema_namespace_catalog = .{ .rename = try self.parseRenameSchemaNamespaceDdl() } };
-            if (self.peekKeyword("database")) return .{ .database_catalog = .{ .alter = try self.parseAlterDatabaseDdl() } };
-            if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .rename = try self.parseRenameTablespaceDdl() } };
-            if (self.peekKeyword("publication")) return .{ .logical_replication = .{ .publication = .{ .alter = try self.parseAlterPublicationDdl() } } };
-            if (self.peekKeyword("subscription")) return .{ .logical_replication = .{ .subscription = .{ .alter = try self.parseAlterSubscriptionDdl() } } };
-            if (self.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .rename = try self.parseRenameCollationDdl() } } };
-            if (self.peekKeyword("view")) return .{ .view_catalog = .{ .rename = try self.parseRenameViewDdl() } };
-            if (self.peekKeyword("role")) return .{ .authorization_catalog = .{ .alter_role = try self.parseAlterRoleDdl() } };
+            if (self.peekKeyword("domain")) return .{ .domain_catalog = .{ .alter = try sql_adapter.parseAlterDomainPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .alter = try sql_adapter.parseAlterSequencePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("type")) return .{ .enum_type_catalog = .{ .add_value = try sql_adapter.parseAlterEnumTypePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("extension")) return .{ .extension_catalog = .{ .update = try sql_adapter.parseUpdateExtensionPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("schema")) return .{ .schema_namespace_catalog = .{ .rename = try sql_adapter.parseRenameSchemaNamespacePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("database")) return .{ .database_catalog = .{ .alter = try sql_adapter.parseAlterDatabasePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .rename = try sql_adapter.parseRenameTablespacePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("publication")) return .{ .logical_replication = .{ .publication = .{ .alter = try sql_adapter.parseAlterPublicationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("subscription")) return .{ .logical_replication = .{ .subscription = .{ .alter = try sql_adapter.parseAlterSubscriptionPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .rename = try sql_adapter.parseRenameCollationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("view")) return .{ .view_catalog = .{ .rename = try sql_adapter.parseRenameViewPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("role")) return .{ .authorization_catalog = .{ .alter_role = try sql_adapter.parseAlterRolePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
             if (self.peekKeyword("policy")) return .{ .row_security_catalog = .{ .alter_policy = try self.parseAlterRowSecurityPolicyDdl() } };
             if (self.peekKeyword("table")) {
                 const checkpoint = self.pos;
-                if (self.parseAlterRowSecurityDdl()) |row_security| {
+                if (sql_adapter.parseAlterRowSecurityPlanTailAlloc(self.alloc, self.tokens, &self.pos)) |row_security| {
                     return .{ .row_security_catalog = .{ .alter_table = row_security } };
                 } else |err| switch (err) {
                     error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2341,7 +2323,7 @@ const Parser = struct {
             }
             if (self.peekKeyword("table")) {
                 const checkpoint = self.pos;
-                if (self.parseAlterTablePartitionDdl()) |partition| {
+                if (sql_adapter.parseAlterTablePartitionPlanTailAlloc(self.alloc, self.tokens, &self.pos)) |partition| {
                     return .{ .table_partition_catalog = partition };
                 } else |err| switch (err) {
                     error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2351,117 +2333,117 @@ const Parser = struct {
             return .{ .alter_table = try self.parseAlterTableDdl() };
         }
         if (self.matchKeyword("drop")) {
-            if (self.peekKeyword("materialized")) return .{ .materialized_view_catalog = .{ .drop = try self.parseDropMaterializedViewDdl() } };
-            if (self.peekKeyword("view")) return .{ .view_catalog = .{ .drop = try self.parseDropViewDdl() } };
-            if (self.peekKeyword("domain")) return .{ .domain_catalog = .{ .drop = try self.parseDropDomainDdl() } };
-            if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .drop = try self.parseDropSequenceDdl() } };
-            if (self.peekKeyword("type")) return .{ .enum_type_catalog = .{ .drop = try self.parseDropEnumTypeDdl() } };
-            if (self.peekKeyword("schema")) return .{ .schema_namespace_catalog = .{ .drop = try self.parseDropSchemaNamespaceDdl() } };
-            if (self.peekKeyword("extension")) return .{ .extension_catalog = .{ .drop = try self.parseDropExtensionDdl() } };
-            if (self.peekKeyword("database")) return .{ .database_catalog = .{ .drop = try self.parseDropDatabaseDdl() } };
-            if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .drop = try self.parseDropTablespaceDdl() } };
-            if (self.peekKeyword("publication")) return .{ .logical_replication = .{ .publication = .{ .drop = try self.parseDropPublicationDdl() } } };
-            if (self.peekKeyword("subscription")) return .{ .logical_replication = .{ .subscription = .{ .drop = try self.parseDropSubscriptionDdl() } } };
-            if (self.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .drop = try self.parseDropCollationDdl() } } };
-            if (self.peekKeyword("operator")) return .{ .type_system_catalog = .{ .operator = .{ .drop = try self.parseDropOperatorDdl() } } };
-            if (self.peekKeyword("aggregate")) return .{ .type_system_catalog = .{ .aggregate = .{ .drop = try self.parseDropAggregateDdl() } } };
-            if (self.peekKeyword("cast")) return .{ .type_system_catalog = .{ .cast = .{ .drop = try self.parseDropCastDdl() } } };
-            if (self.peekKeyword("function") or self.peekKeyword("procedure")) return .{ .function_catalog = .{ .drop = try self.parseDropRoutineDdl() } };
-            if (self.peekKeyword("role")) return .{ .authorization_catalog = .{ .drop_role = try self.parseDropRoleDdl() } };
-            if (self.peekKeyword("policy")) return .{ .row_security_catalog = .{ .drop_policy = try self.parseDropRowSecurityPolicyDdl() } };
-            if (self.peekKeyword("table")) return .{ .drop_table = try self.parseDropTableDdl() };
-            if (self.peekKeyword("trigger")) return .{ .alter_table = try self.parseDropTriggerPolicyDdl() };
-            return .{ .drop_index = try self.parseDropIndexDdl() };
+            if (self.peekKeyword("materialized")) return .{ .materialized_view_catalog = .{ .drop = try sql_adapter.parseDropMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("view")) return .{ .view_catalog = .{ .drop = try sql_adapter.parseDropViewPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("domain")) return .{ .domain_catalog = .{ .drop = try sql_adapter.parseDropDomainPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .drop = try sql_adapter.parseDropSequencePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("type")) return .{ .enum_type_catalog = .{ .drop = try sql_adapter.parseDropEnumTypePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("schema")) return .{ .schema_namespace_catalog = .{ .drop = try sql_adapter.parseDropSchemaNamespacePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("extension")) return .{ .extension_catalog = .{ .drop = try sql_adapter.parseDropExtensionPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("database")) return .{ .database_catalog = .{ .drop = try sql_adapter.parseDropDatabasePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("tablespace")) return .{ .tablespace_catalog = .{ .drop = try sql_adapter.parseDropTablespacePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("publication")) return .{ .logical_replication = .{ .publication = .{ .drop = try sql_adapter.parseDropPublicationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("subscription")) return .{ .logical_replication = .{ .subscription = .{ .drop = try sql_adapter.parseDropSubscriptionPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("collation")) return .{ .type_system_catalog = .{ .collation = .{ .drop = try sql_adapter.parseDropCollationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("operator")) return .{ .type_system_catalog = .{ .operator = .{ .drop = try sql_adapter.parseDropOperatorPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("aggregate")) return .{ .type_system_catalog = .{ .aggregate = .{ .drop = try sql_adapter.parseDropAggregatePlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("cast")) return .{ .type_system_catalog = .{ .cast = .{ .drop = try sql_adapter.parseDropCastPlanTailAlloc(self.alloc, self.tokens, &self.pos) } } };
+            if (self.peekKeyword("function") or self.peekKeyword("procedure")) return .{ .function_catalog = .{ .drop = try sql_adapter.parseDropRoutinePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("role")) return .{ .authorization_catalog = .{ .drop_role = try sql_adapter.parseDropRolePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("policy")) return .{ .row_security_catalog = .{ .drop_policy = try sql_adapter.parseDropRowSecurityPolicyPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("table")) return .{ .drop_table = try sql_adapter.parseDropTablePlanTailAlloc(self.alloc, self.tokens, &self.pos) };
+            if (self.peekKeyword("trigger")) return .{ .alter_table = try sql_adapter.parseDropUpdatePolicyTriggerPlanTailAlloc(self.alloc, self.tokens, &self.pos) };
+            return .{ .drop_index = try sql_adapter.parseDropIndexPlanTailAlloc(self.alloc, self.tokens, &self.pos) };
         }
         if (self.matchKeyword("refresh")) {
-            return .{ .materialized_view_catalog = .{ .refresh = try self.parseRefreshMaterializedViewDdl() } };
+            return .{ .materialized_view_catalog = .{ .refresh = try sql_adapter.parseRefreshMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("listen")) {
-            return .{ .notification_channel = .{ .listen = try self.parseListenNotificationDdl() } };
+            return .{ .notification_channel = .{ .listen = try sql_adapter.parseListenNotificationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("notify")) {
-            return .{ .notification_channel = .{ .notify = try self.parseNotifyNotificationDdl() } };
+            return .{ .notification_channel = .{ .notify = try sql_adapter.parseNotifyNotificationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("unlisten")) {
-            return .{ .notification_channel = .{ .unlisten = try self.parseUnlistenNotificationDdl() } };
+            return .{ .notification_channel = .{ .unlisten = try sql_adapter.parseUnlistenNotificationPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("vacuum")) {
-            return .{ .maintenance_job = .{ .vacuum = try self.parseVacuumMaintenanceDdl() } };
+            return .{ .maintenance_job = .{ .vacuum = try sql_adapter.parseVacuumMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("analyze")) {
-            return .{ .maintenance_job = .{ .analyze = try self.parseAnalyzeMaintenanceDdl() } };
+            return .{ .maintenance_job = .{ .analyze = try sql_adapter.parseAnalyzeMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("reindex")) {
-            return .{ .maintenance_job = .{ .reindex = try self.parseReindexMaintenanceDdl() } };
+            return .{ .maintenance_job = .{ .reindex = try sql_adapter.parseReindexMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("cluster")) {
-            return .{ .maintenance_job = .{ .cluster = try self.parseClusterMaintenanceDdl() } };
+            return .{ .maintenance_job = .{ .cluster = try sql_adapter.parseClusterMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("copy")) {
             return .{ .bulk_io = try self.parseBulkIoDdl() };
         }
         if (self.matchKeyword("prepare")) {
             if (self.peekKeyword("transaction")) {
-                return .{ .prepared_transaction = try self.parsePreparedTransactionDdl(.prepare) };
+                return .{ .prepared_transaction = try sql_adapter.parsePreparedTransactionTailAlloc(self.alloc, self.tokens, &self.pos, .prepare) };
             }
-            return .{ .prepared_statement = .{ .prepare = try self.parsePrepareStatementDdl() } };
+            return .{ .prepared_statement = .{ .prepare = try sql_adapter.parsePrepareStatementPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("execute")) {
-            return .{ .prepared_statement = .{ .execute = try self.parseExecutePreparedStatementDdl() } };
+            return .{ .prepared_statement = .{ .execute = try sql_adapter.parseExecutePreparedStatementPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("deallocate")) {
-            return .{ .prepared_statement = .{ .deallocate = try self.parseDeallocatePreparedStatementDdl() } };
+            return .{ .prepared_statement = .{ .deallocate = try sql_adapter.parseDeallocatePreparedStatementPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("declare")) {
-            return .{ .cursor_portal = .{ .declare = try self.parseDeclareCursorPortalDdl() } };
+            return .{ .cursor_portal = .{ .declare = try sql_adapter.parseDeclareCursorPortalPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("fetch")) {
-            return .{ .cursor_portal = .{ .fetch = try self.parseFetchCursorPortalDdl() } };
+            return .{ .cursor_portal = .{ .fetch = try sql_adapter.parseFetchCursorPortalPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("close")) {
-            return .{ .cursor_portal = .{ .close = try self.parseCloseCursorPortalDdl() } };
+            return .{ .cursor_portal = .{ .close = try sql_adapter.parseCloseCursorPortalPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("savepoint")) {
-            return .{ .savepoint_transaction = .{ .savepoint = try self.parseSavepointTransactionDdl() } };
+            return .{ .savepoint_transaction = .{ .savepoint = try sql_adapter.parseSavepointTransactionPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("release")) {
-            return .{ .savepoint_transaction = .{ .release = try self.parseReleaseSavepointDdl() } };
+            return .{ .savepoint_transaction = .{ .release = try sql_adapter.parseReleaseSavepointPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("rollback")) {
             if (self.peekKeyword("prepared")) {
-                return .{ .prepared_transaction = try self.parsePreparedTransactionDdl(.rollback) };
+                return .{ .prepared_transaction = try sql_adapter.parsePreparedTransactionTailAlloc(self.alloc, self.tokens, &self.pos, .rollback) };
             }
             if (!self.peekKeyword("to") and !self.peekKeyword("savepoint")) {
                 if (!try sql_adapter.matchAdapterNoopTransactionBoundaryTail(self.tokens, &self.pos, .{ .work = true, .transaction = true })) return error.UnsupportedSqlShape;
                 return .{ .adapter_noop = .{ .reason = .transaction_control } };
             }
-            return .{ .savepoint_transaction = .{ .rollback_to = try self.parseRollbackToSavepointDdl() } };
+            return .{ .savepoint_transaction = .{ .rollback_to = try sql_adapter.parseRollbackToSavepointPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("commit")) {
             if (self.peekKeyword("prepared")) {
-                return .{ .prepared_transaction = try self.parsePreparedTransactionDdl(.commit) };
+                return .{ .prepared_transaction = try sql_adapter.parsePreparedTransactionTailAlloc(self.alloc, self.tokens, &self.pos, .commit) };
             }
             if (!try sql_adapter.matchAdapterNoopTransactionBoundaryTail(self.tokens, &self.pos, .{ .work = true, .transaction = true })) return error.UnsupportedSqlShape;
             return .{ .adapter_noop = .{ .reason = .transaction_control } };
         }
         if (self.matchKeyword("comment")) {
-            return .{ .comment_metadata = try self.parseCommentMetadataDdl() };
+            return .{ .comment_metadata = try sql_adapter.parseCommentMetadataPlanTailAlloc(self.alloc, self.tokens, &self.pos) };
         }
         if (self.matchKeyword("grant")) {
-            return .{ .authorization_catalog = .{ .grant_privilege = try self.parsePrivilegeChangeDdl(.grant) } };
+            return .{ .authorization_catalog = .{ .grant_privilege = try sql_adapter.parsePrivilegeChangePlanTailAlloc(self.alloc, self.tokens, &self.pos, .grant) } };
         }
         if (self.matchKeyword("revoke")) {
-            return .{ .authorization_catalog = .{ .revoke_privilege = try self.parsePrivilegeChangeDdl(.revoke) } };
+            return .{ .authorization_catalog = .{ .revoke_privilege = try sql_adapter.parsePrivilegeChangePlanTailAlloc(self.alloc, self.tokens, &self.pos, .revoke) } };
         }
         if (self.matchKeyword("lock")) {
-            return .{ .transaction_control = .{ .table_lock = try self.parseTableLockDdl() } };
+            return .{ .transaction_control = .{ .table_lock = try sql_adapter.parseTableLockPlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("set")) {
-            if (self.peekKeyword("constraints")) return .{ .transaction_control = .{ .constraint_mode = try self.parseConstraintModeDdl() } };
-            if (self.peekKeyword("transaction")) return .{ .transaction_control = .{ .transaction_mode = try self.parseTransactionModeDdl(.set_transaction) } };
+            if (self.peekKeyword("constraints")) return .{ .transaction_control = .{ .constraint_mode = try sql_adapter.parseConstraintModePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
+            if (self.peekKeyword("transaction")) return .{ .transaction_control = .{ .transaction_mode = try sql_adapter.parseTransactionModePlanTail(self.tokens, &self.pos, .set_transaction) } };
             if (self.peekKeyword("local") or self.peekKeyword("session") or self.peekKeyword("search_path")) {
                 const checkpoint = self.pos;
-                if (self.parseSetSearchPathDdl()) |plan| {
+                if (sql_adapter.parseSetSearchPathPlanTailAlloc(self.alloc, self.tokens, &self.pos)) |plan| {
                     return .{ .session_catalog = .{ .set_search_path = plan } };
                 } else |err| switch (err) {
                     error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2470,7 +2452,7 @@ const Parser = struct {
             }
             {
                 const checkpoint = self.pos;
-                if (self.parseSetSessionSettingDdl()) |plan| {
+                if (sql_adapter.parseSetSessionSettingTailAlloc(self.alloc, self.tokens, &self.pos)) |plan| {
                     return .{ .session_catalog = .{ .set_setting = plan } };
                 } else |err| switch (err) {
                     error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2491,7 +2473,7 @@ const Parser = struct {
             }
             {
                 const checkpoint = self.pos;
-                if (self.parseResetSessionSettingDdl()) |plan| {
+                if (sql_adapter.parseResetSessionSettingTailAlloc(self.alloc, self.tokens, &self.pos)) |plan| {
                     return .{ .session_catalog = .{ .reset_setting = plan } };
                 } else |err| switch (err) {
                     error.UnsupportedSqlShape => self.pos = checkpoint,
@@ -2519,41 +2501,25 @@ const Parser = struct {
                 return .{ .adapter_noop = .{ .reason = .transaction_control } };
             }
             self.pos = checkpoint;
-            return .{ .transaction_control = .{ .transaction_mode = try self.parseTransactionModeDdl(.start_transaction) } };
+            return .{ .transaction_control = .{ .transaction_mode = try sql_adapter.parseTransactionModePlanTail(self.tokens, &self.pos, .start_transaction) } };
         }
         if (self.matchKeyword("begin")) {
             if (try sql_adapter.matchAdapterNoopTransactionBoundaryTail(self.tokens, &self.pos, .{ .work = true, .transaction = true })) {
                 return .{ .adapter_noop = .{ .reason = .transaction_control } };
             }
-            return .{ .transaction_control = .{ .transaction_mode = try self.parseTransactionModeDdl(.begin) } };
+            return .{ .transaction_control = .{ .transaction_mode = try sql_adapter.parseTransactionModePlanTail(self.tokens, &self.pos, .begin) } };
         }
         if (self.matchKeyword("select")) {
-            return .{ .transaction_control = .{ .advisory_lock = try self.parseAdvisoryLockDdl() } };
+            return .{ .transaction_control = .{ .advisory_lock = try sql_adapter.parseAdvisoryLockPlanTail(self.tokens, &self.pos) } };
         }
         return error.UnsupportedSqlShape;
-    }
-
-    fn parseSetSearchPathDdl(self: *@This()) !SetSearchPathPlan {
-        var syntax = try sql_adapter.parseSetSearchPathTailAlloc(self.alloc, self.tokens, &self.pos);
-        errdefer syntax.deinit(self.alloc);
-        const namespaces = syntax.namespaces;
-        syntax.namespaces = &.{};
-        return .{ .namespaces = namespaces, .local = syntax.local };
-    }
-
-    fn parseSetSessionSettingDdl(self: *@This()) !sql_adapter.SetSessionSettingPlan {
-        return try sql_adapter.parseSetSessionSettingTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseResetSessionSettingDdl(self: *@This()) !sql_adapter.ResetSessionSettingPlan {
-        return try sql_adapter.parseResetSessionSettingTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseCreateDomainDdl(self: *@This()) !CreateDomainPlan {
         var header = try sql_adapter.parseCreateDomainHeaderAlloc(self.alloc, self.tokens, &self.pos);
         var header_transferred = false;
         errdefer if (!header_transferred) header.deinit(self.alloc);
-        const ddl_type = try self.parseDdlType();
+        const ddl_type = try sql_adapter.parseDdlType(self.tokens, &self.pos);
         var not_null = false;
         var default_value: ?runtime_schema.RelationalDefaultValue = null;
         errdefer if (default_value) |default| self.alloc.free(default.value_json);
@@ -2606,54 +2572,6 @@ const Parser = struct {
             .default_value = out_default,
             .checks = owned_checks,
         };
-    }
-
-    fn parseCreateSchemaNamespaceDdl(self: *@This()) !CreateSchemaNamespacePlan {
-        return try sql_adapter.parseCreateSchemaNamespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseRenameSchemaNamespaceDdl(self: *@This()) !RenameSchemaNamespacePlan {
-        return try sql_adapter.parseRenameSchemaNamespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropSchemaNamespaceDdl(self: *@This()) !DropSchemaNamespacePlan {
-        return try sql_adapter.parseDropSchemaNamespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateExtensionDdl(self: *@This()) !CreateExtensionPlan {
-        return try sql_adapter.parseCreateExtensionPlanTailAlloc(self.alloc, self.tokens, &self.pos, catalog_resources.default_namespace_name);
-    }
-
-    fn parseAlterExtensionDdl(self: *@This()) !UpdateExtensionPlan {
-        return try sql_adapter.parseUpdateExtensionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropExtensionDdl(self: *@This()) !DropExtensionPlan {
-        return try sql_adapter.parseDropExtensionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateRoutineDdl(self: *@This(), replace_existing: bool) !CreateRoutinePlan {
-        return try sql_adapter.parseCreateRoutinePlanTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
-    }
-
-    fn parseDropRoutineDdl(self: *@This()) !DropRoutinePlan {
-        return try sql_adapter.parseDropRoutinePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateRoleDdl(self: *@This()) !CreateRolePlan {
-        return try sql_adapter.parseCreateRolePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterRoleDdl(self: *@This()) !AlterRolePlan {
-        return try sql_adapter.parseAlterRolePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropRoleDdl(self: *@This()) !DropRolePlan {
-        return try sql_adapter.parseDropRolePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parsePrivilegeChangeDdl(self: *@This(), action: PrivilegeChangeAction) !PrivilegeChangePlan {
-        return try sql_adapter.parsePrivilegeChangePlanTailAlloc(self.alloc, self.tokens, &self.pos, action);
     }
 
     fn parseBulkIoDdl(self: *@This()) !BulkIoPlan {
@@ -2733,198 +2651,6 @@ const Parser = struct {
         };
     }
 
-    fn parseCreateDatabaseDdl(self: *@This()) !CreateDatabasePlan {
-        return try sql_adapter.parseCreateDatabasePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterDatabaseDdl(self: *@This()) !AlterDatabasePlan {
-        return try sql_adapter.parseAlterDatabasePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropDatabaseDdl(self: *@This()) !DropDatabasePlan {
-        return try sql_adapter.parseDropDatabasePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateTablespaceDdl(self: *@This()) !CreateTablespacePlan {
-        return try sql_adapter.parseCreateTablespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseRenameTablespaceDdl(self: *@This()) !RenameTablespacePlan {
-        return try sql_adapter.parseRenameTablespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropTablespaceDdl(self: *@This()) !DropTablespacePlan {
-        return try sql_adapter.parseDropTablespacePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseListenNotificationDdl(self: *@This()) !ListenNotificationPlan {
-        return try sql_adapter.parseListenNotificationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseNotifyNotificationDdl(self: *@This()) !NotifyNotificationPlan {
-        return try sql_adapter.parseNotifyNotificationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseUnlistenNotificationDdl(self: *@This()) !UnlistenNotificationPlan {
-        return try sql_adapter.parseUnlistenNotificationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreatePublicationDdl(self: *@This()) !CreatePublicationPlan {
-        return try sql_adapter.parseCreatePublicationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterPublicationDdl(self: *@This()) !AlterPublicationPlan {
-        return try sql_adapter.parseAlterPublicationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropPublicationDdl(self: *@This()) !DropPublicationPlan {
-        return try sql_adapter.parseDropPublicationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateSubscriptionDdl(self: *@This()) !CreateSubscriptionPlan {
-        return try sql_adapter.parseCreateSubscriptionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterSubscriptionDdl(self: *@This()) !AlterSubscriptionPlan {
-        return try sql_adapter.parseAlterSubscriptionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropSubscriptionDdl(self: *@This()) !DropSubscriptionPlan {
-        return try sql_adapter.parseDropSubscriptionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseVacuumMaintenanceDdl(self: *@This()) !VacuumMaintenancePlan {
-        return try sql_adapter.parseVacuumMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAnalyzeMaintenanceDdl(self: *@This()) !AnalyzeMaintenancePlan {
-        return try sql_adapter.parseAnalyzeMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseReindexMaintenanceDdl(self: *@This()) !ReindexMaintenancePlan {
-        return try sql_adapter.parseReindexMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseClusterMaintenanceDdl(self: *@This()) !ClusterMaintenancePlan {
-        return try sql_adapter.parseClusterMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parsePrepareStatementDdl(self: *@This()) !PrepareStatementPlan {
-        return try sql_adapter.parsePrepareStatementPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseExecutePreparedStatementDdl(self: *@This()) !ExecutePreparedStatementPlan {
-        return try sql_adapter.parseExecutePreparedStatementPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDeallocatePreparedStatementDdl(self: *@This()) !DeallocatePreparedStatementPlan {
-        return try sql_adapter.parseDeallocatePreparedStatementPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parsePreparedTransactionDdl(self: *@This(), action: PreparedTransactionAction) !PreparedTransactionPlan {
-        return try sql_adapter.parsePreparedTransactionTailAlloc(self.alloc, self.tokens, &self.pos, action);
-    }
-
-    fn parseDeclareCursorPortalDdl(self: *@This()) !DeclareCursorPortalPlan {
-        return try sql_adapter.parseDeclareCursorPortalPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseFetchCursorPortalDdl(self: *@This()) !FetchCursorPortalPlan {
-        return try sql_adapter.parseFetchCursorPortalPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCloseCursorPortalDdl(self: *@This()) !CloseCursorPortalPlan {
-        return try sql_adapter.parseCloseCursorPortalPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseSavepointTransactionDdl(self: *@This()) !SavepointNamePlan {
-        return try sql_adapter.parseSavepointTransactionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseReleaseSavepointDdl(self: *@This()) !SavepointNamePlan {
-        return try sql_adapter.parseReleaseSavepointPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseRollbackToSavepointDdl(self: *@This()) !SavepointNamePlan {
-        return try sql_adapter.parseRollbackToSavepointPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCommentMetadataDdl(self: *@This()) !CommentMetadataPlan {
-        return try sql_adapter.parseCommentMetadataPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseTableLockDdl(self: *@This()) !TableLockPlan {
-        return try sql_adapter.parseTableLockPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseConstraintModeDdl(self: *@This()) !ConstraintModePlan {
-        return try sql_adapter.parseConstraintModePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseTransactionModeDdl(self: *@This(), starter: TransactionModeStarter) !TransactionModePlan {
-        return try sql_adapter.parseTransactionModePlanTail(self.tokens, &self.pos, starter);
-    }
-
-    fn parseAdvisoryLockDdl(self: *@This()) !AdvisoryLockPlan {
-        return try sql_adapter.parseAdvisoryLockPlanTail(self.tokens, &self.pos);
-    }
-
-    fn parseCreateCollationDdl(self: *@This()) !CreateCollationPlan {
-        return try sql_adapter.parseCreateCollationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseRenameCollationDdl(self: *@This()) !RenameCollationPlan {
-        return try sql_adapter.parseRenameCollationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropCollationDdl(self: *@This()) !DropCollationPlan {
-        return try sql_adapter.parseDropCollationPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateOperatorDdl(self: *@This()) !CreateOperatorPlan {
-        return try sql_adapter.parseCreateOperatorPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropOperatorDdl(self: *@This()) !DropOperatorPlan {
-        return try sql_adapter.parseDropOperatorPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateAggregateDdl(self: *@This()) !CreateAggregatePlan {
-        return try sql_adapter.parseCreateAggregatePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropAggregateDdl(self: *@This()) !DropAggregatePlan {
-        return try sql_adapter.parseDropAggregatePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateCastDdl(self: *@This()) !CreateCastPlan {
-        return try sql_adapter.parseCreateCastPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropCastDdl(self: *@This()) !DropCastPlan {
-        return try sql_adapter.parseDropCastPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterDomainDdl(self: *@This()) !AlterDomainPlan {
-        return try sql_adapter.parseAlterDomainPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropDomainDdl(self: *@This()) !DropDomainPlan {
-        return try sql_adapter.parseDropDomainPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateSequenceDdl(self: *@This()) !CreateSequencePlan {
-        return try sql_adapter.parseCreateSequencePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterSequenceDdl(self: *@This()) !AlterSequencePlan {
-        return try sql_adapter.parseAlterSequencePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropSequenceDdl(self: *@This()) !DropSequencePlan {
-        return try sql_adapter.parseDropSequencePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
     fn parseDomainCheckConstraint(
         self: *@This(),
         constraint_name: ?[]const u8,
@@ -2956,67 +2682,11 @@ const Parser = struct {
         return .{ .name = name, .field = field, .op = op, .value_json = value_json };
     }
 
-    fn parseCreateEnumTypeDdl(self: *@This()) !CreateEnumTypePlan {
-        return try sql_adapter.parseCreateEnumTypePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterEnumTypeDdl(self: *@This()) !AddEnumValuePlan {
-        return try sql_adapter.parseAlterEnumTypePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropEnumTypeDdl(self: *@This()) !DropEnumTypePlan {
-        return try sql_adapter.parseDropEnumTypePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
     fn parseRelationLifetimeDdl(self: *@This()) !RelationLifetimePlan {
         const prefix = try sql_adapter.parseRelationLifetimePrefix(self.tokens, &self.pos);
         var create_table = try self.parseCreateTableDdl();
         errdefer create_table.deinit(self.alloc);
         return .{ .kind = prefix.kind, .create_table = create_table };
-    }
-
-    fn parseCreateMaterializedViewDdl(self: *@This(), replace_existing: bool) !CreateMaterializedViewPlan {
-        return try sql_adapter.parseCreateMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
-    }
-
-    fn parseRefreshMaterializedViewDdl(self: *@This()) !RefreshMaterializedViewPlan {
-        return try sql_adapter.parseRefreshMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropMaterializedViewDdl(self: *@This()) !DropMaterializedViewPlan {
-        return try sql_adapter.parseDropMaterializedViewPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateViewDdl(self: *@This(), replace_existing: bool) !CreateViewPlan {
-        return try sql_adapter.parseCreateViewPlanTailAlloc(self.alloc, self.tokens, &self.pos, replace_existing);
-    }
-
-    fn parseRenameViewDdl(self: *@This()) !RenameViewPlan {
-        return try sql_adapter.parseRenameViewPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropViewDdl(self: *@This()) !DropViewPlan {
-        return try sql_adapter.parseDropViewPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropTableDdl(self: *@This()) !DropTablePlan {
-        return try sql_adapter.parseDropTablePlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropIndexDdl(self: *@This()) !DropIndexPlan {
-        return try sql_adapter.parseDropIndexPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseDropTriggerPolicyDdl(self: *@This()) !AlterTablePlan {
-        return try sql_adapter.parseDropUpdatePolicyTriggerPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseCreateTriggerPolicyDdl(self: *@This()) !CreateUpdatePolicyPlan {
-        return try sql_adapter.parseCreateUpdatePolicyTriggerPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterRowSecurityDdl(self: *@This()) !AlterRowSecurityPlan {
-        return try sql_adapter.parseAlterRowSecurityPlanTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseCreateRowSecurityPolicyDdl(self: *@This()) !CreateRowSecurityPolicyPlan {
@@ -3125,10 +2795,6 @@ const Parser = struct {
         } };
     }
 
-    fn parseDropRowSecurityPolicyDdl(self: *@This()) !DropRowSecurityPolicyPlan {
-        return try sql_adapter.parseDropRowSecurityPolicyPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
     fn parseAlterTableDdl(self: *@This()) !AlterTablePlan {
         var header = try sql_adapter.parseAlterTableHeaderAlloc(self.alloc, self.tokens, &self.pos);
         var header_transferred = false;
@@ -3212,7 +2878,7 @@ const Parser = struct {
                 var syntax_transferred = false;
                 errdefer if (!syntax_transferred) syntax.deinit(self.alloc);
                 const default_value: ?runtime_schema.RelationalDefaultValue = if (syntax.action == .set) blk: {
-                    const value = try self.parseDdlDefaultValueUntyped();
+                    const value = try sql_adapter.parseDdlDefaultValueUntypedAlloc(self.alloc, self.tokens, &self.pos);
                     errdefer self.alloc.free(value.value_json);
                     break :blk value;
                 } else null;
@@ -3227,11 +2893,11 @@ const Parser = struct {
             var type_header = try sql_adapter.parseAlterTableColumnTypeHeaderAlloc(self.alloc, self.tokens, &self.pos);
             var type_header_transferred = false;
             errdefer if (!type_header_transferred) type_header.deinit(self.alloc);
-            const ddl_type = try self.parseDdlType();
+            const ddl_type = try sql_adapter.parseDdlType(self.tokens, &self.pos);
             const collation = try self.parseOptionalDdlCollationAlloc(ddl_type.field_type);
             var collation_transferred = false;
             errdefer if (!collation_transferred) if (collation) |value| self.alloc.free(value);
-            var rewrite_expression = try self.parseOptionalDdlAlterColumnRewriteExpressionAlloc(type_header.column_name);
+            var rewrite_expression = try sql_adapter.parseOptionalDdlAlterColumnRewriteExpressionAlloc(self.alloc, self.tokens, &self.pos);
             var rewrite_transferred = false;
             errdefer if (!rewrite_transferred) if (rewrite_expression) |*rewrite| rewrite.deinit(self.alloc);
             const operation = sql_adapter.alterTableColumnTypeOperationFromSyntax(&type_header, ddl_type, collation, rewrite_expression);
@@ -3296,19 +2962,6 @@ const Parser = struct {
         }
 
         return error.UnsupportedSqlShape;
-    }
-
-    fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(self: *@This(), column_name: []const u8) !?AlterColumnRewriteExpression {
-        _ = column_name;
-        if (!self.matchKeyword("using")) return null;
-        const expression = try sql_adapter.parseDdlGeneratedRowExpressionAlloc(
-            self.alloc,
-            sql_adapter.Cursor.init(self.tokens, &self.pos),
-        );
-        errdefer runtime_schema.freeRelationalRowsExpression(self.alloc, expression);
-        return .{
-            .expression = expression,
-        };
     }
 
     fn parseAlterTableAddColumnOperation(
@@ -3545,7 +3198,7 @@ const Parser = struct {
         var path_transferred = false;
         errdefer if (!path_transferred) self.alloc.free(path);
 
-        var identity = try self.parseIdentityAllocatorSpec();
+        var identity = try sql_adapter.parseIdentityAllocatorSpecAlloc(self.alloc, self.tokens, &self.pos);
         var identity_transferred = false;
         errdefer if (!identity_transferred) identity.deinit(self.alloc);
         var primary_key = false;
@@ -3599,10 +3252,6 @@ const Parser = struct {
             .primary_key = primary_key,
             .additional_columns = owned_additional_columns,
         };
-    }
-
-    fn parseIdentityAllocatorSpec(self: *@This()) !IdentityAllocatorSpec {
-        return sql_adapter.parseIdentityAllocatorSpecAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseCreateTableDdl(self: *@This()) !CreateTablePlan {
@@ -3683,21 +3332,9 @@ const Parser = struct {
         return plan;
     }
 
-    fn parseCreateTablePartitionDdl(self: *@This()) !CreateTablePartitionPlan {
-        return sql_adapter.parseCreateTablePartitionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
-    fn parseAlterTablePartitionDdl(self: *@This()) !TablePartitionCatalogPlan {
-        return sql_adapter.parseAlterTablePartitionPlanTailAlloc(self.alloc, self.tokens, &self.pos);
-    }
-
     fn expectDdlEnd(self: *@This()) !void {
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
         if (!self.atEnd()) return error.UnsupportedSqlShape;
-    }
-
-    fn parseTableCloneDdl(self: *@This()) !TableClonePlan {
-        return sql_adapter.parseCreateTableClonePlanTailAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseDdlColumnDefinition(
@@ -3862,7 +3499,7 @@ const Parser = struct {
         var name_transferred = false;
         errdefer if (!name_transferred) self.alloc.free(name);
 
-        const ddl_type = try self.parseDdlType();
+        const ddl_type = try sql_adapter.parseDdlType(self.tokens, &self.pos);
         const path = try self.alloc.dupe(u8, name);
         var path_transferred = false;
         errdefer if (!path_transferred) self.alloc.free(path);
@@ -3993,10 +3630,6 @@ const Parser = struct {
         }
     }
 
-    fn parseDdlType(self: *@This()) !sql_adapter.DdlTypeSyntax {
-        return sql_adapter.parseDdlType(self.tokens, &self.pos);
-    }
-
     fn parseDdlPeriodConstraint(self: *@This()) !runtime_schema.RelationalPeriod {
         var syntax = try sql_adapter.parseDdlPeriodConstraintAlloc(self.alloc, self.tokens, &self.pos);
         errdefer syntax.deinit(self.alloc);
@@ -4009,10 +3642,6 @@ const Parser = struct {
         }
         const value = try self.parseSqlColumnValueAlloc(.{ .name = "", .path = "", .field_type = field_type });
         return .{ .kind = .literal, .value_json = value };
-    }
-
-    fn parseDdlDefaultValueUntyped(self: *@This()) !runtime_schema.RelationalDefaultValue {
-        return try sql_adapter.parseDdlDefaultValueUntypedAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseDdlCheckConstraint(self: *@This(), constraint_name: ?[]const u8) !runtime_schema.RelationalCheck {
@@ -27394,6 +27023,26 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_active_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522", create_literal_row_policy_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_literal_row_policy));
 
+    var create_check_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_write_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');");
+    defer create_check_row_policy.deinit(alloc);
+    const create_check_row_policy_plan = switch (create_check_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const create_check_row_policy_predicate = switch (create_check_row_policy_plan.check_predicate orelse return error.TestUnexpectedResult) {
+        .literal_equals => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", create_check_row_policy_predicate.field);
+    try std.testing.expectEqualStrings("\"active\"", create_check_row_policy_predicate.value_json);
+    const create_check_row_policy_fingerprint = try ddlFingerprintAlloc(alloc, create_check_row_policy);
+    defer alloc.free(create_check_row_policy_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_write_policy:table=usage_records:kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:check=kind=literal_eq:field=status:value_json_hex=2261637469766522", create_check_row_policy_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_check_row_policy));
+
     var create_expression_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');");
     defer create_expression_row_policy.deinit(alloc);
     const create_expression_row_policy_plan = switch (create_expression_row_policy) {
@@ -39061,21 +38710,35 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             .create_policy => |create| blk: {
                 const predicate_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
                 defer alloc.free(predicate_suffix);
-                const base = try std.fmt.allocPrint(
+                var base = try std.fmt.allocPrint(
                     alloc,
                     "ddl:create_row_policy:policy={s}:table={s}:{s}",
                     .{ create.policy_name, create.table_name, predicate_suffix },
                 );
+                if (create.check_predicate) |check_predicate| {
+                    const check_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    defer alloc.free(check_suffix);
+                    const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
+                    alloc.free(base);
+                    base = with_check;
+                }
                 break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
             },
             .alter_policy => |alter| blk: {
                 const predicate_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, alter.predicate);
                 defer alloc.free(predicate_suffix);
-                const base = try std.fmt.allocPrint(
+                var base = try std.fmt.allocPrint(
                     alloc,
                     "ddl:alter_row_policy:policy={s}:table={s}:{s}",
                     .{ alter.policy_name, alter.table_name, predicate_suffix },
                 );
+                if (alter.check_predicate) |check_predicate| {
+                    const check_suffix = try rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    defer alloc.free(check_suffix);
+                    const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
+                    alloc.free(base);
+                    base = with_check;
+                }
                 break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
             },
             .drop_policy => |drop| try std.fmt.allocPrint(

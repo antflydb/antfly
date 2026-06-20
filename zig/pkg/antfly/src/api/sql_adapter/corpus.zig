@@ -4293,6 +4293,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_sql_expression_concat_body: bool = false,
     ddl_function_sql_expression_body: bool = false,
     ddl_function_sql_expression_multi_arg_body: bool = false,
+    ddl_function_sql_expression_named_arg_body: bool = false,
     ddl_function_sql_expression_nested_body: bool = false,
     ddl_function_sql_expression_minmax_body: bool = false,
     ddl_function_drop: bool = false,
@@ -4342,6 +4343,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
     ddl_row_security_conjunction_policy: bool = false,
+    ddl_row_security_check_policy: bool = false,
     ddl_row_security_literal_policy: bool = false,
     ddl_row_security_targeted_policy: bool = false,
     ddl_row_security_alter_policy: bool = false,
@@ -5984,6 +5986,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_sql_expression_multi_arg_body = self.ddl_function_sql_expression_multi_arg_body or
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "arg2") != null);
+                    self.ddl_function_sql_expression_named_arg_body = self.ddl_function_sql_expression_named_arg_body or
+                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                            std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
+                            std.mem.indexOf(u8, entry.sql, "status_text text") != null and
+                            std.mem.indexOf(u8, entry.sql, "lower(status_text)") != null);
                     self.ddl_function_sql_expression_nested_body = self.ddl_function_sql_expression_nested_body or
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null and
@@ -6072,10 +6079,14 @@ pub const AppParityCorpusCoverage = struct {
                 .create_row_policy => {
                     self.ddl_row_security_create_policy = true;
                     self.ddl_row_security_conjunction_policy = self.ddl_row_security_conjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=and:") != null;
+                    self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or std.mem.indexOf(u8, entry.plan, ":check=") != null;
                     self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
                     self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or std.mem.indexOf(u8, entry.plan, ":roles=") != null;
                 },
-                .alter_row_policy => self.ddl_row_security_alter_policy = true,
+                .alter_row_policy => {
+                    self.ddl_row_security_alter_policy = true;
+                    self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or std.mem.indexOf(u8, entry.plan, ":check=") != null;
+                },
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
                 .create_database => self.ddl_database_create = true,
                 .alter_database => {

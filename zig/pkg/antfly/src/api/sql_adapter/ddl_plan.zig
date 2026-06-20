@@ -18,6 +18,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
+const parser = @import("parser.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const value_mod = @import("value.zig");
 
@@ -60,6 +61,18 @@ pub const SetSearchPathPlan = struct {
         self.* = undefined;
     }
 };
+
+pub fn parseSetSearchPathPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !SetSearchPathPlan {
+    var syntax = try grammar.parseSetSearchPathTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    const namespaces = syntax.namespaces;
+    syntax.namespaces = &.{};
+    return .{ .namespaces = namespaces, .local = syntax.local };
+}
 
 pub const SessionSettingKind = enum {
     app,
@@ -2258,12 +2271,14 @@ pub const CreateRowSecurityPolicyPlan = struct {
     table_name: []const u8,
     role_targets: []const []const u8 = &.{},
     predicate: RowSecurityPolicyPredicate,
+    check_predicate: ?RowSecurityPolicyPredicate = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.policy_name);
         alloc.free(self.table_name);
         freeStringSlice(alloc, self.role_targets);
         self.predicate.deinit(alloc);
+        if (self.check_predicate) |*predicate| predicate.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2273,12 +2288,14 @@ pub const AlterRowSecurityPolicyPlan = struct {
     table_name: []const u8,
     role_targets: []const []const u8 = &.{},
     predicate: RowSecurityPolicyPredicate,
+    check_predicate: ?RowSecurityPolicyPredicate = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.policy_name);
         alloc.free(self.table_name);
         freeStringSlice(alloc, self.role_targets);
         self.predicate.deinit(alloc);
+        if (self.check_predicate) |*predicate| predicate.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -4165,14 +4182,17 @@ pub fn createRowSecurityPolicyPlanFromSyntax(syntax: *grammar.CreateRowSecurityP
     const table_name = syntax.table_name;
     const role_targets = syntax.role_targets;
     const predicate = syntax.predicate;
+    const check_predicate = syntax.check_predicate;
     syntax.policy_name = "";
     syntax.table_name = "";
     syntax.role_targets = &.{};
+    syntax.check_predicate = null;
     return .{
         .policy_name = policy_name,
         .table_name = table_name,
         .role_targets = role_targets,
         .predicate = predicate,
+        .check_predicate = check_predicate,
     };
 }
 
@@ -4181,14 +4201,17 @@ pub fn alterRowSecurityPolicyPlanFromSyntax(syntax: *grammar.AlterRowSecurityPol
     const table_name = syntax.table_name;
     const role_targets = syntax.role_targets;
     const predicate = syntax.predicate;
+    const check_predicate = syntax.check_predicate;
     syntax.policy_name = "";
     syntax.table_name = "";
     syntax.role_targets = &.{};
+    syntax.check_predicate = null;
     return .{
         .policy_name = policy_name,
         .table_name = table_name,
         .role_targets = role_targets,
         .predicate = predicate,
+        .check_predicate = check_predicate,
     };
 }
 
@@ -4288,6 +4311,18 @@ pub fn alterTableColumnTypeOperationFromSyntax(
         .collation = collation,
         .rewrite_expression = rewrite_expression,
     } };
+}
+
+pub fn parseOptionalDdlAlterColumnRewriteExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !?AlterColumnRewriteExpression {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("using")) return null;
+    const expression = try grammar.parseDdlGeneratedRowExpressionAlloc(alloc, cursor);
+    errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
+    return .{ .expression = expression };
 }
 
 pub fn alterTableAddColumnOperationFromParts(

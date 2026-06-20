@@ -467,6 +467,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
                 \\p5 = sub, database, setting, value
                 \\p6 = sub, database, setting, value
                 \\p7 = sub, table, target
+                \\p8 = sub, obj, filter
                 \\[role_definition]
                 \\g = _, _
                 \\[matchers]
@@ -514,6 +515,7 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
                 \\p5 = sub, database, setting, value
                 \\p6 = sub, database, setting, value
                 \\p7 = sub, table, target
+                \\p8 = sub, obj, filter
                 \\[role_definition]
                 \\g = _, _
                 \\[matchers]

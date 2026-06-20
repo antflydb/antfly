@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "65bdd25027b3bc9c2a4d3240b7ab5e89d49eee7e955452a999c29601ff8a8e52",
-  "source_entry_count": 998,
-  "entry_count": 998,
+  "source_sha256": "61b42c7b3f65479dd6b031c23840c1a05279be9a071f9aada9facc765062a04d",
+  "source_entry_count": 1000,
+  "entry_count": 1000,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3477,6 +3477,17 @@
       "sql": "CREATE POLICY usage_records_literal_policy ON usage_records USING (tenant_id = 'tenant-a')"
     },
     {
+      "name": "row security write check policy catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_row_policy",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:create_row_policy:policy=usage_records_write_policy:table=usage_records:kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:check=kind=literal_eq:field=status:value_json_hex=2261637469766522",
+      "sql": "CREATE POLICY usage_records_write_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active')"
+    },
+    {
       "name": "row security compound policy catalog ddl",
       "family": "ddl",
       "summary": {
@@ -4196,6 +4207,17 @@
       },
       "plan": "ddl:create_function:name=shift_amount:args=1:replace=false:returns=numeric:language=sql:body=sql_expression:hook=expression:expr=add[value[31]+field[source:arg1]]",
       "sql": "CREATE FUNCTION shift_amount(numeric) RETURNS numeric LANGUAGE sql AS $$SELECT 1 + arg1$$"
+    },
+    {
+      "name": "create sql expression function named argument body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "normalize_named_status",
+        "operations": 1
+      },
+      "plan": "ddl:create_function:name=normalize_named_status:args=1:replace=false:returns=text:language=sql:body=sql_expression:hook=expression:expr=lower[field[source:arg1]]",
+      "sql": "CREATE FUNCTION normalize_named_status(status_text text) RETURNS text LANGUAGE sql AS $$SELECT lower(status_text)$$"
     },
     {
       "name": "unsupported create function body",

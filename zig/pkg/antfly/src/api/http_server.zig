@@ -7263,27 +7263,37 @@ pub const ApiHttpServer = struct {
     ) !void {
         const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, database_name, table_name);
         defer if (row_filter_json) |value| self.alloc.free(value);
-        const filter = row_filter_json orelse return;
+        const row_check_filter_json = try self.resolveEffectiveRowCheckFilterJsonForDatabase(self.alloc, authenticated_identity, database_name, table_name);
+        defer if (row_check_filter_json) |value| self.alloc.free(value);
+        if (row_filter_json == null and row_check_filter_json == null) return;
 
         const source = self.table_reads orelse return error.PermissionDenied;
         for (rows_req.writes) |write| {
-            try self.requireExistingRowVisibleIfPresent(source, table_name, catalog_target, write.key, filter);
-            if (!(try self.docJsonMatchesRowFilter(write.key, write.value, filter))) return error.PermissionDenied;
+            if (row_filter_json) |filter| try self.requireExistingRowVisibleIfPresent(source, table_name, catalog_target, write.key, filter);
+            if (row_check_filter_json) |filter| {
+                if (!(try self.docJsonMatchesRowFilter(write.key, write.value, filter))) return error.PermissionDenied;
+            }
         }
         for (rows_req.relational_identity_rewrites) |rewrite| {
-            try self.requireExistingRowVisible(source, table_name, catalog_target, rewrite.old_key, filter);
-            if (!(try self.docJsonMatchesRowFilter(rewrite.new_key, rewrite.value, filter))) return error.PermissionDenied;
+            if (row_filter_json) |filter| try self.requireExistingRowVisible(source, table_name, catalog_target, rewrite.old_key, filter);
+            if (row_check_filter_json) |filter| {
+                if (!(try self.docJsonMatchesRowFilter(rewrite.new_key, rewrite.value, filter))) return error.PermissionDenied;
+            }
         }
         for (rows_req.deletes) |key| {
-            try self.requireExistingRowVisible(source, table_name, catalog_target, key, filter);
+            if (row_filter_json) |filter| try self.requireExistingRowVisible(source, table_name, catalog_target, key, filter);
         }
         for (rows_req.transforms) |transform| {
             var lookup = (try self.lookupRowForFilter(source, table_name, catalog_target, transform.key)) orelse return error.PermissionDenied;
             defer lookup.deinit(self.alloc);
-            if (!(try self.docJsonMatchesRowFilter(transform.key, lookup.json, filter))) return error.PermissionDenied;
+            if (row_filter_json) |filter| {
+                if (!(try self.docJsonMatchesRowFilter(transform.key, lookup.json, filter))) return error.PermissionDenied;
+            }
             const projected = (try db_mod.transform.resolveDocumentTransform(self.alloc, lookup.json, transform)) orelse return error.PermissionDenied;
             defer self.alloc.free(projected);
-            if (!(try self.docJsonMatchesRowFilter(transform.key, projected, filter))) return error.PermissionDenied;
+            if (row_check_filter_json) |filter| {
+                if (!(try self.docJsonMatchesRowFilter(transform.key, projected, filter))) return error.PermissionDenied;
+            }
         }
     }
 
@@ -13655,6 +13665,23 @@ pub const ApiHttpServer = struct {
             scoped_identity.role_settings = settings;
         }
         return try resolveAuthRowFilterJson(alloc, scoped_identity, raw);
+    }
+
+    fn resolveEffectiveRowCheckFilterJsonForDatabase(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        identity: ?AuthenticatedIdentity,
+        database_name: []const u8,
+        table_name: []const u8,
+    ) !?[]u8 {
+        const active_identity = identity orelse return null;
+        const manager = self.cfg.user_manager orelse return try self.resolveEffectiveRowFilterJsonForDatabase(alloc, identity, database_name, table_name);
+        if (!manager.hasUser(active_identity.username)) return try self.resolveEffectiveRowFilterJsonForDatabase(alloc, identity, database_name, table_name);
+        const check_filters = try manager.getWriteRowFilters(active_identity.username);
+        defer freeRowFilters(alloc, check_filters);
+        var scoped_identity = active_identity;
+        scoped_identity.row_filter = check_filters;
+        return try self.resolveEffectiveRowFilterJsonForDatabase(alloc, @as(?AuthenticatedIdentity, scoped_identity), database_name, table_name);
     }
 
     fn applyAuthenticatedIdentityToJoinRequestForDatabase(
@@ -20173,6 +20200,211 @@ test "api http server applies authorization SQL DDL through user manager" {
     var dropped = try server.applyRelationalSqlDdl("DROP ROLE app_writer;");
     defer dropped.deinit(alloc);
     try std.testing.expect(!(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read)));
+}
+
+test "api http server enforces SQL row security WITH CHECK on row writes" {
+    const alloc = std.testing.allocator;
+    const usage_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const table_target: catalog_resources.TableTarget = .{
+        .database_name = catalog_resources.default_database_name,
+        .namespace_name = catalog_resources.default_namespace_name,
+        .table_name = "usage_records",
+    };
+    const table_resource = "default.public.usage_records";
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{
+            .table_id = 1,
+            .name = "usage_records",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = usage_schema_json,
+        }},
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const FakeReads = struct {
+        lookup_calls: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .lookup_catalog = lookupCatalog,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn lookupCatalog(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
+            try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
+            try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqualStrings("usage_records", target.table_name);
+            self.lookup_calls += 1;
+            if (std.mem.eql(u8, key, "missing")) return null;
+            if (std.mem.eql(u8, key, "tenant-b-existing")) {
+                return .{
+                    .json = try allocator.dupe(u8, "{\"id\":\"tenant-b-existing\",\"tenant_id\":\"tenant-b\",\"status\":\"active\"}"),
+                    .version = 7,
+                };
+            }
+            return .{
+                .json = try allocator.dupe(u8, "{\"id\":\"existing\",\"tenant_id\":\"tenant-a\",\"status\":\"archived\"}"),
+                .version = 3,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+    const BatchHelper = struct {
+        fn oneWrite(allocator: std.mem.Allocator, key: []const u8, json: []const u8) !relational_rows_api.OwnedRowsBatchRequest {
+            const writes = try allocator.alloc(db_mod.types.BatchWrite, 1);
+            errdefer allocator.free(writes);
+            const owned_key = try allocator.dupe(u8, key);
+            errdefer allocator.free(owned_key);
+            const owned_value = try allocator.dupe(u8, json);
+            errdefer allocator.free(owned_value);
+            writes[0] = .{
+                .key = owned_key,
+                .value = owned_value,
+            };
+            return .{
+                .writes = writes,
+                .req = .{ .writes = writes },
+                .inserted = 1,
+            };
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+
+    var source = FakeSource{};
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{ .user_manager = &auth.manager }, source.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var enabled = try server.applyRelationalSqlDdl("ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;");
+    defer enabled.deinit(alloc);
+    var policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_write_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');");
+    defer policy.deinit(alloc);
+
+    const read_filters = try auth.manager.getRowFilters("alice");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = read_filters,
+    };
+    defer identity.deinit(alloc);
+
+    var accepted_insert = try BatchHelper.oneWrite(
+        alloc,
+        "missing",
+        "{\"id\":\"missing\",\"tenant_id\":\"tenant-b\",\"status\":\"active\"}",
+    );
+    defer accepted_insert.deinit(alloc);
+    try server.requireRowsBatchSatisfiesEffectiveFilterForDatabase(
+        catalog_resources.default_database_name,
+        table_resource,
+        table_target,
+        accepted_insert,
+        identity,
+    );
+
+    var rejected_check = try BatchHelper.oneWrite(
+        alloc,
+        "existing",
+        "{\"id\":\"existing\",\"tenant_id\":\"tenant-a\",\"status\":\"archived\"}",
+    );
+    defer rejected_check.deinit(alloc);
+    try std.testing.expectError(
+        error.PermissionDenied,
+        server.requireRowsBatchSatisfiesEffectiveFilterForDatabase(
+            catalog_resources.default_database_name,
+            table_resource,
+            table_target,
+            rejected_check,
+            identity,
+        ),
+    );
+
+    var rejected_visibility = try BatchHelper.oneWrite(
+        alloc,
+        "tenant-b-existing",
+        "{\"id\":\"tenant-b-existing\",\"tenant_id\":\"tenant-b\",\"status\":\"active\"}",
+    );
+    defer rejected_visibility.deinit(alloc);
+    try std.testing.expectError(
+        error.PermissionDenied,
+        server.requireRowsBatchSatisfiesEffectiveFilterForDatabase(
+            catalog_resources.default_database_name,
+            table_resource,
+            table_target,
+            rejected_visibility,
+            identity,
+        ),
+    );
+
+    try std.testing.expect(reads.lookup_calls >= 3);
 }
 
 test "api http server applies SQL DDL with explicit catalog session" {

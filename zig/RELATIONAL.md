@@ -5085,7 +5085,12 @@ literal equality predicates such as `status = 'active'` as native policy
 metadata rather than raw SQL. `CREATE POLICY ... TO role[, ...]` and
 `ALTER POLICY ... TO role[, ...]` preserve ordered role-target metadata on the
 same typed policy plan, so role scoping is catalog data rather than SQL text
-hidden in the adapter. `CREATE POLICY` tails parse in
+hidden in the adapter. `CREATE POLICY ... WITH CHECK (...)` and
+`ALTER POLICY ... WITH CHECK (...)` preserve a separate write-check predicate
+beside the read-side `USING` predicate. If a policy omits `WITH CHECK`, the
+write predicate defaults to the read predicate when applied to native auth
+state, matching PostgreSQL's insert/update behavior without storing raw SQL.
+`CREATE POLICY` tails parse in
 `api/sql_adapter/grammar.zig`, so the SQL lowerer only transfers owned grammar
 syntax into typed row-security catalog plans. Public API execution maps each
 supported policy to a hidden native row-filter policy subject, converts
@@ -5096,11 +5101,15 @@ effective-policy resolution, and merges enabled-table filters into every
 matching user's effective row filters before row-query, aggregate, join,
 lateral, window, and document query execution. Those setting references are
 resolved from the authenticated user's effective native role settings; a missing
-setting fails closed during request filter resolution. Creating a policy stores
+setting fails closed during request filter resolution. Write execution resolves
+the enabled read and write filters independently: existing rows touched by a
+delete/update must satisfy the read `USING` filter, while inserted rows and
+final update row images must satisfy the `WITH CHECK` filter. Creating a policy stores
 policy metadata but does not make the filter active until `ALTER TABLE ...
 ENABLE ROW LEVEL SECURITY` marks that table as RLS-enabled in the native auth
 policy store. `ALTER POLICY ... USING (...)` replaces the hidden policy
-subject's native row-filter metadata and fails if the policy does not already
+subject's native read-filter metadata, `ALTER POLICY ... WITH CHECK (...)`
+replaces its write-filter metadata, and both fail if the policy does not already
 exist. `DROP POLICY` removes the hidden policy subject for that table, while
 `DROP POLICY IF EXISTS` is an idempotent no-op. Policy syntax outside the
 current native `term`/`conjuncts` row-filter subset still fails closed until it
