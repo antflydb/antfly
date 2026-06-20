@@ -1588,6 +1588,10 @@ pub export fn antfly_lite_abi_version() u32 {
     return lite_abi_version;
 }
 
+pub export fn antfly_lite_open_options_size() u32 {
+    return @intCast(@sizeOf(capi.LiteOpenOptions));
+}
+
 pub export fn antfly_error_code_name(code: c_int) [*:0]const u8 {
     return capi.errorCodeName(code);
 }
@@ -6394,6 +6398,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     cleanupTestFile(path);
     defer cleanupTestFile(path);
 
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(capi.LiteOpenOptions))), antfly_lite_open_options_size());
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_options_init(null));
 
     var defaults = capi.LiteOpenOptions{
