@@ -39,8 +39,9 @@ Antfly Lite.
   Antfly cluster on day one.
 - Antfly Lite should not silently emulate distributed behavior in ways that make
   later promotion surprising.
-- Antfly Lite v1 does not need legacy fallback code for pre-release `.aflite`
-  experiments. Unknown versions and invalid headers should fail explicitly.
+- Antfly Lite v1 should not include legacy fallback code for pre-release
+  `.aflite`, directory-backed, or LSM-container experiments. Unknown versions
+  and invalid headers should fail explicitly.
 
 ## Existing Starting Point
 
@@ -169,13 +170,14 @@ same way. Neither should be the public Lite v1 contract.
 
 ### Compatibility Policy
 
-Because this is new, unreleased code, v1 should not carry a legacy fallback or
-pre-release importer. `.aflite` readers should accept the documented v1 format
-and reject unknown versions loudly. Recovery from an older complete checkpoint
-root inside the same v1 file is crash recovery, not legacy compatibility; a file
-with no complete v1 checkpoint should fail with an explicit integrity error.
-Compatibility branches should only be added after a format has shipped and users
-can reasonably have files that need preservation.
+Because this is new, unreleased code, v1 should not carry a legacy fallback,
+pre-release importer, v0 directory reader, or silent LSM-container upgrade path.
+`.aflite` readers should accept the documented v1 format and reject unknown
+versions loudly. Recovery from an older complete checkpoint root inside the same
+v1 file is crash recovery, not legacy compatibility; a file with no complete v1
+checkpoint should fail with an explicit integrity error. Compatibility branches
+should only be added after a format has shipped and users can reasonably have
+files that need preservation.
 
 The extension meanings should stay distinct:
 
@@ -567,9 +569,9 @@ query-visible results should match within documented index rebuild semantics.
 - Run existing DB conformance tests against the native `.aflite` backend.
 - Keep filesystem-backed LSM and LSM-container profiles as developer/test-only
   bridge paths.
-- Do not add legacy fallback code for pre-release Lite layouts; reject unknown
-  versions and invalid headers with explicit errors while preserving same-format
-  checkpoint recovery.
+- Do not add legacy fallback code for pre-release Lite layouts, v0 directories,
+  or LSM-container prototypes; reject unknown versions and invalid headers with
+  explicit errors while preserving same-format checkpoint recovery.
 
 ### Phase 2: Name And CLI Shell
 
