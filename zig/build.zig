@@ -6307,12 +6307,24 @@ pub fn build(b: *std.Build) void {
         .name = "antfly-lite-core",
         .root_module = lite_core_main_mod,
     });
+    const lite_core_main_tests = b.addTest(.{
+        .root_module = lite_core_main_mod,
+        .filters = &.{"lite core main compiles"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
+    const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
+    lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
     const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
 
     const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantflylite C ABI");
     lite_core_step.dependOn(&install_lite_core_main.step);
     lite_core_step.dependOn(&install_lite_capi_lib.step);
     lite_core_step.dependOn(&install_lite_capi_header.step);
+    lite_core_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
