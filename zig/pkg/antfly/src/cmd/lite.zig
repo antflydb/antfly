@@ -31,6 +31,7 @@ const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 
 var active_lite_http_state: ?*LiteHttpState = null;
+const lite_http_state_key = "antfly.lite.state";
 
 const LiteDb = struct {
     backend: antfly.lite.backend.Handle,
@@ -855,6 +856,7 @@ fn parseLiteListenAddress(addr: []const u8) !LiteListenAddress {
 }
 
 fn registerLiteHttpRoutes(server: *httpx.Server) !void {
+    try server.preRoute(liteHttpInjectState);
     try server.get("/healthz", liteHttpHealth);
     try server.get("/lite/v1/status", liteHttpStatus);
     try server.get("/lite/v1/capabilities", liteHttpCapabilities);
@@ -876,11 +878,14 @@ fn registerLiteHttpRoutes(server: *httpx.Server) !void {
     try server.post("/lite/v1/vacuum", liteHttpVacuum);
 }
 
+fn liteHttpInjectState(ctx: *httpx.Context) anyerror!void {
+    const state = active_lite_http_state orelse return error.LiteHttpServerUnavailable;
+    try ctx.setData(lite_http_state_key, state, null);
+}
+
 fn liteHttpState(ctx: *httpx.Context) !*LiteHttpState {
-    return active_lite_http_state orelse {
-        _ = ctx;
-        return error.LiteHttpServerUnavailable;
-    };
+    const raw = ctx.getData(lite_http_state_key) orelse return error.LiteHttpServerUnavailable;
+    return @ptrCast(@alignCast(raw));
 }
 
 fn lockLiteHttpState(state: *LiteHttpState) void {
@@ -2040,6 +2045,7 @@ test "lite status json includes pending work" {
 
 fn testLiteHttpCall(
     allocator: Allocator,
+    state: ?*LiteHttpState,
     comptime handler: httpx.Handler,
     method: httpx.Method,
     url: []const u8,
@@ -2053,6 +2059,7 @@ fn testLiteHttpCall(
     var ctx = httpx.Context.init(allocator, std.testing.io, &req);
     defer ctx.deinit();
     ctx.params = params;
+    if (state) |s| try ctx.setData(lite_http_state_key, s, null);
     return try handler(&ctx);
 }
 
@@ -2073,11 +2080,8 @@ test "lite http handlers expose narrow embedded api" {
     defer lite.close();
 
     var state = LiteHttpState{ .lite = &lite };
-    active_lite_http_state = &state;
-    defer active_lite_http_state = null;
-
     {
-        var resp = try testLiteHttpCall(allocator, liteHttpHealth, .GET, "http://lite.test/healthz", "", &.{});
+        var resp = try testLiteHttpCall(allocator, null, liteHttpHealth, .GET, "http://lite.test/healthz", "", &.{});
         defer resp.deinit();
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"status\":\"ok\"") != null);
@@ -2085,6 +2089,7 @@ test "lite http handlers expose narrow embedded api" {
     {
         var resp = try testLiteHttpCall(
             allocator,
+            &state,
             liteHttpBatch,
             .POST,
             "http://lite.test/lite/v1/batch",
@@ -2099,6 +2104,7 @@ test "lite http handlers expose narrow embedded api" {
         const params = [_]@import("httpx").router.RouteParam{.{ .name = "key", .value = "doc:http" }};
         var resp = try testLiteHttpCall(
             allocator,
+            &state,
             liteHttpLookup,
             .POST,
             "http://lite.test/lite/v1/lookup/doc:http",
@@ -2110,12 +2116,29 @@ test "lite http handlers expose narrow embedded api" {
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"served lite\"") != null);
     }
     {
-        var resp = try testLiteHttpCall(allocator, liteHttpStatus, .GET, "http://lite.test/lite/v1/status", "", &.{});
+        var resp = try testLiteHttpCall(allocator, &state, liteHttpStatus, .GET, "http://lite.test/lite/v1/status", "", &.{});
         defer resp.deinit();
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"engine\":\"native_single_file\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"capabilities\":") != null);
+    }
+    {
+        var req = try httpx.Request.init(allocator, .GET, "http://lite.test/lite/v1/status");
+        defer req.deinit();
+
+        var ctx = httpx.Context.init(allocator, std.testing.io, &req);
+        defer ctx.deinit();
+
+        active_lite_http_state = &state;
+        defer active_lite_http_state = null;
+        try liteHttpInjectState(&ctx);
+        try std.testing.expect(ctx.getData(lite_http_state_key) != null);
+
+        var resp = try liteHttpStatus(&ctx);
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
     }
 }
 
