@@ -3394,6 +3394,14 @@ const Parser = struct {
         };
     }
 
+    fn caseExpressionParserHooks(self: *@This()) sql_adapter.CaseExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
+            .parse_operand = parseNullifRowExpressionOperandHook,
+        };
+    }
+
     fn jsonBuildObjectRowExpressionParserHooks(self: *@This()) sql_adapter.JsonBuildObjectRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -15873,97 +15881,11 @@ const Parser = struct {
     }
 
     fn parseCaseRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseCaseExpressionStart(self.tokens, &self.pos);
-
-        var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
-        errdefer {
-            for (branches.items) |branch| freeExpressionCaseBranch(self.alloc, branch);
-            branches.deinit(self.alloc);
-        }
-
-        while (sql_adapter.matchCaseExpressionWhen(self.tokens, &self.pos)) {
-            const condition = try self.parseCaseExpressionConditionAlloc();
-            var condition_transferred = false;
-            errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-            try sql_adapter.parseCaseExpressionThen(self.tokens, &self.pos);
-            const then_expression = try self.parseRowExpressionOperandAlloc();
-            var then_transferred = false;
-            errdefer if (!then_transferred) freeExpression(self.alloc, then_expression);
-            try branches.append(self.alloc, .{ .when = condition, .then = then_expression });
-            condition_transferred = true;
-            then_transferred = true;
-        }
-        if (branches.items.len == 0) return error.UnsupportedSqlShape;
-
-        try sql_adapter.parseCaseExpressionElse(self.tokens, &self.pos);
-        const else_expression = try self.parseRowExpressionOperandAlloc();
-        var else_transferred = false;
-        errdefer if (!else_transferred) freeExpression(self.alloc, else_expression);
-        try sql_adapter.parseCaseExpressionEnd(self.tokens, &self.pos);
-
-        const owned_branches = try branches.toOwnedSlice(self.alloc);
-        var branches_transferred = false;
-        errdefer if (!branches_transferred) {
-            for (owned_branches) |branch| freeExpressionCaseBranch(self.alloc, branch);
-            self.alloc.free(owned_branches);
-        };
-        const fallback = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-        var fallback_initialized = false;
-        var fallback_transferred = false;
-        errdefer if (!fallback_transferred) {
-            if (fallback_initialized) freeExpression(self.alloc, fallback[0]);
-            self.alloc.free(fallback);
-        };
-        fallback[0] = else_expression;
-        fallback_initialized = true;
-        else_transferred = true;
-
-        _ = try self.rowExpressionTypeContext().caseExpressionOutputType(owned_branches, fallback);
-
-        branches_transferred = true;
-        fallback_transferred = true;
-        return .{
-            .kind = .case,
-            .case_branches = owned_branches,
-            .case_else = fallback,
-        };
+        return try sql_adapter.parseCaseRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.caseExpressionParserHooks());
     }
 
     fn parseCaseExpressionConditionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpressionCondition {
-        const lhs = try self.parseRowExpressionAlloc();
-        var lhs_transferred = false;
-        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
-
-        const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{})) |is_tail|
-            is_tail.op
-        else
-            try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
-
-        const rhs = switch (op) {
-            .is_null, .is_not_null => &.{},
-            else => blk: {
-                const out = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-                var out_transferred = false;
-                errdefer if (!out_transferred) self.alloc.free(out);
-                out[0] = try self.parseRowExpressionAlloc();
-                out_transferred = true;
-                break :blk out;
-            },
-        };
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred and rhs.len > 0) {
-            for (rhs) |expression| freeExpression(self.alloc, expression);
-            self.alloc.free(rhs);
-        };
-        try sql_adapter.validateExpressionConditionTypes(self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, lhs, op, rhs);
-
-        lhs_transferred = true;
-        rhs_transferred = true;
-        return .{
-            .lhs = lhs,
-            .op = op,
-            .rhs = rhs,
-        };
+        return try sql_adapter.parseCaseExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.caseExpressionParserHooks());
     }
 
     fn parseCaseFoldRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {

@@ -674,6 +674,11 @@ pub const CaseExpressionParserHooks = struct {
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const CaseFoldRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub fn sqlRowClaimForClause(clause: ast.SqlRowClaimClause) db_mod.types.RowClaimRequest {
     return .{
         .mode = clause.mode,
@@ -3344,6 +3349,222 @@ pub fn parseBooleanExpressionRestAlloc(
 
     current_owned = false;
     return current;
+}
+
+pub fn parseCaseRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    hooks: CaseExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseCaseExpressionStart(tokens, pos);
+
+    var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
+    errdefer {
+        for (branches.items) |branch| plan_mod.freeExpressionCaseBranch(alloc, branch);
+        branches.deinit(alloc);
+    }
+
+    while (matchCaseExpressionWhen(tokens, pos)) {
+        const condition = try parseCaseExpressionConditionAlloc(alloc, tokens, pos, type_context, defer_row_expression_field_validation, hooks);
+        var condition_transferred = false;
+        errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
+        try parseCaseExpressionThen(tokens, pos);
+        const then_expression = try hooks.parse_operand(hooks.ptr);
+        var then_transferred = false;
+        errdefer if (!then_transferred) freeExpression(alloc, then_expression);
+        try branches.append(alloc, .{ .when = condition, .then = then_expression });
+        condition_transferred = true;
+        then_transferred = true;
+    }
+    if (branches.items.len == 0) return error.UnsupportedSqlShape;
+
+    try parseCaseExpressionElse(tokens, pos);
+    const else_expression = try hooks.parse_operand(hooks.ptr);
+    var else_transferred = false;
+    errdefer if (!else_transferred) freeExpression(alloc, else_expression);
+    try parseCaseExpressionEnd(tokens, pos);
+
+    const owned_branches = try branches.toOwnedSlice(alloc);
+    var branches_transferred = false;
+    errdefer if (!branches_transferred) {
+        for (owned_branches) |branch| plan_mod.freeExpressionCaseBranch(alloc, branch);
+        alloc.free(owned_branches);
+    };
+    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var fallback_initialized = false;
+    var fallback_transferred = false;
+    errdefer if (!fallback_transferred) {
+        if (fallback_initialized) freeExpression(alloc, fallback[0]);
+        alloc.free(fallback);
+    };
+    fallback[0] = else_expression;
+    fallback_initialized = true;
+    else_transferred = true;
+
+    _ = try type_context.caseExpressionOutputType(owned_branches, fallback);
+
+    branches_transferred = true;
+    fallback_transferred = true;
+    return .{
+        .kind = .case,
+        .case_branches = owned_branches,
+        .case_else = fallback,
+    };
+}
+
+pub fn parseCaseExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    hooks: CaseExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const lhs = try hooks.parse_expression(hooks.ptr);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+    const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{})) |is_tail|
+        is_tail.op
+    else
+        try parseComparisonOp(tokens, pos);
+
+    const rhs = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            out[0] = try hooks.parse_expression(hooks.ptr);
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |expression| freeExpression(alloc, expression);
+        alloc.free(rhs);
+    };
+    try validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
+
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+pub fn parseCaseFoldRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    type_context: RowExpressionTypeContext,
+    hooks: CaseFoldRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try parseCaseFoldFunctionCallStart(tokens, pos);
+    if (try parsePeriodBoundRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        kind,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+        field_source,
+    )) |expression| return expression;
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+
+    const operand = try hooks.parse_expression(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateTextRowExpression(operand);
+    try operands.append(alloc, operand);
+    operand_transferred = true;
+
+    if (kind == .trim or kind == .ltrim or kind == .rtrim) {
+        if (parser.matchToken(tokens, pos, .comma) != null) {
+            const trim_operand = try hooks.parse_expression(hooks.ptr);
+            var trim_transferred = false;
+            errdefer if (!trim_transferred) freeExpression(alloc, trim_operand);
+            try type_context.validateTextRowExpression(trim_operand);
+            try operands.append(alloc, trim_operand);
+            trim_transferred = true;
+        }
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+
+    return try buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+}
+
+pub fn parsePeriodBoundRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !?db_mod.types.RelationalRowsExpression {
+    if (kind != .lower and kind != .upper) return null;
+    const start_pos = pos.*;
+    const parsed_field = parseIdentifierOwnedAlloc(alloc, tokens, pos) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return null,
+        else => return err,
+    };
+    defer alloc.free(parsed_field);
+    const field = (try binder.normalizePeriodReferenceAlloc(
+        alloc,
+        schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+    )) orelse (binder.normalizeRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    ) catch |err| switch (err) {
+        error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
+            pos.* = start_pos;
+            return null;
+        },
+        else => return err,
+    });
+    defer alloc.free(field);
+    const period = binder.relationalPeriodForDdl(schema.periods, field) orelse {
+        pos.* = start_pos;
+        return null;
+    };
+    if (!parser.Cursor.init(tokens, pos).peekKind(.rparen)) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+    const bound_name = if (kind == .lower) period.start_column else period.end_column;
+    const bound_column = binder.relationalColumnForField(schema, bound_name, null) orelse return error.InvalidSqlCatalog;
+    if (!binder.relationalPeriodColumnType(bound_column.field_type)) return error.InvalidSqlCatalog;
+    return .{
+        .kind = .field,
+        .field = try alloc.dupe(u8, bound_column.name),
+        .field_source = field_source,
+    };
 }
 
 fn parseTextNumericBinaryRowExpressionRestAlloc(
