@@ -31,16 +31,7 @@ pub const RemoteTemplateRenderer = template_remote_host.HostRenderer;
 pub const LiteCheckReport = support.lite.backend.CheckReport;
 pub const LiteStableSnapshotReport = support.lite.backend.StableSnapshotReport;
 pub const LiteVacuumReport = support.lite.backend.VacuumReport;
-
-pub const LiteStorageStatus = struct {
-    format: []const u8 = "aflite",
-    engine: []const u8,
-    format_version: ?u32 = null,
-    page_size: ?u32 = null,
-    active_checkpoint: ?u8 = null,
-    checkpoint_sequence: ?u64 = null,
-    page_count: ?u64 = null,
-};
+pub const LiteStorageStatus = support.lite.backend.StorageStatus;
 
 pub const OpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -132,24 +123,7 @@ pub const DB = struct {
 
     pub fn liteStorageStatus(self: *DB) !LiteStorageStatus {
         const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
-        return switch (backend.engine) {
-            .native_single_file => blk: {
-                const file = &backend.native_docstore.?.file;
-                const checkpoint = file.activeCheckpoint();
-                break :blk .{
-                    .engine = @tagName(backend.engine),
-                    .format_version = support.lite.backend.native.format_version,
-                    .page_size = file.header.page_size,
-                    .active_checkpoint = file.header.active_checkpoint,
-                    .checkpoint_sequence = checkpoint.commit_sequence,
-                    .page_count = checkpoint.page_count,
-                };
-            },
-            .bridge_lsm_container => .{
-                .format = "aflite-internal",
-                .engine = @tagName(backend.engine),
-            },
-        };
+        return backend.storageStatus();
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) !void {

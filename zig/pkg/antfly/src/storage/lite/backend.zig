@@ -115,6 +115,16 @@ pub const OpenOptions = struct {
     read_only: bool = false,
 };
 
+pub const StorageStatus = struct {
+    format: []const u8 = "aflite",
+    engine: []const u8,
+    format_version: ?u32 = null,
+    page_size: ?u32 = null,
+    active_checkpoint: ?u8 = null,
+    checkpoint_sequence: ?u64 = null,
+    page_count: ?u64 = null,
+};
+
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     return try native.checkFile(allocator, path);
 }
@@ -200,6 +210,27 @@ pub const Handle = struct {
                 opts.external_derived_checkpoints = false;
             },
         }
+    }
+
+    pub fn storageStatus(self: *Handle) StorageStatus {
+        return switch (self.engine) {
+            .native_single_file => blk: {
+                const file = &self.native_docstore.?.file;
+                const checkpoint = file.activeCheckpoint();
+                break :blk .{
+                    .engine = @tagName(self.engine),
+                    .format_version = native.format_version,
+                    .page_size = file.header.page_size,
+                    .active_checkpoint = file.header.active_checkpoint,
+                    .checkpoint_sequence = checkpoint.commit_sequence,
+                    .page_count = checkpoint.page_count,
+                };
+            },
+            .bridge_lsm_container => .{
+                .format = "aflite-internal",
+                .engine = @tagName(self.engine),
+            },
+        };
     }
 
     pub fn check(self: *Handle) !CheckReport {
@@ -377,6 +408,31 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);
     try std.testing.expectEqual(report.file_size, vacuumed.after_size);
     try std.testing.expectEqual(@as(u64, 0), vacuumed.reclaimed_bytes);
+}
+
+test "lite backend reports native storage status from active checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-status.aflite");
+    defer allocator.free(path);
+
+    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    defer handle.deinit();
+
+    try handle.native_docstore.?.file.putDocument("doc:status", "value");
+
+    const status = handle.storageStatus();
+    const checkpoint = handle.native_docstore.?.file.activeCheckpoint();
+    try std.testing.expectEqualStrings("aflite", status.format);
+    try std.testing.expectEqualStrings("native_single_file", status.engine);
+    try std.testing.expectEqual(native.format_version, status.format_version.?);
+    try std.testing.expectEqual(native.default_page_size, status.page_size.?);
+    try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);
+    try std.testing.expectEqual(checkpoint.commit_sequence, status.checkpoint_sequence.?);
+    try std.testing.expectEqual(checkpoint.page_count, status.page_count.?);
 }
 
 test "lite backend native stable snapshot uses open handle checkpoint" {

@@ -497,16 +497,6 @@ const JsonDBStats = struct {
     term_doc_freq_cache_misses: u64,
 };
 
-const JsonLiteStorageStatus = struct {
-    format: []const u8 = "aflite",
-    engine: []const u8,
-    format_version: ?u32 = null,
-    page_size: ?u32 = null,
-    active_checkpoint: ?u8 = null,
-    checkpoint_sequence: ?u64 = null,
-    page_count: ?u64 = null,
-};
-
 const JsonDBIndexStats = struct {
     name: []const u8,
     kind: []const u8,
@@ -1662,7 +1652,7 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: *capi.Bu
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     const backend = if (handle.owned_lite_backend) |*backend| backend else return .invalid_argument;
 
-    const storage_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(liteStorageStatus(backend), .{})}) catch return .internal;
+    const storage_json = std.fmt.allocPrint(handle.alloc, "{f}", .{std.json.fmt(backend.storageStatus(), .{})}) catch return .internal;
     defer handle.alloc.free(storage_json);
     const stats_json = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
     defer handle.alloc.free(stats_json);
@@ -3157,27 +3147,6 @@ fn dbStatsJsonAlloc(handle: *Handle) ![]u8 {
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
     }, .{})});
     return json;
-}
-
-fn liteStorageStatus(backend: *lite_backend.Handle) JsonLiteStorageStatus {
-    return switch (backend.engine) {
-        .native_single_file => blk: {
-            const file = &backend.native_docstore.?.file;
-            const checkpoint = file.activeCheckpoint();
-            break :blk .{
-                .engine = @tagName(backend.engine),
-                .format_version = lite_backend.native.format_version,
-                .page_size = file.header.page_size,
-                .active_checkpoint = file.header.active_checkpoint,
-                .checkpoint_sequence = checkpoint.commit_sequence,
-                .page_count = checkpoint.page_count,
-            };
-        },
-        .bridge_lsm_container => .{
-            .format = "aflite-internal",
-            .engine = @tagName(backend.engine),
-        },
-    };
 }
 
 pub export fn antfly_db_search_json(

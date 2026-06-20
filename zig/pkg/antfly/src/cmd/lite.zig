@@ -804,42 +804,11 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     return try allocator.dupe(u8, response.json);
 }
 
-const StorageStatus = struct {
-    format: []const u8 = "aflite",
-    engine: []const u8,
-    format_version: ?u32 = null,
-    page_size: ?u32 = null,
-    active_checkpoint: ?u8 = null,
-    checkpoint_sequence: ?u64 = null,
-    page_count: ?u64 = null,
-};
-
-fn storageStatus(lite: *LiteDb) StorageStatus {
-    return switch (lite.backend.engine) {
-        .native_single_file => blk: {
-            const file = &lite.backend.native_docstore.?.file;
-            const checkpoint = file.activeCheckpoint();
-            break :blk .{
-                .engine = @tagName(lite.backend.engine),
-                .format_version = antfly.lite.backend.native.format_version,
-                .page_size = file.header.page_size,
-                .active_checkpoint = file.header.active_checkpoint,
-                .checkpoint_sequence = checkpoint.commit_sequence,
-                .page_count = checkpoint.page_count,
-            };
-        },
-        .bridge_lsm_container => .{
-            .format = "aflite-internal",
-            .engine = @tagName(lite.backend.engine),
-        },
-    };
-}
-
 fn statusJson(allocator: Allocator, lite: *LiteDb, profile: antfly.lite.backend.Profile) ![]u8 {
     const stats_value = try lite.db.stats(allocator);
     defer db_types.freeDBStats(allocator, stats_value);
 
-    const storage_json = try std.json.Stringify.valueAlloc(allocator, storageStatus(lite), .{});
+    const storage_json = try std.json.Stringify.valueAlloc(allocator, lite.backend.storageStatus(), .{});
     defer allocator.free(storage_json);
     const stats_json = try std.json.Stringify.valueAlloc(allocator, stats_value, .{});
     defer allocator.free(stats_json);
