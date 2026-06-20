@@ -5920,6 +5920,30 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_buffer_free(lite_txn_lookup.ptr, lite_txn_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, lite_txn_lookup.ptr.?[0..lite_txn_lookup.len], "\"transactional\"") != null);
 
+    var concurrent_readonly_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(src_path, &concurrent_readonly_handle));
+    defer antfly_db_close(concurrent_readonly_handle);
+    var concurrent_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &concurrent_lookup));
+    defer antfly_db_buffer_free(concurrent_lookup.ptr, concurrent_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, concurrent_lookup.ptr.?[0..concurrent_lookup.len], "\"second\"") != null);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(concurrent_readonly_handle, &writes_a, 1, null, 0, 4_500, 0));
+
+    var concurrent_status_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_status_only(src_path, &concurrent_status_handle));
+    defer antfly_db_close(concurrent_status_handle);
+    var concurrent_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
+    defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
+    try std.testing.expect(std.mem.indexOf(u8, concurrent_status.ptr.?[0..concurrent_status.len], "\"doc_count\":") != null);
+    antfly_db_close(concurrent_status_handle);
+    concurrent_status_handle = null;
+    antfly_db_close(concurrent_readonly_handle);
+    concurrent_readonly_handle = null;
+
     var check_before: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(src_handle, &check_before));
     defer antfly_db_buffer_free(check_before.ptr, check_before.len);
