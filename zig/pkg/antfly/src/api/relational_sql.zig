@@ -152,6 +152,7 @@ const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
 const joinProjectionOutputIsUnique = sql_adapter.joinProjectionOutputIsUnique;
 const joinSideForQualifier = sql_adapter.joinSideForQualifier;
+const mergeSourceQueryIsDefault = sql_adapter.mergeSourceQueryIsDefault;
 const windowDefaultCount = sql_adapter.windowDefaultCount;
 const windowFilterAccessCount = sql_adapter.windowFilterAccessCount;
 const windowFilterExpressionCount = sql_adapter.windowFilterExpressionCount;
@@ -244,9 +245,12 @@ const uniqueExpressionOpToken = sql_adapter.uniqueExpressionOpToken;
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
 const uniquePredicateAsRelationalCheckOp = sql_adapter.uniquePredicateAsRelationalCheckOp;
 const uniquePredicateOpToken = sql_adapter.uniquePredicateOpToken;
+const updateWillLookupExistingRow = sql_adapter.updateWillLookupExistingRow;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
+const validateCommentMetadataPlanForRuntimeSchemaAlloc = sql_adapter.validateCommentMetadataPlanForRuntimeSchemaAlloc;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
+const validateMergeAssignmentsUnique = sql_adapter.validateMergeAssignmentsUnique;
 const validateAggregateGroupBy = sql_adapter.validateAggregateGroupBy;
 const validateDefaultValueForColumnAlloc = sql_adapter.validateDefaultValueForColumnAlloc;
 const validateGeneratedColumnForColumns = sql_adapter.validateGeneratedColumnForColumns;
@@ -1506,41 +1510,6 @@ fn mergeSourceRowsFromPreimagesAlloc(
     return source_rows;
 }
 
-fn mergeSourceQueryIsDefault(req: db_mod.types.RelationalRowsQueryRequest) bool {
-    return req.source_cte.len == 0 and
-        req.predicates.len == 0 and
-        req.array_any.len == 0 and
-        req.array_contains.len == 0 and
-        req.array_eq.len == 0 and
-        req.in_predicates.len == 0 and
-        req.json_contains.len == 0 and
-        req.json_path_eq.len == 0 and
-        req.json_path_exists.len == 0 and
-        req.text_patterns.len == 0 and
-        req.or_predicates.len == 0 and
-        req.not_predicates.len == 0 and
-        req.access_or_predicates.len == 0 and
-        req.access_not_predicates.len == 0 and
-        req.expression_predicates.len == 0 and
-        req.expression_or_predicates.len == 0 and
-        req.expression_not_predicates.len == 0 and
-        req.expression_array_contains.len == 0 and
-        req.select.len == 0 and
-        req.json_extract.len == 0 and
-        req.array_length.len == 0 and
-        req.coalesce.len == 0 and
-        req.field_aliases.len == 0 and
-        req.expressions.len == 0 and
-        req.select_all and
-        req.distinct_on.len == 0 and
-        req.distinct_on_expressions.len == 0 and
-        req.order_by.len == 0 and
-        req.row_claim == null and
-        req.doc_key_range == null and
-        req.limit == null and
-        req.offset == 0;
-}
-
 pub fn buildMergeMutationBatchAlloc(
     alloc: std.mem.Allocator,
     target_schema: runtime_schema.TableSchema,
@@ -1751,25 +1720,6 @@ fn mergeRowsMatch(
         if (!mergeJsonValuesEqual(try mergeObjectField(target, mapping.target_field), try mergeObjectField(source, mapping.source_field))) return false;
     }
     return true;
-}
-
-fn validateMergeAssignmentsUnique(
-    mappings: []const MergeFieldMapping,
-    expressions: []const MergeExpressionAssignment,
-) !void {
-    for (mappings, 0..) |mapping, i| {
-        for (mappings[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, mapping.target_field, other.target_field)) return error.UnsupportedSqlShape;
-        }
-        for (expressions) |expression| {
-            if (std.mem.eql(u8, mapping.target_field, expression.target_field)) return error.UnsupportedSqlShape;
-        }
-    }
-    for (expressions, 0..) |expression, i| {
-        for (expressions[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, expression.target_field, other.target_field)) return error.UnsupportedSqlShape;
-        }
-    }
 }
 
 fn mergePredicatesMatch(
@@ -4063,39 +4013,6 @@ fn applyCommentMetadataPlanAlloc(
     if (!tableSchemaCatalogExists(current)) return error.InvalidSqlCatalog;
     try validateCommentMetadataPlanForRuntimeSchemaAlloc(alloc, current, plan);
     return try cloneRelationalRuntimeSchemaAlloc(alloc, current);
-}
-
-fn validateCommentMetadataPlanForRuntimeSchemaAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    plan: CommentMetadataPlan,
-) !void {
-    if (plan.object_name.len == 0) return error.InvalidSqlCatalog;
-    try validateStringCommentJsonAlloc(alloc, plan.comment_json);
-    switch (plan.target) {
-        .table => {},
-        .column => {
-            const column_name = commentColumnName(plan.object_name);
-            _ = relationalColumnForDdl(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
-        },
-        .index => {
-            if (!relationalIndexNameExists(schema, plan.object_name)) return error.InvalidSqlCatalog;
-        },
-        .constraint => {
-            const parent_table = plan.parent_table_name orelse return error.InvalidSqlCatalog;
-            if (!relationalConstraintNameExists(schema, parent_table, plan.object_name)) return error.InvalidSqlCatalog;
-        },
-    }
-}
-
-fn validateStringCommentJsonAlloc(alloc: std.mem.Allocator, comment_json: ?[]const u8) !void {
-    const raw = comment_json orelse return;
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
-    defer parsed.deinit();
-    switch (parsed.value) {
-        .string => {},
-        else => return error.UnsupportedSqlShape,
-    }
 }
 
 fn applyDropIndexPlanAlloc(
@@ -37964,14 +37881,6 @@ fn arrayTransformOpToken(op: db_mod.types.TransformOpType) []const u8 {
         .add_to_set => "add_to_set",
         else => unreachable,
     };
-}
-
-fn updateWillLookupExistingRow(schema: runtime_schema.TableSchema, returning: ReturningProjection) bool {
-    if (returning.hasProjection() or schema.checks.len > 0) return true;
-    for (schema.relational_columns) |column| {
-        if (column.generated != null) return true;
-    }
-    return false;
 }
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {

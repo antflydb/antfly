@@ -115,6 +115,44 @@ pub fn relationalConstraintNameExists(schema: runtime_schema.TableSchema, table_
         relationalCheckNameExists(schema.checks, name);
 }
 
+pub fn validateCommentMetadataPlanForRuntimeSchemaAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: anytype,
+) !void {
+    if (plan.object_name.len == 0) return error.InvalidSqlCatalog;
+    try validateStringCommentJsonAlloc(alloc, plan.comment_json);
+    switch (plan.target) {
+        .table => {},
+        .column => {
+            const column_name = commentColumnName(plan.object_name);
+            _ = relationalColumnForDdl(schema.relational_columns, column_name) orelse return error.InvalidSqlCatalog;
+        },
+        .index => {
+            if (!relationalIndexNameExists(schema, plan.object_name)) return error.InvalidSqlCatalog;
+        },
+        .constraint => {
+            const parent_table = plan.parent_table_name orelse return error.InvalidSqlCatalog;
+            if (!relationalConstraintNameExists(schema, parent_table, plan.object_name)) return error.InvalidSqlCatalog;
+        },
+    }
+}
+
+fn validateStringCommentJsonAlloc(alloc: std.mem.Allocator, comment_json: ?[]const u8) !void {
+    const raw = comment_json orelse return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .string => {},
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn commentColumnName(object_name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, object_name, '.') orelse return object_name;
+    return object_name[dot + 1 ..];
+}
+
 pub fn primaryKeyNameEquals(primary_key: ?runtime_schema.PrimaryKey, table_name: []const u8, name: []const u8) bool {
     const key = primary_key orelse return false;
     if (key.name) |key_name| return std.mem.eql(u8, key_name, name);

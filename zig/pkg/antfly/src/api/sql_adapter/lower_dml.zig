@@ -15,7 +15,13 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const plan_mod = @import("plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+
+const MergeExpressionAssignment = plan_mod.MergeExpressionAssignment;
+const MergeFieldMapping = plan_mod.MergeFieldMapping;
+const ReturningProjection = plan_mod.ReturningProjection;
 
 pub fn sqlCanonicalMutationFieldPath(
     schema: runtime_schema.TableSchema,
@@ -67,6 +73,68 @@ pub fn mergeExpressionPredicateGroupsUseTargetRow(groups: []const runtime_schema
         }
     }
     return false;
+}
+
+pub fn updateWillLookupExistingRow(schema: runtime_schema.TableSchema, returning: ReturningProjection) bool {
+    if (returning.hasProjection() or schema.checks.len > 0) return true;
+    for (schema.relational_columns) |column| {
+        if (column.generated != null) return true;
+    }
+    return false;
+}
+
+pub fn validateMergeAssignmentsUnique(
+    mappings: []const MergeFieldMapping,
+    expressions: []const MergeExpressionAssignment,
+) !void {
+    for (mappings, 0..) |mapping, i| {
+        for (mappings[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, mapping.target_field, other.target_field)) return error.UnsupportedSqlShape;
+        }
+        for (expressions) |expression| {
+            if (std.mem.eql(u8, mapping.target_field, expression.target_field)) return error.UnsupportedSqlShape;
+        }
+    }
+    for (expressions, 0..) |expression, i| {
+        for (expressions[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, expression.target_field, other.target_field)) return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+pub fn mergeSourceQueryIsDefault(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.source_cte.len == 0 and
+        req.predicates.len == 0 and
+        req.array_any.len == 0 and
+        req.array_contains.len == 0 and
+        req.array_eq.len == 0 and
+        req.in_predicates.len == 0 and
+        req.json_contains.len == 0 and
+        req.json_path_eq.len == 0 and
+        req.json_path_exists.len == 0 and
+        req.text_patterns.len == 0 and
+        req.or_predicates.len == 0 and
+        req.not_predicates.len == 0 and
+        req.access_or_predicates.len == 0 and
+        req.access_not_predicates.len == 0 and
+        req.expression_predicates.len == 0 and
+        req.expression_or_predicates.len == 0 and
+        req.expression_not_predicates.len == 0 and
+        req.expression_array_contains.len == 0 and
+        req.select.len == 0 and
+        req.json_extract.len == 0 and
+        req.array_length.len == 0 and
+        req.coalesce.len == 0 and
+        req.field_aliases.len == 0 and
+        req.expressions.len == 0 and
+        req.select_all and
+        req.distinct_on.len == 0 and
+        req.distinct_on_expressions.len == 0 and
+        req.order_by.len == 0 and
+        req.row_claim == null and
+        req.doc_key_range == null and
+        req.limit == null and
+        req.offset == 0;
 }
 
 pub fn sqlJsonSetPathsConflict(
