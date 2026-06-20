@@ -150,6 +150,10 @@ func OpenStatusOnly(path string) (*DB, error) {
 // maintenance mode. In this profile callers drive pending work explicitly with
 // RunUntilIdle.
 func OpenHosted(path string) (*DB, error) {
+	if err := ValidateABI(); err != nil {
+		return nil, err
+	}
+
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 

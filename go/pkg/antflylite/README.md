@@ -18,10 +18,10 @@ Normal `go test ./...` does not run the C ABI smoke test. The
 built `libantflylite` unless they are testing the local binding against the
 source-tree C library.
 
-`Open` and `OpenWithOptions` call `ValidateABI` before filling C option
-structures. Applications can call `ValidateABI` at startup to fail fast when the
-loaded `libantflylite` ABI version or `antfly_lite_open_options` size does not
-match the header used to build the Go binding.
+The open helpers call `ValidateABI` before filling C option structures or
+creating handles. Applications can call `ValidateABI` at startup to fail fast
+when the loaded `libantflylite` ABI version or `antfly_lite_open_options` size
+does not match the header used to build the Go binding.
 
 The binding exposes raw JSON methods such as `StatusJSON` and `CapabilitiesJSON`
 for parity with the C ABI. It also exposes typed `Status` and `Capabilities`
