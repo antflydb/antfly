@@ -1899,8 +1899,20 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expect(generatedColumnReferencesAny(generated_column, &.{"tenant_id"}));
     try std.testing.expect(generatedColumnReferencesAny(expression_generated, &.{"status"}));
     try std.testing.expect(expressionConditionReferencesAny(condition, &.{"status"}));
+    try std.testing.expect(expressionConditionReferencesField(condition, "status"));
+    try std.testing.expect(!expressionConditionReferencesField(condition, "tenant_id"));
     try std.testing.expect(uniqueConstraintReferencesAny(unique_constraint, &.{"status"}));
     try std.testing.expect(!uniqueConstraintReferencesAny(unique_constraint, &.{"missing"}));
+
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{status_field},
+    };
+    const same_unique_expressions = [_]runtime_schema.UniqueExpression{.{ .op = .expression, .expression = lower_status }};
+    const equal_unique_expressions = [_]runtime_schema.UniqueExpression{.{ .op = .expression, .expression = lower_status }};
+    const different_unique_expressions = [_]runtime_schema.UniqueExpression{.{ .op = .lower, .field = "tenant_id" }};
+    try std.testing.expect(uniqueExpressionsEqual(&same_unique_expressions, &equal_unique_expressions));
+    try std.testing.expect(!uniqueExpressionsEqual(&same_unique_expressions, &different_unique_expressions));
 }
 
 test "sql adapter lower expr compares query projection and set operation surfaces" {

@@ -66,6 +66,8 @@ const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const ddlForeignKeyActionFromSyntax = sql_adapter.ddlForeignKeyActionFromSyntax;
 const ddlForeignKeyMatchFromSyntax = sql_adapter.ddlForeignKeyMatchFromSyntax;
 const ddlForeignKeyTimingFromSyntax = sql_adapter.ddlForeignKeyTimingFromSyntax;
+const expressionConditionReferencesField = sql_adapter.expressionConditionReferencesField;
+const expressionReferencesField = sql_adapter.expressionReferencesField;
 const expressionProjectionFromCoalesceAlloc = sql_adapter.expressionProjectionFromCoalesceAlloc;
 const freeAccessPredicateGroup = sql_adapter.freeAccessPredicateGroup;
 const freeAccessPredicateGroups = sql_adapter.freeAccessPredicateGroups;
@@ -156,6 +158,7 @@ const sqlStringIsJsonNumber = sql_adapter.sqlStringIsJsonNumber;
 const tokenizeAlloc = sql_adapter.tokenizeAlloc;
 const uniqueConstraintNameExists = sql_adapter.uniqueConstraintNameExists;
 const uniqueConstraintReferencesAny = sql_adapter.uniqueConstraintReferencesAny;
+const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
@@ -35617,39 +35620,6 @@ fn selectorJsonNumber(value: std.json.Value) ?f64 {
         .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
         else => null,
     };
-}
-
-fn expressionConditionReferencesField(condition: db_mod.types.RelationalRowsExpressionCondition, field: []const u8) bool {
-    if (expressionReferencesField(condition.lhs, field)) return true;
-    for (condition.rhs) |rhs| {
-        if (expressionReferencesField(rhs, field)) return true;
-    }
-    return false;
-}
-
-fn expressionReferencesField(expression: db_mod.types.RelationalRowsExpression, field: []const u8) bool {
-    if (expression.kind == .field and expression.field_source == .row and std.mem.eql(u8, expression.field, field)) return true;
-    for (expression.operands) |operand| {
-        if (expressionReferencesField(operand, field)) return true;
-    }
-    for (expression.case_branches) |branch| {
-        if (expressionConditionReferencesField(branch.when, field)) return true;
-        if (expressionReferencesField(branch.then, field)) return true;
-    }
-    for (expression.case_else) |fallback| {
-        if (expressionReferencesField(fallback, field)) return true;
-    }
-    return false;
-}
-
-fn uniqueExpressionsEqual(a: []const runtime_schema.UniqueExpression, b: []const runtime_schema.UniqueExpression) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (left.op != right.op) return false;
-        if (!std.mem.eql(u8, left.field, right.field)) return false;
-        if (!sql_adapter.relationalRowsExpressionOptionalEqual(left.expression, right.expression)) return false;
-    }
-    return true;
 }
 
 fn conflictInsertedValueForColumn(insert_columns: []const []const u8, row: []const []const u8, column: []const u8) ?[]const u8 {
