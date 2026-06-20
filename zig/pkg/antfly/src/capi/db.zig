@@ -1886,8 +1886,22 @@ pub export fn antfly_buffer_free(buffer: ?*capi.Buffer) void {
     out.* = .{};
 }
 
+fn wipeBufferBytes(buffer: capi.Buffer) void {
+    if (buffer.ptr == null or buffer.len == 0) return;
+    std.crypto.secureZero(u8, buffer.ptr.?[0..buffer.len]);
+}
+
 pub export fn antfly_buffer_free_zero(buffer: ?*capi.Buffer) void {
-    antfly_buffer_free(buffer);
+    const out = buffer orelse return;
+    wipeBufferBytes(out.*);
+    antfly_buffer_free(out);
+}
+
+test "capi zero buffer helper wipes bytes before free" {
+    var bytes = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    wipeBufferBytes(.{ .ptr = &bytes, .len = bytes.len });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &bytes);
+    wipeBufferBytes(.{});
 }
 
 pub export fn antfly_db_dense_search_result_free(result: *capi.DenseSearchResult) void {

@@ -2056,6 +2056,7 @@ pub fn build(b: *std.Build) void {
 
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
+        "capi zero buffer helper wipes bytes before free",
         "capi lite exposes hosted and status-only profiles",
         "capi lite open options validate and configure ttl cleanup",
         "capi execute graph queries honors identity read generation",
