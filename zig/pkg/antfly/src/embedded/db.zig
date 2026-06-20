@@ -46,6 +46,18 @@ pub const OpenOptions = struct {
 pub const Profile = support.lite.backend.Profile;
 pub const Capabilities = support.lite.backend.Capabilities;
 
+pub const LiteStatus = struct {
+    storage: LiteStorageStatus,
+    stats: types.DBStats,
+    pending_work: db_core.PendingWorkStats,
+    capabilities: Capabilities,
+
+    pub fn deinit(self: *LiteStatus, alloc: Allocator) void {
+        types.freeDBStats(alloc, self.stats);
+        self.* = undefined;
+    }
+};
+
 pub const DB = struct {
     allocator: Allocator,
     inner: db_mod.DB,
@@ -124,6 +136,19 @@ pub const DB = struct {
     pub fn liteStorageStatus(self: *DB) !LiteStorageStatus {
         const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
         return backend.storageStatus();
+    }
+
+    pub fn liteStatus(self: *DB, alloc: Allocator) !LiteStatus {
+        const storage_status = try self.liteStorageStatus();
+        const stats_value = try self.stats(alloc);
+        errdefer types.freeDBStats(alloc, stats_value);
+
+        return .{
+            .storage = storage_status,
+            .stats = stats_value,
+            .pending_work = self.pendingWorkStats(),
+            .capabilities = self.capabilities(),
+        };
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) !void {
@@ -307,6 +332,56 @@ test "embedded db openLite persists documents in aflite file" {
 
         try std.testing.expect(std.mem.indexOf(u8, result.json, "\"lite persisted\"") != null);
     }
+}
+
+test "embedded db liteStatus exposes storage stats work and capabilities" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const plain_path = try testLitePath(alloc, tmp, "embedded-status-plain");
+    defer alloc.free(plain_path);
+
+    {
+        var plain = try DB.open(alloc, plain_path, .{
+            .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        });
+        defer plain.close();
+        try std.testing.expectError(error.NotLiteDatabase, plain.liteStatus(alloc));
+    }
+
+    const path = try testLitePath(alloc, tmp, "embedded-status.aflite");
+    defer alloc.free(path);
+
+    var db = try DB.openLite(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:status",
+            .value = "{\"title\":\"typed status\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    var status = try db.liteStatus(alloc);
+    defer status.deinit(alloc);
+
+    try std.testing.expectEqualStrings("aflite", status.storage.format);
+    try std.testing.expectEqualStrings("native_single_file", status.storage.engine);
+    try std.testing.expectEqual(@as(?u32, 1), status.storage.format_version);
+    try std.testing.expect(status.storage.page_size != null);
+    try std.testing.expect(status.storage.active_checkpoint != null);
+    try std.testing.expectEqual(@as(u64, 1), status.stats.doc_count);
+    try std.testing.expect(!status.pending_work.has_async_indexes);
+    try std.testing.expect(status.capabilities.dense_vector_search);
+    try std.testing.expect(status.capabilities.sparse_vector_search);
+    try std.testing.expect(status.capabilities.no_inference_configured_ok);
+    try std.testing.expect(!status.capabilities.raft_replication);
+    try std.testing.expect(!status.capabilities.cluster_placement);
 }
 
 test "embedded db openLiteHosted exposes manual maintenance capabilities" {

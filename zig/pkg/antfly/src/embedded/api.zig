@@ -176,21 +176,9 @@ pub const Api = struct {
     }
 
     pub fn statusJson(self: *Api, alloc: Allocator) ![]u8 {
-        const storage_json = try std.json.Stringify.valueAlloc(alloc, try self.db.liteStorageStatus(), .{});
-        defer alloc.free(storage_json);
-        const stats_json = try self.statsJson(alloc);
-        defer alloc.free(stats_json);
-        const pending_json = try self.pendingWorkStatsJson(alloc);
-        defer alloc.free(pending_json);
-        const capabilities_json = try self.capabilitiesJson(alloc);
-        defer alloc.free(capabilities_json);
-
-        return try std.fmt.allocPrint(alloc, "{{\"storage\":{s},\"stats\":{s},\"pending_work\":{s},\"capabilities\":{s}}}", .{
-            storage_json,
-            stats_json,
-            pending_json,
-            capabilities_json,
-        });
+        var status = try self.db.liteStatus(alloc);
+        defer status.deinit(alloc);
+        return try std.json.Stringify.valueAlloc(alloc, status, .{});
     }
 
     pub fn runUntilIdleJson(self: *Api, alloc: Allocator) ![]u8 {
