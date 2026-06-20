@@ -3056,6 +3056,124 @@ pub fn parseRepeatRowExpressionAlloc(
     return try parseTextNumericBinaryRowExpressionRestAlloc(alloc, tokens, pos, .repeat, type_context, hooks);
 }
 
+pub fn parseDateTruncRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: FixedBinaryRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsDateTruncFunction);
+    const unit = try hooks.parse_expression(hooks.ptr);
+    var unit_transferred = false;
+    errdefer if (!unit_transferred) freeExpression(alloc, unit);
+    try type_context.validateTextRowExpression(unit);
+    try parser.expectToken(tokens, pos, .comma);
+
+    const value = try hooks.parse_expression(hooks.ptr);
+    var value_transferred = false;
+    errdefer if (!value_transferred) freeExpression(alloc, value);
+    try type_context.validateNumericOrDatetimeRowExpression(value);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildBinaryFunctionExpressionAlloc(alloc, .date_trunc, unit, value);
+    unit_transferred = true;
+    value_transferred = true;
+    return expression;
+}
+
+pub fn parseDateBinRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsDateBinFunction);
+    const stride = try hooks.parse_expression(hooks.ptr);
+    var stride_transferred = false;
+    errdefer if (!stride_transferred) freeExpression(alloc, stride);
+    try type_context.validateDateBinStrideRowExpression(stride);
+    try parser.expectToken(tokens, pos, .comma);
+
+    const source = try hooks.parse_expression(hooks.ptr);
+    var source_transferred = false;
+    errdefer if (!source_transferred) freeExpression(alloc, source);
+    try type_context.validateNumericOrDatetimeRowExpression(source);
+    try parser.expectToken(tokens, pos, .comma);
+
+    const origin = try hooks.parse_expression(hooks.ptr);
+    var origin_transferred = false;
+    errdefer if (!origin_transferred) freeExpression(alloc, origin);
+    try type_context.validateNumericOrDatetimeRowExpression(origin);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildTernaryFunctionExpressionAlloc(alloc, .date_bin, stride, source, origin);
+    stride_transferred = true;
+    source_transferred = true;
+    origin_transferred = true;
+    return expression;
+}
+
+pub fn parseDatePartRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const extract_syntax = try parseDatePartFunctionCallStart(tokens, pos);
+    var unit: db_mod.types.RelationalRowsExpression = undefined;
+    var unit_initialized = false;
+    var unit_transferred = false;
+    errdefer if (unit_initialized and !unit_transferred) freeExpression(alloc, unit);
+    var value: db_mod.types.RelationalRowsExpression = undefined;
+    var value_initialized = false;
+    var value_transferred = false;
+    errdefer if (value_initialized and !value_transferred) freeExpression(alloc, value);
+
+    if (extract_syntax) {
+        unit = try parseDatePartUnitLiteralExpressionAlloc(alloc, tokens, pos);
+        unit_initialized = true;
+        try parseDatePartExtractSeparator(tokens, pos);
+        value = try hooks.parse_expression(hooks.ptr);
+        value_initialized = true;
+        try type_context.validateNumericOrDatetimeRowExpression(value);
+    } else {
+        unit = try hooks.parse_expression(hooks.ptr);
+        unit_initialized = true;
+        try type_context.validateTextRowExpression(unit);
+        try parser.expectToken(tokens, pos, .comma);
+        value = try hooks.parse_expression(hooks.ptr);
+        value_initialized = true;
+        try type_context.validateNumericOrDatetimeRowExpression(value);
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try buildBinaryFunctionExpressionAlloc(alloc, .date_part, unit, value);
+    unit_transferred = true;
+    value_transferred = true;
+    return expression;
+}
+
+fn parseDatePartUnitLiteralExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsExpression {
+    const token = if (parser.matchToken(tokens, pos, .identifier)) |token|
+        token
+    else if (parser.matchToken(tokens, pos, .string)) |token|
+        token
+    else
+        return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(token.text, "from")) return error.UnsupportedSqlShape;
+    return .{
+        .kind = .value,
+        .value_json = try std.json.Stringify.valueAlloc(alloc, token.text, .{}),
+    };
+}
+
 fn parseTextNumericBinaryRowExpressionRestAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
