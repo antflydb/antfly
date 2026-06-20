@@ -530,6 +530,7 @@ pub const relationalCheckOpFromUniquePredicateToken = lower_expr.relationalCheck
 pub const relationalFieldTypeSupportsCollation = binder.relationalFieldTypeSupportsCollation;
 pub const relationalGeneratedOpForUniqueExpressionOp = lower_expr.relationalGeneratedOpForUniqueExpressionOp;
 pub const relationalIndexNameExists = binder.relationalIndexNameExists;
+pub const relationalIndexLifecycleName = ddl_plan.relationalIndexLifecycleName;
 pub const relationalPeriodColumnType = binder.relationalPeriodColumnType;
 pub const relationalPeriodForDdl = binder.relationalPeriodForDdl;
 pub const relationalPeriodNameExists = binder.relationalPeriodNameExists;

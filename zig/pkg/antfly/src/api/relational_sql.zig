@@ -181,6 +181,7 @@ const relationalCheckValidationStateName = sql_adapter.relationalCheckValidation
 const relationalFieldTypeSupportsCollation = sql_adapter.relationalFieldTypeSupportsCollation;
 const relationalGeneratedOpForUniqueExpressionOp = sql_adapter.relationalGeneratedOpForUniqueExpressionOp;
 const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
+const relationalIndexLifecycleName = sql_adapter.relationalIndexLifecycleName;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
 const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
@@ -38152,15 +38153,6 @@ fn hashPlanU64(hasher: *std.hash.Wyhash, value: u64) void {
     var buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &buf, value, .big);
     hasher.update(&buf);
-}
-
-fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLifecycle) []const u8 {
-    return switch (lifecycle) {
-        .ready => "ready",
-        .building => "building",
-        .invalid => "invalid",
-        .dropping => "dropping",
-    };
 }
 
 fn setColumnOnUpdatePolicyAlloc(
