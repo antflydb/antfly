@@ -46,6 +46,20 @@ const RestoreArgs = struct {
     input_path: ?[]const u8 = null,
 };
 
+const InputRestorePlan = struct {
+    staged: lite_restore_staging.StagedRestore,
+    request: antfly_client.types.RestoreRequest,
+
+    fn tableName(self: InputRestorePlan) []const u8 {
+        return self.staged.table_name;
+    }
+
+    fn deinit(self: *InputRestorePlan, allocator: std.mem.Allocator) void {
+        self.staged.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const opts = parseBackupArgs(args) catch cli.fatal("invalid backup arguments", .{});
     if (opts.help) {
@@ -146,20 +160,9 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
             }
         }
 
-        var owned_backup_id: ?[]u8 = null;
-        defer if (owned_backup_id) |value| allocator.free(value);
-        const bid = opts.backup_id orelse blk: {
-            owned_backup_id = try lite_restore_staging.defaultBackupIdAlloc(allocator, input);
-            break :blk owned_backup_id.?;
-        };
-
-        var staged = try lite_restore_staging.stageInputRestoreBackup(allocator, input, tbl, bid, opts.location);
-        defer staged.deinit(allocator);
-        try client.restoreTable(tbl, .{
-            .backup_id = staged.backup_id,
-            .location = staged.location,
-            .format = "portable",
-        });
+        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, opts.location);
+        defer plan.deinit(allocator);
+        try client.restoreTable(plan.tableName(), plan.request);
         std.debug.print("Restore command successfully initiated.\n", .{});
         return;
     }
@@ -193,6 +196,36 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
         try cli.writeJson(allocator, io, data.value);
     }
     std.debug.print("Restore command successfully initiated.\n", .{});
+}
+
+fn prepareInputRestorePlan(
+    allocator: std.mem.Allocator,
+    input_path: []const u8,
+    table_name: []const u8,
+    backup_id: ?[]const u8,
+    location: []const u8,
+) !InputRestorePlan {
+    var owned_backup_id: ?[]u8 = null;
+    defer if (owned_backup_id) |value| allocator.free(value);
+    const resolved_backup_id = backup_id orelse blk: {
+        owned_backup_id = try lite_restore_staging.defaultBackupIdAlloc(allocator, input_path);
+        break :blk owned_backup_id.?;
+    };
+
+    const staged = try lite_restore_staging.stageInputRestoreBackup(allocator, input_path, table_name, resolved_backup_id, location);
+    errdefer {
+        var owned_staged = staged;
+        owned_staged.deinit(allocator);
+    }
+
+    return .{
+        .staged = staged,
+        .request = .{
+            .backup_id = staged.backup_id,
+            .location = staged.location,
+            .format = "portable",
+        },
+    };
 }
 
 fn parseBackupArgs(args: *std.process.Args.Iterator) !BackupArgs {
@@ -451,6 +484,65 @@ test "restore cli parser accepts aflite input shape" {
     try std.testing.expectEqualStrings("portable", opts.format.?);
     try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
     try std.testing.expectEqualStrings("lite-app", opts.backup_id.?);
+}
+
+test "restore input plan stages aflite as portable table restore" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-input-plan-src.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/restore-input-plan-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+
+    {
+        var backend = try antfly.lite.backend.Handle.create(allocator, src_path, true);
+        defer backend.deinit();
+
+        var opts = antfly.db.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+        };
+        try backend.configureDbOpenOptions(&opts);
+
+        var db = try antfly.db.DB.open(allocator, src_path, opts);
+        defer db.close();
+        try db.setSchemaJson(allocator, schema_json);
+    }
+
+    var plan = try prepareInputRestorePlan(allocator, src_path, "docs", null, location);
+    defer plan.deinit(allocator);
+
+    try std.testing.expectEqualStrings("docs", plan.tableName());
+    try std.testing.expectEqualStrings("lite-restore-input-plan-src", plan.request.backup_id);
+    try std.testing.expectEqualStrings(location, plan.request.location);
+    try std.testing.expectEqualStrings("portable", plan.request.format.?);
+    try std.testing.expectEqualStrings("lite-restore-input-plan-src.afb", plan.staged.snapshot_path);
+
+    var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);
+    defer backup_location.deinit(allocator);
+    var manifest = try antfly.public_api.backups.readManifestFromLocation(allocator, &backup_location, plan.request.backup_id);
+    defer manifest.deinit(allocator);
+
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings(plan.request.backup_id, manifest.backup_id);
+    try std.testing.expectEqualStrings(schema_json, manifest.schema_json);
+    try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
+    try std.testing.expectEqualStrings(plan.staged.snapshot_path, manifest.shards[0].snapshot_path);
 }
 
 test "restore cli parser accepts help flag" {
