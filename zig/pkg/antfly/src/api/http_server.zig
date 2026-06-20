@@ -3251,6 +3251,7 @@ pub const ApiHttpServer = struct {
                 alloc.free(@constCast(table.database_name));
                 alloc.free(@constCast(table.namespace_name));
                 alloc.free(@constCast(table.table_name));
+                alloc.free(@constCast(table.schema_json));
             }
             if (self.tables.len > 0) alloc.free(self.tables);
             self.* = undefined;
@@ -3296,6 +3297,7 @@ pub const ApiHttpServer = struct {
                 self.alloc.free(@constCast(table.database_name));
                 self.alloc.free(@constCast(table.namespace_name));
                 self.alloc.free(@constCast(table.table_name));
+                self.alloc.free(@constCast(table.schema_json));
             }
             self.alloc.free(table_refs);
         }
@@ -3309,12 +3311,15 @@ pub const ApiHttpServer = struct {
                 errdefer self.alloc.free(namespace_name);
                 const table_name = try self.alloc.dupe(u8, table.name);
                 errdefer self.alloc.free(table_name);
+                const schema_json = try self.alloc.dupe(u8, table.schema_json);
+                errdefer self.alloc.free(schema_json);
 
                 names[filled] = name;
                 table_refs[filled] = .{
                     .database_name = database_name,
                     .namespace_name = namespace_name,
                     .table_name = table_name,
+                    .schema_json = schema_json,
                 };
                 filled += 1;
             }
@@ -19569,9 +19574,12 @@ test "api http server serves user management routes when auth is enabled" {
 
 test "api http server applies authorization SQL DDL through user manager" {
     const alloc = std.testing.allocator;
+    const usage_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
     const FakeSource = struct {
         tables: [2]metadata_table_manager.TableRecord = .{
-            .{ .table_id = 1, .name = "usage_records" },
+            .{ .table_id = 1, .name = "usage_records", .schema_json = usage_schema_json },
             .{ .table_id = 2, .name = "docs" },
         },
 
@@ -19639,6 +19647,7 @@ test "api http server applies authorization SQL DDL through user manager" {
     var row_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));");
     defer row_policy.deinit(alloc);
     try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("CREATE POLICY missing_tenant_policy ON missing_records USING (tenant_id = 'tenant-a');"));
+    try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdl("CREATE POLICY missing_column_policy ON usage_records USING (missing_tenant = 'tenant-a');"));
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read));

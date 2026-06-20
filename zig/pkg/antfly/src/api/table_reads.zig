@@ -5072,7 +5072,11 @@ fn rowsQueryPlanFromLakeScanAlloc(
     plan: db_mod.types.RelationalRowsQueryPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsQueryResult {
-    if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+    if (plan.ctes.len != 0 or plan.ranges.len != 0) {
+        var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+        defer base_rows.deinit(alloc);
+        return try relational_rows_api.executeRowsQueryPlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
+    }
     var lake_request = try relational_rows_api.buildLakeRowsScanRequestForRowsQueryAlloc(alloc, runtime_schema, plan.query);
     defer lake_request.deinit(alloc);
 
@@ -5104,7 +5108,11 @@ fn rowsAggregatePlanFromLakeScanAlloc(
     plan: db_mod.types.RelationalRowsAggregatePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsAggregateResult {
-    if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+    if (plan.ctes.len != 0 or plan.ranges.len != 0) {
+        var base_rows = (try fullRowsFromLakeScanAlloc(alloc, source, table_name, runtime_schema, consistency)) orelse return null;
+        defer base_rows.deinit(alloc);
+        return try relational_rows_api.executeRowsAggregatePlanOnJsonRowsAlloc(alloc, runtime_schema, plan, base_rows.rows);
+    }
     var maybe_expression_request = try relational_rows_api.buildLakeRowsExpressionAggregateRequestForRowsAggregateAlloc(alloc, plan.aggregate);
     if (maybe_expression_request) |*expression_request| {
         defer expression_request.deinit(alloc);
@@ -18706,6 +18714,62 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqual(@as(usize, 2), lateral_result.rows.len);
     try std.testing.expectEqualStrings("{\"left_amount\":20,\"latest_amount\":30}", lateral_result.rows[0]);
     try std.testing.expectEqualStrings("{\"left_amount\":30,\"latest_amount\":30}", lateral_result.rows[1]);
+
+    const lake_range = [_]db_mod.types.RelationalRowsDocKeyRange{.{
+        .start = doc_range_start,
+        .end = doc_range_end,
+    }};
+    var ranged_plan_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .ranges = lake_range[0..],
+        .query = .{
+            .select = select[0..],
+            .select_all = false,
+        },
+    }, .read_index)).?;
+    defer ranged_plan_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 27), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), ranged_plan_result.total);
+    try std.testing.expectEqual(@as(usize, 1), ranged_plan_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", ranged_plan_result.rows[0]);
+
+    const cte_select = [_][]const u8{ "amount", "tenant" };
+    const lake_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = "high_amounts",
+        .query = .{
+            .predicates = residual_predicates[0..],
+            .select = cte_select[0..],
+            .select_all = false,
+        },
+    }};
+    var cte_query_result = (try source.rowsQueryPlan(alloc, "events", schema, .{
+        .ctes = lake_ctes[0..],
+        .query = .{
+            .source_cte = "high_amounts",
+            .select = select[0..],
+            .select_all = false,
+        },
+    }, .read_index)).?;
+    defer cte_query_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 28), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), cte_query_result.total);
+    try std.testing.expectEqual(@as(usize, 1), cte_query_result.rows.len);
+    try std.testing.expectEqualStrings("{\"amount\":30}", cte_query_result.rows[0]);
+
+    var cte_aggregate_result = (try source.rowsAggregatePlan(alloc, "events", schema, .{
+        .ctes = lake_ctes[0..],
+        .aggregate = .{
+            .source = .{ .source_cte = "high_amounts" },
+            .aggregations = aggregations[0..],
+        },
+    }, .read_index)).?;
+    defer cte_aggregate_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 29), fake.lake_scan_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.lake_expression_aggregate_calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.routed_scan_calls);
+    try std.testing.expectEqual(@as(u32, 1), cte_aggregate_result.total_groups);
+    try std.testing.expectEqualStrings("{\"count_all\":1,\"sum_amount\":30}", cte_aggregate_result.rows[0]);
 }
 
 test "pinned external lake rows scanner validates schema binding against inventory" {

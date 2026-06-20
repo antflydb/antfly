@@ -17,6 +17,7 @@ const relational_sql = @import("relational_sql.zig");
 const tables_api = @import("tables.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const runtime_schema = @import("../storage/schema.zig");
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
@@ -32,6 +33,7 @@ pub const SqlAuthTableRef = struct {
     database_name: []const u8,
     namespace_name: []const u8,
     table_name: []const u8,
+    schema_json: []const u8 = "",
 };
 
 pub const SqlAuthCatalog = struct {
@@ -215,6 +217,7 @@ fn executeCreateRowSecurityPolicy(
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
     defer alloc.free(table_resource);
+    try validateRowSecurityPredicateForCatalogTableSchema(alloc, plan.table_name, catalog, plan.predicate);
     const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
     defer alloc.free(filter_json);
     const role_targets = try rowSecurityPolicyTargetSubjectsAlloc(manager, alloc, plan.role_targets);
@@ -231,6 +234,7 @@ fn executeAlterRowSecurityPolicy(
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
     defer alloc.free(table_resource);
+    try validateRowSecurityPredicateForCatalogTableSchema(alloc, plan.table_name, catalog, plan.predicate);
     const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
     defer alloc.free(filter_json);
     const role_targets = try rowSecurityPolicyTargetSubjectsAlloc(manager, alloc, plan.role_targets);
@@ -287,6 +291,96 @@ fn sqlAuthTableResourceNameAlloc(
         }
     }
     return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
+
+fn sqlAuthTableRefForObject(sql_object_name: []const u8, catalog: SqlAuthCatalog) !?SqlAuthTableRef {
+    const target = try catalog.session().tableTargetFromObjectName(sql_object_name);
+    if (catalog.tables.len > 0) {
+        for (catalog.tables) |table_ref| {
+            if (std.mem.eql(u8, table_ref.database_name, target.database_name) and
+                std.mem.eql(u8, table_ref.namespace_name, target.namespace_name) and
+                std.mem.eql(u8, table_ref.table_name, target.table_name))
+            {
+                return table_ref;
+            }
+        }
+        return error.TableNotFound;
+    }
+    if (catalog.public_table_names) |public_table_names| {
+        if (std.mem.eql(u8, target.database_name, catalog_resources.default_database_name) and
+            std.mem.eql(u8, target.namespace_name, catalog_resources.default_namespace_name))
+        {
+            for (public_table_names) |table_name| {
+                if (std.mem.eql(u8, table_name, target.table_name)) return null;
+            }
+            return error.TableNotFound;
+        }
+    }
+    return null;
+}
+
+fn validateRowSecurityPredicateForCatalogTableSchema(
+    alloc: std.mem.Allocator,
+    sql_object_name: []const u8,
+    catalog: SqlAuthCatalog,
+    predicate: relational_sql.RowSecurityPolicyPredicate,
+) !void {
+    const table_ref = (try sqlAuthTableRefForObject(sql_object_name, catalog)) orelse return;
+    if (table_ref.schema_json.len == 0) return;
+    var parsed = try tables_api.parseValidatedTableSchema(alloc, table_ref.schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+    try validateRowSecurityPredicateForSchema(alloc, schema, predicate);
+}
+
+fn validateRowSecurityPredicateForSchema(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    predicate: relational_sql.RowSecurityPolicyPredicate,
+) !void {
+    switch (predicate) {
+        .current_setting_equals => |current_setting| {
+            _ = rowSecurityPolicyColumn(schema, current_setting.field) orelse return error.UnsupportedSqlShape;
+            usermgr.validateRoleSettingName(current_setting.setting_name) catch return error.UnsupportedSqlShape;
+        },
+        .literal_equals => |literal| {
+            const column = rowSecurityPolicyColumn(schema, literal.field) orelse return error.UnsupportedSqlShape;
+            try validateRowSecurityLiteralForColumn(alloc, column, literal.value_json);
+        },
+        .conjunction => |conjunction| {
+            for (conjunction.predicates) |term| try validateRowSecurityPredicateForSchema(alloc, schema, term);
+        },
+    }
+}
+
+fn rowSecurityPolicyColumn(schema: runtime_schema.TableSchema, field: []const u8) ?runtime_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, field) or std.mem.eql(u8, column.path, field)) return column;
+    }
+    return null;
+}
+
+fn validateRowSecurityLiteralForColumn(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    value_json: []const u8,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    switch (column.field_type) {
+        .keyword, .text, .link, .html, .search_as_you_type, .blob => {
+            if (parsed.value != .string) return error.UnsupportedSqlShape;
+        },
+        .boolean => {
+            if (parsed.value != .bool) return error.UnsupportedSqlShape;
+        },
+        .numeric, .datetime => switch (parsed.value) {
+            .integer, .float, .number_string => {},
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 const SqlPrivilegeResourceTarget = struct {
