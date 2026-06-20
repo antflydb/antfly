@@ -1662,6 +1662,44 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
 }
 
+test "lite full text query survives writer close and readonly reopen" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/query-reopen.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    {
+        var lite = try LiteDb.create(allocator, path, true);
+        defer lite.close();
+
+        try lite.db.addIndex(.{
+            .name = "ft_body",
+            .kind = .full_text,
+            .config_json = "{}",
+        });
+
+        const batch_response = try batchJson(allocator, &lite.db,
+            \\{"inserts":{"doc:query-reopen":{"body":"native lite full text"}},"sync_level":"full_index"}
+        );
+        defer allocator.free(batch_response);
+        try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":1") != null);
+    }
+
+    {
+        var reopened = try LiteDb.open(allocator, path, .query_readonly);
+        defer reopened.close();
+
+        const query_response = try searchJson(allocator, &reopened.db,
+            \\{"full_text_search":{"match":{"field":"body","text":"full text"}},"limit":1}
+        );
+        defer allocator.free(query_response);
+        try std.testing.expect(std.mem.indexOf(u8, query_response, "\"doc:query-reopen\"") != null);
+    }
+}
+
 test "lite snapshot copies stable aflite prefix without source tail" {
     const allocator = std.testing.allocator;
 

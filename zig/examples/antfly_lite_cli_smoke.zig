@@ -67,7 +67,7 @@ pub fn main(init: std.process.Init) !void {
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "run-until-idle", db_path }, "\"has_async_indexes\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", db_path, "--key", "doc:cli-smoke", "--file", lookup_path }, "native lite command smoke");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "scan", db_path, "--file", scan_path }, "doc:cli-smoke");
-    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", query_path }, "\"status\":200");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "query", db_path, "--file", query_path }, "doc:cli-smoke");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "check", db_path }, "\"valid\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "backup", db_path, "--out", backup_path }, "\"format\":\"afb\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", backup_path, "--out", restored_path }, "\"format\":\"aflite\"");

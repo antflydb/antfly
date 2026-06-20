@@ -777,7 +777,7 @@ test "embedded api openLite keeps full text index inside native aflite file" {
 
         const batch_json = try api.batchJson(
             alloc,
-            "{\"inserts\":{\"doc:a\":{\"body\":\"native lite full text\"}},\"sync\":\"full_index\"}",
+            "{\"inserts\":{\"doc:a\":{\"body\":\"native lite full text\"}},\"sync_level\":\"full_index\"}",
         );
         defer alloc.free(batch_json);
         try std.testing.expect(std.mem.indexOf(u8, batch_json, "\"inserted\":1") != null);

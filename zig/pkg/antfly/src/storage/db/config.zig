@@ -337,11 +337,15 @@ pub fn indexBackendOptionsForPrimary(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     overrides: IndexBackendOptions,
 ) IndexBackendOptions {
+    const text_storage_override = overrides.text_lsm_storage != null;
+    const dense_storage_override = overrides.dense_lsm_storage != null;
+    const sparse_storage_override = overrides.sparse_lsm_storage != null;
+    const graph_storage_override = overrides.graph_lsm_storage != null;
     return .{
-        .text_main_backend = textMainBackendForPrimary(kind),
-        .dense_storage_backend = denseStorageBackendForPrimary(kind),
-        .sparse_backend = sparseBackendForPrimary(kind),
-        .graph_reverse_backend = graphReverseBackendForPrimary(kind),
+        .text_main_backend = if (text_storage_override) overrides.text_main_backend else textMainBackendForPrimary(kind),
+        .dense_storage_backend = if (dense_storage_override) overrides.dense_storage_backend else denseStorageBackendForPrimary(kind),
+        .sparse_backend = if (sparse_storage_override) overrides.sparse_backend else sparseBackendForPrimary(kind),
+        .graph_reverse_backend = if (graph_storage_override) overrides.graph_reverse_backend else graphReverseBackendForPrimary(kind),
         .text_lsm_storage = overrides.text_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .dense_lsm_storage = overrides.dense_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
         .sparse_lsm_storage = overrides.sparse_lsm_storage orelse if (kind == .lsm) primary_lsm_storage else null,
@@ -452,6 +456,32 @@ test "index lsm profiles preserve current flush profiles" {
     try std.testing.expectEqual(primary_wal_soft_limit_bytes, primary_opts.wal_soft_limit_bytes);
     try std.testing.expectEqual(primary_wal_hard_limit_bytes, primary_opts.wal_hard_limit_bytes);
     try std.testing.expectEqual(@as(@TypeOf(primary_opts.table_prefix_extractor), .first_separator), primary_opts.table_prefix_extractor);
+}
+
+test "index backend resolver honors explicit lsm storage over memory primary" {
+    const storage: lsm_backend_mod.Storage = undefined;
+    const opts = indexBackendOptionsForPrimary(
+        .mem,
+        null,
+        null,
+        null,
+        0,
+        null,
+        .{
+            .text_main_backend = .lsm,
+            .dense_storage_backend = .lsm,
+            .sparse_backend = .lsm,
+            .graph_reverse_backend = .lsm,
+            .text_lsm_storage = storage,
+            .dense_lsm_storage = storage,
+            .sparse_lsm_storage = storage,
+            .graph_lsm_storage = storage,
+        },
+    );
+    try std.testing.expectEqual(persistent_mod.MainBackend.lsm, opts.text_main_backend);
+    try std.testing.expectEqual(hbc_mod.StorageBackend.lsm, opts.dense_storage_backend);
+    try std.testing.expectEqual(sparse_mod.SparseBackend.lsm, opts.sparse_backend);
+    try std.testing.expectEqual(graph_mod.ReverseBackend.lsm, opts.graph_reverse_backend);
 }
 
 test "index lsm profiles inherit shared cache root generation and overrides" {
