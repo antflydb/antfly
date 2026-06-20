@@ -248,6 +248,11 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
 fn validateRestoreArgs(opts: RestoreArgs) !void {
     if (opts.input_path == null) return;
     if (opts.restore_mode != null) return error.RestoreInputModeUnsupported;
+    if (!isPortableRestoreInputPath(opts.input_path.?)) return error.InvalidRestoreInputPath;
+}
+
+fn isPortableRestoreInputPath(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".aflite") or std.mem.endsWith(u8, path, ".afb");
 }
 
 fn printBackupUsage() void {
@@ -434,6 +439,18 @@ test "restore cli validation rejects mode with input restore" {
     var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.RestoreInputModeUnsupported, validateRestoreArgs(opts));
+}
+
+test "restore cli validation rejects unsupported input extension" {
+    var argv = [_][*:0]const u8{
+        "--input",
+        "app.db",
+        "--table",
+        "docs",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expectError(error.InvalidRestoreInputPath, validateRestoreArgs(opts));
 }
 
 test "restore cli parser rejects unknown arguments" {
