@@ -2025,8 +2025,27 @@ pub fn build(b: *std.Build) void {
     });
     const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
 
-    const capi_step = b.step("capi", "Build the Zig C API shared library");
+    const lite_capi_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lite_capi_mod.addImport("antfly-zig", lib_mod);
+    lite_capi_mod.addImport("structlog", structlog_mod);
+
+    const lite_capi_lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "antflylite",
+        .root_module = lite_capi_mod,
+    });
+    const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
+
+    const capi_step = b.step("capi", "Build the Zig C API shared libraries");
     capi_step.dependOn(&install_capi_lib.step);
+    capi_step.dependOn(&install_lite_capi_lib.step);
+
+    const lite_capi_step = b.step("lite-capi", "Build the libantflylite C ABI shared library");
+    lite_capi_step.dependOn(&install_lite_capi_lib.step);
 
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
