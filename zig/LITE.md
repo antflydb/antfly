@@ -92,6 +92,10 @@ antfly lite vacuum app.aflite
 antfly lite serve app.aflite --addr 127.0.0.1:8080
 ```
 
+`antfly lite init` should be non-destructive: it creates a new `.aflite` file
+and rejects an existing database path. Destructive replacement should stay on
+explicit restore/import flows where the source and target are both known.
+
 `antfly lite serve` is optional convenience mode. It should expose a local
 single-node HTTP API for development and migration testing, but the primary
 contract is embedded use.
