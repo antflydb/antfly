@@ -15573,21 +15573,7 @@ const Parser = struct {
     }
 
     fn parseDateTruncRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsDateTruncFunction);
-        const unit = try self.parseRowExpressionAlloc();
-        var unit_transferred = false;
-        errdefer if (!unit_transferred) freeExpression(self.alloc, unit);
-        try self.rowExpressionTypeContext().validateTextRowExpression(unit);
-        try self.expect(.comma);
-        const value = try self.parseRowExpressionAlloc();
-        var value_transferred = false;
-        errdefer if (!value_transferred) freeExpression(self.alloc, value);
-        try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(value);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .date_trunc, unit, value);
-        unit_transferred = true;
-        value_transferred = true;
-        return expression;
+        return try sql_adapter.parseDateTruncRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.fixedBinaryRowExpressionParserHooks());
     }
 
     fn parseDateBinExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15599,27 +15585,7 @@ const Parser = struct {
     }
 
     fn parseDateBinRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsDateBinFunction);
-        const stride = try self.parseRowExpressionAlloc();
-        var stride_transferred = false;
-        errdefer if (!stride_transferred) freeExpression(self.alloc, stride);
-        try self.rowExpressionTypeContext().validateDateBinStrideRowExpression(stride);
-        try self.expect(.comma);
-        const source = try self.parseRowExpressionAlloc();
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(source);
-        try self.expect(.comma);
-        const origin = try self.parseRowExpressionAlloc();
-        var origin_transferred = false;
-        errdefer if (!origin_transferred) freeExpression(self.alloc, origin);
-        try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(origin);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildTernaryFunctionExpressionAlloc(self.alloc, .date_bin, stride, source, origin);
-        stride_transferred = true;
-        source_transferred = true;
-        origin_transferred = true;
-        return expression;
+        return try sql_adapter.parseDateBinRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseDatePartExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15631,50 +15597,7 @@ const Parser = struct {
     }
 
     fn parseDatePartRowExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        const extract_syntax = try sql_adapter.parseDatePartFunctionCallStart(self.tokens, &self.pos);
-        var unit: db_mod.types.RelationalRowsExpression = undefined;
-        var unit_initialized = false;
-        var unit_transferred = false;
-        errdefer if (unit_initialized and !unit_transferred) freeExpression(self.alloc, unit);
-        var value: db_mod.types.RelationalRowsExpression = undefined;
-        var value_initialized = false;
-        var value_transferred = false;
-        errdefer if (value_initialized and !value_transferred) freeExpression(self.alloc, value);
-        if (extract_syntax) {
-            unit = try self.parseDatePartUnitLiteralExpressionAlloc();
-            unit_initialized = true;
-            try sql_adapter.parseDatePartExtractSeparator(self.tokens, &self.pos);
-            value = try self.parseRowExpressionAlloc();
-            value_initialized = true;
-            try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(value);
-        } else {
-            unit = try self.parseRowExpressionAlloc();
-            unit_initialized = true;
-            try self.rowExpressionTypeContext().validateTextRowExpression(unit);
-            try self.expect(.comma);
-            value = try self.parseRowExpressionAlloc();
-            value_initialized = true;
-            try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(value);
-        }
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .date_part, unit, value);
-        unit_transferred = true;
-        value_transferred = true;
-        return expression;
-    }
-
-    fn parseDatePartUnitLiteralExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpression {
-        const token = if (self.match(.identifier)) |token|
-            token
-        else if (self.match(.string)) |token|
-            token
-        else
-            return error.UnsupportedSqlShape;
-        if (std.ascii.eqlIgnoreCase(token.text, "from")) return error.UnsupportedSqlShape;
-        return .{
-            .kind = .value,
-            .value_json = try std.json.Stringify.valueAlloc(self.alloc, token.text, .{}),
-        };
+        return try sql_adapter.parseDatePartRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.variadicRowExpressionParserHooks());
     }
 
     fn parseConcatExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
