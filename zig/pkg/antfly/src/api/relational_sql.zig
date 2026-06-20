@@ -125,7 +125,6 @@ const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSynta
 const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const createTablePlanFromTableCloneSourceAlloc = sql_adapter.createTablePlanFromTableCloneSourceAlloc;
 const ddlRangeBoundTypeForName = sql_adapter.ddlRangeBoundTypeForName;
-const ddlRangeTypeForName = sql_adapter.ddlRangeTypeForName;
 const expressionConditionReferencesField = sql_adapter.expressionConditionReferencesField;
 const expressionConditionsFromSimpleSetQueryAlloc = sql_adapter.expressionConditionsFromSimpleSetQueryAlloc;
 const expressionGroupsFromInSetQueryAlloc = sql_adapter.expressionGroupsFromInSetQueryAlloc;
@@ -262,7 +261,6 @@ const windowOutputFieldIsUnique = sql_adapter.windowOutputFieldIsUnique;
 const windowValueExpressionCount = sql_adapter.windowValueExpressionCount;
 const max_scalar_or_expanded_branches: usize = 32;
 const advisoryLockActionFromSyntax = sql_adapter.advisoryLockActionFromSyntax;
-const bulkIoDirectionFromSyntax = sql_adapter.bulkIoDirectionFromSyntax;
 pub const bulkSqlIoExecutionFingerprintAlloc = sql_adapter.bulkSqlIoExecutionFingerprintAlloc;
 pub const bulkSqlIoExecutionPlanFromDdlPlan = sql_adapter.bulkSqlIoExecutionPlanFromDdlPlan;
 pub const bulkSqlIoExportRowsCsvToStdoutAlloc = sql_adapter.bulkSqlIoExportRowsCsvToStdoutAlloc;
@@ -274,7 +272,6 @@ const findUniqueConstraintByColumnsExpressionsAndConflictWhere = sql_adapter.fin
 const findUniqueConstraintByColumns = sql_adapter.findUniqueConstraintByColumns;
 const findUniqueConstraintByExpression = sql_adapter.findUniqueConstraintByExpression;
 const findUniqueConstraintByName = sql_adapter.findUniqueConstraintByName;
-const findDdlColumn = sql_adapter.relationalColumnForDdl;
 const foreignKeyActionName = sql_adapter.foreignKeyActionName;
 const foreignKeyMatchName = sql_adapter.foreignKeyMatchName;
 const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
@@ -305,7 +302,6 @@ const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalIndexLifecycleName = sql_adapter.relationalIndexLifecycleName;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
-const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
 const relationalPeriodRangeTypeName = sql_adapter.relationalPeriodRangeTypeName;
 const renameRelationalColumnAlloc = sql_adapter.renameRelationalColumnAlloc;
 const renameRelationalConstraintAlloc = sql_adapter.renameRelationalConstraintAlloc;
@@ -2380,7 +2376,15 @@ const Parser = struct {
             return .{ .maintenance_job = .{ .cluster = try sql_adapter.parseClusterMaintenancePlanTailAlloc(self.alloc, self.tokens, &self.pos) } };
         }
         if (self.matchKeyword("copy")) {
-            return .{ .bulk_io = try self.parseBulkIoDdl() };
+            return .{ .bulk_io = try sql_adapter.parseBulkIoPlanTailAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                self.schema,
+                self.field_expression_qualifiers,
+                self.returning_expression_qualifiers,
+                self.defer_row_expression_field_validation,
+            ) };
         }
         if (self.matchKeyword("prepare")) {
             if (self.peekKeyword("transaction")) {
@@ -2571,83 +2575,6 @@ const Parser = struct {
             .not_null = not_null,
             .default_value = out_default,
             .checks = owned_checks,
-        };
-    }
-
-    fn parseBulkIoDdl(self: *@This()) !BulkIoPlan {
-        var syntax = try sql_adapter.parseBulkIoTailAlloc(self.alloc, self.tokens, &self.pos);
-        errdefer syntax.deinit(self.alloc);
-        const table_name = syntax.table_name;
-        const columns = syntax.columns;
-        const endpoint_kind = syntax.endpoint_kind;
-        const endpoint = syntax.endpoint;
-        const format = syntax.format;
-        const header = syntax.header;
-        const freeze = syntax.freeze;
-        const on_error = syntax.on_error;
-        const reject_limit = syntax.reject_limit;
-        const log_verbosity = syntax.log_verbosity;
-        const force_quote_all = syntax.force_quote_all;
-        const force_quote_columns = syntax.force_quote_columns;
-        const force_not_null_columns = syntax.force_not_null_columns;
-        const force_null_columns = syntax.force_null_columns;
-        const delimiter = syntax.delimiter;
-        const quote = syntax.quote;
-        const escape = syntax.escape;
-        const null_marker = syntax.null_marker;
-        const default_marker = syntax.default_marker;
-        const encoding = syntax.encoding;
-        const where_expressions = try sql_adapter.parseBulkIoWhereExpressionsAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.schema,
-            self.field_expression_qualifiers,
-            self.returning_expression_qualifiers,
-            self.defer_row_expression_field_validation,
-        );
-        var where_expressions_transferred = false;
-        errdefer if (!where_expressions_transferred) {
-            freeExpressionConditions(self.alloc, where_expressions);
-            if (where_expressions.len > 0) self.alloc.free(where_expressions);
-        };
-        syntax.table_name = "";
-        syntax.columns = &.{};
-        syntax.endpoint = "";
-        syntax.format = null;
-        syntax.force_quote_columns = &.{};
-        syntax.force_not_null_columns = &.{};
-        syntax.force_null_columns = &.{};
-        syntax.delimiter = null;
-        syntax.quote = null;
-        syntax.escape = null;
-        syntax.null_marker = null;
-        syntax.default_marker = null;
-        syntax.encoding = null;
-        where_expressions_transferred = true;
-        return .{
-            .direction = bulkIoDirectionFromSyntax(syntax.direction),
-            .table_name = table_name,
-            .columns = columns,
-            .endpoint_kind = endpoint_kind,
-            .endpoint = endpoint,
-            .format = format,
-            .header = header,
-            .freeze = freeze,
-            .on_error = on_error,
-            .reject_limit = reject_limit,
-            .log_verbosity = log_verbosity,
-            .force_quote_all = force_quote_all,
-            .force_quote_columns = force_quote_columns,
-            .force_not_null_columns = force_not_null_columns,
-            .force_null_columns = force_null_columns,
-            .delimiter = delimiter,
-            .quote = quote,
-            .escape = escape,
-            .null_marker = null_marker,
-            .default_marker = default_marker,
-            .encoding = encoding,
-            .where_expressions = where_expressions,
         };
     }
 
@@ -3354,7 +3281,7 @@ const Parser = struct {
         var column = try self.parseDdlColumnDefinitionStandalone();
         var column_transferred = false;
         errdefer if (!column_transferred) freeDdlRelationalColumn(self.alloc, column);
-        if (findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
+        if (sql_adapter.findDdlColumn(columns.items, column.name) != null) return error.UnsupportedSqlShape;
         while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon)) {
             if (try self.parseOptionalDdlCollationAlloc(column.field_type)) |collation| {
                 if (column.collation != null) {
@@ -3419,79 +3346,21 @@ const Parser = struct {
         columns: *std.ArrayListUnmanaged(runtime_schema.RelationalColumn),
         periods: *std.ArrayListUnmanaged(runtime_schema.RelationalPeriod),
     ) !void {
-        const period_name = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
+        const definition = try sql_adapter.parseDdlRangeColumnDefinitionAlloc(self.alloc, self.tokens, &self.pos, columns.items, periods.items);
+        var start_transferred = false;
+        var end_transferred = false;
         var period_transferred = false;
-        errdefer if (!period_transferred) self.alloc.free(period_name);
-        const type_token = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        const bound_type = ddlRangeBoundTypeForName(type_token.text) orelse return error.UnsupportedSqlShape;
-        const range_type = ddlRangeTypeForName(type_token.text) orelse return error.UnsupportedSqlShape;
-
-        if (findDdlColumn(columns.items, period_name) != null) return error.UnsupportedSqlShape;
-        if (relationalPeriodNameExists(periods.items, period_name)) return error.UnsupportedSqlShape;
-
-        while (!self.atEnd() and !self.peekKind(.comma) and !self.peekKind(.rparen) and !self.peekKind(.semicolon)) {
-            if (self.matchKeyword("not")) {
-                try self.expectKeyword("null");
-            } else if (self.matchKeyword("null")) {} else {
-                return error.UnsupportedSqlShape;
-            }
+        errdefer {
+            if (!start_transferred) freeDdlRelationalColumn(self.alloc, definition.start_column);
+            if (!end_transferred) freeDdlRelationalColumn(self.alloc, definition.end_column);
+            if (!period_transferred) freeDdlPeriod(self.alloc, definition.period);
         }
-
-        const start_column_name = try std.fmt.allocPrint(self.alloc, "{s}_start", .{period_name});
-        var start_name_transferred = false;
-        errdefer if (!start_name_transferred) self.alloc.free(start_column_name);
-        const end_column_name = try std.fmt.allocPrint(self.alloc, "{s}_end", .{period_name});
-        var end_name_transferred = false;
-        errdefer if (!end_name_transferred) self.alloc.free(end_column_name);
-        if (findDdlColumn(columns.items, start_column_name) != null or findDdlColumn(columns.items, end_column_name) != null) return error.UnsupportedSqlShape;
-
-        const start_path = try self.alloc.dupe(u8, start_column_name);
-        var start_path_transferred = false;
-        errdefer if (!start_path_transferred) self.alloc.free(start_path);
-        const end_path = try self.alloc.dupe(u8, end_column_name);
-        var end_path_transferred = false;
-        errdefer if (!end_path_transferred) self.alloc.free(end_path);
-
-        const start_column: runtime_schema.RelationalColumn = .{
-            .name = start_column_name,
-            .path = start_path,
-            .field_type = bound_type,
-            .nullable = true,
-        };
-        var start_column_transferred = false;
-        errdefer if (!start_column_transferred) freeDdlRelationalColumn(self.alloc, start_column);
-        const end_column: runtime_schema.RelationalColumn = .{
-            .name = end_column_name,
-            .path = end_path,
-            .field_type = bound_type,
-            .nullable = true,
-        };
-        var end_column_transferred = false;
-        errdefer if (!end_column_transferred) freeDdlRelationalColumn(self.alloc, end_column);
-        const period_start = try self.alloc.dupe(u8, start_column_name);
-        var period_start_transferred = false;
-        errdefer if (!period_start_transferred) self.alloc.free(period_start);
-        const period_end = try self.alloc.dupe(u8, end_column_name);
-        var period_end_transferred = false;
-        errdefer if (!period_end_transferred) self.alloc.free(period_end);
-
-        try columns.append(self.alloc, start_column);
-        start_column_transferred = true;
-        start_name_transferred = true;
-        start_path_transferred = true;
-        try columns.append(self.alloc, end_column);
-        end_column_transferred = true;
-        end_name_transferred = true;
-        end_path_transferred = true;
-        try periods.append(self.alloc, .{
-            .name = period_name,
-            .start_column = period_start,
-            .end_column = period_end,
-            .range_type = range_type,
-        });
+        try columns.append(self.alloc, definition.start_column);
+        start_transferred = true;
+        try columns.append(self.alloc, definition.end_column);
+        end_transferred = true;
+        try periods.append(self.alloc, definition.period);
         period_transferred = true;
-        period_start_transferred = true;
-        period_end_transferred = true;
     }
 
     fn parseDdlColumnDefinitionStandalone(self: *@This()) !runtime_schema.RelationalColumn {

@@ -2605,6 +2605,91 @@ pub fn bulkIoDirectionFromSyntax(syntax: grammar.BulkIoDirectionSyntax) BulkIoDi
     };
 }
 
+pub fn parseBulkIoPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) !BulkIoPlan {
+    var syntax = try grammar.parseBulkIoTailAlloc(alloc, tokens, pos);
+    errdefer syntax.deinit(alloc);
+    const table_name = syntax.table_name;
+    const columns = syntax.columns;
+    const endpoint_kind = syntax.endpoint_kind;
+    const endpoint = syntax.endpoint;
+    const format = syntax.format;
+    const header = syntax.header;
+    const freeze = syntax.freeze;
+    const on_error = syntax.on_error;
+    const reject_limit = syntax.reject_limit;
+    const log_verbosity = syntax.log_verbosity;
+    const force_quote_all = syntax.force_quote_all;
+    const force_quote_columns = syntax.force_quote_columns;
+    const force_not_null_columns = syntax.force_not_null_columns;
+    const force_null_columns = syntax.force_null_columns;
+    const delimiter = syntax.delimiter;
+    const quote = syntax.quote;
+    const escape = syntax.escape;
+    const null_marker = syntax.null_marker;
+    const default_marker = syntax.default_marker;
+    const encoding = syntax.encoding;
+    const where_expressions = try lower_expr.parseBulkIoWhereExpressionsAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    var where_expressions_transferred = false;
+    errdefer if (!where_expressions_transferred) {
+        freeExpressionConditions(alloc, where_expressions);
+        if (where_expressions.len > 0) alloc.free(where_expressions);
+    };
+    syntax.table_name = "";
+    syntax.columns = &.{};
+    syntax.endpoint = "";
+    syntax.format = null;
+    syntax.force_quote_columns = &.{};
+    syntax.force_not_null_columns = &.{};
+    syntax.force_null_columns = &.{};
+    syntax.delimiter = null;
+    syntax.quote = null;
+    syntax.escape = null;
+    syntax.null_marker = null;
+    syntax.default_marker = null;
+    syntax.encoding = null;
+    where_expressions_transferred = true;
+    return .{
+        .direction = bulkIoDirectionFromSyntax(syntax.direction),
+        .table_name = table_name,
+        .columns = columns,
+        .endpoint_kind = endpoint_kind,
+        .endpoint = endpoint,
+        .format = format,
+        .header = header,
+        .freeze = freeze,
+        .on_error = on_error,
+        .reject_limit = reject_limit,
+        .log_verbosity = log_verbosity,
+        .force_quote_all = force_quote_all,
+        .force_quote_columns = force_quote_columns,
+        .force_not_null_columns = force_not_null_columns,
+        .force_null_columns = force_null_columns,
+        .delimiter = delimiter,
+        .quote = quote,
+        .escape = escape,
+        .null_marker = null_marker,
+        .default_marker = default_marker,
+        .encoding = encoding,
+        .where_expressions = where_expressions,
+    };
+}
+
 pub fn privilegeChangeActionToSyntax(action: PrivilegeChangeAction) grammar.PrivilegeChangeActionSyntax {
     return switch (action) {
         .grant => .grant,
@@ -4550,6 +4635,111 @@ pub fn parseDdlInlineForeignKeyConstraintAlloc(
     parent_table_transferred = true;
     parent_transferred = true;
     return foreign_key;
+}
+
+pub const DdlRangeColumnDefinition = struct {
+    start_column: runtime_schema.RelationalColumn,
+    end_column: runtime_schema.RelationalColumn,
+    period: runtime_schema.RelationalPeriod,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeDdlRelationalColumn(alloc, self.start_column);
+        freeDdlRelationalColumn(alloc, self.end_column);
+        freeDdlPeriod(alloc, self.period);
+        self.* = undefined;
+    }
+};
+
+pub fn findDdlColumn(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
+    for (columns) |column| {
+        if (std.ascii.eqlIgnoreCase(column.name, name)) return column;
+    }
+    return null;
+}
+
+pub fn parseDdlRangeColumnDefinitionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    columns: []const runtime_schema.RelationalColumn,
+    periods: []const runtime_schema.RelationalPeriod,
+) !DdlRangeColumnDefinition {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const period_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var period_transferred = false;
+    errdefer if (!period_transferred) alloc.free(period_name);
+    const type_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    const bound_type = ddlRangeBoundTypeForName(type_token.text) orelse return error.UnsupportedSqlShape;
+    const range_type = ddlRangeTypeForName(type_token.text) orelse return error.UnsupportedSqlShape;
+
+    if (findDdlColumn(columns, period_name) != null) return error.UnsupportedSqlShape;
+    if (binder.relationalPeriodNameExists(periods, period_name)) return error.UnsupportedSqlShape;
+
+    while (!cursor.atEnd() and !cursor.peekKind(.comma) and !cursor.peekKind(.rparen) and !cursor.peekKind(.semicolon)) {
+        if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("null");
+        } else if (cursor.matchKeyword("null")) {} else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    const start_column_name = try std.fmt.allocPrint(alloc, "{s}_start", .{period_name});
+    var start_name_transferred = false;
+    errdefer if (!start_name_transferred) alloc.free(start_column_name);
+    const end_column_name = try std.fmt.allocPrint(alloc, "{s}_end", .{period_name});
+    var end_name_transferred = false;
+    errdefer if (!end_name_transferred) alloc.free(end_column_name);
+    if (findDdlColumn(columns, start_column_name) != null or findDdlColumn(columns, end_column_name) != null) return error.UnsupportedSqlShape;
+
+    const start_path = try alloc.dupe(u8, start_column_name);
+    var start_path_transferred = false;
+    errdefer if (!start_path_transferred) alloc.free(start_path);
+    const end_path = try alloc.dupe(u8, end_column_name);
+    var end_path_transferred = false;
+    errdefer if (!end_path_transferred) alloc.free(end_path);
+
+    const start_column: runtime_schema.RelationalColumn = .{
+        .name = start_column_name,
+        .path = start_path,
+        .field_type = bound_type,
+        .nullable = true,
+    };
+    var start_column_transferred = false;
+    errdefer if (!start_column_transferred) freeDdlRelationalColumn(alloc, start_column);
+    const end_column: runtime_schema.RelationalColumn = .{
+        .name = end_column_name,
+        .path = end_path,
+        .field_type = bound_type,
+        .nullable = true,
+    };
+    var end_column_transferred = false;
+    errdefer if (!end_column_transferred) freeDdlRelationalColumn(alloc, end_column);
+    const period_start = try alloc.dupe(u8, start_column_name);
+    var period_start_transferred = false;
+    errdefer if (!period_start_transferred) alloc.free(period_start);
+    const period_end = try alloc.dupe(u8, end_column_name);
+    var period_end_transferred = false;
+    errdefer if (!period_end_transferred) alloc.free(period_end);
+
+    period_transferred = true;
+    start_name_transferred = true;
+    start_path_transferred = true;
+    end_name_transferred = true;
+    end_path_transferred = true;
+    start_column_transferred = true;
+    end_column_transferred = true;
+    period_start_transferred = true;
+    period_end_transferred = true;
+    return .{
+        .start_column = start_column,
+        .end_column = end_column,
+        .period = .{
+            .name = period_name,
+            .start_column = period_start,
+            .end_column = period_end,
+            .range_type = range_type,
+        },
+    };
 }
 
 pub fn makeDdlForeignKeyAlloc(
