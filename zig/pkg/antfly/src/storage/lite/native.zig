@@ -47,6 +47,7 @@ pub const PageKind = enum(u8) {
     catalog = 2,
     document = 3,
     value = 4,
+    free_map = 5,
 };
 
 const catalog_key_len_mask: u32 = 0x00ff_ffff;
@@ -55,6 +56,8 @@ const catalog_external_value_flag: u32 = 1 << 30;
 const document_delete_flag: u8 = 1 << 0;
 const document_external_value_flag: u8 = 1 << 1;
 const value_page_header_size: usize = 8;
+const free_map_format_version: u32 = 1;
+const free_map_header_size: usize = 16;
 
 const CatalogRoot = enum {
     metadata,
@@ -253,6 +256,9 @@ pub const NativeFile = struct {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         const document_records = self.countReachableChainPages(.document, checkpoint.document_root_page, &reachable_pages) catch |err| {
+            return invalidCheck(report, issueForPageCheckError(err));
+        };
+        self.validateReachableFreeMap(checkpoint, &reachable_pages) catch |err| {
             return invalidCheck(report, issueForPageCheckError(err));
         };
         const live = self.liveStats() catch |err| {
@@ -609,6 +615,7 @@ pub const NativeFile = struct {
         var catalog_root_page: u64 = 0;
         var index_catalog_root_page: u64 = 0;
         var document_root_page: u64 = 0;
+        var free_map_root_page: u64 = 0;
         var live_bytes: u64 = 0;
 
         for (catalog_records) |record| {
@@ -665,12 +672,14 @@ pub const NativeFile = struct {
             live_bytes +|= doc.key.len + doc.value.len;
         }
 
+        free_map_root_page = try appendFreeMapPageToImage(self.allocator, &image, page_size, &next_page_id, next_page_id + 1);
+
         const checkpoint = CheckpointSlot{
             .commit_sequence = previous.commit_sequence + 1,
             .catalog_root_page = catalog_root_page,
             .document_root_page = document_root_page,
             .index_catalog_root_page = index_catalog_root_page,
-            .free_map_root_page = 0,
+            .free_map_root_page = free_map_root_page,
             .page_count = next_page_id,
         };
         const compact_header = Header{
@@ -831,7 +840,7 @@ pub const NativeFile = struct {
                     }
                     break :blk entry.previous_page;
                 },
-                .data, .value => return error.UnexpectedNativePageKind,
+                .data, .value, .free_map => return error.UnexpectedNativePageKind,
             };
             count += 1;
             if (count > self.activeCheckpoint().page_count) return error.InvalidNativePageChain;
@@ -931,6 +940,15 @@ pub const NativeFile = struct {
         if (remaining != 0) return error.InvalidNativeValueChain;
     }
 
+    fn validateReachableFreeMap(self: *NativeFile, checkpoint: CheckpointSlot, reachable_pages: *ReachablePageSet) !void {
+        if (checkpoint.free_map_root_page == 0) return;
+        try self.markReachablePage(reachable_pages, checkpoint.free_map_root_page);
+
+        const payload = try self.readPagePayloadByKindAlloc(self.allocator, checkpoint.free_map_root_page, .free_map);
+        defer self.allocator.free(payload);
+        try decodeFreeMap(payload, checkpoint.page_count);
+    }
+
     const LiveStats = struct {
         record_count: u64,
         bytes: u64,
@@ -973,6 +991,7 @@ pub const NativeFile = struct {
                 compact_pages += self.valuePageCount(doc.value.len);
             }
         }
+        if (self.activeCheckpoint().free_map_root_page != 0) compact_pages += 1;
 
         return .{
             .record_count = @intCast(catalog_records.len + index_catalog_records.len + docs.len),
@@ -1065,6 +1084,18 @@ fn appendValuePagesToImage(
     }
 
     return root_page_id;
+}
+
+fn appendFreeMapPageToImage(
+    allocator: Allocator,
+    image: *std.ArrayListUnmanaged(u8),
+    page_size: usize,
+    next_page_id: *u64,
+    covered_page_count: u64,
+) !u64 {
+    var payload: [free_map_header_size]u8 = undefined;
+    encodeFreeMap(&payload, covered_page_count, 0);
+    return try appendPageToImage(allocator, image, page_size, next_page_id, .free_map, &payload);
 }
 
 fn catalogRootPage(slot: CheckpointSlot, root: CatalogRoot) u64 {
@@ -1426,6 +1457,7 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
         @intFromEnum(PageKind.catalog) => .catalog,
         @intFromEnum(PageKind.document) => .document,
         @intFromEnum(PageKind.value) => .value,
+        @intFromEnum(PageKind.free_map) => .free_map,
         else => return error.InvalidNativePageKind,
     };
     if (kind != expected_kind) return error.UnexpectedNativePageKind;
@@ -1567,6 +1599,23 @@ fn decodeValuePage(raw: []const u8) !ValuePage {
     };
 }
 
+fn encodeFreeMap(out: *[free_map_header_size]u8, covered_page_count: u64, free_page_count: u32) void {
+    std.mem.writeInt(u32, out[0..4], free_map_format_version, .little);
+    std.mem.writeInt(u32, out[4..8], free_page_count, .little);
+    std.mem.writeInt(u64, out[8..16], covered_page_count, .little);
+}
+
+fn decodeFreeMap(raw: []const u8, checkpoint_page_count: u64) !void {
+    if (raw.len < free_map_header_size) return error.TruncatedNativeFreeMap;
+    const version = std.mem.readInt(u32, raw[0..4], .little);
+    if (version != free_map_format_version) return error.InvalidNativeFreeMap;
+    const free_page_count = std.mem.readInt(u32, raw[4..8], .little);
+    const covered_page_count = std.mem.readInt(u64, raw[8..16], .little);
+    if (covered_page_count > checkpoint_page_count) return error.InvalidNativeFreeMap;
+    if (free_page_count != 0) return error.UnsupportedNativeFreeMap;
+    if (raw.len != free_map_header_size) return error.UnsupportedNativeFreeMap;
+}
+
 fn readExactAt(file: std.Io.File, io: std.Io, out: []u8, offset: u64) !void {
     const read = try file.readPositionalAll(io, out, offset);
     if (read != out.len) return error.EndOfStream;
@@ -1621,6 +1670,10 @@ fn issueForPageCheckError(err: anyerror) []const u8 {
         error.InvalidNativePageChain => "invalid_page_chain",
         error.TruncatedNativeValuePage => "truncated_value_page",
         error.InvalidNativeValueChain => "invalid_value_chain",
+        error.TruncatedNativeFreeMap,
+        error.InvalidNativeFreeMap,
+        error.UnsupportedNativeFreeMap,
+        => "invalid_free_map",
         else => "invalid_page",
     };
 }
@@ -2454,6 +2507,7 @@ test "lite native vacuum rewrites live catalog and document records" {
         const vacuumed = try file.vacuum();
         try std.testing.expect(vacuumed.before_size > vacuumed.after_size);
         try std.testing.expect(vacuumed.reclaimed_bytes > 0);
+        try std.testing.expect(file.activeCheckpoint().free_map_root_page != 0);
 
         const after = try file.check();
         try std.testing.expect(after.valid);
@@ -2487,6 +2541,36 @@ test "lite native vacuum rewrites live catalog and document records" {
     const live = (try reopened.getDocumentAlloc(allocator, "doc:live")).?;
     defer allocator.free(live);
     try std.testing.expectEqualStrings("small", live);
+}
+
+test "lite native check validates committed free map root" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-corrupt.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "value");
+    _ = try file.vacuum();
+
+    const checkpoint = file.activeCheckpoint();
+    try std.testing.expect(checkpoint.free_map_root_page != 0);
+
+    var payload: [free_map_header_size]u8 = undefined;
+    encodeFreeMap(&payload, checkpoint.page_count + 1, 0);
+    var page: [default_page_size]u8 = undefined;
+    encodePage(&page, .free_map, &payload);
+    try file.file.writePositionalAll(file.io_impl.io(), &page, checkpoint.free_map_root_page * default_page_size);
+    try file.file.sync(file.io_impl.io());
+
+    const report = try file.check();
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
 }
 
 test "lite native check reports corrupted committed document page" {
