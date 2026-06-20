@@ -6375,6 +6375,9 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
+    const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
+    lite_wasm_step.dependOn(wasm_step);
+
     const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
     lite_dev_step.dependOn(&install_antfly.step);
     lite_dev_step.dependOn(&install_lite_capi_lib.step);
