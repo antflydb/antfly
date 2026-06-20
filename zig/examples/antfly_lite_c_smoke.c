@@ -129,7 +129,7 @@ int main(void) {
         (void)remove(path);
         return fail_with_buffer("status json did not describe native aflite storage", &status);
     }
-    antfly_buffer_free_zero(&status);
+    antfly_db_buffer_free_zero(&status);
 
     antfly_db_close(handle);
     (void)remove(path);

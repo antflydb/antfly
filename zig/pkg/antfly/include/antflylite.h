@@ -212,6 +212,7 @@ void antfly_db_close(void *handle);
 void antfly_buffer_free(antfly_buffer *buffer);
 void antfly_buffer_free_zero(antfly_buffer *buffer);
 void antfly_db_buffer_free(uint8_t *ptr, size_t len);
+void antfly_db_buffer_free_zero(antfly_buffer *buffer);
 void antfly_db_dense_search_result_free(antfly_dense_search_result *result);
 void antfly_db_packed_dense_search_result_free(antfly_packed_dense_search_result *result);
 void antfly_db_scan_hash_result_free(antfly_scan_hash_result *result);
