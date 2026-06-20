@@ -145,6 +145,7 @@ pub fn executePreparedTransactionRecoveryIntent(
 pub const OwnedSqlCatalogSession = struct {
     current_database_name: []u8,
     search_path: []const []const u8,
+    transaction_local_search_path_base: ?[]const []const u8 = null,
     settings: []const catalog_resources.SqlSessionSetting = &.{},
     transaction_local_search_path: bool = false,
     notification_session_id: u64 = 0,
@@ -183,6 +184,7 @@ pub const OwnedSqlCatalogSession = struct {
         return .{
             .current_database_name = current_database_name,
             .search_path = search_path,
+            .transaction_local_search_path_base = null,
             .settings = settings,
             .transaction_local_search_path = false,
             .notification_session_id = 0,
@@ -197,10 +199,24 @@ pub const OwnedSqlCatalogSession = struct {
         };
     }
 
+    pub fn clearTransactionLocalState(self: *@This(), alloc: std.mem.Allocator) !void {
+        if (self.transaction_local_search_path_base) |base| {
+            for (self.search_path) |name| alloc.free(@constCast(name));
+            if (self.search_path.len > 0) alloc.free(self.search_path);
+            self.search_path = base;
+            self.transaction_local_search_path_base = null;
+        }
+        self.transaction_local_search_path = false;
+    }
+
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.current_database_name);
         for (self.search_path) |name| alloc.free(@constCast(name));
         if (self.search_path.len > 0) alloc.free(self.search_path);
+        if (self.transaction_local_search_path_base) |base| {
+            for (base) |name| alloc.free(@constCast(name));
+            if (base.len > 0) alloc.free(base);
+        }
         for (self.settings) |setting| {
             alloc.free(@constCast(setting.name));
             alloc.free(@constCast(setting.value));
@@ -209,6 +225,25 @@ pub const OwnedSqlCatalogSession = struct {
         self.* = undefined;
     }
 };
+
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(values);
+}
 
 pub fn parseSqlStatementTimeoutNs(value: []const u8) !u64 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -379,10 +414,27 @@ pub fn applySessionCatalogPlanAlloc(
     session: catalog_resources.SqlCatalogSession,
     plan: ddl_plan.SessionCatalogPlan,
 ) !OwnedSqlCatalogSession {
+    var owned = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+    defer owned.deinit(alloc);
+    return try applyOwnedSessionCatalogPlanAlloc(alloc, owned, plan);
+}
+
+pub fn applyOwnedSessionCatalogPlanAlloc(
+    alloc: std.mem.Allocator,
+    session: OwnedSqlCatalogSession,
+    plan: ddl_plan.SessionCatalogPlan,
+) !OwnedSqlCatalogSession {
     switch (plan) {
         .set_search_path => |set| {
-            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            if (set.local) {
+                if (session.transaction_local_search_path_base) |base| {
+                    updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
+                } else {
+                    updated.transaction_local_search_path_base = try cloneStringSlice(alloc, session.search_path);
+                }
+            }
             for (updated.search_path) |name| alloc.free(@constCast(name));
             if (updated.search_path.len > 0) alloc.free(updated.search_path);
             const search_path = try alloc.alloc([]const u8, set.namespaces.len);
@@ -397,6 +449,10 @@ pub fn applySessionCatalogPlanAlloc(
             }
             updated.search_path = search_path;
             updated.transaction_local_search_path = set.local;
+            if (!set.local) {
+                if (updated.transaction_local_search_path_base) |base| freeStringSlice(alloc, base);
+                updated.transaction_local_search_path_base = null;
+            }
             return updated;
         },
         .set_setting => |set| {
@@ -404,8 +460,12 @@ pub fn applySessionCatalogPlanAlloc(
                 .app => if (set.value.len == 0) return error.InvalidRoleSetting,
                 .runtime => try validateSqlRuntimeSettingValue(set.name, set.value),
             }
-            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            if (session.transaction_local_search_path_base) |base| {
+                updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
+                updated.transaction_local_search_path = session.transaction_local_search_path;
+            }
             const settings = try replaceSessionSettingAlloc(alloc, updated.settings, set.name, set.value);
             for (updated.settings) |setting| {
                 alloc.free(@constCast(setting.name));
@@ -416,8 +476,12 @@ pub fn applySessionCatalogPlanAlloc(
             return updated;
         },
         .reset_setting => |reset| {
-            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
             errdefer updated.deinit(alloc);
+            if (session.transaction_local_search_path_base) |base| {
+                updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
+                updated.transaction_local_search_path = session.transaction_local_search_path;
+            }
             const settings = try removeSessionSettingAlloc(alloc, updated.settings, reset.name);
             for (updated.settings) |setting| {
                 alloc.free(@constCast(setting.name));
@@ -429,11 +493,19 @@ pub fn applySessionCatalogPlanAlloc(
         },
         .reset_search_path, .discard_all => {
             return try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
-                .current_database_name = session.currentDatabase(),
+                .current_database_name = session.session().currentDatabase(),
                 .search_path = &.{catalog_resources.default_namespace_name},
             });
         },
-        .show_search_path => return try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session),
+        .show_search_path => {
+            var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());
+            errdefer updated.deinit(alloc);
+            if (session.transaction_local_search_path_base) |base| {
+                updated.transaction_local_search_path_base = try cloneStringSlice(alloc, base);
+                updated.transaction_local_search_path = session.transaction_local_search_path;
+            }
+            return updated;
+        },
     }
 }
 

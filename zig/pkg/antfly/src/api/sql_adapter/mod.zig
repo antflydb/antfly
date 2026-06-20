@@ -39,6 +39,7 @@ pub const applyDropIndexPlanToSchemaJsonValue = schema_json.applyDropIndexPlanTo
 pub const applyAlterTablePlanToSchemaJsonValue = schema_json.applyAlterTablePlanToSchemaJsonValue;
 pub const applyDdlPlanToRuntimeSchemaAlloc = catalog_apply.applyDdlPlanToRuntimeSchemaAlloc;
 pub const applyDdlPlanToSchemaJsonAlloc = catalog_apply.applyDdlPlanToSchemaJsonAlloc;
+pub const applyOwnedSessionCatalogPlanAlloc = catalog_apply.applyOwnedSessionCatalogPlanAlloc;
 pub const applySessionCatalogPlanAlloc = catalog_apply.applySessionCatalogPlanAlloc;
 pub const appliedDdlTableWorkItemsForFlagsAlloc = catalog_apply.appliedDdlTableWorkItemsForFlagsAlloc;
 pub const enforceSqlStatementTimeoutAt = catalog_apply.enforceSqlStatementTimeoutAt;

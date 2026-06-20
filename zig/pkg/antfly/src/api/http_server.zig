@@ -2966,6 +2966,19 @@ pub const ApiHttpServer = struct {
         if (relational_sql.sqlStatementTimeoutExpired(statement_timeout_ns, statement_start_ns, platform_time.monotonicNs())) return error.StatementTimeout;
     }
 
+    fn sqlTransactionBoundaryClearsLocalSession(sql: []const u8) bool {
+        const trimmed = std.mem.trim(u8, sql, " \t\r\n");
+        return sqlFirstKeywordEquals(trimmed, "commit") or sqlFirstKeywordEquals(trimmed, "rollback");
+    }
+
+    fn sqlFirstKeywordEquals(sql: []const u8, expected: []const u8) bool {
+        if (sql.len < expected.len) return false;
+        if (!std.ascii.eqlIgnoreCase(sql[0..expected.len], expected)) return false;
+        if (sql.len == expected.len) return true;
+        const next = sql[expected.len];
+        return next == ';' or next == ' ' or next == '\t' or next == '\r' or next == '\n';
+    }
+
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *relational_sql.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try relational_sql.sqlStatementTimeoutNsFromSession(session.session());
@@ -2979,13 +2992,25 @@ pub const ApiHttpServer = struct {
         defer plan.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         switch (plan) {
+            .adapter_noop => |noop| {
+                if (noop.reason == .transaction_control and sqlTransactionBoundaryClearsLocalSession(sql)) {
+                    try session.clearTransactionLocalState(self.alloc);
+                    var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                    applied.noop = true;
+                    try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                    return applied;
+                }
+            },
+            else => {},
+        }
+        switch (plan) {
             .session_catalog => |session_plan| {
                 const notification_session_id = session.notification_session_id;
                 const clear_prepared_statements = switch (session_plan) {
                     .discard_all => true,
                     else => false,
                 };
-                var updated = try relational_sql.applySessionCatalogPlanAlloc(self.alloc, session.session(), session_plan);
+                var updated = try relational_sql.applyOwnedSessionCatalogPlanAlloc(self.alloc, session.*, session_plan);
                 errdefer updated.deinit(self.alloc);
                 updated.notification_session_id = notification_session_id;
                 if (clear_prepared_statements and notification_session_id != 0) {
@@ -20270,6 +20295,18 @@ test "api http server applies SQL DDL with explicit catalog session" {
     try std.testing.expect(set_local.noop);
     try std.testing.expectEqualStrings("public", session.search_path[0]);
     try std.testing.expect(session.transaction_local_search_path);
+
+    var local_table = try server.applyRelationalSqlDdlWithSession("CREATE TABLE local_events (id text PRIMARY KEY);", &session);
+    defer local_table.deinit(alloc);
+    try std.testing.expectEqualStrings("public", local_table.table.namespace_name);
+
+    var committed = try server.applyRelationalSqlDdlWithSession("COMMIT;", &session);
+    defer committed.deinit(alloc);
+    try std.testing.expect(committed.noop);
+    try std.testing.expect(!session.transaction_local_search_path);
+    try std.testing.expect(session.transaction_local_search_path_base == null);
+    try std.testing.expectEqualStrings("analytics", session.search_path[0]);
+    try std.testing.expectEqualStrings("public", session.search_path[1]);
 }
 
 test "api http server enforces SQL statement timeout on session-backed DDL" {

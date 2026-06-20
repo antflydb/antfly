@@ -4691,7 +4691,8 @@ instead of adapter no-ops. Applying those plans mutates an explicit SQL catalog
 session used by table/schema resolution. `SET [SESSION] search_path` preserves
 the ordered namespace list in the typed plan; `SET LOCAL search_path` preserves
 the same ordered namespace list plus transaction-local intent on the owned
-session state. The source parity corpus pins public-only, multi-namespace, and
+session state, including the prior base path so `COMMIT` and `ROLLBACK` can
+clear the local override without losing the session path. The source parity corpus pins public-only, multi-namespace, and
 transaction-local search paths so schema-resolution metadata cannot collapse
 back into an adapter-only no-op. Role/session
 authorization changes, arbitrary settings, timeout settings, default storage
