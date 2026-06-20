@@ -16,6 +16,7 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
@@ -54,6 +55,70 @@ pub const JoinedMutationSourceParserHooks = struct {
     ) anyerror!plan_mod.LoweredJoinedMutationSource,
 };
 
+pub const ConflictTargetParserHooks = struct {
+    ptr: *anyopaque,
+    parse_where_expression_conditions: *const fn (*anyopaque) anyerror![]const db_mod.types.RelationalRowsExpressionCondition,
+};
+
+const ConflictCoalesceValueParserHooks = struct {
+    ptr: *anyopaque,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    parse_operand_value_json: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+};
+
+const ConflictJsonbBuildObjectParserHooks = struct {
+    ptr: *anyopaque,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    parse_value_json: *const fn (
+        *anyopaque,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+};
+
+pub const ConflictValueParserHooks = struct {
+    ptr: *anyopaque,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    parse_column_value_json: *const fn (*anyopaque, runtime_schema.RelationalColumn) anyerror![]const u8,
+    parse_json_value_json: *const fn (*anyopaque) anyerror![]const u8,
+    parse_coalesce_operand_value_json: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+    parse_jsonb_build_object_value_json: *const fn (
+        *anyopaque,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+};
+
+pub const ConflictIncrementParserHooks = struct {
+    ptr: *anyopaque,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    parse_coalesce_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_value_json: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror![]const u8,
+};
+
 const LoweredMergeMutationPlan = plan_mod.LoweredMergeMutationPlan;
 const MergeArmPredicate = plan_mod.MergeArmPredicate;
 const MergeExpressionAssignment = plan_mod.MergeExpressionAssignment;
@@ -84,6 +149,8 @@ const freeJsonExtract = plan_mod.freeJsonExtract;
 const freeRelationalChecks = plan_mod.freeRelationalChecks;
 const freeRowsJsonSetExpressionAssignments = plan_mod.freeRowsJsonSetExpressionAssignments;
 const freeTableAlias = plan_mod.freeTableAlias;
+const clearDdlUniqueExpressions = ddl_plan.clearDdlUniqueExpressions;
+const freeDdlUniqueExpression = ddl_plan.freeDdlUniqueExpression;
 
 pub const InsertValueRows = []const []const []const u8;
 
@@ -598,6 +665,190 @@ pub fn conflictExpressionIdentityAlloc(
     return try out.toOwnedSlice();
 }
 
+pub fn conflictExcludedJsonObjectValueAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    source: []const u8,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+) ![]const u8 {
+    _ = binder.relationalColumnForField(schema, source, null) orelse return error.InvalidSqlCatalog;
+    const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, value_json);
+}
+
+pub fn conflictExcludedValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    column: runtime_schema.RelationalColumn,
+    source: []const u8,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+) ![]const u8 {
+    const source_column = binder.relationalColumnForField(schema, source, null) orelse return error.InvalidSqlCatalog;
+    if (source_column.field_type != column.field_type) return error.UnsupportedSqlShape;
+    const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, value_json);
+}
+
+pub fn conflictExcludedArrayElementValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    column: runtime_schema.RelationalColumn,
+    source: []const u8,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+) ![]const u8 {
+    const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
+    const source_column = binder.relationalColumnForField(schema, source, null) orelse return error.InvalidSqlCatalog;
+    if (source_column.field_type != item_type) return error.UnsupportedSqlShape;
+    const insert_value = lower_expr.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
+    try sql_value.validateSqlArrayElementValueJson(alloc, column, insert_value);
+    return try alloc.dupe(u8, insert_value);
+}
+
+fn parseConflictCoalesceValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    hooks: ConflictCoalesceValueParserHooks,
+) ![]const u8 {
+    try lower_expr.parseCoalesceFunctionCallStart(tokens, pos);
+
+    var selected: ?[]const u8 = null;
+    errdefer if (selected) |value| alloc.free(value);
+    var operands: usize = 0;
+    while (true) {
+        const value_json = try hooks.parse_operand_value_json(hooks.ptr, column, hooks.insert_columns, hooks.insert_values);
+        var value_transferred = false;
+        defer if (!value_transferred) alloc.free(value_json);
+        operands += 1;
+        if (selected == null and !std.mem.eql(u8, value_json, "null")) {
+            selected = value_json;
+            value_transferred = true;
+        }
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (operands == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+
+    if (selected) |value| {
+        selected = null;
+        return value;
+    }
+    return try alloc.dupe(u8, "null");
+}
+
+fn parseConflictJsonbBuildObjectAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    hooks: ConflictJsonbBuildObjectParserHooks,
+) ![]const u8 {
+    try sql_value.parseJsonbBuildObjectFunctionCallStart(tokens, pos);
+    if (parser.matchToken(tokens, pos, .rparen) != null) return try alloc.dupe(u8, "{}");
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    while (true) {
+        const key = try sql_value.parseJsonbBuildObjectKey(tokens, pos, params);
+        const entry = try seen.getOrPut(alloc, key);
+        if (entry.found_existing) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .comma);
+        const value_json = try hooks.parse_value_json(hooks.ptr, hooks.insert_columns, hooks.insert_values);
+        defer alloc.free(value_json);
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(key, .{})});
+        try writer.writeAll(value_json);
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+pub fn parseConflictValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    column: runtime_schema.RelationalColumn,
+    hooks: ConflictValueParserHooks,
+) ![]const u8 {
+    if (sql_value.peekJsonbBuildObjectFunctionCall(tokens, pos.*)) {
+        if (column.field_type != .json) return error.InvalidSqlCatalog;
+        return try parseConflictJsonbBuildObjectAlloc(alloc, tokens, pos, params, .{
+            .ptr = hooks.ptr,
+            .insert_columns = hooks.insert_columns,
+            .insert_values = hooks.insert_values,
+            .parse_value_json = hooks.parse_jsonb_build_object_value_json,
+        });
+    }
+    if (lower_expr.peekCoalesceFunctionCall(tokens, pos.*)) {
+        return try parseConflictCoalesceValueJsonAlloc(alloc, tokens, pos, column, .{
+            .ptr = hooks.ptr,
+            .insert_columns = hooks.insert_columns,
+            .insert_values = hooks.insert_values,
+            .parse_operand_value_json = hooks.parse_coalesce_operand_value_json,
+        });
+    }
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier) {
+        const token = tokens[pos.*];
+        if (std.mem.startsWith(u8, token.text, "excluded.")) {
+            pos.* += 1;
+            return try conflictExcludedValueJsonAlloc(alloc, schema, column, token.text["excluded.".len..], hooks.insert_columns, hooks.insert_values);
+        }
+    }
+    return try hooks.parse_column_value_json(hooks.ptr, column);
+}
+
+pub fn parseConflictArrayElementValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    column: runtime_schema.RelationalColumn,
+    hooks: ConflictValueParserHooks,
+) ![]const u8 {
+    const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
+    const element_column: runtime_schema.RelationalColumn = .{
+        .name = column.name,
+        .path = column.path,
+        .field_type = item_type,
+    };
+    if (lower_expr.peekCoalesceFunctionCall(tokens, pos.*)) {
+        const value_json = try parseConflictCoalesceValueJsonAlloc(alloc, tokens, pos, element_column, .{
+            .ptr = hooks.ptr,
+            .insert_columns = hooks.insert_columns,
+            .insert_values = hooks.insert_values,
+            .parse_operand_value_json = hooks.parse_coalesce_operand_value_json,
+        });
+        errdefer alloc.free(value_json);
+        try sql_value.validateSqlArrayElementValueJson(alloc, column, value_json);
+        return value_json;
+    }
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier) {
+        const token = tokens[pos.*];
+        if (std.mem.startsWith(u8, token.text, "excluded.")) {
+            pos.* += 1;
+            return try conflictExcludedArrayElementValueJsonAlloc(alloc, schema, column, token.text["excluded.".len..], hooks.insert_columns, hooks.insert_values);
+        }
+    }
+    const value_json = try hooks.parse_json_value_json(hooks.ptr);
+    errdefer alloc.free(value_json);
+    try sql_value.validateSqlArrayElementValueJson(alloc, column, value_json);
+    return value_json;
+}
+
 pub fn insertSourceUniquePredicatesFromConstraintAlloc(
     alloc: std.mem.Allocator,
     predicates: []const runtime_schema.UniquePredicate,
@@ -811,7 +1062,89 @@ pub const UniqueConflictTarget = struct {
     where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
 };
 
-pub fn conflictTargetForNamedConstraintAlloc(
+pub fn parseConflictTargetAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+    hooks: ConflictTargetParserHooks,
+) !ConflictTarget {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("on")) {
+        try cursor.expectKeyword("constraint");
+        const constraint_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        defer alloc.free(constraint_name);
+        return try conflictTargetForNamedConstraintAlloc(alloc, schema, table_name, constraint_name);
+    }
+
+    try cursor.expectToken(.lparen);
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (columns.items) |column| alloc.free(column);
+        columns.deinit(alloc);
+    }
+    var expressions = std.ArrayListUnmanaged(runtime_schema.UniqueExpression).empty;
+    defer {
+        clearDdlUniqueExpressions(alloc, expressions.items);
+        expressions.deinit(alloc);
+    }
+    while (true) {
+        if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
+            const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
+            const expression = try parseConflictTargetUniqueExpressionAlloc(alloc, tokens, pos, schema);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeDdlUniqueExpression(alloc, expression);
+            try expressions.append(alloc, expression);
+            expression_transferred = true;
+            try grammar.closeDdlIndexExpressionWrappers(tokens, pos, wrapper_count);
+        } else {
+            const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            var column_transferred = false;
+            errdefer if (!column_transferred) alloc.free(column);
+            if (cursor.peekKind(.lparen)) return error.UnsupportedSqlShape;
+            if (binder.relationalColumnForField(schema, column, null) == null) return error.InvalidSqlCatalog;
+            try columns.append(alloc, column);
+            column_transferred = true;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0 and expressions.items.len == 0) return error.UnsupportedSqlShape;
+    try validateSqlInsertColumnsUnique(schema, columns.items);
+    try lower_expr.validateSqlUniqueExpressionListUnique(expressions.items);
+
+    var where_json: []const u8 = "";
+    defer if (where_json.len > 0) alloc.free(where_json);
+    var where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{};
+    defer {
+        freeExpressionConditions(alloc, where_expressions);
+        if (where_expressions.len > 0) alloc.free(where_expressions);
+    }
+    if (cursor.matchKeyword("where")) {
+        const where_start = cursor.checkpoint();
+        where_json = grammar.parseDdlUniquePredicateWhereJsonAlloc(alloc, tokens, pos, schema.relational_columns) catch |err| switch (err) {
+            error.UnsupportedSqlShape, error.InvalidSqlCatalog => blk: {
+                cursor.restore(where_start);
+                break :blk "";
+            },
+            else => return err,
+        };
+        if (where_json.len == 0) {
+            where_expressions = try hooks.parse_where_expression_conditions(hooks.ptr);
+        }
+    }
+
+    if (expressions.items.len == 0 and binder.columnsMatchPrimaryKey(schema.primary_key.?, columns.items)) {
+        if (where_json.len > 0 or where_expressions.len > 0) return error.UnsupportedSqlShape;
+        return .primary;
+    }
+
+    const constraint = try lower_expr.findUniqueConstraintByColumnsExpressionsAndConflictWhere(alloc, schema, columns.items, expressions.items, where_json, where_expressions) orelse return error.InvalidSqlCatalog;
+    return try conflictTargetForUniqueConstraintAlloc(alloc, constraint);
+}
+
+fn conflictTargetForNamedConstraintAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
     table_name: []const u8,
@@ -820,6 +1153,13 @@ pub fn conflictTargetForNamedConstraintAlloc(
     if (try namedConstraintIsPrimaryKeyAlloc(alloc, schema, table_name, constraint_name)) return .primary;
 
     const constraint = binder.findUniqueConstraintByName(schema, constraint_name) orelse return error.InvalidSqlCatalog;
+    return try conflictTargetForUniqueConstraintAlloc(alloc, constraint);
+}
+
+fn conflictTargetForUniqueConstraintAlloc(
+    alloc: std.mem.Allocator,
+    constraint: runtime_schema.UniqueConstraint,
+) !ConflictTarget {
     const name = try alloc.dupe(u8, constraint.name);
     errdefer alloc.free(name);
     const where_json = try grammar.uniquePredicateWhereJsonAlloc(alloc, constraint.where);
@@ -850,6 +1190,32 @@ pub fn namedConstraintIsPrimaryKeyAlloc(
     const default_primary_name = try std.fmt.allocPrint(alloc, "{s}_pkey", .{table_name});
     defer alloc.free(default_primary_name);
     return std.mem.eql(u8, constraint_name, default_primary_name);
+}
+
+fn validateConflictTargetUniqueExpression(
+    schema: runtime_schema.TableSchema,
+    expression: runtime_schema.UniqueExpression,
+) !void {
+    if (expression.op == .expression) {
+        const row_expression = expression.expression orelse return error.InvalidSqlCatalog;
+        try lower_expr.validateCheckExpressionForColumns(schema.relational_columns, row_expression);
+        if (!lower_expr.rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
+        if (!lower_expr.checkExpressionTypeOrderable(try lower_expr.checkExpressionTypeForColumns(schema.relational_columns, row_expression))) return error.InvalidSqlCatalog;
+    } else if (binder.relationalColumnForField(schema, expression.field, null) == null) {
+        return error.InvalidSqlCatalog;
+    }
+}
+
+fn parseConflictTargetUniqueExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+) !runtime_schema.UniqueExpression {
+    const expression = try grammar.parseDdlUniqueExpressionAlloc(alloc, tokens, pos);
+    errdefer freeDdlUniqueExpression(alloc, expression);
+    try validateConflictTargetUniqueExpression(schema, expression);
+    return expression;
 }
 
 pub const ConflictClause = struct {

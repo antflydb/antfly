@@ -77,16 +77,12 @@ const appendRelationalColumnAlloc = sql_adapter.appendRelationalColumnAlloc;
 const appendStringFingerprintAlloc = sql_adapter.appendStringFingerprintAlloc;
 const appendTrueBoolFingerprintAlloc = sql_adapter.appendTrueBoolFingerprintAlloc;
 const appendUniqueConstraintAlloc = sql_adapter.appendUniqueConstraintAlloc;
-const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
-const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
 const clearDdlForeignKeys = sql_adapter.clearDdlForeignKeys;
 const clearDdlRelationalChecks = sql_adapter.clearDdlRelationalChecks;
 const clearDdlRelationalColumns = sql_adapter.clearDdlRelationalColumns;
 const clearDdlUniqueConstraints = sql_adapter.clearDdlUniqueConstraints;
-const clearDdlUniqueExpressions = sql_adapter.clearDdlUniqueExpressions;
 const cloneExpressionAlloc = sql_adapter.cloneExpressionAlloc;
 const cloneExpressionConditionAlloc = sql_adapter.cloneExpressionConditionAlloc;
-const cloneExpressionConditionsAlloc = sql_adapter.cloneExpressionConditionsAlloc;
 const cloneExpressionConditionsConcatAlloc = sql_adapter.cloneExpressionConditionsConcatAlloc;
 const cloneDdlDefaultValue = sql_adapter.cloneDdlDefaultValue;
 const cloneDdlForeignKey = sql_adapter.cloneDdlForeignKey;
@@ -112,7 +108,6 @@ const cloneQueryRelationalCheckAlloc = sql_adapter.cloneQueryRelationalCheckAllo
 const cloneQueryRelationalChecksAlloc = sql_adapter.cloneQueryRelationalChecksAlloc;
 const cloneSelectOutputsAlloc = sql_adapter.cloneSelectOutputsAlloc;
 const cloneStringSlice = sql_adapter.cloneStringSlice;
-const columnsMatchPrimaryKey = sql_adapter.columnsMatchPrimaryKey;
 const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSyntax;
 const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const createTablePlanFromTableCloneSourceAlloc = sql_adapter.createTablePlanFromTableCloneSourceAlloc;
@@ -162,8 +157,6 @@ const freeDdlRelationalColumn = sql_adapter.freeDdlRelationalColumn;
 const freeDdlRelationalColumns = sql_adapter.freeDdlRelationalColumns;
 const freeDdlUniqueConstraint = sql_adapter.freeDdlUniqueConstraint;
 const freeDdlUniqueConstraints = sql_adapter.freeDdlUniqueConstraints;
-const freeDdlUniqueExpression = sql_adapter.freeDdlUniqueExpression;
-const freeDdlUniqueExpressions = sql_adapter.freeDdlUniqueExpressions;
 const freeDdlUniquePredicates = sql_adapter.freeDdlUniquePredicates;
 const freeFieldAliasProjections = sql_adapter.freeFieldAliasProjections;
 const freeInPredicates = sql_adapter.freeInPredicates;
@@ -254,7 +247,6 @@ pub const bulkSqlIoImportRowsBatchFromStdinAlloc = sql_adapter.bulkSqlIoImportRo
 const constraintCheckModeFromSyntax = sql_adapter.constraintCheckModeFromSyntax;
 const defaultPrimaryKeyNameEquals = sql_adapter.defaultPrimaryKeyNameEquals;
 const findUniqueConstraintByColumnSet = sql_adapter.findUniqueConstraintByColumnSet;
-const findUniqueConstraintByColumnsExpressionsAndConflictWhere = sql_adapter.findUniqueConstraintByColumnsExpressionsAndConflictWhere;
 const findUniqueConstraintByColumns = sql_adapter.findUniqueConstraintByColumns;
 const findUniqueConstraintByExpression = sql_adapter.findUniqueConstraintByExpression;
 const foreignKeyActionName = sql_adapter.foreignKeyActionName;
@@ -332,7 +324,6 @@ const uniqueConstraintValidationStateString = sql_adapter.uniqueConstraintValida
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
 const updateWillLookupExistingRow = sql_adapter.updateWillLookupExistingRow;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
-const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
 const validateReturningProjectionOutputs = sql_adapter.validateReturningProjectionOutputs;
 const validateCommentMetadataPlanForRuntimeSchemaAlloc = sql_adapter.validateCommentMetadataPlanForRuntimeSchemaAlloc;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
@@ -426,6 +417,7 @@ pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
 
 pub const LoweredInsert = sql_adapter.LoweredInsert;
 pub const LoweredInsertSource = sql_adapter.LoweredInsertSource;
+pub const LoweredRecursiveInsertSource = sql_adapter.LoweredRecursiveInsertSource;
 pub const LoweredMutation = sql_adapter.LoweredMutation;
 const ReturningProjection = sql_adapter.ReturningProjection;
 pub const LoweredMutationSource = sql_adapter.LoweredMutationSource;
@@ -1361,6 +1353,34 @@ pub fn lowerInsertSourceWithSchemasAlloc(
     };
 }
 
+pub fn lowerRecursiveInsertSourceWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !LoweredRecursiveInsertSource {
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .insert_source_allows_different_table = true,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parser.parseRecursiveInsertSource() catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
 pub fn lowerUpdateAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -1700,7 +1720,13 @@ pub fn lowerWritePlanAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try tokenizeAlloc(alloc, sql);
     defer freeTokens(alloc, &tokens);
-    const write_kind = sql_adapter.classifyWriteStatement(tokens.items) orelse return error.UnsupportedSqlShape;
+    const write_kind = sql_adapter.classifyWriteStatement(tokens.items) orelse {
+        var recursive_tables = (try sql_adapter.recursiveInsertSourceTableNamesFromTokensAlloc(alloc, tokens.items)) orelse return error.UnsupportedSqlShape;
+        recursive_tables.deinit(alloc);
+        const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+        const source_schema = options.insert_source_schema orelse schema;
+        return .{ .recursive_insert_source = try lowerRecursiveInsertSourceWithSchemasAlloc(alloc, sql, schema, source_schema, params, resolver) };
+    };
 
     if (write_kind == .insert) {
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
@@ -1795,9 +1821,18 @@ pub fn lowerWritePlanWithCatalogAlloc(
     defer if (owned_insert_source_schema) |value| runtime_schema.freeSchema(alloc, value);
     var owned_joined_source_schema: ?runtime_schema.TableSchema = null;
     defer if (owned_joined_source_schema) |value| runtime_schema.freeSchema(alloc, value);
+    var resolved_recursive_insert_source = false;
 
     if (effective_options.insert_source_schema == null) {
-        if (try sql_adapter.insertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+        if (try sql_adapter.recursiveInsertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+            var tables = resolved_tables;
+            defer tables.deinit(alloc);
+            resolved_recursive_insert_source = true;
+            if (!std.mem.eql(u8, tables.target, tables.source)) {
+                owned_insert_source_schema = try sql_adapter.runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
+                effective_options.insert_source_schema = owned_insert_source_schema.?;
+            }
+        } else if (try sql_adapter.insertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
             var tables = resolved_tables;
             defer tables.deinit(alloc);
             if (!std.mem.eql(u8, tables.target, tables.source)) {
@@ -1806,7 +1841,7 @@ pub fn lowerWritePlanWithCatalogAlloc(
             }
         }
     }
-    if (effective_options.joined_source_schema == null) {
+    if (!resolved_recursive_insert_source and effective_options.joined_source_schema == null) {
         if (try sql_adapter.joinedWriteSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
             var tables = resolved_tables;
             defer tables.deinit(alloc);
@@ -2061,6 +2096,11 @@ fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpu
     switch (entry.family) {
         .insert_source => {
             var tables = (try sql_adapter.insertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            defer tables.deinit(alloc);
+            return try alloc.dupe(u8, tables.source);
+        },
+        .recursive_insert_source => {
+            var tables = (try sql_adapter.recursiveInsertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
@@ -2980,6 +3020,75 @@ const Parser = struct {
         self.defer_row_expression_field_validation = true;
         defer self.defer_row_expression_field_validation = previous_defer_field_validation;
         return try self.parseUniquePredicateWhereExpressionConditionsAlloc();
+    }
+
+    fn conflictTargetParserHooks(self: *@This()) sql_adapter.ConflictTargetParserHooks {
+        return .{
+            .ptr = self,
+            .parse_where_expression_conditions = parseConflictTargetWhereExpressionConditionsHook,
+        };
+    }
+
+    fn parseConflictTargetWhereExpressionConditionsHook(ptr: *anyopaque) anyerror![]const db_mod.types.RelationalRowsExpressionCondition {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseUniquePredicateWhereExpressionConditionsAlloc();
+    }
+
+    fn uniquePredicateWhereExpressionParserHooks(self: *@This()) sql_adapter.UniquePredicateWhereExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_condition = parseUniquePredicateWhereExpressionConditionHook,
+        };
+    }
+
+    fn parseUniquePredicateWhereExpressionConditionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseCaseExpressionConditionAlloc();
+    }
+
+    fn parseConflictCoalesceOperandJsonHook(
+        ptr: *anyopaque,
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseConflictCoalesceOperandJsonAlloc(column, insert_columns, insert_values);
+    }
+
+    fn parseConflictJsonbBuildObjectValueHook(
+        ptr: *anyopaque,
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseConflictJsonbBuildObjectValueAlloc(insert_columns, insert_values);
+    }
+
+    fn conflictValueParserHooks(
+        self: *@This(),
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) sql_adapter.ConflictValueParserHooks {
+        return .{
+            .ptr = self,
+            .insert_columns = insert_columns,
+            .insert_values = insert_values,
+            .parse_column_value_json = parseConflictColumnValueJsonHook,
+            .parse_json_value_json = parseConflictJsonValueHook,
+            .parse_coalesce_operand_value_json = parseConflictCoalesceOperandJsonHook,
+            .parse_jsonb_build_object_value_json = parseConflictJsonbBuildObjectValueHook,
+        };
+    }
+
+    fn parseConflictColumnValueJsonHook(ptr: *anyopaque, column: runtime_schema.RelationalColumn) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseSqlColumnValueAlloc(column);
+    }
+
+    fn parseConflictJsonValueHook(ptr: *anyopaque) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseJsonValueAlloc();
     }
 
     fn parseDdlDefaultValueHook(ptr: *anyopaque, field_type: runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue {
@@ -4706,6 +4815,29 @@ const Parser = struct {
 
     fn parseInsertSource(self: *@This()) !LoweredInsertSource {
         return try sql_adapter.parseInsertSourceAlloc(self.alloc, self.tokens, &self.pos, self.joinCteSelectParserHooks(), self.insertSourceParserHooks());
+    }
+
+    fn parseRecursiveInsertSource(self: *@This()) !LoweredRecursiveInsertSource {
+        var recursive = try sql_adapter.parseRecursiveCteProducerAlloc(self.alloc, self.tokens, &self.pos, self.recursiveCteParserHooks());
+        errdefer recursive.deinit(self.alloc);
+        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
+        if (!self.peekKeyword("insert")) return error.UnsupportedSqlShape;
+
+        var base_table_name: ?[]const u8 = try self.alloc.dupe(u8, recursive.anchor.table_name);
+        defer if (base_table_name) |name| self.alloc.free(name);
+        const recursive_ctes = [_]db_mod.types.RelationalRowsCte{.{
+            .name = recursive.cte_name,
+            .query = recursive.anchor.plan.query,
+        }};
+        var insert_source = try self.parseInsertSourceWithCtes(recursive_ctes[0..], &base_table_name);
+        errdefer insert_source.deinit(self.alloc);
+        if (!std.mem.eql(u8, insert_source.insert_source.req.source.source_cte, recursive.cte_name)) return error.UnsupportedSqlShape;
+        if (insert_source.ctes.len != 0) return error.UnsupportedSqlShape;
+
+        return .{
+            .recursive = recursive,
+            .insert_source = insert_source,
+        };
     }
 
     fn parseInsertSourceWithCtes(
@@ -10251,138 +10383,11 @@ const Parser = struct {
     }
 
     fn parseConflictTarget(self: *@This(), table_name: []const u8) !ConflictTarget {
-        if (self.matchKeyword("on")) {
-            try self.expectKeyword("constraint");
-            const constraint_name = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-            defer self.alloc.free(constraint_name);
-            return try sql_adapter.conflictTargetForNamedConstraintAlloc(self.alloc, self.schema, table_name, constraint_name);
-        }
-
-        try self.expect(.lparen);
-        var columns = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (columns.items) |column| self.alloc.free(column);
-            columns.deinit(self.alloc);
-        }
-        var expressions = std.ArrayListUnmanaged(runtime_schema.UniqueExpression).empty;
-        errdefer {
-            clearDdlUniqueExpressions(self.alloc, expressions.items);
-            expressions.deinit(self.alloc);
-        }
-        while (true) {
-            if (self.nextConflictTargetElementIsUniqueExpression()) {
-                const wrapper_count = sql_adapter.consumeDdlIndexExpressionWrappers(self.tokens, &self.pos);
-                const expression = try self.parseConflictTargetUniqueExpressionAlloc();
-                var expression_transferred = false;
-                errdefer if (!expression_transferred) freeDdlUniqueExpression(self.alloc, expression);
-                try expressions.append(self.alloc, expression);
-                expression_transferred = true;
-                try sql_adapter.closeDdlIndexExpressionWrappers(self.tokens, &self.pos, wrapper_count);
-            } else {
-                const column = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-                var column_transferred = false;
-                errdefer if (!column_transferred) self.alloc.free(column);
-                if (self.peekKind(.lparen)) return error.UnsupportedSqlShape;
-                if (relationalColumnForField(self.schema, column, null) == null) return error.InvalidSqlCatalog;
-                try columns.append(self.alloc, column);
-                column_transferred = true;
-            }
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        if (columns.items.len == 0 and expressions.items.len == 0) return error.UnsupportedSqlShape;
-        try sql_adapter.validateSqlInsertColumnsUnique(self.schema, columns.items);
-        try sql_adapter.validateSqlUniqueExpressionListUnique(expressions.items);
-
-        var where_json: []const u8 = "";
-        errdefer if (where_json.len > 0) self.alloc.free(where_json);
-        var where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{};
-        errdefer {
-            freeExpressionConditions(self.alloc, where_expressions);
-            if (where_expressions.len > 0) self.alloc.free(where_expressions);
-        }
-        if (self.matchKeyword("where")) {
-            const where_start = self.pos;
-            where_json = sql_adapter.parseDdlUniquePredicateWhereJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema.relational_columns) catch |err| switch (err) {
-                error.UnsupportedSqlShape, error.InvalidSqlCatalog => blk: {
-                    self.pos = where_start;
-                    break :blk "";
-                },
-                else => return err,
-            };
-            if (where_json.len == 0) {
-                where_expressions = try self.parseUniquePredicateWhereExpressionConditionsAlloc();
-            }
-        }
-
-        if (expressions.items.len == 0 and columnsMatchPrimaryKey(self.schema.primary_key.?, columns.items)) {
-            if (where_json.len > 0 or where_expressions.len > 0) return error.UnsupportedSqlShape;
-            for (columns.items) |column| self.alloc.free(column);
-            columns.deinit(self.alloc);
-            return .primary;
-        }
-
-        const constraint = try findUniqueConstraintByColumnsExpressionsAndConflictWhere(self.alloc, self.schema, columns.items, expressions.items, where_json, where_expressions) orelse return error.InvalidSqlCatalog;
-
-        const name = try self.alloc.dupe(u8, constraint.name);
-        errdefer self.alloc.free(name);
-        const out_where = try sql_adapter.uniquePredicateWhereJsonAlloc(self.alloc, constraint.where);
-        errdefer if (out_where.len > 0) self.alloc.free(out_where);
-        const out_where_expressions = try cloneExpressionConditionsAlloc(self.alloc, constraint.where_expressions);
-        errdefer {
-            freeExpressionConditions(self.alloc, out_where_expressions);
-            if (out_where_expressions.len > 0) self.alloc.free(out_where_expressions);
-        }
-        for (columns.items) |column| self.alloc.free(column);
-        columns.deinit(self.alloc);
-        clearDdlUniqueExpressions(self.alloc, expressions.items);
-        expressions.deinit(self.alloc);
-        if (where_json.len > 0) self.alloc.free(where_json);
-        where_json = "";
-        freeExpressionConditions(self.alloc, where_expressions);
-        if (where_expressions.len > 0) self.alloc.free(where_expressions);
-        where_expressions = &.{};
-        return .{ .unique = .{
-            .name = name,
-            .where_json = out_where,
-            .where_expressions = out_where_expressions,
-        } };
+        return try sql_adapter.parseConflictTargetAlloc(self.alloc, self.tokens, &self.pos, self.schema, table_name, self.conflictTargetParserHooks());
     }
 
     fn parseUniquePredicateWhereExpressionConditionsAlloc(self: *@This()) ![]const db_mod.types.RelationalRowsExpressionCondition {
-        var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
-        errdefer {
-            freeExpressionConditions(self.alloc, conditions.items);
-            conditions.deinit(self.alloc);
-        }
-        while (true) {
-            var condition = try self.parseCaseExpressionConditionAlloc();
-            var condition_transferred = false;
-            errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-            try conditions.append(self.alloc, condition);
-            condition = undefined;
-            condition_transferred = true;
-            if (!self.matchKeyword("and")) break;
-        }
-        return try conditions.toOwnedSlice(self.alloc);
-    }
-
-    fn nextConflictTargetElementIsUniqueExpression(self: *@This()) bool {
-        return sql_adapter.peekDdlIndexElementExpression(self.tokens, self.pos, true);
-    }
-
-    fn parseConflictTargetUniqueExpressionAlloc(self: *@This()) !runtime_schema.UniqueExpression {
-        const expression = try sql_adapter.parseDdlUniqueExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        errdefer freeDdlUniqueExpression(self.alloc, expression);
-        if (expression.op == .expression) {
-            const row_expression = expression.expression orelse return error.InvalidSqlCatalog;
-            try validateCheckExpressionForColumns(self.schema.relational_columns, row_expression);
-            if (!sql_adapter.rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
-            if (!checkExpressionTypeOrderable(try checkExpressionTypeForColumns(self.schema.relational_columns, row_expression))) return error.InvalidSqlCatalog;
-        } else if (relationalColumnForField(self.schema, expression.field, null) == null) {
-            return error.InvalidSqlCatalog;
-        }
-        return expression;
+        return try sql_adapter.parseUniquePredicateWhereExpressionConditionsAlloc(self.alloc, self.tokens, &self.pos, self.uniquePredicateWhereExpressionParserHooks());
     }
 
     fn rejectDuplicateConflictUpdateTargets(
@@ -10653,21 +10658,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         insert_values: []const []const u8,
     ) ![]const u8 {
-        if (sql_adapter.peekJsonbBuildObjectFunctionCall(self.tokens, self.pos)) {
-            if (column.field_type != .json) return error.InvalidSqlCatalog;
-            return try self.parseConflictJsonbBuildObjectAlloc(insert_columns, insert_values);
-        }
-        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
-            return try self.parseConflictCoalesceValueJsonAlloc(column, insert_columns, insert_values);
-        }
-        if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
-            const token = self.tokens[self.pos];
-            if (std.mem.startsWith(u8, token.text, "excluded.")) {
-                self.pos += 1;
-                return try self.conflictExcludedValueJsonAlloc(column, token.text["excluded.".len..], insert_columns, insert_values);
-            }
-        }
-        return try self.parseSqlColumnValueAlloc(column);
+        return try sql_adapter.parseConflictValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.params, column, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
     fn parseConflictArrayElementValueJsonAlloc(
@@ -10676,71 +10667,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         insert_values: []const []const u8,
     ) ![]const u8 {
-        const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
-        const element_column: runtime_schema.RelationalColumn = .{
-            .name = column.name,
-            .path = column.path,
-            .field_type = item_type,
-        };
-        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
-            const value_json = try self.parseConflictCoalesceValueJsonAlloc(element_column, insert_columns, insert_values);
-            errdefer self.alloc.free(value_json);
-            try sql_adapter.validateSqlArrayElementValueJson(self.alloc, column, value_json);
-            return value_json;
-        }
-        if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
-            const token = self.tokens[self.pos];
-            if (std.mem.startsWith(u8, token.text, "excluded.")) {
-                self.pos += 1;
-                const source = token.text["excluded.".len..];
-                const source_column = relationalColumnForField(self.schema, source, null) orelse return error.InvalidSqlCatalog;
-                if (source_column.field_type != item_type) return error.UnsupportedSqlShape;
-                for (insert_columns, insert_values) |insert_column, insert_value| {
-                    if (std.mem.eql(u8, insert_column, source)) {
-                        try sql_adapter.validateSqlArrayElementValueJson(self.alloc, column, insert_value);
-                        return try self.alloc.dupe(u8, insert_value);
-                    }
-                }
-                return error.UnsupportedSqlShape;
-            }
-        }
-        const value_json = try self.parseJsonValueAlloc();
-        errdefer self.alloc.free(value_json);
-        try sql_adapter.validateSqlArrayElementValueJson(self.alloc, column, value_json);
-        return value_json;
-    }
-
-    fn parseConflictJsonbBuildObjectAlloc(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        try sql_adapter.parseJsonbBuildObjectFunctionCallStart(self.tokens, &self.pos);
-        if (self.match(.rparen) != null) return try self.alloc.dupe(u8, "{}");
-
-        var seen = std.StringHashMapUnmanaged(void).empty;
-        defer seen.deinit(self.alloc);
-        var out: std.Io.Writer.Allocating = .init(self.alloc);
-        errdefer out.deinit();
-        const writer = &out.writer;
-        try writer.writeByte('{');
-        var first = true;
-        while (true) {
-            const key = try sql_adapter.parseJsonbBuildObjectKey(self.tokens, &self.pos, self.params);
-            const entry = try seen.getOrPut(self.alloc, key);
-            if (entry.found_existing) return error.UnsupportedSqlShape;
-            try self.expect(.comma);
-            const value_json = try self.parseConflictJsonbBuildObjectValueAlloc(insert_columns, insert_values);
-            defer self.alloc.free(value_json);
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writer.print("{f}:", .{std.json.fmt(key, .{})});
-            try writer.writeAll(value_json);
-            if (self.match(.comma) == null) break;
-        }
-        try self.expect(.rparen);
-        try writer.writeByte('}');
-        return try out.toOwnedSlice();
+        return try sql_adapter.parseConflictArrayElementValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, column, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
     fn parseConflictJsonbBuildObjectValueAlloc(
@@ -10759,70 +10686,10 @@ const Parser = struct {
             const token = self.tokens[self.pos];
             if (std.mem.startsWith(u8, token.text, "excluded.")) {
                 self.pos += 1;
-                return try self.conflictExcludedJsonObjectValueAlloc(token.text["excluded.".len..], insert_columns, insert_values);
+                return try sql_adapter.conflictExcludedJsonObjectValueAlloc(self.alloc, self.schema, token.text["excluded.".len..], insert_columns, insert_values);
             }
         }
         return try self.parseJsonValueAlloc();
-    }
-
-    fn conflictExcludedJsonObjectValueAlloc(
-        self: *@This(),
-        source: []const u8,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        _ = relationalColumnForField(self.schema, source, null) orelse return error.InvalidSqlCatalog;
-        for (insert_columns, insert_values) |insert_column, insert_value| {
-            if (std.mem.eql(u8, insert_column, source)) return try self.alloc.dupe(u8, insert_value);
-        }
-        return error.UnsupportedSqlShape;
-    }
-
-    fn conflictExcludedValueJsonAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        source: []const u8,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        const source_column = relationalColumnForField(self.schema, source, null) orelse return error.InvalidSqlCatalog;
-        if (source_column.field_type != column.field_type) return error.UnsupportedSqlShape;
-        for (insert_columns, insert_values) |insert_column, insert_value| {
-            if (std.mem.eql(u8, insert_column, source)) return try self.alloc.dupe(u8, insert_value);
-        }
-        return error.UnsupportedSqlShape;
-    }
-
-    fn parseConflictCoalesceValueJsonAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
-
-        var selected: ?[]const u8 = null;
-        errdefer if (selected) |value| self.alloc.free(value);
-        var operands: usize = 0;
-        while (true) {
-            const value_json = try self.parseConflictCoalesceOperandJsonAlloc(column, insert_columns, insert_values);
-            var value_transferred = false;
-            defer if (!value_transferred) self.alloc.free(value_json);
-            operands += 1;
-            if (selected == null and !std.mem.eql(u8, value_json, "null")) {
-                selected = value_json;
-                value_transferred = true;
-            }
-            if (self.match(.comma) == null) break;
-        }
-        if (operands == 0) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-
-        if (selected) |value| {
-            selected = null;
-            return value;
-        }
-        return try self.alloc.dupe(u8, "null");
     }
 
     fn parseConflictCoalesceOperandJsonAlloc(
@@ -10835,7 +10702,7 @@ const Parser = struct {
             const token = self.tokens[self.pos];
             if (std.mem.startsWith(u8, token.text, "excluded.")) {
                 self.pos += 1;
-                return try self.conflictExcludedValueJsonAlloc(column, token.text["excluded.".len..], insert_columns, insert_values);
+                return try sql_adapter.conflictExcludedValueJsonAlloc(self.alloc, self.schema, column, token.text["excluded.".len..], insert_columns, insert_values);
             }
         }
         return try self.parseSqlColumnValueAlloc(column);
@@ -38095,6 +37962,31 @@ fn insertSourceFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredInsert
     return with_cte_access;
 }
 
+fn recursiveInsertSourceFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    lowered: LoweredRecursiveInsertSource,
+) ![]u8 {
+    const insert = try insertSourceFingerprintAlloc(alloc, lowered.insert_source);
+    defer alloc.free(insert);
+    const member = try recursiveCteMemberFingerprintAlloc(alloc, lowered.recursive.recursive_member);
+    defer alloc.free(member);
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "recursive_insert_source:cte={s}:op={s}:anchor_table={s}:outputs={d}:member={s}:insert={s}",
+        .{
+            lowered.recursive.cte_name,
+            @tagName(lowered.recursive.operation),
+            lowered.recursive.anchor.table_name,
+            lowered.recursive.output_columns.len,
+            member,
+            insert,
+        },
+    );
+    fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_offset", lowered.insert_source.insert_source.req.source.offset);
+    fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", lowered.insert_source.conflict_where);
+    return fingerprint;
+}
+
 fn updateSourceFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredMutationSource) ![]u8 {
     const source = lowered.mutation.req.source;
     const claim = if (source.row_claim) |claim_value| sqlRowClaimFingerprintName(claim_value) else "none";
@@ -38527,6 +38419,9 @@ fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan
             fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "source_offset", insert_source.insert_source.req.source.offset);
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", insert_source.conflict_where);
             break :blk fingerprint;
+        },
+        .recursive_insert_source => |recursive_insert_source| blk: {
+            break :blk try recursiveInsertSourceFingerprintAlloc(alloc, recursive_insert_source);
         },
         .update => |update| blk: {
             const operations = transformOperationCount(update.batch.transforms);
@@ -38992,6 +38887,21 @@ fn expectAppParityWriteSummary(summary: AppParityPlanSummary, lowered: LoweredWr
             if (summary.returning_all) |expected| try std.testing.expectEqual(expected, insert_source.insert_source.req.returning_all);
             if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert_source.conflict_where);
         },
+        .recursive_insert_source => |recursive_insert_source| {
+            try expectOptionalTableName(summary.table_name, recursive_insert_source.insert_source.table_name);
+            try expectOptionalUsize(summary.ctes, 1);
+            try expectQuerySummary(summary, recursive_insert_source.insert_source.insert_source.req.source);
+            try expectOptionalUsize(summary.operations, recursive_insert_source.insert_source.insert_source.req.assignments.len);
+            const conflict_patch_expressions = if (recursive_insert_source.insert_source.insert_source.req.on_conflict) |conflict| conflict.patch_expressions.len else 0;
+            const conflict_increment_expressions = if (recursive_insert_source.insert_source.insert_source.req.on_conflict) |conflict| conflict.increment_expressions.len else 0;
+            const conflict_json_set_expressions = if (recursive_insert_source.insert_source.insert_source.req.on_conflict) |conflict| conflict.json_set_expressions.len else 0;
+            try expectOptionalUsize(summary.patch_expressions, conflict_patch_expressions);
+            try expectOptionalUsize(summary.increment_expressions, conflict_increment_expressions);
+            try expectOptionalUsize(summary.json_set_expressions, conflict_json_set_expressions);
+            try expectOptionalUsize(summary.returning, recursive_insert_source.insert_source.insert_source.req.returning.len);
+            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, recursive_insert_source.insert_source.insert_source.req.returning_all);
+            if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, recursive_insert_source.insert_source.conflict_where);
+        },
         .update => |update| {
             try expectOptionalTableName(summary.table_name, update.table_name);
             try expectOptionalUsize(summary.operations, transformOperationCount(update.batch.transforms));
@@ -39142,6 +39052,14 @@ fn expectAppParityWritePlanEntry(
             },
             else => return error.TestUnexpectedResult,
         },
+        .recursive_insert_source => switch (lowered) {
+            .recursive_insert_source => |recursive_insert_source| {
+                const fingerprint = try recursiveInsertSourceFingerprintAlloc(alloc, recursive_insert_source);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
+            else => return error.TestUnexpectedResult,
+        },
         .update => switch (lowered) {
             .update => |update| {
                 const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
@@ -39224,6 +39142,7 @@ fn appParityPlanFamilyIsSupportedWrite(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .insert,
         .insert_source,
+        .recursive_insert_source,
         .update,
         .delete,
         .update_source,
@@ -39400,6 +39319,7 @@ fn expectAppParityCorpusEntry(
         },
         .insert,
         .insert_source,
+        .recursive_insert_source,
         .update,
         .delete,
         .update_source,

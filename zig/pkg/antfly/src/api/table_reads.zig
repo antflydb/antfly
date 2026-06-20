@@ -5256,15 +5256,25 @@ pub fn rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
 
     var source_query = req.source;
     source_query.source_cte = "";
+    source_query.select = &.{};
+    source_query.json_extract = &.{};
+    source_query.array_length = &.{};
+    source_query.coalesce = &.{};
+    source_query.field_aliases = &.{};
+    source_query.expressions = &.{};
+    source_query.select_all = true;
     var source_result = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, source_schema, source_query, materialized.rows);
     defer source_result.deinit(alloc);
 
+    var effective_req = req;
+    effective_req.source = source_query;
+    effective_req.source.source_cte = recursive.cte_name;
     return try relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
         alloc,
         target_table_name,
         target_schema,
         source_schema,
-        req,
+        effective_req,
         source_result.rows,
         conflict_resolver,
     );

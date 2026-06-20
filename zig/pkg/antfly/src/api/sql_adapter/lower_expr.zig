@@ -44,6 +44,11 @@ pub const QueryPlanParserHooks = struct {
     ) anyerror!plan_mod.LoweredSelect,
 };
 
+pub const UniquePredicateWhereExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_condition: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpressionCondition,
+};
+
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
 const cloneExpressionConditionsConcatAlloc = plan_mod.cloneExpressionConditionsConcatAlloc;
@@ -97,6 +102,29 @@ pub const PeriodRangeValuePair = struct {
 pub fn freePeriodRangeValuePair(alloc: std.mem.Allocator, value: PeriodRangeValuePair) void {
     alloc.free(value.start_json);
     alloc.free(value.end_json);
+}
+
+pub fn parseUniquePredicateWhereExpressionConditionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: UniquePredicateWhereExpressionParserHooks,
+) ![]const db_mod.types.RelationalRowsExpressionCondition {
+    var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+    errdefer {
+        freeExpressionConditions(alloc, conditions.items);
+        conditions.deinit(alloc);
+    }
+    while (true) {
+        var condition = try hooks.parse_condition(hooks.ptr);
+        var condition_transferred = false;
+        errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
+        try conditions.append(alloc, condition);
+        condition = undefined;
+        condition_transferred = true;
+        if (!parser.matchKeyword(tokens, pos, "and")) break;
+    }
+    return try conditions.toOwnedSlice(alloc);
 }
 
 pub const ProjectedColumnType = struct {

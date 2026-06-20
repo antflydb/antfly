@@ -745,6 +745,55 @@ pub fn insertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?
     return try insertSourceTableNamesFromInsertAlloc(alloc, tokens.items, 0);
 }
 
+pub fn recursiveInsertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    return try recursiveInsertSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+}
+
+pub fn recursiveInsertSourceTableNamesFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !?InsertSourceTableNames {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    if (!std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return null;
+    var index: usize = 1;
+    if (!consumeKeyword(tokens, &index, "recursive")) return null;
+    if (index >= tokens.len or tokens[index].kind != .identifier) return null;
+    index += 1;
+    if (index < tokens.len and tokens[index].kind == .lparen) {
+        index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
+    }
+    if (!consumeKeyword(tokens, &index, "as")) return null;
+    parser.consumeCteMaterializationHint(tokens, &index) catch return null;
+    if (index >= tokens.len or tokens[index].kind != .lparen) return null;
+
+    const body_start = index + 1;
+    const body_end = findMatchingRParenIndex(tokens, index) orelse return null;
+    const body = tokens[body_start..body_end];
+    const from_index = findTopLevelKeyword(body, "from") orelse return null;
+    var source_index = body_start + from_index + 1;
+    _ = consumeKeyword(tokens, &source_index, "only");
+    if (source_index >= body_end or tokens[source_index].kind != .identifier) return null;
+    const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
+    var source_transferred = false;
+    defer if (!source_transferred) alloc.free(source);
+
+    index = body_end + 1;
+    if (!consumeKeyword(tokens, &index, "insert")) return null;
+    if (!consumeKeyword(tokens, &index, "into")) return null;
+    _ = consumeKeyword(tokens, &index, "only");
+    if (index >= tokens.len or tokens[index].kind != .identifier) return null;
+    const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
+    errdefer alloc.free(target);
+
+    source_transferred = true;
+    return .{
+        .target = target,
+        .source = source,
+    };
+}
+
 pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);

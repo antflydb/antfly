@@ -47,6 +47,7 @@ pub const AppParityCorpusPlanFamily = enum {
     relation_population,
     insert,
     insert_source,
+    recursive_insert_source,
     update,
     delete,
     update_source,
@@ -1459,6 +1460,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         .relation_population => "relation_population:",
         .insert => "insert:",
         .insert_source => "insert_source:",
+        .recursive_insert_source => "recursive_insert_source:",
         .update => "update:",
         .delete => "delete:",
         .update_source => "update_source:",
@@ -1497,6 +1499,7 @@ pub fn corpusFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) b
         .relation_population,
         .insert,
         .insert_source,
+        .recursive_insert_source,
         .update,
         .delete,
         .update_source,
@@ -1523,6 +1526,7 @@ pub fn corpusFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool 
         .relation_population,
         .insert,
         .insert_source,
+        .recursive_insert_source,
         .update,
         .delete,
         .update_source,
@@ -1542,6 +1546,7 @@ pub fn corpusFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) 
         .join,
         .lateral,
         .insert_source,
+        .recursive_insert_source,
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
@@ -1589,6 +1594,7 @@ pub fn corpusFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFam
         .ddl,
         .insert,
         .insert_source,
+        .recursive_insert_source,
         .update,
         .update_source,
         .update_joined_source,
@@ -1653,6 +1659,8 @@ pub fn corpusFixtureHasTemporalDdlSummary(entry: AppParityCorpusEntry) bool {
 pub fn corpusFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_table_name: []const u8) bool {
     return switch (entry.family) {
         .insert_source => planHasExactStringToken(entry.plan, ":source_table=", source_table_name),
+        .recursive_insert_source => planHasExactStringToken(entry.plan, ":source_table=", source_table_name) or
+            planHasExactStringToken(entry.plan, ":anchor_table=", source_table_name),
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
@@ -2133,7 +2141,9 @@ pub fn corpusFixtureOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, ex
         .update_source,
         .update_joined_source,
         => planHasExactUsizeToken(entry.plan, ":ops=", expected),
-        .insert_source => planHasExactUsizeToken(entry.plan, ":assignments=", expected),
+        .insert_source,
+        .recursive_insert_source,
+        => planHasExactUsizeToken(entry.plan, ":assignments=", expected),
         .merge_mutation => planHasExactUsizeToken(entry.plan, ":matched_update=", expected),
         else => false,
     };
@@ -2143,6 +2153,7 @@ pub fn corpusFixtureAllowsReturningSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .insert,
         .insert_source,
+        .recursive_insert_source,
         .update,
         .delete,
         .update_source,
@@ -3832,6 +3843,14 @@ test "sql adapter corpus owns fixture family policies" {
         "other_sources",
     ));
     try std.testing.expect(corpusFixturePlanMatchesSourceTable(
+        .{ .name = "recursive insert source", .family = .recursive_insert_source, .plan = "recursive_insert_source:cte=source_rows:insert=insert_source:table=archived_records:source_table=usage_records", .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archived_records SELECT id FROM source_rows" },
+        "usage_records",
+    ));
+    try std.testing.expect(corpusFixturePlanMatchesSourceTable(
+        .{ .name = "recursive insert source anchor", .family = .recursive_insert_source, .plan = "recursive_insert_source:cte=source_rows:anchor_table=usage_records:insert=insert_source:table=archived_records:source_cte=1", .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archived_records SELECT id FROM source_rows" },
+        "usage_records",
+    ));
+    try std.testing.expect(corpusFixturePlanMatchesSourceTable(
         .{ .name = "set operation", .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records", .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records" },
         "archived_records",
     ));
@@ -4509,6 +4528,7 @@ pub const AppParityCorpusCoverage = struct {
     relation_population_create_table_as_no_data: bool = false,
     insert: bool = false,
     insert_source: bool = false,
+    recursive_insert_source: bool = false,
     insert_source_expression_assignment: bool = false,
     insert_source_regexp_expression_assignment: bool = false,
     insert_source_computed_pattern_source: bool = false,
@@ -4540,7 +4560,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_write: bool = false,
-    unsupported_write_recursive_cte_insert: bool = false,
     unsupported_write_recursive_cte_update: bool = false,
     unsupported_write_recursive_cte_delete: bool = false,
     unsupported_write_recursive_cte_merge: bool = false,
@@ -5636,6 +5655,7 @@ pub const AppParityCorpusCoverage = struct {
             },
             .insert => self.insert = true,
             .insert_source => self.insert_source = true,
+            .recursive_insert_source => self.recursive_insert_source = true,
             .update => {
                 self.update = true;
                 self.update_identity_rewrite = self.update_identity_rewrite or
@@ -5760,11 +5780,12 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":matched_update_expr=") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
-        } else if (entry.family == .unsupported_write) {
-            self.unsupported_write_recursive_cte_insert = self.unsupported_write_recursive_cte_insert or
-                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
+        } else if (entry.family == .recursive_insert_source) {
+            self.recursive_insert_source = self.recursive_insert_source or
+                (std.mem.startsWith(u8, entry.plan, "recursive_insert_source:") and
                     std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
                     std.mem.indexOf(u8, entry.sql, " INSERT INTO ") != null);
+        } else if (entry.family == .unsupported_write) {
             self.unsupported_write_recursive_cte_update = self.unsupported_write_recursive_cte_update or
                 (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
                     std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and

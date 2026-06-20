@@ -403,6 +403,17 @@ pub const LoweredInsertSource = struct {
     }
 };
 
+pub const LoweredRecursiveInsertSource = struct {
+    recursive: LoweredRecursiveCtePlan,
+    insert_source: LoweredInsertSource,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.recursive.deinit(alloc);
+        self.insert_source.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredMutation = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
@@ -539,6 +550,7 @@ pub const LoweredMergeMutationPlan = struct {
 pub const LoweredWritePlan = union(enum) {
     insert: LoweredInsert,
     insert_source: LoweredInsertSource,
+    recursive_insert_source: LoweredRecursiveInsertSource,
     update: LoweredMutation,
     delete: LoweredMutation,
     update_source: LoweredMutationSource,
@@ -552,6 +564,7 @@ pub const LoweredWritePlan = union(enum) {
         switch (self.*) {
             .insert => |*insert| insert.deinit(alloc),
             .insert_source => |*insert_source| insert_source.deinit(alloc),
+            .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.deinit(alloc),
             .update => |*update| update.deinit(alloc),
             .delete => |*delete| delete.deinit(alloc),
             .update_source => |*update_source| update_source.deinit(alloc),
@@ -1331,6 +1344,45 @@ pub fn parseRecursiveCtePlanAlloc(
     pos: *usize,
     hooks: RecursiveCteParserHooks,
 ) !LoweredRecursiveCtePlan {
+    var recursive = try parseRecursiveCteProducerAlloc(alloc, tokens, pos, hooks);
+    errdefer recursive.deinit(alloc);
+
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+
+    if (!cursor.peekKeyword("select")) return error.UnsupportedSqlShape;
+    if (!tokensContainTopLevelSourceName(tokens[pos.*..], recursive.cte_name)) return error.UnsupportedSqlShape;
+
+    const final_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = recursive.cte_name,
+        .query = recursive.anchor.plan.query,
+    }};
+    var final = try hooks.parse_select_with_set_boundary(hooks.ptr, tokens, pos, final_ctes[0..]);
+    errdefer final.deinit(alloc);
+    var final_base_table_name: ?[]const u8 = null;
+    defer if (final_base_table_name) |name| alloc.free(name);
+    try resolveSelectSourceForPlanAlloc(alloc, &final, final_ctes[0..], &final_base_table_name);
+    if (!std.mem.eql(u8, final.query.source_cte, recursive.cte_name)) return error.UnsupportedSqlShape;
+    if (cursor.matchToken(.semicolon) != null and pos.* != tokens.len) return error.UnsupportedSqlShape;
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+
+    var final_query = final.query;
+    final.query = .{};
+    final.clearSelectOutputs(alloc);
+    alloc.free(final.table_name);
+    final.table_name = "";
+    errdefer final_query.deinit(alloc);
+
+    recursive.final_query = final_query;
+    return recursive;
+}
+
+pub fn parseRecursiveCteProducerAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: RecursiveCteParserHooks,
+) !LoweredRecursiveCtePlan {
     const cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("with");
     try cursor.expectKeyword("recursive");
@@ -1377,23 +1429,6 @@ pub fn parseRecursiveCtePlanAlloc(
     if (body_pos != body_tokens.len) return error.UnsupportedSqlShape;
 
     pos.* = close_index + 1;
-    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
-
-    if (!cursor.peekKeyword("select")) return error.UnsupportedSqlShape;
-    if (!tokensContainTopLevelSourceName(tokens[pos.*..], cte_name)) return error.UnsupportedSqlShape;
-
-    const final_ctes = [_]db_mod.types.RelationalRowsCte{.{
-        .name = cte_name,
-        .query = anchor.query,
-    }};
-    var final = try hooks.parse_select_with_set_boundary(hooks.ptr, tokens, pos, final_ctes[0..]);
-    errdefer final.deinit(alloc);
-    var final_base_table_name: ?[]const u8 = null;
-    defer if (final_base_table_name) |name| alloc.free(name);
-    try resolveSelectSourceForPlanAlloc(alloc, &final, final_ctes[0..], &final_base_table_name);
-    if (!std.mem.eql(u8, final.query.source_cte, cte_name)) return error.UnsupportedSqlShape;
-    if (cursor.matchToken(.semicolon) != null and pos.* != tokens.len) return error.UnsupportedSqlShape;
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
 
     const anchor_table_name = anchor.table_name;
     anchor.table_name = "";
@@ -1405,13 +1440,6 @@ pub fn parseRecursiveCtePlanAlloc(
     anchor.query = .{};
     errdefer anchor_plan.deinit(alloc);
 
-    var final_query = final.query;
-    final.query = .{};
-    final.clearSelectOutputs(alloc);
-    alloc.free(final.table_name);
-    final.table_name = "";
-    errdefer final_query.deinit(alloc);
-
     cte_name_transferred = true;
     output_columns_transferred = true;
     return .{
@@ -1419,7 +1447,7 @@ pub fn parseRecursiveCtePlanAlloc(
         .operation = operation,
         .anchor = anchor_plan,
         .recursive_member = recursive_member,
-        .final_query = final_query,
+        .final_query = .{},
         .output_columns = output_columns,
         .recursive_member_references_cte = recursive_member_references_cte,
         .max_rows = db_mod.types.default_relational_rows_cte_max_rows,

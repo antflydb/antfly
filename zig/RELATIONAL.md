@@ -1528,21 +1528,18 @@ remains an Antfly row-plan input rather than SQL text attached to execution.
 Local execution materializes that source CTE through the ordinary row-plan
 reader, including catalog-resolved cross-schema source tables, before feeding
 the resulting typed source rows into the deterministic MERGE batch builder.
-Recursive CTE-backed SQL writes still fail closed under
-`recursive_cte_stream_plan` until the SQL adapter grows a write-plan envelope
-that can carry the recursive producer and final mutation together. The native
-execution side is intentionally ahead of the SQL syntax surface for the
-insert-source case: bounded recursive CTE materialization can now feed a typed
-insert-source batch builder through REST/SDK-level structs, with the recursive
-rows validated under the same row/byte caps and the final insert-source query
-projected before target-row planning. The remaining adapter work is to lower
-`WITH RECURSIVE ... INSERT ... SELECT ...` into that typed envelope rather than
-passing SQL through execution. Bound table write sources can also stage claimed
-joined mutations from pre-materialized source rows through the ordinary
-target-row claim/OCC path, which is the native building block needed before
-recursive CTE-backed joined updates/deletes can graduate. Recursive CTE-backed
-SQL claimed update/delete and MERGE remain fail-closed until the adapter lowers
-them into an explicit recursive-source envelope over those native primitives.
+Recursive CTE-backed `INSERT ... SELECT` has its own typed write envelope: the
+SQL adapter lowers `WITH RECURSIVE ... INSERT ... SELECT ...` into a recursive
+producer plus an insert-source request, the catalog resolver loads the
+recursive anchor's base source schema for cross-table inserts, and execution
+materializes the bounded recursive rows under the same row/byte caps before the
+final source projection feeds deterministic target-row planning. Bound table
+write sources can also stage claimed joined mutations from pre-materialized
+source rows through the ordinary target-row claim/OCC path, which is the native
+building block needed before recursive CTE-backed joined updates/deletes can
+graduate. Recursive CTE-backed SQL claimed update/delete and MERGE remain
+fail-closed under `recursive_cte_stream_plan` until the adapter lowers them
+into an explicit recursive-source envelope over those native primitives.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.
