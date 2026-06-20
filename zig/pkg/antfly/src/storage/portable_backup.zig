@@ -810,6 +810,10 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
     return try importPortableWithOptions(alloc, store, data, .{});
 }
 
+pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
+    try validatePortableImportBlocks(alloc, data, .{});
+}
+
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
     try validatePortableImportBlocks(alloc, data, opts);
 

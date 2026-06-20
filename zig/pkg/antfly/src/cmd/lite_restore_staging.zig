@@ -130,6 +130,7 @@ pub fn stageAfliteRestoreBackup(
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(allocator);
     try portable_backup.exportPortable(allocator, lite.db.core.store, &portable);
+    try portable_backup.validatePortable(allocator, portable.items);
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
@@ -160,6 +161,7 @@ pub fn stageAfbRestoreBackup(
 
     const portable = try readFileAlloc(allocator, path, max_afb_file_bytes);
     defer allocator.free(portable);
+    try portable_backup.validatePortable(allocator, portable);
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
@@ -590,15 +592,27 @@ test "lite restore staging preflights afb before publishing staged files" {
     const staged_manifest_path = try backups_api.metadataPath(allocator, backup_root, "bad-input");
     defer allocator.free(staged_manifest_path);
 
+    var malformed = std.ArrayList(u8).empty;
+    defer malformed.deinit(allocator);
+    try backup_codec.writeHeader(&malformed, allocator, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+    try backup_codec.writeBlock(&malformed, allocator, .document_batch, &malformed_doc_payload);
     {
         var file = try std.Io.Dir.cwd().createFile(io, malformed_path, .{ .truncate = true });
         defer file.close(io);
-        try file.writePositionalAll(io, "not an afb", 0);
+        try file.writePositionalAll(io, malformed.items, 0);
         try file.sync(io);
     }
 
     try std.testing.expectError(
-        error.EndOfStream,
+        error.Truncated,
         stageAfbRestoreBackup(allocator, malformed_path, "docs", "bad-input", location),
     );
     try std.testing.expect(!fileExists(io, staged_afb_path));

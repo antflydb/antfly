@@ -159,10 +159,10 @@ Antfly DB and indexes
 
 An LSM-backed `.aflite` container can still be useful as an incremental
 implementation bridge because it exercises the existing storage abstraction and
-lets the CLI, C ABI, backup, restore, and compatibility tests land early. It
-should not define the long-term v1 architecture. If benchmarks show meaningful
-I/O and coordination savings from the Lite-native path, the native backend is
-the v1 target, not a v2 candidate.
+lets the CLI, C ABI, backup, restore, portable-interoperability, and
+conformance tests land early. It should not define the long-term v1
+architecture. If benchmarks show meaningful I/O and coordination savings from
+the Lite-native path, the native backend is the v1 target, not a v2 candidate.
 
 Directory-backed LSM storage should remain available as an internal development,
 debug, and conformance-test profile. LSM-container storage should be treated the
@@ -178,6 +178,10 @@ v1 file is crash recovery, not legacy compatibility; a file with no complete v1
 checkpoint should fail with an explicit integrity error. Compatibility branches
 should only be added after a format has shipped and users can reasonably have
 files that need preservation.
+
+Internal bridge profiles are explicit developer/test engine selections, not
+compatibility modes. The default `auto` path should never inspect a failed
+native open and then silently retry a bridge or prototype layout.
 
 The extension meanings should stay distinct:
 
