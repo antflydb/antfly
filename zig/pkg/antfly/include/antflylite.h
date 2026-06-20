@@ -85,6 +85,14 @@ antfly_error_code antfly_db_run_until_idle(void *handle);
 antfly_error_code antfly_db_list_indexes_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_add_index_json(void *handle, antfly_slice config_json);
 antfly_error_code antfly_db_delete_index(void *handle, antfly_slice name, bool *out_deleted);
+antfly_error_code antfly_db_list_enrichments_json(void *handle, antfly_buffer *out);
+antfly_error_code antfly_db_add_enrichment_json(void *handle, antfly_slice config_json);
+antfly_error_code antfly_db_delete_enrichment(
+    void *handle,
+    antfly_slice kind,
+    antfly_slice name,
+    bool *out_deleted
+);
 antfly_error_code antfly_db_scan_json(void *handle, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_db_stats_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_search_json(void *handle, antfly_slice request_json, antfly_buffer *out);

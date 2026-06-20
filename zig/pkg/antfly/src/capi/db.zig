@@ -315,6 +315,13 @@ fn decodeBase64Alloc(alloc: Allocator, encoded: []const u8) ![]u8 {
     return out;
 }
 
+fn parseEnrichmentKind(kind: []const u8) ?db_mod.types.EnrichmentKind {
+    if (std.mem.eql(u8, kind, "chunk")) return .chunk;
+    if (std.mem.eql(u8, kind, "asset")) return .asset;
+    if (std.mem.eql(u8, kind, "embedding")) return .embedding;
+    return null;
+}
+
 fn graphFreeEdges(alloc: Allocator, edges: []graph_mod.Edge) void {
     graph_mod.GraphIndex.freeEdges(alloc, edges);
     alloc.free(edges);
@@ -2839,6 +2846,17 @@ pub export fn antfly_db_list_indexes_json(
     return .ok;
 }
 
+pub export fn antfly_db_list_enrichments_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const configs = handle.db.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
+    defer db_mod.types.freeEnrichmentConfigs(handle.alloc, configs);
+    out_buf.* = stringifyJson(configs) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_db_scan_json(
     handle_ptr: ?*anyopaque,
     request_json: capi.Slice,
@@ -5288,6 +5306,31 @@ pub export fn antfly_db_delete_index(
     return .ok;
 }
 
+pub export fn antfly_db_add_enrichment_json(
+    handle_ptr: ?*anyopaque,
+    config_json: capi.Slice,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
+        .ignore_unknown_fields = true,
+    }) catch return .invalid_argument;
+    defer parsed.deinit();
+    handle.db.addEnrichment(parsed.value) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_delete_enrichment(
+    handle_ptr: ?*anyopaque,
+    kind_slice: capi.Slice,
+    name: capi.Slice,
+    out_deleted: *bool,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return .invalid_argument;
+    out_deleted.* = handle.db.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
 pub export fn antfly_db_get_edges_json(
     handle_ptr: ?*anyopaque,
     index_name: capi.Slice,
@@ -5784,6 +5827,38 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(src_handle, &loaded_schema));
     defer antfly_db_buffer_free(loaded_schema.ptr, loaded_schema.len);
     try std.testing.expectEqualStrings(schema_json, loaded_schema.ptr.?[0..loaded_schema.len]);
+
+    const enrichment_json =
+        \\{"name":"body_chunks_v1","kind":"chunk","field":"body","chunk_size":8,"chunk_overlap":2}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(src_handle, .{
+        .ptr = enrichment_json,
+        .len = enrichment_json.len,
+    }));
+
+    const scratch_enrichment_json =
+        \\{"name":"scratch_chunks_v1","kind":"chunk","field":"scratch","chunk_size":4,"chunk_overlap":1}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_add_enrichment_json(src_handle, .{
+        .ptr = scratch_enrichment_json,
+        .len = scratch_enrichment_json.len,
+    }));
+
+    var enrichments: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_list_enrichments_json(src_handle, &enrichments));
+    defer antfly_db_buffer_free(enrichments.ptr, enrichments.len);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments.ptr.?[0..enrichments.len], "\"body_chunks_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enrichments.ptr.?[0..enrichments.len], "\"chunk_size\":8") != null);
+
+    var deleted_enrichment = false;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_delete_enrichment(src_handle, .{
+        .ptr = "chunk",
+        .len = "chunk".len,
+    }, .{
+        .ptr = "scratch_chunks_v1",
+        .len = "scratch_chunks_v1".len,
+    }, &deleted_enrichment));
+    try std.testing.expect(deleted_enrichment);
 
     const writes_a = [_]capi.WriteIntent{
         .{
