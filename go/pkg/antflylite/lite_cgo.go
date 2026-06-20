@@ -90,6 +90,20 @@ func OpenStatusOnly(path string) (*DB, error) {
 	})
 }
 
+// OpenHosted opens or creates an Antfly Lite database in hosted/manual
+// maintenance mode. In this profile callers drive pending work explicitly with
+// RunUntilIdle.
+func OpenHosted(path string) (*DB, error) {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	var handle unsafe.Pointer
+	if err := check(C.antfly_lite_open_hosted(cPath, &handle)); err != nil {
+		return nil, err
+	}
+	return newDB(handle), nil
+}
+
 // OpenWithOptions opens an Antfly Lite database using explicit C ABI options.
 func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	cPath := C.CString(path)

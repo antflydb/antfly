@@ -91,4 +91,30 @@ func TestLiteCAPI(t *testing.T) {
 	if typedCaps.RaftReplication || typedCaps.ClusterPlacement || typedCaps.DistributedTransactionCoordination {
 		t.Fatalf("typed capabilities should not advertise distributed features: %#v", typedCaps)
 	}
+
+	hostedPath := filepath.Join(t.TempDir(), "go-hosted.aflite")
+	hosted, err := OpenHosted(hostedPath)
+	if err != nil {
+		t.Fatalf("open hosted Lite database: %v", err)
+	}
+	defer hosted.Close()
+
+	hostedCaps, err := hosted.Capabilities()
+	if err != nil {
+		t.Fatalf("hosted capabilities: %v", err)
+	}
+	if !hostedCaps.HostedProfile || !hostedCaps.ManualMaintenance {
+		t.Fatalf("hosted capabilities should report manual maintenance: %#v", hostedCaps)
+	}
+	if hostedCaps.BackgroundEnrichmentRuntime || hostedCaps.TTLCleanupRuntime || hostedCaps.TransactionRecoveryRuntime {
+		t.Fatalf("hosted capabilities should not report background runtimes: %#v", hostedCaps)
+	}
+
+	hostedStatus, err := hosted.Status()
+	if err != nil {
+		t.Fatalf("hosted status: %v", err)
+	}
+	if !hostedStatus.Capabilities.HostedProfile || !hostedStatus.Capabilities.ManualMaintenance {
+		t.Fatalf("hosted status should include hosted capabilities: %#v", hostedStatus.Capabilities)
+	}
 }

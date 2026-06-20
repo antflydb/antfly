@@ -1699,6 +1699,8 @@ fn openLiteHandle(
         opts.executor = .{ .backend = .manual };
         opts.ttl_cleanup = .{ .enabled = false };
         opts.transaction_recovery = .{ .enabled = false };
+        opts.text_merge = .{ .enabled = false };
+        opts.sparse_compaction = .{ .enabled = false };
     }
     backend.configureDbOpenOptions(&opts) catch |err| return capi.mapError(err);
 

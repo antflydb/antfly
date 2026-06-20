@@ -272,6 +272,8 @@ fn toDbOpenOptions(opts: OpenOptions, profile: Profile) db_mod.OpenOptions {
         resolved.enrichment = opts.enrichment;
         resolved.ttl_cleanup = .{ .enabled = false };
         resolved.transaction_recovery = .{ .enabled = false };
+        resolved.text_merge = .{ .enabled = false };
+        resolved.sparse_compaction = .{ .enabled = false };
     }
     return resolved;
 }
