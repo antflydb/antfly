@@ -13,9 +13,13 @@
 // limitations.
 
 const std = @import("std");
+const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 const lite_restore_staging = @import("../lite_restore_staging.zig");
+
+const backup_codec = antfly.backup_codec;
+const portable_backup = antfly.portable_backup;
 
 const BackupArgs = struct {
     help: bool = false,
@@ -83,7 +87,11 @@ pub fn runBackup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
         const location = if (out_plan) |plan| plan.location else opts.location;
         try client.backupTable(tbl, .{ .backup_id = bid, .location = location, .format = selected_format });
         if (out_plan) |plan| {
-            try requireReadableOutputFile(allocator, io, plan.out_path);
+            validatePortableOutputFile(allocator, io, plan.out_path) catch |err| switch (err) {
+                error.EmptyPortableOutput => cli.fatal("portable backup completed but local --out file is empty: {s}", .{plan.out_path}),
+                error.FileNotFound => cli.fatal("portable backup completed but local --out file is not readable: {s}", .{plan.out_path}),
+                else => cli.fatal("portable backup completed but local --out file is not a valid portable AFB: {s}", .{plan.out_path}),
+            };
             std.debug.print("Portable backup written to {s}.\n", .{plan.out_path});
         } else {
             std.debug.print("Backup command successful.\n", .{});
@@ -333,16 +341,24 @@ const PortableOutPlan = struct {
     }
 };
 
-fn requireReadableOutputFile(_: std.mem.Allocator, io: std.Io, path: []const u8) !void {
-    var file = (if (std.fs.path.isAbsolute(path))
-        std.Io.Dir.openFileAbsolute(io, path, .{})
-    else
-        std.Io.Dir.cwd().openFile(io, path, .{})) catch {
-        cli.fatal("portable backup completed but local --out file is not readable: {s}", .{path});
-    };
+fn validatePortableOutputFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    const body = try readOutputFileAlloc(allocator, io, path, lite_restore_staging.max_afb_file_bytes);
+    defer allocator.free(body);
+    if (body.len == 0) return error.EmptyPortableOutput;
+    try portable_backup.validatePortable(allocator, body);
+}
+
+fn readOutputFileAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_bytes));
+    }
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
-    const stat = try file.stat(io);
-    if (stat.size == 0) cli.fatal("portable backup completed but local --out file is empty: {s}", .{path});
+    const size = (try file.stat(io)).size;
+    if (size > max_bytes or size > std.math.maxInt(usize)) return error.FileTooBig;
+    var buf: [8192]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    return try reader.interface.readAlloc(allocator, @intCast(size));
 }
 
 test "backup cli parser accepts help flag" {
@@ -381,6 +397,38 @@ test "portable out plan derives file location and backup id" {
     try std.testing.expectEqualStrings("docs", plan.backup_id);
     try std.testing.expect(std.mem.endsWith(u8, plan.out_path, "/docs.afb"));
     try std.testing.expect(std.mem.startsWith(u8, plan.location, "file://"));
+}
+
+test "portable output validation requires a valid afb" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const valid_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/valid.afb", .{tmp.sub_path});
+    defer allocator.free(valid_path);
+    const malformed_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/malformed.afb", .{tmp.sub_path});
+    defer allocator.free(malformed_path);
+
+    var valid = std.ArrayList(u8).empty;
+    defer valid.deinit(allocator);
+    try backup_codec.writeHeader(&valid, allocator, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = valid_path, .data = valid.items });
+    try validatePortableOutputFile(allocator, io, valid_path);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = malformed_path, .data = "not an afb" });
+    try std.testing.expectError(error.EndOfStream, validatePortableOutputFile(allocator, io, malformed_path));
 }
 
 test "restore cli parser accepts aflite input shape" {
