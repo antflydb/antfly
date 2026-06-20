@@ -1050,6 +1050,62 @@ pub fn validatePrimaryKeyColumns(columns: []const runtime_schema.RelationalColum
     try validateCreateIndexIncludeColumns(columns, primary_key.columns, primary_key.include_columns);
 }
 
+pub fn generatedColumnReferencesAny(column: runtime_schema.RelationalColumn, fields: []const []const u8) bool {
+    const generated = column.generated orelse return false;
+    if (generated.field) |field| {
+        if (stringSlicesContains(fields, field)) return true;
+    }
+    if (generated.expression) |expression| {
+        if (expressionReferencesAny(expression, fields)) return true;
+    }
+    return stringSlicesIntersect(generated.fields, fields);
+}
+
+pub fn expressionReferencesAny(expression: runtime_schema.RelationalRowsExpression, fields: []const []const u8) bool {
+    if (expression.kind == .field and stringSlicesContains(fields, expression.field)) return true;
+    for (expression.operands) |operand| {
+        if (expressionReferencesAny(operand, fields)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (expressionConditionReferencesAny(branch.when, fields)) return true;
+        if (expressionReferencesAny(branch.then, fields)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (expressionReferencesAny(case_else, fields)) return true;
+    }
+    return false;
+}
+
+pub fn expressionConditionReferencesAny(condition: runtime_schema.RelationalRowsExpressionCondition, fields: []const []const u8) bool {
+    if (expressionReferencesAny(condition.lhs, fields)) return true;
+    for (condition.rhs) |rhs| {
+        if (expressionReferencesAny(rhs, fields)) return true;
+    }
+    return false;
+}
+
+pub fn uniqueConstraintReferencesAny(
+    constraint: runtime_schema.UniqueConstraint,
+    fields: []const []const u8,
+) bool {
+    if (stringSlicesIntersect(constraint.columns, fields)) return true;
+    for (constraint.expressions) |expression| {
+        switch (expression.op) {
+            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
+            .expression => if (expression.expression) |row_expression| {
+                if (expressionReferencesAny(row_expression, fields)) return true;
+            },
+        }
+    }
+    for (constraint.where) |predicate| {
+        if (stringSlicesContains(fields, predicate.field)) return true;
+    }
+    for (constraint.where_expressions) |condition| {
+        if (expressionConditionReferencesAny(condition, fields)) return true;
+    }
+    return false;
+}
+
 fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |left, right| {
@@ -1061,6 +1117,13 @@ fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
 fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
     for (values) |candidate| {
         if (std.mem.eql(u8, candidate, value)) return true;
+    }
+    return false;
+}
+
+fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
+    for (a) |value| {
+        if (stringSlicesContains(b, value)) return true;
     }
     return false;
 }
@@ -1480,6 +1543,41 @@ test "sql adapter lower expr compares aggregate specs" {
 
     try std.testing.expect(aggregateSpecsEquivalent(lhs, same));
     try std.testing.expect(!aggregateSpecsEquivalent(lhs, different));
+}
+
+test "sql adapter lower expr detects catalog expression references" {
+    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
+    const tenant_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "tenant_id" };
+    const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"active\"" };
+    const condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{literal},
+    };
+    const generated_column: runtime_schema.RelationalColumn = .{
+        .name = "tenant_status",
+        .path = "tenant_status",
+        .field_type = .keyword,
+        .generated = .{ .op = .concat_ws, .fields = &.{ "tenant_id", "status" }, .separator = ":" },
+    };
+    const expression_generated: runtime_schema.RelationalColumn = .{
+        .name = "status_lower",
+        .path = "status_lower",
+        .field_type = .keyword,
+        .generated = .{ .op = .expression, .expression = .{ .kind = .lower, .operands = &.{status_field} } },
+    };
+    const unique_constraint: runtime_schema.UniqueConstraint = .{
+        .name = "tenant_status_key",
+        .columns = &.{"tenant_id"},
+        .expressions = &.{.{ .op = .expression, .expression = .{ .kind = .concat, .operands = &.{ tenant_field, status_field } } }},
+        .where_expressions = &.{condition},
+    };
+
+    try std.testing.expect(generatedColumnReferencesAny(generated_column, &.{"tenant_id"}));
+    try std.testing.expect(generatedColumnReferencesAny(expression_generated, &.{"status"}));
+    try std.testing.expect(expressionConditionReferencesAny(condition, &.{"status"}));
+    try std.testing.expect(uniqueConstraintReferencesAny(unique_constraint, &.{"status"}));
+    try std.testing.expect(!uniqueConstraintReferencesAny(unique_constraint, &.{"missing"}));
 }
 
 test "sql adapter lower expr validates unique expression lists" {

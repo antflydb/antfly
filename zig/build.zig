@@ -3848,6 +3848,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml detects merge target row usage",
             "sql adapter lower expr compares row expressions",
             "sql adapter lower expr compares aggregate specs",
+            "sql adapter lower expr detects catalog expression references",
             "sql adapter lower expr validates catalog check expression types",
             "sql adapter lower expr validates DDL expression catalog constraints",
             "sql adapter lower expr detects deterministic row expressions",

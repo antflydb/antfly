@@ -1085,9 +1085,12 @@ Row-expression equality and unique-expression duplicate validation move into
 and plan/fingerprint comparisons use one adapter-owned expression comparison
 surface. Aggregate-spec equivalence also lives in `lower_expr.zig`, so aggregate
 deduplication compares row expressions, order keys, and typed filter predicates
-through the same adapter-owned equality helpers. Row-expression determinism and
-catalog check-expression type validation also live in `lower_expr.zig`, so
-partial indexes, generated columns, and
+through the same adapter-owned equality helpers. Generated-column,
+row-expression, and unique-constraint dependency walkers also live in
+`lower_expr.zig`, so schema mutation code asks the adapter which typed catalog
+objects reference dropped fields instead of recursively inspecting expression
+trees itself. Row-expression determinism and catalog check-expression type
+validation also live in `lower_expr.zig`, so partial indexes, generated columns, and
 expression checks share the same definition of catalog-safe deterministic and
 type-compatible expression trees. DDL catalog validation for relational columns,
 primary keys, `CHECK`, foreign-key names, generated columns, unique constraints,

@@ -47,16 +47,25 @@ const TokenKind = sql_adapter.TokenKind;
 const aggregateSpecsEquivalent = sql_adapter.aggregateSpecsEquivalent;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
+const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSyntax;
+const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const freeTokens = sql_adapter.freeTokens;
+const generatedColumnReferencesAny = sql_adapter.generatedColumnReferencesAny;
 const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
 const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
 const max_scalar_or_expanded_branches: usize = 32;
 const parseSqlTimestampLiteralNs = sql_adapter.parseSqlTimestampLiteralNs;
+const advisoryLockActionFromSyntax = sql_adapter.advisoryLockActionFromSyntax;
+const bulkIoDirectionFromSyntax = sql_adapter.bulkIoDirectionFromSyntax;
+const constraintCheckModeFromSyntax = sql_adapter.constraintCheckModeFromSyntax;
 const defaultPrimaryKeyNameEquals = sql_adapter.defaultPrimaryKeyNameEquals;
 const foreignKeyActionSupportsTemporalUpdate = sql_adapter.foreignKeyActionSupportsTemporalUpdate;
 const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
+const preparedStatementStatementKindFromSyntax = sql_adapter.preparedStatementStatementKindFromSyntax;
+const preparedStatementSubjectKindFromSyntax = sql_adapter.preparedStatementSubjectKindFromSyntax;
 const primaryKeyNameEquals = sql_adapter.primaryKeyNameEquals;
+const reindexMaintenanceTargetFromSyntax = sql_adapter.reindexMaintenanceTargetFromSyntax;
 const relationalCheckNameExists = sql_adapter.relationalCheckNameExists;
 const relationalColumnForDdl = sql_adapter.relationalColumnForDdl;
 const relationalColumnForField = sql_adapter.relationalColumnForField;
@@ -69,13 +78,20 @@ const relationalIndexNameExists = sql_adapter.relationalIndexNameExists;
 const relationalPeriodColumnType = sql_adapter.relationalPeriodColumnType;
 const relationalPeriodForDdl = sql_adapter.relationalPeriodForDdl;
 const relationalPeriodNameExists = sql_adapter.relationalPeriodNameExists;
+const routineKindFromSyntax = sql_adapter.routineKindFromSyntax;
 const tableSchemaCatalogExists = sql_adapter.tableSchemaCatalogExists;
+const tableLockModeFromSyntax = sql_adapter.tableLockModeFromSyntax;
+const transactionAccessModeFromSyntax = sql_adapter.transactionAccessModeFromSyntax;
+const transactionIsolationLevelFromSyntax = sql_adapter.transactionIsolationLevelFromSyntax;
+const transactionModeStarterFromSyntax = sql_adapter.transactionModeStarterFromSyntax;
+const transactionModeStarterToSyntax = sql_adapter.transactionModeStarterToSyntax;
 const sqlIntervalLiteral = sql_adapter.sqlIntervalLiteral;
 const sqlArrayItemValueMatches = sql_adapter.sqlArrayItemValueMatches;
 const sqlScalarValueMatches = sql_adapter.sqlScalarValueMatches;
 const sqlStringIsJsonNumber = sql_adapter.sqlStringIsJsonNumber;
 const tokenizeAlloc = sql_adapter.tokenizeAlloc;
 const uniqueConstraintNameExists = sql_adapter.uniqueConstraintNameExists;
+const uniqueConstraintReferencesAny = sql_adapter.uniqueConstraintReferencesAny;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
@@ -35746,62 +35762,6 @@ fn writeAllFieldValuesObjectJson(
         try writer.writeAll(value.value_json);
     }
     try writer.writeByte('}');
-}
-
-fn generatedColumnReferencesAny(column: runtime_schema.RelationalColumn, fields: []const []const u8) bool {
-    const generated = column.generated orelse return false;
-    if (generated.field) |field| {
-        if (stringSlicesContains(fields, field)) return true;
-    }
-    if (generated.expression) |expression| {
-        if (expressionReferencesAny(expression, fields)) return true;
-    }
-    return stringSlicesIntersect(generated.fields, fields);
-}
-
-fn expressionReferencesAny(expression: db_mod.types.RelationalRowsExpression, fields: []const []const u8) bool {
-    if (expression.kind == .field and stringSlicesContains(fields, expression.field)) return true;
-    for (expression.operands) |operand| {
-        if (expressionReferencesAny(operand, fields)) return true;
-    }
-    for (expression.case_branches) |branch| {
-        if (expressionConditionReferencesAny(branch.when, fields)) return true;
-        if (expressionReferencesAny(branch.then, fields)) return true;
-    }
-    for (expression.case_else) |case_else| {
-        if (expressionReferencesAny(case_else, fields)) return true;
-    }
-    return false;
-}
-
-fn expressionConditionReferencesAny(condition: db_mod.types.RelationalRowsExpressionCondition, fields: []const []const u8) bool {
-    if (expressionReferencesAny(condition.lhs, fields)) return true;
-    for (condition.rhs) |rhs| {
-        if (expressionReferencesAny(rhs, fields)) return true;
-    }
-    return false;
-}
-
-fn uniqueConstraintReferencesAny(
-    constraint: runtime_schema.UniqueConstraint,
-    fields: []const []const u8,
-) bool {
-    if (stringSlicesIntersect(constraint.columns, fields)) return true;
-    for (constraint.expressions) |expression| {
-        switch (expression.op) {
-            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
-            .expression => if (expression.expression) |row_expression| {
-                if (expressionReferencesAny(row_expression, fields)) return true;
-            },
-        }
-    }
-    for (constraint.where) |predicate| {
-        if (stringSlicesContains(fields, predicate.field)) return true;
-    }
-    for (constraint.where_expressions) |condition| {
-        if (expressionConditionReferencesAny(condition, fields)) return true;
-    }
-    return false;
 }
 
 fn columnsMatchPrimaryKey(primary_key: runtime_schema.PrimaryKey, columns: []const []const u8) bool {
