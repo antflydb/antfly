@@ -128,7 +128,6 @@
       "summary": {
         "table_name": "usage_records",
         "ctes": 1,
-        "join_on": 1,
         "operations": 1
       },
       "plan": "update_joined_source:recursive_cte=source_rows:op=union_all:anchor_table=usage_records:outputs=1:member=recursive_member_join:type=inner:left=usage_records:right=source_rows:on=1:projections=1:mutation=update_joined_source:target=usage_records:source=usage_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
@@ -139,10 +138,9 @@
       "family": "delete_joined_source",
       "summary": {
         "table_name": "usage_records",
-        "ctes": 1,
-        "join_on": 1
+        "ctes": 1
       },
-      "plan": "delete_joined_source:recursive_cte=source_rows:ctes=1:on=1",
+      "plan": "delete_joined_source:recursive_cte=source_rows:op=union_all:anchor_table=usage_records:outputs=1:member=recursive_member_join:type=inner:left=usage_records:right=source_rows:on=1:projections=1:mutation=delete_joined_source:target=usage_records:source=usage_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0:ctes=1:right_source_cte=1",
       "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)"
     },
     {

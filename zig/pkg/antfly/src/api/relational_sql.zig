@@ -185,7 +185,6 @@ const freeInsertValueRows = sql_adapter.freeInsertValueRows;
 const freeJoinedMutationSourceAssignments = sql_adapter.freeJoinedMutationSourceAssignments;
 const freeJsonSetParsedValue = sql_adapter.freeJsonSetParsedValue;
 const freeJsonSetValues = sql_adapter.freeJsonSetValues;
-const freeMergeArmPredicateValue = sql_adapter.freeMergeArmPredicateValue;
 const freeMergeArmPredicateValues = sql_adapter.freeMergeArmPredicateValues;
 const freeMergeExpressionAssignmentValues = sql_adapter.freeMergeExpressionAssignmentValues;
 const freeMergeFieldMappingValues = sql_adapter.freeMergeFieldMappingValues;
@@ -3452,12 +3451,40 @@ const Parser = struct {
         };
     }
 
+    fn mergeArmConditionParserHooks(self: *@This()) sql_adapter.MergeArmConditionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_column_value_json = parseMergeArmPredicateColumnValueJsonHook,
+            .parse_expression_predicates = parseMergeArmExpressionPredicatesHook,
+        };
+    }
+
     fn parseMergeArmPredicateColumnValueJsonHook(
         ptr: *anyopaque,
         column: runtime_schema.RelationalColumn,
     ) anyerror![]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseSqlColumnValueAlloc(column);
+    }
+
+    fn parseMergeArmExpressionPredicatesHook(
+        ptr: *anyopaque,
+        target_table: TableAlias,
+        source_table: TableAlias,
+        allow_target: bool,
+        expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+        expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+        expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    ) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseMergeArmExpressionPredicates(
+            target_table,
+            source_table,
+            allow_target,
+            expression_predicates,
+            expression_or_predicates,
+            expression_not_predicates,
+        );
     }
 
     fn parseDdlDefaultValueHook(ptr: *anyopaque, field_type: runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue {
@@ -5970,39 +5997,20 @@ const Parser = struct {
         expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
         expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     ) !void {
-        const checkpoint = self.pos;
-        if (self.parseMergeArmPredicateAlloc(target_table, source_table, allow_target)) |predicate| {
-            var predicate_transferred = false;
-            errdefer if (!predicate_transferred) freeMergeArmPredicateValue(self.alloc, predicate);
-            if (self.peekKeyword("or")) {
-                freeMergeArmPredicateValue(self.alloc, predicate);
-                predicate_transferred = true;
-                self.pos = checkpoint;
-                try self.parseMergeArmExpressionPredicates(
-                    target_table,
-                    source_table,
-                    allow_target,
-                    expression_predicates,
-                    expression_or_predicates,
-                    expression_not_predicates,
-                );
-                return;
-            }
-            try predicates.append(self.alloc, predicate);
-            predicate_transferred = true;
-            return;
-        } else |err| switch (err) {
-            error.UnsupportedSqlShape => self.pos = checkpoint,
-            else => return err,
-        }
-
-        try self.parseMergeArmExpressionPredicates(
+        return try sql_adapter.parseMergeArmConditionAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.joined_source_schema,
             target_table,
             source_table,
             allow_target,
+            predicates,
             expression_predicates,
             expression_or_predicates,
             expression_not_predicates,
+            self.mergeArmConditionParserHooks(),
         );
     }
 
