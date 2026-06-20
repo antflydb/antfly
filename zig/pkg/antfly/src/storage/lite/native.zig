@@ -224,11 +224,9 @@ pub const NativeFile = struct {
 
         var header_bytes: [header_size]u8 = undefined;
         try readExactAt(file, io, &header_bytes, 0);
-        const header = try decodeHeader(&header_bytes);
-        const checkpoint = header.checkpoints[header.active_checkpoint];
-        const expected_size = try checkpointPrefixSize(checkpoint, header.page_size);
+        var header = try decodeHeader(&header_bytes);
         const file_size = (try file.stat(io)).size;
-        if (file_size < expected_size) return error.TruncatedNativeFile;
+        header.active_checkpoint = try selectCompleteCheckpointForFile(header, file_size);
 
         return .{
             .allocator = allocator,
@@ -1052,8 +1050,11 @@ pub const NativeFile = struct {
     }
 
     fn collectAllValidCheckpointReachablePages(self: *NativeFile, out: *ReachablePageSet) !void {
+        const file_size = (try self.file.stat(self.io_impl.io())).size;
         for (self.header.checkpoints) |slot| {
             if (!validCheckpointSlot(slot)) continue;
+            const expected_size = checkpointPrefixSize(slot, self.header.page_size) catch continue;
+            if (expected_size > file_size) continue;
             try self.collectCheckpointReachablePages(slot, out);
         }
     }
@@ -1459,21 +1460,9 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .reclaimable_bytes = 0,
         }, issueForDecodeError(err));
     };
-    const checkpoint = header.checkpoints[header.active_checkpoint];
-    const expected_size = checkpointPrefixSize(checkpoint, header.page_size) catch {
-        return invalidCheck(.{
-            .valid = true,
-            .file_size = file_size,
-            .valid_prefix_size = 0,
-            .tail_bytes = file_size,
-            .record_count = 0,
-            .live_file_count = 0,
-            .live_bytes = 0,
-            .compact_size = 0,
-            .reclaimable_bytes = 0,
-        }, "invalid_checkpoint");
-    };
-    if (file_size < expected_size) {
+    _ = selectCompleteCheckpointForFile(header, file_size) catch {
+        const checkpoint = header.checkpoints[header.active_checkpoint];
+        const expected_size = checkpointPrefixSize(checkpoint, header.page_size) catch 0;
         return invalidCheck(.{
             .valid = true,
             .file_size = file_size,
@@ -1485,8 +1474,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .compact_size = expected_size,
             .reclaimable_bytes = 0,
         }, "truncated_file");
-    }
-
+    };
     var native_file = try NativeFile.open(allocator, path, true);
     defer native_file.close();
     return try native_file.check();
@@ -1643,6 +1631,27 @@ fn selectActiveCheckpoint(
         }
     }
     return best orelse error.InvalidNativeCheckpoint;
+}
+
+fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
+    var best: ?u8 = null;
+    for (header.checkpoints, 0..) |slot, index| {
+        if (!validCheckpointSlot(slot)) continue;
+        const expected_size = checkpointPrefixSize(slot, header.page_size) catch continue;
+        if (expected_size > file_size) continue;
+        const slot_index: u8 = @intCast(index);
+        if (best) |best_index| {
+            const best_slot = header.checkpoints[best_index];
+            if (slot.commit_sequence > best_slot.commit_sequence or
+                (slot.commit_sequence == best_slot.commit_sequence and slot_index == header.active_checkpoint))
+            {
+                best = slot_index;
+            }
+        } else {
+            best = slot_index;
+        }
+    }
+    return best orelse error.TruncatedNativeFile;
 }
 
 fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
@@ -2186,6 +2195,49 @@ test "lite native file publishes checkpoint without rewriting static header" {
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
     try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
+}
+
+test "lite native file recovers older complete checkpoint when newest prefix is truncated" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-truncated-newest-checkpoint.aflite");
+    defer allocator.free(path);
+
+    const stable_size = blk: {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+
+        try file.putDocument("doc:recover", "stable");
+        const stable_checkpoint = file.activeCheckpoint();
+        const stable_size = try checkpointPrefixSize(stable_checkpoint, file.header.page_size);
+
+        try file.putDocument("doc:recover", "newer");
+        try std.testing.expect(file.activeCheckpoint().commit_sequence > stable_checkpoint.commit_sequence);
+        try std.testing.expect(try checkpointPrefixSize(file.activeCheckpoint(), file.header.page_size) > stable_size);
+        break :blk stable_size;
+    };
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.setLength(std.testing.io, stable_size);
+        try raw.sync(std.testing.io);
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:recover")).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("stable", value);
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.record_count);
+    try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
 }
 
 test "lite native file permits concurrent readers" {
@@ -3044,11 +3096,16 @@ test "lite native check reports truncated committed file" {
         try file.setLength(std.testing.io, default_page_size + 16);
     }
 
-    try std.testing.expectError(error.TruncatedNativeFile, NativeFile.open(allocator, path, true));
+    {
+        var reopened = try NativeFile.open(allocator, path, true);
+        defer reopened.close();
+        try std.testing.expectEqual(@as(u64, 0), reopened.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(?[]u8, null), try reopened.getDocumentAlloc(allocator, "doc:1"));
+    }
 
     const report = try checkFile(allocator, path);
     try std.testing.expect(!report.valid);
-    try std.testing.expectEqualStrings("truncated_file", report.issue.?);
+    try std.testing.expectEqualStrings("tail_bytes", report.issue.?);
 }
 
 test "lite native checkFile reports corrupted header" {
