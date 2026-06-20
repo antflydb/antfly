@@ -645,9 +645,9 @@ fn restoreFromSourceFile(
             return err;
         };
 
-        cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
-        try writeJsonString(allocator, io, out_path);
-        cli.writeStdout(io, "}\n");
+        const json = try restoreResultJsonAlloc(allocator, "snapshot", "aflite", out_path);
+        defer allocator.free(json);
+        writeJsonLine(io, json);
         return;
     }
 
@@ -673,9 +673,28 @@ fn restoreFromSourceFile(
         return err;
     };
 
-    cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
-    try writeJsonString(allocator, io, out_path);
-    cli.writeStdout(io, "}\n");
+    const json = try restoreResultJsonAlloc(allocator, "portable_restore", "afb", out_path);
+    defer allocator.free(json);
+    writeJsonLine(io, json);
+}
+
+fn restoreResultJsonAlloc(
+    allocator: Allocator,
+    operation: []const u8,
+    source_format: []const u8,
+    path: []const u8,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"format\":\"aflite\",\"operation\":");
+    try appendJsonString(allocator, &out, operation);
+    try out.appendSlice(allocator, ",\"source_format\":");
+    try appendJsonString(allocator, &out, source_format);
+    try out.appendSlice(allocator, ",\"path\":");
+    try appendJsonString(allocator, &out, path);
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
 }
 
 fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path: []const u8) ![]u8 {
@@ -1606,7 +1625,8 @@ fn printUsage(argv0: []const u8) void {
         \\  backup <db.aflite> --out backup.afb
         \\  export <db.aflite> --out backup.afb
         \\  snapshot <db.aflite> --out copy.aflite [--replace]
-        \\  restore <backup.afb|source.aflite> --out <db.aflite> [--replace]
+        \\  restore <backup.afb> --out <db.aflite> [--replace]
+        \\  restore <source.aflite> --out <db.aflite> [--replace] (stable snapshot copy)
         \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
         \\  promote <db.aflite> --target <url> --table <name> [--backup-id <id>] [--location <uri>]
         \\  check <db.aflite>
@@ -1786,6 +1806,24 @@ test "lite restore source can be an aflite database" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
     }
+}
+
+test "lite restore result json distinguishes portable restore and snapshot copy" {
+    const allocator = std.testing.allocator;
+
+    const portable = try restoreResultJsonAlloc(allocator, "portable_restore", "afb", "restored.aflite");
+    defer allocator.free(portable);
+    try std.testing.expectEqualStrings(
+        "{\"format\":\"aflite\",\"operation\":\"portable_restore\",\"source_format\":\"afb\",\"path\":\"restored.aflite\"}",
+        portable,
+    );
+
+    const snapshot_json = try restoreResultJsonAlloc(allocator, "snapshot", "aflite", "copy.aflite");
+    defer allocator.free(snapshot_json);
+    try std.testing.expectEqualStrings(
+        "{\"format\":\"aflite\",\"operation\":\"snapshot\",\"source_format\":\"aflite\",\"path\":\"copy.aflite\"}",
+        snapshot_json,
+    );
 }
 
 test "lite restore publishes staged aflite from aflite source" {
