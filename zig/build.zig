@@ -2903,6 +2903,7 @@ pub fn build(b: *std.Build) void {
         "index encoders expose graph metric runtime ownership summary",
         "index encoders expose mixed graph metric runtime roles without aggregate role",
         "graph metric status encoder exposes active build pages",
+        "distributed graph expand request defers worker result limit for metric post processing",
         "indexes openapi parses graph metric runtime summary",
         "client openapi parses graph metric runtime summary",
         "internal group write routes expose graph metric maintenance boundary",
@@ -3121,6 +3122,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
     const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
+    const promotion_test_step = b.step("promotion-test", "Run explicit promotion and release qualification suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
 
     dependOnAll(conformance_test_step, &.{
@@ -4266,6 +4268,7 @@ pub fn build(b: *std.Build) void {
             "hosted cross-range graph metric fan-in merges active stale shard for published",
             "hosted cross-range graph metric fan-in merges nonuniform promotion shard layout",
             "encode query request includes graph metric read and rerank",
+            "graph metric fan-in shard request carries internal status without mutating public request",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -7209,7 +7212,7 @@ pub fn build(b: *std.Build) void {
         run_graph_metric_process_harness.addArtifactArg(antfly_main);
         run_graph_metric_process_harness.addArgs(&.{ "--profile", "promotion" });
         run_graph_metric_process_harness.has_side_effects = true;
-        integration_test_step.dependOn(&run_graph_metric_process_harness.step);
+        promotion_test_step.dependOn(&run_graph_metric_process_harness.step);
     }
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
