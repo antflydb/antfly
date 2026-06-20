@@ -79,6 +79,14 @@ func ABIVersion() uint32 {
 	return uint32(C.antfly_lite_abi_version())
 }
 
+func cABIErrorCodeName(code ErrorCode) string {
+	return C.GoString(C.antfly_error_code_name(C.antfly_error_code(code)))
+}
+
+func cABIErrorCodeDescription(code ErrorCode) string {
+	return C.GoString(C.antfly_error_code_description(C.antfly_error_code(code)))
+}
+
 // Open opens or creates a native Antfly Lite database file for writing.
 func Open(path string) (*DB, error) {
 	return OpenWithOptions(path, OpenOptions{

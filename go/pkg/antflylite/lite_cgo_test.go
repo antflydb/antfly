@@ -17,6 +17,28 @@ import (
 	"testing"
 )
 
+func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
+	cases := []ErrorCode{
+		OK,
+		InvalidArgument,
+		NotFound,
+		VersionConflict,
+		IntentConflict,
+		TxnNotFound,
+		Busy,
+		Internal,
+		ErrorCode(127),
+	}
+	for _, code := range cases {
+		if got, want := code.Name(), cABIErrorCodeName(code); got != want {
+			t.Fatalf("error code %d name = %q, C ABI = %q", code, got, want)
+		}
+		if got, want := code.Description(), cABIErrorCodeDescription(code); got != want {
+			t.Fatalf("error code %d description = %q, C ABI = %q", code, got, want)
+		}
+	}
+}
+
 func TestLiteCAPI(t *testing.T) {
 	if got := ABIVersion(); got != 1 {
 		t.Fatalf("ABI version = %d, want 1", got)

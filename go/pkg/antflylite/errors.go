@@ -34,14 +34,14 @@ var errorCodeNames = map[ErrorCode]string{
 }
 
 var errorCodeDescriptions = map[ErrorCode]string{
-	OK:              "success",
-	InvalidArgument: "invalid argument",
-	NotFound:        "not found",
-	VersionConflict: "version conflict",
-	IntentConflict:  "intent conflict",
-	TxnNotFound:     "transaction not found",
-	Busy:            "resource busy",
-	Internal:        "internal error",
+	OK:              "operation completed successfully",
+	InvalidArgument: "an argument, request, path, or open mode is invalid",
+	NotFound:        "the requested database object was not found",
+	VersionConflict: "a version predicate did not match the current document version",
+	IntentConflict:  "a transaction intent conflicts with the requested operation",
+	TxnNotFound:     "the requested transaction was not found",
+	Busy:            "the database is temporarily busy or a writer is already active",
+	Internal:        "an internal error occurred",
 }
 
 func (code ErrorCode) Error() string {
@@ -53,7 +53,7 @@ func (code ErrorCode) Name() string {
 	if name, ok := errorCodeNames[code]; ok {
 		return name
 	}
-	return "ANTFLY_UNKNOWN"
+	return "ANTFLY_UNKNOWN_ERROR"
 }
 
 // Description returns a short stable description for code.
@@ -61,5 +61,5 @@ func (code ErrorCode) Description() string {
 	if description, ok := errorCodeDescriptions[code]; ok {
 		return description
 	}
-	return "unknown error"
+	return "unknown Antfly error code"
 }
