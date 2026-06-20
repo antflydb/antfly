@@ -29,6 +29,18 @@ const KVPair = docstore_mod.KVPair;
 
 /// Target batch size in bytes before flushing a document/embedding/edge batch.
 const batch_target_bytes: usize = 4 * 1024 * 1024;
+const resolution_public_id_prefix = "af1:resolution:";
+
+const ResolutionArtifactRef = struct {
+    doc_key: []u8,
+    artifact_name: []u8,
+
+    fn deinit(self: *ResolutionArtifactRef, alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.artifact_name);
+        self.* = undefined;
+    }
+};
 
 // ============================================================================
 // Export
@@ -105,6 +117,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
     var artifact_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
     defer artifact_batch.deinit(alloc);
     var artifact_batch_bytes: usize = 0;
+
+    var resolution_batch = std.ArrayListUnmanaged(backup_codec.KeyValueEntry).empty;
+    defer resolution_batch.deinit(alloc);
+    var resolution_batch_bytes: usize = 0;
 
     // Embeddings keyed by index name
     var emb_batches = std.StringHashMapUnmanaged(EmbeddingBatch).empty;
@@ -200,14 +216,20 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
             } else if (try parseStandaloneGraphIndexEdgeKeyAlloc(alloc, kv.key)) |parsed| {
                 defer parsed.deinit(alloc);
                 try appendEdgeBatchEntry(alloc, &edge_batches, parsed.index_name, parsed.source, parsed.target, parsed.edge_type, kv.value);
+            } else if (try appendResolutionArtifactEntry(alloc, &resolution_batch, kv.key, kv.value)) {
+                resolution_batch_bytes += kv.key.len + kv.value.len;
+                if (resolution_batch_bytes >= batch_target_bytes) {
+                    try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
+                    resolution_batch_bytes = 0;
+                }
             } else if (try appendPortableArtifactEntry(alloc, &artifact_batch, kv.key, kv.value, .asset)) {
                 artifact_batch_bytes += kv.key.len + kv.value.len;
                 if (artifact_batch_bytes >= batch_target_bytes) {
-                    try flushArtifactBatch(alloc, out, &artifact_batch);
+                    try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
                     artifact_batch_bytes = 0;
                 }
             }
-            // Skip: TTL, summary, resolution, and derived embedding keys
+            // Skip: TTL, summary, and derived embedding keys
             continue;
         }
 
@@ -237,7 +259,10 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         try flushChunkBatch(alloc, out, &chunk_batch);
     }
     if (artifact_batch.items.len > 0) {
-        try flushArtifactBatch(alloc, out, &artifact_batch);
+        try flushKeyValueBlock(alloc, out, &artifact_batch, .artifact_batch);
+    }
+    if (resolution_batch.items.len > 0) {
+        try flushKeyValueBlock(alloc, out, &resolution_batch, .resolution_batch);
     }
 
     // Flush embedding batches
@@ -494,14 +519,15 @@ fn flushChunkBatch(
     batch.clearRetainingCapacity();
 }
 
-fn flushArtifactBatch(
+fn flushKeyValueBlock(
     alloc: Allocator,
     out: *ArrayList(u8),
     batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    block_type: backup_codec.BlockType,
 ) !void {
     const encoded = try backup_codec.encodeKeyValueBatch(alloc, batch.items);
     defer alloc.free(encoded);
-    try backup_codec.writeBlock(out, alloc, .artifact_batch, encoded);
+    try backup_codec.writeBlock(out, alloc, block_type, encoded);
 
     for (batch.items) |e| {
         alloc.free(e.key);
@@ -562,6 +588,70 @@ fn appendPortableArtifactEntry(
         .value = owned_value,
     });
     return true;
+}
+
+fn appendResolutionArtifactEntry(
+    alloc: Allocator,
+    batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
+    key: []const u8,
+    value: []const u8,
+) !bool {
+    const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, key)) orelse return false;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+
+    const public_id = try resolutionPublicIdAlloc(alloc, parsed.doc_key, parsed.artifact_name);
+    errdefer alloc.free(public_id);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    try batch.append(alloc, .{
+        .key = public_id,
+        .value = owned_value,
+    });
+    return true;
+}
+
+fn resolutionPublicIdAlloc(alloc: Allocator, doc_key: []const u8, artifact_name: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+
+    try out.appendSlice(alloc, resolution_public_id_prefix);
+    try appendBase64UrlComponent(alloc, &out, doc_key);
+    try out.append(alloc, ':');
+    try appendBase64UrlComponent(alloc, &out, artifact_name);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn decodeResolutionPublicIdAlloc(alloc: Allocator, public_id: []const u8) !?ResolutionArtifactRef {
+    if (!std.mem.startsWith(u8, public_id, resolution_public_id_prefix)) return null;
+
+    const body = public_id[resolution_public_id_prefix.len..];
+    const separator = std.mem.indexOfScalar(u8, body, ':') orelse return error.InvalidBackupRequest;
+    if (std.mem.indexOfScalar(u8, body[separator + 1 ..], ':') != null) return error.InvalidBackupRequest;
+
+    return .{
+        .doc_key = try decodeBase64UrlComponentAlloc(alloc, body[0..separator]),
+        .artifact_name = try decodeBase64UrlComponentAlloc(alloc, body[separator + 1 ..]),
+    };
+}
+
+fn appendBase64UrlComponent(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const encoded_len = encoder.calcSize(bytes.len);
+    const start = out.items.len;
+    try out.resize(alloc, start + encoded_len);
+    _ = encoder.encode(out.items[start .. start + encoded_len], bytes);
+}
+
+fn decodeBase64UrlComponentAlloc(alloc: Allocator, encoded: []const u8) ![]u8 {
+    const decoder = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(encoded) catch return error.InvalidBackupRequest;
+    const out = try alloc.alloc(u8, decoded_len);
+    errdefer alloc.free(out);
+    decoder.decode(out, encoded) catch return error.InvalidBackupRequest;
+    return out;
 }
 
 /// Parse an embedding artifact value and collect into the appropriate batch.
@@ -757,6 +847,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
             switch (block.block_type) {
                 .chunk_batch => try importChunkBatch(alloc, store, block.payload),
                 .artifact_batch => try importPublicArtifactBatch(alloc, store, block.payload, .asset),
+                .resolution_batch => try importResolutionArtifactBatch(alloc, store, block.payload),
                 .embedding_batch => try importEmbeddingBatch(alloc, store, block.payload, opts.embedding_source_fields),
                 .sparse_batch => try importSparseBatch(alloc, store, block.payload, opts.embedding_source_fields),
                 .edge_batch => try importEdgeBatch(alloc, store, block.payload),
@@ -940,6 +1031,54 @@ fn importPublicArtifactBatch(
         if (artifact_ref.kind != allowed_kind) return error.InvalidBackupRequest;
 
         const store_key = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, artifact_ref);
+        var store_key_owned = true;
+        errdefer if (store_key_owned) alloc.free(store_key);
+        try owned_keys.append(alloc, store_key);
+        store_key_owned = false;
+
+        const store_value = try alloc.dupe(u8, entry.value);
+        var store_value_owned = true;
+        errdefer if (store_value_owned) alloc.free(store_value);
+        try owned_vals.append(alloc, store_value);
+        store_value_owned = false;
+
+        try writes.append(alloc, .{
+            .key = store_key,
+            .value = store_value,
+        });
+    }
+
+    if (writes.items.len > 0) {
+        try store.putBatch(writes.items, &.{});
+    }
+}
+
+fn importResolutionArtifactBatch(
+    alloc: Allocator,
+    store: *DocStore,
+    payload: []const u8,
+) !void {
+    const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
+    defer freeKeyValueEntries(alloc, entries);
+
+    var writes = std.ArrayListUnmanaged(KVPair).empty;
+    defer writes.deinit(alloc);
+    var owned_keys = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_keys.items) |k| alloc.free(k);
+        owned_keys.deinit(alloc);
+    }
+    var owned_vals = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_vals.items) |v| alloc.free(v);
+        owned_vals.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        var artifact_ref = (try decodeResolutionPublicIdAlloc(alloc, entry.key)) orelse return error.InvalidBackupRequest;
+        defer artifact_ref.deinit(alloc);
+
+        const store_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, artifact_ref.doc_key, artifact_ref.artifact_name);
         var store_key_owned = true;
         errdefer if (store_key_owned) alloc.free(store_key);
         try owned_keys.append(alloc, store_key);
@@ -1839,6 +1978,52 @@ test "export and import asset artifacts round trip with public artifact ids" {
     const restored_unit_asset = try dst.get(alloc, unit_asset_key);
     defer alloc.free(restored_unit_asset);
     try std.testing.expectEqualStrings(unit_asset_value, restored_unit_asset);
+}
+
+test "export and import resolution artifacts round trip with public artifact ids" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:mention-source", "people_resolver_v1");
+    defer alloc.free(resolution_key);
+    const resolution_value =
+        \\{"mentions":[{"text":"Ada","entity_id":"entity:ada","confidence":0.98}]}
+    ;
+
+    try src.putBatch(&.{.{ .key = resolution_key, .value = resolution_value }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try exportPortable(alloc, &src, &out);
+
+    var saw_resolution_batch = false;
+    var reader = backup_codec.SliceReader.init(out.items);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+        if (block.block_type != .resolution_batch) continue;
+        saw_resolution_batch = true;
+        const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
+        defer freeKeyValueEntries(alloc, entries);
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expect(std.mem.startsWith(u8, entries[0].key, resolution_public_id_prefix));
+    }
+    try std.testing.expect(saw_resolution_batch);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortable(alloc, &dst, out.items);
+
+    const restored_resolution = try dst.get(alloc, resolution_key);
+    defer alloc.free(restored_resolution);
+    try std.testing.expectEqualStrings(resolution_value, restored_resolution);
 }
 
 test "export skips derived data" {
