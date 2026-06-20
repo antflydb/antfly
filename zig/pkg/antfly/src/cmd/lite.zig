@@ -123,6 +123,7 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
     if (std.mem.eql(u8, subcommand, "schema")) return try schemaCommand(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "run-until-idle")) return try runUntilIdle(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "backup") or std.mem.eql(u8, subcommand, "export")) return try backup(init.gpa, init.io, args);
+    if (std.mem.eql(u8, subcommand, "snapshot")) return try snapshot(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "restore")) return try restore(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "import")) return try importBackup(init.gpa, init.io, args);
     if (std.mem.eql(u8, subcommand, "promote")) return try promote(init.gpa, init.io, args);
@@ -442,6 +443,55 @@ fn backup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     cli.writeStdout(io, "{\"format\":\"afb\",\"path\":");
     try writeJsonString(allocator, io, out_path);
     cli.writeStdout(io, "}\n");
+}
+
+const SnapshotOptions = struct {
+    out_path: []const u8,
+    replace: bool = false,
+};
+
+fn snapshot(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const opts = parseSnapshotOptions(args);
+    try snapshotStableAflite(allocator, io, path, opts.out_path, opts.replace);
+}
+
+fn parseSnapshotOptions(args: *std.process.Args.Iterator) SnapshotOptions {
+    var out_path: ?[]const u8 = null;
+    var replace = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--out") or std.mem.eql(u8, arg, "-o")) {
+            out_path = args.next();
+        } else if (std.mem.eql(u8, arg, "--replace")) {
+            replace = true;
+        } else {
+            cli.fatal("unknown snapshot argument: {s}", .{arg});
+        }
+    }
+    return .{
+        .out_path = out_path orelse cli.fatal("--out is required", .{}),
+        .replace = replace,
+    };
+}
+
+fn snapshotStableAflite(allocator: Allocator, io: std.Io, path: []const u8, out_path: []const u8, replace: bool) !void {
+    try requireAflitePath(path);
+    try requireAflitePath(out_path);
+    if (std.mem.eql(u8, path, out_path)) {
+        cli.fatal("source and output snapshot paths must be different: {s}", .{path});
+    }
+    if (pathExists(io, out_path) and !replace) {
+        cli.fatal("output snapshot already exists; pass --replace to overwrite: {s}", .{out_path});
+    }
+
+    var backend = try antfly.lite.backend.Handle.open(allocator, path, .{ .read_only = true });
+    defer backend.deinit();
+
+    const report = try backend.copyStableSnapshot(out_path, replace);
+    const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
+    defer allocator.free(json);
+    writeJsonLine(io, json);
 }
 
 fn restore(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -958,6 +1008,7 @@ fn printUsage(argv0: []const u8) void {
         \\  run-until-idle <db.aflite>
         \\  backup <db.aflite> --out backup.afb
         \\  export <db.aflite> --out backup.afb
+        \\  snapshot <db.aflite> --out copy.aflite [--replace]
         \\  restore <backup.afb|source.aflite> --out <db.aflite> [--replace]
         \\  import <db.aflite> --from <backup.afb|source.aflite> [--replace]
         \\  promote <db.aflite> --target <url> --table <name> [--backup-id <id>] [--location <uri>]
@@ -1045,6 +1096,53 @@ test "lite restore source can be an aflite database" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
     }
+}
+
+test "lite snapshot copies stable aflite prefix without source tail" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/snapshot-source.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const snapshot_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/snapshot-copy.aflite", .{tmp.sub_path});
+    defer allocator.free(snapshot_path);
+
+    const source_size = blk: {
+        var source = try LiteDb.open(allocator, src_path, .writer);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:lite-snapshot\":{\"title\":\"stable snapshot\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+        break :blk (try source.backend.native_docstore.?.file.file.stat(source.backend.native_docstore.?.file.io_impl.io())).size;
+    };
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(io, src_path, .{ .mode = .read_write });
+        defer file.close(io);
+        try file.writePositionalAll(io, "tail", source_size);
+    }
+
+    const source_report = try antfly.lite.backend.checkFile(allocator, src_path);
+    try std.testing.expect(!source_report.valid);
+    try std.testing.expectEqualStrings("tail_bytes", source_report.issue.?);
+
+    try snapshotStableAflite(allocator, io, src_path, snapshot_path, false);
+
+    const snapshot_report = try antfly.lite.backend.checkFile(allocator, snapshot_path);
+    try std.testing.expect(snapshot_report.valid);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_report.tail_bytes);
+
+    var snapshot_db = try LiteDb.open(allocator, snapshot_path, .query_readonly);
+    defer snapshot_db.close();
+    const json = try lookupJson(allocator, &snapshot_db.db, "doc:lite-snapshot", "");
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stable snapshot\"") != null);
 }
 
 test "lite promote stages portable afb and table manifest" {
