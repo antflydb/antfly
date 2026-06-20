@@ -4831,9 +4831,12 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         }, consistency);
     }
 
-    var left = (try source.rowsQueryPlan(alloc, lowered.left.table_name, left_schema, lowered.left.plan, consistency)) orelse return null;
+    const left_target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.left.table_name);
+    const right_target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.right.table_name);
+
+    var left = (try source.rowsQueryPlanCatalog(alloc, left_target, left_schema, lowered.left.plan, consistency)) orelse return null;
     defer left.deinit(alloc);
-    var right = (try source.rowsQueryPlan(alloc, lowered.right.table_name, right_schema, lowered.right.plan, consistency)) orelse return null;
+    var right = (try source.rowsQueryPlanCatalog(alloc, right_target, right_schema, lowered.right.plan, consistency)) orelse return null;
     defer right.deinit(alloc);
     return try executeRelationalRowsSetOperationOnQueryResultsAlloc(alloc, .{
         .operation = operation,
@@ -20471,6 +20474,8 @@ test "lowered sql set operation plans route cross table branches through catalog
     const FakeSource = struct {
         usage_scans: usize = 0,
         archived_scans: usize = 0,
+        usage_catalog_queries: usize = 0,
+        archived_catalog_queries: usize = 0,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -20480,6 +20485,7 @@ test "lowered sql set operation plans route cross table branches through catalog
                     .scan = scan,
                     .query = query,
                     .rows_query_plan = rowsQueryPlan,
+                    .rows_query_plan_catalog = rowsQueryPlanCatalog,
                 },
             };
         }
@@ -20540,15 +20546,36 @@ test "lowered sql set operation plans route cross table branches through catalog
         }
 
         fn rowsQueryPlan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: storage_schema.TableSchema,
+            _: db_mod.types.RelationalRowsQueryPlan,
+            _: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            _ = table_name;
+            return error.TestUnexpectedResult;
+        }
+
+        fn rowsQueryPlanCatalog(
             ptr: *anyopaque,
             plan_alloc: std.mem.Allocator,
-            table_name: []const u8,
+            target: catalog_resources.TableTarget,
             runtime_schema: storage_schema.TableSchema,
             plan: db_mod.types.RelationalRowsQueryPlan,
             consistency: raft_mod.ReadConsistency,
         ) !?db_mod.types.RelationalRowsQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), table_name, runtime_schema, plan, consistency);
+            try std.testing.expectEqualStrings(tables_api.default_database_name, target.database_name);
+            try std.testing.expectEqualStrings(tables_api.default_namespace_name, target.namespace_name);
+            if (std.mem.eql(u8, target.table_name, "usage_records")) {
+                self.usage_catalog_queries += 1;
+            } else if (std.mem.eql(u8, target.table_name, "archived_records")) {
+                self.archived_catalog_queries += 1;
+            } else {
+                return error.TableNotFound;
+            }
+            return try rowsQueryPlanFromRoutedScansAlloc(plan_alloc, self.source(), target.table_name, runtime_schema, plan, consistency);
         }
     };
 
@@ -20580,6 +20607,8 @@ test "lowered sql set operation plans route cross table branches through catalog
 
     try std.testing.expectEqual(@as(usize, 1), fake.usage_scans);
     try std.testing.expectEqual(@as(usize, 1), fake.archived_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake.usage_catalog_queries);
+    try std.testing.expectEqual(@as(usize, 1), fake.archived_catalog_queries);
     switch (result) {
         .set_operation => |query_result| {
             try std.testing.expectEqual(@as(u32, 4), query_result.total);
@@ -20619,6 +20648,8 @@ test "lowered sql set operation plans route cross table branches through catalog
 
     try std.testing.expectEqual(@as(usize, 1), fake_except.usage_scans);
     try std.testing.expectEqual(@as(usize, 1), fake_except.archived_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake_except.usage_catalog_queries);
+    try std.testing.expectEqual(@as(usize, 1), fake_except.archived_catalog_queries);
     switch (except_result) {
         .set_operation => |query_result| {
             try std.testing.expectEqual(@as(u32, 1), query_result.total);
@@ -20655,6 +20686,8 @@ test "lowered sql set operation plans route cross table branches through catalog
 
     try std.testing.expectEqual(@as(usize, 1), fake_intersect.usage_scans);
     try std.testing.expectEqual(@as(usize, 1), fake_intersect.archived_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake_intersect.usage_catalog_queries);
+    try std.testing.expectEqual(@as(usize, 1), fake_intersect.archived_catalog_queries);
     switch (intersect_result) {
         .set_operation => |query_result| {
             try std.testing.expectEqual(@as(u32, 1), query_result.total);
