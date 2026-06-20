@@ -2445,9 +2445,30 @@ test "lite promote stages portable afb and table manifest" {
     const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
     defer allocator.free(location);
 
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    const enrichment_json = "{\"name\":\"promote_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":192,\"chunk_overlap\":24}";
+    const index_json = "{\"name\":\"promote_ft_body\",\"kind\":\"full_text\",\"config_json\":\"{\\\"chunk_name\\\":\\\"promote_chunks_v1\\\"}\"}";
+
     {
         var source = try LiteDb.open(allocator, src_path, .writer);
         defer source.close();
+
+        try source.db.setSchemaJson(allocator, schema_json);
+
+        var enrichment = try std.json.parseFromSlice(db_types.EnrichmentConfig, allocator, enrichment_json, .{
+            .ignore_unknown_fields = true,
+        });
+        defer enrichment.deinit();
+        try source.db.addEnrichment(enrichment.value);
+
+        var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
+            .ignore_unknown_fields = true,
+        });
+        defer index.deinit();
+        try source.db.addIndex(index.value);
+
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:promote\":{\"title\":\"portable promote\"}}}");
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
@@ -2463,8 +2484,20 @@ test "lite promote stages portable afb and table manifest" {
     var manifest = try antfly.public_api.backups.readManifestFromLocation(allocator, &backup_location, "lite-promote-test");
     defer manifest.deinit(allocator);
     try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings(schema_json, manifest.schema_json);
     try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
     try std.testing.expectEqualStrings("lite-promote-test.afb", manifest.shards[0].snapshot_path);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"promote_ft_body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"promote_chunks_v1\"") != null);
+
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, allocator, manifest.indexes_json, .{});
+    defer parsed_indexes.deinit();
+    try std.testing.expect(parsed_indexes.value == .object);
+    try std.testing.expect(parsed_indexes.value.object.get("promote_ft_body") != null);
+    const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
+    try std.testing.expect(enrichments == .array);
+    try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
 
     const afb_path = try std.fmt.allocPrint(allocator, "{s}/lite-promote-test.afb", .{backup_root});
     defer allocator.free(afb_path);
