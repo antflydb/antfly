@@ -282,6 +282,30 @@ pub const GraphMetricEdgeFilter = struct {
     mode: GraphMetricEdgeFilterMode = .all,
     types: []const []const u8 = &.{},
 
+    pub fn equivalent(self: @This(), other: @This()) bool {
+        if (self.mode != other.mode) return false;
+        return switch (self.mode) {
+            .all => true,
+            .types => {
+                if (self.types.len != other.types.len) return false;
+                for (self.types) |edge_type| {
+                    if (!other.includesType(edge_type)) return false;
+                }
+                for (other.types) |edge_type| {
+                    if (!self.includesType(edge_type)) return false;
+                }
+                return true;
+            },
+        };
+    }
+
+    pub fn includesType(self: @This(), edge_type: []const u8) bool {
+        for (self.types) |allowed| {
+            if (std.mem.eql(u8, allowed, edge_type)) return true;
+        }
+        return false;
+    }
+
     pub fn cloneAlloc(self: @This(), alloc: Allocator) !@This() {
         if (self.types.len == 0) return .{ .mode = self.mode };
         const types = try alloc.alloc([]const u8, self.types.len);
@@ -5318,21 +5342,12 @@ pub const GraphIndex = struct {
     fn graphMetricEdgeAllowed(filter: GraphMetricEdgeFilter, edge_type: []const u8) bool {
         return switch (filter.mode) {
             .all => true,
-            .types => blk: {
-                for (filter.types) |allowed| {
-                    if (std.mem.eql(u8, allowed, edge_type)) break :blk true;
-                }
-                break :blk false;
-            },
+            .types => filter.includesType(edge_type),
         };
     }
 
     fn graphMetricEdgeFiltersEqual(a: GraphMetricEdgeFilter, b: GraphMetricEdgeFilter) bool {
-        if (a.mode != b.mode or a.types.len != b.types.len) return false;
-        for (a.types, b.types) |a_type, b_type| {
-            if (!std.mem.eql(u8, a_type, b_type)) return false;
-        }
-        return true;
+        return a.equivalent(b);
     }
 
     fn graphMetricConfigFingerprintHashU64(hasher: *std.hash.Wyhash, value: u64) void {
@@ -5348,11 +5363,29 @@ pub const GraphIndex = struct {
         graphMetricConfigFingerprintHashU64(&hasher, cfg.max_iterations);
         graphMetricConfigFingerprintHashU64(&hasher, @intFromEnum(cfg.edge_filter.mode));
         graphMetricConfigFingerprintHashU64(&hasher, cfg.edge_filter.types.len);
-        for (cfg.edge_filter.types) |edge_type| {
+        var last: ?[]const u8 = null;
+        var emitted: usize = 0;
+        while (emitted < cfg.edge_filter.types.len) {
+            const edge_type = nextGraphMetricEdgeFilterType(cfg.edge_filter.types, last) orelse break;
             graphMetricConfigFingerprintHashU64(&hasher, edge_type.len);
             hasher.update(edge_type);
+            last = edge_type;
+            emitted += 1;
         }
         return hasher.final();
+    }
+
+    fn nextGraphMetricEdgeFilterType(types: []const []const u8, last: ?[]const u8) ?[]const u8 {
+        var next: ?[]const u8 = null;
+        for (types) |edge_type| {
+            if (last) |prior| {
+                if (std.mem.order(u8, edge_type, prior) != .gt) continue;
+            }
+            if (next == null or std.mem.lessThan(u8, edge_type, next.?)) {
+                next = edge_type;
+            }
+        }
+        return next;
     }
 
     fn graphMetricScoresFingerprint(scores: []const GraphMetricScore) u64 {
@@ -10791,6 +10824,28 @@ test "graph metric build lease survives reopen and expired lease can be reclaime
         try std.testing.expectEqual(target_generation, completed_job.target_generation);
         try std.testing.expectEqual(@as(u64, 0), completed_job.lease_expires_at_ms);
     }
+}
+
+test "graph metric edge filter equality and fingerprint treat types as set" {
+    const left_types = [_][]const u8{ "cites", "mentions" };
+    const right_types = [_][]const u8{ "mentions", "cites" };
+    const left_filter = GraphMetricEdgeFilter{ .mode = .types, .types = &left_types };
+    const right_filter = GraphMetricEdgeFilter{ .mode = .types, .types = &right_types };
+
+    try std.testing.expect(left_filter.equivalent(right_filter));
+    try std.testing.expect(right_filter.equivalent(left_filter));
+
+    const left = GraphMetricConfig{
+        .name = "pagerank",
+        .kind = .pagerank,
+        .edge_filter = left_filter,
+    };
+    const right = GraphMetricConfig{
+        .name = "pagerank",
+        .kind = .pagerank,
+        .edge_filter = right_filter,
+    };
+    try std.testing.expectEqual(GraphIndex.graphMetricConfigFingerprint(left), GraphIndex.graphMetricConfigFingerprint(right));
 }
 
 test "graph metric build manifest is durable and idempotent across reopen" {

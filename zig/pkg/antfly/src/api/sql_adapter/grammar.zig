@@ -3929,6 +3929,17 @@ pub fn parseDdlColumnListAlloc(
     return try columns.toOwnedSlice(alloc);
 }
 
+pub fn parseDdlUniqueColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const columns = try parseDdlColumnListAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, columns);
+    try validateSqlIdentifierListUnique(columns);
+    return columns;
+}
+
 pub fn parseOptionalDdlConstraintIncludeAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3937,6 +3948,19 @@ pub fn parseOptionalDdlConstraintIncludeAlloc(
     const cursor = parser.Cursor.init(tokens, pos);
     if (!cursor.matchKeyword("include")) return &.{};
     return try parseDdlColumnListAlloc(alloc, tokens, pos);
+}
+
+pub fn parseOptionalDdlConstraintIncludeUniqueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    key_columns: []const []const u8,
+) ![]const []const u8 {
+    const include_columns = try parseOptionalDdlConstraintIncludeAlloc(alloc, tokens, pos);
+    errdefer freeStringSlice(alloc, include_columns);
+    try validateSqlIdentifierListUnique(include_columns);
+    try validateSqlIdentifierListsDisjoint(key_columns, include_columns);
+    return include_columns;
 }
 
 pub fn parseDdlTemporalColumnListAlloc(
@@ -3972,6 +3996,17 @@ pub fn parseDdlTemporalColumnListAlloc(
     const period = without_overlaps_period;
     without_overlaps_period = null;
     return .{ .columns = owned_columns, .without_overlaps_period = period };
+}
+
+pub fn parseDdlUniqueTemporalColumnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DdlTemporalColumnListSyntax {
+    const columns = try parseDdlTemporalColumnListAlloc(alloc, tokens, pos);
+    errdefer columns.deinit(alloc);
+    try validateSqlIdentifierListUnique(columns.columns);
+    return columns;
 }
 
 pub fn parseDdlForeignKeyColumnListAlloc(
@@ -6212,6 +6247,22 @@ pub fn parseIdentifierListAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn validateSqlIdentifierListUnique(columns: []const []const u8) !void {
+    for (columns, 0..) |lhs, i| {
+        for (columns[i + 1 ..]) |rhs| {
+            if (std.ascii.eqlIgnoreCase(lhs, rhs)) return error.UnsupportedSqlShape;
+        }
+    }
+}
+
+pub fn validateSqlIdentifierListsDisjoint(left: []const []const u8, right: []const []const u8) !void {
+    for (left) |lhs| {
+        for (right) |rhs| {
+            if (std.ascii.eqlIgnoreCase(lhs, rhs)) return error.UnsupportedSqlShape;
+        }
+    }
+}
+
 pub fn parseOptionalCteColumnAliasesAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -6274,6 +6325,94 @@ pub fn parseSqlObjectIdentifierListAlloc(
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
     return try out.toOwnedSlice(alloc);
+}
+
+pub fn parseDdlUniquePredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const runtime_schema.UniquePredicate {
+    var predicates = std.ArrayListUnmanaged(runtime_schema.UniquePredicate).empty;
+    errdefer {
+        for (predicates.items) |predicate| freeDdlUniquePredicate(alloc, predicate);
+        predicates.deinit(alloc);
+    }
+    while (true) {
+        const atom_start = pos.*;
+        var depth: usize = 0;
+        while (pos.* < tokens.len) {
+            const token = tokens[pos.*];
+            if (depth == 0 and token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "and")) break;
+            if (depth == 0 and token.kind == .semicolon) break;
+            switch (token.kind) {
+                .lparen => depth += 1,
+                .rparen => {
+                    if (depth == 0) return error.UnsupportedSqlShape;
+                    depth -= 1;
+                },
+                else => {},
+            }
+            pos.* += 1;
+        }
+        if (depth != 0 or atom_start == pos.*) return error.UnsupportedSqlShape;
+
+        const predicate = try parseDdlUniquePredicateAtomAlloc(alloc, tokens[atom_start..pos.*]);
+        var predicate_transferred = false;
+        errdefer if (!predicate_transferred) freeDdlUniquePredicate(alloc, predicate);
+        try predicates.append(alloc, predicate);
+        predicate_transferred = true;
+        if (!parser.matchKeyword(tokens, pos, "and")) break;
+    }
+    return try predicates.toOwnedSlice(alloc);
+}
+
+fn parseDdlUniquePredicateAtomAlloc(
+    alloc: std.mem.Allocator,
+    raw_tokens: []const Token,
+) !runtime_schema.UniquePredicate {
+    const tokens = parser.stripBalancedOuterParens(raw_tokens);
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+
+    var idx: usize = 0;
+    const field_token = try parser.parseWrappedIdentifierOperand(tokens, &idx);
+    const field = try alloc.dupe(u8, field_token.text);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+
+    if (idx >= tokens.len) return error.UnsupportedSqlShape;
+    if (tokens[idx].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[idx].text, "is")) {
+        idx += 1;
+        const op: runtime_schema.UniquePredicateOp = if (idx < tokens.len and tokens[idx].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[idx].text, "not")) blk: {
+            idx += 1;
+            if (idx >= tokens.len or tokens[idx].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[idx].text, "null")) return error.UnsupportedSqlShape;
+            idx += 1;
+            break :blk .is_not_null;
+        } else blk: {
+            if (idx >= tokens.len or tokens[idx].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[idx].text, "null")) return error.UnsupportedSqlShape;
+            idx += 1;
+            break :blk .is_null;
+        };
+        if (idx != tokens.len) return error.UnsupportedSqlShape;
+        field_transferred = true;
+        return .{ .field = field, .op = op };
+    }
+
+    const op: runtime_schema.UniquePredicateOp = if (tokens[idx].kind == .eq) .eq else if (tokens[idx].kind == .neq) .ne else return error.UnsupportedSqlShape;
+    idx += 1;
+    if (idx >= tokens.len) return error.UnsupportedSqlShape;
+    const value_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, &idx);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    if (idx != tokens.len) return error.UnsupportedSqlShape;
+
+    field_transferred = true;
+    value_transferred = true;
+    return .{ .field = field, .op = op, .value_json = value_json };
+}
+
+fn freeDdlUniquePredicate(alloc: std.mem.Allocator, predicate: runtime_schema.UniquePredicate) void {
+    alloc.free(predicate.field);
+    if (predicate.value_json) |value| alloc.free(value);
 }
 
 pub fn parseSqlTableReferenceIdentifierOwnedAlloc(
@@ -8276,6 +8415,26 @@ test "sql adapter grammar parses ddl constraint column lists" {
     defer freeStringSlice(alloc, duplicate);
     try std.testing.expectEqual(@as(usize, 2), duplicate.len);
 
+    var duplicate_unique_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, TENANT_ID)");
+    defer lexer.freeTokens(alloc, &duplicate_unique_tokens);
+    var duplicate_unique_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlUniqueColumnListAlloc(alloc, duplicate_unique_tokens.items, &duplicate_unique_pos));
+
+    var duplicate_include_tokens = try lexer.tokenizeAlloc(alloc, "INCLUDE (status, STATUS)");
+    defer lexer.freeTokens(alloc, &duplicate_include_tokens);
+    var duplicate_include_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, duplicate_include_tokens.items, &duplicate_include_pos, &.{"tenant_id"}));
+
+    var overlapping_include_tokens = try lexer.tokenizeAlloc(alloc, "INCLUDE (usage_id)");
+    defer lexer.freeTokens(alloc, &overlapping_include_tokens);
+    var overlapping_include_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseOptionalDdlConstraintIncludeUniqueAlloc(alloc, overlapping_include_tokens.items, &overlapping_include_pos, &.{ "tenant_id", "usage_id" }));
+
+    var duplicate_temporal_tokens = try lexer.tokenizeAlloc(alloc, "(tenant_id, TENANT_ID WITHOUT OVERLAPS)");
+    defer lexer.freeTokens(alloc, &duplicate_temporal_tokens);
+    var duplicate_temporal_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseDdlUniqueTemporalColumnListAlloc(alloc, duplicate_temporal_tokens.items, &duplicate_temporal_pos));
+
     var empty_tokens = try lexer.tokenizeAlloc(alloc, "()");
     defer lexer.freeTokens(alloc, &empty_tokens);
     var empty_pos: usize = 0;
@@ -8285,6 +8444,14 @@ test "sql adapter grammar parses ddl constraint column lists" {
     defer lexer.freeTokens(alloc, &double_period_tokens);
     var double_period_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseDdlTemporalColumnListAlloc(alloc, double_period_tokens.items, &double_period_pos));
+}
+
+test "sql adapter grammar validates identifier lists" {
+    try validateSqlIdentifierListUnique(&.{ "tenant_id", "usage_id" });
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlIdentifierListUnique(&.{ "tenant_id", "TENANT_ID" }));
+
+    try validateSqlIdentifierListsDisjoint(&.{ "tenant_id", "usage_id" }, &.{"status"});
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlIdentifierListsDisjoint(&.{ "tenant_id", "usage_id" }, &.{"USAGE_ID"}));
 }
 
 test "sql adapter grammar parses ddl foreign key options" {

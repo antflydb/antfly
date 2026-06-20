@@ -118,7 +118,7 @@ pub fn cloneExpressionSubstitutingRoutineArgsAlloc(
     value: runtime_schema.RelationalRowsExpression,
     args: []const runtime_schema.RelationalRowsExpression,
 ) anyerror!runtime_schema.RelationalRowsExpression {
-    if (value.kind == .field and value.field_source == .row) {
+    if (value.kind == .field) {
         if (routineArgIndex(value.field)) |index| {
             if (index >= args.len) return error.UnsupportedSqlShape;
             return try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, args[index]);
@@ -235,6 +235,105 @@ fn freeRoutineExpressionCaseBranch(
 ) void {
     runtime_schema.freeRelationalRowsExpressionCondition(alloc, value.when);
     runtime_schema.freeRelationalRowsExpression(alloc, value.then);
+}
+
+pub fn relationalRowsExpressionOptionalEqual(
+    lhs: ?runtime_schema.RelationalRowsExpression,
+    rhs: ?runtime_schema.RelationalRowsExpression,
+) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return relationalRowsExpressionEqual(lhs.?, rhs.?);
+}
+
+pub fn relationalRowsExpressionEqual(
+    lhs: runtime_schema.RelationalRowsExpression,
+    rhs: runtime_schema.RelationalRowsExpression,
+) bool {
+    if (lhs.kind != rhs.kind or
+        lhs.field_source != rhs.field_source or
+        lhs.json_as_text != rhs.json_as_text or
+        lhs.cast_type != rhs.cast_type or
+        !std.mem.eql(u8, lhs.field, rhs.field) or
+        !std.mem.eql(u8, lhs.value_json, rhs.value_json) or
+        !std.mem.eql(u8, lhs.json_path, rhs.json_path) or
+        lhs.operands.len != rhs.operands.len or
+        lhs.case_branches.len != rhs.case_branches.len or
+        lhs.case_else.len != rhs.case_else.len)
+    {
+        return false;
+    }
+    for (lhs.operands, rhs.operands) |lhs_operand, rhs_operand| {
+        if (!relationalRowsExpressionEqual(lhs_operand, rhs_operand)) return false;
+    }
+    for (lhs.case_branches, rhs.case_branches) |lhs_branch, rhs_branch| {
+        if (!relationalRowsExpressionConditionEqual(lhs_branch.when, rhs_branch.when)) return false;
+        if (!relationalRowsExpressionEqual(lhs_branch.then, rhs_branch.then)) return false;
+    }
+    for (lhs.case_else, rhs.case_else) |lhs_else, rhs_else| {
+        if (!relationalRowsExpressionEqual(lhs_else, rhs_else)) return false;
+    }
+    return true;
+}
+
+pub fn relationalRowsExpressionConditionsEqual(
+    lhs: []const runtime_schema.RelationalRowsExpressionCondition,
+    rhs: []const runtime_schema.RelationalRowsExpressionCondition,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |lhs_condition, rhs_condition| {
+        if (!relationalRowsExpressionConditionEqual(lhs_condition, rhs_condition)) return false;
+    }
+    return true;
+}
+
+pub fn relationalRowsExpressionArrayContainsEqual(
+    lhs: []const runtime_schema.RelationalRowsExpressionArrayContainsPredicate,
+    rhs: []const runtime_schema.RelationalRowsExpressionArrayContainsPredicate,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
+        if (!relationalRowsExpressionEqual(lhs_predicate.expression, rhs_predicate.expression) or
+            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub fn relationalRowsExpressionPredicateGroupsEqual(
+    lhs: []const runtime_schema.RelationalRowsExpressionPredicateGroup,
+    rhs: []const runtime_schema.RelationalRowsExpressionPredicateGroup,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |lhs_group, rhs_group| {
+        if (!relationalRowsExpressionConditionsEqual(lhs_group.conditions, rhs_group.conditions)) return false;
+    }
+    return true;
+}
+
+pub fn relationalRowsExpressionConditionEqual(
+    lhs: runtime_schema.RelationalRowsExpressionCondition,
+    rhs: runtime_schema.RelationalRowsExpressionCondition,
+) bool {
+    if (lhs.op != rhs.op or lhs.rhs.len != rhs.rhs.len or !relationalRowsExpressionEqual(lhs.lhs, rhs.lhs)) return false;
+    for (lhs.rhs, rhs.rhs) |lhs_rhs, rhs_rhs| {
+        if (!relationalRowsExpressionEqual(lhs_rhs, rhs_rhs)) return false;
+    }
+    return true;
+}
+
+pub fn validateSqlUniqueExpressionListUnique(expressions: []const runtime_schema.UniqueExpression) !void {
+    for (expressions, 0..) |lhs, i| {
+        for (expressions[i + 1 ..]) |rhs| {
+            if (lhs.op != rhs.op) continue;
+            if (lhs.op == .expression) {
+                if (lhs.expression != null and rhs.expression != null and relationalRowsExpressionEqual(lhs.expression.?, rhs.expression.?)) return error.UnsupportedSqlShape;
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(lhs.field, rhs.field)) return error.UnsupportedSqlShape;
+        }
+    }
 }
 
 pub fn validateExtensionFunctionArity(
@@ -565,4 +664,44 @@ test "sql adapter expression grammar distinguishes grouped predicates from scala
         .{ .kind = .string, .text = "%bot%", .source_start = 17, .source_end = 24 },
     };
     try std.testing.expect(!parenthesizedPredicateGroupCanStartAt(not_like_expression[0..], 0));
+}
+
+test "sql adapter lower expr compares row expressions" {
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    };
+    const same_lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    };
+    const upper_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .upper,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    };
+
+    try std.testing.expect(relationalRowsExpressionEqual(lower_status, same_lower_status));
+    try std.testing.expect(!relationalRowsExpressionEqual(lower_status, upper_status));
+    try std.testing.expect(relationalRowsExpressionOptionalEqual(lower_status, same_lower_status));
+    try std.testing.expect(!relationalRowsExpressionOptionalEqual(lower_status, null));
+}
+
+test "sql adapter lower expr validates unique expression lists" {
+    try validateSqlUniqueExpressionListUnique(&.{
+        .{ .op = .lower, .field = "status" },
+        .{ .op = .upper, .field = "status" },
+    });
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlUniqueExpressionListUnique(&.{
+        .{ .op = .lower, .field = "status" },
+        .{ .op = .lower, .field = "STATUS" },
+    }));
+
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlUniqueExpressionListUnique(&.{
+        .{ .op = .expression, .expression = lower_status },
+        .{ .op = .expression, .expression = lower_status },
+    }));
 }

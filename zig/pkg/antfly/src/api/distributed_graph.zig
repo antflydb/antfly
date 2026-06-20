@@ -4617,6 +4617,7 @@ fn mergeGraphMetricStatus(
 ) !void {
     for (statuses.items) |*status| {
         if (!std.mem.eql(u8, status.name, source.name)) continue;
+        try validateDistributedGraphMetricStatusCompatible(status.*, source);
         if (status.published_generation != 0 and
             source.published_generation != 0 and
             status.published_generation != source.published_generation)
@@ -4627,6 +4628,19 @@ fn mergeGraphMetricStatus(
         return;
     }
     try statuses.append(alloc, try cloneGraphMetricStatus(alloc, source));
+}
+
+fn validateDistributedGraphMetricStatusCompatible(
+    existing: db_mod.types.GraphMetricStatus,
+    incoming: db_mod.types.GraphMetricStatus,
+) !void {
+    if (existing.metadata_version != 0 and
+        incoming.metadata_version != 0 and
+        existing.metadata_version != incoming.metadata_version)
+    {
+        return error.UnsupportedQueryRequest;
+    }
+    if (!existing.edge_filter.equivalent(incoming.edge_filter)) return error.UnsupportedQueryRequest;
 }
 
 fn mergeGraphMetricStatusInto(
@@ -6599,4 +6613,73 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
     for (results[0].hits) |hit| {
         try std.testing.expect(hit.doc_ordinal == null);
     }
+}
+
+test "distributed graph metric status merge validates metadata compatibility" {
+    const alloc = std.testing.allocator;
+    const left_types = [_][]const u8{ "cites", "mentions" };
+    const reordered_types = [_][]const u8{ "mentions", "cites" };
+    const different_types = [_][]const u8{"related"};
+
+    var statuses = std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus).empty;
+    defer {
+        for (statuses.items) |*status| status.deinit(alloc);
+        statuses.deinit(alloc);
+    }
+
+    try mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &left_types },
+            .metadata_version = 3,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    });
+
+    try mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &reordered_types },
+            .metadata_version = 3,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    });
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &reordered_types },
+            .metadata_version = 4,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    }));
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeGraphMetricStatuses(alloc, &statuses, &.{
+        .{
+            .name = @constCast("pagerank"),
+            .state = .fresh,
+            .edge_filter = .{ .mode = .types, .types = &different_types },
+            .metadata_version = 3,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    }));
 }

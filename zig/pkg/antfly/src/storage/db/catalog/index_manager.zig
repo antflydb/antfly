@@ -3192,7 +3192,7 @@ pub const IndexManager = struct {
             candidate.max_iterations == cfg.max_iterations and
             candidate.max_iterations <= options.max_hits_iterations and
             candidate.tolerance == cfg.tolerance and
-            graphMetricEdgeFiltersEqual(candidate.edge_filter, cfg.edge_filter);
+            candidate.edge_filter.equivalent(cfg.edge_filter);
     }
 
     fn graphMetricShouldAutoStartQueuedBuild(
@@ -3213,17 +3213,6 @@ pub const IndexManager = struct {
             index_active_builds,
             index_scheduled_builds,
         );
-    }
-
-    fn graphMetricEdgeFiltersEqual(
-        a: graph_mod.GraphMetricEdgeFilter,
-        b: graph_mod.GraphMetricEdgeFilter,
-    ) bool {
-        if (a.mode != b.mode or a.types.len != b.types.len) return false;
-        for (a.types, b.types) |a_type, b_type| {
-            if (!std.mem.eql(u8, a_type, b_type)) return false;
-        }
-        return true;
     }
 
     pub fn runGraphMetricPlannedCoordinatorSweep(
@@ -13872,8 +13861,12 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
             break :blk raw;
         } else 50;
 
+        const owned_name = try alloc.dupe(u8, name);
+        var owned_name_moved = false;
+        errdefer if (!owned_name_moved) alloc.free(owned_name);
+
         var cfg = graph_mod.GraphMetricConfig{
-            .name = try alloc.dupe(u8, name),
+            .name = owned_name,
             .kind = kind,
             .damping = damping,
             .tolerance = tolerance,
@@ -13888,6 +13881,7 @@ fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.
         };
         try configs.append(alloc, cfg);
         cfg_moved = true;
+        owned_name_moved = true;
     }
 
     const owned = try configs.toOwnedSlice(alloc);
@@ -13898,6 +13892,7 @@ fn parseGraphMetricEdgeFilter(alloc: Allocator, maybe_value: ?std.json.Value) !g
     const value = maybe_value orelse return .{};
     if (value != .object) return error.InvalidIndexConfig;
     if (value.object.get("types")) |types_value| {
+        if (value.object.contains("mode")) return error.InvalidIndexConfig;
         if (types_value != .array or types_value.array.items.len == 0) return error.InvalidIndexConfig;
         const edge_types = try alloc.alloc([]const u8, types_value.array.items.len);
         var initialized: usize = 0;
@@ -13910,6 +13905,11 @@ fn parseGraphMetricEdgeFilter(alloc: Allocator, maybe_value: ?std.json.Value) !g
             edge_types[i] = try alloc.dupe(u8, item.string);
             initialized += 1;
         }
+        std.mem.sort([]const u8, edge_types, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
         return .{ .mode = .types, .types = edge_types };
     }
     if (value.object.get("mode")) |mode_value| {
@@ -14178,13 +14178,14 @@ test "graph config validates metric edge filters against declared edge types" {
     var cfg = try parseGraphConfig(alloc,
         \\{
         \\  "edge_types":[{"name":"cites"},{"name":"mentions"}],
-        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["cites"]}}}
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["mentions","cites"]}}}
         \\}
     );
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), cfg.metric_configs.len);
     try std.testing.expectEqual(graph_mod.GraphMetricEdgeFilterMode.types, cfg.metric_configs[0].edge_filter.mode);
     try std.testing.expectEqualStrings("cites", cfg.metric_configs[0].edge_filter.types[0]);
+    try std.testing.expectEqualStrings("mentions", cfg.metric_configs[0].edge_filter.types[1]);
 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{
@@ -14200,6 +14201,13 @@ test "graph config validates metric edge filters against declared edge types" {
     );
     defer untyped.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), untyped.edge_type_configs.len);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{
+        \\  "edge_types":[{"name":"cites"}],
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"mode":"all","types":["cites"]}}}
+        \\}
+    ));
 }
 
 test "graph config parses eigenvector graph metric" {

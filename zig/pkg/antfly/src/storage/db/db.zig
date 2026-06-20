@@ -6443,6 +6443,85 @@ pub const DB = struct {
         }
     };
 
+    pub const SchemaRewriteJobDrainOptions = struct {
+        worker_id: []const u8 = "antfly-schema-rewrite-worker",
+        now_ms: ?u64 = null,
+        lease_ttl_ms: u64 = 60_000,
+        max_jobs: usize = 1,
+    };
+
+    pub fn drainSchemaRewriteJobsForIdle(
+        self: *DB,
+        alloc: Allocator,
+        service: anytype,
+        options: SchemaRewriteJobDrainOptions,
+    ) !usize {
+        if (options.max_jobs == 0) return 0;
+        const ServiceType = @TypeOf(service);
+        const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+            .pointer => |pointer| pointer.child,
+            else => ServiceType,
+        };
+        if (comptime !@hasDecl(ServiceDeclType, "listProjectedSchemaRewriteJobs") or
+            !@hasDecl(ServiceDeclType, "beginSchemaRewriteJob") or
+            !@hasDecl(ServiceDeclType, "finishSchemaRewriteJob") or
+            !@hasDecl(ServiceDeclType, "invalidateSchemaRewriteJob"))
+        {
+            return error.UnsupportedOperation;
+        }
+
+        const now_ms = options.now_ms orelse @divTrunc(currentTimeNs(), std.time.ns_per_ms);
+        const lease_expires_at_ms = now_ms +| options.lease_ttl_ms;
+        if (options.worker_id.len == 0 or lease_expires_at_ms <= now_ms) return error.InvalidSchemaRewriteJobLease;
+
+        const jobs = try service.listProjectedSchemaRewriteJobs(alloc);
+        defer if (comptime @hasDecl(ServiceDeclType, "freeProjectedSchemaRewriteJobs")) {
+            service.freeProjectedSchemaRewriteJobs(alloc, jobs);
+        } else {
+            for (jobs) |job| metadata_table_manager.freeSchemaRewriteJob(alloc, job);
+            alloc.free(jobs);
+        };
+
+        var progressed: usize = 0;
+        for (jobs) |job| {
+            if (progressed >= options.max_jobs) break;
+            if (!schemaRewriteJobClaimableForDrain(job, now_ms)) continue;
+
+            try service.beginSchemaRewriteJob(.{
+                .job_id = job.job_id,
+                .lease_owner = options.worker_id,
+                .now_ms = now_ms,
+                .lease_expires_at_ms = lease_expires_at_ms,
+            });
+
+            var running_job = job;
+            running_job.state = metadata_table_manager.schema_rewrite_running;
+            running_job.lease_owner = options.worker_id;
+            running_job.lease_expires_at_ms = lease_expires_at_ms;
+
+            var result = self.executeClaimedSchemaRewriteJob(alloc, running_job) catch |err| {
+                try service.invalidateSchemaRewriteJob(.{
+                    .job_id = running_job.job_id,
+                    .lease_owner = options.worker_id,
+                    .last_error = @errorName(err),
+                });
+                progressed += 1;
+                continue;
+            };
+            defer result.deinit(alloc);
+            try service.finishSchemaRewriteJob(result.finishRequest(running_job));
+            progressed += 1;
+        }
+        return progressed;
+    }
+
+    fn schemaRewriteJobClaimableForDrain(job: metadata_table_manager.SchemaRewriteJobRecord, now_ms: u64) bool {
+        if (std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_declared)) return true;
+        return std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_running) and
+            job.lease_expires_at_ms != 0 and
+            job.lease_expires_at_ms <= now_ms;
+    }
+
     pub fn executeClaimedSchemaRewriteJob(
         self: *DB,
         alloc: Allocator,
@@ -44622,6 +44701,106 @@ test "db executes claimed schema rewrite job expressions over relational rows" {
     var stale = job;
     stale.schema_generation = 99;
     try std.testing.expectError(error.InvalidSchemaRewriteGeneration, db.executeClaimedSchemaRewriteJob(alloc, stale));
+}
+
+test "db drains metadata schema rewrite jobs through claim and finish lifecycle" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"one\",\"status\":\"ACTIVE\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const TestSchemaRewriteService = struct {
+        manager: metadata_table_manager.TableManager,
+
+        fn deinit(self: *@This()) void {
+            self.manager.deinit();
+        }
+
+        fn listProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+            return try self.manager.listSchemaRewriteJobs(allocator);
+        }
+
+        fn freeProjectedSchemaRewriteJobs(self: *@This(), allocator: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+            self.manager.freeSchemaRewriteJobs(allocator, records);
+        }
+
+        fn beginSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            try self.manager.beginSchemaRewriteJob(request);
+        }
+
+        fn finishSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            try self.manager.finishSchemaRewriteJob(request);
+        }
+
+        fn invalidateSchemaRewriteJob(self: *@This(), request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            try self.manager.invalidateSchemaRewriteJob(request);
+        }
+    };
+
+    var service = TestSchemaRewriteService{ .manager = metadata_table_manager.TableManager.init(alloc) };
+    defer service.deinit();
+    try service.manager.upsertTable(.{
+        .table_id = 7,
+        .name = "usage_records",
+        .schema_json = schema_v2,
+    });
+    try service.manager.upsertSchemaRewriteJob(.{
+        .job_id = 44,
+        .table_id = 7,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "rewrite",
+        .reason = "row_images",
+        .target_column = "status_key",
+        .expression = .{
+            .kind = .lower,
+            .operands = &.{.{
+                .kind = .field,
+                .field = "status",
+            }},
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
+        .worker_id = "worker-a",
+        .now_ms = 1000,
+        .lease_ttl_ms = 5000,
+        .max_jobs = 4,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), try db.drainSchemaRewriteJobsForIdle(alloc, &service, .{
+        .worker_id = "worker-a",
+        .now_ms = 2000,
+        .lease_ttl_ms = 5000,
+        .max_jobs = 4,
+    }));
+
+    const jobs = try service.manager.listSchemaRewriteJobs(alloc);
+    defer service.manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_ready, jobs[0].state);
+    try std.testing.expectEqual(@as(u64, 1), jobs[0].completed_row_count);
+    try std.testing.expectEqualStrings("", jobs[0].progress_row_key);
+    try std.testing.expectEqualStrings("", jobs[0].last_error);
+
+    const materialized = (try db.get(alloc, "doc:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(materialized);
+    try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
 }
 
 test "db direct schema apply rejects generated columns without deterministic backfill sources" {

@@ -28,6 +28,21 @@ const token_mod = @import("token.zig");
 
 const Token = token_mod.Token;
 
+pub fn relationalColumnForField(
+    schema: runtime_schema.TableSchema,
+    field: []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+) ?runtime_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (!std.mem.eql(u8, column.name, field)) continue;
+        if (expected_type) |field_type| {
+            if (column.field_type != field_type) return null;
+        }
+        return column;
+    }
+    return null;
+}
+
 pub fn runtimeSchemaForCatalogTableAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,

@@ -551,15 +551,7 @@ fn validateGraphMetricStatusCompatible(
     {
         return error.UnsupportedQueryRequest;
     }
-    if (!graphMetricEdgeFiltersEqual(existing.edge_filter, incoming.edge_filter)) return error.UnsupportedQueryRequest;
-}
-
-fn graphMetricEdgeFiltersEqual(a: graph_mod.GraphMetricEdgeFilter, b: graph_mod.GraphMetricEdgeFilter) bool {
-    if (a.mode != b.mode or a.types.len != b.types.len) return false;
-    for (a.types, b.types) |a_type, b_type| {
-        if (!std.mem.eql(u8, a_type, b_type)) return false;
-    }
-    return true;
+    if (!existing.edge_filter.equivalent(incoming.edge_filter)) return error.UnsupportedQueryRequest;
 }
 
 fn validateGraphMetricScoreNodesUnique(

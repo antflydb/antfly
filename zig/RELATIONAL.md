@@ -1047,8 +1047,31 @@ moves `SqlFunctionBindings`, routine expression binding metadata, `argN`
 substitution, duplicate/arity lookup, and null-input short-circuit helpers to
 the adapter expression layer. A follow-on cleanup routes DDL predicate literal
 parsing through `api/sql_adapter/value.zig` instead of carrying a second local
-token-slice parser in `relational_sql.zig`. The future larger slice can move
-the full row-expression parser once this contract is stable.
+token-slice parser in `relational_sql.zig`; the next grammar slice moves
+partial unique-predicate token grouping and atom parsing into
+`api/sql_adapter/grammar.zig` while keeping the runtime `UniquePredicate`
+contract unchanged. Parser-local forwarding wrappers for identifier lists and
+scalar JSON literals are removed as adapter facade calls replace them, with
+negative-number JSON literal parsing owned by `api/sql_adapter/value.zig`.
+Case-insensitive identifier-list uniqueness and disjointness checks move with
+the list grammar into `api/sql_adapter/grammar.zig`. The validating DDL
+constraint column-list entrypoints for primary keys, unique constraints,
+temporal `WITHOUT OVERLAPS` lists, and `INCLUDE` columns also live in
+`grammar.zig`, so `relational_sql.zig` no longer needs parser-local wrappers
+that parse a list and then re-run identifier-list validation. Mutation-path
+conflict validation for insert columns, dotted field paths, and JSON set paths
+now lives in `api/sql_adapter/lower_dml.zig`, with `relational_sql.zig` only
+adapting its parser-local temporary assignment structs to that shared DML
+surface. MERGE target-row usage checks for expressions and predicate groups
+also live in `lower_dml.zig`, so source-only clauses fail closed through
+adapter-owned DML rules instead of parser-local recursion. Basic runtime-column
+lookup moves to `api/sql_adapter/binder.zig` so parser validation, DML lowering,
+and later catalog binding use the same column-name and type matching helper.
+Row-expression equality and unique-expression duplicate validation move into
+`api/sql_adapter/lower_expr.zig`, so DDL index parsing, conflict-target parsing,
+and plan/fingerprint comparisons use one adapter-owned expression comparison
+surface. The future larger slice can move the full row-expression parser once
+this contract is stable.
 
 The internal flow is always:
 
@@ -4467,11 +4490,15 @@ Current PR status:
   `SchemaRewriteJobRecord` metadata with the target table, schema generation,
   action/reason, target column, and cloned typed row-expression AST so
   `ALTER TABLE ... USING` rewrite intent is durable catalog state rather than
-  SQL text or request-local metadata.
+  SQL text or request-local metadata; and owner-local DB maintenance exposes a
+  bounded schema-rewrite drain that lists projected metadata jobs, claims
+  declared or expired work through the catalog lifecycle, executes the typed
+  row-expression rewrite against local owner rows, then finishes or invalidates
+  the job through the same metadata lease owner.
 - Remaining: non-additive migration-equivalence compilation, broader
   trigger/function pattern compilation beyond updated-at policies,
-  catalog-owned rewrite/backfill job claiming, execution, progress tracking,
-  and schema-promotion gates, type-cast row transforms, ordered generated-column
+  routed/background schema-rewrite workers for provisioned and hosted ranges,
+  schema-promotion gates, type-cast row transforms, ordered generated-column
   dependency rewrites beyond the local append-only safe-source case, and
   unique/FK repair orchestration around row rewrites; full typed scalar
   expression trees for
@@ -4633,9 +4660,17 @@ so CTE-backed `UPDATE`, `DELETE`, `INSERT`, `TRUNCATE`, and `MERGE` subjects
 are writes while recursive CTE subjects fail closed. The parity corpus requires
 direct prepared `SELECT`, `INSERT`, `TRUNCATE`, DDL, and CTE-backed
 insert-source/update/delete/merge families to keep that metadata durable. They
-still fail closed when applied to storage until Antfly has a native prepared-plan
-cache keyed by typed plan fingerprints, parameter schemas, catalog epochs,
-authorization context, and invalidation rules. `DECLARE ... [BINARY]
+now route through `ApiHttpServer` into a session-scoped prepared-statement
+runtime: `PREPARE` records the statement name, parameter count, subject kind,
+and statement family for the SQL protocol session; duplicate names fail closed;
+`EXECUTE` verifies the prepared statement exists in the same session and that
+the argument count matches; `DEALLOCATE [PREPARE] name|ALL` removes registered
+session entries; and `DISCARD ALL` clears the same runtime state while resetting
+catalog-session defaults. The runtime intentionally stores typed metadata, not
+raw SQL text. Executing cached statement bodies still fails closed until Antfly
+has a native prepared-plan cache keyed by typed plan fingerprints, parameter
+schemas, catalog epochs, authorization context, and invalidation rules.
+`DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]
 cursor`, shorthand `FETCH cursor`, bare-count `FETCH n cursor`, and `CLOSE
 cursor|ALL` lower to typed cursor-portal intents that capture portal name,
@@ -5090,19 +5125,25 @@ audits as `copy_to`, and routes to the row-query export surface. The bridge also
 marks both directions as requiring an external SQL protocol stream so the SQL
 text cannot masquerade as payload. `COPY FROM STDIN` has an initial native CSV
 executor that converts the supplied stream into the row-batch API, and
-`ApiHttpServer.executeBulkSqlCopyFromStdinWithSession` resolves the SQL target
-through the current catalog session, checks the concrete table write permission,
-loads the relational schema for typed default/generated/check validation,
-validates imported rows against the authenticated identity's effective
-row-filter policy when one applies, and dispatches the resulting rows through
-the catalog-aware row-batch write source.
+`ApiHttpServer.executeBulkSqlWithSession` is the production SQL bulk-I/O
+entrypoint. It dispatches typed `COPY FROM STDIN` plans to an owned import
+result after resolving the SQL target through the current catalog session,
+checking the concrete table write permission, loading the relational schema for
+typed default/generated/check validation, validating imported rows against the
+authenticated identity's effective row-filter policy when one applies, and
+dispatching the resulting rows through the catalog-aware row-batch write
+source. The direction-specific `executeBulkSqlCopyFromStdinWithSession` helper
+is kept as a narrow compatibility wrapper over that same plan-level
+implementation.
 `COPY TO STDOUT` has the matching native CSV executor:
-`ApiHttpServer.executeBulkSqlCopyToStdoutWithSession` resolves the SQL target
-through the current catalog session, checks concrete table read permission,
-loads the relational schema, pushes the authenticated identity's effective
-row-filter policy into the catalog-aware rows-query read vtable, and serializes
-the selected result columns with `HEADER`, delimiter, quote, escape,
-null-marker, UTF-8 encoding, and `FORCE_QUOTE` semantics. The
+`ApiHttpServer.executeBulkSqlWithSession` returns an owned export stream after
+resolving the SQL target through the current catalog session, checking concrete
+table read permission, loading the relational schema, pushing the authenticated
+identity's effective row-filter policy into the catalog-aware rows-query read
+vtable, and serializing the selected result columns with `HEADER`, delimiter,
+quote, escape, null-marker, UTF-8 encoding, and `FORCE_QUOTE` semantics. The
+direction-specific `executeBulkSqlCopyToStdoutWithSession` helper is likewise a
+compatibility wrapper over the shared plan-level path. The
 decoder keeps per-field quote metadata, so default CSV `NULL ''` handling
 distinguishes unquoted empty fields from quoted empty strings and
 `FORCE_NULL`/`FORCE_NOT_NULL` follow PostgreSQL CSV semantics before row JSON
@@ -6579,6 +6620,17 @@ that can be passed to the metadata `finishSchemaRewriteJob` lifecycle request.
 Stale generations, unclaimed jobs, unsupported actions/reasons, invalid target
 columns, non-nullable null results, and unsupported expression shapes fail
 closed before any batch commit.
+The DB-level drain wraps that primitive in the metadata lifecycle: it lists
+projected schema rewrite jobs from an injected metadata service, claims
+declared or expired jobs with a bounded lease, executes the typed local
+rewrite, finishes successful jobs with row-count/progress metadata, and marks
+failed jobs invalid with the stable execution error token so bad catalog work
+does not spin indefinitely. Storage still does not store or interpret SQL text;
+only `SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross
+the boundary. The remaining production step is wiring that drain into
+provisioned/hosted background workers that route each range-local job to the
+current owner and then trigger schema compare-and-swap promotion once every
+required rewrite, rebuild, and validation record is complete.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from

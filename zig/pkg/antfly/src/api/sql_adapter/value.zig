@@ -58,10 +58,18 @@ pub fn parseSqlUntypedValueJsonAlloc(
     if (cursor.matchToken(.string)) |token| return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
     if (cursor.matchToken(.number)) |token| return try alloc.dupe(u8, token.text);
     if (cursor.matchToken(.minus) != null) {
-        const token = cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
-        return try std.fmt.allocPrint(alloc, "-{s}", .{token.text});
+        return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
     }
     return error.UnsupportedSqlShape;
+}
+
+pub fn parseSqlNegativeNumberJsonAfterMinusAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    const token = parser.matchToken(tokens, pos, .number) orelse return error.UnsupportedSqlShape;
+    return try std.fmt.allocPrint(alloc, "-{s}", .{token.text});
 }
 
 pub fn parseSqlTimestampLiteralNs(raw: []const u8) !i64 {
@@ -270,6 +278,34 @@ test "sql adapter value parses timestamp literals" {
     try std.testing.expectEqual(@as(i64, 1_000_000_000), try parseSqlTimestampLiteralNs("'1970-01-01T00:00:01Z'"));
     try std.testing.expectEqual(@as(i64, 0), try parseSqlTimestampLiteralNs("1970-01-01 01:00:00+01:00"));
     try std.testing.expectError(error.UnsupportedSqlShape, parseSqlTimestampLiteralNs("2026-02-29"));
+}
+
+test "sql adapter value parses scalar json literals" {
+    const alloc = std.testing.allocator;
+    const tokens = [_]Token{
+        .{ .kind = .identifier, .text = "true" },
+        .{ .kind = .string, .text = "active" },
+        .{ .kind = .minus, .text = "-" },
+        .{ .kind = .number, .text = "42" },
+    };
+
+    var bool_pos: usize = 0;
+    const bool_json = try parseSqlUntypedValueJsonAlloc(alloc, tokens[0..1], &bool_pos);
+    defer alloc.free(bool_json);
+    try std.testing.expectEqualStrings("true", bool_json);
+    try std.testing.expectEqual(@as(usize, 1), bool_pos);
+
+    var string_pos: usize = 0;
+    const string_json = try parseSqlUntypedValueJsonAlloc(alloc, tokens[1..2], &string_pos);
+    defer alloc.free(string_json);
+    try std.testing.expectEqualStrings("\"active\"", string_json);
+    try std.testing.expectEqual(@as(usize, 1), string_pos);
+
+    var negative_pos: usize = 0;
+    const negative_json = try parseSqlUntypedValueJsonAlloc(alloc, tokens[2..], &negative_pos);
+    defer alloc.free(negative_json);
+    try std.testing.expectEqualStrings("-42", negative_json);
+    try std.testing.expectEqual(@as(usize, 2), negative_pos);
 }
 
 test "sql adapter value parses interval literals" {
