@@ -3343,6 +3343,21 @@ const Parser = struct {
         };
     }
 
+    fn parenthesizedRowExpressionParserHooks(self: *@This()) sql_adapter.ParenthesizedRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseParenthesizedRowExpressionHook,
+        };
+    }
+
+    fn booleanNotRowExpressionParserHooks(self: *@This()) sql_adapter.BooleanNotRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_parenthesized_operand = parseParenthesizedBooleanRowExpressionHook,
+            .parse_operand = parseBooleanNotRowExpressionOperandHook,
+        };
+    }
+
     fn unaryNegativeRowExpressionParserHooks(self: *@This()) sql_adapter.UnaryNegativeRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3553,6 +3568,21 @@ const Parser = struct {
     fn parseRoutineExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseBooleanRowExpressionAlloc();
+    }
+
+    fn parseParenthesizedRowExpressionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseBooleanRowExpressionAlloc();
+    }
+
+    fn parseParenthesizedBooleanRowExpressionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseParenthesizedBooleanRowExpressionAlloc();
+    }
+
+    fn parseBooleanNotRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionOperandAlloc();
     }
 
     fn parseUnaryNegativeRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
@@ -16308,17 +16338,7 @@ const Parser = struct {
     }
 
     fn parseBooleanNotRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseBooleanNotExpressionStart(self.tokens, &self.pos);
-        const operand = if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos))
-            try self.parseParenthesizedBooleanRowExpressionAlloc()
-        else
-            try self.parseRowExpressionOperandAlloc();
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateBooleanRowExpression(operand);
-        const expression = try sql_adapter.wrapBooleanNotExpressionAlloc(self.alloc, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseBooleanNotRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.booleanNotRowExpressionParserHooks());
     }
 
     fn rowExpressionFieldSource(self: *@This()) db_mod.types.RelationalRowsExpressionFieldSource {
@@ -16326,23 +16346,11 @@ const Parser = struct {
     }
 
     fn parseParenthesizedRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expect(.lparen);
-        const expression = try self.parseBooleanRowExpressionAlloc();
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.expect(.rparen);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseParenthesizedRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.parenthesizedRowExpressionParserHooks());
     }
 
     fn parseParenthesizedBooleanRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expect(.lparen);
-        const expression = try self.parseBooleanRowExpressionAlloc();
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.expect(.rparen);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseParenthesizedRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.parenthesizedRowExpressionParserHooks());
     }
 
     fn parseUnaryNegativeRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
