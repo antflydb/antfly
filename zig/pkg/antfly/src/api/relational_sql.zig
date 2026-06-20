@@ -66,11 +66,16 @@ const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const ddlForeignKeyActionFromSyntax = sql_adapter.ddlForeignKeyActionFromSyntax;
 const ddlForeignKeyMatchFromSyntax = sql_adapter.ddlForeignKeyMatchFromSyntax;
 const ddlForeignKeyTimingFromSyntax = sql_adapter.ddlForeignKeyTimingFromSyntax;
+const expressionProjectionFromCoalesceAlloc = sql_adapter.expressionProjectionFromCoalesceAlloc;
 const freeAccessPredicateGroup = sql_adapter.freeAccessPredicateGroup;
 const freeAccessPredicateGroups = sql_adapter.freeAccessPredicateGroups;
+const freeArrayLengthProjections = sql_adapter.freeArrayLengthProjections;
 const freeArrayAny = sql_adapter.freeArrayAny;
 const freeArrayContains = sql_adapter.freeArrayContains;
 const freeArrayEq = sql_adapter.freeArrayEq;
+const freeCoalesceOperand = sql_adapter.freeCoalesceOperand;
+const freeCoalesceProjection = sql_adapter.freeCoalesceProjection;
+const freeCoalesceProjections = sql_adapter.freeCoalesceProjections;
 const freeExpression = sql_adapter.freeExpression;
 const freeExpressionArrayContains = sql_adapter.freeExpressionArrayContains;
 const freeExpressionArrayContainsOne = sql_adapter.freeExpressionArrayContainsOne;
@@ -82,7 +87,11 @@ const freeExpressionPredicateGroups = sql_adapter.freeExpressionPredicateGroups;
 const freeExpressionProjection = sql_adapter.freeExpressionProjection;
 const freeExpressionProjections = sql_adapter.freeExpressionProjections;
 const freeExpressionSlice = sql_adapter.freeExpressionSlice;
+const freeFieldAliasProjections = sql_adapter.freeFieldAliasProjections;
 const freeInPredicates = sql_adapter.freeInPredicates;
+const freeJoinOn = sql_adapter.freeJoinOn;
+const freeJoinProjections = sql_adapter.freeJoinProjections;
+const freeJsonExtract = sql_adapter.freeJsonExtract;
 const freeJsonContains = sql_adapter.freeJsonContains;
 const freeJsonPathEq = sql_adapter.freeJsonPathEq;
 const freeJsonPathExists = sql_adapter.freeJsonPathExists;
@@ -39253,20 +39262,6 @@ fn freeConflictClauses(alloc: std.mem.Allocator, clauses: []const Parser.Conflic
     for (clauses) |clause| freeConflictClause(alloc, clause);
 }
 
-fn freeJoinOn(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJoinOn) void {
-    for (values) |value| {
-        alloc.free(value.left_field);
-        alloc.free(value.right_field);
-    }
-}
-
-fn freeJoinProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJoinProjection) void {
-    for (values) |value| {
-        alloc.free(value.output);
-        alloc.free(value.field);
-    }
-}
-
 fn freeSelectItem(alloc: std.mem.Allocator, item: Parser.SelectItem) void {
     switch (item) {
         .field => |field| alloc.free(field),
@@ -39962,79 +39957,6 @@ fn expressionConditionsFromSimpleExpressionSetQueryBranchAlloc(
     return error.UnsupportedSqlShape;
 }
 
-fn freeJsonExtract(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsJsonExtractProjection) void {
-    for (values) |value| {
-        alloc.free(value.output);
-        alloc.free(value.field);
-        alloc.free(value.path);
-    }
-    if (values.len > 0) alloc.free(values);
-}
-
-fn freeArrayLengthProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsArrayLengthProjection) void {
-    for (values) |value| {
-        alloc.free(value.output);
-        alloc.free(value.field);
-    }
-    if (values.len > 0) alloc.free(values);
-}
-
-fn freeCoalesceOperand(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsCoalesceOperand) void {
-    switch (value.kind) {
-        .field => if (value.field.len > 0) alloc.free(value.field),
-        .value => if (value.value_json.len > 0) alloc.free(value.value_json),
-    }
-}
-
-fn freeCoalesceProjection(alloc: std.mem.Allocator, value: db_mod.types.RelationalRowsCoalesceProjection) void {
-    alloc.free(value.output);
-    for (value.operands) |operand| freeCoalesceOperand(alloc, operand);
-    if (value.operands.len > 0) alloc.free(value.operands);
-}
-
-fn freeCoalesceProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsCoalesceProjection) void {
-    for (values) |value| freeCoalesceProjection(alloc, value);
-    if (values.len > 0) alloc.free(values);
-}
-
-fn expressionProjectionFromCoalesceAlloc(
-    alloc: std.mem.Allocator,
-    projection: db_mod.types.RelationalRowsCoalesceProjection,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const output = try alloc.dupe(u8, projection.output);
-    var output_transferred = false;
-    errdefer if (!output_transferred) alloc.free(output);
-
-    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, projection.operands.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
-        alloc.free(operands);
-    }
-    for (projection.operands) |operand| {
-        operands[initialized] = switch (operand.kind) {
-            .field => .{
-                .kind = .field,
-                .field = try alloc.dupe(u8, operand.field),
-            },
-            .value => .{
-                .kind = .value,
-                .value_json = try alloc.dupe(u8, operand.value_json),
-            },
-        };
-        initialized += 1;
-    }
-
-    output_transferred = true;
-    return .{
-        .output = output,
-        .expression = .{
-            .kind = .coalesce,
-            .operands = operands,
-        },
-    };
-}
-
 fn cloneNamedWindowDefinitionAlloc(
     alloc: std.mem.Allocator,
     value: Parser.NamedWindowSpec,
@@ -40056,14 +39978,6 @@ fn cloneNamedWindowDefinitionAlloc(
         .order_by = order_by,
         .frame = value.frame,
     };
-}
-
-fn freeFieldAliasProjections(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsFieldAliasProjection) void {
-    for (values) |value| {
-        alloc.free(value.output);
-        alloc.free(value.field);
-    }
-    if (values.len > 0) alloc.free(values);
 }
 
 fn freeNamedWindowDefinition(alloc: std.mem.Allocator, value: Parser.NamedWindowDefinition) void {
