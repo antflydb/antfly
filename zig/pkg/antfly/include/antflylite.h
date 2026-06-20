@@ -44,6 +44,32 @@ typedef struct antfly_buffer {
     size_t len;
 } antfly_buffer;
 
+#define ANTFLY_LITE_OPEN_MODE_WRITER 0u
+#define ANTFLY_LITE_OPEN_MODE_READONLY 1u
+#define ANTFLY_LITE_OPEN_MODE_STATUS_ONLY 2u
+
+#define ANTFLY_LITE_PROFILE_NATIVE 0u
+#define ANTFLY_LITE_PROFILE_HOSTED 1u
+
+#define ANTFLY_LITE_OPEN_FLAG_NO_SYNC (1u << 0)
+#define ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP (1u << 1)
+
+typedef struct antfly_lite_open_options {
+    uint32_t abi_size;
+    uint32_t open_mode;
+    uint32_t profile;
+    uint32_t flags;
+    uint64_t map_size;
+    bool ttl_cleanup_enabled;
+    bool ttl_cleanup_lease_owned;
+    uint32_t ttl_cleanup_batch_size;
+    antfly_slice ttl_cleanup_owner_id;
+    uint64_t ttl_cleanup_lease_ttl_ms;
+    uint64_t ttl_cleanup_interval_ms;
+    uint64_t ttl_cleanup_grace_period_ns;
+    uint64_t reserved[8];
+} antfly_lite_open_options;
+
 typedef struct antfly_write_intent {
     antfly_slice key;
     antfly_slice value;
@@ -152,6 +178,11 @@ const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
 
 antfly_error_code antfly_lite_open(const char *path, void **out_handle);
+antfly_error_code antfly_lite_open_with_options(
+    const char *path,
+    const antfly_lite_open_options *options,
+    void **out_handle
+);
 antfly_error_code antfly_lite_open_hosted(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_readonly(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_status_only(const char *path, void **out_handle);

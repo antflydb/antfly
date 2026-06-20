@@ -1596,10 +1596,73 @@ pub export fn antfly_error_code_description(code: c_int) [*:0]const u8 {
     return capi.errorCodeDescription(code);
 }
 
+const lite_open_known_flags = capi.lite_open_flag_no_sync | capi.lite_open_flag_ttl_cleanup;
+
+const LiteResolvedOpenOptions = struct {
+    open_mode: db_mod.OpenOptions.OpenMode = .writer,
+    profile: lite_backend.Profile = .native,
+    map_size: ?usize = null,
+    no_sync: bool = false,
+    ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
+};
+
+fn validateLiteOpenOptionsReserved(options: *const capi.LiteOpenOptions) !void {
+    for (options.reserved) |word| {
+        if (word != 0) return error.InvalidArgument;
+    }
+}
+
+fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolvedOpenOptions {
+    const options = options_ptr orelse return .{};
+    if (options.abi_size < @sizeOf(capi.LiteOpenOptions)) return error.InvalidArgument;
+    if ((options.flags & ~lite_open_known_flags) != 0) return error.InvalidArgument;
+    try validateLiteOpenOptionsReserved(options);
+
+    const open_mode: db_mod.OpenOptions.OpenMode = switch (options.open_mode) {
+        capi.lite_open_mode_writer => .writer,
+        capi.lite_open_mode_readonly => .query_readonly,
+        capi.lite_open_mode_status_only => .status_only,
+        else => return error.InvalidArgument,
+    };
+    const profile: lite_backend.Profile = switch (options.profile) {
+        capi.lite_profile_native => .native,
+        capi.lite_profile_hosted => .hosted,
+        else => return error.InvalidArgument,
+    };
+    if (profile == .hosted and (options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
+        return error.InvalidArgument;
+    }
+    if (options.map_size > std.math.maxInt(usize)) return error.InvalidArgument;
+
+    var resolved = LiteResolvedOpenOptions{
+        .open_mode = open_mode,
+        .profile = profile,
+        .map_size = if (options.map_size == 0) null else @as(usize, @intCast(options.map_size)),
+        .no_sync = (options.flags & capi.lite_open_flag_no_sync) != 0,
+    };
+    if ((options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
+        if (options.ttl_cleanup_owner_id.ptr == null and options.ttl_cleanup_owner_id.len != 0) {
+            return error.InvalidArgument;
+        }
+        var ttl_cfg = db_mod.ttl_runtime.Config{
+            .enabled = options.ttl_cleanup_enabled,
+            .lease_owned = options.ttl_cleanup_lease_owned,
+        };
+        if (options.ttl_cleanup_owner_id.len != 0) {
+            ttl_cfg.owner_id = options.ttl_cleanup_owner_id.ptr.?[0..options.ttl_cleanup_owner_id.len];
+        }
+        if (options.ttl_cleanup_lease_ttl_ms != 0) ttl_cfg.lease_ttl_ms = options.ttl_cleanup_lease_ttl_ms;
+        if (options.ttl_cleanup_interval_ms != 0) ttl_cfg.interval_ms = options.ttl_cleanup_interval_ms;
+        if (options.ttl_cleanup_batch_size != 0) ttl_cfg.batch_size = options.ttl_cleanup_batch_size;
+        if (options.ttl_cleanup_grace_period_ns != 0) ttl_cfg.grace_period_ns = options.ttl_cleanup_grace_period_ns;
+        resolved.ttl_cleanup = ttl_cfg;
+    }
+    return resolved;
+}
+
 fn openLiteHandle(
     path: []const u8,
-    open_mode: db_mod.OpenOptions.OpenMode,
-    profile: lite_backend.Profile,
+    resolved: LiteResolvedOpenOptions,
     out_handle: *?*anyopaque,
 ) capi.ErrorCode {
     out_handle.* = null;
@@ -1608,15 +1671,18 @@ fn openLiteHandle(
     errdefer alloc.destroy(handle);
 
     var backend = lite_backend.Handle.open(alloc, path, .{
-        .read_only = open_mode == .query_readonly or open_mode == .status_only,
+        .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
     }) catch |err| return capi.mapError(err);
     errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
-        .open_mode = open_mode,
+        .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
     };
-    if (profile == .hosted) {
+    if (resolved.map_size) |map_size| opts.map_size = map_size;
+    opts.no_sync = resolved.no_sync;
+    if (resolved.ttl_cleanup) |ttl_cleanup| opts.ttl_cleanup = ttl_cleanup;
+    if (resolved.profile == .hosted) {
         opts.executor = .{ .backend = .manual };
         opts.ttl_cleanup = .{ .enabled = false };
         opts.transaction_recovery = .{ .enabled = false };
@@ -1628,26 +1694,32 @@ fn openLiteHandle(
         .alloc = alloc,
         .db = db,
         .owned_lite_backend = backend,
-        .lite_profile = profile,
+        .lite_profile = resolved.profile,
     };
     out_handle.* = handle;
     return .ok;
 }
 
 pub export fn antfly_lite_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
-    return openLiteHandle(std.mem.span(path), .writer, .native, out_handle);
+    return openLiteHandle(std.mem.span(path), .{}, out_handle);
+}
+
+pub export fn antfly_lite_open_with_options(path: [*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: *?*anyopaque) capi.ErrorCode {
+    out_handle.* = null;
+    const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
+    return openLiteHandle(std.mem.span(path), resolved, out_handle);
 }
 
 pub export fn antfly_lite_open_hosted(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
-    return openLiteHandle(std.mem.span(path), .writer, .hosted, out_handle);
+    return openLiteHandle(std.mem.span(path), .{ .profile = .hosted }, out_handle);
 }
 
 pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
-    return openLiteHandle(std.mem.span(path), .query_readonly, .native, out_handle);
+    return openLiteHandle(std.mem.span(path), .{ .open_mode = .query_readonly }, out_handle);
 }
 
 pub export fn antfly_lite_open_status_only(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
-    return openLiteHandle(std.mem.span(path), .status_only, .native, out_handle);
+    return openLiteHandle(std.mem.span(path), .{ .open_mode = .status_only }, out_handle);
 }
 
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
@@ -6245,6 +6317,85 @@ test "capi lite exposes hosted and status-only profiles" {
     defer antfly_db_buffer_free(stats.ptr, stats.len);
     try std.testing.expect(std.mem.indexOf(u8, stats.ptr.?[0..stats.len], "\"doc_count\":") != null);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(status_handle, &writes, writes.len, null, 0, 2_000, 0));
+}
+
+test "capi lite open options validate and configure ttl cleanup" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestAflitePath(alloc, "capi-lite-open-options");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var sentinel: u8 = 0;
+    var invalid_handle: ?*anyopaque = &sentinel;
+    var invalid_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .open_mode = 99,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &invalid_options, &invalid_handle));
+    try std.testing.expect(invalid_handle == null);
+
+    var hosted_ttl_handle: ?*anyopaque = &sentinel;
+    var hosted_ttl_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .profile = capi.lite_profile_hosted,
+        .flags = capi.lite_open_flag_ttl_cleanup,
+        .ttl_cleanup_enabled = true,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &hosted_ttl_options, &hosted_ttl_handle));
+    try std.testing.expect(hosted_ttl_handle == null);
+
+    const owner_id = "capi-ttl-owner";
+    var open_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_no_sync | capi.lite_open_flag_ttl_cleanup,
+        .ttl_cleanup_enabled = true,
+        .ttl_cleanup_lease_owned = true,
+        .ttl_cleanup_batch_size = 8,
+        .ttl_cleanup_owner_id = .{ .ptr = owner_id, .len = owner_id.len },
+        .ttl_cleanup_lease_ttl_ms = 250,
+        .ttl_cleanup_interval_ms = 10,
+        .ttl_cleanup_grace_period_ns = 1,
+    };
+
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &open_options, &handle));
+    defer antfly_db_close(handle);
+
+    const schema_json =
+        \\{"default_type":"doc","ttl_duration_ns":1,"ttl_field":"expires_at","document_schemas":{"doc":{"schema":{"type":"object","properties":{"expires_at":{"type":"datetime"},"title":{"type":"text"}}}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle, .{
+        .ptr = schema_json,
+        .len = schema_json.len,
+    }));
+
+    const doc_json = "{\"title\":\"gone\",\"expires_at\":1}";
+    const writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:expired", .len = "doc:expired".len },
+        .value = .{ .ptr = doc_json, .len = doc_json.len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(handle, &writes, writes.len, null, 0, 1, 0));
+
+    var stats: capi.Buffer = .{};
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        antfly_db_buffer_free(stats.ptr, stats.len);
+        stats = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(handle, &stats));
+        const stats_json = stats.ptr.?[0..stats.len];
+        if (std.mem.indexOf(u8, stats_json, "\"enabled\":true") != null and
+            std.mem.indexOf(u8, stats_json, "\"lease_owned\":true") != null and
+            std.mem.indexOf(u8, stats_json, "\"deleted_docs\":1") != null and
+            std.mem.indexOf(u8, stats_json, "\"scanned_timestamps\":1") != null)
+        {
+            break;
+        }
+        antfly.platform_clock.Clock.real().sleepMs(10);
+    }
+    defer antfly_db_buffer_free(stats.ptr, stats.len);
+    try std.testing.expect(attempts < 200);
 }
 
 test "capi execute graph queries honors identity read generation" {
