@@ -163,10 +163,10 @@ pub fn stageAfbRestoreBackup(
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
-    try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable, "application/vnd.antfly.backup");
-
     const manifest = try portableFileManifest(allocator, portable, table_name, backup_id, snapshot_path);
     defer freeManifest(allocator, manifest);
+
+    try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable, "application/vnd.antfly.backup");
     try backups_api.writeManifestToLocation(allocator, &location, &manifest);
 
     return .{
@@ -476,6 +476,15 @@ fn readFileAlloc(allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8
     return try reader.interface.readAlloc(allocator, @intCast(size));
 }
 
+fn fileExists(io: std.Io, path: []const u8) bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch return false;
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch return false;
+    }
+    return true;
+}
+
 test "lite restore staging preserves portable afb schema index and enrichment metadata" {
     const allocator = std.testing.allocator;
 
@@ -556,6 +565,44 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     const enrichments = parsed_indexes.value.object.get("enrichments") orelse return error.TestExpectedEqual;
     try std.testing.expect(enrichments == .array);
     try std.testing.expectEqual(@as(usize, 1), enrichments.array.items.len);
+}
+
+test "lite restore staging preflights afb before publishing staged files" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const malformed_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/malformed.afb", .{tmp.sub_path});
+    defer allocator.free(malformed_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/malformed-staging-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+    const staged_afb_path = try std.fmt.allocPrint(allocator, "{s}/bad-input.afb", .{backup_root});
+    defer allocator.free(staged_afb_path);
+    const staged_manifest_path = try backups_api.metadataPath(allocator, backup_root, "bad-input");
+    defer allocator.free(staged_manifest_path);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(io, malformed_path, .{ .truncate = true });
+        defer file.close(io);
+        try file.writePositionalAll(io, "not an afb", 0);
+        try file.sync(io);
+    }
+
+    try std.testing.expectError(
+        error.EndOfStream,
+        stageAfbRestoreBackup(allocator, malformed_path, "docs", "bad-input", location),
+    );
+    try std.testing.expect(!fileExists(io, staged_afb_path));
+    try std.testing.expect(!fileExists(io, staged_manifest_path));
 }
 
 test "lite restore staging accepts aflite input for normal restore" {
