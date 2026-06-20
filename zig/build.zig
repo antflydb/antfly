@@ -6432,6 +6432,8 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_lite_go_tests.step);
     lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
+    lite_dev_step.dependOn(&install_lite_wasm_profile.step);
+    lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
     lite_dev_step.dependOn(&run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
