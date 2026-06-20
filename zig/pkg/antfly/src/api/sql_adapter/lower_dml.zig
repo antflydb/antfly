@@ -199,6 +199,44 @@ pub const ConflictPipeConcatExpressionParserHooks = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const ConflictArithmeticExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictCoalesceExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictNullifExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictUnaryExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const JoinedMutationJsonSetSqlValueParserHooks = struct {
     ptr: *anyopaque,
     parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
@@ -1467,6 +1505,171 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
     value_transferred = true;
 }
 
+pub fn parseJoinedMutationSetAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    target_alias: []const u8,
+    pending_joined_source_alias: ?[]const u8,
+    source_assignments: *std.ArrayListUnmanaged(JoinedMutationSourceAssignment),
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    saw_primary_key_assignment: *bool,
+    hooks: JoinedMutationAssignmentValueParserHooks,
+) !void {
+    if (parser.peekKind(tokens, pos.*, .lparen)) {
+        return try parseJoinedMutationRowAssignmentAlloc(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            joined_source_schema,
+            params,
+            target_alias,
+            pending_joined_source_alias,
+            source_assignments,
+            patch,
+            patch_expr,
+            json_set,
+            saw_primary_key_assignment,
+            hooks,
+        );
+    }
+    return try parseJoinedMutationScalarAssignmentAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        joined_source_schema,
+        params,
+        target_alias,
+        pending_joined_source_alias,
+        source_assignments,
+        patch,
+        patch_expr,
+        json_set,
+        saw_primary_key_assignment,
+        hooks,
+    );
+}
+
+fn parseJoinedMutationRowAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    target_alias: []const u8,
+    pending_joined_source_alias: ?[]const u8,
+    source_assignments: *std.ArrayListUnmanaged(JoinedMutationSourceAssignment),
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    saw_primary_key_assignment: *bool,
+    hooks: JoinedMutationAssignmentValueParserHooks,
+) !void {
+    try parser.expectToken(tokens, pos, .lparen);
+    var targets = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (targets.items) |target| {
+            if (target.len != 0) alloc.free(target);
+        }
+        targets.deinit(alloc);
+    }
+    while (true) {
+        const target = try parseJoinedMutationTargetFieldAlloc(alloc, tokens, pos, target_alias);
+        var target_transferred = false;
+        errdefer if (!target_transferred) alloc.free(target);
+        try targets.append(alloc, target);
+        target_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (targets.items.len == 0) return error.UnsupportedSqlShape;
+    try grammar.validateSqlIdentifierListUnique(targets.items);
+    try parser.expectToken(tokens, pos, .rparen);
+    try parser.expectToken(tokens, pos, .eq);
+    _ = parser.matchKeyword(tokens, pos, "row");
+    try parser.expectToken(tokens, pos, .lparen);
+
+    const primary_key = schema.primary_key orelse return error.InvalidSqlCatalog;
+    for (targets.items, 0..) |target, i| {
+        const target_column = binder.relationalColumnForField(schema, target, null) orelse return error.InvalidSqlCatalog;
+        if (binder.primaryKeyContains(primary_key, target)) saw_primary_key_assignment.* = true;
+        var target_transferred = false;
+        try parseJoinedMutationAssignmentValueAlloc(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            joined_source_schema,
+            params,
+            target,
+            target_column,
+            target_alias,
+            pending_joined_source_alias,
+            source_assignments,
+            patch,
+            patch_expr,
+            json_set,
+            &target_transferred,
+            hooks,
+        );
+        if (target_transferred) targets.items[i] = "";
+        if (i + 1 < targets.items.len) {
+            try parser.expectToken(tokens, pos, .comma);
+        }
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+}
+
+fn parseJoinedMutationScalarAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    target_alias: []const u8,
+    pending_joined_source_alias: ?[]const u8,
+    source_assignments: *std.ArrayListUnmanaged(JoinedMutationSourceAssignment),
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    saw_primary_key_assignment: *bool,
+    hooks: JoinedMutationAssignmentValueParserHooks,
+) !void {
+    const target = try parseJoinedMutationTargetFieldAlloc(alloc, tokens, pos, target_alias);
+    var target_transferred = false;
+    defer if (!target_transferred) alloc.free(target);
+    const target_column = binder.relationalColumnForField(schema, target, null) orelse return error.InvalidSqlCatalog;
+    const primary_key = schema.primary_key orelse return error.InvalidSqlCatalog;
+    if (binder.primaryKeyContains(primary_key, target)) saw_primary_key_assignment.* = true;
+    try parser.expectToken(tokens, pos, .eq);
+    try parseJoinedMutationAssignmentValueAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        joined_source_schema,
+        params,
+        target,
+        target_column,
+        target_alias,
+        pending_joined_source_alias,
+        source_assignments,
+        patch,
+        patch_expr,
+        json_set,
+        &target_transferred,
+        hooks,
+    );
+}
+
 pub fn parseMergeTargetFieldOwnedAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1737,6 +1940,158 @@ pub fn parseConflictPipeConcatExpressionRestAlloc(
     }
     if (operands.items.len < 2) return error.UnsupportedSqlShape;
     return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .concat, &operands);
+}
+
+pub fn parseConflictArithmeticExpressionRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    lhs: db_mod.types.RelationalRowsExpression,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    min_precedence: u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictArithmeticExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var current = lhs;
+    var current_owned = true;
+    errdefer if (current_owned) freeExpression(alloc, current);
+
+    while (lower_expr.peekArithmeticOperator(tokens, pos.*)) |op| {
+        if (op.precedence < min_precedence) break;
+        _ = parser.matchToken(tokens, pos, op.token) orelse unreachable;
+        if (lower_expr.peekSqlIntervalExpressionSyntax(tokens, pos.*)) {
+            try type_context.validateNumericOrDatetimeRowExpression(current);
+            const interval = try sql_value.parseSqlIntervalLiteral(tokens, pos);
+            const next = try lower_expr.buildIntervalLiteralArithmeticAlloc(alloc, current, op.kind, interval);
+            current_owned = false;
+            current = next;
+            current_owned = true;
+            try type_context.validateNumericRowExpression(current);
+            continue;
+        }
+
+        var rhs = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+        var rhs_owned = true;
+        errdefer if (rhs_owned) freeExpression(alloc, rhs);
+
+        while (lower_expr.peekArithmeticOperator(tokens, pos.*)) |next_op| {
+            if (next_op.precedence <= op.precedence) break;
+            rhs_owned = false;
+            rhs = try parseConflictArithmeticExpressionRestAlloc(alloc, tokens, pos, rhs, column, insert_columns, next_op.precedence, type_context, hooks);
+            rhs_owned = true;
+        }
+
+        const expression = try lower_expr.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
+        current_owned = false;
+        rhs_owned = false;
+        current = expression;
+        current_owned = true;
+        try type_context.validateNumericRowExpression(current);
+    }
+
+    current_owned = false;
+    return current;
+}
+
+pub fn parseConflictCoalesceExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    hooks: ConflictCoalesceExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try lower_expr.parseCoalesceFunctionCallStart(tokens, pos);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, expected_type);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (operands.items.len == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+
+    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .coalesce, &operands);
+}
+
+pub fn parseConflictNullifExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    hooks: ConflictNullifExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try lower_expr.parseNullifFunctionCallStart(tokens, pos);
+    const lhs = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+    try parser.expectToken(tokens, pos, .comma);
+    const rhs = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .nullif, lhs, rhs);
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictLengthExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
+    const kind = try lower_expr.parseTextLengthFunctionCallStart(tokens, pos);
+    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateTextRowExpression(operand);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    operand_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictAsciiExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
+    try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, .ascii);
+    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateTextRowExpression(operand);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, .ascii, operand);
+    operand_transferred = true;
+    return expression;
 }
 
 pub fn parseMergeArmConditionAlloc(
