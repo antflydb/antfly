@@ -2048,10 +2048,14 @@ fn wipeBufferBytes(buffer: capi.Buffer) void {
     std.crypto.secureZero(u8, buffer.ptr.?[0..buffer.len]);
 }
 
-pub export fn antfly_buffer_free_zero(buffer: ?*capi.Buffer) void {
+pub export fn antfly_db_buffer_free_zero(buffer: ?*capi.Buffer) void {
     const out = buffer orelse return;
     wipeBufferBytes(out.*);
     antfly_buffer_free(out);
+}
+
+pub export fn antfly_buffer_free_zero(buffer: ?*capi.Buffer) void {
+    antfly_db_buffer_free_zero(buffer);
 }
 
 test "capi zero buffer helper wipes bytes before free" {
@@ -2059,6 +2063,11 @@ test "capi zero buffer helper wipes bytes before free" {
     wipeBufferBytes(.{ .ptr = &bytes, .len = bytes.len });
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, &bytes);
     wipeBufferBytes(.{});
+
+    var empty: capi.Buffer = .{};
+    antfly_db_buffer_free_zero(&empty);
+    try std.testing.expect(empty.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 pub export fn antfly_db_dense_search_result_free(result: *capi.DenseSearchResult) void {
@@ -6283,7 +6292,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_runtime_configured\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"local_runtime_available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
-    antfly_buffer_free_zero(&status);
+    antfly_db_buffer_free_zero(&status);
     try std.testing.expect(status.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), status.len);
 
