@@ -102,11 +102,11 @@ file format, the selected engine, the v1 format version, page size, and active
 checkpoint sequence. That makes the public native `.aflite` path observable and
 keeps internal bridge profiles from being mistaken for the v1 contract.
 
-`antfly lite serve` is optional convenience mode. It should expose a local
-single-node HTTP API for development and migration testing, but the primary
-contract is embedded use.
-The base `lite-core` CLI may recognize the command and return a clear
-unsupported error until the `lite-dev` HTTP serve profile is wired.
+`antfly lite serve` is optional convenience mode. It should expose a narrow
+local single-node HTTP API under `/lite/v1` for development, SDK smoke tests,
+and migration testing, but the primary contract is embedded use. It should not
+pretend to be the clustered `/db/v1` service API unless a future compatibility
+profile is deliberately added.
 
 ### Embedded Library
 
@@ -171,13 +171,15 @@ same way. Neither should be the public Lite v1 contract.
 ### Compatibility Policy
 
 Because this is new, unreleased code, v1 should not carry a legacy fallback,
-pre-release importer, v0 directory reader, or silent LSM-container upgrade path.
-`.aflite` readers should accept the documented v1 format and reject unknown
-versions loudly. Recovery from an older complete checkpoint root inside the same
-v1 file is crash recovery, not legacy compatibility; a file with no complete v1
-checkpoint should fail with an explicit integrity error. Compatibility branches
-should only be added after a format has shipped and users can reasonably have
-files that need preservation.
+pre-release importer, v0 directory reader, silent LSM-container upgrade path, or
+prototype-to-v1 auto-migrator. Prototype files can be recreated from tests or
+explicit exports while the format is still pre-release. `.aflite` readers should
+accept the documented v1 format and reject unknown versions loudly. Recovery
+from an older complete checkpoint root inside the same v1 file is crash
+recovery, not legacy compatibility; a file with no complete v1 checkpoint should
+fail with an explicit integrity error. Compatibility branches should only be
+added after a format has shipped and users can reasonably have files that need
+preservation.
 
 Internal bridge profiles are explicit developer/test engine selections, not
 compatibility modes. The default `auto` path should never inspect a failed
@@ -524,10 +526,11 @@ Packages:
 
 Build profiles:
 
-- `lite-core`: embedded database and indexes, no heavyweight inference runtime.
+- `lite-core`: embedded database, indexes, CLI, and narrow `/lite/v1` local
+  serve mode, with no heavyweight inference runtime.
 - `lite-full`: embedded database plus local inference runtime.
 - `lite-wasm`: hosted/manual maintenance profile.
-- `lite-dev`: includes `antfly lite serve` and debug/status tooling.
+- `lite-dev`: debug/status tooling and compatibility experiments.
 
 ## Testing
 
@@ -636,8 +639,6 @@ query-visible results should match within documented index rebuild semantics.
 ## Open Questions
 
 - Which language binding should be first after Zig and C?
-- Should `antfly lite serve` expose the full normal Antfly HTTP API or a narrow
-  local-only subset?
 - Which enrichment artifacts are portable enough to backup/restore directly,
   and which should always be rebuilt?
 - What is the minimum local inference package that is small enough for Lite

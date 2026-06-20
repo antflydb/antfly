@@ -17,6 +17,7 @@ const antfly = @import("antfly-zig");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
 const lite_restore_staging = @import("lite_restore_staging.zig");
+const platform_sync = @import("antfly_platform").sync;
 const fs_paths = antfly.common.fs_paths;
 
 const Allocator = std.mem.Allocator;
@@ -28,6 +29,8 @@ const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
+
+var active_lite_http_state: ?*LiteHttpState = null;
 
 const LiteDb = struct {
     backend: antfly.lite.backend.Handle,
@@ -786,14 +789,42 @@ const ServeOptions = struct {
     addr: []const u8 = "127.0.0.1:8080",
 };
 
-fn serve(_: Allocator, _: std.Io, args: *std.process.Args.Iterator) !void {
+const LiteHttpState = struct {
+    lite: *LiteDb,
+    mutex: std.atomic.Mutex = .unlocked,
+};
+
+const LiteListenAddress = struct {
+    host: []const u8,
+    port: u16,
+};
+
+fn serve(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const opts = try parseServeOptions(args);
     try requireAflitePath(opts.path);
-    std.debug.print(
-        "error: antfly lite serve is planned but not implemented yet; use the embedded API or CLI commands for this build\n",
-        .{},
-    );
-    return error.UnsupportedLiteServe;
+
+    const listen = try parseLiteListenAddress(opts.addr);
+    var lite = try LiteDb.open(allocator, opts.path, .writer);
+    defer lite.close();
+
+    var state = LiteHttpState{ .lite = &lite };
+    if (active_lite_http_state != null) return error.UnsupportedLiteServe;
+    active_lite_http_state = &state;
+    defer active_lite_http_state = null;
+
+    var server = httpx.Server.initWithConfig(allocator, io, .{
+        .host = listen.host,
+        .port = listen.port,
+        .max_body_size = max_json_file_bytes,
+    });
+    defer server.deinit();
+
+    try registerLiteHttpRoutes(&server);
+    try server.bind();
+    if (server.boundAddress()) |addr| {
+        std.debug.print("antfly lite serving {s} on http://{}\n", .{ opts.path, addr });
+    }
+    try server.listen();
 }
 
 fn parseServeOptions(args: *std.process.Args.Iterator) !ServeOptions {
@@ -814,6 +845,292 @@ fn parseServeOptions(args: *std.process.Args.Iterator) !ServeOptions {
         }
     }
     return opts;
+}
+
+fn parseLiteListenAddress(addr: []const u8) !LiteListenAddress {
+    const sep = std.mem.lastIndexOfScalar(u8, addr, ':') orelse return error.InvalidArguments;
+    if (sep == 0 or sep + 1 >= addr.len) return error.InvalidArguments;
+    const port = try std.fmt.parseInt(u16, addr[sep + 1 ..], 10);
+    return .{ .host = addr[0..sep], .port = port };
+}
+
+fn registerLiteHttpRoutes(server: *httpx.Server) !void {
+    try server.get("/healthz", liteHttpHealth);
+    try server.get("/lite/v1/status", liteHttpStatus);
+    try server.get("/lite/v1/capabilities", liteHttpCapabilities);
+    try server.post("/lite/v1/batch", liteHttpBatch);
+    try server.post("/lite/v1/lookup/:key", liteHttpLookup);
+    try server.post("/lite/v1/scan", liteHttpScan);
+    try server.post("/lite/v1/query", liteHttpQuery);
+    try server.get("/lite/v1/indexes", liteHttpIndexList);
+    try server.post("/lite/v1/indexes", liteHttpIndexCreate);
+    try server.delete("/lite/v1/indexes/:name", liteHttpIndexDrop);
+    try server.get("/lite/v1/enrichments", liteHttpEnrichmentList);
+    try server.post("/lite/v1/enrichments", liteHttpEnrichmentCreate);
+    try server.delete("/lite/v1/enrichments/:kind/:name", liteHttpEnrichmentDrop);
+    try server.get("/lite/v1/schema", liteHttpSchemaGet);
+    try server.put("/lite/v1/schema", liteHttpSchemaSet);
+    try server.post("/lite/v1/run-until-idle", liteHttpRunUntilIdle);
+    try server.get("/lite/v1/check", liteHttpCheck);
+    try server.post("/lite/v1/compact", liteHttpCompact);
+    try server.post("/lite/v1/vacuum", liteHttpVacuum);
+}
+
+fn liteHttpState(ctx: *httpx.Context) !*LiteHttpState {
+    return active_lite_http_state orelse {
+        _ = ctx;
+        return error.LiteHttpServerUnavailable;
+    };
+}
+
+fn lockLiteHttpState(state: *LiteHttpState) void {
+    platform_sync.lockYielding(&state.mutex);
+}
+
+fn liteHttpJson(ctx: *httpx.Context, status_code: u16, body: []const u8) !httpx.Response {
+    _ = ctx.response.status(status_code);
+    _ = try ctx.response.header("Content-Type", "application/json");
+    _ = ctx.response.body(body);
+    return ctx.response.build();
+}
+
+fn liteHttpError(ctx: *httpx.Context, err: anyerror) anyerror!httpx.Response {
+    const status_code: u16 = switch (err) {
+        error.FileNotFound, error.NotFound => 404,
+        error.WouldBlock, error.WriterLocked, error.FileBusy => 409,
+        error.InvalidArguments,
+        error.InvalidArgument,
+        error.InvalidQueryRequest,
+        error.UnsupportedQueryRequest,
+        error.UnsupportedLiteServe,
+        error.InvalidNativeMagic,
+        error.TruncatedNativeHeader,
+        error.UnsupportedNativeFormatVersion,
+        error.InvalidNativeHeaderSize,
+        error.NativeHeaderChecksumMismatch,
+        error.InvalidNativePageSize,
+        error.InvalidNativeCheckpoint,
+        error.TruncatedNativeFile,
+        error.EndOfStream,
+        error.Truncated,
+        error.InvalidMagic,
+        error.HeaderCrcMismatch,
+        error.UnsupportedVersion,
+        error.BlockCrcMismatch,
+        => 400,
+        else => 500,
+    };
+    var buf: [256]u8 = undefined;
+    const body = std.fmt.bufPrint(&buf, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch "{\"error\":\"internal\"}";
+    return liteHttpJson(ctx, status_code, body);
+}
+
+fn liteHttpRequestBody(ctx: *httpx.Context) ![]const u8 {
+    return (try ctx.body()) orelse "";
+}
+
+fn liteHttpHealth(ctx: *httpx.Context) anyerror!httpx.Response {
+    return liteHttpJson(ctx, 200, "{\"status\":\"ok\"}");
+}
+
+fn liteHttpStatus(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const json = statusJson(ctx.allocator, state.lite, .native) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpCapabilities(ctx: *httpx.Context) anyerror!httpx.Response {
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, antfly.lite.backend.capabilitiesForProfile(.native), .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpBatch(ctx: *httpx.Context) anyerror!httpx.Response {
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const json = batchJson(ctx.allocator, &state.lite.db, body) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpLookup(ctx: *httpx.Context) anyerror!httpx.Response {
+    const key = ctx.param("key") orelse return liteHttpError(ctx, error.InvalidArguments);
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const json = lookupJson(ctx.allocator, &state.lite.db, key, body) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpScan(ctx: *httpx.Context) anyerror!httpx.Response {
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const json = scanJson(ctx.allocator, &state.lite.db, body) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpQuery(ctx: *httpx.Context) anyerror!httpx.Response {
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const json = searchJson(ctx.allocator, &state.lite.db, body) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpIndexList(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const configs = state.lite.db.listIndexes(ctx.allocator) catch |err| return liteHttpError(ctx, err);
+    defer db_types.freeIndexConfigs(ctx.allocator, configs);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, configs, .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpIndexCreate(ctx: *httpx.Context) anyerror!httpx.Response {
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    var parsed = std.json.parseFromSlice(db_types.IndexConfig, ctx.allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| return liteHttpError(ctx, err);
+    defer parsed.deinit();
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    state.lite.db.addIndex(parsed.value) catch |err| return liteHttpError(ctx, err);
+    const json = mutationJson(ctx.allocator, "created", parsed.value.name, true) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpIndexDrop(ctx: *httpx.Context) anyerror!httpx.Response {
+    const name = ctx.param("name") orelse return liteHttpError(ctx, error.InvalidArguments);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const removed = state.lite.db.deleteIndex(name) catch |err| return liteHttpError(ctx, err);
+    const json = mutationJson(ctx.allocator, "removed", name, removed) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpEnrichmentList(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const configs = state.lite.db.listEnrichments(ctx.allocator) catch |err| return liteHttpError(ctx, err);
+    defer db_types.freeEnrichmentConfigs(ctx.allocator, configs);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, configs, .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpEnrichmentCreate(ctx: *httpx.Context) anyerror!httpx.Response {
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    var parsed = std.json.parseFromSlice(db_types.EnrichmentConfig, ctx.allocator, body, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| return liteHttpError(ctx, err);
+    defer parsed.deinit();
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    state.lite.db.addEnrichment(parsed.value) catch |err| return liteHttpError(ctx, err);
+    const json = mutationJson(ctx.allocator, "created", parsed.value.name, true) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpEnrichmentDrop(ctx: *httpx.Context) anyerror!httpx.Response {
+    const kind_raw = ctx.param("kind") orelse return liteHttpError(ctx, error.InvalidArguments);
+    const name = ctx.param("name") orelse return liteHttpError(ctx, error.InvalidArguments);
+    const kind = parseLiteHttpEnrichmentKind(kind_raw) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const removed = state.lite.db.deleteEnrichment(kind, name) catch |err| return liteHttpError(ctx, err);
+    const json = mutationJson(ctx.allocator, "removed", name, removed) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn parseLiteHttpEnrichmentKind(value: []const u8) !db_types.EnrichmentKind {
+    if (std.mem.eql(u8, value, "chunk")) return .chunk;
+    if (std.mem.eql(u8, value, "asset")) return .asset;
+    if (std.mem.eql(u8, value, "embedding")) return .embedding;
+    return error.InvalidArguments;
+}
+
+fn liteHttpSchemaGet(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const schema_json = state.lite.db.getSchemaJson(ctx.allocator) catch |err| return liteHttpError(ctx, err);
+    if (schema_json) |json| {
+        defer ctx.allocator.free(json);
+        return liteHttpJson(ctx, 200, json);
+    }
+    return liteHttpJson(ctx, 200, "null");
+}
+
+fn liteHttpSchemaSet(ctx: *httpx.Context) anyerror!httpx.Response {
+    const body = liteHttpRequestBody(ctx) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    state.lite.db.setSchemaJson(ctx.allocator, body) catch |err| return liteHttpError(ctx, err);
+    return liteHttpJson(ctx, 200, "{\"updated\":true}");
+}
+
+fn liteHttpRunUntilIdle(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    state.lite.db.maintenanceDriver().runUntilIdle() catch |err| return liteHttpError(ctx, err);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, state.lite.db.maintenanceDriver().pendingWorkStats(), .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpCheck(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const report = state.lite.backend.check() catch |err| return liteHttpError(ctx, err);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpCompact(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const report = compactLite(state.lite) catch |err| return liteHttpError(ctx, err);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
+}
+
+fn liteHttpVacuum(ctx: *httpx.Context) anyerror!httpx.Response {
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    const report = state.lite.backend.vacuum() catch |err| return liteHttpError(ctx, err);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
+    defer ctx.allocator.free(json);
+    return liteHttpJson(ctx, 200, json);
 }
 
 fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
@@ -1221,7 +1538,7 @@ fn printUsage(argv0: []const u8) void {
         \\  check <db.aflite>
         \\  compact <db.aflite>
         \\  vacuum <db.aflite>
-        \\  serve <db.aflite> --addr 127.0.0.1:8080 (planned lite-dev HTTP mode)
+        \\  serve <db.aflite> --addr 127.0.0.1:8080
         \\
     , .{argv0});
 }
@@ -1255,6 +1572,9 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
         const opts = try parseServeOptions(&args);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
         try std.testing.expectEqualStrings("127.0.0.1:8080", opts.addr);
+        const listen = try parseLiteListenAddress(opts.addr);
+        try std.testing.expectEqualStrings("127.0.0.1", listen.host);
+        try std.testing.expectEqual(@as(u16, 8080), listen.port);
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--addr", "127.0.0.1:9090" };
@@ -1262,12 +1582,17 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
         const opts = try parseServeOptions(&args);
         try std.testing.expectEqualStrings("app.aflite", opts.path);
         try std.testing.expectEqualStrings("127.0.0.1:9090", opts.addr);
+        const listen = try parseLiteListenAddress(opts.addr);
+        try std.testing.expectEqualStrings("127.0.0.1", listen.host);
+        try std.testing.expectEqual(@as(u16, 9090), listen.port);
     }
     {
         const argv = [_][*:0]const u8{ "app.aflite", "--port", "9090" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
         try std.testing.expectError(error.InvalidArguments, parseServeOptions(&args));
     }
+    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("127.0.0.1"));
+    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress(":8080"));
 }
 
 test "lite promote parser requires values and derives default backup id" {
@@ -1711,6 +2036,87 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cluster_heartbeat_status_aggregation\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"has_async_indexes\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
+}
+
+fn testLiteHttpCall(
+    allocator: Allocator,
+    comptime handler: httpx.Handler,
+    method: httpx.Method,
+    url: []const u8,
+    body: []const u8,
+    params: []const @import("httpx").router.RouteParam,
+) !httpx.Response {
+    var req = try httpx.Request.init(allocator, method, url);
+    defer req.deinit();
+    if (body.len > 0) try req.setBody(body);
+
+    var ctx = httpx.Context.init(allocator, std.testing.io, &req);
+    defer ctx.deinit();
+    ctx.params = params;
+    return try handler(&ctx);
+}
+
+fn testLiteHttpBody(resp: *const httpx.Response) []const u8 {
+    return resp.body orelse "";
+}
+
+test "lite http handlers expose narrow embedded api" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/http-api.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var lite = try LiteDb.create(allocator, path, true);
+    defer lite.close();
+
+    var state = LiteHttpState{ .lite = &lite };
+    active_lite_http_state = &state;
+    defer active_lite_http_state = null;
+
+    {
+        var resp = try testLiteHttpCall(allocator, liteHttpHealth, .GET, "http://lite.test/healthz", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"status\":\"ok\"") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(
+            allocator,
+            liteHttpBatch,
+            .POST,
+            "http://lite.test/lite/v1/batch",
+            "{\"inserts\":{\"doc:http\":{\"title\":\"served lite\"}}}",
+            &.{},
+        );
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"inserted\":1") != null);
+    }
+    {
+        const params = [_]@import("httpx").router.RouteParam{.{ .name = "key", .value = "doc:http" }};
+        var resp = try testLiteHttpCall(
+            allocator,
+            liteHttpLookup,
+            .POST,
+            "http://lite.test/lite/v1/lookup/doc:http",
+            "{}",
+            params[0..],
+        );
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"served lite\"") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(allocator, liteHttpStatus, .GET, "http://lite.test/lite/v1/status", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"engine\":\"native_single_file\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"capabilities\":") != null);
+    }
 }
 
 test "lite full text query survives writer close and readonly reopen" {
