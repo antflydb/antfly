@@ -29,7 +29,6 @@ const transactions_mod = antfly.transactions;
 const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
-const schema_mod = antfly.schema;
 const lite_backend = antfly.lite.backend;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
@@ -2598,93 +2597,26 @@ pub export fn antfly_db_decode_artifact_id_json(
     return .ok;
 }
 
+pub export fn antfly_db_get_schema_json(
+    handle_ptr: ?*anyopaque,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.db.getSchemaJson(handle.alloc) catch |err| return capi.mapError(err)) |schema_json| {
+        out_buf.* = .{ .ptr = schema_json.ptr, .len = schema_json.len };
+    } else {
+        out_buf.* = dupBytes("null") catch return .internal;
+    }
+    return .ok;
+}
+
 pub export fn antfly_db_set_schema_json(
     handle_ptr: ?*anyopaque,
     schema_json: capi.Slice,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const Request = struct {
-        version: u32 = 0,
-        default_type: []const u8 = "_default",
-        ttl_duration_ns: u64 = 0,
-        ttl_field: []const u8 = "_timestamp",
-        enforce_types: bool = false,
-        dynamic_templates: []const struct {
-            name: []const u8 = "",
-            match_pattern: ?[]const u8 = null,
-            path_match: ?[]const u8 = null,
-            mapping: struct {
-                field_type: []const u8 = "text",
-                do_index: bool = true,
-                store: bool = true,
-                doc_values: bool = false,
-                include_in_all: bool = false,
-                analyzer: []const u8 = "standard",
-            } = .{},
-        } = &.{},
-    };
-
-    var parsed = std.json.parseFromSlice(Request, handle.alloc, schema_json.bytes(), .{}) catch return .invalid_argument;
-    defer parsed.deinit();
-
-    var templates = handle.alloc.alloc(schema_mod.DynamicTemplate, parsed.value.dynamic_templates.len) catch return .internal;
-    var initialized: usize = 0;
-    errdefer {
-        for (templates[0..initialized]) |tmpl| {
-            handle.alloc.free(tmpl.name);
-            if (tmpl.match_pattern) |value| handle.alloc.free(value);
-            if (tmpl.path_match) |value| handle.alloc.free(value);
-            handle.alloc.free(tmpl.mapping.analyzer);
-        }
-        handle.alloc.free(templates);
-    }
-
-    for (parsed.value.dynamic_templates, 0..) |tmpl, i| {
-        const field_type = parseSchemaFieldType(tmpl.mapping.field_type) catch return .invalid_argument;
-        templates[i] = .{
-            .name = handle.alloc.dupe(u8, tmpl.name) catch return .internal,
-            .match_pattern = if (tmpl.match_pattern) |value| handle.alloc.dupe(u8, value) catch return .internal else null,
-            .path_match = if (tmpl.path_match) |value| handle.alloc.dupe(u8, value) catch return .internal else null,
-            .mapping = .{
-                .field_type = field_type,
-                .do_index = tmpl.mapping.do_index,
-                .store = tmpl.mapping.store,
-                .doc_values = tmpl.mapping.doc_values,
-                .include_in_all = tmpl.mapping.include_in_all,
-                .analyzer = handle.alloc.dupe(u8, tmpl.mapping.analyzer) catch return .internal,
-            },
-        };
-        initialized += 1;
-    }
-
-    const table_schema: schema_mod.TableSchema = .{
-        .version = parsed.value.version,
-        .default_type = handle.alloc.dupe(u8, parsed.value.default_type) catch return .internal,
-        .ttl_duration_ns = parsed.value.ttl_duration_ns,
-        .ttl_field = handle.alloc.dupe(u8, parsed.value.ttl_field) catch return .internal,
-        .enforce_types = parsed.value.enforce_types,
-        .dynamic_templates = templates,
-    };
-    defer schema_mod.freeSchema(handle.alloc, table_schema);
-
-    handle.db.setSchema(table_schema) catch |err| return capi.mapError(err);
+    handle.db.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
     return .ok;
-}
-
-fn parseSchemaFieldType(name: []const u8) !schema_mod.AntflyType {
-    if (std.mem.eql(u8, name, "text")) return .text;
-    if (std.mem.eql(u8, name, "keyword")) return .keyword;
-    if (std.mem.eql(u8, name, "numeric")) return .numeric;
-    if (std.mem.eql(u8, name, "embedding")) return .embedding;
-    if (std.mem.eql(u8, name, "link")) return .link;
-    if (std.mem.eql(u8, name, "boolean")) return .boolean;
-    if (std.mem.eql(u8, name, "datetime")) return .datetime;
-    if (std.mem.eql(u8, name, "geopoint")) return .geopoint;
-    if (std.mem.eql(u8, name, "geoshape")) return .geoshape;
-    if (std.mem.eql(u8, name, "blob")) return .blob;
-    if (std.mem.eql(u8, name, "html")) return .html;
-    if (std.mem.eql(u8, name, "search_as_you_type")) return .search_as_you_type;
-    return error.InvalidArgument;
 }
 
 fn antflyDbExtractEnrichmentsJson(
@@ -5833,6 +5765,19 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"manual_maintenance\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"dense_vector_search\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sparse_vector_search\":true") != null);
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(src_handle, .{
+        .ptr = schema_json,
+        .len = schema_json.len,
+    }));
+
+    var loaded_schema: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_schema_json(src_handle, &loaded_schema));
+    defer antfly_db_buffer_free(loaded_schema.ptr, loaded_schema.len);
+    try std.testing.expectEqualStrings(schema_json, loaded_schema.ptr.?[0..loaded_schema.len]);
 
     const writes_a = [_]capi.WriteIntent{
         .{

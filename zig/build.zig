@@ -2039,13 +2039,20 @@ pub fn build(b: *std.Build) void {
         .root_module = lite_capi_mod,
     });
     const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
+    const install_lite_capi_header = b.addInstallFileWithDir(
+        b.path("pkg/antfly/include/antflylite.h"),
+        .header,
+        "antflylite.h",
+    );
 
     const capi_step = b.step("capi", "Build the Zig C API shared libraries");
     capi_step.dependOn(&install_capi_lib.step);
     capi_step.dependOn(&install_lite_capi_lib.step);
+    capi_step.dependOn(&install_lite_capi_header.step);
 
     const lite_capi_step = b.step("lite-capi", "Build the libantflylite C ABI shared library");
     lite_capi_step.dependOn(&install_lite_capi_lib.step);
+    lite_capi_step.dependOn(&install_lite_capi_header.step);
 
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
