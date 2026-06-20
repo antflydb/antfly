@@ -98,8 +98,14 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 }
 
 func TestLiteCAPI(t *testing.T) {
-	if got := ABIVersion(); got != 1 {
-		t.Fatalf("ABI version = %d, want 1", got)
+	if got := ABIVersion(); got != SupportedABIVersion {
+		t.Fatalf("ABI version = %d, want %d", got, SupportedABIVersion)
+	}
+	if got, want := OpenOptionsSize(), compiledOpenOptionsSize(); got != want {
+		t.Fatalf("open options size = %d, compiled header size = %d", got, want)
+	}
+	if err := ValidateABI(); err != nil {
+		t.Fatalf("validate ABI: %v", err)
 	}
 
 	path := filepath.Join(t.TempDir(), "go-smoke.aflite")

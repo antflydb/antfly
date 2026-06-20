@@ -21,9 +21,13 @@ package antflylite
 import "C"
 
 import (
+	"fmt"
 	"runtime"
 	"unsafe"
 )
+
+// SupportedABIVersion is the Antfly Lite C ABI version this binding expects.
+const SupportedABIVersion uint32 = 1
 
 // OpenMode controls how an Antfly Lite file is opened.
 type OpenMode uint32
@@ -89,6 +93,27 @@ func ABIVersion() uint32 {
 	return uint32(C.antfly_lite_abi_version())
 }
 
+// OpenOptionsSize returns the loaded C ABI size of antfly_lite_open_options.
+func OpenOptionsSize() uint32 {
+	return uint32(C.antfly_lite_open_options_size())
+}
+
+func compiledOpenOptionsSize() uint32 {
+	return uint32(C.sizeof_antfly_lite_open_options)
+}
+
+// ValidateABI verifies that the loaded C library matches the header used to
+// compile this Go binding.
+func ValidateABI() error {
+	if got := ABIVersion(); got != SupportedABIVersion {
+		return fmt.Errorf("antflylite: unsupported C ABI version %d, want %d", got, SupportedABIVersion)
+	}
+	if got, want := OpenOptionsSize(), compiledOpenOptionsSize(); got != want {
+		return fmt.Errorf("antflylite: C ABI open options size %d, compiled header size %d", got, want)
+	}
+	return nil
+}
+
 func cABIErrorCodeName(code ErrorCode) string {
 	return C.GoString(C.antfly_error_code_name(C.antfly_error_code(code)))
 }
@@ -137,6 +162,10 @@ func OpenHosted(path string) (*DB, error) {
 
 // OpenWithOptions opens an Antfly Lite database using explicit C ABI options.
 func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
+	if err := ValidateABI(); err != nil {
+		return nil, err
+	}
+
 	cPath := C.CString(path)
 	defer C.free(unsafe.Pointer(cPath))
 
