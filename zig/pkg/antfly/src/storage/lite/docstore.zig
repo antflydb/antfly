@@ -63,10 +63,26 @@ pub const Store = struct {
     }
 
     pub fn vacuum(self: *Store) !native.VacuumReport {
-        if (self.read_only) return error.ReadOnly;
+        try self.reserveWriterSlot();
+        defer self.releaseWriterSlot();
+
         lockStore(self);
         defer self.mutex.unlock();
         return try self.file.vacuum();
+    }
+
+    pub fn reserveWriterSlot(self: *Store) !void {
+        if (self.read_only) return error.ReadOnly;
+        lockStore(self);
+        defer self.mutex.unlock();
+        if (self.writer_active) return error.FileBusy;
+        self.writer_active = true;
+    }
+
+    pub fn releaseWriterSlot(self: *Store) void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        self.writer_active = false;
     }
 
     const NativeBackendStore = backend_adapter.Store(Store, Txn, Txn, Txn, .{
@@ -132,12 +148,11 @@ pub const Txn = struct {
     }
 
     pub fn openWrite(store: *Store) !Txn {
+        try store.reserveWriterSlot();
+        errdefer store.releaseWriterSlot();
+
         lockStore(store);
         defer store.mutex.unlock();
-
-        if (store.writer_active) return error.FileBusy;
-        store.writer_active = true;
-        errdefer store.writer_active = false;
 
         return .{
             .allocator = store.allocator,
@@ -234,9 +249,7 @@ pub const Txn = struct {
     fn releaseWriterSlot(self: *Txn) void {
         if (!self.writer_reserved) return;
         const store = self.store orelse return;
-        lockStore(store);
-        defer store.mutex.unlock();
-        store.writer_active = false;
+        store.releaseWriterSlot();
         self.writer_reserved = false;
     }
 };
@@ -419,6 +432,7 @@ test "lite native docstore reserves one writer until abort or commit" {
     var writer = try store.beginWrite();
     try writer.put("doc:a", "first");
     try std.testing.expectError(error.FileBusy, store.beginWrite());
+    try std.testing.expectError(error.FileBusy, store.vacuum());
 
     var read = try store.beginRead();
     defer read.abort();
