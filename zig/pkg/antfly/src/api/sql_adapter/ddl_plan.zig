@@ -955,6 +955,7 @@ pub const RoutineExecutionHook = enum {
     expression,
     trigger_return_new,
     trigger_return_old,
+    trigger_return_null,
     procedure_noop,
 };
 

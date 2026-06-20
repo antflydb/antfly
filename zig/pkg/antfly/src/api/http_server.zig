@@ -10299,9 +10299,12 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
+        const triggered_body = (try self.rowsBatchBodyAfterBeforeInsertTriggersAlloc(table_name, body)) orelse body;
+        defer if (triggered_body.ptr != body.ptr) self.alloc.free(triggered_body);
+
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         const unique_resolver = unique_resolver_ctx.resolver();
-        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, table_name, body, schema, unique_resolver) catch |err| switch (err) {
+        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, table_name, triggered_body, schema, unique_resolver) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
@@ -10387,9 +10390,12 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
+        const triggered_body = (try self.rowsBatchBodyAfterBeforeInsertTriggersAlloc(target.table_name, body)) orelse body;
+        defer if (triggered_body.ptr != body.ptr) self.alloc.free(triggered_body);
+
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
         const unique_resolver = unique_resolver_ctx.resolver();
-        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, target.table_name, body, schema, unique_resolver) catch |err| switch (err) {
+        var rows_req = relational_rows_api.parseRowsBatchRequestWithResolver(self.alloc, target.table_name, triggered_body, schema, unique_resolver) catch |err| switch (err) {
             error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
             error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
@@ -10425,6 +10431,96 @@ pub const ApiHttpServer = struct {
         const response_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_req);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 201, response_body);
+    }
+
+    fn rowsBatchBodyAfterBeforeInsertTriggersAlloc(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?[]u8 {
+        const function_name = (try self.sql_routine_runtime.triggerFunctionForTableEventAlloc(self.alloc, table_name, .insert)) orelse return null;
+        defer self.alloc.free(function_name);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const operations = parsed.value.object.get("operations") orelse return error.InvalidRowsRequest;
+        if (operations != .array) return error.InvalidRowsRequest;
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        var first_field = true;
+        for (parsed.value.object.keys(), parsed.value.object.values()) |key, value| {
+            if (!first_field) try writer.writeByte(',');
+            first_field = false;
+            try writer.print("{f}:", .{std.json.fmt(key, .{})});
+            if (std.mem.eql(u8, key, "operations")) {
+                try self.writeRowsBatchOperationsAfterBeforeInsertTrigger(writer, function_name, operations.array.items);
+            } else {
+                try std.json.Stringify.value(value, .{}, writer);
+            }
+        }
+        try writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
+    fn writeRowsBatchOperationsAfterBeforeInsertTrigger(
+        self: *ApiHttpServer,
+        writer: *std.Io.Writer,
+        function_name: []const u8,
+        operations: []const std.json.Value,
+    ) !void {
+        try writer.writeByte('[');
+        var first_operation = true;
+        for (operations) |operation| {
+            if (operation != .object) return error.InvalidRowsRequest;
+            const op_text = operation.object.get("op") orelse return error.InvalidRowsRequest;
+            if (op_text != .string) return error.InvalidRowsRequest;
+            if (std.mem.eql(u8, op_text.string, "insert") or std.mem.eql(u8, op_text.string, "upsert")) {
+                const row = operation.object.get("row") orelse return error.InvalidRowsRequest;
+                if (row != .object) return error.InvalidRowsRequest;
+                const row_json = try std.json.Stringify.valueAlloc(self.alloc, row, .{});
+                defer self.alloc.free(row_json);
+                const triggered_row = try self.sql_routine_runtime.executeTriggerRoutineAlloc(self.alloc, function_name, row_json, null);
+                defer self.alloc.free(triggered_row);
+                var parsed_triggered = std.json.parseFromSlice(std.json.Value, self.alloc, triggered_row, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed_triggered.deinit();
+                if (parsed_triggered.value == .null) continue;
+                if (parsed_triggered.value != .object) return error.InvalidRowsRequest;
+                if (!first_operation) try writer.writeByte(',');
+                first_operation = false;
+                try self.writeRowsBatchOperationWithTriggeredRow(writer, operation.object, parsed_triggered.value);
+                continue;
+            }
+
+            if (!first_operation) try writer.writeByte(',');
+            first_operation = false;
+            try std.json.Stringify.value(operation, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+
+    fn writeRowsBatchOperationWithTriggeredRow(
+        _: *ApiHttpServer,
+        writer: *std.Io.Writer,
+        operation: std.json.ObjectMap,
+        triggered_row: std.json.Value,
+    ) !void {
+        try writer.writeByte('{');
+        var first_field = true;
+        for (operation.keys(), operation.values()) |key, value| {
+            if (!first_field) try writer.writeByte(',');
+            first_field = false;
+            try writer.print("{f}:", .{std.json.fmt(key, .{})});
+            if (std.mem.eql(u8, key, "row")) {
+                try std.json.Stringify.value(triggered_row, .{}, writer);
+            } else {
+                try std.json.Stringify.value(value, .{}, writer);
+            }
+        }
+        try writer.writeByte('}');
     }
 
     pub fn handlePublicTableRowsMutationSource(
@@ -21567,6 +21663,97 @@ test "api http server keeps updated-at trigger DDL on table source path" {
 
     try std.testing.expectEqual(@as(usize, 1), source.apply_count);
     try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.triggerCountForTest());
+}
+
+test "api http server applies safe before insert SQL triggers to rows batch" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-before-insert-trigger", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("events", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("events", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var created_function = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION skip_event_insert() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
+        &session,
+    );
+    defer created_function.deinit(alloc);
+    var created_trigger = try server.applyRelationalSqlDdlWithSession(
+        "CREATE TRIGGER skip_event_insert BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION skip_event_insert();",
+        &session,
+    );
+    defer created_trigger.deinit(alloc);
+
+    var insert_resp = try server.handlePublicTableRowsBatch(
+        "events",
+        "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"evt-1\",\"status\":\"new\"},\"returning\":[\"id\"]}]}",
+        null,
+    );
+    defer insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
+
+    var query_resp = try server.handlePublicTableRowsQuery("events", "{\"query\":{\"select\":[\"id\"]}}", null);
+    defer query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_query.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_query.value.object.get("total").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), parsed_query.value.object.get("rows").?.array.items.len);
 }
 
 test "api http server exposes SQL routine bindings to catalog read planning" {

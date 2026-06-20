@@ -3076,6 +3076,8 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
         .trigger_return_new
     else if (cursor.matchKeyword("old"))
         .trigger_return_old
+    else if (cursor.matchKeyword("null"))
+        .trigger_return_null
     else
         return error.UnsupportedSqlShape;
     try cursor.expectToken(.semicolon);
@@ -8823,6 +8825,16 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, old_trigger_body.body.?.kind);
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_old, old_trigger_body.body.?.hook);
     try std.testing.expect(old_trigger_body.body.?.expression == null);
+
+    var null_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION skip_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';");
+    defer lexer.freeTokens(alloc, &null_trigger_body_tokens);
+    var null_trigger_body_pos: usize = 0;
+    var null_trigger_body = try parseCreateRoutineCatalogTailAlloc(alloc, null_trigger_body_tokens.items, &null_trigger_body_pos);
+    defer null_trigger_body.deinit(alloc);
+    try std.testing.expectEqual(null_trigger_body_tokens.items.len, null_trigger_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, null_trigger_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_null, null_trigger_body.body.?.hook);
+    try std.testing.expect(null_trigger_body.body.?.expression == null);
 
     var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';");
     defer lexer.freeTokens(alloc, &unsupported_trigger_body_tokens);

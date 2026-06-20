@@ -5323,7 +5323,8 @@ fail closed until the row-expression AST has a native null-guard node that can
 preserve PostgreSQL null-input semantics for nullable row fields.
 The routine body model also admits narrow safe PL/pgSQL trigger bodies:
 `BEGIN RETURN NEW; END` as a `plpgsql_trigger` / `trigger_return_new` hook and
-`BEGIN RETURN OLD; END` as a `plpgsql_trigger` / `trigger_return_old` hook.
+`BEGIN RETURN OLD; END` as a `plpgsql_trigger` / `trigger_return_old` hook, and
+`BEGIN RETURN NULL; END` as a `plpgsql_trigger` / `trigger_return_null` hook.
 `ApiHttpServer` routes cataloged `CREATE TRIGGER` / `DROP TRIGGER` DDL that is
 not a table-owned update-policy shortcut into the routine runtime, where
 trigger records persist table name, trigger name, function name, and event.

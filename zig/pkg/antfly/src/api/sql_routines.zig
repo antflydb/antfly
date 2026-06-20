@@ -278,6 +278,7 @@ pub const Runtime = struct {
         const routine = self.findRoutineLocked(.function, routine_name, 0) orelse return error.RoutineNotFound;
         const body = routine.body orelse return error.RoutineBodyNotExecutable;
         if (body.kind != .plpgsql_trigger or body.expression != null) return error.RoutineBodyNotExecutable;
+        if (body.hook == .trigger_return_null) return try alloc.dupe(u8, "null");
         const tuple_json = switch (body.hook) {
             .trigger_return_new => new_row_json orelse return error.RoutineTriggerTupleUnavailable,
             .trigger_return_old => old_row_json orelse return error.RoutineTriggerTupleUnavailable,
@@ -331,7 +332,7 @@ pub const Runtime = struct {
                 .expression => {
                     if (plan.kind != .function or body.kind != .sql_expression or body.expression == null) return error.UnsupportedSqlShape;
                 },
-                .trigger_return_new, .trigger_return_old => {
+                .trigger_return_new, .trigger_return_old, .trigger_return_null => {
                     if (plan.kind != .function or body.kind != .plpgsql_trigger or body.expression != null) return error.UnsupportedSqlShape;
                     const returns_type = plan.returns_type orelse return error.UnsupportedSqlShape;
                     if (!std.ascii.eqlIgnoreCase(returns_type, "trigger")) return error.UnsupportedSqlShape;
@@ -452,6 +453,7 @@ pub const Runtime = struct {
             .trigger_return_old => {
                 if (event == .insert) return error.UnsupportedSqlShape;
             },
+            .trigger_return_null => {},
             else => return error.RoutineBodyNotExecutable,
         }
     }
@@ -1499,6 +1501,25 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         runtime.executeTriggerRoutineAlloc(alloc, "old_audit_body", "{\"id\":\"u1\"}", "null"),
     );
 
+    var null_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION skip_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
+    );
+    defer null_trigger_plan.deinit(alloc);
+    try runtime.apply(switch (null_trigger_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 6), runtime.routineCountForTest());
+    const trigger_null = try runtime.executeTriggerRoutineAlloc(
+        alloc,
+        "skip_audit_body",
+        "{\"id\":\"u1\",\"status\":\"updated\"}",
+        "{\"id\":\"u1\",\"status\":\"old\"}",
+    );
+    defer alloc.free(trigger_null);
+    try std.testing.expectEqualStrings("null", trigger_null);
+
     var noop_procedure_plan = try relational_sql.lowerDdlPlanAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
@@ -1508,7 +1529,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         .function_catalog => |function_plan| function_plan,
         else => return error.TestUnexpectedResult,
     });
-    try std.testing.expectEqual(@as(usize, 6), runtime.routineCountForTest());
+    try std.testing.expectEqual(@as(usize, 7), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "rotate_usage", &.{}));
     try std.testing.expectError(
         error.UnsupportedSqlShape,

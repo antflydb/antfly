@@ -3919,6 +3919,7 @@ pub fn build(b: *std.Build) void {
             "api http server recovers durable SQL routine catalog",
             "api http server routes routine-backed SQL trigger DDL through routine runtime",
             "api http server keeps updated-at trigger DDL on table source path",
+            "api http server applies safe before insert SQL triggers to rows batch",
             "api http server exposes SQL routine bindings to catalog read planning",
             "api http server enforces SQL row security WITH CHECK on row writes",
             "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL",
