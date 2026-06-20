@@ -811,6 +811,8 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 }
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
+    try validatePortableEnvelope(alloc, data);
+
     var reader = backup_codec.SliceReader.init(data);
     _ = try reader.readHeader();
     var imported_identity = false;
@@ -854,6 +856,15 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 else => {},
             }
         }
+    }
+}
+
+fn validatePortableEnvelope(alloc: Allocator, data: []const u8) !void {
+    var reader = backup_codec.SliceReader.init(data);
+    _ = try reader.readHeader();
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        alloc.free(block.payload);
     }
 }
 
@@ -1441,6 +1452,33 @@ test "export and import documents round trip" {
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
     }
+}
+
+test "import preflights full portable envelope before mutating destination" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const store_key = try internal_keys.documentKeyAlloc(alloc, "doc:truncated-import");
+    defer alloc.free(store_key);
+    try src.putBatch(&.{.{ .key = store_key, .value = "{\"title\":\"must not import\"}" }}, &.{});
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try exportPortable(alloc, &src, &portable);
+    try std.testing.expect(portable.items.len > backup_codec.header_size);
+    const truncated = portable.items[0 .. portable.items.len - 1];
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+
+    try std.testing.expectError(error.EndOfStream, importPortable(alloc, &dst, truncated));
+    try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
 }
 
 test "export and import documents preserve timestamps" {
