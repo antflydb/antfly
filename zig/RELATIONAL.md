@@ -1081,12 +1081,13 @@ and plan/fingerprint comparisons use one adapter-owned expression comparison
 surface. Row-expression determinism and catalog check-expression type validation
 also live in `lower_expr.zig`, so partial indexes, generated columns, and
 expression checks share the same definition of catalog-safe deterministic and
-type-compatible expression trees. Expression-backed DDL catalog validation for
-`CHECK`, generated columns, unique constraints, index `INCLUDE` columns, and
-field-based unique predicates is adapter-owned as well: `relational_sql.zig`
-asks `lower_expr.zig` to validate the typed catalog metadata instead of
-retaining parallel schema-specific helpers beside the parser. The future larger slice can
-move the full row-expression parser once this contract is stable.
+type-compatible expression trees. DDL catalog validation for relational columns,
+primary keys, `CHECK`, foreign-key names, generated columns, unique constraints,
+index `INCLUDE` columns, and field-based unique predicates is adapter-owned as
+well: `relational_sql.zig` asks `lower_expr.zig` and `binder.zig` to validate
+the typed catalog metadata instead of retaining parallel schema-specific helpers
+beside the parser. The future larger slice can move the full row-expression
+parser once this contract is stable.
 
 The internal flow is always:
 

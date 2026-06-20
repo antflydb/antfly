@@ -1354,14 +1354,33 @@ test "sql adapter lower expr validates DDL expression catalog constraints" {
         .{ .name = "updated_at", .path = "updated_at", .field_type = .datetime },
         .{ .name = "metadata", .path = "metadata", .field_type = .json },
     };
+    const pk_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
     const periods = [_]runtime_schema.RelationalPeriod{.{ .name = "valid_at", .start_column = "created_at", .end_column = "updated_at" }};
     const lower_status: runtime_schema.RelationalRowsExpression = .{
         .kind = .lower,
         .operands = &.{.{ .kind = .field, .field = "status" }},
     };
 
+    try validateRelationalColumnCatalog(&columns);
+    try std.testing.expectError(error.InvalidSqlCatalog, validateRelationalColumnCatalog(&.{.{
+        .name = "amount",
+        .path = "amount",
+        .field_type = .numeric,
+        .collation = "C",
+    }}));
+    try validatePrimaryKeyColumns(&pk_columns, .{ .columns = &.{"id"}, .include_columns = &.{"status"} });
+    try std.testing.expectError(error.InvalidSqlCatalog, validatePrimaryKeyColumns(&columns, .{ .columns = &.{"status"} }));
+
     try validateCheckForColumns(&columns, .{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" });
     try std.testing.expectError(error.InvalidSqlCatalog, validateCheckForColumns(&columns, .{ .name = "bad_json_order", .field = "metadata", .op = .gt, .value_json = "{}" }));
+    try validateRelationalCheckCatalog(&columns, &.{.{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateRelationalCheckCatalog(&columns, &.{
+        .{ .name = "dup_check", .field = "amount", .op = .gt, .value_json = "0" },
+        .{ .name = "dup_check", .field = "amount", .op = .lt, .value_json = "10" },
+    }));
 
     try validateGeneratedColumnForColumns(&columns, .{
         .name = "status_lower",
@@ -1396,5 +1415,21 @@ test "sql adapter lower expr validates DDL expression catalog constraints" {
     }));
     try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintForColumns(&columns, &periods, .{
         .name = "empty_key",
+    }));
+    try validateUniqueConstraintCatalog(&columns, &periods, &.{.{ .name = "status_key", .columns = &.{"status"} }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintCatalog(&columns, &periods, &.{
+        .{ .name = "dup_key", .columns = &.{"status"} },
+        .{ .name = "dup_key", .columns = &.{"amount"} },
+    }));
+
+    try validateForeignKeyCatalog(&columns, &periods, &.{.{
+        .name = "status_parent_fkey",
+        .parent_table = "parent_statuses",
+        .child_columns = &.{"status"},
+        .parent_columns = &.{"status"},
+    }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateForeignKeyCatalog(&columns, &periods, &.{
+        .{ .name = "dup_fkey", .parent_table = "parent_statuses", .child_columns = &.{"status"}, .parent_columns = &.{"status"} },
+        .{ .name = "dup_fkey", .parent_table = "parent_statuses", .child_columns = &.{"amount"}, .parent_columns = &.{"amount"} },
     }));
 }
