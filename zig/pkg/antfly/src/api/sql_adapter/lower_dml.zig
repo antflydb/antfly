@@ -237,6 +237,73 @@ pub const ConflictUnaryExpressionParserHooks = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const ConflictJsonBuildObjectExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
+};
+
+pub const ConflictArrayLengthExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_field: *const fn (
+        *anyopaque,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictBooleanExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const ConflictExpressionConditionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_untyped_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_boolean_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
+};
+
+pub const ConflictCaseExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_untyped_expression: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_boolean_operand: *const fn (
+        *anyopaque,
+        runtime_schema.RelationalColumn,
+        []const []const u8,
+        ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
+};
+
 pub const JoinedMutationJsonSetSqlValueParserHooks = struct {
     ptr: *anyopaque,
     parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
@@ -370,6 +437,7 @@ const freeCoalesceProjections = plan_mod.freeCoalesceProjections;
 const freeExpression = plan_mod.freeExpression;
 const freeExpressionAssignments = plan_mod.freeExpressionAssignments;
 const freeExpressionArrayContains = plan_mod.freeExpressionArrayContains;
+const freeExpressionCaseBranch = plan_mod.freeExpressionCaseBranch;
 const freeExpressionCondition = plan_mod.freeExpressionCondition;
 const freeExpressionConditions = plan_mod.freeExpressionConditions;
 const freeExpressionPredicateGroups = plan_mod.freeExpressionPredicateGroups;
@@ -2117,6 +2185,369 @@ pub fn parseConflictChrExpressionAlloc(
     return expression;
 }
 
+pub fn parseConflictCastExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try lower_expr.parseCastExpressionCallStart(tokens, pos);
+    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try lower_expr.parseCastExpressionAs(tokens, pos);
+    const cast_type = try lower_expr.parseExpressionCastType(tokens, pos);
+    try parser.expectToken(tokens, pos, .rparen);
+    const expression = try lower_expr.buildCastExpressionAlloc(alloc, operand, cast_type);
+    operand_transferred = true;
+    return expression;
+}
+
+fn conflictBooleanHooksFromConditionHooks(hooks: ConflictExpressionConditionParserHooks) ConflictBooleanExpressionParserHooks {
+    return .{
+        .ptr = hooks.ptr,
+        .parse_operand = hooks.parse_boolean_operand,
+    };
+}
+
+fn conflictConditionHooksFromCaseHooks(hooks: ConflictCaseExpressionParserHooks) ConflictExpressionConditionParserHooks {
+    return .{
+        .ptr = hooks.ptr,
+        .parse_untyped_expression = hooks.parse_untyped_expression,
+        .parse_boolean_operand = hooks.parse_boolean_operand,
+        .parse_json_array_value = hooks.parse_json_array_value,
+    };
+}
+
+pub fn parseConflictCaseExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    hooks: ConflictCaseExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try lower_expr.parseCaseExpressionStart(tokens, pos);
+
+    var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
+    errdefer {
+        for (branches.items) |branch| freeExpressionCaseBranch(alloc, branch);
+        branches.deinit(alloc);
+    }
+
+    const condition_hooks = conflictConditionHooksFromCaseHooks(hooks);
+    while (lower_expr.matchCaseExpressionWhen(tokens, pos)) {
+        const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks);
+        var condition_transferred = false;
+        errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
+        try lower_expr.parseCaseExpressionThen(tokens, pos);
+        const then_expression = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+        var then_transferred = false;
+        errdefer if (!then_transferred) freeExpression(alloc, then_expression);
+        try branches.append(alloc, .{ .when = condition, .then = then_expression });
+        condition_transferred = true;
+        then_transferred = true;
+    }
+    if (branches.items.len == 0) return error.UnsupportedSqlShape;
+
+    try lower_expr.parseCaseExpressionElse(tokens, pos);
+    const else_expression = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+    var else_transferred = false;
+    errdefer if (!else_transferred) freeExpression(alloc, else_expression);
+    try lower_expr.parseCaseExpressionEnd(tokens, pos);
+
+    const owned_branches = try branches.toOwnedSlice(alloc);
+    var branches_transferred = false;
+    errdefer if (!branches_transferred) {
+        for (owned_branches) |branch| freeExpressionCaseBranch(alloc, branch);
+        alloc.free(owned_branches);
+    };
+    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var fallback_transferred = false;
+    errdefer if (!fallback_transferred) alloc.free(fallback);
+    fallback[0] = else_expression;
+
+    branches_transferred = true;
+    fallback_transferred = true;
+    else_transferred = true;
+    return .{
+        .kind = .case,
+        .case_branches = owned_branches,
+        .case_else = fallback,
+    };
+}
+
+pub fn parseConflictExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    hooks: ConflictExpressionConditionParserHooks,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    if (canParseBareBooleanConflictExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, insert_columns)) {
+        return try parseBareBooleanConflictExpressionConditionAlloc(alloc, tokens, pos, column, insert_columns, type_context, conflictBooleanHooksFromConditionHooks(hooks));
+    }
+
+    const lhs = try hooks.parse_untyped_expression(hooks.ptr, column, insert_columns);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+    const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+        .allow_boolean_unknown = true,
+        .allow_boolean_literal = true,
+    })) |is_tail| blk: {
+        switch (is_tail.kind) {
+            .distinct_comparison, .null_test => {},
+            .boolean_unknown => {
+                try type_context.validateBooleanRowExpression(lhs);
+                lhs_transferred = true;
+                return lower_expr.expressionNullTestCondition(lhs, is_tail.op);
+            },
+            .boolean_literal => {
+                try type_context.validateBooleanRowExpression(lhs);
+                const condition = try lower_expr.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
+                lhs_transferred = true;
+                return condition;
+            },
+        }
+        break :blk is_tail.op;
+    } else if (lower_expr.matchPostfixNullTest(tokens, pos)) |postfix_null_test|
+        postfix_null_test
+    else
+        try lower_expr.parseComparisonOp(tokens, pos);
+
+    if (op == .eq and lower_expr.matchAnyOrSomeKeyword(tokens, pos)) {
+        try parser.expectToken(tokens, pos, .lparen);
+        const values_json = try hooks.parse_json_array_value(hooks.ptr);
+        defer alloc.free(values_json);
+        try parser.expectToken(tokens, pos, .rparen);
+        return error.UnsupportedSqlShape;
+    }
+
+    const rhs = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            out[0] = try hooks.parse_untyped_expression(hooks.ptr, column, insert_columns);
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |expression| freeExpression(alloc, expression);
+        alloc.free(rhs);
+    };
+    try lower_expr.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
+
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+fn parseBareBooleanConflictExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictBooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const expression = try parseConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateBooleanRowExpression(expression);
+
+    const value_json = try alloc.dupe(u8, "true");
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) alloc.free(rhs);
+    rhs[0] = .{
+        .kind = .value,
+        .value_json = value_json,
+    };
+
+    expression_transferred = true;
+    value_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = expression,
+        .op = .eq,
+        .rhs = rhs,
+    };
+}
+
+pub fn parseConflictBooleanExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictBooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var expression = try parseConflictBooleanOperandAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    var expression_owned = true;
+    errdefer if (expression_owned) freeExpression(alloc, expression);
+    if (lower_expr.peekBooleanOperator(tokens, pos.*)) |_| {
+        try type_context.validateBooleanRowExpression(expression);
+        expression_owned = false;
+        expression = try parseConflictBooleanExpressionRestAlloc(alloc, tokens, pos, expression, column, insert_columns, type_context, hooks, 0);
+        expression_owned = true;
+        try type_context.validateBooleanRowExpression(expression);
+    }
+    expression_owned = false;
+    return expression;
+}
+
+fn parseConflictBooleanExpressionRestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    lhs: db_mod.types.RelationalRowsExpression,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictBooleanExpressionParserHooks,
+    min_precedence: u8,
+) !db_mod.types.RelationalRowsExpression {
+    try type_context.validateBooleanRowExpression(lhs);
+    var current = lhs;
+    var current_owned = true;
+    errdefer if (current_owned) freeExpression(alloc, current);
+
+    while (lower_expr.peekBooleanOperator(tokens, pos.*)) |op| {
+        if (op.precedence < min_precedence) break;
+        if (!parser.matchKeyword(tokens, pos, op.keyword)) unreachable;
+        var rhs = try parseConflictBooleanOperandAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+        var rhs_owned = true;
+        errdefer if (rhs_owned) freeExpression(alloc, rhs);
+        try type_context.validateBooleanRowExpression(rhs);
+
+        while (lower_expr.peekBooleanOperator(tokens, pos.*)) |next_op| {
+            if (next_op.precedence <= op.precedence) break;
+            rhs_owned = false;
+            rhs = try parseConflictBooleanExpressionRestAlloc(alloc, tokens, pos, rhs, column, insert_columns, type_context, hooks, next_op.precedence);
+            rhs_owned = true;
+        }
+
+        const expression = try lower_expr.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
+        current_owned = false;
+        rhs_owned = false;
+        current = expression;
+        current_owned = true;
+    }
+
+    current_owned = false;
+    return current;
+}
+
+fn parseConflictBooleanOperandAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictBooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (lower_expr.peekBooleanNotExpressionSyntax(tokens, pos.*)) return try parseConflictBooleanNotExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    if (lower_expr.peekParenthesizedExpressionSyntax(tokens, pos.*)) return try parseParenthesizedConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    return try hooks.parse_operand(hooks.ptr, column, insert_columns, .boolean);
+}
+
+fn parseConflictBooleanNotExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictBooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try lower_expr.parseBooleanNotExpressionStart(tokens, pos);
+    const operand = try parseConflictBooleanOperandAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateBooleanRowExpression(operand);
+    const expression = try lower_expr.wrapBooleanNotExpressionAlloc(alloc, operand);
+    operand_transferred = true;
+    return expression;
+}
+
+fn parseParenthesizedConflictBooleanExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictBooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    try parser.expectToken(tokens, pos, .lparen);
+    const expression = try parseConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try parser.expectToken(tokens, pos, .rparen);
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictConcatExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    const kind = try lower_expr.parseConcatFunctionCallStart(tokens, pos);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if ((kind == .concat and operands.items.len == 0) or (kind == .concat_ws and operands.items.len < 2)) return error.UnsupportedSqlShape;
+    if (kind == .concat_ws) {
+        for (operands.items) |operand| try type_context.validateTextRowExpression(operand);
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+
+    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+}
+
 pub fn parseConflictTextUnaryExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2363,6 +2794,767 @@ pub fn parseConflictRegexpListExpressionAlloc(
 
     try parser.expectToken(tokens, pos, .rparen);
     return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+}
+
+pub fn parseConflictTextNumericBinaryExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: lower_expr.RowExpressionTypeContext,
+    text_hooks: ConflictUnaryExpressionParserHooks,
+    numeric_hooks: ConflictCoalesceExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    const expression_kind: db_mod.types.RelationalRowsExpressionKind = switch (kind) {
+        .left, .right => blk: {
+            const matched_kind = lower_expr.matchLeftRightFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
+            try parser.expectToken(tokens, pos, .lparen);
+            break :blk matched_kind;
+        },
+        .repeat => blk: {
+            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsRepeatFunction);
+            break :blk .repeat;
+        },
+        else => return error.UnsupportedSqlShape,
+    };
+
+    const source = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+    var source_transferred = false;
+    errdefer if (!source_transferred) freeExpression(alloc, source);
+    try type_context.validateTextRowExpression(source);
+
+    try parser.expectToken(tokens, pos, .comma);
+    const count = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+    var count_transferred = false;
+    errdefer if (!count_transferred) freeExpression(alloc, count);
+    try type_context.validateNumericRowExpression(count);
+
+    try parser.expectToken(tokens, pos, .rparen);
+    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, expression_kind, source, count);
+    source_transferred = true;
+    count_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictMixedTextFunctionExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: lower_expr.RowExpressionTypeContext,
+    text_hooks: ConflictUnaryExpressionParserHooks,
+    numeric_hooks: ConflictCoalesceExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+
+    const expression_kind: db_mod.types.RelationalRowsExpressionKind = switch (kind) {
+        .substring => blk: {
+            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsSubstringFunction);
+            break :blk .substring;
+        },
+        .overlay => blk: {
+            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsOverlayFunction);
+            break :blk .overlay;
+        },
+        .split_part => blk: {
+            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsSplitPartFunction);
+            break :blk .split_part;
+        },
+        .lpad, .rpad => blk: {
+            const matched_kind = lower_expr.matchPadFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
+            try parser.expectToken(tokens, pos, .lparen);
+            break :blk matched_kind;
+        },
+        else => return error.UnsupportedSqlShape,
+    };
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+
+    switch (expression_kind) {
+        .substring => {
+            const text_operand = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+            var text_transferred = false;
+            errdefer if (!text_transferred) freeExpression(alloc, text_operand);
+            try type_context.validateTextRowExpression(text_operand);
+            try operands.append(alloc, text_operand);
+            text_transferred = true;
+
+            if (parser.matchToken(tokens, pos, .comma) != null) {
+                const start_operand = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+                var start_transferred = false;
+                errdefer if (!start_transferred) freeExpression(alloc, start_operand);
+                try type_context.validateNumericRowExpression(start_operand);
+                try operands.append(alloc, start_operand);
+                start_transferred = true;
+
+                if (parser.matchToken(tokens, pos, .comma) != null) {
+                    const length_operand = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+                    var length_transferred = false;
+                    errdefer if (!length_transferred) freeExpression(alloc, length_operand);
+                    try type_context.validateNumericRowExpression(length_operand);
+                    try operands.append(alloc, length_operand);
+                    length_transferred = true;
+                }
+            } else if (parser.matchKeyword(tokens, pos, "from")) {
+                const start_operand = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+                var start_transferred = false;
+                errdefer if (!start_transferred) freeExpression(alloc, start_operand);
+                try type_context.validateNumericRowExpression(start_operand);
+                try operands.append(alloc, start_operand);
+                start_transferred = true;
+
+                if (parser.matchKeyword(tokens, pos, "for")) {
+                    const length_operand = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+                    var length_transferred = false;
+                    errdefer if (!length_transferred) freeExpression(alloc, length_operand);
+                    try type_context.validateNumericRowExpression(length_operand);
+                    try operands.append(alloc, length_operand);
+                    length_transferred = true;
+                }
+            } else return error.UnsupportedSqlShape;
+        },
+        .overlay => {
+            const source_operand = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+            var source_transferred = false;
+            errdefer if (!source_transferred) freeExpression(alloc, source_operand);
+            try type_context.validateTextRowExpression(source_operand);
+            try operands.append(alloc, source_operand);
+            source_transferred = true;
+
+            try parser.expectKeyword(tokens, pos, "placing");
+            const replacement_operand = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+            var replacement_transferred = false;
+            errdefer if (!replacement_transferred) freeExpression(alloc, replacement_operand);
+            try type_context.validateTextRowExpression(replacement_operand);
+            try operands.append(alloc, replacement_operand);
+            replacement_transferred = true;
+
+            try parser.expectKeyword(tokens, pos, "from");
+            const start_operand = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+            var start_transferred = false;
+            errdefer if (!start_transferred) freeExpression(alloc, start_operand);
+            try type_context.validateNumericRowExpression(start_operand);
+            try operands.append(alloc, start_operand);
+            start_transferred = true;
+
+            if (parser.matchKeyword(tokens, pos, "for")) {
+                const length_operand = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+                var length_transferred = false;
+                errdefer if (!length_transferred) freeExpression(alloc, length_operand);
+                try type_context.validateNumericRowExpression(length_operand);
+                try operands.append(alloc, length_operand);
+                length_transferred = true;
+            }
+        },
+        .split_part => {
+            const source = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+            var source_transferred = false;
+            errdefer if (!source_transferred) freeExpression(alloc, source);
+            try type_context.validateTextRowExpression(source);
+            try operands.append(alloc, source);
+            source_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const delimiter = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+            var delimiter_transferred = false;
+            errdefer if (!delimiter_transferred) freeExpression(alloc, delimiter);
+            try type_context.validateTextRowExpression(delimiter);
+            try operands.append(alloc, delimiter);
+            delimiter_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const position = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+            var position_transferred = false;
+            errdefer if (!position_transferred) freeExpression(alloc, position);
+            try type_context.validateNumericRowExpression(position);
+            try operands.append(alloc, position);
+            position_transferred = true;
+        },
+        .lpad, .rpad => {
+            const source = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+            var source_transferred = false;
+            errdefer if (!source_transferred) freeExpression(alloc, source);
+            try type_context.validateTextRowExpression(source);
+            try operands.append(alloc, source);
+            source_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const target = try numeric_hooks.parse_operand(numeric_hooks.ptr, column, insert_columns, .numeric);
+            var target_transferred = false;
+            errdefer if (!target_transferred) freeExpression(alloc, target);
+            try type_context.validateNumericRowExpression(target);
+            try operands.append(alloc, target);
+            target_transferred = true;
+
+            if (parser.matchToken(tokens, pos, .comma) != null) {
+                const fill = try text_hooks.parse_operand(text_hooks.ptr, column, insert_columns, null);
+                var fill_transferred = false;
+                errdefer if (!fill_transferred) freeExpression(alloc, fill);
+                try type_context.validateTextRowExpression(fill);
+                try operands.append(alloc, fill);
+                fill_transferred = true;
+            }
+        },
+        else => unreachable,
+    }
+
+    try parser.expectToken(tokens, pos, .rparen);
+    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, expression_kind, &operands);
+}
+
+pub fn parseConflictStrposExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
+
+    if (lower_expr.matchFunctionKeyword(tokens, pos, lower_expr.sqlKeywordIsStrposFunction)) {
+        try parser.expectToken(tokens, pos, .lparen);
+        const source = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+        var source_transferred = false;
+        errdefer if (!source_transferred) freeExpression(alloc, source);
+        try type_context.validateTextRowExpression(source);
+
+        try parser.expectToken(tokens, pos, .comma);
+        const needle = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+        var needle_transferred = false;
+        errdefer if (!needle_transferred) freeExpression(alloc, needle);
+        try type_context.validateTextRowExpression(needle);
+
+        try parser.expectToken(tokens, pos, .rparen);
+        const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
+        source_transferred = true;
+        needle_transferred = true;
+        return expression;
+    } else if (parser.matchKeyword(tokens, pos, "position")) {
+        try parser.expectToken(tokens, pos, .lparen);
+        const needle = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+        var needle_transferred = false;
+        errdefer if (!needle_transferred) freeExpression(alloc, needle);
+        try type_context.validateTextRowExpression(needle);
+
+        try parser.expectKeyword(tokens, pos, "in");
+        const source = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+        var source_transferred = false;
+        errdefer if (!source_transferred) freeExpression(alloc, source);
+        try type_context.validateTextRowExpression(source);
+
+        try parser.expectToken(tokens, pos, .rparen);
+        const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
+        source_transferred = true;
+        needle_transferred = true;
+        return expression;
+    } else return error.UnsupportedSqlShape;
+}
+
+pub fn parseDatePartUnitLiteralExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsExpression {
+    const token = if (parser.matchToken(tokens, pos, .identifier)) |token|
+        token
+    else if (parser.matchToken(tokens, pos, .string)) |token|
+        token
+    else
+        return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(token.text, "from")) return error.UnsupportedSqlShape;
+    return .{
+        .kind = .value,
+        .value_json = try std.json.Stringify.valueAlloc(alloc, token.text, .{}),
+    };
+}
+
+pub fn parseConflictDateExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    switch (kind) {
+        .date_trunc, .date_bin => {
+            if (expected_type) |field_type| if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+        },
+        .date_part => {
+            if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+
+    switch (kind) {
+        .date_trunc => {
+            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsDateTruncFunction);
+            const unit = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var unit_transferred = false;
+            errdefer if (!unit_transferred) freeExpression(alloc, unit);
+            try type_context.validateTextRowExpression(unit);
+
+            try parser.expectToken(tokens, pos, .comma);
+            const value = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var value_transferred = false;
+            errdefer if (!value_transferred) freeExpression(alloc, value);
+            try type_context.validateNumericOrDatetimeRowExpression(value);
+
+            try parser.expectToken(tokens, pos, .rparen);
+            const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .date_trunc, unit, value);
+            unit_transferred = true;
+            value_transferred = true;
+            return expression;
+        },
+        .date_part => {
+            const extract_syntax = try lower_expr.parseDatePartFunctionCallStart(tokens, pos);
+            var unit: db_mod.types.RelationalRowsExpression = undefined;
+            var unit_initialized = false;
+            var unit_transferred = false;
+            errdefer if (unit_initialized and !unit_transferred) freeExpression(alloc, unit);
+            var value: db_mod.types.RelationalRowsExpression = undefined;
+            var value_initialized = false;
+            var value_transferred = false;
+            errdefer if (value_initialized and !value_transferred) freeExpression(alloc, value);
+
+            if (extract_syntax) {
+                unit = try parseDatePartUnitLiteralExpressionAlloc(alloc, tokens, pos);
+                unit_initialized = true;
+                try lower_expr.parseDatePartExtractSeparator(tokens, pos);
+                value = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+                value_initialized = true;
+                try type_context.validateNumericOrDatetimeRowExpression(value);
+            } else {
+                unit = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+                unit_initialized = true;
+                try type_context.validateTextRowExpression(unit);
+                try parser.expectToken(tokens, pos, .comma);
+                value = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+                value_initialized = true;
+                try type_context.validateNumericOrDatetimeRowExpression(value);
+            }
+
+            try parser.expectToken(tokens, pos, .rparen);
+            const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .date_part, unit, value);
+            unit_transferred = true;
+            value_transferred = true;
+            return expression;
+        },
+        .date_bin => {
+            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsDateBinFunction);
+            const stride = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var stride_transferred = false;
+            errdefer if (!stride_transferred) freeExpression(alloc, stride);
+            try type_context.validateDateBinStrideRowExpression(stride);
+
+            try parser.expectToken(tokens, pos, .comma);
+            const source = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var source_transferred = false;
+            errdefer if (!source_transferred) freeExpression(alloc, source);
+            try type_context.validateNumericOrDatetimeRowExpression(source);
+
+            try parser.expectToken(tokens, pos, .comma);
+            const origin = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var origin_transferred = false;
+            errdefer if (!origin_transferred) freeExpression(alloc, origin);
+            try type_context.validateNumericOrDatetimeRowExpression(origin);
+
+            try parser.expectToken(tokens, pos, .rparen);
+            const expression = try lower_expr.buildTernaryFunctionExpressionAlloc(alloc, .date_bin, stride, source, origin);
+            stride_transferred = true;
+            source_transferred = true;
+            origin_transferred = true;
+            return expression;
+        },
+        else => unreachable,
+    }
+}
+
+pub fn parseConflictGreatestLeastExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    hooks: ConflictCoalesceExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try lower_expr.parseGreatestLeastFunctionCallStart(tokens, pos);
+
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, expected_type);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (operands.items.len == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+
+    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+}
+
+pub fn parseConflictJsonUnaryExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    switch (kind) {
+        .json_array_length => try lower_expr.parseJsonArrayLengthFunctionCallStart(tokens, pos),
+        .json_typeof => try lower_expr.parseJsonTypeofFunctionCallStart(tokens, pos),
+        else => return error.UnsupportedSqlShape,
+    }
+    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, .json);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateJsonRowExpression(operand);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    operand_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictJsonExtractPathExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const keyword = lower_expr.matchFunctionKeywordText(tokens, pos, lower_expr.sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    const as_text = lower_expr.sqlJsonExtractPathFunctionAsText(keyword);
+    const output_type: runtime_schema.AntflyType = if (as_text) .keyword else .json;
+    if (expected_type) |field_type| {
+        if (!lower_expr.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
+    }
+
+    try parser.expectToken(tokens, pos, .lparen);
+    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, .json);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateJsonRowExpression(operand);
+    const path = try sql_value.parseJsonExtractPathSegmentsAlloc(alloc, tokens, pos, params);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(path);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try lower_expr.buildJsonExtractExpressionAlloc(alloc, operand, path, as_text);
+    operand_transferred = true;
+    path_transferred = true;
+    return expression;
+}
+
+fn parseConflictJsonBuildObjectOperandExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    hooks: ConflictJsonBuildObjectExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (sql_value.peekToJsonbFunctionCall(tokens, pos.*)) {
+        try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, .to_jsonb);
+        const expression = try parseConflictJsonBuildObjectOperandExpressionAlloc(alloc, tokens, pos, column, insert_columns, hooks);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try parser.expectToken(tokens, pos, .rparen);
+        expression_transferred = true;
+        return expression;
+    }
+    if (sql_value.peekConvertFromFunctionCall(tokens, pos.*)) {
+        const value_json = try hooks.parse_json_value(hooks.ptr);
+        errdefer alloc.free(value_json);
+        return .{ .kind = .value, .value_json = value_json };
+    }
+    return try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+}
+
+pub fn parseConflictJsonBuildObjectExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictJsonBuildObjectExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| {
+        if (field_type != .json) return error.UnsupportedSqlShape;
+    }
+    try lower_expr.parseJsonBuildObjectFunctionCallStart(tokens, pos);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    if (parser.matchToken(tokens, pos, .rparen) == null) {
+        while (true) {
+            const key = try hooks.parse_operand(hooks.ptr, column, insert_columns, .text);
+            var key_transferred = false;
+            errdefer if (!key_transferred) freeExpression(alloc, key);
+            try type_context.validateTextRowExpression(key);
+            try operands.append(alloc, key);
+            key_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const value = try parseConflictJsonBuildObjectOperandExpressionAlloc(alloc, tokens, pos, column, insert_columns, hooks);
+            var value_transferred = false;
+            errdefer if (!value_transferred) freeExpression(alloc, value);
+            _ = try type_context.rowExpressionOutputType(value);
+            try operands.append(alloc, value);
+            value_transferred = true;
+
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+    const expression = try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .json_build_object, &operands);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateJsonBuildObjectExpression(expression);
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictTextArrayExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| {
+        const compatible = switch (kind) {
+            .string_to_array => field_type == .array,
+            .array_to_string => lower_expr.sqlExpressionTypeIsTextLike(field_type),
+            else => false,
+        };
+        if (!compatible) return error.UnsupportedSqlShape;
+    }
+
+    switch (kind) {
+        .string_to_array => {
+            try lower_expr.parseStringToArrayFunctionCallStart(tokens, pos);
+            const text_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var text_transferred = false;
+            errdefer if (!text_transferred) freeExpression(alloc, text_expression);
+            try type_context.validateTextRowExpression(text_expression);
+
+            try parser.expectToken(tokens, pos, .comma);
+            const delimiter_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var delimiter_transferred = false;
+            errdefer if (!delimiter_transferred) freeExpression(alloc, delimiter_expression);
+            try type_context.validateTextRowExpression(delimiter_expression);
+            try type_context.validateStringToArrayDelimiterLiteral(delimiter_expression);
+
+            try parser.expectToken(tokens, pos, .rparen);
+            const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .string_to_array, text_expression, delimiter_expression);
+            text_transferred = true;
+            delimiter_transferred = true;
+            return expression;
+        },
+        .array_to_string => {
+            try lower_expr.parseArrayToStringFunctionCallStart(tokens, pos);
+            var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+            errdefer {
+                for (operands.items) |operand| freeExpression(alloc, operand);
+                operands.deinit(alloc);
+            }
+
+            const array_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, .array);
+            var array_transferred = false;
+            errdefer if (!array_transferred) freeExpression(alloc, array_expression);
+            try operands.append(alloc, array_expression);
+            array_transferred = true;
+
+            try parser.expectToken(tokens, pos, .comma);
+            const delimiter_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            var delimiter_transferred = false;
+            errdefer if (!delimiter_transferred) freeExpression(alloc, delimiter_expression);
+            try type_context.validateTextRowExpression(delimiter_expression);
+            try operands.append(alloc, delimiter_expression);
+            delimiter_transferred = true;
+
+            if (parser.matchToken(tokens, pos, .comma) != null) {
+                const null_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+                var null_transferred = false;
+                errdefer if (!null_transferred) freeExpression(alloc, null_expression);
+                try type_context.validateTextRowExpression(null_expression);
+                try operands.append(alloc, null_expression);
+                null_transferred = true;
+            }
+            try parser.expectToken(tokens, pos, .rparen);
+
+            const expression = try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .array_to_string, &operands);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeExpression(alloc, expression);
+            try type_context.validateArrayToStringExpression(expression);
+            expression_transferred = true;
+            return expression;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+pub fn parseConflictArrayLengthExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    insert_columns: []const []const u8,
+    hooks: ConflictArrayLengthExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const keyword = try lower_expr.parseArrayLengthFunctionCallStart(tokens, pos);
+    const field = try hooks.parse_field(hooks.ptr, insert_columns, .array);
+    var field_transferred = false;
+    errdefer if (!field_transferred) freeExpression(alloc, field);
+    try sql_value.parseArrayLengthFunctionTail(tokens, pos, params, keyword);
+
+    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, .array_length, field);
+    field_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictArrayPositionExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    const kind = try lower_expr.parseArrayPositionFunctionCallStart(tokens, pos);
+    if (expected_type) |field_type| {
+        const expected_result_type: runtime_schema.AntflyType = if (kind == .array_positions) .array else .numeric;
+        if (field_type != expected_result_type) return error.UnsupportedSqlShape;
+    }
+
+    const array_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, .array);
+    var array_transferred = false;
+    errdefer if (!array_transferred) freeExpression(alloc, array_expression);
+    const array_type = try type_context.rowExpressionOutputType(array_expression);
+    if (array_type != .array) return error.UnsupportedSqlShape;
+    const item_type = (try type_context.rowExpressionOutputArrayItemType(array_expression)) orelse .json;
+
+    try parser.expectToken(tokens, pos, .comma);
+    const needle_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, item_type);
+    var needle_transferred = false;
+    errdefer if (!needle_transferred) freeExpression(alloc, needle_expression);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, array_expression, needle_expression);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    array_transferred = true;
+    needle_transferred = true;
+    try type_context.validateArrayPositionExpression(expression);
+
+    expression_transferred = true;
+    return expression;
+}
+
+pub fn parseConflictArrayElementTransformExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    hooks: ConflictUnaryExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (expected_type) |field_type| if (field_type != .array) return error.UnsupportedSqlShape;
+    const kind = try lower_expr.parseArrayElementTransformFunctionCallStart(tokens, pos);
+
+    const first_expected: ?runtime_schema.AntflyType = if (kind == .array_prepend) null else .array;
+    const first_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, first_expected);
+    var first_transferred = false;
+    errdefer if (!first_transferred) freeExpression(alloc, first_expression);
+
+    try parser.expectToken(tokens, pos, .comma);
+    const second_expected: ?runtime_schema.AntflyType = if (kind == .array_prepend or kind == .array_cat) .array else null;
+    const second_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, second_expected);
+    var second_transferred = false;
+    errdefer if (!second_transferred) freeExpression(alloc, second_expression);
+
+    var third_expression: db_mod.types.RelationalRowsExpression = undefined;
+    var third_transferred = true;
+    if (kind == .array_replace) {
+        third_transferred = false;
+        try parser.expectToken(tokens, pos, .comma);
+        third_expression = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+        errdefer if (!third_transferred) freeExpression(alloc, third_expression);
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = if (kind == .array_prepend) blk: {
+        const out = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, second_expression, first_expression);
+        second_transferred = true;
+        first_transferred = true;
+        break :blk out;
+    } else if (kind == .array_replace) blk: {
+        const out = try lower_expr.buildTernaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression, third_expression);
+        first_transferred = true;
+        second_transferred = true;
+        third_transferred = true;
+        break :blk out;
+    } else blk: {
+        const out = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression);
+        first_transferred = true;
+        second_transferred = true;
+        break :blk out;
+    };
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    if (kind == .array_cat) {
+        try type_context.validateArrayCatExpression(expression);
+    } else if (kind == .array_replace) {
+        try type_context.validateArrayReplaceExpression(expression);
+    } else {
+        try type_context.validateArrayElementTransformExpression(expression);
+    }
+    expression_transferred = true;
+    return expression;
 }
 
 pub fn parseMergeArmConditionAlloc(

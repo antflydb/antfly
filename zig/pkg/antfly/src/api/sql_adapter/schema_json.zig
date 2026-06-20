@@ -326,9 +326,20 @@ pub fn schemaJsonRelationalChecksAlloc(alloc: std.mem.Allocator, checks: []const
 pub fn schemaJsonRelationalCheckAlloc(alloc: std.mem.Allocator, check: runtime_schema.RelationalCheck) !std.json.Value {
     var object = std.json.ObjectMap.empty;
     try putJsonString(alloc, &object, "name", check.name);
+    if (check.validation_state != .enforced) try putJsonString(alloc, &object, "validation_state", ddl_plan.relationalCheckValidationStateName(check.validation_state));
+    if (check.expression) |expression| {
+        var expression_json_writer: std.Io.Writer.Allocating = .init(alloc);
+        defer expression_json_writer.deinit();
+        try lower_expr.writeRowExpressionConditionJson(&expression_json_writer.writer, expression);
+        const expression_json = try expression_json_writer.toOwnedSlice();
+        defer alloc.free(expression_json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, expression_json, .{});
+        defer parsed.deinit();
+        try object.put(alloc, try alloc.dupe(u8, "expression"), try json_helpers.cloneJsonValue(alloc, parsed.value));
+        return .{ .object = object };
+    }
     try putJsonString(alloc, &object, "field", check.field);
     try putJsonString(alloc, &object, "op", ddl_plan.relationalCheckOpToken(check.op));
-    if (check.validation_state != .enforced) try putJsonString(alloc, &object, "validation_state", ddl_plan.relationalCheckValidationStateName(check.validation_state));
     if (check.value_json) |value_json| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();

@@ -1620,34 +1620,36 @@ fn parseRowSecurityPolicyPredicateAlloc(
     tokens: []const Token,
     pos: *usize,
 ) !ddl_plan.RowSecurityPolicyPredicate {
-    const PredicateBoolOp = enum { none, and_op, or_op };
-
     try cursor.expectToken(.lparen);
+    var predicate = try parseRowSecurityPolicyOrPredicateAlloc(alloc, cursor, tokens, pos);
+    errdefer predicate.deinit(alloc);
+    try cursor.expectToken(.rparen);
+    return predicate;
+}
+
+fn parseRowSecurityPolicyOrPredicateAlloc(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    tokens: []const Token,
+    pos: *usize,
+) !ddl_plan.RowSecurityPolicyPredicate {
     var predicates = std.ArrayList(ddl_plan.RowSecurityPolicyPredicate).empty;
     var predicates_transferred = false;
-    errdefer if (!predicates_transferred) {
-        for (predicates.items) |*predicate| predicate.deinit(alloc);
-        predicates.deinit(alloc);
-    };
+    errdefer if (!predicates_transferred) freeRowSecurityPolicyPredicateList(alloc, &predicates);
 
-    var bool_op: PredicateBoolOp = .none;
-    try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
+    var first = try parseRowSecurityPolicyAndPredicateAlloc(alloc, cursor, tokens, pos);
+    var first_transferred = false;
+    errdefer if (!first_transferred) first.deinit(alloc);
+    try predicates.append(alloc, first);
+    first_transferred = true;
     while (true) {
-        if (cursor.matchKeyword("and")) {
-            if (bool_op == .or_op) return error.UnsupportedSqlShape;
-            bool_op = .and_op;
-            try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
-            continue;
-        }
-        if (cursor.matchKeyword("or")) {
-            if (bool_op == .and_op) return error.UnsupportedSqlShape;
-            bool_op = .or_op;
-            try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
-            continue;
-        }
-        break;
+        if (!cursor.matchKeyword("or")) break;
+        var term = try parseRowSecurityPolicyAndPredicateAlloc(alloc, cursor, tokens, pos);
+        var term_transferred = false;
+        errdefer if (!term_transferred) term.deinit(alloc);
+        try predicates.append(alloc, term);
+        term_transferred = true;
     }
-    try cursor.expectToken(.rparen);
 
     if (predicates.items.len == 1) {
         const single = predicates.items[0];
@@ -1658,23 +1660,51 @@ fn parseRowSecurityPolicyPredicateAlloc(
 
     const owned = try predicates.toOwnedSlice(alloc);
     predicates_transferred = true;
-    return switch (bool_op) {
-        .and_op => .{ .conjunction = .{ .predicates = owned } },
-        .or_op => .{ .disjunction = .{ .predicates = owned } },
-        .none => unreachable,
-    };
+    return .{ .disjunction = .{ .predicates = owned } };
 }
 
-fn appendRowSecurityPolicyPredicateAtomAlloc(
+fn parseRowSecurityPolicyAndPredicateAlloc(
     alloc: std.mem.Allocator,
-    predicates: *std.ArrayList(ddl_plan.RowSecurityPolicyPredicate),
     cursor: parser.Cursor,
     tokens: []const Token,
     pos: *usize,
-) !void {
-    var predicate = try parseRowSecurityPolicyPredicateAtomAlloc(alloc, cursor, tokens, pos);
-    errdefer predicate.deinit(alloc);
-    try predicates.append(alloc, predicate);
+) !ddl_plan.RowSecurityPolicyPredicate {
+    var predicates = std.ArrayList(ddl_plan.RowSecurityPolicyPredicate).empty;
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) freeRowSecurityPolicyPredicateList(alloc, &predicates);
+
+    var first = try parseRowSecurityPolicyPredicateAtomAlloc(alloc, cursor, tokens, pos);
+    var first_transferred = false;
+    errdefer if (!first_transferred) first.deinit(alloc);
+    try predicates.append(alloc, first);
+    first_transferred = true;
+    while (true) {
+        if (!cursor.matchKeyword("and")) break;
+        var term = try parseRowSecurityPolicyPredicateAtomAlloc(alloc, cursor, tokens, pos);
+        var term_transferred = false;
+        errdefer if (!term_transferred) term.deinit(alloc);
+        try predicates.append(alloc, term);
+        term_transferred = true;
+    }
+
+    if (predicates.items.len == 1) {
+        const single = predicates.items[0];
+        predicates_transferred = true;
+        predicates.deinit(alloc);
+        return single;
+    }
+
+    const owned = try predicates.toOwnedSlice(alloc);
+    predicates_transferred = true;
+    return .{ .conjunction = .{ .predicates = owned } };
+}
+
+fn freeRowSecurityPolicyPredicateList(
+    alloc: std.mem.Allocator,
+    predicates: *std.ArrayList(ddl_plan.RowSecurityPolicyPredicate),
+) void {
+    for (predicates.items) |*predicate| predicate.deinit(alloc);
+    predicates.deinit(alloc);
 }
 
 fn parseRowSecurityPolicyPredicateAtomAlloc(
@@ -7946,7 +7976,24 @@ test "sql adapter grammar parses row security catalog tails" {
     var mixed_boolean_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');");
     defer lexer.freeTokens(alloc, &mixed_boolean_tokens);
     var mixed_boolean_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, mixed_boolean_tokens.items, &mixed_boolean_pos));
+    var mixed_boolean = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, mixed_boolean_tokens.items, &mixed_boolean_pos);
+    defer mixed_boolean.deinit(alloc);
+    try std.testing.expectEqual(mixed_boolean_tokens.items.len, mixed_boolean_pos);
+    const mixed_disjunction = switch (mixed_boolean.predicate) {
+        .disjunction => |or_predicate| or_predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), mixed_disjunction.predicates.len);
+    const mixed_first = switch (mixed_disjunction.predicates[0]) {
+        .literal_equals => |predicate_value| predicate_value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("tenant_id", mixed_first.field);
+    const mixed_second = switch (mixed_disjunction.predicates[1]) {
+        .conjunction => |and_predicate| and_predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), mixed_second.predicates.len);
 
     var drop_tokens = try lexer.tokenizeAlloc(alloc, "POLICY IF EXISTS tenant_policy ON public.usage_records CASCADE;");
     defer lexer.freeTokens(alloc, &drop_tokens);

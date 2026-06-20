@@ -3917,8 +3917,11 @@ pub fn build(b: *std.Build) void {
             "sql adapter grammar parses truncate mutation-source syntax",
             "sql routine runtime",
             "api http server recovers durable SQL routine catalog",
+            "api http server routes routine-backed SQL trigger DDL through routine runtime",
+            "api http server keeps updated-at trigger DDL on table source path",
             "api http server exposes SQL routine bindings to catalog read planning",
             "api http server enforces SQL row security WITH CHECK on row writes",
+            "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.

@@ -1323,9 +1323,12 @@ runtime path may execute only typed expression-body plans, and
 `ApiHttpServer.lowerRelationalSqlReadPlanWithRoutineBindingsAlloc` exports the
 current routine runtime bindings into catalog-aware SQL read planning so
 `CREATE FUNCTION ... LANGUAGE sql AS 'SELECT ...'` bodies can be used by the
-ordinary row-expression lowerer. Procedural bodies, PL bodies, cascaded routine
-drops, and unsupported expression forms fail closed until they have native typed
-execution contracts.
+ordinary row-expression lowerer. Narrow safe PL/pgSQL trigger bodies that
+return `NEW` or `OLD` are stored as typed routine hooks rather than opaque
+procedure text, and cataloged trigger DDL records bind those hooks to table
+events through the routine runtime. Unsupported procedural bodies, cascaded
+routine drops, and unsupported expression forms fail closed until they have
+native typed execution contracts.
 sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, including idempotent create, `IF EXISTS` alter, owned-by/type
 metadata, and drop dependency metadata,
@@ -5119,12 +5122,12 @@ supported policy to a hidden native row-filter policy subject, converts
 `current_setting('app.<key>')` to `{"$auth":"settings.app.<key>"}`, stores
 literal equality as a native `term` row filter, lowers supported `AND` chains
 over those atoms to native row-filter `conjuncts`, lowers supported `OR` chains
-over those atoms to native row-filter `disjuncts`, applies role targets during
-effective-policy resolution, and merges enabled-table filters into every
-matching user's effective row filters before row-query, aggregate, join,
-lateral, window, and document query execution. Mixed unparenthesized `AND`/`OR`
-policy predicates still fail closed until the native policy AST can preserve
-precedence explicitly. Those setting references are
+over those atoms to native row-filter `disjuncts`, preserves nested
+conjunctions/disjunctions for mixed parenthesized and SQL-precedence
+`AND`/`OR` policy predicates, applies role targets during effective-policy
+resolution, and merges enabled-table filters into every matching user's
+effective row filters before row-query, aggregate, join, lateral, window, and
+document query execution. Those setting references are
 resolved from the authenticated user's effective native role settings; a missing
 setting fails closed during request filter resolution. Write execution resolves
 the enabled read and write filters independently: existing rows touched by a
@@ -5321,7 +5324,14 @@ preserve PostgreSQL null-input semantics for nullable row fields.
 The routine body model also admits narrow safe PL/pgSQL trigger bodies:
 `BEGIN RETURN NEW; END` as a `plpgsql_trigger` / `trigger_return_new` hook and
 `BEGIN RETURN OLD; END` as a `plpgsql_trigger` / `trigger_return_old` hook.
-It also admits the side-effect-free PL/pgSQL procedure body
+`ApiHttpServer` routes cataloged `CREATE TRIGGER` / `DROP TRIGGER` DDL that is
+not a table-owned update-policy shortcut into the routine runtime, where
+trigger records persist table name, trigger name, function name, and event.
+Trigger creation validates that the referenced zero-argument function exists
+and has a safe trigger hook for the requested event; routine drops fail while a
+cataloged trigger still references the function. Trigger records recover from
+the durable routine store and remain metadata until a later typed mutation-hook
+executor claims the event. The model also admits the side-effect-free PL/pgSQL procedure body
 `BEGIN NULL; END` as a `plpgsql_procedure` / `procedure_noop` hook. Both hooks
 are stored as durable routine metadata and are intentionally not executable
 through the expression-function path. Other PL/pgSQL bodies, such as
@@ -5627,7 +5637,7 @@ closed because Antfly does not model table inheritance.
 | `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT` | A conservative same-table subset lowers to ordinary typed row-query predicate composition when both branches read the same table or the same CTE-backed row source, project identical simple fields or identical expression projections, and use only scalar, scalar OR, scalar `IN`, expression predicates, or expression-OR branches: `UNION` becomes predicate `OR`, promoting scalar branch predicates to equivalent expression conditions when either branch has expression predicates or expression-OR branches; scalar `IN` `UNION` branches lower to typed `access_or_predicates` so the composed plan preserves native membership predicates, and scalar `IN` plus expression-predicate or expression-OR `UNION` branches expand bounded membership values into typed `expression_or_predicates`. Base scalar/expression predicates beside expression-OR groups are copied into each expression branch before set-operation composition, preserving `base AND branch` semantics. `UNION ALL` uses the same typed `OR` plan only when every branch pair is proven disjoint by same-field or same-expression equality predicates over distinct canonical string, boolean, or null JSON literals, equality versus exact `!=` / `IS DISTINCT FROM` on the same safe literal, `IS NOT DISTINCT FROM` versus `IS DISTINCT FROM` on the same safe literal, exact numeric equality versus complementary inequality/distinctness over the same raw JSON number literal, adjacent numeric field or expression range partitions such as `< bound` versus `>= bound` or `<= bound` versus `> bound`, `IS NULL` versus `IS NOT NULL`, `IS NULL` versus equality to a definitely non-null safe scalar or numeric literal, non-negated same-field scalar `IN` branches that are disjoint from scalar equality/null checks or another scalar `IN` array over safe JSON scalar literals, or same-expression contradiction proofs for expression-OR branches; scalar `IN` plus expression-predicate or expression-OR `UNION ALL` branches are admitted only through those same membership disjointness proofs or through same-expression contradiction proofs after bounded expansion, then lower to typed `expression_or_predicates`. `INTERSECT` becomes predicate conjunction, distributes scalar OR, scalar `IN`, and expression OR branches into bounded expression branch conjunctions when expression OR is involved, promotes scalar branch predicates to typed expression conditions when needed, and includes scalar `IN` conjunctions, including alongside expression predicates when no OR distribution is required; `EXCEPT` becomes typed negation of the right branch, using multiple `not_predicates` for scalar OR, `access_not_predicates` when the right branch includes only scalar `IN`, expanded `expression_not_predicates` when a non-negated scalar `IN` right branch also has expression predicates or expression OR branches, direct `expression_not_predicates` for expression OR, and expression conditions when needed so mixed scalar/expression branches evaluate as `NOT (scalar AND expression)`. Negated scalar `IN` plus expression predicate negation remains fail-closed until there are single native access-plus-expression negated groups. When the catalog provides the right-side schema, compatible two-branch cross-table set operations lower to the explicit native set-operation read plan, including `INTERSECT` and `EXCEPT`; final set-result `ORDER BY` over output names or ordinals plus `LIMIT`, `OFFSET`, and `FETCH` lower as result-tail metadata and execute after branch combination. Unknown sources, type-incompatible outputs, different CTE sources, branch ordering/pagination, expression result-order keys, recursive CTEs, and broader stream-composition shapes still fail closed as `set_operation_plan`. | Keep the predicate-composition subset in row-query plans because it has the same ownership, filtering, and result-shape semantics as the native API. Model general branch output-schema reconciliation, duplicate handling, routed merge behavior, and spill bounds as explicit typed stream-composition plan metadata before accepting broader PostgreSQL set-operation syntax. |
 | Aggregates, `FILTER`, `DISTINCT`, `array_agg`, `string_agg`, `bool_or`, `bool_and`, `HAVING` | Typed aggregate plans with per-aggregate predicate filters, executable expression filters, boolean filter groups, scalar/JSON/array/text field inputs, boolean field/expression folds, JSON extraction expression inputs, native expression group keys, distinct state, ordering, output predicates, and computed/boolean `having_expressions`, `having_any`, and `having_not` over emitted aggregate rows | Add spill-backed distinct state beyond the current explicit cap, planner pushdown for aggregate expression keys where an index can satisfy the input, and explicit memory/backpressure policy for large materialized aggregate stages while keeping ordered collection aggregates bounded. |
 | Window functions | Typed local `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile()`, `lag()`, `lead()`, `first_value()`, `last_value()`, `nth_value()`, `count()`, `sum()`, `avg()`, `min()`, `max()`, `bool_or()`, and `bool_and()` stages over ordered base-row or materialized CTE streams, with aggregate-window `FILTER` predicates, `ROWS`/`RANGE` frames, current-row starts, unbounded ends, bounded `ROWS n PRECEDING/FOLLOWING` offsets, and bounded `RANGE n PRECEDING/FOLLOWING` offsets over a leading numeric/datetime field or expression order key plus optional trailing composite tie-breakers. | Add ordered-set/percentile window stages, routed partition execution, and memory/spill bounds. Use window stages for migration/backfill ranking, previous/next-row value projection, boolean running state, and wake-one job selection rather than folding windows into aggregate or join nodes. |
-| Triggers and server-maintained columns | Explicit table-owned server-update policies and mutation hooks | Do not emulate PL/pgSQL trigger execution. Updated timestamps use `x-antfly-on-update` metadata today. Compile any remaining known trigger patterns into typed policies for denormalized JSON/array fields, action-job creation, or other deterministic mutation hooks. |
+| Triggers and server-maintained columns | Explicit table-owned server-update policies, cataloged trigger records, and typed mutation hooks | Do not execute opaque PL/pgSQL. Updated timestamps use `x-antfly-on-update` metadata today. Safe `RETURN NEW`/`RETURN OLD` trigger functions and their trigger records are catalog metadata; they are accepted only when the routine runtime can validate the hook/event pairing and preserve it durably. Compile future deterministic trigger patterns into typed mutation-hook metadata for denormalized JSON/array fields, action-job creation, or other deterministic side effects before execution. |
 
 Plain SQL `DROP TABLE` and direct table-delete API calls share the same catalog
 constraint validation. A table referenced by any relational foreign key is

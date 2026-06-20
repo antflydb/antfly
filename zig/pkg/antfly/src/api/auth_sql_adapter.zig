@@ -1134,7 +1134,11 @@ test "sql auth adapter applies row security policies through user manager" {
     const stored_disjunction = try manager.getSqlRowSecurityPolicy("usage_records_or_policy", usage_records_resource);
     defer alloc.free(stored_disjunction);
     try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_disjunction);
-    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');"));
+    var mixed_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');")).?;
+    defer mixed_policy.deinit(alloc);
+    const stored_mixed = try manager.getSqlRowSecurityPolicy("usage_records_mixed_policy", usage_records_resource);
+    defer alloc.free(stored_mixed);
+    try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"region\":\"us\"}}]}]}", stored_mixed);
 
     var altered_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_literal_policy ON usage_records USING (status = 'archived');")).?;
     defer altered_policy.deinit(alloc);

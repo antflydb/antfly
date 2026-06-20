@@ -18,6 +18,7 @@ const docstore_mod = @import("../storage/docstore.zig");
 const relational_rows = @import("relational_rows.zig");
 const relational_sql = @import("relational_sql.zig");
 const runtime_schema = @import("../storage/schema.zig");
+const sql_adapter = @import("sql_adapter/mod.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,
@@ -71,6 +72,26 @@ pub const RoutineOrigin = enum {
     extension_query_function,
 };
 
+pub const TriggerEvent = enum {
+    insert,
+    update,
+    delete,
+};
+
+pub const TriggerRecord = struct {
+    trigger_name: []u8,
+    table_name: []u8,
+    function_name: []u8,
+    event: TriggerEvent,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
+        alloc.free(self.function_name);
+        self.* = undefined;
+    }
+};
+
 pub const OpenedStore = struct {
     alloc: std.mem.Allocator,
     path_z: [:0]u8,
@@ -102,6 +123,7 @@ pub const Runtime = struct {
     alloc: std.mem.Allocator,
     mutex: SpinMutex = .{},
     routines: std.ArrayListUnmanaged(RoutineRecord) = .empty,
+    triggers: std.ArrayListUnmanaged(TriggerRecord) = .empty,
     opened_store: ?*OpenedStore = null,
 
     pub fn init(alloc: std.mem.Allocator) Runtime {
@@ -113,6 +135,8 @@ pub const Runtime = struct {
         defer self.mutex.unlock();
         for (self.routines.items) |*routine| routine.deinit(self.alloc);
         self.routines.deinit(self.alloc);
+        for (self.triggers.items) |*trigger| trigger.deinit(self.alloc);
+        self.triggers.deinit(self.alloc);
         if (self.opened_store) |opened| {
             opened.deinit();
             self.alloc.destroy(opened);
@@ -126,6 +150,7 @@ pub const Runtime = struct {
         self.opened_store = opened;
         errdefer self.opened_store = null;
         try self.recoverPersistedRoutinesLocked(opened);
+        try self.recoverPersistedTriggersLocked(opened);
     }
 
     pub fn apply(self: *@This(), plan: relational_sql.FunctionCatalogPlan) !void {
@@ -141,6 +166,63 @@ pub const Runtime = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.routines.items.len;
+    }
+
+    pub fn triggerCountForTest(self: *@This()) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.triggers.items.len;
+    }
+
+    pub fn applyTriggerDdlAlloc(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !bool {
+        var parsed = parseTriggerDdlAlloc(alloc, sql) catch |err| switch (err) {
+            error.NotTriggerDdl, error.UnsupportedSqlShape => return false,
+            else => return err,
+        };
+        defer parsed.deinit(alloc);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (parsed) {
+            .create => |create| try self.createTriggerLocked(create),
+            .drop => |drop| try self.dropTriggerLocked(drop),
+        }
+        return true;
+    }
+
+    pub fn applyCatalogedTriggerDropDdlAlloc(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !bool {
+        var parsed = parseTriggerDdlAlloc(alloc, sql) catch |err| switch (err) {
+            error.NotTriggerDdl, error.UnsupportedSqlShape => return false,
+            else => return err,
+        };
+        defer parsed.deinit(alloc);
+
+        switch (parsed) {
+            .create => return false,
+            .drop => |drop| {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+                if (self.findTriggerIndexLocked(drop.table_name, drop.trigger_name) == null) return false;
+                try self.dropTriggerLocked(drop);
+                return true;
+            },
+        }
+    }
+
+    pub fn triggerFunctionForTableEventAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        event: TriggerEvent,
+    ) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.triggers.items) |trigger| {
+            if (trigger.event == event and std.ascii.eqlIgnoreCase(trigger.table_name, table_name)) {
+                return try alloc.dupe(u8, trigger.function_name);
+            }
+        }
+        return null;
     }
 
     pub fn replaceNativeQueryFunctionBindings(
@@ -289,6 +371,7 @@ pub const Runtime = struct {
 
     fn dropLocked(self: *@This(), plan: relational_sql.DropRoutinePlan) !void {
         if (plan.cascade) return error.UnsupportedSqlShape;
+        if (self.routineReferencedByTriggerLocked(plan.kind, plan.routine_name, plan.argument_count)) return error.RoutineInUse;
         if (self.findRoutineIndexLocked(plan.kind, plan.routine_name, plan.argument_count)) |existing| {
             try self.deletePersistedCatalogRoutineLocked(self.routines.items[existing]);
             var removed = self.routines.orderedRemove(existing);
@@ -296,6 +379,32 @@ pub const Runtime = struct {
             return;
         }
         if (!plan.if_exists) return error.RoutineNotFound;
+    }
+
+    fn createTriggerLocked(self: *@This(), plan: CreateTriggerPlan) !void {
+        try self.validateTriggerFunctionLocked(plan.function_name, plan.event);
+        const existing_index = self.findTriggerIndexLocked(plan.table_name, plan.trigger_name);
+        if (existing_index != null and !plan.replace_existing) return error.TriggerAlreadyExists;
+        var record = try cloneCreateTriggerRecordAlloc(self.alloc, plan);
+        errdefer record.deinit(self.alloc);
+        try self.triggers.ensureUnusedCapacity(self.alloc, 1);
+        try self.persistTriggerLocked(record);
+        if (existing_index) |existing| {
+            var removed = self.triggers.orderedRemove(existing);
+            removed.deinit(self.alloc);
+        }
+        self.triggers.appendAssumeCapacity(record);
+    }
+
+    fn dropTriggerLocked(self: *@This(), plan: DropTriggerPlan) !void {
+        if (plan.cascade) return error.UnsupportedSqlShape;
+        if (self.findTriggerIndexLocked(plan.table_name, plan.trigger_name)) |existing| {
+            try self.deletePersistedTriggerLocked(self.triggers.items[existing]);
+            var removed = self.triggers.orderedRemove(existing);
+            removed.deinit(self.alloc);
+            return;
+        }
+        if (!plan.if_exists) return error.TriggerNotFound;
     }
 
     fn removeExtensionQueryFunctionsLocked(self: *@This()) void {
@@ -330,6 +439,42 @@ pub const Runtime = struct {
             if (routine.kind == kind and routine.argument_count == argument_count and std.ascii.eqlIgnoreCase(routine.name, name)) return i;
         }
         return null;
+    }
+
+    fn validateTriggerFunctionLocked(self: *@This(), function_name: []const u8, event: TriggerEvent) !void {
+        const routine = self.findRoutineLocked(.function, function_name, 0) orelse return error.RoutineNotFound;
+        const body = routine.body orelse return error.RoutineBodyNotExecutable;
+        if (body.kind != .plpgsql_trigger or body.expression != null) return error.RoutineBodyNotExecutable;
+        switch (body.hook) {
+            .trigger_return_new => {
+                if (event == .delete) return error.UnsupportedSqlShape;
+            },
+            .trigger_return_old => {
+                if (event == .insert) return error.UnsupportedSqlShape;
+            },
+            else => return error.RoutineBodyNotExecutable,
+        }
+    }
+
+    fn findTriggerIndexLocked(self: *@This(), table_name: []const u8, trigger_name: []const u8) ?usize {
+        for (self.triggers.items, 0..) |trigger, i| {
+            if (std.ascii.eqlIgnoreCase(trigger.table_name, table_name) and
+                std.ascii.eqlIgnoreCase(trigger.trigger_name, trigger_name)) return i;
+        }
+        return null;
+    }
+
+    fn routineReferencedByTriggerLocked(
+        self: *@This(),
+        kind: relational_sql.RoutineKind,
+        routine_name: []const u8,
+        argument_count: usize,
+    ) bool {
+        if (kind != .function or argument_count != 0) return false;
+        for (self.triggers.items) |trigger| {
+            if (std.ascii.eqlIgnoreCase(trigger.function_name, routine_name)) return true;
+        }
+        return false;
     }
 
     fn persistCatalogRoutineLocked(self: *@This(), record: RoutineRecord) !void {
@@ -375,6 +520,48 @@ pub const Runtime = struct {
             try self.routines.append(self.alloc, record);
         }
     }
+
+    fn persistTriggerLocked(self: *@This(), record: TriggerRecord) !void {
+        const opened = self.opened_store orelse return;
+        const key = try triggerRecordKeyAlloc(self.alloc, record.table_name, record.trigger_name);
+        defer self.alloc.free(key);
+        const encoded = try encodeTriggerRecordAlloc(self.alloc, record);
+        defer self.alloc.free(encoded);
+        try opened.docstore.put(key, encoded);
+    }
+
+    fn deletePersistedTriggerLocked(self: *@This(), record: TriggerRecord) !void {
+        const opened = self.opened_store orelse return;
+        const key = try triggerRecordKeyAlloc(self.alloc, record.table_name, record.trigger_name);
+        defer self.alloc.free(key);
+        opened.docstore.delete(key) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+
+    fn recoverPersistedTriggersLocked(self: *@This(), opened: *OpenedStore) !void {
+        const results = try opened.docstore.scanPrefix(self.alloc, trigger_key_prefix);
+        defer docstore_mod.DocStore.freeResults(self.alloc, results);
+        for (results) |kv| {
+            var parsed = std.json.parseFromSlice(PersistedTriggerRecord, self.alloc, kv.value, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidRoutineStore,
+            };
+            defer parsed.deinit();
+            if (parsed.value.version != 1) return error.InvalidRoutineStore;
+            var record = clonePersistedTriggerRecordAlloc(self.alloc, parsed.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+            };
+            errdefer record.deinit(self.alloc);
+            try self.validateTriggerFunctionLocked(record.function_name, record.event);
+            if (self.findTriggerIndexLocked(record.table_name, record.trigger_name)) |existing| {
+                var removed = self.triggers.orderedRemove(existing);
+                removed.deinit(self.alloc);
+            }
+            try self.triggers.append(self.alloc, record);
+        }
+    }
 };
 
 pub fn freeExpressionRoutineBindings(
@@ -386,6 +573,254 @@ pub fn freeExpressionRoutineBindings(
         runtime_schema.freeRelationalRowsExpression(alloc, binding.expression);
     }
     if (bindings.len > 0) alloc.free(@constCast(bindings));
+}
+
+const TriggerDdlPlan = union(enum) {
+    create: CreateTriggerPlan,
+    drop: DropTriggerPlan,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .create => |*create| create.deinit(alloc),
+            .drop => |*drop| drop.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+const CreateTriggerPlan = struct {
+    trigger_name: []u8,
+    table_name: []u8,
+    function_name: []u8,
+    event: TriggerEvent,
+    replace_existing: bool = false,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
+        alloc.free(self.function_name);
+        self.* = undefined;
+    }
+};
+
+const DropTriggerPlan = struct {
+    trigger_name: []u8,
+    table_name: []u8,
+    if_exists: bool = false,
+    cascade: bool = false,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.trigger_name);
+        alloc.free(self.table_name);
+        self.* = undefined;
+    }
+};
+
+const TriggerParser = struct {
+    alloc: std.mem.Allocator,
+    tokens: []const sql_adapter.Token,
+    pos: usize = 0,
+
+    fn parse(self: *@This()) !TriggerDdlPlan {
+        if (self.matchKeyword("create")) {
+            var replace_existing = false;
+            if (self.matchKeyword("or")) {
+                try self.expectKeyword("replace");
+                replace_existing = true;
+            }
+            if (!self.matchKeyword("trigger")) return error.NotTriggerDdl;
+            return .{ .create = try self.parseCreateTriggerTail(replace_existing) };
+        }
+        if (self.matchKeyword("drop")) {
+            if (!self.matchKeyword("trigger")) return error.NotTriggerDdl;
+            return .{ .drop = try self.parseDropTriggerTail() };
+        }
+        return error.NotTriggerDdl;
+    }
+
+    fn parseCreateTriggerTail(self: *@This(), replace_existing: bool) !CreateTriggerPlan {
+        const trigger_name = try self.parseIdentifierOwned();
+        var trigger_transferred = false;
+        errdefer if (!trigger_transferred) self.alloc.free(trigger_name);
+
+        try self.expectKeyword("before");
+        const event = try self.parseTriggerEvent();
+        try self.expectKeyword("on");
+        const table_name = try self.parseObjectIdentifierOwned();
+        var table_transferred = false;
+        errdefer if (!table_transferred) self.alloc.free(table_name);
+
+        if (self.matchKeyword("for")) {
+            try self.expectKeyword("each");
+            try self.expectKeyword("row");
+        }
+
+        try self.expectKeyword("execute");
+        if (!(self.matchKeyword("function") or self.matchKeyword("procedure"))) return error.UnsupportedSqlShape;
+        const function_name = try self.parseObjectIdentifierOwned();
+        var function_transferred = false;
+        errdefer if (!function_transferred) self.alloc.free(function_name);
+        try self.expect(.lparen);
+        try self.expect(.rparen);
+        try self.expectStatementEnd();
+
+        trigger_transferred = true;
+        table_transferred = true;
+        function_transferred = true;
+        return .{
+            .trigger_name = trigger_name,
+            .table_name = table_name,
+            .function_name = function_name,
+            .event = event,
+            .replace_existing = replace_existing,
+        };
+    }
+
+    fn parseDropTriggerTail(self: *@This()) !DropTriggerPlan {
+        var if_exists = false;
+        if (self.matchKeyword("if")) {
+            try self.expectKeyword("exists");
+            if_exists = true;
+        }
+        const trigger_name = try self.parseIdentifierOwned();
+        var trigger_transferred = false;
+        errdefer if (!trigger_transferred) self.alloc.free(trigger_name);
+        try self.expectKeyword("on");
+        _ = self.matchKeyword("only");
+        const table_name = try self.parseObjectIdentifierOwned();
+        var table_transferred = false;
+        errdefer if (!table_transferred) self.alloc.free(table_name);
+        var cascade = false;
+        if (self.matchKeyword("cascade")) {
+            cascade = true;
+        } else {
+            _ = self.matchKeyword("restrict");
+        }
+        try self.expectStatementEnd();
+        trigger_transferred = true;
+        table_transferred = true;
+        return .{
+            .trigger_name = trigger_name,
+            .table_name = table_name,
+            .if_exists = if_exists,
+            .cascade = cascade,
+        };
+    }
+
+    fn parseTriggerEvent(self: *@This()) !TriggerEvent {
+        if (self.matchKeyword("insert")) return .insert;
+        if (self.matchKeyword("update")) {
+            if (self.matchKeyword("of")) return error.UnsupportedSqlShape;
+            return .update;
+        }
+        if (self.matchKeyword("delete")) return .delete;
+        return error.UnsupportedSqlShape;
+    }
+
+    fn parseIdentifierOwned(self: *@This()) ![]u8 {
+        if (self.pos >= self.tokens.len) return error.UnsupportedSqlShape;
+        const token = self.tokens[self.pos];
+        if (token.kind != .identifier) return error.UnsupportedSqlShape;
+        self.pos += 1;
+        return try self.alloc.dupe(u8, token.text);
+    }
+
+    fn parseObjectIdentifierOwned(self: *@This()) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        var first = true;
+        while (true) {
+            if (self.pos >= self.tokens.len) return error.UnsupportedSqlShape;
+            const token = self.tokens[self.pos];
+            if (token.kind != .identifier) return error.UnsupportedSqlShape;
+            if (!first) try writer.writeByte('.');
+            first = false;
+            try writer.writeAll(token.text);
+            self.pos += 1;
+            if (self.pos + 1 > self.tokens.len) break;
+            if (!std.mem.eql(u8, self.tokens[self.pos].text, ".")) break;
+            self.pos += 1;
+        }
+        return try out.toOwnedSlice();
+    }
+
+    fn expect(self: *@This(), kind: sql_adapter.TokenKind) !void {
+        if (self.pos >= self.tokens.len or self.tokens[self.pos].kind != kind) return error.UnsupportedSqlShape;
+        self.pos += 1;
+    }
+
+    fn matchKeyword(self: *@This(), keyword: []const u8) bool {
+        if (self.pos >= self.tokens.len) return false;
+        const token = self.tokens[self.pos];
+        if (token.kind != .identifier or !std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
+        self.pos += 1;
+        return true;
+    }
+
+    fn expectKeyword(self: *@This(), keyword: []const u8) !void {
+        if (!self.matchKeyword(keyword)) return error.UnsupportedSqlShape;
+    }
+
+    fn expectStatementEnd(self: *@This()) !void {
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind == .semicolon) self.pos += 1;
+        if (self.pos != self.tokens.len) return error.UnsupportedSqlShape;
+    }
+};
+
+fn parseTriggerDdlAlloc(alloc: std.mem.Allocator, sql: []const u8) !TriggerDdlPlan {
+    var tokens = try sql_adapter.tokenizeAlloc(alloc, sql);
+    defer sql_adapter.freeTokens(alloc, &tokens);
+    var parser = TriggerParser{ .alloc = alloc, .tokens = tokens.items };
+    return try parser.parse();
+}
+
+fn cloneCreateTriggerRecordAlloc(alloc: std.mem.Allocator, plan: CreateTriggerPlan) !TriggerRecord {
+    const trigger_name = try alloc.dupe(u8, plan.trigger_name);
+    errdefer alloc.free(trigger_name);
+    const table_name = try alloc.dupe(u8, plan.table_name);
+    errdefer alloc.free(table_name);
+    const function_name = try alloc.dupe(u8, plan.function_name);
+    errdefer alloc.free(function_name);
+    return .{
+        .trigger_name = trigger_name,
+        .table_name = table_name,
+        .function_name = function_name,
+        .event = plan.event,
+    };
+}
+
+const PersistedTriggerRecord = struct {
+    version: u32 = 1,
+    trigger_name: []u8,
+    table_name: []u8,
+    function_name: []u8,
+    event: TriggerEvent,
+};
+
+fn encodeTriggerRecordAlloc(alloc: std.mem.Allocator, record: TriggerRecord) ![]u8 {
+    return try std.json.Stringify.valueAlloc(alloc, PersistedTriggerRecord{
+        .version = 1,
+        .trigger_name = record.trigger_name,
+        .table_name = record.table_name,
+        .function_name = record.function_name,
+        .event = record.event,
+    }, .{ .emit_null_optional_fields = false });
+}
+
+fn clonePersistedTriggerRecordAlloc(alloc: std.mem.Allocator, persisted: PersistedTriggerRecord) !TriggerRecord {
+    const trigger_name = try alloc.dupe(u8, persisted.trigger_name);
+    errdefer alloc.free(trigger_name);
+    const table_name = try alloc.dupe(u8, persisted.table_name);
+    errdefer alloc.free(table_name);
+    const function_name = try alloc.dupe(u8, persisted.function_name);
+    errdefer alloc.free(function_name);
+    return .{
+        .trigger_name = trigger_name,
+        .table_name = table_name,
+        .function_name = function_name,
+        .event = persisted.event,
+    };
 }
 
 fn nativeQueryFunctionRecordAlloc(
@@ -679,6 +1114,36 @@ fn routineRecordKeyAlloc(
 }
 
 const routine_key_prefix = "__api_sql_routines__:";
+const trigger_key_prefix = "__api_sql_triggers__:";
+
+fn triggerRecordKeyAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    trigger_name: []const u8,
+) ![]u8 {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    var hasher = Sha256.init(.{});
+    hasher.update("antfly.sql.trigger.catalog.v1\x00");
+    try hashLowerIdentifier(alloc, &hasher, table_name);
+    hasher.update("\x00");
+    try hashLowerIdentifier(alloc, &hasher, trigger_name);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ trigger_key_prefix, std.fmt.bytesToHex(digest, .lower) });
+}
+
+fn hashLowerIdentifier(alloc: std.mem.Allocator, hasher: anytype, value: []const u8) !void {
+    var lower_buf: [256]u8 = undefined;
+    if (value.len <= lower_buf.len) {
+        for (value, 0..) |c, i| lower_buf[i] = std.ascii.toLower(c);
+        hasher.update(lower_buf[0..value.len]);
+    } else {
+        const lower = try alloc.alloc(u8, value.len);
+        defer alloc.free(lower);
+        for (value, 0..) |c, i| lower[i] = std.ascii.toLower(c);
+        hasher.update(lower);
+    }
+}
 
 test "sql routine runtime stores and executes safe expression bodies" {
     const alloc = std.testing.allocator;
@@ -1049,6 +1514,128 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         error.UnsupportedSqlShape,
         relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';"),
     );
+}
+
+test "sql routine runtime persists safe row trigger catalog records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-routine-trigger-catalog", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        errdefer opened.deinit();
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        try runtime.attachOpenedStore(opened);
+
+        var trigger_fn_plan = try relational_sql.lowerDdlPlanAlloc(
+            alloc,
+            "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+        );
+        defer trigger_fn_plan.deinit(alloc);
+        try runtime.apply(switch (trigger_fn_plan) {
+            .function_catalog => |function| function,
+            else => return error.TestUnexpectedResult,
+        });
+
+        try std.testing.expect(try runtime.applyTriggerDdlAlloc(
+            alloc,
+            "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_body();",
+        ));
+        try std.testing.expectEqual(@as(usize, 1), runtime.triggerCountForTest());
+        const function_name = (try runtime.triggerFunctionForTableEventAlloc(alloc, "usage_records", .insert)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(function_name);
+        try std.testing.expectEqualStrings("audit_body", function_name);
+        try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (trigger_fn_plan) {
+            .function_catalog => |function| .{ .drop = .{
+                .kind = function.create.kind,
+                .routine_name = function.create.routine_name,
+                .argument_count = function.create.argument_count,
+                .if_exists = false,
+                .cascade = false,
+            } },
+            else => return error.TestUnexpectedResult,
+        }));
+    }
+
+    {
+        var opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        errdefer opened.deinit();
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        try runtime.attachOpenedStore(opened);
+        try std.testing.expectEqual(@as(usize, 1), runtime.routineCountForTest());
+        try std.testing.expectEqual(@as(usize, 1), runtime.triggerCountForTest());
+        try std.testing.expect(try runtime.applyTriggerDdlAlloc(
+            alloc,
+            "DROP TRIGGER audit_insert ON usage_records;",
+        ));
+        try std.testing.expectEqual(@as(usize, 0), runtime.triggerCountForTest());
+    }
+
+    {
+        var opened = try alloc.create(OpenedStore);
+        errdefer alloc.destroy(opened);
+        opened.* = try OpenedStore.open(alloc, path);
+        errdefer opened.deinit();
+        var runtime = Runtime.init(alloc);
+        defer runtime.deinit();
+        try runtime.attachOpenedStore(opened);
+        try std.testing.expectEqual(@as(usize, 0), runtime.triggerCountForTest());
+    }
+}
+
+test "sql routine runtime validates trigger ddl against executable trigger bodies" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    try std.testing.expect(!(try runtime.applyTriggerDdlAlloc(alloc, "CREATE TABLE usage_records (id text);")));
+    try std.testing.expectError(error.RoutineNotFound, runtime.applyTriggerDdlAlloc(
+        alloc,
+        "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records EXECUTE FUNCTION missing_trigger();",
+    ));
+
+    var old_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
+    );
+    defer old_trigger_plan.deinit(alloc);
+    try runtime.apply(switch (old_trigger_plan) {
+        .function_catalog => |function| function,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.applyTriggerDdlAlloc(
+        alloc,
+        "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records EXECUTE FUNCTION old_audit_body();",
+    ));
+    try std.testing.expect(try runtime.applyTriggerDdlAlloc(
+        alloc,
+        "CREATE TRIGGER audit_update BEFORE UPDATE ON usage_records EXECUTE FUNCTION old_audit_body();",
+    ));
+    try std.testing.expectEqual(@as(usize, 1), runtime.triggerCountForTest());
+    try std.testing.expectError(error.TriggerAlreadyExists, runtime.applyTriggerDdlAlloc(
+        alloc,
+        "CREATE TRIGGER audit_update BEFORE UPDATE ON usage_records EXECUTE FUNCTION old_audit_body();",
+    ));
+    try std.testing.expect(try runtime.applyTriggerDdlAlloc(
+        alloc,
+        "CREATE OR REPLACE TRIGGER audit_update BEFORE UPDATE ON usage_records EXECUTE FUNCTION old_audit_body();",
+    ));
+    try std.testing.expectError(error.TriggerNotFound, runtime.applyTriggerDdlAlloc(
+        alloc,
+        "DROP TRIGGER missing_trigger ON usage_records;",
+    ));
+    try std.testing.expect(try runtime.applyTriggerDdlAlloc(
+        alloc,
+        "DROP TRIGGER IF EXISTS missing_trigger ON usage_records;",
+    ));
 }
 
 test "sql routine runtime replaces ready extension query function bindings" {

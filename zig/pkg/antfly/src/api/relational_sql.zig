@@ -3201,6 +3201,11 @@ const Parser = struct {
         return try self.parseJsonValueAlloc();
     }
 
+    fn parseConflictJsonArrayValueHook(ptr: *anyopaque) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseJsonArrayValueAlloc();
+    }
+
     fn jsonSetSqlValueParserHooks(
         self: *@This(),
         insert_columns: []const []const u8,
@@ -3288,6 +3293,47 @@ const Parser = struct {
         return .{
             .ptr = self,
             .parse_operand = parseConflictUnaryExpressionOperandHook,
+        };
+    }
+
+    fn conflictJsonBuildObjectExpressionParserHooks(self: *@This()) sql_adapter.ConflictJsonBuildObjectExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseConflictUnaryExpressionOperandHook,
+            .parse_json_value = parseConflictJsonValueHook,
+        };
+    }
+
+    fn conflictArrayLengthExpressionParserHooks(self: *@This()) sql_adapter.ConflictArrayLengthExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_field = parseConflictFieldExpressionHook,
+        };
+    }
+
+    fn conflictBooleanExpressionParserHooks(self: *@This()) sql_adapter.ConflictBooleanExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseConflictUnaryExpressionOperandHook,
+        };
+    }
+
+    fn conflictExpressionConditionParserHooks(self: *@This()) sql_adapter.ConflictExpressionConditionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_untyped_expression = parseConflictUntypedExpressionHook,
+            .parse_boolean_operand = parseConflictUnaryExpressionOperandHook,
+            .parse_json_array_value = parseConflictJsonArrayValueHook,
+        };
+    }
+
+    fn conflictCaseExpressionParserHooks(self: *@This()) sql_adapter.ConflictCaseExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_expression = parseConflictNullifExpressionHook,
+            .parse_untyped_expression = parseConflictUntypedExpressionHook,
+            .parse_boolean_operand = parseConflictUnaryExpressionOperandHook,
+            .parse_json_array_value = parseConflictJsonArrayValueHook,
         };
     }
 
@@ -3399,6 +3445,15 @@ const Parser = struct {
         return try self.parseConflictExpressionAlloc(column, insert_columns);
     }
 
+    fn parseConflictUntypedExpressionHook(
+        ptr: *anyopaque,
+        column: runtime_schema.RelationalColumn,
+        insert_columns: []const []const u8,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseConflictUntypedExpressionAlloc(column, insert_columns);
+    }
+
     fn parseConflictUnaryExpressionOperandHook(
         ptr: *anyopaque,
         column: runtime_schema.RelationalColumn,
@@ -3407,6 +3462,15 @@ const Parser = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseConflictRowExpressionAlloc(column, insert_columns, expected_type);
+    }
+
+    fn parseConflictFieldExpressionHook(
+        ptr: *anyopaque,
+        insert_columns: []const []const u8,
+        expected_type: ?runtime_schema.AntflyType,
+    ) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseConflictFieldExpressionAlloc(insert_columns, expected_type);
     }
 
     fn conflictIncrementParserHooks(
@@ -10866,64 +10930,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| {
-            if (field_type != .json) return error.UnsupportedSqlShape;
-        }
-        try sql_adapter.parseJsonBuildObjectFunctionCallStart(self.tokens, &self.pos);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        if (self.match(.rparen) == null) {
-            while (true) {
-                const key = try self.parseConflictRowExpressionAlloc(column, insert_columns, .text);
-                var key_transferred = false;
-                errdefer if (!key_transferred) freeExpression(self.alloc, key);
-                try self.rowExpressionTypeContext().validateTextRowExpression(key);
-                try operands.append(self.alloc, key);
-                key_transferred = true;
-
-                try self.expect(.comma);
-                const value = try self.parseConflictJsonBuildObjectOperandExpressionAlloc(column, insert_columns);
-                var value_transferred = false;
-                errdefer if (!value_transferred) freeExpression(self.alloc, value);
-                _ = try self.rowExpressionTypeContext().rowExpressionOutputType(value);
-                try operands.append(self.alloc, value);
-                value_transferred = true;
-
-                if (self.match(.comma) == null) break;
-            }
-            try self.expect(.rparen);
-        }
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .json_build_object, &operands);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateJsonBuildObjectExpression(expression);
-        expression_transferred = true;
-        return expression;
-    }
-
-    fn parseConflictJsonBuildObjectOperandExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.peekToJsonbFunctionCall(self.tokens, self.pos)) {
-            try sql_adapter.parseFixedUnaryFunctionCallStart(self.tokens, &self.pos, .to_jsonb);
-            const expression = try self.parseConflictJsonBuildObjectOperandExpressionAlloc(column, insert_columns);
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            try self.expect(.rparen);
-            expression_transferred = true;
-            return expression;
-        }
-        if (sql_adapter.peekConvertFromFunctionCall(self.tokens, self.pos)) {
-            const value_json = try self.parseJsonValueAlloc();
-            errdefer self.alloc.free(value_json);
-            return .{ .kind = .value, .value_json = value_json };
-        }
-        return try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
+        return try sql_adapter.parseConflictJsonBuildObjectExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictJsonBuildObjectExpressionParserHooks());
     }
 
     fn parseConflictExpressionOperandAlloc(
@@ -11181,16 +11188,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseCastExpressionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try sql_adapter.parseCastExpressionAs(self.tokens, &self.pos);
-        const cast_type = try sql_adapter.parseExpressionCastType(self.tokens, &self.pos);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildCastExpressionAlloc(self.alloc, operand, cast_type);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictCastExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictCaseExpressionAlloc(
@@ -11198,53 +11196,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseCaseExpressionStart(self.tokens, &self.pos);
-
-        var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
-        errdefer {
-            for (branches.items) |branch| freeExpressionCaseBranch(self.alloc, branch);
-            branches.deinit(self.alloc);
-        }
-
-        while (sql_adapter.matchCaseExpressionWhen(self.tokens, &self.pos)) {
-            const condition = try self.parseConflictExpressionConditionAlloc(column, insert_columns);
-            var condition_transferred = false;
-            errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-            try sql_adapter.parseCaseExpressionThen(self.tokens, &self.pos);
-            const then_expression = try self.parseConflictExpressionAlloc(column, insert_columns);
-            var then_transferred = false;
-            errdefer if (!then_transferred) freeExpression(self.alloc, then_expression);
-            try branches.append(self.alloc, .{ .when = condition, .then = then_expression });
-            condition_transferred = true;
-            then_transferred = true;
-        }
-        if (branches.items.len == 0) return error.UnsupportedSqlShape;
-
-        try sql_adapter.parseCaseExpressionElse(self.tokens, &self.pos);
-        const else_expression = try self.parseConflictExpressionAlloc(column, insert_columns);
-        var else_transferred = false;
-        errdefer if (!else_transferred) freeExpression(self.alloc, else_expression);
-        try sql_adapter.parseCaseExpressionEnd(self.tokens, &self.pos);
-
-        const owned_branches = try branches.toOwnedSlice(self.alloc);
-        var branches_transferred = false;
-        errdefer if (!branches_transferred) {
-            for (owned_branches) |branch| freeExpressionCaseBranch(self.alloc, branch);
-            self.alloc.free(owned_branches);
-        };
-        const fallback = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-        var fallback_transferred = false;
-        errdefer if (!fallback_transferred) self.alloc.free(fallback);
-        fallback[0] = else_expression;
-
-        branches_transferred = true;
-        fallback_transferred = true;
-        else_transferred = true;
-        return .{
-            .kind = .case,
-            .case_branches = owned_branches,
-            .case_else = fallback,
-        };
+        return try sql_adapter.parseConflictCaseExpressionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.conflict_existing_qualifiers, column, insert_columns, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.conflictCaseExpressionParserHooks());
     }
 
     fn parseConflictExpressionConditionAlloc(
@@ -11252,102 +11204,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpressionCondition {
-        if (sql_adapter.canParseBareBooleanConflictExpression(self.alloc, self.tokens, self.pos, self.schema, self.conflict_existing_qualifiers, insert_columns)) {
-            return try self.parseBareBooleanConflictExpressionConditionAlloc(column, insert_columns);
-        }
-
-        const lhs = try self.parseConflictUntypedExpressionAlloc(column, insert_columns);
-        var lhs_transferred = false;
-        errdefer if (!lhs_transferred) freeExpression(self.alloc, lhs);
-
-        const op: runtime_schema.RelationalCheckOp = if (try sql_adapter.parseExpressionIsTailIf(self.tokens, &self.pos, .{
-            .allow_boolean_unknown = true,
-            .allow_boolean_literal = true,
-        })) |is_tail| blk: {
-            switch (is_tail.kind) {
-                .distinct_comparison, .null_test => {},
-                .boolean_unknown => {
-                    try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                    lhs_transferred = true;
-                    return sql_adapter.expressionNullTestCondition(lhs, is_tail.op);
-                },
-                .boolean_literal => {
-                    try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-                    const condition = try sql_adapter.expressionBooleanComparisonConditionAlloc(self.alloc, lhs, is_tail.op, is_tail.boolean_value);
-                    lhs_transferred = true;
-                    return condition;
-                },
-            }
-            break :blk is_tail.op;
-        } else if (sql_adapter.matchPostfixNullTest(self.tokens, &self.pos)) |postfix_null_test|
-            postfix_null_test
-        else
-            try sql_adapter.parseComparisonOp(self.tokens, &self.pos);
-
-        if (op == .eq and sql_adapter.matchAnyOrSomeKeyword(self.tokens, &self.pos)) {
-            try self.expect(.lparen);
-            const values_json = try self.parseJsonArrayValueAlloc();
-            defer self.alloc.free(values_json);
-            try self.expect(.rparen);
-            return error.UnsupportedSqlShape;
-        }
-
-        const rhs = switch (op) {
-            .is_null, .is_not_null => &.{},
-            else => blk: {
-                const out = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-                var out_transferred = false;
-                errdefer if (!out_transferred) self.alloc.free(out);
-                out[0] = try self.parseConflictUntypedExpressionAlloc(column, insert_columns);
-                out_transferred = true;
-                break :blk out;
-            },
-        };
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred and rhs.len > 0) {
-            for (rhs) |expression| freeExpression(self.alloc, expression);
-            self.alloc.free(rhs);
-        };
-        try sql_adapter.validateExpressionConditionTypes(self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, lhs, op, rhs);
-
-        lhs_transferred = true;
-        rhs_transferred = true;
-        return .{
-            .lhs = lhs,
-            .op = op,
-            .rhs = rhs,
-        };
-    }
-
-    fn parseBareBooleanConflictExpressionConditionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) !db_mod.types.RelationalRowsExpressionCondition {
-        const expression = try self.parseConflictBooleanExpressionAlloc(column, insert_columns);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateBooleanRowExpression(expression);
-
-        const value_json = try self.alloc.dupe(u8, "true");
-        var value_transferred = false;
-        errdefer if (!value_transferred) self.alloc.free(value_json);
-        const rhs = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred) self.alloc.free(rhs);
-        rhs[0] = .{
-            .kind = .value,
-            .value_json = value_json,
-        };
-
-        expression_transferred = true;
-        value_transferred = true;
-        rhs_transferred = true;
-        return .{
-            .lhs = expression,
-            .op = .eq,
-            .rhs = rhs,
-        };
+        return try sql_adapter.parseConflictExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.conflict_existing_qualifiers, column, insert_columns, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.conflictExpressionConditionParserHooks());
     }
 
     fn parseConflictBooleanExpressionAlloc(
@@ -11355,95 +11212,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        var expression = try self.parseConflictBooleanOperandAlloc(column, insert_columns);
-        var expression_owned = true;
-        errdefer if (expression_owned) freeExpression(self.alloc, expression);
-        if (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |_| {
-            try self.rowExpressionTypeContext().validateBooleanRowExpression(expression);
-            expression_owned = false;
-            expression = try self.parseConflictBooleanExpressionRestAlloc(expression, column, insert_columns, 0);
-            expression_owned = true;
-            try self.rowExpressionTypeContext().validateBooleanRowExpression(expression);
-        }
-        expression_owned = false;
-        return expression;
-    }
-
-    fn parseConflictBooleanExpressionRestAlloc(
-        self: *@This(),
-        lhs: db_mod.types.RelationalRowsExpression,
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        min_precedence: u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.rowExpressionTypeContext().validateBooleanRowExpression(lhs);
-        var current = lhs;
-        var current_owned = true;
-        errdefer if (current_owned) freeExpression(self.alloc, current);
-
-        while (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |op| {
-            if (op.precedence < min_precedence) break;
-            if (!self.matchKeyword(op.keyword)) unreachable;
-            var rhs = try self.parseConflictBooleanOperandAlloc(column, insert_columns);
-            var rhs_owned = true;
-            errdefer if (rhs_owned) freeExpression(self.alloc, rhs);
-            try self.rowExpressionTypeContext().validateBooleanRowExpression(rhs);
-
-            while (sql_adapter.peekBooleanOperator(self.tokens, self.pos)) |next_op| {
-                if (next_op.precedence <= op.precedence) break;
-                rhs_owned = false;
-                rhs = try self.parseConflictBooleanExpressionRestAlloc(rhs, column, insert_columns, next_op.precedence);
-                rhs_owned = true;
-            }
-
-            const expression = try sql_adapter.buildBinaryExpressionAlloc(self.alloc, op.kind, current, rhs);
-            current_owned = false;
-            rhs_owned = false;
-            current = expression;
-            current_owned = true;
-        }
-
-        current_owned = false;
-        return current;
-    }
-
-    fn parseConflictBooleanOperandAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.peekBooleanNotExpressionSyntax(self.tokens, self.pos)) return try self.parseConflictBooleanNotExpressionAlloc(column, insert_columns);
-        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) return try self.parseParenthesizedConflictBooleanExpressionAlloc(column, insert_columns);
-        return try self.parseConflictRowExpressionAlloc(column, insert_columns, .boolean);
-    }
-
-    fn parseConflictBooleanNotExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseBooleanNotExpressionStart(self.tokens, &self.pos);
-        const operand = try self.parseConflictBooleanOperandAlloc(column, insert_columns);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateBooleanRowExpression(operand);
-        const expression = try sql_adapter.wrapBooleanNotExpressionAlloc(self.alloc, operand);
-        operand_transferred = true;
-        return expression;
-    }
-
-    fn parseParenthesizedConflictBooleanExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        try self.expect(.lparen);
-        const expression = try self.parseConflictBooleanExpressionAlloc(column, insert_columns);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.expect(.rparen);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictBooleanExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, self.rowExpressionTypeContext(), self.conflictBooleanExpressionParserHooks());
     }
 
     fn parseConflictCaseFoldExpressionAlloc(
@@ -11489,29 +11258,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        const kind = try sql_adapter.parseConcatFunctionCallStart(self.tokens, &self.pos);
-
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        while (true) {
-            const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-            try operands.append(self.alloc, operand);
-            operand_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if ((kind == .concat and operands.items.len == 0) or (kind == .concat_ws and operands.items.len < 2)) return error.UnsupportedSqlShape;
-        if (kind == .concat_ws) {
-            for (operands.items) |operand| try self.rowExpressionTypeContext().validateTextRowExpression(operand);
-        }
-        try self.expect(.rparen);
-
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
+        return try sql_adapter.parseConflictConcatExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictNullifExpressionAlloc(
@@ -11618,56 +11365,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsSubstringFunction);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const text_operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var text_transferred = false;
-        errdefer if (!text_transferred) freeExpression(self.alloc, text_operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(text_operand);
-        try operands.append(self.alloc, text_operand);
-        text_transferred = true;
-
-        if (self.match(.comma) != null) {
-            const start_operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-            var start_transferred = false;
-            errdefer if (!start_transferred) freeExpression(self.alloc, start_operand);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(start_operand);
-            try operands.append(self.alloc, start_operand);
-            start_transferred = true;
-
-            if (self.match(.comma) != null) {
-                const length_operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-                var length_transferred = false;
-                errdefer if (!length_transferred) freeExpression(self.alloc, length_operand);
-                try self.rowExpressionTypeContext().validateNumericRowExpression(length_operand);
-                try operands.append(self.alloc, length_operand);
-                length_transferred = true;
-            }
-        } else if (self.matchKeyword("from")) {
-            const start_operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-            var start_transferred = false;
-            errdefer if (!start_transferred) freeExpression(self.alloc, start_operand);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(start_operand);
-            try operands.append(self.alloc, start_operand);
-            start_transferred = true;
-
-            if (self.matchKeyword("for")) {
-                const length_operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-                var length_transferred = false;
-                errdefer if (!length_transferred) freeExpression(self.alloc, length_operand);
-                try self.rowExpressionTypeContext().validateNumericRowExpression(length_operand);
-                try operands.append(self.alloc, length_operand);
-                length_transferred = true;
-            }
-        } else return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .substring, &operands);
+        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .substring, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictOverlayExpressionAlloc(
@@ -11676,48 +11374,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsOverlayFunction);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const source_operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source_operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source_operand);
-        try operands.append(self.alloc, source_operand);
-        source_transferred = true;
-
-        try self.expectKeyword("placing");
-        const replacement_operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var replacement_transferred = false;
-        errdefer if (!replacement_transferred) freeExpression(self.alloc, replacement_operand);
-        try self.rowExpressionTypeContext().validateTextRowExpression(replacement_operand);
-        try operands.append(self.alloc, replacement_operand);
-        replacement_transferred = true;
-
-        try self.expectKeyword("from");
-        const start_operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-        var start_transferred = false;
-        errdefer if (!start_transferred) freeExpression(self.alloc, start_operand);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(start_operand);
-        try operands.append(self.alloc, start_operand);
-        start_transferred = true;
-
-        if (self.matchKeyword("for")) {
-            const length_operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-            var length_transferred = false;
-            errdefer if (!length_transferred) freeExpression(self.alloc, length_operand);
-            try self.rowExpressionTypeContext().validateNumericRowExpression(length_operand);
-            try operands.append(self.alloc, length_operand);
-            length_transferred = true;
-        }
-
-        try self.expect(.rparen);
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .overlay, &operands);
+        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .overlay, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictSplitPartExpressionAlloc(
@@ -11726,28 +11383,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsSplitPartFunction);
-        const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const delimiter = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var delimiter_transferred = false;
-        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter);
-        try self.rowExpressionTypeContext().validateTextRowExpression(delimiter);
-        try self.expect(.comma);
-        const position = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-        var position_transferred = false;
-        errdefer if (!position_transferred) freeExpression(self.alloc, position);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(position);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildTernaryFunctionExpressionAlloc(self.alloc, .split_part, source, delimiter, position);
-        source_transferred = true;
-        delimiter_transferred = true;
-        position_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .split_part, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictStrposExpressionAlloc(
@@ -11756,41 +11392,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
-
-        if (sql_adapter.matchFunctionKeyword(self.tokens, &self.pos, sqlKeywordIsStrposFunction)) {
-            try self.expect(.lparen);
-            const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var source_transferred = false;
-            errdefer if (!source_transferred) freeExpression(self.alloc, source);
-            try self.rowExpressionTypeContext().validateTextRowExpression(source);
-            try self.expect(.comma);
-            const needle = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var needle_transferred = false;
-            errdefer if (!needle_transferred) freeExpression(self.alloc, needle);
-            try self.rowExpressionTypeContext().validateTextRowExpression(needle);
-            try self.expect(.rparen);
-            const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .strpos, source, needle);
-            source_transferred = true;
-            needle_transferred = true;
-            return expression;
-        } else if (self.matchKeyword("position")) {
-            try self.expect(.lparen);
-            const needle = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var needle_transferred = false;
-            errdefer if (!needle_transferred) freeExpression(self.alloc, needle);
-            try self.rowExpressionTypeContext().validateTextRowExpression(needle);
-            try self.expectKeyword("in");
-            const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var source_transferred = false;
-            errdefer if (!source_transferred) freeExpression(self.alloc, source);
-            try self.rowExpressionTypeContext().validateTextRowExpression(source);
-            try self.expect(.rparen);
-            const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .strpos, source, needle);
-            source_transferred = true;
-            needle_transferred = true;
-            return expression;
-        } else return error.UnsupportedSqlShape;
+        return try sql_adapter.parseConflictStrposExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictLeftRightExpressionAlloc(
@@ -11799,23 +11401,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        const kind = sql_adapter.matchLeftRightFunctionKind(self.tokens, &self.pos) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const count = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-        var count_transferred = false;
-        errdefer if (!count_transferred) freeExpression(self.alloc, count);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(count);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, source, count);
-        source_transferred = true;
-        count_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictTextNumericBinaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .left, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictPadExpressionAlloc(
@@ -11824,40 +11410,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        const kind = sql_adapter.matchPadFunctionKind(self.tokens, &self.pos) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try operands.append(self.alloc, source);
-        source_transferred = true;
-        try self.expect(.comma);
-
-        const target = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-        var target_transferred = false;
-        errdefer if (!target_transferred) freeExpression(self.alloc, target);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(target);
-        try operands.append(self.alloc, target);
-        target_transferred = true;
-
-        if (self.match(.comma) != null) {
-            const fill = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var fill_transferred = false;
-            errdefer if (!fill_transferred) freeExpression(self.alloc, fill);
-            try self.rowExpressionTypeContext().validateTextRowExpression(fill);
-            try operands.append(self.alloc, fill);
-            fill_transferred = true;
-        }
-        try self.expect(.rparen);
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
+        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .lpad, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictRepeatExpressionAlloc(
@@ -11866,22 +11419,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsRepeatFunction);
-        const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateTextRowExpression(source);
-        try self.expect(.comma);
-        const count = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, .numeric);
-        var count_transferred = false;
-        errdefer if (!count_transferred) freeExpression(self.alloc, count);
-        try self.rowExpressionTypeContext().validateNumericRowExpression(count);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .repeat, source, count);
-        source_transferred = true;
-        count_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictTextNumericBinaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .repeat, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictReverseExpressionAlloc(
@@ -11926,22 +11464,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsDateTruncFunction);
-        const unit = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var unit_transferred = false;
-        errdefer if (!unit_transferred) freeExpression(self.alloc, unit);
-        try self.rowExpressionTypeContext().validateTextRowExpression(unit);
-        try self.expect(.comma);
-        const value = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var value_transferred = false;
-        errdefer if (!value_transferred) freeExpression(self.alloc, value);
-        try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(value);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .date_trunc, unit, value);
-        unit_transferred = true;
-        value_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictDateExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .date_trunc, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictDatePartExpressionAlloc(
@@ -11950,37 +11473,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
-        const extract_syntax = try sql_adapter.parseDatePartFunctionCallStart(self.tokens, &self.pos);
-        var unit: db_mod.types.RelationalRowsExpression = undefined;
-        var unit_initialized = false;
-        var unit_transferred = false;
-        errdefer if (unit_initialized and !unit_transferred) freeExpression(self.alloc, unit);
-        var value: db_mod.types.RelationalRowsExpression = undefined;
-        var value_initialized = false;
-        var value_transferred = false;
-        errdefer if (value_initialized and !value_transferred) freeExpression(self.alloc, value);
-        if (extract_syntax) {
-            unit = try self.parseDatePartUnitLiteralExpressionAlloc();
-            unit_initialized = true;
-            try sql_adapter.parseDatePartExtractSeparator(self.tokens, &self.pos);
-            value = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            value_initialized = true;
-            try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(value);
-        } else {
-            unit = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            unit_initialized = true;
-            try self.rowExpressionTypeContext().validateTextRowExpression(unit);
-            try self.expect(.comma);
-            value = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            value_initialized = true;
-            try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(value);
-        }
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .date_part, unit, value);
-        unit_transferred = true;
-        value_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictDateExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .date_part, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictDateBinExpressionAlloc(
@@ -11989,28 +11482,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
-        try sql_adapter.parseFunctionCallStartIf(self.tokens, &self.pos, sqlKeywordIsDateBinFunction);
-        const stride = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var stride_transferred = false;
-        errdefer if (!stride_transferred) freeExpression(self.alloc, stride);
-        try self.rowExpressionTypeContext().validateDateBinStrideRowExpression(stride);
-        try self.expect(.comma);
-        const source = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(self.alloc, source);
-        try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(source);
-        try self.expect(.comma);
-        const origin = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var origin_transferred = false;
-        errdefer if (!origin_transferred) freeExpression(self.alloc, origin);
-        try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(origin);
-        try self.expect(.rparen);
-        const expression = try sql_adapter.buildTernaryFunctionExpressionAlloc(self.alloc, .date_bin, stride, source, origin);
-        stride_transferred = true;
-        source_transferred = true;
-        origin_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictDateExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .date_bin, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictGreatestLeastExpressionAlloc(
@@ -12019,25 +11491,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) !db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseGreatestLeastFunctionCallStart(self.tokens, &self.pos);
-
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        while (true) {
-            const operand = try self.parseConflictExpressionWithExpectedAlloc(column, insert_columns, expected_type);
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-            try operands.append(self.alloc, operand);
-            operand_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (operands.items.len == 0) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
+        return try sql_adapter.parseConflictGreatestLeastExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.conflictCoalesceExpressionParserHooks());
     }
 
     fn parseConflictAbsExpressionAlloc(
@@ -12085,15 +11539,7 @@ const Parser = struct {
         self: *@This(),
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = try sql_adapter.parseArrayLengthFunctionCallStart(self.tokens, &self.pos);
-        const field = try self.parseConflictFieldExpressionAlloc(insert_columns, .array);
-        var field_transferred = false;
-        errdefer if (!field_transferred) freeExpression(self.alloc, field);
-        try sql_adapter.parseArrayLengthFunctionTail(self.tokens, &self.pos, self.params, keyword);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .array_length, field);
-        field_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictArrayLengthExpressionAlloc(self.alloc, self.tokens, &self.pos, self.params, insert_columns, self.conflictArrayLengthExpressionParserHooks());
     }
 
     fn parseConflictArrayPositionExpressionAlloc(
@@ -12102,32 +11548,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        const kind = try sql_adapter.parseArrayPositionFunctionCallStart(self.tokens, &self.pos);
-        if (expected_type) |field_type| {
-            const expected_result_type: runtime_schema.AntflyType = if (kind == .array_positions) .array else .numeric;
-            if (field_type != expected_result_type) return error.UnsupportedSqlShape;
-        }
-        const array_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, .array);
-        var array_transferred = false;
-        errdefer if (!array_transferred) freeExpression(self.alloc, array_expression);
-        const array_type = try self.rowExpressionTypeContext().rowExpressionOutputType(array_expression);
-        if (array_type != .array) return error.UnsupportedSqlShape;
-        const item_type = (try self.rowExpressionTypeContext().rowExpressionOutputArrayItemType(array_expression)) orelse .json;
-        try self.expect(.comma);
-        const needle_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, item_type);
-        var needle_transferred = false;
-        errdefer if (!needle_transferred) freeExpression(self.alloc, needle_expression);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, array_expression, needle_expression);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        array_transferred = true;
-        needle_transferred = true;
-        try self.rowExpressionTypeContext().validateArrayPositionExpression(expression);
-
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictArrayPositionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictJsonArrayLengthExpressionAlloc(
@@ -12135,16 +11556,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseJsonArrayLengthFunctionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, .json);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateJsonRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .json_array_length, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictJsonUnaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, .json_array_length, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictJsonTypeofExpressionAlloc(
@@ -12152,16 +11564,7 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        try sql_adapter.parseJsonTypeofFunctionCallStart(self.tokens, &self.pos);
-        const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, .json);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateJsonRowExpression(operand);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildUnaryFunctionExpressionAlloc(self.alloc, .json_typeof, operand);
-        operand_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictJsonUnaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, .json_typeof, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictJsonExtractPathExpressionAlloc(
@@ -12170,27 +11573,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        const keyword = sql_adapter.matchFunctionKeywordText(self.tokens, &self.pos, sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
-        const as_text = sqlJsonExtractPathFunctionAsText(keyword);
-        const output_type: runtime_schema.AntflyType = if (as_text) .keyword else .json;
-        if (expected_type) |field_type| {
-            if (!sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
-        }
-
-        try self.expect(.lparen);
-        const operand = try self.parseConflictRowExpressionAlloc(column, insert_columns, .json);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-        try self.rowExpressionTypeContext().validateJsonRowExpression(operand);
-        const path = try sql_adapter.parseJsonExtractPathSegmentsAlloc(self.alloc, self.tokens, &self.pos, self.params);
-        var path_transferred = false;
-        errdefer if (!path_transferred) self.alloc.free(path);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildJsonExtractExpressionAlloc(self.alloc, operand, path, as_text);
-        operand_transferred = true;
-        path_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictJsonExtractPathExpressionAlloc(self.alloc, self.tokens, &self.pos, self.params, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictStringToArrayExpressionAlloc(
@@ -12199,24 +11582,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (field_type != .array) return error.UnsupportedSqlShape;
-        try sql_adapter.parseStringToArrayFunctionCallStart(self.tokens, &self.pos);
-        const text_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var text_transferred = false;
-        errdefer if (!text_transferred) freeExpression(self.alloc, text_expression);
-        try self.rowExpressionTypeContext().validateTextRowExpression(text_expression);
-        try self.expect(.comma);
-        const delimiter_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var delimiter_transferred = false;
-        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter_expression);
-        try self.rowExpressionTypeContext().validateTextRowExpression(delimiter_expression);
-        try self.rowExpressionTypeContext().validateStringToArrayDelimiterLiteral(delimiter_expression);
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, .string_to_array, text_expression, delimiter_expression);
-        text_transferred = true;
-        delimiter_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictTextArrayExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .string_to_array, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictArrayToStringExpressionAlloc(
@@ -12225,44 +11591,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (!sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-        try sql_adapter.parseArrayToStringFunctionCallStart(self.tokens, &self.pos);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-
-        const array_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, .array);
-        var array_transferred = false;
-        errdefer if (!array_transferred) freeExpression(self.alloc, array_expression);
-        try operands.append(self.alloc, array_expression);
-        array_transferred = true;
-
-        try self.expect(.comma);
-        const delimiter_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-        var delimiter_transferred = false;
-        errdefer if (!delimiter_transferred) freeExpression(self.alloc, delimiter_expression);
-        try self.rowExpressionTypeContext().validateTextRowExpression(delimiter_expression);
-        try operands.append(self.alloc, delimiter_expression);
-        delimiter_transferred = true;
-
-        if (self.match(.comma) != null) {
-            const null_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            var null_transferred = false;
-            errdefer if (!null_transferred) freeExpression(self.alloc, null_expression);
-            try self.rowExpressionTypeContext().validateTextRowExpression(null_expression);
-            try operands.append(self.alloc, null_expression);
-            null_transferred = true;
-        }
-        try self.expect(.rparen);
-
-        const expression = try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, .array_to_string, &operands);
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.rowExpressionTypeContext().validateArrayToStringExpression(expression);
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictTextArrayExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .array_to_string, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictArrayElementTransformExpressionAlloc(
@@ -12271,55 +11600,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (expected_type) |field_type| if (field_type != .array) return error.UnsupportedSqlShape;
-        const kind = try sql_adapter.parseArrayElementTransformFunctionCallStart(self.tokens, &self.pos);
-        const first_expected: ?runtime_schema.AntflyType = if (kind == .array_prepend) null else .array;
-        const first_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, first_expected);
-        var first_transferred = false;
-        errdefer if (!first_transferred) freeExpression(self.alloc, first_expression);
-        try self.expect(.comma);
-        const second_expected: ?runtime_schema.AntflyType = if (kind == .array_prepend or kind == .array_cat) .array else null;
-        const second_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, second_expected);
-        var second_transferred = false;
-        errdefer if (!second_transferred) freeExpression(self.alloc, second_expression);
-        var third_expression: db_mod.types.RelationalRowsExpression = undefined;
-        var third_transferred = true;
-        if (kind == .array_replace) {
-            third_transferred = false;
-            try self.expect(.comma);
-            third_expression = try self.parseConflictRowExpressionAlloc(column, insert_columns, null);
-            errdefer if (!third_transferred) freeExpression(self.alloc, third_expression);
-        }
-        try self.expect(.rparen);
-
-        const expression = if (kind == .array_prepend) blk: {
-            const out = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, second_expression, first_expression);
-            second_transferred = true;
-            first_transferred = true;
-            break :blk out;
-        } else if (kind == .array_replace) blk: {
-            const out = try sql_adapter.buildTernaryFunctionExpressionAlloc(self.alloc, kind, first_expression, second_expression, third_expression);
-            first_transferred = true;
-            second_transferred = true;
-            third_transferred = true;
-            break :blk out;
-        } else blk: {
-            const out = try sql_adapter.buildBinaryFunctionExpressionAlloc(self.alloc, kind, first_expression, second_expression);
-            first_transferred = true;
-            second_transferred = true;
-            break :blk out;
-        };
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        if (kind == .array_cat) {
-            try self.rowExpressionTypeContext().validateArrayCatExpression(expression);
-        } else if (kind == .array_replace) {
-            try self.rowExpressionTypeContext().validateArrayReplaceExpression(expression);
-        } else {
-            try self.rowExpressionTypeContext().validateArrayElementTransformExpression(expression);
-        }
-        expression_transferred = true;
-        return expression;
+        return try sql_adapter.parseConflictArrayElementTransformExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictArithmeticExpressionRestAlloc(
@@ -24119,7 +23400,29 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_or_policy:table=usage_records:kind=or:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=literal_eq:field=status:value_json_hex=2261637469766522", create_disjunction_row_policy_fingerprint);
     try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_disjunction_row_policy));
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');"));
+    var create_mixed_row_policy = try lowerDdlPlanAlloc(alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');");
+    defer create_mixed_row_policy.deinit(alloc);
+    const create_mixed_row_policy_plan = switch (create_mixed_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const create_mixed_row_policy_predicate = switch (create_mixed_row_policy_plan.predicate) {
+        .disjunction => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), create_mixed_row_policy_predicate.predicates.len);
+    const create_mixed_row_policy_nested = switch (create_mixed_row_policy_predicate.predicates[1]) {
+        .conjunction => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), create_mixed_row_policy_nested.predicates.len);
+    const create_mixed_row_policy_fingerprint = try ddlFingerprintAlloc(alloc, create_mixed_row_policy);
+    defer alloc.free(create_mixed_row_policy_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_row_policy:policy=usage_records_mixed_policy:table=usage_records:kind=or:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=and:terms=2:term=kind=literal_eq:field=status:value_json_hex=2261637469766522:term=kind=literal_eq:field=region:value_json_hex=22757322", create_mixed_row_policy_fingerprint);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_mixed_row_policy));
 
     var alter_row_policy = try lowerDdlPlanAlloc(alloc, "ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');");
     defer alter_row_policy.deinit(alloc);

@@ -1454,6 +1454,84 @@ fn nonZeroId(value: u64) u64 {
     return if (value == 0) 1 else value;
 }
 
+fn appliedDdlHasSchemaRewriteWork(applied: tables_api.AppliedRelationalSqlDdlRecord) bool {
+    if (applied.dropped_table or !applied.rewrite_required) return false;
+    for (applied.work_items) |item| {
+        if (item.action == .rewrite) return true;
+    }
+    return false;
+}
+
+const SchemaRewriteWakeJob = struct {
+    runtime: *db_mod.background_runtime.BackendRuntime,
+    owner_id: u64,
+    source: table_writes.TableWriteSource,
+    table_name: []u8,
+    worker_id: []const u8 = "api-schema-rewrite",
+    lease_ms: u64 = 60_000,
+    max_work_units_per_pass: usize = 16,
+    max_passes: usize = 64,
+
+    fn submit(
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        owner_id: u64,
+        source: table_writes.TableWriteSource,
+        table_name: []const u8,
+    ) !void {
+        const alloc = std.heap.page_allocator;
+        const work = try alloc.create(SchemaRewriteWakeJob);
+        errdefer alloc.destroy(work);
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        errdefer alloc.free(owned_table_name);
+        work.* = .{
+            .runtime = runtime,
+            .owner_id = owner_id,
+            .source = source,
+            .table_name = owned_table_name,
+        };
+        try runtime.durable_jobs.submit(.{
+            .owner_id = owner_id,
+            .class = .maintenance,
+            .ptr = work,
+            .run = SchemaRewriteWakeJob.run,
+            .deinit = SchemaRewriteWakeJob.deinit,
+        });
+    }
+
+    fn run(ptr: *anyopaque) !void {
+        const self: *SchemaRewriteWakeJob = @ptrCast(@alignCast(ptr));
+        const alloc = std.heap.page_allocator;
+        var pass_count: usize = 0;
+        var made_progress = false;
+        while (pass_count < self.max_passes) : (pass_count += 1) {
+            var pass = (try self.source.schemaRewriteWorkerPass(
+                alloc,
+                self.table_name,
+                self.worker_id,
+                self.lease_ms,
+                self.max_work_units_per_pass,
+            )) orelse return;
+            defer pass.deinit(alloc);
+
+            if (pass.jobs_claimed == 0) return;
+            made_progress = true;
+            if (pass.complete) return;
+        }
+        if (!made_progress or self.runtime.backend == .manual) return;
+        SchemaRewriteWakeJob.submit(self.runtime, self.owner_id, self.source, self.table_name) catch |err| switch (err) {
+            error.BackgroundOwnerClosing => return,
+            else => return err,
+        };
+    }
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *SchemaRewriteWakeJob = @ptrCast(@alignCast(ptr));
+        const alloc = std.heap.page_allocator;
+        alloc.free(self.table_name);
+        alloc.destroy(self);
+    }
+};
+
 fn droppedRelationalSqlTableRecordAlloc(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
@@ -1622,6 +1700,140 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     try std.testing.expectEqual(@as(u64, 9002), service.jobs.items[1].group_id);
     try std.testing.expectEqualStrings("m", service.jobs.items[1].start_row_key);
     try std.testing.expect(service.jobs.items[1].end_row_key == null);
+}
+
+test "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeSource = struct {
+        apply_count: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            sql: []const u8,
+            session: catalog_resources.SqlCatalogSession,
+            function_bindings: relational_sql.SqlFunctionBindings,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            _ = sql;
+            _ = session;
+            _ = function_bindings;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.apply_count += 1;
+
+            const table = try metadata_table_manager.cloneTable(allocator, .{
+                .table_id = 88,
+                .name = "audit_log",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+                .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .indexes_json = "{}",
+                .replication_sources_json = "[]",
+                .placement_role = "data",
+            });
+            errdefer metadata_table_manager.freeTable(allocator, table);
+            const work_items = try allocator.alloc(relational_sql.AppliedDdlWorkItem, 1);
+            errdefer allocator.free(work_items);
+            work_items[0] = .{
+                .action = .rewrite,
+                .subject = .table,
+                .reason = .row_images,
+            };
+            return .{
+                .table = table,
+                .rewrite_required = true,
+                .work_items = work_items,
+            };
+        }
+    };
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+        last_table_name_buf: [128]u8 = undefined,
+        last_table_name_len: usize = 0,
+        last_worker_id_buf: [128]u8 = undefined,
+        last_worker_id_len: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            _ = allocator;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            if (table_name.len > self.last_table_name_buf.len or worker_id.len > self.last_worker_id_buf.len) return error.TestUnexpectedResult;
+            @memcpy(self.last_table_name_buf[0..table_name.len], table_name);
+            self.last_table_name_len = table_name.len;
+            @memcpy(self.last_worker_id_buf[0..worker_id.len], worker_id);
+            self.last_worker_id_len = worker_id.len;
+            return .{
+                .complete = self.pass_count >= 2,
+                .jobs_scanned = 1,
+                .jobs_claimed = 1,
+                .jobs_completed = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(
+        alloc,
+        .{ .backend_runtime = runtime.ptr() },
+        source.iface(),
+        null,
+        writes.iface(),
+    );
+    defer server.deinit();
+
+    var applied = try server.applyRelationalSqlDdl("ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;");
+    defer applied.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), source.apply_count);
+    try std.testing.expectEqual(@as(usize, 2), writes.pass_count);
+    try std.testing.expectEqualStrings("audit_log", writes.last_table_name_buf[0..writes.last_table_name_len]);
+    try std.testing.expectEqualStrings("api-schema-rewrite", writes.last_worker_id_buf[0..writes.last_worker_id_len]);
 }
 
 test "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs" {
@@ -2081,6 +2293,7 @@ pub const ApiHttpServer = struct {
     sql_notification_runtime: sql_notifications.Runtime = .{ .alloc = undefined },
     sql_prepared_statement_runtime: SqlPreparedStatementRuntime = .{ .alloc = undefined },
     sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
+    schema_rewrite_wake_owner_id: u64 = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -2366,6 +2579,11 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        if (self.schema_rewrite_wake_owner_id != 0) {
+            if (self.cfg.backend_runtime) |runtime| {
+                runtime.durable_jobs.closeOwner(self.schema_rewrite_wake_owner_id);
+            }
+        }
         self.mcp_sessions.deinit(self.alloc);
         self.a2a_tasks.deinit(self.alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -3048,7 +3266,13 @@ pub const ApiHttpServer = struct {
         const function_bindings: relational_sql.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
-        var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(self.alloc, sql, function_bindings);
+        var plan = relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(self.alloc, sql, function_bindings) catch |err| switch (err) {
+            error.UnsupportedSqlShape => {
+                if (try self.applySqlRoutineTriggerDdlAlloc(sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
+                return err;
+            },
+            else => return err,
+        };
         defer plan.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         switch (plan) {
@@ -3123,6 +3347,10 @@ pub const ApiHttpServer = struct {
             else => {},
         }
 
+        if (loweredDdlPlanMayDropTrigger(plan)) {
+            if (try self.applyCatalogedSqlRoutineTriggerDropDdlAlloc(sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
+        }
+
         if (self.cfg.user_manager) |manager| {
             var catalog = try self.sqlAuthCatalogForDdlWithSession(sql, session.session());
             defer catalog.deinit(self.alloc);
@@ -3135,8 +3363,71 @@ pub const ApiHttpServer = struct {
         }
         var applied = try self.source.applyRelationalSqlDdlWithSessionAndFunctionBindings(self.alloc, sql, session.session(), function_bindings);
         errdefer applied.deinit(self.alloc);
+        try self.scheduleSchemaRewriteWakeForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         return applied;
+    }
+
+    fn applySqlRoutineTriggerDdlAlloc(
+        self: *ApiHttpServer,
+        sql: []const u8,
+        statement_timeout_ns: ?u64,
+        statement_start_ns: u64,
+    ) !?tables_api.AppliedRelationalSqlDdlRecord {
+        if (!try self.sql_routine_runtime.applyTriggerDdlAlloc(self.alloc, sql)) return null;
+        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+        errdefer applied.deinit(self.alloc);
+        applied.noop = true;
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return applied;
+    }
+
+    fn loweredDdlPlanMayDropTrigger(plan: relational_sql.LoweredDdlPlan) bool {
+        return switch (plan) {
+            .alter_table => |alter_table| {
+                for (alter_table.operations) |operation| {
+                    if (operation == .drop_update_policy) return true;
+                }
+                return false;
+            },
+            else => false,
+        };
+    }
+
+    fn applyCatalogedSqlRoutineTriggerDropDdlAlloc(
+        self: *ApiHttpServer,
+        sql: []const u8,
+        statement_timeout_ns: ?u64,
+        statement_start_ns: u64,
+    ) !?tables_api.AppliedRelationalSqlDdlRecord {
+        if (!try self.sql_routine_runtime.applyCatalogedTriggerDropDdlAlloc(self.alloc, sql)) return null;
+        var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+        errdefer applied.deinit(self.alloc);
+        applied.noop = true;
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+        return applied;
+    }
+
+    fn schemaRewriteWakeOwnerId(self: *ApiHttpServer, runtime: *db_mod.background_runtime.BackendRuntime) u64 {
+        if (self.schema_rewrite_wake_owner_id == 0) {
+            self.schema_rewrite_wake_owner_id = runtime.allocOwnerId();
+        }
+        return self.schema_rewrite_wake_owner_id;
+    }
+
+    fn scheduleSchemaRewriteWakeForAppliedDdl(
+        self: *ApiHttpServer,
+        applied: tables_api.AppliedRelationalSqlDdlRecord,
+    ) !void {
+        if (!appliedDdlHasSchemaRewriteWork(applied)) return;
+        const runtime = self.cfg.backend_runtime orelse return;
+        const write_source = self.table_writes orelse return;
+        try SchemaRewriteWakeJob.submit(
+            runtime,
+            self.schemaRewriteWakeOwnerId(runtime),
+            write_source,
+            applied.table.name,
+        );
     }
 
     fn refreshSqlExtensionQueryFunctions(self: *ApiHttpServer) !void {
@@ -20255,9 +20546,10 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer routine_policy.deinit(alloc);
     var disjunction_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');");
     defer disjunction_policy.deinit(alloc);
+    var mixed_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND id = 'evt-1');");
+    defer mixed_policy.deinit(alloc);
     try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("CREATE POLICY missing_tenant_policy ON missing_records USING (tenant_id = 'tenant-a');"));
     try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdl("CREATE POLICY missing_column_policy ON usage_records USING (missing_tenant = 'tenant-a');"));
-    try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdl("CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');"));
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read));
@@ -20274,6 +20566,9 @@ test "api http server applies authorization SQL DDL through user manager" {
     const stored_disjunction_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_or_policy", "default.public.usage_records");
     defer alloc.free(stored_disjunction_policy);
     try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_disjunction_policy);
+    const stored_mixed_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_mixed_policy", "default.public.usage_records");
+    defer alloc.free(stored_mixed_policy);
+    try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"conjuncts\":[{\"term\":{\"status\":\"active\"}},{\"term\":{\"id\":\"evt-1\"}}]}]}", stored_mixed_policy);
     try std.testing.expect(try auth.manager.sqlRowSecurityEnabled("default.public.usage_records"));
 
     var altered_policy = try server.applyRelationalSqlDdl("ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');");
@@ -20570,10 +20865,20 @@ test "api http server applies SQL DDL with explicit catalog session" {
             defer target.deinit(alloc_arg);
             try std.testing.expect(target.createsTable());
             try std.testing.expectEqualStrings("tenant_ops", target.database_name);
-            try std.testing.expectEqualStrings("analytics", target.namespace_name);
-            try std.testing.expectEqualStrings("events", target.table_name);
-            self.saw_session_create = true;
-            return try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(alloc_arg);
+            if (std.mem.eql(u8, target.table_name, "events")) {
+                try std.testing.expectEqualStrings("analytics", target.namespace_name);
+                self.saw_session_create = true;
+            } else if (std.mem.eql(u8, target.table_name, "local_events")) {
+                try std.testing.expectEqualStrings("public", target.namespace_name);
+            } else {
+                return error.TestUnexpectedResult;
+            }
+            return .{ .table = try metadata_table_manager.cloneTable(alloc_arg, .{
+                .table_id = 0,
+                .name = target.table_name,
+                .database_name = target.database_name,
+                .namespace_name = target.namespace_name,
+            }) };
         }
     };
 
@@ -21140,6 +21445,128 @@ test "api http server recovers durable SQL routine catalog" {
         defer server.deinit();
         try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
     }
+}
+
+test "api http server routes routine-backed SQL trigger DDL through routine runtime" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: catalog_resources.SqlCatalogSession,
+            _: relational_sql.SqlFunctionBindings,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var created_function = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+        &session,
+    );
+    defer created_function.deinit(alloc);
+
+    var created_trigger = try server.applyRelationalSqlDdlWithSession(
+        "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_body();",
+        &session,
+    );
+    defer created_trigger.deinit(alloc);
+    try std.testing.expect(created_trigger.noop);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.triggerCountForTest());
+
+    var dropped_trigger = try server.applyRelationalSqlDdlWithSession(
+        "DROP TRIGGER audit_insert ON usage_records;",
+        &session,
+    );
+    defer dropped_trigger.deinit(alloc);
+    try std.testing.expect(dropped_trigger.noop);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.triggerCountForTest());
+
+    var dropped_function = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION audit_body();", &session);
+    defer dropped_function.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
+}
+
+test "api http server keeps updated-at trigger DDL on table source path" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        apply_count: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+
+        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            sql: []const u8,
+            session: catalog_resources.SqlCatalogSession,
+            function_bindings: relational_sql.SqlFunctionBindings,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            _ = sql;
+            _ = session;
+            _ = function_bindings;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.apply_count += 1;
+            var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(allocator);
+            applied.noop = true;
+            return applied;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+    var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var applied = try server.applyRelationalSqlDdlWithSession(
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records FOR EACH ROW EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+        &session,
+    );
+    defer applied.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), source.apply_count);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.triggerCountForTest());
 }
 
 test "api http server exposes SQL routine bindings to catalog read planning" {
