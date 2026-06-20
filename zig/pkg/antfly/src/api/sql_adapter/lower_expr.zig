@@ -588,6 +588,16 @@ pub const SqlFunctionBindings = struct {
     routine_expressions: []const RoutineExpressionBinding = &.{},
 };
 
+pub const ExtensionFunctionRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const RoutineExpressionRowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub fn sqlRowClaimForClause(clause: ast.SqlRowClaimClause) db_mod.types.RowClaimRequest {
     return .{
         .mode = clause.mode,
@@ -2042,6 +2052,40 @@ pub fn extensionFunctionBinding(bindings: []const ExtensionFunctionBinding, name
     return found;
 }
 
+pub fn parseExtensionFunctionRowExpressionOrNullAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    bindings: []const ExtensionFunctionBinding,
+    hooks: ExtensionFunctionRowExpressionParserHooks,
+) !?db_mod.types.RelationalRowsExpression {
+    if (!peekExtensionFunctionCall(tokens, pos.*, bindings)) return null;
+    const name = tokens[pos.*].text;
+    const binding = try extensionFunctionBinding(bindings, name) orelse return null;
+    const kind = binding.native_expression_kind;
+    _ = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    errdefer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    if (parser.matchToken(tokens, pos, .rparen) == null) {
+        while (true) {
+            const operand = try hooks.parse_operand(hooks.ptr);
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(alloc, operand);
+            try operands.append(alloc, operand);
+            operand_transferred = true;
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+    try validateExtensionFunctionArity(kind, binding.arity, operands.items.len);
+    if (kind == .uuid_v4) return .{ .kind = .uuid_v4 };
+    return try buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+}
+
 pub fn peekRoutineExpressionCall(tokens: []const Token, pos: usize, bindings: []const RoutineExpressionBinding) bool {
     if (bindings.len == 0) return false;
     if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
@@ -2064,6 +2108,50 @@ pub fn routineExpressionBinding(
         found = binding;
     }
     return found;
+}
+
+pub fn parseRoutineExpressionRowExpressionOrNullAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    bindings: []const RoutineExpressionBinding,
+    hooks: RoutineExpressionRowExpressionParserHooks,
+) !?db_mod.types.RelationalRowsExpression {
+    if (!peekRoutineExpressionCall(tokens, pos.*, bindings)) return null;
+    const name = tokens[pos.*].text;
+    _ = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
+    defer {
+        for (operands.items) |operand| freeExpression(alloc, operand);
+        operands.deinit(alloc);
+    }
+    if (parser.matchToken(tokens, pos, .rparen) == null) {
+        while (true) {
+            const operand = try hooks.parse_operand(hooks.ptr);
+            var operand_transferred = false;
+            errdefer if (!operand_transferred) freeExpression(alloc, operand);
+            try operands.append(alloc, operand);
+            operand_transferred = true;
+            if (parser.matchToken(tokens, pos, .comma) != null) continue;
+            break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+    const binding = try routineExpressionBinding(bindings, name, operands.items.len) orelse return error.UnsupportedSqlShape;
+    if (binding.null_input == .returns_null) {
+        for (operands.items) |operand| {
+            if (routineArgumentExpressionIsNullLiteral(operand)) {
+                return .{
+                    .kind = .value,
+                    .value_json = try alloc.dupe(u8, "null"),
+                };
+            }
+        }
+        return error.UnsupportedSqlShape;
+    }
+
+    return try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands.items);
 }
 
 pub fn routineArgumentExpressionIsNullLiteral(value: runtime_schema.RelationalRowsExpression) bool {
@@ -9305,6 +9393,32 @@ pub fn peekGeneralOrderRowExpression(tokens: []const Token, pos: usize) bool {
         peekFixedBinaryFunctionCall(tokens, pos, .mod) or
         peekFixedBinaryFunctionCall(tokens, pos, .power) or
         peekGreatestLeastFunctionCall(tokens, pos);
+}
+
+pub const OrderExpressionStart = enum {
+    parenthesized_null_test,
+    parenthesized,
+    pipe_concat,
+    json_extract_field,
+    generated_or_case_fold,
+    generated_or_md5,
+    generated_or_concat,
+    general,
+    unary_negative,
+    field,
+};
+
+pub fn orderExpressionStartAt(tokens: []const Token, pos: usize) OrderExpressionStart {
+    if (peekParenthesizedNullTestProjection(tokens, pos)) return .parenthesized_null_test;
+    if (peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
+    if (rowExpressionHasTopLevelPipeConcat(tokens, pos)) return .pipe_concat;
+    if (pos < tokens.len and tokens[pos].kind == .identifier and pos + 1 < tokens.len and tokenKindIsJsonExtractOperator(tokens[pos + 1].kind)) return .json_extract_field;
+    if (peekCaseFoldFunctionCall(tokens, pos)) return .generated_or_case_fold;
+    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) return .generated_or_md5;
+    if (peekConcatFunctionCall(tokens, pos)) return .generated_or_concat;
+    if (peekGeneralOrderRowExpression(tokens, pos)) return .general;
+    if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
+    return .field;
 }
 
 pub const SelectItemStart = enum {

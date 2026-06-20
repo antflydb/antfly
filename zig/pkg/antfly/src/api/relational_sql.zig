@@ -3329,6 +3329,20 @@ const Parser = struct {
         };
     }
 
+    fn extensionFunctionRowExpressionParserHooks(self: *@This()) sql_adapter.ExtensionFunctionRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseExtensionFunctionOperandHook,
+        };
+    }
+
+    fn routineExpressionRowExpressionParserHooks(self: *@This()) sql_adapter.RoutineExpressionRowExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_operand = parseRoutineExpressionOperandHook,
+        };
+    }
+
     fn conflictCoalesceExpressionParserHooks(self: *@This()) sql_adapter.ConflictCoalesceExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3522,6 +3536,16 @@ const Parser = struct {
     ) anyerror!db_mod.types.RelationalRowsExpressionProjection {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseBooleanExpressionProjectionFromFieldAlloc(field);
+    }
+
+    fn parseExtensionFunctionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseRowExpressionAlloc();
+    }
+
+    fn parseRoutineExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseBooleanRowExpressionAlloc();
     }
 
     fn parseConflictCoalesceExpressionOperandHook(
@@ -13590,98 +13614,80 @@ const Parser = struct {
     }
 
     fn parseOrderExpressionAlloc(self: *@This()) !db_mod.types.RelationalRowsQueryOrder {
-        if (sql_adapter.peekParenthesizedNullTestProjection(self.tokens, self.pos)) {
-            _ = self.match(.lparen) orelse unreachable;
-            const parsed_field = try self.parseFieldExpressionOwned();
-            defer self.alloc.free(parsed_field);
-            const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
-            try self.expectKeyword("is");
-            const null_test: db_mod.types.RelationalRowsQueryOrderNullTest = if (self.matchKeyword("not")) blk: {
-                try self.expectKeyword("null");
-                break :blk .is_not_null;
-            } else blk: {
-                try self.expectKeyword("null");
-                break :blk .is_null;
-            };
-            try self.expect(.rparen);
-            field_transferred = true;
-            return .{ .field = field, .null_test = null_test };
-        }
-        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
-            const expression = try self.parseParenthesizedRowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
+        if (try self.parseBoundFunctionOrderExpressionOrNullAlloc()) |order| return order;
 
-        if (sql_adapter.rowExpressionHasTopLevelPipeConcat(self.tokens, self.pos)) {
-            const expression = try self.parseRowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            try self.rowExpressionTypeContext().validateTextRowExpression(expression);
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
-        if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len and tokenKindIsJsonExtractOperator(self.tokens[self.pos + 1].kind)) {
-            const expression = try self.parseRowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
-        if (try sql_adapter.parseGeneratedFieldExpressionOrNullOwnedAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.schema,
-            self.field_expression_qualifiers,
-            self.returning_expression_qualifiers,
-            self.defer_row_expression_field_validation,
-        )) |field| return .{ .field = field };
-        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) {
-            const expression = try self.parseCaseFoldRowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            if (expression.kind == .field and expression.field.len != 0) {
+        switch (sql_adapter.orderExpressionStartAt(self.tokens, self.pos)) {
+            .parenthesized_null_test => {
+                _ = self.match(.lparen) orelse unreachable;
+                const parsed_field = try self.parseFieldExpressionOwned();
+                defer self.alloc.free(parsed_field);
+                const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
+                var field_transferred = false;
+                errdefer if (!field_transferred) self.alloc.free(field);
+                if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
+                try self.expectKeyword("is");
+                const null_test: db_mod.types.RelationalRowsQueryOrderNullTest = if (self.matchKeyword("not")) blk: {
+                    try self.expectKeyword("null");
+                    break :blk .is_not_null;
+                } else blk: {
+                    try self.expectKeyword("null");
+                    break :blk .is_null;
+                };
+                try self.expect(.rparen);
+                field_transferred = true;
+                return .{ .field = field, .null_test = null_test };
+            },
+            .parenthesized => {
+                const expression = try self.parseParenthesizedRowExpressionAlloc();
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+                try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
                 expression_transferred = true;
-                return .{ .field = expression.field };
-            }
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsMd5Function)) {
-            const expression = try self.parseMd5RowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
-        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) {
-            const expression = try self.parseRowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
-        if (sql_adapter.peekGeneralOrderRowExpression(self.tokens, self.pos)) {
-            const expression = try self.parseRowExpressionAlloc();
-            var expression_transferred = false;
-            errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-            try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
-            expression_transferred = true;
-            return .{ .expression = expression };
-        }
-        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) {
-            const expression = try self.parseRowExpressionAlloc();
-            try self.rowExpressionTypeContext().validateNumericRowExpression(expression);
-            return .{ .expression = expression };
+                return .{ .expression = expression };
+            },
+            .pipe_concat => {
+                const expression = try self.parseRowExpressionAlloc();
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+                try self.rowExpressionTypeContext().validateTextRowExpression(expression);
+                expression_transferred = true;
+                return .{ .expression = expression };
+            },
+            .json_extract_field, .generated_or_concat, .general => {
+                if (try self.parseGeneratedOrderFieldOrNullAlloc()) |field| return .{ .field = field };
+                const expression = try self.parseRowExpressionAlloc();
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+                try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
+                expression_transferred = true;
+                return .{ .expression = expression };
+            },
+            .generated_or_case_fold => {
+                if (try self.parseGeneratedOrderFieldOrNullAlloc()) |field| return .{ .field = field };
+                const expression = try self.parseCaseFoldRowExpressionAlloc();
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+                if (expression.kind == .field and expression.field.len != 0) {
+                    expression_transferred = true;
+                    return .{ .field = expression.field };
+                }
+                expression_transferred = true;
+                return .{ .expression = expression };
+            },
+            .generated_or_md5 => {
+                if (try self.parseGeneratedOrderFieldOrNullAlloc()) |field| return .{ .field = field };
+                const expression = try self.parseMd5RowExpressionAlloc();
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+                expression_transferred = true;
+                return .{ .expression = expression };
+            },
+            .unary_negative => {
+                const expression = try self.parseRowExpressionAlloc();
+                try self.rowExpressionTypeContext().validateNumericRowExpression(expression);
+                return .{ .expression = expression };
+            },
+            .field => {},
         }
 
         const parsed_field = try self.parseFieldExpressionOwned();
@@ -13700,6 +13706,32 @@ const Parser = struct {
         }
         field_transferred = true;
         return .{ .field = field };
+    }
+
+    fn parseBoundFunctionOrderExpressionOrNullAlloc(self: *@This()) !?db_mod.types.RelationalRowsQueryOrder {
+        if (!sql_adapter.peekExtensionFunctionCall(self.tokens, self.pos, self.function_bindings.extension_functions) and
+            !sql_adapter.peekRoutineExpressionCall(self.tokens, self.pos, self.function_bindings.routine_expressions))
+        {
+            return null;
+        }
+        const expression = try self.parseRowExpressionAlloc();
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
+        try self.rowExpressionTypeContext().validateOrderableRowExpression(expression);
+        expression_transferred = true;
+        return .{ .expression = expression };
+    }
+
+    fn parseGeneratedOrderFieldOrNullAlloc(self: *@This()) !?[]const u8 {
+        return try sql_adapter.parseGeneratedFieldExpressionOrNullOwnedAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+        );
     }
 
     fn parseGroupBy(self: *@This(), group_by: *std.ArrayListUnmanaged([]const u8)) !void {
@@ -16260,77 +16292,11 @@ const Parser = struct {
     }
 
     fn parseExtensionFunctionRowExpressionAlloc(self: *@This()) !?db_mod.types.RelationalRowsExpression {
-        if (!sql_adapter.peekExtensionFunctionCall(self.tokens, self.pos, self.function_bindings.extension_functions)) return null;
-        const name = self.tokens[self.pos].text;
-        const binding = try self.extensionFunctionBinding(name) orelse return null;
-        const kind = binding.native_expression_kind;
-        _ = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        errdefer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        if (self.match(.rparen) == null) {
-            while (true) {
-                const operand = try self.parseRowExpressionAlloc();
-                var operand_transferred = false;
-                errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-                try operands.append(self.alloc, operand);
-                operand_transferred = true;
-                if (self.match(.comma) == null) break;
-            }
-            try self.expect(.rparen);
-        }
-        try sql_adapter.lower_expr.validateExtensionFunctionArity(kind, binding.arity, operands.items.len);
-        if (kind == .uuid_v4) return .{ .kind = .uuid_v4 };
-        return try sql_adapter.buildFunctionExpressionFromOperandListAlloc(self.alloc, kind, &operands);
-    }
-
-    fn extensionFunctionBinding(self: *@This(), name: []const u8) !?ExtensionFunctionBinding {
-        return try sql_adapter.lower_expr.extensionFunctionBinding(self.function_bindings.extension_functions, name);
+        return try sql_adapter.parseExtensionFunctionRowExpressionOrNullAlloc(self.alloc, self.tokens, &self.pos, self.function_bindings.extension_functions, self.extensionFunctionRowExpressionParserHooks());
     }
 
     fn parseRoutineExpressionRowExpressionAlloc(self: *@This()) !?db_mod.types.RelationalRowsExpression {
-        if (!sql_adapter.peekRoutineExpressionCall(self.tokens, self.pos, self.function_bindings.routine_expressions)) return null;
-        const name = self.tokens[self.pos].text;
-        _ = self.match(.identifier) orelse return error.UnsupportedSqlShape;
-        try self.expect(.lparen);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-        defer {
-            for (operands.items) |operand| freeExpression(self.alloc, operand);
-            operands.deinit(self.alloc);
-        }
-        if (self.match(.rparen) == null) {
-            while (true) {
-                const operand = try self.parseBooleanRowExpressionAlloc();
-                var operand_transferred = false;
-                errdefer if (!operand_transferred) freeExpression(self.alloc, operand);
-                try operands.append(self.alloc, operand);
-                operand_transferred = true;
-                if (self.match(.comma)) |_| continue;
-                break;
-            }
-            try self.expect(.rparen);
-        }
-        const binding = try self.routineExpressionBinding(name, operands.items.len) orelse return error.UnsupportedSqlShape;
-        if (binding.null_input == .returns_null) {
-            for (operands.items) |operand| {
-                if (sql_adapter.lower_expr.routineArgumentExpressionIsNullLiteral(operand)) {
-                    return .{
-                        .kind = .value,
-                        .value_json = try self.alloc.dupe(u8, "null"),
-                    };
-                }
-            }
-            return error.UnsupportedSqlShape;
-        }
-
-        return try sql_adapter.lower_expr.cloneExpressionSubstitutingRoutineArgsAlloc(self.alloc, binding.expression, operands.items);
-    }
-
-    fn routineExpressionBinding(self: *@This(), name: []const u8, arity: usize) !?RoutineExpressionBinding {
-        return try sql_adapter.lower_expr.routineExpressionBinding(self.function_bindings.routine_expressions, name, arity);
+        return try sql_adapter.parseRoutineExpressionRowExpressionOrNullAlloc(self.alloc, self.tokens, &self.pos, self.function_bindings.routine_expressions, self.routineExpressionRowExpressionParserHooks());
     }
 
     fn parseBooleanNotRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
@@ -33170,6 +33136,29 @@ test "postgres sql adapter lowers uuid generation values and projections" {
         },
         else => return error.TestUnexpectedResult,
     }
+    var ordered_extension = try lowerReadPlanWithExtensionFunctionsAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE id = $1 ORDER BY extension_lower(request_id) DESC",
+        schema,
+        &.{.{ .string = "u1" }},
+        &.{.{
+            .sql_name = "extension_lower",
+            .native_expression_kind = .lower,
+            .arity = 1,
+        }},
+    );
+    defer ordered_extension.deinit();
+    switch (ordered_extension) {
+        .query => |read_query| {
+            try std.testing.expectEqual(@as(usize, 1), read_query.plan.query.order_by.len);
+            const order_expression = read_query.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, order_expression.kind);
+            try std.testing.expectEqual(@as(usize, 1), order_expression.operands.len);
+            try std.testing.expectEqualStrings("request_id", order_expression.operands[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, read_query.plan.query.order_by[0].direction);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     if (lowerReadPlanWithExtensionFunctionsAlloc(
         alloc,
@@ -33268,6 +33257,21 @@ test "postgres sql adapter lowers routine expression bindings into row expressio
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, set_operation.right.plan.query.expressions[0].expression.kind);
     try std.testing.expectEqualStrings("status", set_operation.left.plan.query.expressions[0].expression.operands[0].field);
     try std.testing.expectEqualStrings("status", set_operation.right.plan.query.expressions[0].expression.operands[0].field);
+
+    var ordered = try lowerQueryPlanWithFunctionBindingsAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE id = $1 ORDER BY normalize_status(status) DESC",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &bindings },
+    );
+    defer ordered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered.plan.query.order_by.len);
+    const order_expression = ordered.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, order_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), order_expression.operands.len);
+    try std.testing.expectEqualStrings("status", order_expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered.plan.query.order_by[0].direction);
 
     const overloaded_operands = [_]db_mod.types.RelationalRowsExpression{
         .{ .kind = .field, .field = "arg1" },
