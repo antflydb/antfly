@@ -438,6 +438,114 @@ pub fn aggregateSpecsEquivalent(
     return true;
 }
 
+pub fn aggregateOpForName(name: []const u8) ?db_mod.types.RelationalRowsAggregateOp {
+    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
+    if (std.ascii.eqlIgnoreCase(name, "sum")) return .sum;
+    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
+    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
+    if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
+    if (std.ascii.eqlIgnoreCase(name, "percentile_cont")) return .percentile_cont;
+    if (std.ascii.eqlIgnoreCase(name, "percentile_disc")) return .percentile_disc;
+    if (std.ascii.eqlIgnoreCase(name, "mode")) return .mode;
+    if (std.ascii.eqlIgnoreCase(name, "array_agg")) return .array_agg;
+    if (std.ascii.eqlIgnoreCase(name, "string_agg")) return .string_agg;
+    if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
+    if (std.ascii.eqlIgnoreCase(name, "bool_and")) return .bool_and;
+    return null;
+}
+
+pub fn aggregateOpName(op: db_mod.types.RelationalRowsAggregateOp) []const u8 {
+    return switch (op) {
+        .count => "count",
+        .sum => "sum",
+        .min => "min",
+        .max => "max",
+        .avg => "avg",
+        .percentile_cont => "percentile_cont",
+        .percentile_disc => "percentile_disc",
+        .mode => "mode",
+        .array_agg => "array_agg",
+        .string_agg => "string_agg",
+        .bool_or => "bool_or",
+        .bool_and => "bool_and",
+    };
+}
+
+pub fn isSqlPercentileAggregateOp(op: db_mod.types.RelationalRowsAggregateOp) bool {
+    return op == .percentile_cont or op == .percentile_disc;
+}
+
+pub fn sqlJsonNumberAsF64(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
+        else => null,
+    };
+}
+
+pub fn validateAggregateGroupBy(
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    group_by: []const []const u8,
+    parsed_group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+) !void {
+    if (!stringSlicesEqual(group_fields, group_by)) return error.UnsupportedSqlShape;
+    if (group_expressions.len != parsed_group_expressions.len) return error.UnsupportedSqlShape;
+    for (group_expressions, parsed_group_expressions) |selected, parsed| {
+        if (!relationalRowsExpressionEqual(selected.expression, parsed.expression)) return error.UnsupportedSqlShape;
+    }
+}
+
+pub fn aggregateOutputFieldIsUnique(
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    field: []const u8,
+) bool {
+    var matches: usize = 0;
+    for (group_fields) |group_field| {
+        if (std.mem.eql(u8, group_field, field)) matches += 1;
+    }
+    for (group_expressions) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) matches += 1;
+    }
+    for (aggregations) |aggregation| {
+        if (std.mem.eql(u8, aggregation.name, field)) matches += 1;
+    }
+    return matches == 1;
+}
+
+pub fn aggregateOutputColumnExists(columns: []const runtime_schema.RelationalColumn, name: []const u8) bool {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return true;
+    }
+    return false;
+}
+
+pub fn joinSideForQualifier(
+    qualifier: []const u8,
+    left_alias: []const u8,
+    right_alias: []const u8,
+) !db_mod.types.RelationalRowsJoinProjectionSide {
+    if (std.mem.eql(u8, qualifier, left_alias)) return .left;
+    if (std.mem.eql(u8, qualifier, right_alias)) return .right;
+    return error.UnsupportedSqlShape;
+}
+
+pub fn joinProjectionOutputIsUnique(select: []const db_mod.types.RelationalRowsJoinProjection, field: []const u8) bool {
+    var matches: usize = 0;
+    for (select) |projection| {
+        if (std.mem.eql(u8, projection.output, field)) matches += 1;
+    }
+    return matches == 1;
+}
+
+pub fn identifierContainsQualifier(identifier: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return false;
+    return dot > 0 and dot + 1 < identifier.len;
+}
+
 fn optionalStringEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;
     return std.mem.eql(u8, lhs.?, rhs.?);
@@ -2148,6 +2256,46 @@ test "sql adapter lower expr compares aggregate specs" {
 
     try std.testing.expect(aggregateSpecsEquivalent(lhs, same));
     try std.testing.expect(!aggregateSpecsEquivalent(lhs, different));
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, aggregateOpForName("PERCENTILE_CONT").?);
+    try std.testing.expectEqualStrings("array_agg", aggregateOpName(.array_agg));
+    try std.testing.expect(isSqlPercentileAggregateOp(.percentile_disc));
+    try std.testing.expect(!isSqlPercentileAggregateOp(.array_agg));
+    try std.testing.expectEqual(@as(?f64, 1.5), sqlJsonNumberAsF64(.{ .number_string = "1.5" }));
+    try std.testing.expect(sqlJsonNumberAsF64(.{ .string = "1.5" }) == null);
+
+    const group_projection: db_mod.types.RelationalRowsExpressionProjection = .{
+        .output = "status_lower",
+        .expression = lower_status,
+    };
+    try validateAggregateGroupBy(&.{"status"}, &.{group_projection}, &.{"status"}, &.{group_projection});
+    try std.testing.expectError(error.UnsupportedSqlShape, validateAggregateGroupBy(&.{"status"}, &.{}, &.{"tenant_id"}, &.{}));
+
+    const aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{lhs};
+    const duplicate_aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{.{
+        .name = "status",
+        .op = .count,
+    }};
+    try std.testing.expect(aggregateOutputFieldIsUnique(&.{"status"}, &.{group_projection}, &aggregate_specs, "statuses"));
+    try std.testing.expect(!aggregateOutputFieldIsUnique(&.{"status"}, &.{group_projection}, &duplicate_aggregate_specs, "status"));
+    const output_columns = [_]runtime_schema.RelationalColumn{.{ .name = "statuses", .path = "statuses", .field_type = .array }};
+    try std.testing.expect(aggregateOutputColumnExists(&output_columns, "statuses"));
+    try std.testing.expect(!aggregateOutputColumnExists(&output_columns, "missing"));
+
+    try std.testing.expect(identifierContainsQualifier("left.status"));
+    try std.testing.expect(!identifierContainsQualifier("status"));
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, try joinSideForQualifier("l", "l", "r"));
+    try std.testing.expectError(error.UnsupportedSqlShape, joinSideForQualifier("x", "l", "r"));
+
+    const join_projections = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "id", .field = "id", .side = .left },
+        .{ .output = "status", .field = "status", .side = .right },
+    };
+    const duplicate_join_projections = [_]db_mod.types.RelationalRowsJoinProjection{
+        .{ .output = "id", .field = "left_id", .side = .left },
+        .{ .output = "id", .field = "right_id", .side = .right },
+    };
+    try std.testing.expect(joinProjectionOutputIsUnique(&join_projections, "status"));
+    try std.testing.expect(!joinProjectionOutputIsUnique(&duplicate_join_projections, "id"));
 }
 
 test "sql adapter lower expr detects catalog expression references" {

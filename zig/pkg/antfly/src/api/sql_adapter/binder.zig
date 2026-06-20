@@ -128,6 +128,17 @@ pub fn defaultPrimaryKeyNameEquals(table_name: []const u8, name: []const u8) boo
         std.mem.endsWith(u8, name, suffix);
 }
 
+pub fn columnsMatchPrimaryKey(primary_key: runtime_schema.PrimaryKey, columns: []const []const u8) bool {
+    return stringSlicesEqual(primary_key.columns, columns);
+}
+
+pub fn primaryKeyContains(primary_key: runtime_schema.PrimaryKey, field: []const u8) bool {
+    for (primary_key.columns) |column| {
+        if (std.mem.eql(u8, column, field)) return true;
+    }
+    return false;
+}
+
 pub fn relationalColumnForDdl(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
     for (columns) |column| {
         if (std.mem.eql(u8, column.name, name)) return column;
@@ -926,6 +937,10 @@ test "sql adapter binder validates relational catalog lookups" {
     try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_pkey"));
     try std.testing.expect(relationalConstraintNameExists(schema, "users", "users_status_check"));
     try std.testing.expect(!relationalConstraintNameExists(schema, "users", "missing_check"));
+    try std.testing.expect(columnsMatchPrimaryKey(primary_key, &.{"id"}));
+    try std.testing.expect(!columnsMatchPrimaryKey(primary_key, &.{"email"}));
+    try std.testing.expect(primaryKeyContains(primary_key, "id"));
+    try std.testing.expect(!primaryKeyContains(primary_key, "email"));
     try std.testing.expect(findUniqueConstraintByName(schema, "users_email_key") != null);
     try std.testing.expect(findUniqueConstraintByName(schema, "users_unvalidated_key") == null);
     try std.testing.expect(findUniqueConstraintByColumns(schema, &.{"email"}, false) != null);

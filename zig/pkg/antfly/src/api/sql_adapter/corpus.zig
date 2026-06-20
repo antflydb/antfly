@@ -15,6 +15,7 @@
 const std = @import("std");
 const sql_adapter = @This();
 
+const classifier = @import("classifier.zig");
 const diagnostics = @import("diagnostics.zig");
 const value_mod = @import("value.zig");
 
@@ -318,6 +319,7 @@ pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
+pub const sql_adapter_edge_case_fixture_format: u64 = 1;
 
 pub const AppParityFixtureRoot = struct {
     fixture_format: u64,
@@ -337,6 +339,42 @@ pub const AppParitySourceCorpusRoot = struct {
 pub const AppParityCoverageRequirementsRoot = struct {
     coverage_format: u64,
     required: []const []const u8,
+};
+
+pub const SqlAdapterEdgeCaseAction = enum {
+    select,
+    update,
+    delete,
+    insert,
+    ddl,
+    classify_write,
+    write_plan,
+};
+
+pub const SqlAdapterEdgeCaseDdlTag = enum {
+    create_table,
+};
+
+pub const SqlAdapterEdgeCase = struct {
+    name: []const u8,
+    action: SqlAdapterEdgeCaseAction,
+    sql: []const u8,
+    expected_error: []const u8 = "",
+    expected_table: ?[]const u8 = null,
+    expected_predicates: ?usize = null,
+    expected_first_predicate_field: ?[]const u8 = null,
+    expected_first_predicate_value_json: ?[]const u8 = null,
+    expected_transformed: ?u32 = null,
+    expected_write_kind: ?classifier.SqlWriteStatementKind = null,
+    expected_inserted: ?u32 = null,
+    expected_ddl_tag: ?SqlAdapterEdgeCaseDdlTag = null,
+    expected_if_not_exists: ?bool = null,
+    params: []const SqlValue = &.{},
+};
+
+pub const SqlAdapterEdgeCaseRoot = struct {
+    edge_case_format: u64,
+    cases: []const SqlAdapterEdgeCase,
 };
 
 pub const AppParityFixtureEncodedEntry = struct {
@@ -840,6 +878,106 @@ pub fn freeCoverageRequirementsRoot(
     root: AppParityCoverageRequirementsRoot,
 ) void {
     if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn parseSqlAdapterEdgeCaseRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlAdapterEdgeCaseRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "edge_case_format", "cases" });
+    const edge_case_format = try fixtureJsonOptionalU64(root, "edge_case_format", 0);
+    if (edge_case_format != sql_adapter_edge_case_fixture_format) return error.TestUnexpectedResult;
+    const case_values = switch (root.get("cases") orelse return error.TestUnexpectedResult) {
+        .array => |array| array.items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (case_values.len == 0) return error.TestUnexpectedResult;
+
+    var cases = std.ArrayListUnmanaged(SqlAdapterEdgeCase).empty;
+    errdefer {
+        for (cases.items) |case| freeSqlAdapterEdgeCase(alloc, case);
+        cases.deinit(alloc);
+    }
+    var seen_names = std.StringHashMapUnmanaged(void){};
+    defer seen_names.deinit(alloc);
+
+    for (case_values) |case_value| {
+        const edge_case = try parseSqlAdapterEdgeCaseAlloc(alloc, case_value);
+        errdefer freeSqlAdapterEdgeCase(alloc, edge_case);
+        if (edge_case.name.len == 0 or edge_case.sql.len == 0 or seen_names.contains(edge_case.name)) {
+            return error.TestUnexpectedResult;
+        }
+        try seen_names.put(alloc, edge_case.name, {});
+        try cases.append(alloc, edge_case);
+    }
+
+    return .{
+        .edge_case_format = edge_case_format,
+        .cases = try cases.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeSqlAdapterEdgeCaseRoot(
+    alloc: std.mem.Allocator,
+    root: SqlAdapterEdgeCaseRoot,
+) void {
+    for (root.cases) |case| freeSqlAdapterEdgeCase(alloc, case);
+    if (root.cases.len > 0) alloc.free(root.cases);
+}
+
+fn parseSqlAdapterEdgeCaseAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlAdapterEdgeCase {
+    const object = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(object, &.{
+        "name",
+        "action",
+        "expected_error",
+        "expected_table",
+        "expected_predicates",
+        "expected_first_predicate_field",
+        "expected_first_predicate_value_json",
+        "expected_transformed",
+        "expected_write_kind",
+        "expected_inserted",
+        "expected_ddl_tag",
+        "expected_if_not_exists",
+        "params",
+        "sql",
+    });
+    const action_text = try fixtureJsonString(object.get("action") orelse return error.TestUnexpectedResult);
+    const action = std.meta.stringToEnum(SqlAdapterEdgeCaseAction, action_text) orelse return error.TestUnexpectedResult;
+    return .{
+        .name = try fixtureJsonString(object.get("name") orelse return error.TestUnexpectedResult),
+        .action = action,
+        .sql = try fixtureJsonString(object.get("sql") orelse return error.TestUnexpectedResult),
+        .expected_error = try fixtureJsonOptionalString(object, "expected_error", ""),
+        .expected_table = try fixtureJsonOptionalStringField(object, "expected_table"),
+        .expected_predicates = try fixtureJsonOptionalUsize(object, "expected_predicates"),
+        .expected_first_predicate_field = try fixtureJsonOptionalStringField(object, "expected_first_predicate_field"),
+        .expected_first_predicate_value_json = try fixtureJsonOptionalStringField(object, "expected_first_predicate_value_json"),
+        .expected_transformed = try fixtureJsonOptionalU32(object, "expected_transformed"),
+        .expected_write_kind = if (try fixtureJsonOptionalStringField(object, "expected_write_kind")) |kind|
+            std.meta.stringToEnum(classifier.SqlWriteStatementKind, kind) orelse return error.TestUnexpectedResult
+        else
+            null,
+        .expected_inserted = try fixtureJsonOptionalU32(object, "expected_inserted"),
+        .expected_ddl_tag = if (try fixtureJsonOptionalStringField(object, "expected_ddl_tag")) |tag|
+            std.meta.stringToEnum(SqlAdapterEdgeCaseDdlTag, tag) orelse return error.TestUnexpectedResult
+        else
+            null,
+        .expected_if_not_exists = try fixtureJsonOptionalBool(object, "expected_if_not_exists"),
+        .params = try parseFixtureSqlValuesAlloc(alloc, object),
+    };
+}
+
+fn freeSqlAdapterEdgeCase(
+    alloc: std.mem.Allocator,
+    edge_case: SqlAdapterEdgeCase,
+) void {
+    if (edge_case.params.len > 0) alloc.free(edge_case.params);
 }
 
 pub fn expectAppParityCoverageRequirements(
@@ -4003,6 +4141,70 @@ test "sql adapter corpus parses data-driven coverage requirements" {
     var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
     defer parsed_incomplete.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRequirementsRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus parses adapter edge case fixtures" {
+    const alloc = std.testing.allocator;
+    const fixture_json = @embedFile("../fixtures/sql_api_adapter_edge_cases.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
+    defer parsed.deinit();
+
+    const root = try parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed.value);
+    defer freeSqlAdapterEdgeCaseRoot(alloc, root);
+    try std.testing.expectEqual(sql_adapter_edge_case_fixture_format, root.edge_case_format);
+    try std.testing.expect(root.cases.len > 0);
+
+    const valid_json =
+        \\{
+        \\  "edge_case_format": 1,
+        \\  "cases": [
+        \\    {
+        \\      "name": "valid edge",
+        \\      "action": "classify_write",
+        \\      "sql": "UPDATE users SET organization_id = $1",
+        \\      "expected_write_kind": "update",
+        \\      "params": [{"string": "o1"}]
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_valid = try std.json.parseFromSlice(std.json.Value, alloc, valid_json, .{});
+    defer parsed_valid.deinit();
+    const valid_root = try parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_valid.value);
+    defer freeSqlAdapterEdgeCaseRoot(alloc, valid_root);
+    try std.testing.expectEqual(SqlAdapterEdgeCaseAction.classify_write, valid_root.cases[0].action);
+    try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, valid_root.cases[0].expected_write_kind.?);
+    try std.testing.expectEqual(@as(usize, 1), valid_root.cases[0].params.len);
+
+    const duplicate_json =
+        \\{
+        \\  "edge_case_format": 1,
+        \\  "cases": [
+        \\    {"name": "dup", "action": "select", "sql": "SELECT id FROM users"},
+        \\    {"name": "dup", "action": "select", "sql": "SELECT id FROM users"}
+        \\  ]
+        \\}
+    ;
+    var parsed_duplicate = try std.json.parseFromSlice(std.json.Value, alloc, duplicate_json, .{});
+    defer parsed_duplicate.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_duplicate.value));
+
+    const invalid_kind_json =
+        \\{
+        \\  "edge_case_format": 1,
+        \\  "cases": [
+        \\    {
+        \\      "name": "bad kind",
+        \\      "action": "classify_write",
+        \\      "sql": "UPDATE users SET organization_id = 'o1'",
+        \\      "expected_write_kind": "not_a_write_kind"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_invalid_kind = try std.json.parseFromSlice(std.json.Value, alloc, invalid_kind_json, .{});
+    defer parsed_invalid_kind.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_invalid_kind.value));
 }
 
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {

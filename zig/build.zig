@@ -3776,6 +3776,7 @@ pub fn build(b: *std.Build) void {
             "api http server exposes SQL routine bindings to catalog read planning",
             "api http server refreshes SQL routine hooks from ready extension query functions",
             "api http server schedules typed schema rewrite jobs from applied SQL DDL work",
+            "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs",
             "api http server executes SQL COPY FROM STDIN through catalog rows batch",
             "api http server maps runtime role settings into SQL catalog session defaults",
             "sql auth adapter creates roles and applies table grants through user manager",

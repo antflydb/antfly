@@ -1434,7 +1434,7 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
             self.* = undefined;
         }
 
-        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = &.{},
@@ -1506,6 +1506,122 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     try std.testing.expectEqualStrings("status", job_expression.operands[0].field);
     try std.testing.expectEqual(@as(u64, 9002), service.jobs.items[1].group_id);
     try std.testing.expectEqualStrings("m", service.jobs.items[1].start_row_key);
+    try std.testing.expect(service.jobs.items[1].end_row_key == null);
+}
+
+test "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs" {
+    const alloc = std.testing.allocator;
+    const initial_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const FakeService = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 88,
+            .name = "audit_log",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = initial_schema_json,
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        table_owned: bool = false,
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9901, .range_id = 9911, .table_id = 88, .start_key = "", .end_key = "n" },
+            .{ .group_id = 9902, .range_id = 9912, .table_id = 88, .start_key = "n", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
+        upsert_table_count: usize = 0,
+        run_round_count: usize = 0,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            if (self.table_owned) metadata_table_manager.freeTable(allocator, self.table);
+            for (self.jobs.items) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.jobs.deinit(allocator);
+            self.* = undefined;
+        }
+
+        fn tableSlice(self: *@This()) []metadata_table_manager.TableRecord {
+            return @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1];
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tableSlice(),
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            const cloned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+            if (self.table_owned) metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table = cloned;
+            self.table_owned = true;
+            self.upsert_table_count += 1;
+        }
+
+        pub fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            try self.jobs.append(
+                std.testing.allocator,
+                try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record),
+            );
+        }
+
+        pub fn runRound(self: *@This()) !void {
+            self.run_round_count += 1;
+        }
+    };
+
+    var service = FakeService{};
+    defer service.deinit(alloc);
+
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByQualifiedName(
+        &snapshot,
+        catalog_resources.default_database_name,
+        catalog_resources.default_namespace_name,
+        "audit_log",
+    ) orelse return error.TestUnexpectedResult;
+    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAlloc(
+        alloc,
+        table,
+        "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1;",
+        catalog_resources.SqlCatalogSession.default(),
+    );
+    defer applied.deinit(alloc);
+    try service.upsertTable(applied.table);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
+    try service.runRound();
+
+    try std.testing.expect(applied.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
+    try std.testing.expectEqual(@as(usize, 1), service.run_round_count);
+    try std.testing.expectEqual(@as(usize, 2), service.jobs.items.len);
+
+    const first = service.jobs.items[0];
+    try std.testing.expectEqual(@as(u64, 88), first.table_id);
+    try std.testing.expectEqual(@as(u64, 9901), first.group_id);
+    try std.testing.expectEqualStrings("", first.start_row_key);
+    try std.testing.expectEqualStrings("n", first.end_row_key.?);
+    try std.testing.expectEqualStrings("rewrite", first.action);
+    try std.testing.expectEqualStrings("row_images", first.reason);
+    try std.testing.expectEqualStrings("amount", first.target_column);
+    const expression = first.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.add, expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression.operands.len);
+    try std.testing.expectEqualStrings("amount", expression.operands[0].field);
+    try std.testing.expectEqualStrings("1", expression.operands[1].value_json);
+
+    try std.testing.expectEqual(@as(u64, 9902), service.jobs.items[1].group_id);
+    try std.testing.expectEqualStrings("n", service.jobs.items[1].start_row_key);
     try std.testing.expect(service.jobs.items[1].end_row_key == null);
 }
 

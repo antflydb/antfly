@@ -44,6 +44,10 @@ const SqlPatternQuantifier = sql_adapter.SqlPatternQuantifier;
 const SqlRowClaimClause = sql_adapter.SqlRowClaimClause;
 const Token = sql_adapter.Token;
 const TokenKind = sql_adapter.TokenKind;
+const aggregateOpForName = sql_adapter.aggregateOpForName;
+const aggregateOpName = sql_adapter.aggregateOpName;
+const aggregateOutputColumnExists = sql_adapter.aggregateOutputColumnExists;
+const aggregateOutputFieldIsUnique = sql_adapter.aggregateOutputFieldIsUnique;
 const aggregateSpecsEquivalent = sql_adapter.aggregateSpecsEquivalent;
 const checkExpressionTypeForColumns = sql_adapter.checkExpressionTypeForColumns;
 const checkExpressionTypeOrderable = sql_adapter.checkExpressionTypeOrderable;
@@ -61,6 +65,7 @@ const cloneQueryRelationalCheckAlloc = sql_adapter.cloneQueryRelationalCheckAllo
 const cloneQueryRelationalChecksAlloc = sql_adapter.cloneQueryRelationalChecksAlloc;
 const cloneQueryRelationalChecksConcatAlloc = sql_adapter.cloneQueryRelationalChecksConcatAlloc;
 const cloneSelectOutputsAlloc = sql_adapter.cloneSelectOutputsAlloc;
+const columnsMatchPrimaryKey = sql_adapter.columnsMatchPrimaryKey;
 const cursorFetchDirectionFromSyntax = sql_adapter.cursorFetchDirectionFromSyntax;
 const cursorScrollModeFromSyntax = sql_adapter.cursorScrollModeFromSyntax;
 const ddlForeignKeyActionFromSyntax = sql_adapter.ddlForeignKeyActionFromSyntax;
@@ -111,9 +116,13 @@ const freeWindowSpec = sql_adapter.freeWindowSpec;
 const freeWindowSpecs = sql_adapter.freeWindowSpecs;
 const generatedUnaryTextColumnForField = sql_adapter.generatedUnaryTextColumnForField;
 const generatedColumnReferencesAny = sql_adapter.generatedColumnReferencesAny;
+const identifierContainsQualifier = sql_adapter.identifierContainsQualifier;
 const isCaseFoldExpressionOp = sql_adapter.isCaseFoldExpressionOp;
+const isSqlPercentileAggregateOp = sql_adapter.isSqlPercentileAggregateOp;
 const jsonValueIsValid = sql_adapter.jsonValueIsValid;
 const jsonSetTypedTransformPathAlloc = sql_adapter.jsonSetTypedTransformPathAlloc;
+const joinProjectionOutputIsUnique = sql_adapter.joinProjectionOutputIsUnique;
+const joinSideForQualifier = sql_adapter.joinSideForQualifier;
 const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
 const max_scalar_or_expanded_branches: usize = 32;
 const parseSqlTimestampLiteralNs = sql_adapter.parseSqlTimestampLiteralNs;
@@ -124,10 +133,12 @@ const defaultPrimaryKeyNameEquals = sql_adapter.defaultPrimaryKeyNameEquals;
 const findUniqueConstraintByColumns = sql_adapter.findUniqueConstraintByColumns;
 const findUniqueConstraintByExpression = sql_adapter.findUniqueConstraintByExpression;
 const findUniqueConstraintByName = sql_adapter.findUniqueConstraintByName;
+const findDdlColumn = sql_adapter.relationalColumnForDdl;
 const foreignKeyActionSupportsTemporalUpdate = sql_adapter.foreignKeyActionSupportsTemporalUpdate;
 const foreignKeyNameExists = sql_adapter.foreignKeyNameExists;
 const preparedStatementStatementKindFromSyntax = sql_adapter.preparedStatementStatementKindFromSyntax;
 const preparedStatementSubjectKindFromSyntax = sql_adapter.preparedStatementSubjectKindFromSyntax;
+const primaryKeyContains = sql_adapter.primaryKeyContains;
 const primaryKeyNameEquals = sql_adapter.primaryKeyNameEquals;
 const queryHasOnlySimpleIntersectExceptPredicateSurface = sql_adapter.queryHasOnlySimpleIntersectExceptPredicateSurface;
 const queryHasOnlySimpleUnionPredicateSurface = sql_adapter.queryHasOnlySimpleUnionPredicateSurface;
@@ -163,6 +174,7 @@ const selectorCompareJsonScalars = sql_adapter.selectorCompareJsonScalars;
 const selectorExpressionValueJsonAlloc = sql_adapter.selectorExpressionValueJsonAlloc;
 const selectorJsonValuesEqual = sql_adapter.selectorJsonValuesEqual;
 const sqlArrayItemValueMatches = sql_adapter.sqlArrayItemValueMatches;
+const sqlJsonNumberAsF64 = sql_adapter.sqlJsonNumberAsF64;
 const sqlScalarValueMatches = sql_adapter.sqlScalarValueMatches;
 const sqlStringIsJsonNumber = sql_adapter.sqlStringIsJsonNumber;
 const tokenKindIsJsonExtractOperator = sql_adapter.tokenKindIsJsonExtractOperator;
@@ -178,6 +190,7 @@ const uniquePredicateOpToken = sql_adapter.uniquePredicateOpToken;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
 const validateCheckExpressionForColumns = sql_adapter.validateCheckExpressionForColumns;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
+const validateAggregateGroupBy = sql_adapter.validateAggregateGroupBy;
 const validateDefaultValueForColumnAlloc = sql_adapter.validateDefaultValueForColumnAlloc;
 const validateGeneratedColumnForColumns = sql_adapter.validateGeneratedColumnForColumns;
 const validateForeignKeyForColumns = sql_adapter.validateForeignKeyForColumns;
@@ -35424,132 +35437,6 @@ fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
         if (stringSlicesContains(b, value)) return true;
     }
     return false;
-}
-
-fn columnsMatchPrimaryKey(primary_key: runtime_schema.PrimaryKey, columns: []const []const u8) bool {
-    return stringSlicesEqual(primary_key.columns, columns);
-}
-
-fn primaryKeyContains(primary_key: runtime_schema.PrimaryKey, field: []const u8) bool {
-    for (primary_key.columns) |column| {
-        if (std.mem.eql(u8, column, field)) return true;
-    }
-    return false;
-}
-
-fn aggregateOpForName(name: []const u8) ?db_mod.types.RelationalRowsAggregateOp {
-    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
-    if (std.ascii.eqlIgnoreCase(name, "sum")) return .sum;
-    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
-    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
-    if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
-    if (std.ascii.eqlIgnoreCase(name, "percentile_cont")) return .percentile_cont;
-    if (std.ascii.eqlIgnoreCase(name, "percentile_disc")) return .percentile_disc;
-    if (std.ascii.eqlIgnoreCase(name, "mode")) return .mode;
-    if (std.ascii.eqlIgnoreCase(name, "array_agg")) return .array_agg;
-    if (std.ascii.eqlIgnoreCase(name, "string_agg")) return .string_agg;
-    if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
-    if (std.ascii.eqlIgnoreCase(name, "bool_and")) return .bool_and;
-    return null;
-}
-
-fn aggregateOpName(op: db_mod.types.RelationalRowsAggregateOp) []const u8 {
-    return switch (op) {
-        .count => "count",
-        .sum => "sum",
-        .min => "min",
-        .max => "max",
-        .avg => "avg",
-        .percentile_cont => "percentile_cont",
-        .percentile_disc => "percentile_disc",
-        .mode => "mode",
-        .array_agg => "array_agg",
-        .string_agg => "string_agg",
-        .bool_or => "bool_or",
-        .bool_and => "bool_and",
-    };
-}
-
-fn isSqlPercentileAggregateOp(op: db_mod.types.RelationalRowsAggregateOp) bool {
-    return op == .percentile_cont or op == .percentile_disc;
-}
-
-fn sqlJsonNumberAsF64(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
-        else => null,
-    };
-}
-
-fn validateAggregateGroupBy(
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    group_by: []const []const u8,
-    parsed_group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-) !void {
-    if (!stringSlicesEqual(group_fields, group_by)) return error.UnsupportedSqlShape;
-    if (group_expressions.len != parsed_group_expressions.len) return error.UnsupportedSqlShape;
-    for (group_expressions, parsed_group_expressions) |selected, parsed| {
-        if (!sql_adapter.relationalRowsExpressionEqual(selected.expression, parsed.expression)) return error.UnsupportedSqlShape;
-    }
-}
-
-fn aggregateOutputFieldIsUnique(
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field: []const u8,
-) bool {
-    var matches: usize = 0;
-    for (group_fields) |group_field| {
-        if (std.mem.eql(u8, group_field, field)) matches += 1;
-    }
-    for (group_expressions) |projection| {
-        if (std.mem.eql(u8, projection.output, field)) matches += 1;
-    }
-    for (aggregations) |aggregation| {
-        if (std.mem.eql(u8, aggregation.name, field)) matches += 1;
-    }
-    return matches == 1;
-}
-
-fn aggregateOutputColumnExists(columns: []const runtime_schema.RelationalColumn, name: []const u8) bool {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.name, name)) return true;
-    }
-    return false;
-}
-
-fn joinSideForQualifier(
-    qualifier: []const u8,
-    left_alias: []const u8,
-    right_alias: []const u8,
-) !db_mod.types.RelationalRowsJoinProjectionSide {
-    if (std.mem.eql(u8, qualifier, left_alias)) return .left;
-    if (std.mem.eql(u8, qualifier, right_alias)) return .right;
-    return error.UnsupportedSqlShape;
-}
-
-fn joinProjectionOutputIsUnique(select: []const db_mod.types.RelationalRowsJoinProjection, field: []const u8) bool {
-    var matches: usize = 0;
-    for (select) |projection| {
-        if (std.mem.eql(u8, projection.output, field)) matches += 1;
-    }
-    return matches == 1;
-}
-
-fn identifierContainsQualifier(identifier: []const u8) bool {
-    const dot = std.mem.indexOfScalar(u8, identifier, '.') orelse return false;
-    return dot > 0 and dot + 1 < identifier.len;
-}
-
-fn findDdlColumn(columns: []const runtime_schema.RelationalColumn, name: []const u8) ?runtime_schema.RelationalColumn {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.name, name)) return column;
-    }
-    return null;
 }
 
 fn ddlRangeBoundTypeForName(name: []const u8) ?runtime_schema.AntflyType {
@@ -71949,29 +71836,26 @@ fn expectSqlAdapterEdgeCaseNoErrorExpected(expected_error: []const u8) !void {
 
 fn expectSqlAdapterEdgeCaseSelect(
     alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
     schema: runtime_schema.TableSchema,
-    params: []const SqlValue,
 ) !void {
-    var lowered = lowerSelectAlloc(alloc, sql, schema, params) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var lowered = lowerSelectAlloc(alloc, edge_case.sql, schema, edge_case.params) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
-    if (try sql_adapter.fixtureJsonOptionalStringField(object, "expected_table")) |table_name| {
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
+    if (edge_case.expected_table) |table_name| {
         try std.testing.expectEqualStrings(table_name, lowered.table_name);
     }
-    if (try sql_adapter.fixtureJsonOptionalUsize(object, "expected_predicates")) |predicates| {
+    if (edge_case.expected_predicates) |predicates| {
         try std.testing.expectEqual(predicates, lowered.query.predicates.len);
     }
-    if (try sql_adapter.fixtureJsonOptionalStringField(object, "expected_first_predicate_field")) |field| {
+    if (edge_case.expected_first_predicate_field) |field| {
         if (lowered.query.predicates.len == 0) return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(field, lowered.query.predicates[0].field);
     }
-    if (try sql_adapter.fixtureJsonOptionalStringField(object, "expected_first_predicate_value_json")) |value_json| {
+    if (edge_case.expected_first_predicate_value_json) |value_json| {
         if (lowered.query.predicates.len == 0) return error.TestUnexpectedResult;
         try std.testing.expectEqualStrings(value_json, lowered.query.predicates[0].value_json orelse return error.TestUnexpectedResult);
     }
@@ -71979,135 +71863,124 @@ fn expectSqlAdapterEdgeCaseSelect(
 
 fn expectSqlAdapterEdgeCaseUpdate(
     alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
     schema: runtime_schema.TableSchema,
-    params: []const SqlValue,
     resolver: relational_rows.UniqueSelectorResolver,
 ) !void {
-    var lowered = lowerUpdateAlloc(alloc, sql, schema, params, resolver) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var lowered = lowerUpdateAlloc(alloc, edge_case.sql, schema, edge_case.params, resolver) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
-    if (try sql_adapter.fixtureJsonOptionalStringField(object, "expected_table")) |table_name| {
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
+    if (edge_case.expected_table) |table_name| {
         try std.testing.expectEqualStrings(table_name, lowered.table_name);
     }
-    if (try sql_adapter.fixtureJsonOptionalU32(object, "expected_transformed")) |transformed| {
+    if (edge_case.expected_transformed) |transformed| {
         try std.testing.expectEqual(transformed, lowered.batch.transformed);
     }
 }
 
 fn expectSqlAdapterEdgeCaseDelete(
     alloc: std.mem.Allocator,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
     schema: runtime_schema.TableSchema,
-    params: []const SqlValue,
     resolver: relational_rows.UniqueSelectorResolver,
 ) !void {
-    var lowered = lowerDeleteAlloc(alloc, sql, schema, params, resolver) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var lowered = lowerDeleteAlloc(alloc, edge_case.sql, schema, edge_case.params, resolver) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
 }
 
 fn expectSqlAdapterEdgeCaseInsert(
     alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
     schema: runtime_schema.TableSchema,
-    params: []const SqlValue,
     resolver: relational_rows.UniqueSelectorResolver,
 ) !void {
-    var lowered = lowerInsertWithResolverAlloc(alloc, sql, schema, params, resolver) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var lowered = lowerInsertWithResolverAlloc(alloc, edge_case.sql, schema, edge_case.params, resolver) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
-    if (try sql_adapter.fixtureJsonOptionalStringField(object, "expected_table")) |table_name| {
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
+    if (edge_case.expected_table) |table_name| {
         try std.testing.expectEqualStrings(table_name, lowered.table_name);
     }
-    if (try sql_adapter.fixtureJsonOptionalU32(object, "expected_inserted")) |inserted| {
+    if (edge_case.expected_inserted) |inserted| {
         try std.testing.expectEqual(inserted, lowered.batch.inserted);
     }
 }
 
 fn expectSqlAdapterEdgeCaseDdl(
     alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
 ) !void {
-    var lowered = lowerDdlPlanAlloc(alloc, sql) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var lowered = lowerDdlPlanAlloc(alloc, edge_case.sql) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
-    const expected_tag = try sql_adapter.fixtureJsonOptionalString(object, "expected_ddl_tag", "");
-    if (std.mem.eql(u8, expected_tag, "create_table")) {
-        switch (lowered) {
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
+    if (edge_case.expected_ddl_tag) |tag| switch (tag) {
+        .create_table => switch (lowered) {
             .create_table => |plan| {
-                if (try sql_adapter.fixtureJsonOptionalStringField(object, "expected_table")) |table_name| {
-                    try std.testing.expectEqualStrings(table_name, plan.table_name);
-                }
-                if (try sql_adapter.fixtureJsonOptionalBool(object, "expected_if_not_exists")) |if_not_exists| {
-                    try std.testing.expectEqual(if_not_exists, plan.if_not_exists);
-                }
+                if (edge_case.expected_table) |table_name| try std.testing.expectEqualStrings(table_name, plan.table_name);
+                if (edge_case.expected_if_not_exists) |if_not_exists| try std.testing.expectEqual(if_not_exists, plan.if_not_exists);
             },
             else => return error.TestUnexpectedResult,
-        }
-    } else if (expected_tag.len != 0) {
-        return error.TestUnexpectedResult;
-    }
+        },
+    };
 }
 
 fn expectSqlAdapterEdgeCaseClassifyWrite(
     alloc: std.mem.Allocator,
-    object: std.json.ObjectMap,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
 ) !void {
-    var tokens = tokenizeAlloc(alloc, sql) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var tokens = tokenizeAlloc(alloc, edge_case.sql) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer freeTokens(alloc, &tokens);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
-    const expected_kind = try sql_adapter.fixtureJsonOptionalString(object, "expected_write_kind", "");
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
+    const expected_kind = edge_case.expected_write_kind orelse return error.TestUnexpectedResult;
     const actual = sql_adapter.classifyWriteStatement(tokens.items) orelse return error.TestUnexpectedResult;
-    if (std.mem.eql(u8, expected_kind, "update")) {
-        try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.update, actual);
-    } else if (std.mem.eql(u8, expected_kind, "delete")) {
-        try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.delete, actual);
-    } else if (std.mem.eql(u8, expected_kind, "insert")) {
-        try std.testing.expectEqual(sql_adapter.SqlWriteStatementKind.insert, actual);
-    } else {
-        return error.TestUnexpectedResult;
-    }
+    try std.testing.expectEqual(expected_kind, actual);
 }
 
 fn expectSqlAdapterEdgeCaseWritePlan(
     alloc: std.mem.Allocator,
-    sql: []const u8,
-    expected_error: []const u8,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
     schema: runtime_schema.TableSchema,
-    params: []const SqlValue,
     resolver: relational_rows.UniqueSelectorResolver,
 ) !void {
-    var lowered = lowerWritePlanAlloc(alloc, sql, schema, params, .{ .unique_resolver = resolver }) catch |err| {
-        try expectSqlAdapterEdgeCaseError(expected_error, err);
+    var lowered = lowerWritePlanAlloc(alloc, edge_case.sql, schema, edge_case.params, .{ .unique_resolver = resolver }) catch |err| {
+        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };
     defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(expected_error);
+    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
+}
+
+fn expectSqlAdapterEdgeCase(
+    alloc: std.mem.Allocator,
+    edge_case: sql_adapter.SqlAdapterEdgeCase,
+    schema: runtime_schema.TableSchema,
+    resolver: relational_rows.UniqueSelectorResolver,
+) !void {
+    errdefer std.debug.print("sql adapter edge case failed: {s}\n", .{edge_case.name});
+    switch (edge_case.action) {
+        .select => try expectSqlAdapterEdgeCaseSelect(alloc, edge_case, schema),
+        .update => try expectSqlAdapterEdgeCaseUpdate(alloc, edge_case, schema, resolver),
+        .delete => try expectSqlAdapterEdgeCaseDelete(alloc, edge_case, schema, resolver),
+        .insert => try expectSqlAdapterEdgeCaseInsert(alloc, edge_case, schema, resolver),
+        .ddl => try expectSqlAdapterEdgeCaseDdl(alloc, edge_case),
+        .classify_write => try expectSqlAdapterEdgeCaseClassifyWrite(alloc, edge_case),
+        .write_plan => try expectSqlAdapterEdgeCaseWritePlan(alloc, edge_case, schema, resolver),
+    }
 }
 
 test "postgres sql adapter rejects data-driven application edge cases explicitly" {
@@ -72124,57 +71997,10 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
     const fixture_json = @embedFile("fixtures/sql_api_adapter_edge_cases.json");
     var parsed_fixture = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed_fixture.deinit();
-    const root = try sql_adapter.fixtureJsonObject(parsed_fixture.value);
-    try sql_adapter.fixtureRequireOnlyKeys(root, &.{ "edge_case_format", "cases" });
-    if ((try sql_adapter.fixtureJsonOptionalU64(root, "edge_case_format", 0)) != 1) return error.TestUnexpectedResult;
-    const cases = switch (root.get("cases") orelse return error.TestUnexpectedResult) {
-        .array => |items| items.items,
-        else => return error.TestUnexpectedResult,
-    };
-    if (cases.len == 0) return error.TestUnexpectedResult;
+    const root = try sql_adapter.parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_fixture.value);
+    defer sql_adapter.freeSqlAdapterEdgeCaseRoot(alloc, root);
 
-    for (cases) |case_value| {
-        const object = try sql_adapter.fixtureJsonObject(case_value);
-        try sql_adapter.fixtureRequireOnlyKeys(object, &.{
-            "name",
-            "action",
-            "expected_error",
-            "expected_table",
-            "expected_predicates",
-            "expected_first_predicate_field",
-            "expected_first_predicate_value_json",
-            "expected_transformed",
-            "expected_write_kind",
-            "expected_inserted",
-            "expected_ddl_tag",
-            "expected_if_not_exists",
-            "params",
-            "sql",
-        });
-        const name = try sql_adapter.fixtureJsonString(object.get("name") orelse return error.TestUnexpectedResult);
-        errdefer std.debug.print("sql adapter edge case failed: {s}\n", .{name});
-        const action = try sql_adapter.fixtureJsonString(object.get("action") orelse return error.TestUnexpectedResult);
-        const sql = try sql_adapter.fixtureJsonString(object.get("sql") orelse return error.TestUnexpectedResult);
-        const expected_error = try sql_adapter.fixtureJsonOptionalString(object, "expected_error", "");
-        const params = try sql_adapter.parseFixtureSqlValuesAlloc(alloc, object);
-        defer if (object.get("params") != null) alloc.free(params);
-
-        if (std.mem.eql(u8, action, "select")) {
-            try expectSqlAdapterEdgeCaseSelect(alloc, object, sql, expected_error, schema, params);
-        } else if (std.mem.eql(u8, action, "update")) {
-            try expectSqlAdapterEdgeCaseUpdate(alloc, object, sql, expected_error, schema, params, resolver_ctx.resolver());
-        } else if (std.mem.eql(u8, action, "delete")) {
-            try expectSqlAdapterEdgeCaseDelete(alloc, sql, expected_error, schema, params, resolver_ctx.resolver());
-        } else if (std.mem.eql(u8, action, "insert")) {
-            try expectSqlAdapterEdgeCaseInsert(alloc, object, sql, expected_error, schema, params, resolver_ctx.resolver());
-        } else if (std.mem.eql(u8, action, "ddl")) {
-            try expectSqlAdapterEdgeCaseDdl(alloc, object, sql, expected_error);
-        } else if (std.mem.eql(u8, action, "classify_write")) {
-            try expectSqlAdapterEdgeCaseClassifyWrite(alloc, object, sql, expected_error);
-        } else if (std.mem.eql(u8, action, "write_plan")) {
-            try expectSqlAdapterEdgeCaseWritePlan(alloc, sql, expected_error, schema, params, resolver_ctx.resolver());
-        } else {
-            return error.TestUnexpectedResult;
-        }
+    for (root.cases) |edge_case| {
+        try expectSqlAdapterEdgeCase(alloc, edge_case, schema, resolver_ctx.resolver());
     }
 }
