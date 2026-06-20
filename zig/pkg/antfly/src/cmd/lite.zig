@@ -154,9 +154,7 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     var lite = try LiteDb.open(allocator, path, .status_only);
     defer lite.close();
 
-    const stats_value = try lite.db.stats(allocator);
-    defer db_types.freeDBStats(allocator, stats_value);
-    const json = try std.json.Stringify.valueAlloc(allocator, stats_value, .{});
+    const json = try statusJson(allocator, &lite.db);
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
@@ -762,6 +760,25 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     return try allocator.dupe(u8, response.json);
 }
 
+fn statusJson(allocator: Allocator, db: *db_mod.DB) ![]u8 {
+    const stats_value = try db.stats(allocator);
+    defer db_types.freeDBStats(allocator, stats_value);
+
+    const stats_json = try std.json.Stringify.valueAlloc(allocator, stats_value, .{});
+    defer allocator.free(stats_json);
+    const pending_json = try std.json.Stringify.valueAlloc(allocator, db.maintenanceDriver().pendingWorkStats(), .{});
+    defer allocator.free(pending_json);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\"stats\":");
+    try out.appendSlice(allocator, stats_json);
+    try out.appendSlice(allocator, ",\"pending_work\":");
+    try out.appendSlice(allocator, pending_json);
+    try out.append(allocator, '}');
+    return try out.toOwnedSlice(allocator);
+}
+
 fn parseLookupRequest(alloc: Allocator, body: []const u8) !OwnedLookupRequest {
     if (body.len == 0) return .{};
 
@@ -1120,6 +1137,39 @@ test "lite restore source can be an aflite database" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
     }
+}
+
+test "lite status json includes pending work" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-pending.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var lite = try LiteDb.open(allocator, path, .writer);
+    defer lite.close();
+
+    const index_json =
+        \\{"name":"full_text_index_v0","kind":"full_text","config_json":"{}"}
+    ;
+    var parsed = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+    try lite.db.addIndex(parsed.value);
+
+    const batch_response = try batchJson(allocator, &lite.db, "{\"inserts\":{\"doc:status-pending\":{\"body\":\"pending work visible\"}}}");
+    defer allocator.free(batch_response);
+    try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":1") != null);
+
+    const json = try statusJson(allocator, &lite.db);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"pending_work\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"has_async_indexes\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
 }
 
 test "lite snapshot copies stable aflite prefix without source tail" {
