@@ -56,6 +56,7 @@ const Handle = struct {
     db: db_mod.DB,
     readable_lease_hook: ?ReadableLeaseHook = null,
     owned_lite_backend: ?lite_backend.Handle = null,
+    lite_profile: ?lite_backend.Profile = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -1566,7 +1567,12 @@ pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
     closeHandle(handle);
 }
 
-fn openLiteHandle(path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, out_handle: *?*anyopaque) capi.ErrorCode {
+fn openLiteHandle(
+    path: []const u8,
+    open_mode: db_mod.OpenOptions.OpenMode,
+    profile: lite_backend.Profile,
+    out_handle: *?*anyopaque,
+) capi.ErrorCode {
     const alloc = std.heap.c_allocator;
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
@@ -1580,6 +1586,11 @@ fn openLiteHandle(path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, out_
         .open_mode = open_mode,
         .external_derived_checkpoints = false,
     };
+    if (profile == .hosted) {
+        opts.executor = .{ .backend = .manual };
+        opts.ttl_cleanup = .{ .enabled = false };
+        opts.transaction_recovery = .{ .enabled = false };
+    }
     backend.configureDbOpenOptions(&opts) catch |err| return capi.mapError(err);
 
     const db = db_mod.DB.open(alloc, path, opts) catch |err| return capi.mapError(err);
@@ -1587,23 +1598,32 @@ fn openLiteHandle(path: []const u8, open_mode: db_mod.OpenOptions.OpenMode, out_
         .alloc = alloc,
         .db = db,
         .owned_lite_backend = backend,
+        .lite_profile = profile,
     };
     out_handle.* = handle;
     return .ok;
 }
 
 pub export fn antfly_lite_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
-    return openLiteHandle(std.mem.span(path), .writer, out_handle);
+    return openLiteHandle(std.mem.span(path), .writer, .native, out_handle);
+}
+
+pub export fn antfly_lite_open_hosted(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+    return openLiteHandle(std.mem.span(path), .writer, .hosted, out_handle);
 }
 
 pub export fn antfly_lite_open_readonly(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
-    return openLiteHandle(std.mem.span(path), .query_readonly, out_handle);
+    return openLiteHandle(std.mem.span(path), .query_readonly, .native, out_handle);
+}
+
+pub export fn antfly_lite_open_status_only(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+    return openLiteHandle(std.mem.span(path), .status_only, .native, out_handle);
 }
 
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: *capi.Buffer) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    out_buf.* = stringifyJson(lite_backend.capabilitiesForProfile(.native)) catch return .internal;
+    out_buf.* = stringifyJson(lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native)) catch return .internal;
     return .ok;
 }
 
@@ -5912,6 +5932,53 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(dst_path, &readonly_handle));
     defer antfly_db_close(readonly_handle);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(readonly_handle, &writes_a, 1, null, 0, 3_000, 0));
+}
+
+test "capi lite exposes hosted and status-only profiles" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-lite-profiles");
+    defer alloc.free(path);
+    cleanupTestFile(path);
+    defer cleanupTestFile(path);
+
+    var hosted_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_hosted(path, &hosted_handle));
+
+    var hosted_caps: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(hosted_handle, &hosted_caps));
+    defer antfly_db_buffer_free(hosted_caps.ptr, hosted_caps.len);
+    const hosted_caps_json = hosted_caps.ptr.?[0..hosted_caps.len];
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"hosted_profile\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"manual_maintenance\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"background_enrichment_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"ttl_cleanup_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_caps_json, "\"transaction_recovery_runtime\":false") != null);
+
+    const writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-lite-profile", .len = "doc:capi-lite-profile".len },
+        .value = .{ .ptr = "{\"title\":\"hosted\"}", .len = "{\"title\":\"hosted\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(hosted_handle, &writes, writes.len, null, 0, 1_000, 0));
+    antfly_db_close(hosted_handle);
+    hosted_handle = null;
+
+    var status_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_status_only(path, &status_handle));
+    defer antfly_db_close(status_handle);
+
+    var status_caps: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(status_handle, &status_caps));
+    defer antfly_db_buffer_free(status_caps.ptr, status_caps.len);
+    const status_caps_json = status_caps.ptr.?[0..status_caps.len];
+    try std.testing.expect(std.mem.indexOf(u8, status_caps_json, "\"hosted_profile\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_caps_json, "\"manual_maintenance\":false") != null);
+
+    var stats: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(status_handle, &stats));
+    defer antfly_db_buffer_free(stats.ptr, stats.len);
+    try std.testing.expect(std.mem.indexOf(u8, stats.ptr.?[0..stats.len], "\"doc_count\":") != null);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(status_handle, &writes, writes.len, null, 0, 2_000, 0));
 }
 
 test "capi execute graph queries honors identity read generation" {
