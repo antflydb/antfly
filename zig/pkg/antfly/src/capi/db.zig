@@ -30,6 +30,7 @@ const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
 const lite_backend = antfly.lite.backend;
+const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const Allocator = std.mem.Allocator;
 
@@ -1813,7 +1814,9 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
-    portable_backup.importPortable(handle.alloc, handle.db.core.store, backup.bytes()) catch |err| return capi.mapError(err);
+    const bytes = backup.bytes();
+    portable_backup.validatePortable(handle.alloc, bytes) catch |err| return capi.mapError(err);
+    portable_backup.importPortable(handle.alloc, handle.db.core.store, bytes) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -5991,6 +5994,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(src_path);
     const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
     defer alloc.free(dst_path);
+    const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
+    defer alloc.free(bad_dst_path);
     const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
     const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
@@ -6000,6 +6005,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(short_lite_path);
     cleanupTestFile(src_path);
     cleanupTestFile(dst_path);
+    cleanupTestFile(bad_dst_path);
     cleanupTestFile(snapshot_path);
     cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestDir(plain_path);
@@ -6007,6 +6013,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(short_lite_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(dst_path);
+    defer cleanupTestFile(bad_dst_path);
     defer cleanupTestFile(snapshot_path);
     defer cleanupTestFile(invalid_snapshot_path);
 
@@ -6300,6 +6307,43 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .ptr = null,
         .len = 0,
     }));
+
+    var bad_dst_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(bad_dst_path, &bad_dst_handle));
+    defer antfly_db_close(bad_dst_handle);
+
+    const target_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-import-target", .len = "doc:capi-import-target".len },
+        .value = .{ .ptr = "{\"title\":\"target survives bad capi import\"}", .len = "{\"title\":\"target survives bad capi import\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(bad_dst_handle, &target_writes, target_writes.len, null, 0, 5_000, 0));
+
+    var malformed = std.ArrayList(u8).empty;
+    defer malformed.deinit(alloc);
+    try backup_codec.writeHeader(&malformed, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+    const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
+    try backup_codec.writeBlock(&malformed, alloc, .document_batch, &malformed_doc_payload);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(bad_dst_handle, .{
+        .ptr = malformed.items.ptr,
+        .len = malformed.items.len,
+    }));
+
+    var target_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(bad_dst_handle, .{
+        .ptr = "doc:capi-import-target",
+        .len = "doc:capi-import-target".len,
+    }, &target_lookup));
+    defer antfly_db_buffer_free(target_lookup.ptr, target_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, target_lookup.ptr.?[0..target_lookup.len], "\"target survives bad capi import\"") != null);
+
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import_backup(dst_handle, .{
         .ptr = backup.ptr,
         .len = backup.len,
