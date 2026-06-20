@@ -478,6 +478,7 @@ from .restore_table_response_202 import RestoreTableResponse202
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
+from .retrieval_step_config import RetrievalStepConfig
 from .retrieval_strategy import RetrievalStrategy
 from .retry_config import RetryConfig
 from .role_assignment import RoleAssignment
@@ -1058,6 +1059,7 @@ __all__ = (
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",
+    "RetrievalStepConfig",
     "RetrievalStrategy",
     "RetryConfig",
     "RoleAssignment",

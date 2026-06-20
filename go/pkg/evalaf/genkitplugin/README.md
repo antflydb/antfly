@@ -290,7 +290,7 @@ func main() {
 }
 ```
 
-### Answer Agent Evaluation
+### Retrieval Agent Evaluation
 
 ```go
 metrics := []genkitplugin.MetricConfig{
