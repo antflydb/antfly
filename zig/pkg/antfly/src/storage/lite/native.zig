@@ -201,6 +201,7 @@ pub const NativeFile = struct {
     io_impl: std.Io.Threaded,
     path: []u8,
     file: std.Io.File,
+    writer_lock_file: ?std.Io.File = null,
     header: Header,
     read_only: bool = false,
 
@@ -212,7 +213,13 @@ pub const NativeFile = struct {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        const file = try openLockedFile(io, path, if (read_only) .reader else .writer);
+        var writer_lock_file: ?std.Io.File = null;
+        if (!read_only) {
+            writer_lock_file = try acquireWriterLock(allocator, io, path);
+        }
+        errdefer if (writer_lock_file) |lock_file| lock_file.close(io);
+
+        const file = try openDataFile(io, path, if (read_only) .reader else .writer);
         errdefer file.close(io);
 
         var header_bytes: [header_size]u8 = undefined;
@@ -228,6 +235,7 @@ pub const NativeFile = struct {
             .io_impl = io_impl,
             .path = owned_path,
             .file = file,
+            .writer_lock_file = writer_lock_file,
             .header = header,
             .read_only = read_only,
         };
@@ -238,12 +246,36 @@ pub const NativeFile = struct {
         errdefer io_impl.deinit();
         const io = io_impl.io();
 
-        try createFile(io, path, .writer);
-        io_impl.deinit();
-        return try open(allocator, path, false);
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+
+        var writer_lock_file = try acquireWriterLock(allocator, io, path);
+        errdefer writer_lock_file.close(io);
+
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, .{});
+
+        const file = try createDataFile(io, path, true);
+        errdefer file.close(io);
+
+        try file.writePositionalAll(io, &encoded, 0);
+        try file.sync(io);
+
+        return .{
+            .allocator = allocator,
+            .io_impl = io_impl,
+            .path = owned_path,
+            .file = file,
+            .writer_lock_file = writer_lock_file,
+            .header = .{},
+            .read_only = false,
+        };
     }
 
     pub fn close(self: *NativeFile) void {
+        if (self.writer_lock_file) |lock_file| {
+            lock_file.close(self.io_impl.io());
+        }
         self.file.close(self.io_impl.io());
         self.allocator.free(self.path);
         self.io_impl.deinit();
@@ -644,6 +676,9 @@ pub const NativeFile = struct {
 
     pub fn vacuum(self: *NativeFile) !VacuumReport {
         if (self.read_only) return error.ReadOnly;
+
+        var data_lock_file = try acquireDataRewriteLock(self.io_impl.io(), self.path);
+        defer data_lock_file.close(self.io_impl.io());
 
         const before_size = (try self.file.stat(self.io_impl.io())).size;
         const previous = self.activeCheckpoint();
@@ -1283,24 +1318,23 @@ fn rewriteOpenFile(file: std.Io.File, io: std.Io, contents: []const u8) !void {
 }
 
 pub fn create(io: std.Io, path: []const u8) !void {
-    try createFile(io, path, .writer);
-}
+    var writer_lock_file = try acquireWriterLock(std.heap.page_allocator, io, path);
+    defer writer_lock_file.close(io);
 
-fn createFile(io: std.Io, path: []const u8, lock_mode: LockMode) !void {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
 
-    var file = try createLockedFile(io, path, lock_mode, true);
+    var file = try createDataFile(io, path, true);
     defer file.close(io);
 
     try file.writePositionalAll(io, &encoded, 0);
     try file.sync(io);
 }
 
-fn openLockedFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
+fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
     return std.Io.Dir.cwd().openFile(io, path, .{
         .mode = if (lock_mode == .reader) .read_only else .read_write,
-        .lock = fileLockForMode(lock_mode),
+        .lock = if (lock_mode == .reader) .shared else .none,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
         error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
@@ -1310,16 +1344,38 @@ fn openLockedFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.Fil
     };
 }
 
-fn createLockedFile(io: std.Io, path: []const u8, lock_mode: LockMode, truncate: bool) !std.Io.File {
+fn createDataFile(io: std.Io, path: []const u8, truncate: bool) !std.Io.File {
     return std.Io.Dir.cwd().createFile(io, path, .{
         .read = true,
         .truncate = truncate,
-        .lock = fileLockForMode(lock_mode),
+    });
+}
+
+fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !std.Io.File {
+    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
+    defer allocator.free(lock_path);
+    return std.Io.Dir.cwd().createFile(io, lock_path, .{
+        .read = true,
+        .truncate = false,
+        .lock = .exclusive,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileLocksUnsupported => try std.Io.Dir.cwd().createFile(io, path, .{
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().createFile(io, lock_path, .{
             .read = true,
-            .truncate = truncate,
+            .truncate = false,
+        }),
+        else => return err,
+    };
+}
+
+fn acquireDataRewriteLock(io: std.Io, path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileLocksUnsupported => try std.Io.Dir.cwd().openFile(io, path, .{
+            .mode = .read_write,
         }),
         else => return err,
     };
@@ -1357,15 +1413,8 @@ fn deleteFilePath(io: std.Io, path: []const u8) !void {
     }
 }
 
-fn fileLockForMode(mode: LockMode) std.Io.File.Lock {
-    return switch (mode) {
-        .writer => .exclusive,
-        .reader => .shared,
-    };
-}
-
 pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
-    var file = try openLockedFile(io, path, .reader);
+    var file = try openDataFile(io, path, .reader);
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
@@ -1378,7 +1427,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var file = try openLockedFile(io, path, .reader);
+    var file = try openDataFile(io, path, .reader);
     defer file.close(io);
 
     const file_size = (try file.stat(io)).size;
@@ -2164,7 +2213,7 @@ test "lite native file permits concurrent readers" {
     try std.testing.expectEqual(@as(u64, 3), reader_b.activeCheckpoint().page_count);
 }
 
-test "lite native file active writer blocks other opens" {
+test "lite native file active writer permits readers but blocks second writer" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -2175,10 +2224,19 @@ test "lite native file active writer blocks other opens" {
 
     var writer = try NativeFile.create(allocator, path);
     defer writer.close();
+    _ = try writer.allocatePage("committed before reader");
 
     try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, path, false));
-    try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, path, true));
-    try std.testing.expectError(error.WouldBlock, inspect(allocator, std.testing.io, path));
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    try std.testing.expectEqual(@as(u64, 3), reader.activeCheckpoint().page_count);
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
+
+    try std.testing.expectError(error.WouldBlock, writer.vacuum());
 }
 
 test "lite native file detects corrupted page payload" {
