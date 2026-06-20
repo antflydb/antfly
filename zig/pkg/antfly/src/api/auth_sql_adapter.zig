@@ -382,6 +382,9 @@ fn validateRowSecurityPredicateForSchema(
         .conjunction => |conjunction| {
             for (conjunction.predicates) |term| try validateRowSecurityPredicateForSchema(alloc, schema, term);
         },
+        .disjunction => |disjunction| {
+            for (disjunction.predicates) |term| try validateRowSecurityPredicateForSchema(alloc, schema, term);
+        },
     }
 }
 
@@ -559,7 +562,8 @@ fn rowSecurityFilterJsonAlloc(
         .current_setting_equals => |current_setting| try currentSettingRowFilterJsonAlloc(alloc, current_setting),
         .literal_equals => |literal| try literalRowFilterJsonAlloc(alloc, literal),
         .expression => |expression| try expressionRowFilterJsonAlloc(alloc, expression),
-        .conjunction => |conjunction| try conjunctionRowFilterJsonAlloc(alloc, conjunction),
+        .conjunction => |conjunction| try boolRowFilterJsonAlloc(alloc, "conjuncts", conjunction),
+        .disjunction => |disjunction| try boolRowFilterJsonAlloc(alloc, "disjuncts", disjunction),
     };
 }
 
@@ -599,13 +603,16 @@ fn expressionRowFilterJsonAlloc(
     return try out.toOwnedSlice();
 }
 
-fn conjunctionRowFilterJsonAlloc(
+fn boolRowFilterJsonAlloc(
     alloc: std.mem.Allocator,
+    key: []const u8,
     predicate: relational_sql.RowSecurityConjunctionPredicate,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"conjuncts\":[");
+    try out.appendSlice(alloc, "{\"");
+    try out.appendSlice(alloc, key);
+    try out.appendSlice(alloc, "\":[");
     for (predicate.predicates, 0..) |term, i| {
         const term_json = try rowSecurityFilterJsonAlloc(alloc, term);
         defer alloc.free(term_json);
@@ -1121,6 +1128,13 @@ test "sql auth adapter applies row security policies through user manager" {
     const stored_compound = try manager.getSqlRowSecurityPolicy("usage_records_compound_policy", usage_records_resource);
     defer alloc.free(stored_compound);
     try std.testing.expectEqualStrings("{\"conjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_compound);
+
+    var disjunction_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');")).?;
+    defer disjunction_policy.deinit(alloc);
+    const stored_disjunction = try manager.getSqlRowSecurityPolicy("usage_records_or_policy", usage_records_resource);
+    defer alloc.free(stored_disjunction);
+    try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_disjunction);
+    try std.testing.expectError(error.UnsupportedSqlShape, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');"));
 
     var altered_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_literal_policy ON usage_records USING (status = 'archived');")).?;
     defer altered_policy.deinit(alloc);

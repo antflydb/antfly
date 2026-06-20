@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "dd8733655dc73b4dafc85901c6c61bf0478074128a4c5d75edc77d1cdc63c64f",
-  "source_entry_count": 1001,
-  "entry_count": 1001,
+  "source_sha256": "0c3fb3138eb7f480552232ab588dc22f389e755f3b5aa727d33e10854c0848b7",
+  "source_entry_count": 1004,
+  "entry_count": 1004,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -3499,6 +3499,17 @@
       "sql": "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active')"
     },
     {
+      "name": "row security disjunction policy catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_row_policy",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:create_row_policy:policy=usage_records_or_policy:table=usage_records:kind=or:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=literal_eq:field=status:value_json_hex=2261637469766522",
+      "sql": "CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active')"
+    },
+    {
       "name": "row security alter policy catalog ddl",
       "family": "ddl",
       "summary": {
@@ -4244,11 +4255,22 @@
       "sql": "CREATE FUNCTION normalize_named_status(status_text text) RETURNS text LANGUAGE sql AS $$SELECT lower(status_text)$$"
     },
     {
-      "name": "unsupported create function body",
+      "name": "create trigger return new function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_body",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new",
+      "sql": "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$"
+    },
+    {
+      "name": "unsupported create function old-row body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$"
+      "sql": "CREATE FUNCTION audit_old_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$"
     },
     {
       "name": "unsupported create function routine option",
@@ -4291,11 +4313,22 @@
       "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql"
     },
     {
-      "name": "unsupported create procedure body",
+      "name": "create noop procedure body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_procedure",
+        "table_name": "rotate_usage",
+        "operations": 0
+      },
+      "plan": "ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop",
+      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS $$BEGIN NULL; END$$"
+    },
+    {
+      "name": "unsupported create procedure statement body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS $$BEGIN NULL; END$$"
+      "sql": "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$"
     },
     {
       "name": "drop procedure catalog ddl",

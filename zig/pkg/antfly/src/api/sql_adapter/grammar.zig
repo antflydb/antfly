@@ -1620,6 +1620,8 @@ fn parseRowSecurityPolicyPredicateAlloc(
     tokens: []const Token,
     pos: *usize,
 ) !ddl_plan.RowSecurityPolicyPredicate {
+    const PredicateBoolOp = enum { none, and_op, or_op };
+
     try cursor.expectToken(.lparen);
     var predicates = std.ArrayList(ddl_plan.RowSecurityPolicyPredicate).empty;
     var predicates_transferred = false;
@@ -1628,9 +1630,22 @@ fn parseRowSecurityPolicyPredicateAlloc(
         predicates.deinit(alloc);
     };
 
+    var bool_op: PredicateBoolOp = .none;
     try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
-    while (cursor.matchKeyword("and")) {
-        try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
+    while (true) {
+        if (cursor.matchKeyword("and")) {
+            if (bool_op == .or_op) return error.UnsupportedSqlShape;
+            bool_op = .and_op;
+            try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
+            continue;
+        }
+        if (cursor.matchKeyword("or")) {
+            if (bool_op == .and_op) return error.UnsupportedSqlShape;
+            bool_op = .or_op;
+            try appendRowSecurityPolicyPredicateAtomAlloc(alloc, &predicates, cursor, tokens, pos);
+            continue;
+        }
+        break;
     }
     try cursor.expectToken(.rparen);
 
@@ -1643,7 +1658,11 @@ fn parseRowSecurityPolicyPredicateAlloc(
 
     const owned = try predicates.toOwnedSlice(alloc);
     predicates_transferred = true;
-    return .{ .conjunction = .{ .predicates = owned } };
+    return switch (bool_op) {
+        .and_op => .{ .conjunction = .{ .predicates = owned } },
+        .or_op => .{ .disjunction = .{ .predicates = owned } },
+        .none => unreachable,
+    };
 }
 
 fn appendRowSecurityPolicyPredicateAtomAlloc(
@@ -2934,7 +2953,7 @@ pub fn parseCreateRoutineCatalogTailAlloc(
         if (cursor.matchKeyword("as")) {
             if (body != null) return error.UnsupportedSqlShape;
             const body_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
-            body = try parseSqlRoutineBodyPlanAlloc(alloc, language, signature.argument_count, signature.argument_names, body_token.text);
+            body = try parseRoutineBodyPlanAlloc(alloc, kind, language, returns_type, signature.argument_count, signature.argument_names, body_token.text);
             continue;
         }
         return error.UnsupportedSqlShape;
@@ -2973,14 +2992,23 @@ pub fn parseCreateRoutineCatalogTailAlloc(
     return out;
 }
 
-fn parseSqlRoutineBodyPlanAlloc(
+fn parseRoutineBodyPlanAlloc(
     alloc: std.mem.Allocator,
+    kind: RoutineKindSyntax,
     language: ?[]const u8,
+    returns_type: ?[]const u8,
     argument_count: usize,
     argument_names: []const []const u8,
     body_text: []const u8,
 ) !ddl_plan.RoutineBodyPlan {
     const lang = language orelse return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(lang, "plpgsql")) {
+        return switch (kind) {
+            .function => try parsePlpgsqlTriggerRoutineBodyPlanAlloc(alloc, returns_type, argument_count, body_text),
+            .procedure => try parsePlpgsqlProcedureRoutineBodyPlanAlloc(alloc, returns_type, argument_count, body_text),
+        };
+    }
+    if (kind != .function) return error.UnsupportedSqlShape;
     if (!std.ascii.eqlIgnoreCase(lang, "sql")) return error.UnsupportedSqlShape;
     const trimmed = std.mem.trim(u8, body_text, " \t\r\n");
     if (!std.ascii.startsWithIgnoreCase(trimmed, "select ")) return error.UnsupportedSqlShape;
@@ -2996,6 +3024,56 @@ fn parseSqlRoutineBodyPlanAlloc(
         .kind = .sql_expression,
         .hook = .expression,
         .expression = body_expression,
+    };
+}
+
+fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
+    alloc: std.mem.Allocator,
+    returns_type: ?[]const u8,
+    argument_count: usize,
+    body_text: []const u8,
+) !ddl_plan.RoutineBodyPlan {
+    if (argument_count != 0) return error.UnsupportedSqlShape;
+    const returns = returns_type orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(returns, "trigger")) return error.UnsupportedSqlShape;
+    var body_tokens = try lexer.tokenizeAlloc(alloc, body_text);
+    defer lexer.freeTokens(alloc, &body_tokens);
+    var pos: usize = 0;
+    const cursor = parser.Cursor.init(body_tokens.items, &pos);
+    try cursor.expectKeyword("begin");
+    try cursor.expectKeyword("return");
+    try cursor.expectKeyword("new");
+    try cursor.expectToken(.semicolon);
+    try cursor.expectKeyword("end");
+    _ = cursor.matchToken(.semicolon);
+    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+    return .{
+        .kind = .plpgsql_trigger,
+        .hook = .trigger_return_new,
+    };
+}
+
+fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
+    alloc: std.mem.Allocator,
+    returns_type: ?[]const u8,
+    argument_count: usize,
+    body_text: []const u8,
+) !ddl_plan.RoutineBodyPlan {
+    if (returns_type != null) return error.UnsupportedSqlShape;
+    if (argument_count != 0) return error.UnsupportedSqlShape;
+    var body_tokens = try lexer.tokenizeAlloc(alloc, body_text);
+    defer lexer.freeTokens(alloc, &body_tokens);
+    var pos: usize = 0;
+    const cursor = parser.Cursor.init(body_tokens.items, &pos);
+    try cursor.expectKeyword("begin");
+    try cursor.expectKeyword("null");
+    try cursor.expectToken(.semicolon);
+    try cursor.expectKeyword("end");
+    _ = cursor.matchToken(.semicolon);
+    if (!cursor.atEnd()) return error.UnsupportedSqlShape;
+    return .{
+        .kind = .plpgsql_procedure,
+        .hook = .procedure_noop,
     };
 }
 
@@ -7836,6 +7914,35 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqualStrings("status", compound_second.field);
     try std.testing.expectEqualStrings("\"active\"", compound_second.value_json);
 
+    var disjunction_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');");
+    defer lexer.freeTokens(alloc, &disjunction_tokens);
+    var disjunction_pos: usize = 0;
+    var disjunction = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, disjunction_tokens.items, &disjunction_pos);
+    defer disjunction.deinit(alloc);
+    try std.testing.expectEqual(disjunction_tokens.items.len, disjunction_pos);
+    const disjunction_predicate = switch (disjunction.predicate) {
+        .disjunction => |or_predicate| or_predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), disjunction_predicate.predicates.len);
+    const disjunction_first = switch (disjunction_predicate.predicates[0]) {
+        .literal_equals => |predicate_value| predicate_value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("tenant_id", disjunction_first.field);
+    try std.testing.expectEqualStrings("\"tenant-a\"", disjunction_first.value_json);
+    const disjunction_second = switch (disjunction_predicate.predicates[1]) {
+        .literal_equals => |predicate_value| predicate_value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", disjunction_second.field);
+    try std.testing.expectEqualStrings("\"active\"", disjunction_second.value_json);
+
+    var mixed_boolean_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');");
+    defer lexer.freeTokens(alloc, &mixed_boolean_tokens);
+    var mixed_boolean_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, mixed_boolean_tokens.items, &mixed_boolean_pos));
+
     var drop_tokens = try lexer.tokenizeAlloc(alloc, "POLICY IF EXISTS tenant_policy ON public.usage_records CASCADE;");
     defer lexer.freeTokens(alloc, &drop_tokens);
     var drop_pos: usize = 0;
@@ -8495,8 +8602,8 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(second_arg_body_tokens.items.len, second_arg_body_pos);
     try std.testing.expectEqual(@as(usize, 2), second_arg_body.argument_count);
     try std.testing.expectEqual(ddl_plan.RoutineBodyKind.sql_expression, second_arg_body.body.?.kind);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.upper, second_arg_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("arg2", second_arg_body.body.?.expression.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.upper, second_arg_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("arg2", second_arg_body.body.?.expression.?.operands[0].field);
 
     var cast_arg_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_dash(text) RETURNS text LANGUAGE sql AS 'SELECT replace($1::text, ''-'', ''_'')';");
     defer lexer.freeTokens(alloc, &cast_arg_body_tokens);
@@ -8504,11 +8611,11 @@ test "sql adapter grammar parses routine catalog tails" {
     var cast_arg_body = try parseCreateRoutineCatalogTailAlloc(alloc, cast_arg_body_tokens.items, &cast_arg_body_pos);
     defer cast_arg_body.deinit(alloc);
     try std.testing.expectEqual(cast_arg_body_tokens.items.len, cast_arg_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.replace, cast_arg_body.body.?.expression.kind);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.cast, cast_arg_body.body.?.expression.operands[0].kind);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionCastType.text, cast_arg_body.body.?.expression.operands[0].cast_type.?);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionFieldSource.source, cast_arg_body.body.?.expression.operands[0].operands[0].field_source);
-    try std.testing.expectEqualStrings("arg1", cast_arg_body.body.?.expression.operands[0].operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.replace, cast_arg_body.body.?.expression.?.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.cast, cast_arg_body.body.?.expression.?.operands[0].kind);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionCastType.text, cast_arg_body.body.?.expression.?.operands[0].cast_type.?);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionFieldSource.source, cast_arg_body.body.?.expression.?.operands[0].operands[0].field_source);
+    try std.testing.expectEqualStrings("arg1", cast_arg_body.body.?.expression.?.operands[0].operands[0].field);
 
     var regexp_arg_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION redact_digits(text) RETURNS text LANGUAGE sql AS 'SELECT regexp_replace($1, ''[0-9]'', ''#'', ''g'')';");
     defer lexer.freeTokens(alloc, &regexp_arg_body_tokens);
@@ -8516,8 +8623,8 @@ test "sql adapter grammar parses routine catalog tails" {
     var regexp_arg_body = try parseCreateRoutineCatalogTailAlloc(alloc, regexp_arg_body_tokens.items, &regexp_arg_body_pos);
     defer regexp_arg_body.deinit(alloc);
     try std.testing.expectEqual(regexp_arg_body_tokens.items.len, regexp_arg_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.regexp_replace, regexp_arg_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("arg1", regexp_arg_body.body.?.expression.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.regexp_replace, regexp_arg_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("arg1", regexp_arg_body.body.?.expression.?.operands[0].field);
 
     var missing_arg_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION missing_arg(text) RETURNS text LANGUAGE sql AS 'SELECT lower($2)';");
     defer lexer.freeTokens(alloc, &missing_arg_body_tokens);
@@ -8530,9 +8637,9 @@ test "sql adapter grammar parses routine catalog tails" {
     var add_body = try parseCreateRoutineCatalogTailAlloc(alloc, add_body_tokens.items, &add_body_pos);
     defer add_body.deinit(alloc);
     try std.testing.expectEqual(add_body_tokens.items.len, add_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, add_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("arg1", add_body.body.?.expression.operands[0].field);
-    try std.testing.expectEqualStrings("arg2", add_body.body.?.expression.operands[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, add_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("arg1", add_body.body.?.expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("arg2", add_body.body.?.expression.?.operands[1].field);
 
     var literal_add_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION shift_amount(numeric) RETURNS numeric LANGUAGE sql AS 'SELECT 1 + arg1';");
     defer lexer.freeTokens(alloc, &literal_add_body_tokens);
@@ -8540,9 +8647,9 @@ test "sql adapter grammar parses routine catalog tails" {
     var literal_add_body = try parseCreateRoutineCatalogTailAlloc(alloc, literal_add_body_tokens.items, &literal_add_body_pos);
     defer literal_add_body.deinit(alloc);
     try std.testing.expectEqual(literal_add_body_tokens.items.len, literal_add_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, literal_add_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("1", literal_add_body.body.?.expression.operands[0].value_json);
-    try std.testing.expectEqualStrings("arg1", literal_add_body.body.?.expression.operands[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.add, literal_add_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("1", literal_add_body.body.?.expression.?.operands[0].value_json);
+    try std.testing.expectEqualStrings("arg1", literal_add_body.body.?.expression.?.operands[1].field);
 
     var concat_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';");
     defer lexer.freeTokens(alloc, &concat_body_tokens);
@@ -8550,10 +8657,10 @@ test "sql adapter grammar parses routine catalog tails" {
     var concat_body = try parseCreateRoutineCatalogTailAlloc(alloc, concat_body_tokens.items, &concat_body_pos);
     defer concat_body.deinit(alloc);
     try std.testing.expectEqual(concat_body_tokens.items.len, concat_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, concat_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("\" \"", concat_body.body.?.expression.operands[0].value_json);
-    try std.testing.expectEqualStrings("arg1", concat_body.body.?.expression.operands[1].field);
-    try std.testing.expectEqualStrings("arg2", concat_body.body.?.expression.operands[2].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, concat_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("\" \"", concat_body.body.?.expression.?.operands[0].value_json);
+    try std.testing.expectEqualStrings("arg1", concat_body.body.?.expression.?.operands[1].field);
+    try std.testing.expectEqualStrings("arg2", concat_body.body.?.expression.?.operands[2].field);
 
     var coalesce_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION status_or_fallback(text) RETURNS text LANGUAGE sql AS 'SELECT coalesce($1, ''missing'')';");
     defer lexer.freeTokens(alloc, &coalesce_body_tokens);
@@ -8561,9 +8668,9 @@ test "sql adapter grammar parses routine catalog tails" {
     var coalesce_body = try parseCreateRoutineCatalogTailAlloc(alloc, coalesce_body_tokens.items, &coalesce_body_pos);
     defer coalesce_body.deinit(alloc);
     try std.testing.expectEqual(coalesce_body_tokens.items.len, coalesce_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, coalesce_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("arg1", coalesce_body.body.?.expression.operands[0].field);
-    try std.testing.expectEqualStrings("\"missing\"", coalesce_body.body.?.expression.operands[1].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, coalesce_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("arg1", coalesce_body.body.?.expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("\"missing\"", coalesce_body.body.?.expression.?.operands[1].value_json);
 
     var nested_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('':'', lower($1), coalesce($2, ''missing''))';");
     defer lexer.freeTokens(alloc, &nested_body_tokens);
@@ -8571,13 +8678,13 @@ test "sql adapter grammar parses routine catalog tails" {
     var nested_body = try parseCreateRoutineCatalogTailAlloc(alloc, nested_body_tokens.items, &nested_body_pos);
     defer nested_body.deinit(alloc);
     try std.testing.expectEqual(nested_body_tokens.items.len, nested_body_pos);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, nested_body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("\":\"", nested_body.body.?.expression.operands[0].value_json);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, nested_body.body.?.expression.operands[1].kind);
-    try std.testing.expectEqualStrings("arg1", nested_body.body.?.expression.operands[1].operands[0].field);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, nested_body.body.?.expression.operands[2].kind);
-    try std.testing.expectEqualStrings("arg2", nested_body.body.?.expression.operands[2].operands[0].field);
-    try std.testing.expectEqualStrings("\"missing\"", nested_body.body.?.expression.operands[2].operands[1].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.concat_ws, nested_body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("\":\"", nested_body.body.?.expression.?.operands[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, nested_body.body.?.expression.?.operands[1].kind);
+    try std.testing.expectEqualStrings("arg1", nested_body.body.?.expression.?.operands[1].operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.coalesce, nested_body.body.?.expression.?.operands[2].kind);
+    try std.testing.expectEqualStrings("arg2", nested_body.body.?.expression.?.operands[2].operands[0].field);
+    try std.testing.expectEqualStrings("\"missing\"", nested_body.body.?.expression.?.operands[2].operands[1].value_json);
 
     var create_procedure_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage(id text) LANGUAGE sql;");
     defer lexer.freeTokens(alloc, &create_procedure_tokens);
@@ -8590,6 +8697,17 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(@as(usize, 1), create_procedure.argument_count);
     try std.testing.expect(create_procedure.returns_type == null);
     try std.testing.expectEqualStrings("sql", create_procedure.language.?);
+
+    var noop_procedure_body_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';");
+    defer lexer.freeTokens(alloc, &noop_procedure_body_tokens);
+    var noop_procedure_body_pos: usize = 0;
+    var noop_procedure_body = try parseCreateRoutineCatalogTailAlloc(alloc, noop_procedure_body_tokens.items, &noop_procedure_body_pos);
+    defer noop_procedure_body.deinit(alloc);
+    try std.testing.expectEqual(noop_procedure_body_tokens.items.len, noop_procedure_body_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.procedure, noop_procedure_body.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_procedure, noop_procedure_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.procedure_noop, noop_procedure_body.body.?.hook);
+    try std.testing.expect(noop_procedure_body.body.?.expression == null);
 
     var drop_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION IF EXISTS public.normalize_status(text) CASCADE;");
     defer lexer.freeTokens(alloc, &drop_function_tokens);
@@ -8619,6 +8737,11 @@ test "sql adapter grammar parses routine catalog tails" {
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 
+    var unsupported_sql_procedure_body_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE touch_usage() LANGUAGE sql AS 'select 1';");
+    defer lexer.freeTokens(alloc, &unsupported_sql_procedure_body_tokens);
+    var unsupported_sql_procedure_body_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_sql_procedure_body_tokens.items, &unsupported_sql_procedure_body_pos));
+
     var body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql AS 'select lower(input)';");
     defer lexer.freeTokens(alloc, &body_tokens);
     var body_pos: usize = 0;
@@ -8626,8 +8749,23 @@ test "sql adapter grammar parses routine catalog tails" {
     defer body.deinit(alloc);
     try std.testing.expectEqual(body_tokens.items.len, body_pos);
     try std.testing.expectEqual(ddl_plan.RoutineBodyKind.sql_expression, body.body.?.kind);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, body.body.?.expression.kind);
-    try std.testing.expectEqualStrings("arg1", body.body.?.expression.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, body.body.?.expression.?.kind);
+    try std.testing.expectEqualStrings("arg1", body.body.?.expression.?.operands[0].field);
+
+    var trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';");
+    defer lexer.freeTokens(alloc, &trigger_body_tokens);
+    var trigger_body_pos: usize = 0;
+    var trigger_body = try parseCreateRoutineCatalogTailAlloc(alloc, trigger_body_tokens.items, &trigger_body_pos);
+    defer trigger_body.deinit(alloc);
+    try std.testing.expectEqual(trigger_body_tokens.items.len, trigger_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, trigger_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, trigger_body.body.?.hook);
+    try std.testing.expect(trigger_body.body.?.expression == null);
+
+    var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';");
+    defer lexer.freeTokens(alloc, &unsupported_trigger_body_tokens);
+    var unsupported_trigger_body_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_trigger_body_tokens.items, &unsupported_trigger_body_pos));
 
     var security_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SECURITY DEFINER;");
     defer lexer.freeTokens(alloc, &security_tokens);

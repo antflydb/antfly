@@ -33,10 +33,14 @@ pub const max_scalar_or_expanded_branches: usize = 32;
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
 const cloneExpressionConditionsConcatAlloc = plan_mod.cloneExpressionConditionsConcatAlloc;
+const cloneExpressionPredicateGroupsAlloc = plan_mod.cloneExpressionPredicateGroupsAlloc;
 const cloneInPredicatesAlloc = plan_mod.cloneInPredicatesAlloc;
+const cloneInPredicatesConcatAlloc = plan_mod.cloneInPredicatesConcatAlloc;
 const cloneQueryRelationalCheckAlloc = plan_mod.cloneQueryRelationalCheckAlloc;
 const cloneQueryRelationalChecksAlloc = plan_mod.cloneQueryRelationalChecksAlloc;
+const cloneQueryRelationalChecksConcatAlloc = plan_mod.cloneQueryRelationalChecksConcatAlloc;
 const freeAccessPredicateGroup = plan_mod.freeAccessPredicateGroup;
+const freeAccessPredicateGroups = plan_mod.freeAccessPredicateGroups;
 const freeArrayAny = plan_mod.freeArrayAny;
 const freeArrayContains = plan_mod.freeArrayContains;
 const freeArrayEq = plan_mod.freeArrayEq;
@@ -52,6 +56,7 @@ const freeJsonPathEq = plan_mod.freeJsonPathEq;
 const freeJsonPathExists = plan_mod.freeJsonPathExists;
 const freeOrderBy = plan_mod.freeOrderBy;
 const freePredicateGroup = plan_mod.freePredicateGroup;
+const freePredicateGroups = plan_mod.freePredicateGroups;
 const freeRelationalChecks = plan_mod.freeRelationalChecks;
 const freeTextPatterns = plan_mod.freeTextPatterns;
 const cloneExpressionAlloc = plan_mod.cloneExpressionAlloc;
@@ -764,6 +769,38 @@ pub fn appendExpressionConditionGroup(
     condition_transferred = true;
     try expression_groups.append(alloc, .{ .conditions = conditions });
     conditions_transferred = true;
+}
+
+pub fn andExpressionPredicateAlternatives(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    alternatives: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+) !void {
+    if (groups.items.len == 0 or alternatives.len == 0) return error.UnsupportedSqlShape;
+    var combined = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    var combined_transferred = false;
+    errdefer {
+        if (!combined_transferred) freeExpressionPredicateGroups(alloc, combined.items);
+        combined.deinit(alloc);
+    }
+
+    for (groups.items) |base| {
+        for (alternatives) |alternative| {
+            const conditions = try cloneExpressionConditionsConcatAlloc(alloc, base.conditions, alternative.conditions);
+            var conditions_transferred = false;
+            errdefer if (!conditions_transferred) {
+                freeExpressionConditions(alloc, conditions);
+                if (conditions.len > 0) alloc.free(conditions);
+            };
+            try combined.append(alloc, .{ .conditions = conditions });
+            conditions_transferred = true;
+        }
+    }
+
+    freeExpressionPredicateGroups(alloc, groups.items);
+    groups.deinit(alloc);
+    groups.* = combined;
+    combined_transferred = true;
 }
 
 pub fn appendExpressionBetweenSymmetricGroups(
@@ -7128,6 +7165,445 @@ pub fn simpleSelectProjectionsEqual(
         if (left.kind != right.kind or left.index != right.index) return false;
     }
     return true;
+}
+
+pub fn applySimpleSelectSetOperationAlloc(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: plan_mod.LoweredSelect,
+    op: ast.SelectSetOperation,
+) !void {
+    if (!std.mem.eql(u8, lhs.table_name, rhs.table_name)) return error.UnsupportedSqlShape;
+    try validateSimpleSetOperationSelect(lhs.query, rhs.query, op);
+    if (!simpleSelectProjectionsEqual(lhs.query, rhs.query, lhs.select_outputs, rhs.select_outputs)) return error.UnsupportedSqlShape;
+
+    switch (op) {
+        .union_distinct => try applySimpleUnion(alloc, lhs, rhs.query),
+        .union_all => try applySimpleUnionAll(alloc, lhs, rhs.query),
+        .intersect => try applySimpleIntersect(alloc, lhs, rhs.query),
+        .except => try applySimpleExcept(alloc, lhs, rhs.query),
+    }
+}
+
+fn clearSimpleSetUnionPredicates(alloc: std.mem.Allocator, query: *db_mod.types.RelationalRowsQueryRequest) void {
+    freeRelationalChecks(alloc, query.predicates);
+    if (query.predicates.len > 0) alloc.free(query.predicates);
+    query.predicates = &.{};
+    freePredicateGroups(alloc, query.or_predicates);
+    if (query.or_predicates.len > 0) alloc.free(query.or_predicates);
+    query.or_predicates = &.{};
+    freeInPredicates(alloc, query.in_predicates);
+    if (query.in_predicates.len > 0) alloc.free(query.in_predicates);
+    query.in_predicates = &.{};
+    freeAccessPredicateGroups(alloc, query.access_or_predicates);
+    if (query.access_or_predicates.len > 0) alloc.free(query.access_or_predicates);
+    query.access_or_predicates = &.{};
+    freeExpressionConditions(alloc, query.expression_predicates);
+    if (query.expression_predicates.len > 0) alloc.free(query.expression_predicates);
+    query.expression_predicates = &.{};
+    freeExpressionPredicateGroups(alloc, query.expression_or_predicates);
+    if (query.expression_or_predicates.len > 0) alloc.free(query.expression_or_predicates);
+    query.expression_or_predicates = &.{};
+}
+
+fn applySimpleUnion(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    if (queryHasNoSimpleSetPredicates(lhs.query) or queryHasNoSimpleSetPredicates(rhs)) {
+        clearSimpleSetUnionPredicates(alloc, &lhs.query);
+        return;
+    }
+    if (lhs.query.expression_or_predicates.len > 0 or rhs.expression_or_predicates.len > 0 or
+        ((lhs.query.in_predicates.len > 0 or rhs.in_predicates.len > 0) and
+            (lhs.query.expression_predicates.len > 0 or rhs.expression_predicates.len > 0)))
+    {
+        return try applySimpleExpressionBranchUnion(alloc, lhs, rhs);
+    }
+    if (lhs.query.in_predicates.len > 0 or rhs.in_predicates.len > 0) {
+        return try applySimpleAccessBranchUnion(alloc, lhs, rhs);
+    }
+    if (lhs.query.or_predicates.len > 0 or rhs.or_predicates.len > 0) {
+        return try applySimpleScalarBranchUnion(alloc, lhs, rhs);
+    }
+    if (lhs.query.expression_predicates.len > 0 or rhs.expression_predicates.len > 0) {
+        return try applySimpleExpressionUnion(alloc, lhs, rhs);
+    }
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, 2);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freePredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    groups[0] = .{ .predicates = try cloneQueryRelationalChecksAlloc(alloc, lhs.query.predicates) };
+    initialized += 1;
+    groups[1] = .{ .predicates = try cloneQueryRelationalChecksAlloc(alloc, rhs.predicates) };
+    initialized += 1;
+
+    freeRelationalChecks(alloc, lhs.query.predicates);
+    if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+    lhs.query.predicates = &.{};
+    freePredicateGroups(alloc, lhs.query.or_predicates);
+    if (lhs.query.or_predicates.len > 0) alloc.free(lhs.query.or_predicates);
+    lhs.query.or_predicates = groups;
+}
+
+fn applySimpleUnionAll(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    if (!try simpleSetQueriesProvablyDisjoint(alloc, lhs.query, rhs)) return error.UnsupportedSqlShape;
+    try applySimpleUnion(alloc, lhs, rhs);
+}
+
+fn applySimpleScalarBranchUnion(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const lhs_branch_count = simpleScalarSetQueryBranchCount(lhs.query);
+    const rhs_branch_count = simpleScalarSetQueryBranchCount(rhs);
+    if (lhs_branch_count == 0 or rhs_branch_count == 0) return error.UnsupportedSqlShape;
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, lhs_branch_count + rhs_branch_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freePredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    try cloneSimpleScalarSetQueryBranchesInto(alloc, groups, &initialized, lhs.query);
+    try cloneSimpleScalarSetQueryBranchesInto(alloc, groups, &initialized, rhs);
+
+    freeRelationalChecks(alloc, lhs.query.predicates);
+    if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+    lhs.query.predicates = &.{};
+    freePredicateGroups(alloc, lhs.query.or_predicates);
+    if (lhs.query.or_predicates.len > 0) alloc.free(lhs.query.or_predicates);
+    lhs.query.or_predicates = groups;
+}
+
+fn applySimpleAccessBranchUnion(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const lhs_branch_count = simpleAccessSetQueryBranchCount(lhs.query);
+    const rhs_branch_count = simpleAccessSetQueryBranchCount(rhs);
+    if (lhs_branch_count == 0 or rhs_branch_count == 0) return error.UnsupportedSqlShape;
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsAccessPredicateGroup, lhs_branch_count + rhs_branch_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freeAccessPredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    try cloneSimpleAccessSetQueryBranchesInto(alloc, groups, &initialized, lhs.query);
+    try cloneSimpleAccessSetQueryBranchesInto(alloc, groups, &initialized, rhs);
+
+    freeRelationalChecks(alloc, lhs.query.predicates);
+    if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+    lhs.query.predicates = &.{};
+    freePredicateGroups(alloc, lhs.query.or_predicates);
+    if (lhs.query.or_predicates.len > 0) alloc.free(lhs.query.or_predicates);
+    lhs.query.or_predicates = &.{};
+    freeInPredicates(alloc, lhs.query.in_predicates);
+    if (lhs.query.in_predicates.len > 0) alloc.free(lhs.query.in_predicates);
+    lhs.query.in_predicates = &.{};
+    freeAccessPredicateGroups(alloc, lhs.query.access_or_predicates);
+    if (lhs.query.access_or_predicates.len > 0) alloc.free(lhs.query.access_or_predicates);
+    lhs.query.access_or_predicates = groups;
+}
+
+fn applySimpleExpressionUnion(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, 2);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    groups[0] = .{ .conditions = try expressionConditionsFromSimpleSetQueryAlloc(alloc, lhs.query) };
+    initialized += 1;
+    groups[1] = .{ .conditions = try expressionConditionsFromSimpleSetQueryAlloc(alloc, rhs) };
+    initialized += 1;
+
+    freeRelationalChecks(alloc, lhs.query.predicates);
+    if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+    lhs.query.predicates = &.{};
+    freeExpressionConditions(alloc, lhs.query.expression_predicates);
+    if (lhs.query.expression_predicates.len > 0) alloc.free(lhs.query.expression_predicates);
+    lhs.query.expression_predicates = &.{};
+    freeExpressionPredicateGroups(alloc, lhs.query.expression_or_predicates);
+    if (lhs.query.expression_or_predicates.len > 0) alloc.free(lhs.query.expression_or_predicates);
+    lhs.query.expression_or_predicates = groups;
+}
+
+fn applySimpleExpressionBranchUnion(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const left_groups = try expressionGroupsFromSimpleUnionQueryAlloc(alloc, lhs.query);
+    defer {
+        freeExpressionPredicateGroups(alloc, left_groups);
+        if (left_groups.len > 0) alloc.free(left_groups);
+    }
+    const right_groups = try expressionGroupsFromSimpleUnionQueryAlloc(alloc, rhs);
+    defer {
+        freeExpressionPredicateGroups(alloc, right_groups);
+        if (right_groups.len > 0) alloc.free(right_groups);
+    }
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, left_groups.len + right_groups.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    for (left_groups) |group| {
+        groups[initialized] = .{ .conditions = try cloneExpressionConditionsAlloc(alloc, group.conditions) };
+        initialized += 1;
+    }
+    for (right_groups) |group| {
+        groups[initialized] = .{ .conditions = try cloneExpressionConditionsAlloc(alloc, group.conditions) };
+        initialized += 1;
+    }
+
+    replaceQueryWithExpressionOrBranches(alloc, lhs, groups);
+}
+
+fn applySimpleIntersect(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    if (lhs.query.expression_or_predicates.len > 0 or rhs.expression_or_predicates.len > 0) {
+        return try applySimpleExpressionBranchIntersect(alloc, lhs, rhs);
+    }
+    if (lhs.query.or_predicates.len > 0 or rhs.or_predicates.len > 0) {
+        return try applySimpleScalarBranchIntersect(alloc, lhs, rhs);
+    }
+    if (rhs.predicates.len > 0) {
+        const predicates = try cloneQueryRelationalChecksConcatAlloc(alloc, lhs.query.predicates, rhs.predicates);
+        freeRelationalChecks(alloc, lhs.query.predicates);
+        if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+        lhs.query.predicates = predicates;
+    }
+    if (rhs.in_predicates.len > 0) {
+        const in_predicates = try cloneInPredicatesConcatAlloc(alloc, lhs.query.in_predicates, rhs.in_predicates);
+        freeInPredicates(alloc, lhs.query.in_predicates);
+        if (lhs.query.in_predicates.len > 0) alloc.free(lhs.query.in_predicates);
+        lhs.query.in_predicates = in_predicates;
+    }
+    if (rhs.expression_predicates.len > 0) {
+        const expression_predicates = try cloneExpressionConditionsConcatAlloc(alloc, lhs.query.expression_predicates, rhs.expression_predicates);
+        freeExpressionConditions(alloc, lhs.query.expression_predicates);
+        if (lhs.query.expression_predicates.len > 0) alloc.free(lhs.query.expression_predicates);
+        lhs.query.expression_predicates = expression_predicates;
+    }
+}
+
+fn applySimpleScalarBranchIntersect(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const lhs_branch_count = simpleScalarSetQueryBranchCount(lhs.query);
+    const rhs_branch_count = simpleScalarSetQueryBranchCount(rhs);
+    if (rhs_branch_count == 0) return;
+    if (lhs_branch_count == 0) {
+        const groups = try cloneSimpleScalarSetQueryBranchesAlloc(alloc, rhs);
+        freeRelationalChecks(alloc, lhs.query.predicates);
+        if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+        lhs.query.predicates = &.{};
+        freePredicateGroups(alloc, lhs.query.or_predicates);
+        if (lhs.query.or_predicates.len > 0) alloc.free(lhs.query.or_predicates);
+        lhs.query.or_predicates = groups;
+        return;
+    }
+    if (lhs_branch_count > max_scalar_or_expanded_branches / rhs_branch_count) return error.UnsupportedSqlShape;
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, lhs_branch_count * rhs_branch_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freePredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    for (0..lhs_branch_count) |left_index| {
+        const left = simpleScalarSetQueryBranchAt(lhs.query, left_index) orelse return error.UnsupportedSqlShape;
+        for (0..rhs_branch_count) |right_index| {
+            const right = simpleScalarSetQueryBranchAt(rhs, right_index) orelse return error.UnsupportedSqlShape;
+            groups[initialized] = .{ .predicates = try cloneQueryRelationalChecksConcatAlloc(alloc, left, right) };
+            initialized += 1;
+        }
+    }
+
+    freeRelationalChecks(alloc, lhs.query.predicates);
+    if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+    lhs.query.predicates = &.{};
+    freePredicateGroups(alloc, lhs.query.or_predicates);
+    if (lhs.query.or_predicates.len > 0) alloc.free(lhs.query.or_predicates);
+    lhs.query.or_predicates = groups;
+}
+
+fn applySimpleExpressionBranchIntersect(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    const rhs_groups = try expressionGroupsFromSimpleIntersectQueryAlloc(alloc, rhs);
+    defer {
+        freeExpressionPredicateGroups(alloc, rhs_groups);
+        if (rhs_groups.len > 0) alloc.free(rhs_groups);
+    }
+    if (rhs_groups.len == 0) return;
+
+    const lhs_groups = try expressionGroupsFromSimpleIntersectQueryAlloc(alloc, lhs.query);
+    defer {
+        freeExpressionPredicateGroups(alloc, lhs_groups);
+        if (lhs_groups.len > 0) alloc.free(lhs_groups);
+    }
+    if (lhs_groups.len == 0) {
+        const groups = try cloneExpressionPredicateGroupsAlloc(alloc, rhs_groups);
+        replaceQueryWithExpressionOrBranches(alloc, lhs, groups);
+        return;
+    }
+    if (lhs_groups.len > max_scalar_or_expanded_branches / rhs_groups.len) return error.UnsupportedSqlShape;
+
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, lhs_groups.len * rhs_groups.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    for (lhs_groups) |left| {
+        for (rhs_groups) |right| {
+            groups[initialized] = .{ .conditions = try cloneExpressionConditionsConcatAlloc(alloc, left.conditions, right.conditions) };
+            initialized += 1;
+        }
+    }
+
+    replaceQueryWithExpressionOrBranches(alloc, lhs, groups);
+}
+
+fn replaceQueryWithExpressionOrBranches(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    groups: []db_mod.types.RelationalRowsExpressionPredicateGroup,
+) void {
+    freeRelationalChecks(alloc, lhs.query.predicates);
+    if (lhs.query.predicates.len > 0) alloc.free(lhs.query.predicates);
+    lhs.query.predicates = &.{};
+    freePredicateGroups(alloc, lhs.query.or_predicates);
+    if (lhs.query.or_predicates.len > 0) alloc.free(lhs.query.or_predicates);
+    lhs.query.or_predicates = &.{};
+    freeInPredicates(alloc, lhs.query.in_predicates);
+    if (lhs.query.in_predicates.len > 0) alloc.free(lhs.query.in_predicates);
+    lhs.query.in_predicates = &.{};
+    freeAccessPredicateGroups(alloc, lhs.query.access_or_predicates);
+    if (lhs.query.access_or_predicates.len > 0) alloc.free(lhs.query.access_or_predicates);
+    lhs.query.access_or_predicates = &.{};
+    freeExpressionConditions(alloc, lhs.query.expression_predicates);
+    if (lhs.query.expression_predicates.len > 0) alloc.free(lhs.query.expression_predicates);
+    lhs.query.expression_predicates = &.{};
+    freeExpressionPredicateGroups(alloc, lhs.query.expression_or_predicates);
+    if (lhs.query.expression_or_predicates.len > 0) alloc.free(lhs.query.expression_or_predicates);
+    lhs.query.expression_or_predicates = groups;
+}
+
+fn applySimpleExcept(
+    alloc: std.mem.Allocator,
+    lhs: *plan_mod.LoweredSelect,
+    rhs: db_mod.types.RelationalRowsQueryRequest,
+) !void {
+    if (rhs.predicates.len == 0 and rhs.or_predicates.len == 0 and rhs.in_predicates.len == 0 and rhs.expression_predicates.len == 0 and rhs.expression_or_predicates.len == 0) return error.UnsupportedSqlShape;
+    if (rhs.or_predicates.len > 0) {
+        const groups = try cloneSimpleScalarSetQueryBranchesAlloc(alloc, rhs);
+        freePredicateGroups(alloc, lhs.query.not_predicates);
+        if (lhs.query.not_predicates.len > 0) alloc.free(lhs.query.not_predicates);
+        lhs.query.not_predicates = groups;
+        return;
+    }
+    if (rhs.in_predicates.len > 0 and rhs.expression_or_predicates.len > 0) {
+        const groups = try expressionGroupsFromInSetQueryAlloc(alloc, rhs);
+        freeExpressionPredicateGroups(alloc, lhs.query.expression_not_predicates);
+        if (lhs.query.expression_not_predicates.len > 0) alloc.free(lhs.query.expression_not_predicates);
+        lhs.query.expression_not_predicates = groups;
+        return;
+    }
+    if (rhs.expression_or_predicates.len > 0) {
+        const groups = try cloneSimpleExpressionSetQueryBranchesAlloc(alloc, rhs);
+        freeExpressionPredicateGroups(alloc, lhs.query.expression_not_predicates);
+        if (lhs.query.expression_not_predicates.len > 0) alloc.free(lhs.query.expression_not_predicates);
+        lhs.query.expression_not_predicates = groups;
+        return;
+    }
+    if (rhs.in_predicates.len > 0 and rhs.expression_predicates.len > 0) {
+        const groups = try expressionGroupsFromInSetQueryAlloc(alloc, rhs);
+        freeExpressionPredicateGroups(alloc, lhs.query.expression_not_predicates);
+        if (lhs.query.expression_not_predicates.len > 0) alloc.free(lhs.query.expression_not_predicates);
+        lhs.query.expression_not_predicates = groups;
+        return;
+    }
+    if (rhs.expression_predicates.len > 0) {
+        const groups = try alloc.alloc(db_mod.types.RelationalRowsExpressionPredicateGroup, 1);
+        var initialized: usize = 0;
+        errdefer {
+            for (groups[0..initialized]) |group| freeExpressionPredicateGroup(alloc, group);
+            alloc.free(groups);
+        }
+        groups[0] = .{ .conditions = try expressionConditionsFromSimpleSetQueryAlloc(alloc, rhs) };
+        initialized += 1;
+        freeExpressionPredicateGroups(alloc, lhs.query.expression_not_predicates);
+        if (lhs.query.expression_not_predicates.len > 0) alloc.free(lhs.query.expression_not_predicates);
+        lhs.query.expression_not_predicates = groups;
+        return;
+    }
+    if (rhs.in_predicates.len > 0) {
+        const groups = try alloc.alloc(db_mod.types.RelationalRowsAccessPredicateGroup, 1);
+        var initialized: usize = 0;
+        errdefer {
+            for (groups[0..initialized]) |group| freeAccessPredicateGroup(alloc, group);
+            alloc.free(groups);
+        }
+        const predicates = try cloneQueryRelationalChecksAlloc(alloc, rhs.predicates);
+        var predicates_transferred = false;
+        errdefer if (!predicates_transferred) {
+            freeRelationalChecks(alloc, predicates);
+            if (predicates.len > 0) alloc.free(predicates);
+        };
+        const in_predicates = try cloneInPredicatesAlloc(alloc, rhs.in_predicates);
+        var in_transferred = false;
+        errdefer if (!in_transferred) {
+            freeInPredicates(alloc, in_predicates);
+            if (in_predicates.len > 0) alloc.free(in_predicates);
+        };
+        groups[0] = .{ .predicates = predicates, .in_predicates = in_predicates };
+        predicates_transferred = true;
+        in_transferred = true;
+        initialized += 1;
+        freeAccessPredicateGroups(alloc, lhs.query.access_not_predicates);
+        if (lhs.query.access_not_predicates.len > 0) alloc.free(lhs.query.access_not_predicates);
+        lhs.query.access_not_predicates = groups;
+        return;
+    }
+    const groups = try alloc.alloc(db_mod.types.RelationalRowsPredicateGroup, 1);
+    var initialized: usize = 0;
+    errdefer {
+        for (groups[0..initialized]) |group| freePredicateGroup(alloc, group);
+        alloc.free(groups);
+    }
+    groups[0] = .{ .predicates = try cloneQueryRelationalChecksAlloc(alloc, rhs.predicates) };
+    initialized += 1;
+    freePredicateGroups(alloc, lhs.query.not_predicates);
+    if (lhs.query.not_predicates.len > 0) alloc.free(lhs.query.not_predicates);
+    lhs.query.not_predicates = groups;
 }
 
 pub fn setOperationColumnsCompatible(

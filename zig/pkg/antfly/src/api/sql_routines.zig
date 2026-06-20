@@ -175,12 +175,13 @@ pub const Runtime = struct {
         const routine = self.findRoutineLocked(.function, routine_name, argument_json.len) orelse return error.RoutineNotFound;
         const body = routine.body orelse return error.RoutineBodyNotExecutable;
         if (body.kind != .sql_expression or body.hook != .expression) return error.RoutineBodyNotExecutable;
+        const expression = body.expression orelse return error.RoutineBodyNotExecutable;
         const row_json = try routineArgumentObjectJsonAlloc(alloc, argument_json, routine.null_input);
         defer alloc.free(row_json);
         if (std.mem.eql(u8, row_json, "null")) return try alloc.dupe(u8, "null");
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
         defer parsed.deinit();
-        return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, body.expression);
+        return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, expression);
     }
 
     pub fn listExpressionRoutineBindingsAlloc(
@@ -203,11 +204,12 @@ pub const Runtime = struct {
             if (routine.kind != .function) continue;
             const body = routine.body orelse continue;
             if (body.kind != .sql_expression or body.hook != .expression) continue;
+            const expression_body = body.expression orelse continue;
             if (routine.argument_count > std.math.maxInt(u16)) return error.UnsupportedSqlShape;
 
             const sql_name = try alloc.dupe(u8, routine.name);
             errdefer alloc.free(sql_name);
-            const expression = try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, body.expression);
+            const expression = try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, expression_body);
             errdefer runtime_schema.freeRelationalRowsExpression(alloc, expression);
 
             try bindings.append(alloc, .{
@@ -222,9 +224,21 @@ pub const Runtime = struct {
     }
 
     fn createLocked(self: *@This(), plan: relational_sql.CreateRoutinePlan) !void {
-        if (plan.kind == .procedure and plan.body != null) return error.UnsupportedSqlShape;
         if (plan.body) |body| {
-            if (body.kind != .sql_expression or body.hook != .expression) return error.UnsupportedSqlShape;
+            switch (body.hook) {
+                .expression => {
+                    if (plan.kind != .function or body.kind != .sql_expression or body.expression == null) return error.UnsupportedSqlShape;
+                },
+                .trigger_return_new => {
+                    if (plan.kind != .function or body.kind != .plpgsql_trigger or body.expression != null) return error.UnsupportedSqlShape;
+                    const returns_type = plan.returns_type orelse return error.UnsupportedSqlShape;
+                    if (!std.ascii.eqlIgnoreCase(returns_type, "trigger")) return error.UnsupportedSqlShape;
+                },
+                .procedure_noop => {
+                    if (plan.kind != .procedure or body.kind != .plpgsql_procedure or body.expression != null) return error.UnsupportedSqlShape;
+                    if (plan.returns_type != null) return error.UnsupportedSqlShape;
+                },
+            }
         }
         const existing_index = self.findRoutineIndexLocked(plan.kind, plan.routine_name, plan.argument_count);
         if (existing_index != null) {
@@ -511,10 +525,12 @@ fn freeRoutineSettings(alloc: std.mem.Allocator, settings: []relational_sql.Rout
 }
 
 fn cloneRoutineBodyAlloc(alloc: std.mem.Allocator, body: relational_sql.RoutineBodyPlan) !relational_sql.RoutineBodyPlan {
+    const expression = if (body.expression) |value| try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, value) else null;
+    errdefer if (expression) |value| runtime_schema.freeRelationalRowsExpression(alloc, value);
     return .{
         .kind = body.kind,
         .hook = body.hook,
-        .expression = try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, body.expression),
+        .expression = expression,
     };
 }
 
@@ -941,6 +957,34 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION ambient_field(text) RETURNS text LANGUAGE sql AS 'SELECT lower(status)';"),
+    );
+
+    var trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
+    );
+    defer trigger_plan.deinit(alloc);
+    try runtime.apply(switch (trigger_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 4), runtime.routineCountForTest());
+    try std.testing.expectError(error.RoutineBodyNotExecutable, runtime.executeExpressionRoutineArgsAlloc(alloc, "audit_body", &.{}));
+
+    var noop_procedure_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
+    );
+    defer noop_procedure_plan.deinit(alloc);
+    try runtime.apply(switch (noop_procedure_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 5), runtime.routineCountForTest());
+    try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "rotate_usage", &.{}));
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';"),
     );
 }
 

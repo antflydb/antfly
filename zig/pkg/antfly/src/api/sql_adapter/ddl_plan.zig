@@ -947,19 +947,23 @@ pub const RoutineSetting = struct {
 
 pub const RoutineBodyKind = enum {
     sql_expression,
+    plpgsql_trigger,
+    plpgsql_procedure,
 };
 
 pub const RoutineExecutionHook = enum {
     expression,
+    trigger_return_new,
+    procedure_noop,
 };
 
 pub const RoutineBodyPlan = struct {
     kind: RoutineBodyKind,
     hook: RoutineExecutionHook,
-    expression: db_mod.types.RelationalRowsExpression,
+    expression: ?db_mod.types.RelationalRowsExpression = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        runtime_schema.freeRelationalRowsExpression(alloc, self.expression);
+        if (self.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
         self.* = undefined;
     }
 };
@@ -2322,6 +2326,7 @@ pub const RowSecurityPolicyPredicate = union(enum) {
     literal_equals: RowSecurityLiteralPredicate,
     expression: db_mod.types.RelationalRowsExpressionCondition,
     conjunction: RowSecurityConjunctionPredicate,
+    disjunction: RowSecurityConjunctionPredicate,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -2329,6 +2334,7 @@ pub const RowSecurityPolicyPredicate = union(enum) {
             .literal_equals => |*predicate| predicate.deinit(alloc),
             .expression => |condition| runtime_schema.freeRelationalRowsExpressionCondition(alloc, condition),
             .conjunction => |*predicate| predicate.deinit(alloc),
+            .disjunction => |*predicate| predicate.deinit(alloc),
         }
         self.* = undefined;
     }
@@ -3541,6 +3547,25 @@ pub fn parseCreateRowSecurityPolicyPlanTailAlloc(
     return createRowSecurityPolicyPlanFromSyntax(&syntax);
 }
 
+pub const RowSecurityPolicyHooks = struct {
+    ptr: *anyopaque,
+    parse_boolean_row_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub fn parseCreateRowSecurityPolicyPlanTailAllocWithHooks(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: RowSecurityPolicyHooks,
+) !CreateRowSecurityPolicyPlan {
+    const start = pos.*;
+    return parseCreateRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        pos.* = start;
+        return try parseCreateRowSecurityPolicyExpressionBindingPlanTailAlloc(alloc, tokens, pos, hooks);
+    };
+}
+
 pub fn parseAlterRowSecurityPolicyPlanTailAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -3549,6 +3574,142 @@ pub fn parseAlterRowSecurityPolicyPlanTailAlloc(
     var syntax = try grammar.parseAlterRowSecurityPolicyCatalogTailAlloc(alloc, tokens, pos);
     errdefer syntax.deinit(alloc);
     return alterRowSecurityPolicyPlanFromSyntax(&syntax);
+}
+
+pub fn parseAlterRowSecurityPolicyPlanTailAllocWithHooks(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: RowSecurityPolicyHooks,
+) !AlterRowSecurityPolicyPlan {
+    const start = pos.*;
+    return parseAlterRowSecurityPolicyPlanTailAlloc(alloc, tokens, pos) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        pos.* = start;
+        return try parseAlterRowSecurityPolicyExpressionBindingPlanTailAlloc(alloc, tokens, pos, hooks);
+    };
+}
+
+fn parseCreateRowSecurityPolicyExpressionBindingPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: RowSecurityPolicyHooks,
+) !CreateRowSecurityPolicyPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("policy");
+    const policy_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var policy_transferred = false;
+    errdefer if (!policy_transferred) alloc.free(policy_name);
+    try cursor.expectKeyword("on");
+    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    const role_targets = try grammar.parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
+    var role_targets_transferred = false;
+    errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
+    try cursor.expectKeyword("using");
+    var predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, hooks);
+    var predicate_transferred = false;
+    errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    var check_predicate: ?RowSecurityPolicyPredicate = null;
+    var check_predicate_transferred = true;
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("check");
+        check_predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, hooks);
+        check_predicate_transferred = false;
+        errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
+    }
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    policy_transferred = true;
+    table_transferred = true;
+    role_targets_transferred = true;
+    predicate_transferred = true;
+    check_predicate_transferred = true;
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .role_targets = role_targets,
+        .predicate = predicate,
+        .check_predicate = check_predicate,
+    };
+}
+
+fn parseAlterRowSecurityPolicyExpressionBindingPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: RowSecurityPolicyHooks,
+) !AlterRowSecurityPolicyPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("policy");
+    const policy_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var policy_transferred = false;
+    errdefer if (!policy_transferred) alloc.free(policy_name);
+    try cursor.expectKeyword("on");
+    const table_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    const role_targets = try grammar.parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
+    var role_targets_transferred = false;
+    errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
+    try cursor.expectKeyword("using");
+    var predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, hooks);
+    var predicate_transferred = false;
+    errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    var check_predicate: ?RowSecurityPolicyPredicate = null;
+    var check_predicate_transferred = true;
+    if (cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("check");
+        check_predicate = try parseRowSecurityPolicyExpressionBindingPredicateAlloc(alloc, tokens, pos, hooks);
+        check_predicate_transferred = false;
+        errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
+    }
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    policy_transferred = true;
+    table_transferred = true;
+    role_targets_transferred = true;
+    predicate_transferred = true;
+    check_predicate_transferred = true;
+    return .{
+        .policy_name = policy_name,
+        .table_name = table_name,
+        .role_targets = role_targets,
+        .predicate = predicate,
+        .check_predicate = check_predicate,
+    };
+}
+
+pub fn parseRowSecurityPolicyExpressionBindingPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: RowSecurityPolicyHooks,
+) !RowSecurityPolicyPredicate {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const wrapped = cursor.matchToken(.lparen) != null;
+    const lhs = try hooks.parse_boolean_row_expression(hooks.ptr);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
+    const op = try lower_expr.parseComparisonOp(tokens, pos);
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer {
+        if (!rhs_transferred) alloc.free(rhs);
+    }
+    rhs[0] = try hooks.parse_boolean_row_expression(hooks.ptr);
+    errdefer if (!rhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs[0]);
+    if (wrapped) try cursor.expectToken(.rparen);
+
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{ .expression = .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    } };
 }
 
 pub fn parseDropRowSecurityPolicyPlanTailAlloc(
@@ -3971,6 +4132,147 @@ pub fn parseIdentityAllocatorPlanAlloc(
         .options = identity.options,
         .primary_key = primary_key,
         .additional_columns = owned_additional_columns,
+    };
+}
+
+pub fn parseCreateIndexPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    unique: bool,
+    hooks: CreateIndexHooks,
+) !CreateIndexPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var header = try grammar.parseCreateIndexHeaderAlloc(alloc, tokens, pos);
+    var header_transferred = false;
+    errdefer if (!header_transferred) header.deinit(alloc);
+    const method = header.method;
+
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    var opclass: DdlIndexOpClass = .default;
+    errdefer {
+        for (columns.items) |column| alloc.free(column);
+        columns.deinit(alloc);
+    }
+    var expressions = std.ArrayListUnmanaged(runtime_schema.UniqueExpression).empty;
+    errdefer {
+        clearDdlUniqueExpressions(alloc, expressions.items);
+        expressions.deinit(alloc);
+    }
+    var generated_expression: ?runtime_schema.RelationalGeneratedValue = null;
+    errdefer if (generated_expression) |generated| freeDdlGeneratedValue(alloc, generated);
+    var without_overlaps_period: ?[]const u8 = null;
+    errdefer if (without_overlaps_period) |period| alloc.free(period);
+    try cursor.expectToken(.lparen);
+    while (true) {
+        if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
+            const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
+            if (unique) {
+                const expression = try grammar.parseDdlUniqueExpressionAlloc(alloc, tokens, pos);
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeDdlUniqueExpression(alloc, expression);
+                try expressions.append(alloc, expression);
+                expression_transferred = true;
+            } else {
+                if (generated_expression != null) return error.UnsupportedSqlShape;
+                const generated = try grammar.parseDdlGeneratedExpressionAlloc(alloc, tokens, pos);
+                var generated_transferred = false;
+                errdefer if (!generated_transferred) freeDdlGeneratedValue(alloc, generated);
+                generated_expression = generated;
+                generated_transferred = true;
+            }
+            try grammar.closeDdlIndexExpressionWrappers(tokens, pos, wrapper_count);
+            _ = try grammar.parseCreateIndexElementSuffix(tokens, pos, method, false);
+        } else {
+            const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            var column_transferred = false;
+            errdefer if (!column_transferred) alloc.free(column);
+            if (cursor.matchKeyword("without")) {
+                try cursor.expectKeyword("overlaps");
+                if (!unique or without_overlaps_period != null) return error.UnsupportedSqlShape;
+                without_overlaps_period = column;
+                column_transferred = true;
+                if (cursor.matchToken(.comma) == null) break;
+                continue;
+            }
+            const suffix = try grammar.parseCreateIndexElementSuffix(tokens, pos, method, true);
+            if (suffix.opclass != .default) opclass = suffix.opclass;
+            try columns.append(alloc, column);
+            column_transferred = true;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null) return error.UnsupportedSqlShape;
+    try grammar.validateSqlIdentifierListUnique(columns.items);
+    try lower_expr.validateSqlUniqueExpressionListUnique(expressions.items);
+
+    const nulls_policy = try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos);
+    if (nulls_policy != null and !unique) return error.UnsupportedSqlShape;
+    const nulls_not_distinct = nulls_policy orelse false;
+    if (nulls_not_distinct and without_overlaps_period != null) return error.UnsupportedSqlShape;
+
+    var include_columns: []const []const u8 = &.{};
+    var include_columns_owned = false;
+    errdefer if (include_columns_owned) freeStringSlice(alloc, include_columns);
+    if (cursor.matchKeyword("include")) {
+        include_columns = try grammar.parseDdlUniqueColumnListAlloc(alloc, tokens, pos);
+        include_columns_owned = true;
+        try grammar.validateSqlIdentifierListsDisjoint(columns.items, include_columns);
+    }
+
+    var predicates: []const runtime_schema.UniquePredicate = &.{};
+    errdefer freeDdlUniquePredicates(alloc, predicates);
+    var where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{};
+    errdefer {
+        freeExpressionConditions(alloc, where_expressions);
+        if (where_expressions.len > 0) alloc.free(where_expressions);
+    }
+    if (cursor.matchKeyword("where")) {
+        const predicate_start = pos.*;
+        predicates = grammar.parseDdlUniquePredicatesAlloc(alloc, tokens, pos) catch |err| switch (err) {
+            error.UnsupportedSqlShape => blk: {
+                pos.* = predicate_start;
+                break :blk &.{};
+            },
+            else => return err,
+        };
+        if (predicates.len == 0) {
+            pos.* = predicate_start;
+            where_expressions = try hooks.parse_where_expression_conditions(hooks.ptr);
+        }
+    }
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const owned_columns = try columns.toOwnedSlice(alloc);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) freeStringSlice(alloc, owned_columns);
+    const owned_include_columns = include_columns;
+    const owned_expressions = try expressions.toOwnedSlice(alloc);
+    var expressions_transferred = false;
+    errdefer if (!expressions_transferred) freeDdlUniqueExpressions(alloc, owned_expressions);
+    const period = without_overlaps_period;
+    without_overlaps_period = null;
+
+    header_transferred = true;
+    columns_transferred = true;
+    include_columns_owned = false;
+    expressions_transferred = true;
+    return .{
+        .index_name = header.index_name,
+        .table_name = header.table_name,
+        .if_not_exists = header.if_not_exists,
+        .unique = unique,
+        .method = method,
+        .opclass = opclass,
+        .columns = owned_columns,
+        .include_columns = owned_include_columns,
+        .expressions = owned_expressions,
+        .generated_expression = generated_expression,
+        .without_overlaps_period = period,
+        .nulls_not_distinct = nulls_not_distinct,
+        .where = predicates,
+        .where_expressions = where_expressions,
     };
 }
 
@@ -5156,6 +5458,356 @@ pub const DdlColumnDefinitionHooks = struct {
     parse_check_constraint: *const fn (*anyopaque, ?[]const u8) anyerror!runtime_schema.RelationalCheck,
 };
 
+pub const DdlDomainHooks = struct {
+    ptr: *anyopaque,
+    parse_default_value: *const fn (*anyopaque, runtime_schema.AntflyType) anyerror!runtime_schema.RelationalDefaultValue,
+    parse_check_value_json: *const fn (*anyopaque, runtime_schema.AntflyType) anyerror![]const u8,
+};
+
+pub const DdlExpressionHooks = struct {
+    ptr: *anyopaque,
+    parse_literal_value_json: *const fn (*anyopaque, runtime_schema.AntflyType) anyerror![]const u8,
+    parse_row_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_condition_alternatives: *const fn (*anyopaque, *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup)) anyerror!void,
+};
+
+pub fn parseDdlDefaultValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    field_type: runtime_schema.AntflyType,
+    hooks: DdlExpressionHooks,
+) !runtime_schema.RelationalDefaultValue {
+    if (try grammar.parseOptionalDdlKnownDefault(tokens, pos)) |known| {
+        return try grammar.ddlDefaultValueFromKnownSyntaxAlloc(alloc, known, field_type);
+    }
+    const value = try hooks.parse_literal_value_json(hooks.ptr, field_type);
+    return .{ .kind = .literal, .value_json = value };
+}
+
+pub fn parseDdlGeneratedValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlExpressionHooks,
+) !runtime_schema.RelationalGeneratedValue {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const start = pos.*;
+    if (cursor.matchKeyword("always")) {
+        try cursor.expectKeyword("as");
+        try cursor.expectToken(.lparen);
+        const expression = hooks.parse_row_expression(hooks.ptr) catch |err| {
+            pos.* = start;
+            if (err == error.OutOfMemory) return err;
+            return try grammar.parseDdlStoredGeneratedValueAlloc(alloc, tokens, pos);
+        };
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+        try cursor.expectToken(.rparen);
+        try cursor.expectKeyword("stored");
+        expression_transferred = true;
+        return .{
+            .op = .expression,
+            .expression = expression,
+        };
+    }
+    pos.* = start;
+    return try grammar.parseDdlStoredGeneratedValueAlloc(alloc, tokens, pos);
+}
+
+pub fn parseDdlCheckConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    constraint_name: ?[]const u8,
+    hooks: DdlExpressionHooks,
+) !runtime_schema.RelationalCheck {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    const condition = try parseDdlCheckExpressionConditionAlloc(alloc, tokens, pos, hooks);
+    defer runtime_schema.freeRelationalRowsExpressionCondition(alloc, condition);
+    try cursor.expectToken(.rparen);
+    return try makeDdlRelationalCheckFromExpressionConditionAlloc(alloc, constraint_name, condition);
+}
+
+pub fn parseDdlCheckExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlExpressionHooks,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    var groups = try parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, hooks);
+    defer alloc.free(groups);
+    errdefer plan_mod.freeExpressionPredicateGroups(alloc, groups);
+
+    if (groups.len == 1 and groups[0].conditions.len == 1) {
+        const conditions = groups[0].conditions;
+        const condition = conditions[0];
+        groups[0].conditions = &.{};
+        alloc.free(conditions);
+        return condition;
+    }
+
+    const expression = try lower_expr.booleanExpressionFromPredicateGroupsAlloc(alloc, groups);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+
+    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) alloc.free(rhs);
+    rhs[0] = try lower_expr.booleanLiteralExpressionAlloc(alloc, true);
+    var rhs_expression_transferred = false;
+    errdefer if (!rhs_expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, rhs[0]);
+
+    expression_transferred = true;
+    rhs_expression_transferred = true;
+    rhs_transferred = true;
+    return .{
+        .lhs = expression,
+        .op = .eq,
+        .rhs = rhs,
+    };
+}
+
+pub fn parseDdlCheckExpressionPredicateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlExpressionHooks,
+) anyerror![]db_mod.types.RelationalRowsExpressionPredicateGroup {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    errdefer {
+        plan_mod.freeExpressionPredicateGroups(alloc, groups.items);
+        groups.deinit(alloc);
+    }
+
+    while (true) {
+        var branch_groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        var branch_groups_transferred = false;
+        defer branch_groups.deinit(alloc);
+        errdefer if (!branch_groups_transferred) plan_mod.freeExpressionPredicateGroups(alloc, branch_groups.items);
+        try branch_groups.append(alloc, .{ .conditions = &.{} });
+
+        while (true) {
+            var alternatives = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+            defer alternatives.deinit(alloc);
+            errdefer plan_mod.freeExpressionPredicateGroups(alloc, alternatives.items);
+            try parseDdlCheckExpressionPredicateFactorAlternatives(alloc, tokens, pos, hooks, &alternatives);
+            try andExpressionPredicateAlternatives(alloc, &branch_groups, alternatives.items);
+            plan_mod.freeExpressionPredicateGroups(alloc, alternatives.items);
+            if (!cursor.matchKeyword("and")) break;
+        }
+
+        if (branch_groups.items.len == 0) return error.UnsupportedSqlShape;
+        try groups.appendSlice(alloc, branch_groups.items);
+        branch_groups_transferred = true;
+
+        if (!cursor.matchKeyword("or")) break;
+    }
+
+    return try groups.toOwnedSlice(alloc);
+}
+
+fn parseDdlCheckExpressionPredicateFactorAlternatives(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlExpressionHooks,
+    alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+) anyerror!void {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("not")) {
+        const groups = try parseDdlCheckNegatedPredicateGroupsAlloc(alloc, tokens, pos, hooks);
+        defer alloc.free(groups);
+        errdefer plan_mod.freeExpressionPredicateGroups(alloc, groups);
+
+        const expression = try lower_expr.booleanExpressionFromPredicateGroupsAlloc(alloc, groups);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) runtime_schema.freeRelationalRowsExpression(alloc, expression);
+        const negated = try lower_expr.booleanNotExpressionAlloc(alloc, expression);
+        expression_transferred = true;
+        var negated_transferred = false;
+        errdefer if (!negated_transferred) runtime_schema.freeRelationalRowsExpression(alloc, negated);
+        const condition = try lower_expr.booleanExpressionConditionAlloc(alloc, negated);
+        negated_transferred = true;
+        try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+        return;
+    }
+
+    if (lower_expr.parenthesizedPredicateGroupCanStartAt(tokens, pos.*)) {
+        try cursor.expectToken(.lparen);
+        const groups = try parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, hooks);
+        var groups_transferred = false;
+        defer alloc.free(groups);
+        errdefer if (!groups_transferred) plan_mod.freeExpressionPredicateGroups(alloc, groups);
+        try cursor.expectToken(.rparen);
+        try alternatives.appendSlice(alloc, groups);
+        groups_transferred = true;
+        return;
+    }
+
+    try hooks.parse_condition_alternatives(hooks.ptr, alternatives);
+}
+
+fn parseDdlCheckNegatedPredicateGroupsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlExpressionHooks,
+) anyerror![]db_mod.types.RelationalRowsExpressionPredicateGroup {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (lower_expr.parenthesizedPredicateGroupCanStartAt(tokens, pos.*)) {
+        try cursor.expectToken(.lparen);
+        const groups = try parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, hooks);
+        errdefer {
+            plan_mod.freeExpressionPredicateGroups(alloc, groups);
+            alloc.free(groups);
+        }
+        try cursor.expectToken(.rparen);
+        return groups;
+    }
+
+    var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    errdefer {
+        plan_mod.freeExpressionPredicateGroups(alloc, groups.items);
+        groups.deinit(alloc);
+    }
+    try hooks.parse_condition_alternatives(hooks.ptr, &groups);
+    return try groups.toOwnedSlice(alloc);
+}
+
+fn andExpressionPredicateAlternatives(
+    alloc: std.mem.Allocator,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    alternatives: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+) !void {
+    if (groups.items.len == 0 or alternatives.len == 0) return error.UnsupportedSqlShape;
+    var combined = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    var combined_transferred = false;
+    errdefer {
+        if (!combined_transferred) plan_mod.freeExpressionPredicateGroups(alloc, combined.items);
+        combined.deinit(alloc);
+    }
+
+    for (groups.items) |base| {
+        for (alternatives) |alternative| {
+            const conditions = try plan_mod.cloneExpressionConditionsConcatAlloc(alloc, base.conditions, alternative.conditions);
+            var conditions_transferred = false;
+            errdefer if (!conditions_transferred) {
+                freeExpressionConditions(alloc, conditions);
+                if (conditions.len > 0) alloc.free(conditions);
+            };
+            try combined.append(alloc, .{ .conditions = conditions });
+            conditions_transferred = true;
+        }
+    }
+
+    plan_mod.freeExpressionPredicateGroups(alloc, groups.items);
+    groups.deinit(alloc);
+    groups.* = combined;
+    combined_transferred = true;
+}
+
+pub fn parseDomainCheckConstraintAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    constraint_name: ?[]const u8,
+    field_type: runtime_schema.AntflyType,
+    hooks: DdlDomainHooks,
+) !runtime_schema.RelationalCheck {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    const value_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(value_token.text, "value")) return error.UnsupportedSqlShape;
+    const op = try lower_expr.parseComparisonOp(tokens, pos);
+    const value_json = if (op == .is_null or op == .is_not_null)
+        null
+    else
+        try hooks.parse_check_value_json(hooks.ptr, field_type);
+    var value_transferred = false;
+    errdefer if (!value_transferred) if (value_json) |value| alloc.free(value);
+    try cursor.expectToken(.rparen);
+    const name = if (constraint_name) |name|
+        try alloc.dupe(u8, name)
+    else
+        try std.fmt.allocPrint(alloc, "domain_value_{s}_check", .{relationalCheckOpToken(op)});
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const field = try alloc.dupe(u8, "VALUE");
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    name_transferred = true;
+    field_transferred = true;
+    value_transferred = true;
+    return .{ .name = name, .field = field, .op = op, .value_json = value_json };
+}
+
+pub fn parseCreateDomainPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlDomainHooks,
+) !CreateDomainPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var header = try grammar.parseCreateDomainHeaderAlloc(alloc, tokens, pos);
+    var header_transferred = false;
+    errdefer if (!header_transferred) header.deinit(alloc);
+    const ddl_type = try grammar.parseDdlType(tokens, pos);
+    var not_null = false;
+    var default_value: ?runtime_schema.RelationalDefaultValue = null;
+    errdefer if (default_value) |default| alloc.free(default.value_json);
+    var checks = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+    errdefer {
+        clearDdlRelationalChecks(alloc, checks.items);
+        checks.deinit(alloc);
+    }
+    while (!cursor.atEnd() and !cursor.peekKind(.semicolon)) {
+        if (cursor.matchKeyword("default")) {
+            if (default_value != null) return error.UnsupportedSqlShape;
+            default_value = try hooks.parse_default_value(hooks.ptr, ddl_type.field_type);
+        } else if (cursor.matchKeyword("not")) {
+            try cursor.expectKeyword("null");
+            not_null = true;
+        } else if (cursor.matchKeyword("null")) {
+            not_null = false;
+        } else if (cursor.matchKeyword("constraint")) {
+            const constraint_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+            defer alloc.free(constraint_name);
+            const check = try parseDomainCheckConstraintAlloc(alloc, tokens, pos, constraint_name, ddl_type.field_type, hooks);
+            var check_transferred = false;
+            errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
+            try checks.append(alloc, check);
+            check_transferred = true;
+        } else if (cursor.matchKeyword("check")) {
+            const check = try parseDomainCheckConstraintAlloc(alloc, tokens, pos, null, ddl_type.field_type, hooks);
+            var check_transferred = false;
+            errdefer if (!check_transferred) freeDdlRelationalCheck(alloc, check);
+            try checks.append(alloc, check);
+            check_transferred = true;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+    const owned_checks = try checks.toOwnedSlice(alloc);
+    var checks_transferred = false;
+    errdefer if (!checks_transferred) freeDdlRelationalChecks(alloc, owned_checks);
+    const out_default = default_value;
+    default_value = null;
+    header_transferred = true;
+    checks_transferred = true;
+    return .{
+        .domain_name = header.domain_name,
+        .field_type = ddl_type.field_type,
+        .array_item_type = ddl_type.array_item_type,
+        .not_null = not_null,
+        .default_value = out_default,
+        .checks = owned_checks,
+    };
+}
+
 pub fn parseDdlColumnDefinitionStandaloneAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -5443,6 +6095,18 @@ pub fn parseCreateTablePlanAlloc(
     errdefer plan.deinit(alloc);
     try grammar.parseAdapterNoopStatementEnd(tokens, pos);
     return plan;
+}
+
+pub fn parseRelationLifetimePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    hooks: DdlColumnDefinitionHooks,
+) !RelationLifetimePlan {
+    const prefix = try grammar.parseRelationLifetimePrefix(tokens, pos);
+    var create_table = try parseCreateTablePlanAlloc(alloc, tokens, pos, hooks);
+    errdefer create_table.deinit(alloc);
+    return .{ .kind = prefix.kind, .create_table = create_table };
 }
 
 pub fn makeDdlForeignKeyAlloc(

@@ -22,6 +22,7 @@ const parser = @import("parser.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
+const value_mod = @import("value.zig");
 
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
 pub const RelationPopulationMode = grammar.RelationPopulationMode;
@@ -717,6 +718,549 @@ pub fn findCteByName(ctes: []const db_mod.types.RelationalRowsCte, name: []const
         if (std.mem.eql(u8, cte.name, name)) return cte;
     }
     return null;
+}
+
+pub const CteSelectParserHooks = struct {
+    ptr: *anyopaque,
+    parse_select: *const fn (
+        *anyopaque,
+        []const Token,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredSelect,
+};
+
+pub const RecursiveCteParserHooks = struct {
+    ptr: *anyopaque,
+    parse_select_with_set_boundary: *const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        []const db_mod.types.RelationalRowsCte,
+    ) anyerror!LoweredSelect,
+    select_output_columns: *const fn (
+        *anyopaque,
+        LoweredSelect,
+    ) anyerror![]runtime_schema.RelationalColumn,
+    parse_recursive_member: *const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        []const db_mod.types.RelationalRowsCte,
+        []const u8,
+    ) anyerror!LoweredRecursiveCteMemberPlan,
+};
+
+pub const RecursiveCteMemberParserHooks = struct {
+    ptr: *anyopaque,
+    parse_projection_expression: *const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        runtime_schema.TableSchema,
+        []const []const u8,
+        []const []const u8,
+    ) anyerror!RecursiveCteMemberProjectionExpression,
+    parse_join_on: *const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        runtime_schema.TableSchema,
+        bool,
+        bool,
+        db_mod.types.RelationalRowsJoinType,
+        []const u8,
+        []const u8,
+    ) anyerror![]const db_mod.types.RelationalRowsJoinOn,
+};
+
+pub const RecursiveCteMemberProjectionExpression = struct {
+    expression: db_mod.types.RelationalRowsExpression,
+    default_output: []const u8,
+};
+
+pub const SetOperationParserHooks = struct {
+    ptr: *anyopaque,
+    parse_left_select: *const fn (*anyopaque) anyerror!LoweredSelect,
+    parse_right_select: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!LoweredSelect,
+    select_output_columns: *const fn (
+        *anyopaque,
+        LoweredSelect,
+    ) anyerror![]runtime_schema.RelationalColumn,
+    parse_result_tail: *const fn (
+        *anyopaque,
+        LoweredSelect,
+    ) anyerror!SetOperationResultTail,
+};
+
+pub const SimpleSelectSetTailHooks = struct {
+    ptr: *anyopaque,
+    parse_order_by: *const fn (
+        *anyopaque,
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder),
+        SelectList,
+    ) anyerror!void,
+};
+
+pub fn parseCtesForPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    base_table_name: *?[]const u8,
+    hooks: CteSelectParserHooks,
+) ![]const db_mod.types.RelationalRowsCte {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("with");
+    var ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
+    errdefer {
+        for (ctes.items) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        ctes.deinit(alloc);
+    }
+
+    while (true) {
+        const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) alloc.free(cte_name);
+        if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
+        const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
+        defer strings.freeStringSlice(alloc, cte_column_aliases);
+        try cursor.expectKeyword("as");
+        try parser.consumeCteMaterializationHint(tokens, pos);
+        try cursor.expectToken(.lparen);
+        const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
+        var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], ctes.items);
+        errdefer lowered.deinit(alloc);
+        pos.* = close_index + 1;
+        try applyCteColumnAliasesAlloc(alloc, &lowered, cte_column_aliases);
+        try resolveSelectSourceForPlanAlloc(alloc, &lowered, ctes.items, base_table_name);
+        try ctes.append(alloc, .{
+            .name = cte_name,
+            .query = lowered.query,
+        });
+        lowered.query = .{};
+        lowered.clearSelectOutputs(alloc);
+        alloc.free(lowered.table_name);
+        lowered.table_name = "";
+        cte_name_transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+
+    return try ctes.toOwnedSlice(alloc);
+}
+
+pub fn parseSimpleSelectSetResultTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    lowered: *LoweredSelect,
+    hooks: SimpleSelectSetTailHooks,
+) !void {
+    var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+    errdefer {
+        freeOrderBy(alloc, order_by.items);
+        order_by.deinit(alloc);
+    }
+    const select = SelectList{
+        .fields = lowered.query.select,
+        .json_extract = lowered.query.json_extract,
+        .array_length = lowered.query.array_length,
+        .coalesce = lowered.query.coalesce,
+        .field_aliases = lowered.query.field_aliases,
+        .expressions = lowered.query.expressions,
+        .outputs = lowered.select_outputs,
+        .select_all = lowered.query.select_all,
+    };
+
+    while (!parser.atEnd(tokens, pos.*)) {
+        if (parser.matchKeyword(tokens, pos, "order")) {
+            if (order_by.items.len > 0) return error.UnsupportedSqlShape;
+            try parser.expectKeyword(tokens, pos, "by");
+            try hooks.parse_order_by(hooks.ptr, &order_by, select);
+        } else if (parser.matchKeyword(tokens, pos, "limit")) {
+            if (lowered.query.limit != null) return error.UnsupportedSqlShape;
+            lowered.query.limit = try value_mod.parseLimitValue(tokens, pos, params);
+        } else if (parser.matchKeyword(tokens, pos, "offset")) {
+            if (lowered.query.offset != 0) return error.UnsupportedSqlShape;
+            lowered.query.offset = try value_mod.parseOffsetValue(tokens, pos, params);
+        } else if (parser.matchKeyword(tokens, pos, "fetch")) {
+            if (lowered.query.limit != null) return error.UnsupportedSqlShape;
+            lowered.query.limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
+        } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
+            if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    if (order_by.items.len > 0) {
+        lowered.query.order_by = try order_by.toOwnedSlice(alloc);
+    }
+}
+
+pub fn parseSetOperationPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    right_schema: runtime_schema.TableSchema,
+    allow_distinct_table_names: bool,
+    hooks: SetOperationParserHooks,
+) !LoweredSetOperationPlan {
+    if (parser.peekKeyword(tokens, pos.*, "with")) return error.UnsupportedSqlShape;
+
+    var left = try hooks.parse_left_select(hooks.ptr);
+    errdefer left.deinit(alloc);
+    const left_columns = try hooks.select_output_columns(hooks.ptr, left);
+    var left_columns_transferred = false;
+    errdefer if (!left_columns_transferred) freeSetOperationOutputColumns(alloc, left_columns);
+    if (parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
+
+    const op = try grammar.parseSelectSetOperation(tokens, pos);
+    var right = try hooks.parse_right_select(hooks.ptr, right_schema);
+    errdefer right.deinit(alloc);
+    const right_columns = try hooks.select_output_columns(hooks.ptr, right);
+    defer freeSetOperationOutputColumns(alloc, right_columns);
+
+    const tail = try hooks.parse_result_tail(hooks.ptr, left);
+    var tail_transferred = false;
+    errdefer if (!tail_transferred) {
+        freeOrderBy(alloc, tail.order_by);
+        if (tail.order_by.len > 0) alloc.free(tail.order_by);
+    };
+    if (!std.mem.eql(u8, left.table_name, right.table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
+    if (!setOperationColumnsCompatible(left_columns, right_columns)) return error.UnsupportedSqlShape;
+
+    const left_table_name = left.table_name;
+    left.table_name = "";
+    const right_table_name = right.table_name;
+    right.table_name = "";
+    left.clearSelectOutputs(alloc);
+    right.clearSelectOutputs(alloc);
+
+    var left_plan = LoweredQueryPlan{
+        .table_name = left_table_name,
+        .plan = .{ .query = left.query },
+    };
+    left.query = .{};
+    errdefer left_plan.deinit(alloc);
+
+    var right_plan = LoweredQueryPlan{
+        .table_name = right_table_name,
+        .plan = .{ .query = right.query },
+    };
+    right.query = .{};
+    errdefer right_plan.deinit(alloc);
+
+    left_columns_transferred = true;
+    tail_transferred = true;
+    return .{
+        .operation = op,
+        .left = left_plan,
+        .right = right_plan,
+        .output_columns = left_columns,
+        .order_by = tail.order_by,
+        .limit = tail.limit,
+        .offset = tail.offset,
+        .max_rows = db_mod.types.default_relational_rows_cte_max_rows,
+        .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
+        .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
+    };
+}
+
+fn setOperationColumnsCompatible(
+    lhs: []const runtime_schema.RelationalColumn,
+    rhs: []const runtime_schema.RelationalColumn,
+) bool {
+    if (lhs.len == 0 or lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name)) return false;
+        if (left.field_type != right.field_type) return false;
+        if (left.array_item_type != right.array_item_type) return false;
+    }
+    return true;
+}
+
+pub fn parseRecursiveCteMemberPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+    cte_name: []const u8,
+    hooks: RecursiveCteMemberParserHooks,
+) !LoweredRecursiveCteMemberPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("select");
+    const projection_start = pos.*;
+    const from_index = parser.findTopLevelKeywordFromIndex(tokens, projection_start, "from") orelse return error.UnsupportedSqlShape;
+    pos.* = from_index;
+
+    try cursor.expectKeyword("from");
+    const left_table = try parseTableAliasAlloc(alloc, tokens, pos);
+    defer freeTableAlias(alloc, left_table);
+
+    const join_type: db_mod.types.RelationalRowsJoinType = if (parser.matchKeyword(tokens, pos, "left")) blk: {
+        _ = parser.matchKeyword(tokens, pos, "outer");
+        try cursor.expectKeyword("join");
+        break :blk .left;
+    } else blk: {
+        _ = parser.matchKeyword(tokens, pos, "inner");
+        try cursor.expectKeyword("join");
+        break :blk .inner;
+    };
+    const right_table = try parseTableAliasAlloc(alloc, tokens, pos);
+    defer freeTableAlias(alloc, right_table);
+    if (std.mem.eql(u8, left_table.alias, right_table.alias)) return error.UnsupportedSqlShape;
+
+    const left_is_cte = std.mem.eql(u8, left_table.name, cte_name);
+    const right_is_cte = std.mem.eql(u8, right_table.name, cte_name);
+    if (left_is_cte == right_is_cte) return error.UnsupportedSqlShape;
+    if (join_type != .inner) return error.UnsupportedSqlShape;
+    const base_table = if (left_is_cte) right_table else left_table;
+    const recursive_table = if (left_is_cte) left_table else right_table;
+
+    const planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, schema, available_ctes);
+    defer relational_rows.freeRowsPlannedCtes(alloc, planned_ctes);
+    const cte_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, cte_name) orelse return error.UnsupportedSqlShape;
+    const target_qualifiers = [_][]const u8{ base_table.name, base_table.alias };
+    const source_qualifiers = [_][]const u8{ recursive_table.name, recursive_table.alias };
+    const projections = try parseRecursiveCteMemberProjectionsAlloc(
+        alloc,
+        tokens[projection_start..from_index],
+        cte_schema,
+        target_qualifiers[0..],
+        source_qualifiers[0..],
+        hooks,
+    );
+    errdefer freeExpressionProjections(alloc, projections);
+
+    try cursor.expectKeyword("on");
+    const on = try hooks.parse_join_on(
+        hooks.ptr,
+        tokens,
+        pos,
+        cte_schema,
+        left_is_cte,
+        right_is_cte,
+        join_type,
+        left_table.alias,
+        right_table.alias,
+    );
+    errdefer {
+        freeJoinOn(alloc, on);
+        if (on.len > 0) alloc.free(on);
+    }
+
+    const left_table_name = try alloc.dupe(u8, left_table.name);
+    errdefer alloc.free(left_table_name);
+    const right_table_name = try alloc.dupe(u8, right_table.name);
+    errdefer alloc.free(right_table_name);
+    return .{ .join = .{
+        .left_table_name = left_table_name,
+        .right_table_name = right_table_name,
+        .join_type = join_type,
+        .on = on,
+        .projections = projections,
+    } };
+}
+
+pub fn parseRecursiveCteMemberProjectionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte_schema: runtime_schema.TableSchema,
+    target_qualifiers: []const []const u8,
+    source_qualifiers: []const []const u8,
+    hooks: RecursiveCteMemberParserHooks,
+) ![]const db_mod.types.RelationalRowsExpressionProjection {
+    var pos: usize = 0;
+    var projections = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+    errdefer {
+        freeExpressionProjections(alloc, projections.items);
+        projections.deinit(alloc);
+    }
+    while (true) {
+        const parsed = try hooks.parse_projection_expression(
+            hooks.ptr,
+            tokens,
+            &pos,
+            cte_schema,
+            target_qualifiers,
+            source_qualifiers,
+        );
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, parsed.expression);
+        const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, &pos, parsed.default_output);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        try projections.append(alloc, .{ .output = output, .expression = parsed.expression });
+        expression_transferred = true;
+        output_transferred = true;
+        if (parser.matchToken(tokens, &pos, .comma) == null) break;
+    }
+    if (!parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    return try projections.toOwnedSlice(alloc);
+}
+
+pub fn parseRecursiveCtePlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: RecursiveCteParserHooks,
+) !LoweredRecursiveCtePlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("with");
+    try cursor.expectKeyword("recursive");
+
+    const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var cte_name_transferred = false;
+    errdefer if (!cte_name_transferred) alloc.free(cte_name);
+
+    const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
+    defer strings.freeStringSlice(alloc, cte_column_aliases);
+    try cursor.expectKeyword("as");
+    try parser.consumeCteMaterializationHint(tokens, pos);
+    try cursor.expectToken(.lparen);
+
+    const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
+    const body_tokens = tokens[pos.*..close_index];
+    var body_pos: usize = 0;
+    var anchor = try hooks.parse_select_with_set_boundary(hooks.ptr, body_tokens, &body_pos, &.{});
+    errdefer anchor.deinit(alloc);
+    const output_columns = try hooks.select_output_columns(hooks.ptr, anchor);
+    var output_columns_transferred = false;
+    errdefer if (!output_columns_transferred) freeSetOperationOutputColumns(alloc, output_columns);
+    try applyRecursiveCteOutputColumnAliasesAlloc(alloc, output_columns, cte_column_aliases);
+    try applyCteColumnAliasesAlloc(alloc, &anchor, cte_column_aliases);
+    var base_table_name: ?[]const u8 = null;
+    defer if (base_table_name) |name| alloc.free(name);
+    try resolveSelectSourceForPlanAlloc(alloc, &anchor, &.{}, &base_table_name);
+    if (body_pos >= body_tokens.len) return error.UnsupportedSqlShape;
+    const operation = try grammar.parseSelectSetOperation(body_tokens, &body_pos);
+    switch (operation) {
+        .union_all, .union_distinct => {},
+        .intersect, .except => return error.UnsupportedSqlShape,
+    }
+    const recursive_member_references_cte = tokensContainTopLevelSourceName(body_tokens[body_pos..], cte_name);
+    if (!recursive_member_references_cte) return error.UnsupportedSqlShape;
+
+    const recursive_member_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = cte_name,
+        .query = anchor.query,
+    }};
+    var recursive_member = try hooks.parse_recursive_member(hooks.ptr, body_tokens, &body_pos, recursive_member_ctes[0..], cte_name);
+    errdefer recursive_member.deinit(alloc);
+    try applyRecursiveCteMemberOutputColumnsAlloc(alloc, &recursive_member, output_columns);
+    if (body_pos != body_tokens.len) return error.UnsupportedSqlShape;
+
+    pos.* = close_index + 1;
+    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+
+    if (!cursor.peekKeyword("select")) return error.UnsupportedSqlShape;
+    if (!tokensContainTopLevelSourceName(tokens[pos.*..], cte_name)) return error.UnsupportedSqlShape;
+
+    const final_ctes = [_]db_mod.types.RelationalRowsCte{.{
+        .name = cte_name,
+        .query = anchor.query,
+    }};
+    var final = try hooks.parse_select_with_set_boundary(hooks.ptr, tokens, pos, final_ctes[0..]);
+    errdefer final.deinit(alloc);
+    var final_base_table_name: ?[]const u8 = null;
+    defer if (final_base_table_name) |name| alloc.free(name);
+    try resolveSelectSourceForPlanAlloc(alloc, &final, final_ctes[0..], &final_base_table_name);
+    if (!std.mem.eql(u8, final.query.source_cte, cte_name)) return error.UnsupportedSqlShape;
+    if (cursor.matchToken(.semicolon) != null and pos.* != tokens.len) return error.UnsupportedSqlShape;
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+
+    const anchor_table_name = anchor.table_name;
+    anchor.table_name = "";
+    anchor.clearSelectOutputs(alloc);
+    var anchor_plan = LoweredQueryPlan{
+        .table_name = anchor_table_name,
+        .plan = .{ .query = anchor.query },
+    };
+    anchor.query = .{};
+    errdefer anchor_plan.deinit(alloc);
+
+    var final_query = final.query;
+    final.query = .{};
+    final.clearSelectOutputs(alloc);
+    alloc.free(final.table_name);
+    final.table_name = "";
+    errdefer final_query.deinit(alloc);
+
+    cte_name_transferred = true;
+    output_columns_transferred = true;
+    return .{
+        .cte_name = cte_name,
+        .operation = operation,
+        .anchor = anchor_plan,
+        .recursive_member = recursive_member,
+        .final_query = final_query,
+        .output_columns = output_columns,
+        .recursive_member_references_cte = recursive_member_references_cte,
+        .max_rows = db_mod.types.default_relational_rows_cte_max_rows,
+        .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
+        .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
+    };
+}
+
+fn applyRecursiveCteOutputColumnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    columns: []const runtime_schema.RelationalColumn,
+    aliases: []const []const u8,
+) !void {
+    if (aliases.len == 0) return;
+    if (aliases.len != columns.len) return error.UnsupportedSqlShape;
+    for (columns, aliases) |*column_const, alias| {
+        const column: *runtime_schema.RelationalColumn = @constCast(column_const);
+        const owned_alias = try alloc.dupe(u8, alias);
+        errdefer alloc.free(owned_alias);
+        alloc.free(column.name);
+        column.name = owned_alias;
+    }
+}
+
+fn applyRecursiveCteMemberOutputColumnsAlloc(
+    alloc: std.mem.Allocator,
+    member: *LoweredRecursiveCteMemberPlan,
+    output_columns: []const runtime_schema.RelationalColumn,
+) !void {
+    switch (member.*) {
+        .join => |*join| {
+            if (join.projections.len != output_columns.len) return error.UnsupportedSqlShape;
+            const projections = @constCast(join.projections);
+            for (projections, output_columns) |*projection, column| {
+                const output = try alloc.dupe(u8, column.name);
+                alloc.free(@constCast(projection.output));
+                projection.output = output;
+            }
+        },
+    }
+}
+
+fn tokensContainTopLevelSourceName(tokens: []const Token, name: []const u8) bool {
+    var depth: usize = 0;
+    var previous_source_keyword = false;
+    for (tokens) |token| {
+        switch (token.kind) {
+            .lparen => {
+                depth += 1;
+                previous_source_keyword = false;
+            },
+            .rparen => {
+                if (depth > 0) depth -= 1;
+                previous_source_keyword = false;
+            },
+            .identifier => {
+                if (depth == 0 and previous_source_keyword and std.ascii.eqlIgnoreCase(token.text, name)) return true;
+                previous_source_keyword = depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "from") or std.ascii.eqlIgnoreCase(token.text, "join"));
+            },
+            else => previous_source_keyword = false,
+        }
+    }
+    return false;
 }
 
 pub fn resolveSelectSourceForPlanAlloc(

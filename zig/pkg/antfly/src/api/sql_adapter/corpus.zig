@@ -4299,6 +4299,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_drop: bool = false,
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
+    ddl_procedure_noop_body: bool = false,
     ddl_procedure_drop: bool = false,
     ddl_procedure_drop_cascade: bool = false,
     ddl_role_create: bool = false,
@@ -4344,6 +4345,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_disable: bool = false,
     ddl_row_security_create_policy: bool = false,
     ddl_row_security_conjunction_policy: bool = false,
+    ddl_row_security_disjunction_policy: bool = false,
     ddl_row_security_check_policy: bool = false,
     ddl_row_security_literal_policy: bool = false,
     ddl_row_security_targeted_policy: bool = false,
@@ -4535,8 +4537,8 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_cascade_action: bool = false,
     ddl_temporal_fk_update_cascade_action: bool = false,
     unsupported_ddl_routine_function_body: bool = false,
-    unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
+    unsupported_ddl_routine_procedure_body: bool = false,
     unsupported_write: bool = false,
     unsupported_write_recursive_cte_insert: bool = false,
     unsupported_write_recursive_cte_update: bool = false,
@@ -5801,14 +5803,14 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
                     std.mem.indexOf(u8, entry.sql, " AS ") != null);
-            self.unsupported_ddl_routine_procedure_body = self.unsupported_ddl_routine_procedure_body or
-                (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
-                    std.mem.startsWith(u8, entry.sql, "CREATE PROCEDURE ") and
-                    std.mem.indexOf(u8, entry.sql, " AS ") != null);
             self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
                     std.mem.indexOf(u8, entry.sql, " SUPPORT ") != null);
+            self.unsupported_ddl_routine_procedure_body = self.unsupported_ddl_routine_procedure_body or
+                (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
+                    std.mem.startsWith(u8, entry.sql, "CREATE PROCEDURE ") and
+                    std.mem.indexOf(u8, entry.sql, " AS ") != null);
             self.unsupported_ddl_system_time_temporal_table = self.unsupported_ddl_system_time_temporal_table or
                 (std.mem.eql(u8, entry.classification_reason, "system_time_temporal_table") and
                     std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
@@ -6002,7 +6004,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_drop = true;
                     self.ddl_function_drop_cascade = self.ddl_function_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
                 },
-                .create_procedure => self.ddl_procedure_create = true,
+                .create_procedure => {
+                    self.ddl_procedure_create = true;
+                    self.ddl_procedure_noop_body = self.ddl_procedure_noop_body or
+                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_procedure:hook=procedure_noop") != null;
+                },
                 .drop_procedure => {
                     self.ddl_procedure_drop = true;
                     self.ddl_procedure_drop_cascade = self.ddl_procedure_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
@@ -6084,6 +6090,7 @@ pub const AppParityCorpusCoverage = struct {
                 .create_row_policy => {
                     self.ddl_row_security_create_policy = true;
                     self.ddl_row_security_conjunction_policy = self.ddl_row_security_conjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=and:") != null;
+                    self.ddl_row_security_disjunction_policy = self.ddl_row_security_disjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=or:") != null;
                     self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or std.mem.indexOf(u8, entry.plan, ":check=") != null;
                     self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
                     self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or std.mem.indexOf(u8, entry.plan, ":roles=") != null;

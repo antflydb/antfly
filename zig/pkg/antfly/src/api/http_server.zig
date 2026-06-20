@@ -1528,10 +1528,15 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
         fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
 
         fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
-            try self.jobs.append(
-                std.testing.allocator,
-                try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record),
-            );
+            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+            for (self.jobs.items) |*existing| {
+                if (existing.job_id != record.job_id) continue;
+                metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing.*);
+                existing.* = owned;
+                return;
+            }
+            try self.jobs.append(std.testing.allocator, owned);
         }
     };
 
@@ -1566,6 +1571,7 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
 
     var service = FakeService{};
     defer service.deinit(alloc);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
     applied.deinit(alloc);
 
@@ -1647,10 +1653,15 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
         }
 
         pub fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
-            try self.jobs.append(
-                std.testing.allocator,
-                try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record),
-            );
+            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+            for (self.jobs.items) |*existing| {
+                if (existing.job_id != record.job_id) continue;
+                metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, existing.*);
+                existing.* = owned;
+                return;
+            }
+            try self.jobs.append(std.testing.allocator, owned);
         }
 
         pub fn runRound(self: *@This()) !void {
@@ -1677,6 +1688,7 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
     );
     defer applied.deinit(alloc);
     try service.upsertTable(applied.table);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
     try service.runRound();
 
@@ -20211,8 +20223,11 @@ test "api http server applies authorization SQL DDL through user manager" {
     defer routine.deinit(alloc);
     var routine_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_normalized_policy ON usage_records USING (normalize_status(status) = 'active');");
     defer routine_policy.deinit(alloc);
+    var disjunction_policy = try server.applyRelationalSqlDdl("CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');");
+    defer disjunction_policy.deinit(alloc);
     try std.testing.expectError(error.TableNotFound, server.applyRelationalSqlDdl("CREATE POLICY missing_tenant_policy ON missing_records USING (tenant_id = 'tenant-a');"));
     try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdl("CREATE POLICY missing_column_policy ON usage_records USING (missing_tenant = 'tenant-a');"));
+    try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdl("CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');"));
 
     try auth.manager.addRoleToUser("alice", "role:app_writer");
     try std.testing.expect(try auth.manager.enforce("alice", .table, "default.public.usage_records", .read));
@@ -20226,6 +20241,9 @@ test "api http server applies authorization SQL DDL through user manager" {
     try std.testing.expect(std.mem.indexOf(u8, stored_routine_policy, "\"expression_where\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored_routine_policy, "\"op\":\"lower\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, stored_routine_policy, "\"field\":\"status\"") != null);
+    const stored_disjunction_policy = try auth.manager.getSqlRowSecurityPolicy("usage_records_or_policy", "default.public.usage_records");
+    defer alloc.free(stored_disjunction_policy);
+    try std.testing.expectEqualStrings("{\"disjuncts\":[{\"term\":{\"tenant_id\":\"tenant-a\"}},{\"term\":{\"status\":\"active\"}}]}", stored_disjunction_policy);
     try std.testing.expect(try auth.manager.sqlRowSecurityEnabled("default.public.usage_records"));
 
     var altered_policy = try server.applyRelationalSqlDdl("ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');");
@@ -20246,6 +20264,9 @@ test "api http server applies authorization SQL DDL through user manager" {
     var dropped_routine_policy = try server.applyRelationalSqlDdl("DROP POLICY usage_records_normalized_policy ON usage_records;");
     defer dropped_routine_policy.deinit(alloc);
     try std.testing.expectError(error.RowFilterNotFound, auth.manager.getSqlRowSecurityPolicy("usage_records_normalized_policy", "default.public.usage_records"));
+    var dropped_disjunction_policy = try server.applyRelationalSqlDdl("DROP POLICY usage_records_or_policy ON usage_records;");
+    defer dropped_disjunction_policy.deinit(alloc);
+    try std.testing.expectError(error.RowFilterNotFound, auth.manager.getSqlRowSecurityPolicy("usage_records_or_policy", "default.public.usage_records"));
     var dropped_routine = try server.applyRelationalSqlDdl("DROP FUNCTION normalize_status(text);");
     defer dropped_routine.deinit(alloc);
     var dropped_policy_if_exists = try server.applyRelationalSqlDdl("DROP POLICY IF EXISTS usage_records_tenant_policy ON usage_records;");
@@ -20674,6 +20695,7 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
         applied: usize = 0,
         last_pending: bool = false,
         last_committed: bool = false,
+        last_aborted: bool = false,
 
         fn iface(self: *@This()) StatusSource {
             return .{
@@ -20706,6 +20728,7 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
             self.applied += 1;
             self.last_pending = result.status == .pending;
             self.last_committed = result.status == .committed;
+            self.last_aborted = result.status == .aborted;
             return result;
         }
     };
@@ -20727,10 +20750,30 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
     try std.testing.expectEqual(@as(usize, 2), source.applied);
     try std.testing.expect(source.last_committed);
 
+    var committed_retry = try server.applyRelationalSqlDdlWithSession("COMMIT PREPARED 'usage_batch';", &session);
+    defer committed_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), source.applied);
+    try std.testing.expect(source.last_committed);
+
     try std.testing.expectError(
         error.PreparedTransactionDecisionConflict,
         server.applyRelationalSqlDdlWithSession("ROLLBACK PREPARED 'usage_batch';", &session),
     );
+
+    var abort_prepared = try server.applyRelationalSqlDdlWithSession("PREPARE TRANSACTION 'usage_abort';", &session);
+    defer abort_prepared.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 4), source.applied);
+    try std.testing.expect(source.last_pending);
+
+    var aborted = try server.applyRelationalSqlDdlWithSession("ROLLBACK PREPARED 'usage_abort';", &session);
+    defer aborted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), source.applied);
+    try std.testing.expect(source.last_aborted);
+
+    var aborted_retry = try server.applyRelationalSqlDdlWithSession("ROLLBACK PREPARED 'usage_abort';", &session);
+    defer aborted_retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 6), source.applied);
+    try std.testing.expect(source.last_aborted);
 }
 
 test "api http server applies prepared statement SQL plans to session runtime" {
@@ -21217,13 +21260,15 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
     defer created_routine.deinit(alloc);
 
     var created_table = try server.applyRelationalSqlDdlWithSession(
-        "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED);",
+        "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED, CONSTRAINT usage_records_status_check CHECK (normalize_status(status) != 'deleted'));",
         &session,
     );
     defer created_table.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 1), source.binding_aware_calls);
     try std.testing.expect(std.mem.indexOf(u8, created_table.table.schema_json, "\"generated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created_table.table.schema_json, "\"checks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, created_table.table.schema_json, "usage_records_status_check") != null);
     try std.testing.expect(std.mem.indexOf(u8, created_table.table.schema_json, "\"op\":\"lower\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, created_table.table.schema_json, "\"field\":\"status\"") != null);
 }

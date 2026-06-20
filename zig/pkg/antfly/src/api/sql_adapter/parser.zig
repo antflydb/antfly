@@ -174,8 +174,14 @@ pub fn consumeCteMaterializationHint(tokens: []const Token, pos: *usize) !void {
 }
 
 pub fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
+    return findTopLevelKeywordFromIndex(tokens, 0, keyword);
+}
+
+pub fn findTopLevelKeywordFromIndex(tokens: []const Token, start: usize, keyword: []const u8) ?usize {
     var depth: usize = 0;
-    for (tokens, 0..) |token, i| {
+    var i = start;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
         switch (token.kind) {
             .lparen => depth += 1,
             .rparen => {
