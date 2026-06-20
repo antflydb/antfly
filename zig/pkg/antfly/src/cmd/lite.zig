@@ -188,6 +188,9 @@ fn lookup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
             key = args.next();
         } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
             file_path = args.next();
+        } else if (std.mem.eql(u8, arg, "--readonly")) {
+            // Lookup always uses a query-readonly handle; accept the flag so
+            // scripts can spell the mode explicitly.
         } else if (!std.mem.startsWith(u8, arg, "-") and key == null) {
             key = arg;
         } else {
@@ -213,7 +216,7 @@ fn lookup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
 fn scan(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
-    const file_path = parseFileFlag(args);
+    const file_path = parseReadFileFlag(args);
 
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
@@ -229,7 +232,7 @@ fn scan(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !voi
 fn query(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
-    const file_path = parseFileFlag(args);
+    const file_path = parseReadFileFlag(args);
 
     const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
     defer allocator.free(body);
@@ -857,6 +860,21 @@ fn parseFileFlag(args: *std.process.Args.Iterator) []const u8 {
     return file_path orelse cli.fatal("--file is required", .{});
 }
 
+fn parseReadFileFlag(args: *std.process.Args.Iterator) []const u8 {
+    var file_path: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
+            file_path = args.next();
+        } else if (std.mem.eql(u8, arg, "--readonly")) {
+            // Read commands already open query-readonly; this flag documents
+            // intent and keeps Lite CLI examples portable.
+        } else {
+            cli.fatal("unknown argument: {s}", .{arg});
+        }
+    }
+    return file_path orelse cli.fatal("--file is required", .{});
+}
+
 fn parseOutFlag(args: *std.process.Args.Iterator) []const u8 {
     var out_path: ?[]const u8 = null;
     while (args.next()) |arg| {
@@ -994,9 +1012,9 @@ fn printUsage(argv0: []const u8) void {
         \\  init <db.aflite>
         \\  status <db.aflite>
         \\  batch <db.aflite> --file request.json
-        \\  lookup <db.aflite> --key <key> [--file request.json]
-        \\  scan <db.aflite> --file request.json
-        \\  query <db.aflite> --file request.json
+        \\  lookup <db.aflite> --key <key> [--file request.json] [--readonly]
+        \\  scan <db.aflite> --file request.json [--readonly]
+        \\  query <db.aflite> --file request.json [--readonly]
         \\  index list <db.aflite>
         \\  index create <db.aflite> --file index.json
         \\  index drop <db.aflite> --index <name>
@@ -1033,6 +1051,12 @@ test "lite restore source validation accepts afb and aflite" {
     try requireRestoreSourcePath("app.afb");
     try requireRestoreSourcePath("app.aflite");
     try std.testing.expectError(error.InvalidArguments, requireRestoreSourcePath("app.db"));
+}
+
+test "lite read file parser accepts explicit readonly flag" {
+    const argv = [_][*:0]const u8{ "--readonly", "--file", "query.json" };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectEqualStrings("query.json", parseReadFileFlag(&args));
 }
 
 test "lite backup writer handles absolute output paths" {
