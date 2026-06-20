@@ -19,6 +19,8 @@ const platform_sync = @import("antfly_platform").sync;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_erased = @import("../backend_erased.zig");
 const backend_types = @import("../backend_types.zig");
+const change_journal_mod = @import("../db/derived/change_journal.zig");
+const internal_keys = @import("../internal_keys.zig");
 const native = @import("native.zig");
 
 const Allocator = std.mem.Allocator;
@@ -59,7 +61,7 @@ pub const Store = struct {
     }
 
     pub fn runtimeStore(self: *Store, allocator: Allocator) !backend_erased.Store {
-        return try backend_erased.storeFrom(allocator, self.backendStore());
+        return try backend_erased.storeFrom(allocator, RuntimeStore{ .store = self });
     }
 
     pub fn vacuum(self: *Store) !native.VacuumReport {
@@ -121,6 +123,176 @@ pub const Store = struct {
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Txn {
         _ = options;
         return try self.beginBatch();
+    }
+
+    pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
+        const next = self.nextReplaySequence(fallback_last + 1);
+        return if (next <= 1) 0 else next - 1;
+    }
+
+    pub fn nextReplaySequence(self: *Store, fallback_next: u64) u64 {
+        var read = self.beginRead() catch return fallback_next;
+        defer read.abort();
+        const raw = read.get(internal_keys.replay_meta_next_sequence_key[0..]) catch return fallback_next;
+        if (raw.len != 8) return fallback_next;
+        return std.mem.readInt(u64, raw[0..8], .little);
+    }
+
+    pub fn appendReplayOpaque(self: *Store, alloc: Allocator, sequence: u64, payload: []const u8) !void {
+        _ = alloc;
+        var txn = try self.beginWrite();
+        errdefer txn.abort();
+        try txn.setReplayOpaque(sequence, payload);
+        try txn.commit();
+    }
+
+    pub fn iterateReplayFrom(self: *Store, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
+        var entries = std.ArrayListUnmanaged(backend_types.ReplayEntry).empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(alloc);
+            entries.deinit(alloc);
+        }
+
+        const Context = struct {
+            allocator: Allocator,
+            entries: *std.ArrayListUnmanaged(backend_types.ReplayEntry),
+
+            fn handle(ctx: *@This(), sequence: u64, payload: []const u8) !void {
+                try ctx.entries.append(ctx.allocator, .{
+                    .sequence = sequence,
+                    .payload = try ctx.allocator.dupe(u8, payload),
+                });
+            }
+        };
+        const Adapter = struct {
+            fn handle(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+                const ctx: *Context = @ptrCast(@alignCast(ptr));
+                try Context.handle(ctx, sequence, payload);
+            }
+        };
+
+        var ctx = Context{
+            .allocator = alloc,
+            .entries = &entries,
+        };
+        _ = try self.forEachReplayLaneFrom(internal_keys.replay_all_kind, from_sequence, 0, &ctx, Adapter.handle);
+        return try entries.toOwnedSlice(alloc);
+    }
+
+    pub fn forEachReplayLaneFrom(
+        self: *Store,
+        kind_ordinal: u8,
+        from_sequence: u64,
+        max_entries: usize,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+    ) !backend_types.ReplayLaneIterationStats {
+        var read = try self.beginRead();
+        defer read.abort();
+        _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return error.ReplayIndexUnavailable;
+
+        var cursor = try read.openCursor();
+        defer cursor.close();
+
+        const lower = internal_keys.replayRangeLower(kind_ordinal, from_sequence);
+        const upper = internal_keys.replayRangeUpper(kind_ordinal);
+        cursor.setUpperBound(upper[0..]);
+
+        var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
+        var entry = cursor.seekAtOrAfter(lower[0..]) catch return stats;
+        while (true) {
+            if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
+            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
+            try callback(callback_ctx, sequence, entry.value);
+            stats.scanned_entries += 1;
+            stats.matched_entries += 1;
+            stats.last_sequence = sequence;
+            if (max_entries != 0 and stats.matched_entries >= max_entries) break;
+            entry = cursor.next() catch break;
+        }
+        return stats;
+    }
+
+    pub fn truncateReplayUpTo(self: *Store, alloc: Allocator, up_to_sequence: u64) !void {
+        if (up_to_sequence == 0) return;
+
+        var deletes = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (deletes.items) |key| alloc.free(key);
+            deletes.deinit(alloc);
+        }
+
+        {
+            var read = try self.beginRead();
+            defer read.abort();
+            _ = read.get(internal_keys.replay_meta_init_key[0..]) catch return;
+
+            try collectReplayDeletes(alloc, &read, internal_keys.replay_all_kind, up_to_sequence, &deletes);
+            for (replay_hints) |hint| {
+                try collectReplayDeletes(alloc, &read, replayHintOrdinal(hint), up_to_sequence, &deletes);
+            }
+        }
+
+        if (deletes.items.len == 0) return;
+        var write = try self.beginWrite();
+        errdefer write.abort();
+        for (deletes.items) |key| try write.delete(key);
+        try write.commit();
+    }
+};
+
+const RuntimeStore = struct {
+    store: *Store,
+
+    pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
+        return Store.capabilities(self.store);
+    }
+
+    pub fn beginRead(self: *RuntimeStore) !Txn {
+        return try self.store.beginRead();
+    }
+
+    pub fn beginWrite(self: *RuntimeStore) !Txn {
+        return try self.store.beginWrite();
+    }
+
+    pub fn beginBatch(self: *RuntimeStore) !Txn {
+        return try self.store.beginBatch();
+    }
+
+    pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
+        return try self.store.beginBatchWithOptions(options);
+    }
+
+    pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
+        return self.store.lastReplaySequence(fallback_last);
+    }
+
+    pub fn nextReplaySequence(self: *RuntimeStore, fallback_next: u64) u64 {
+        return self.store.nextReplaySequence(fallback_next);
+    }
+
+    pub fn appendReplayOpaque(self: *RuntimeStore, alloc: Allocator, sequence: u64, payload: []const u8) !void {
+        return try self.store.appendReplayOpaque(alloc, sequence, payload);
+    }
+
+    pub fn iterateReplayFrom(self: *RuntimeStore, alloc: Allocator, from_sequence: u64) ![]backend_types.ReplayEntry {
+        return try self.store.iterateReplayFrom(alloc, from_sequence);
+    }
+
+    pub fn forEachReplayLaneFrom(
+        self: *RuntimeStore,
+        kind_ordinal: u8,
+        from_sequence: u64,
+        max_entries: usize,
+        callback_ctx: *anyopaque,
+        callback: backend_erased.Store.ReplayCallback,
+    ) !backend_types.ReplayLaneIterationStats {
+        return try self.store.forEachReplayLaneFrom(kind_ordinal, from_sequence, max_entries, callback_ctx, callback);
+    }
+
+    pub fn truncateReplayUpTo(self: *RuntimeStore, alloc: Allocator, up_to_sequence: u64) !void {
+        return try self.store.truncateReplayUpTo(alloc, up_to_sequence);
     }
 };
 
@@ -233,6 +405,10 @@ pub const Txn = struct {
         try self.pending.append(self.allocator, .{ .key = owned_key });
     }
 
+    pub fn setReplayOpaque(self: *Txn, sequence: u64, payload: []const u8) !void {
+        try writeReplayEntries(self.allocator, self, sequence, payload);
+    }
+
     pub fn openCursor(self: *Txn) !Cursor {
         return .{ .txn = self };
     }
@@ -333,6 +509,155 @@ fn lowerBoundDocs(docs: []const native.OwnedDocument, key: []const u8) usize {
         }
     }
     return low;
+}
+
+const replay_hints = [_]change_journal_mod.TargetHint{
+    .enrichment,
+    .full_text,
+    .dense_vector,
+    .sparse_vector,
+    .graph,
+    .algebraic,
+    .resolution,
+    .promotion,
+};
+
+fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
+    return @intCast(@intFromEnum(hint));
+}
+
+fn encodeReplaySequence(sequence: u64) [8]u8 {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, sequence, .little);
+    return raw;
+}
+
+fn isEmbeddingReplayArtifactKey(key: []const u8) bool {
+    return internal_keys.isEmbeddingArtifactKey(key) or internal_keys.isDerivedEmbeddingArtifactKey(key);
+}
+
+fn appendReplayArtifactsForHint(
+    alloc: Allocator,
+    out: *std.ArrayListUnmanaged([]const u8),
+    artifact_keys: []const []const u8,
+    hint: change_journal_mod.TargetHint,
+) !void {
+    for (artifact_keys) |key| {
+        const keep = switch (hint) {
+            .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
+            .graph => internal_keys.isGraphEdgeArtifactKey(key) or
+                internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isResolutionArtifactKey(key),
+            .resolution => internal_keys.isAssetArtifactKey(key),
+            .promotion => internal_keys.isResolutionArtifactKey(key),
+            .enrichment, .full_text, .algebraic => false,
+        };
+        if (keep) try out.append(alloc, key);
+    }
+}
+
+fn encodeReplayPayloadForHint(
+    alloc: Allocator,
+    record: change_journal_mod.Record,
+    hint: change_journal_mod.TargetHint,
+) ![]u8 {
+    var target_hints = [_]change_journal_mod.TargetHint{hint};
+    var artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer artifact_keys.deinit(alloc);
+    try appendReplayArtifactsForHint(alloc, &artifact_keys, record.changed_artifact_keys, hint);
+
+    var filtered = change_journal_mod.Record{
+        .version = record.version,
+        .sequence = record.sequence,
+        .target_hints = target_hints[0..],
+    };
+    switch (hint) {
+        .enrichment => {
+            filtered.changed_doc_keys = record.changed_doc_keys;
+        },
+        .full_text, .algebraic => {
+            filtered.changed_doc_keys = record.changed_doc_keys;
+            filtered.deleted_doc_keys = record.deleted_doc_keys;
+            filtered.overwritten_doc_keys = record.overwritten_doc_keys;
+        },
+        .dense_vector, .sparse_vector => {
+            filtered.changed_doc_keys = record.changed_doc_keys;
+            filtered.deleted_doc_keys = record.deleted_doc_keys;
+            filtered.overwritten_doc_keys = record.overwritten_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
+        },
+        .graph, .resolution, .promotion => {
+            filtered.deleted_doc_keys = record.deleted_doc_keys;
+            filtered.changed_artifact_keys = artifact_keys.items;
+        },
+    }
+    return try change_journal_mod.encodeRecord(alloc, filtered);
+}
+
+fn writeOriginalReplayHintEntries(txn: anytype, sequence: u64, mask: u8, payload: []const u8) !void {
+    const latest_raw = encodeReplaySequence(sequence);
+    for (replay_hints) |hint| {
+        if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+        const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+        try txn.put(key[0..], payload);
+        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+        try txn.put(latest_key[0..], latest_raw[0..]);
+    }
+}
+
+fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []const u8) !void {
+    try txn.put(internal_keys.replay_meta_init_key[0..], "");
+    const next_raw = encodeReplaySequence(sequence + 1);
+    try txn.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
+    const latest_raw = encodeReplaySequence(sequence);
+
+    const all_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    try txn.put(all_key[0..], payload);
+    const all_latest_key = internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind);
+    try txn.put(all_latest_key[0..], latest_raw[0..]);
+
+    const mask = change_journal_mod.encodedRecordHintMask(payload) catch return;
+    if (mask == 0) return;
+
+    var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
+        try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
+        return;
+    };
+    defer decoded.deinit();
+
+    for (replay_hints) |hint| {
+        if ((mask & change_journal_mod.singleHintMask(hint)) == 0) continue;
+        const lane_payload = try encodeReplayPayloadForHint(alloc, decoded.record, hint);
+        defer alloc.free(lane_payload);
+        const key = internal_keys.replayEntryKey(replayHintOrdinal(hint), sequence);
+        try txn.put(key[0..], lane_payload);
+        const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
+        try txn.put(latest_key[0..], latest_raw[0..]);
+    }
+}
+
+fn collectReplayDeletes(
+    alloc: Allocator,
+    read: *Txn,
+    kind_ordinal: u8,
+    up_to_sequence: u64,
+    deletes: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var cursor = try read.openCursor();
+    defer cursor.close();
+
+    const lower = internal_keys.replayRangeLower(kind_ordinal, 0);
+    const upper = internal_keys.replayRangeUpper(kind_ordinal);
+    cursor.setUpperBound(upper[0..]);
+
+    var entry = cursor.seekAtOrAfter(lower[0..]) catch return;
+    while (true) {
+        if (std.mem.order(u8, entry.key, upper[0..]) != .lt) break;
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind_ordinal) orelse break;
+        if (sequence >= up_to_sequence) break;
+        try deletes.append(alloc, try alloc.dupe(u8, entry.key));
+        entry = cursor.next() catch break;
+    }
 }
 
 fn lockStore(store: *Store) void {

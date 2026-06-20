@@ -82,6 +82,7 @@ antfly_error_code antfly_db_get_raw(void *handle, antfly_slice key, antfly_buffe
 antfly_error_code antfly_db_get_schema_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_set_schema_json(void *handle, antfly_slice schema_json);
 antfly_error_code antfly_db_run_until_idle(void *handle);
+antfly_error_code antfly_db_pending_work_stats_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_list_indexes_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_db_add_index_json(void *handle, antfly_slice config_json);
 antfly_error_code antfly_db_delete_index(void *handle, antfly_slice name, bool *out_deleted);
