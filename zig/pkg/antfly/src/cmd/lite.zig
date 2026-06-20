@@ -158,7 +158,7 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     var lite = try LiteDb.open(allocator, path, .status_only);
     defer lite.close();
 
-    const json = try statusJson(allocator, &lite.db);
+    const json = try statusJson(allocator, &lite.db, .native);
     defer allocator.free(json);
     writeJsonLine(io, json);
 }
@@ -764,7 +764,7 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
     return try allocator.dupe(u8, response.json);
 }
 
-fn statusJson(allocator: Allocator, db: *db_mod.DB) ![]u8 {
+fn statusJson(allocator: Allocator, db: *db_mod.DB, profile: antfly.lite.backend.Profile) ![]u8 {
     const stats_value = try db.stats(allocator);
     defer db_types.freeDBStats(allocator, stats_value);
 
@@ -772,6 +772,8 @@ fn statusJson(allocator: Allocator, db: *db_mod.DB) ![]u8 {
     defer allocator.free(stats_json);
     const pending_json = try std.json.Stringify.valueAlloc(allocator, db.maintenanceDriver().pendingWorkStats(), .{});
     defer allocator.free(pending_json);
+    const capabilities_json = try std.json.Stringify.valueAlloc(allocator, antfly.lite.backend.capabilitiesForProfile(profile), .{});
+    defer allocator.free(capabilities_json);
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(allocator);
@@ -779,6 +781,8 @@ fn statusJson(allocator: Allocator, db: *db_mod.DB) ![]u8 {
     try out.appendSlice(allocator, stats_json);
     try out.appendSlice(allocator, ",\"pending_work\":");
     try out.appendSlice(allocator, pending_json);
+    try out.appendSlice(allocator, ",\"capabilities\":");
+    try out.appendSlice(allocator, capabilities_json);
     try out.append(allocator, '}');
     return try out.toOwnedSlice(allocator);
 }
@@ -1193,10 +1197,13 @@ test "lite status json includes pending work" {
     defer allocator.free(batch_response);
     try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":1") != null);
 
-    const json = try statusJson(allocator, &lite.db);
+    const json = try statusJson(allocator, &lite.db, .native);
     defer allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pending_work\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"manual_maintenance\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"background_enrichment_runtime\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"has_async_indexes\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"derived_target_sequence\":") != null);
 }
