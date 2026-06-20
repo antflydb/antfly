@@ -722,7 +722,7 @@ pub const NativeFile = struct {
         if (std.mem.eql(u8, self.path, dest_path)) return error.InvalidNativeSnapshotPath;
 
         const checkpoint = self.activeCheckpoint();
-        const snapshot_size = checkpoint.page_count * @as(u64, self.header.page_size);
+        const snapshot_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
         const source_size = (try self.file.stat(self.io_impl.io())).size;
         if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
         if (!replace and pathExists(self.io_impl.io(), dest_path)) return error.PathAlreadyExists;
@@ -2448,7 +2448,8 @@ test "lite native stable snapshot copies committed prefix without tail bytes" {
         try file.putIndexCatalogRecord("index/files/hbc/postings.bin", "index bytes");
         try file.putDocument("doc:1", "{\"title\":\"one\"}");
         const checkpoint = file.activeCheckpoint();
-        break :blk checkpoint.page_count * @as(u64, file.header.page_size);
+        try std.testing.expect(checkpoint.free_map_root_page != 0);
+        break :blk try checkpointPrefixSize(checkpoint, file.header.page_size);
     };
 
     {
@@ -2474,6 +2475,7 @@ test "lite native stable snapshot copies committed prefix without tail bytes" {
 
     var reopened = try NativeFile.open(allocator, snapshot_path, true);
     defer reopened.close();
+    try std.testing.expect(reopened.activeCheckpoint().free_map_root_page != 0);
 
     const schema = (try reopened.getCatalogRecordAlloc(allocator, "schema")).?;
     defer allocator.free(schema);

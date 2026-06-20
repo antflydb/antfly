@@ -144,8 +144,13 @@ the v1 target, not a v2 candidate.
 
 Directory-backed LSM storage should remain available as an internal development,
 debug, and conformance-test profile. LSM-container storage should be treated the
-same way unless it is explicitly retained as a compatibility importer. Neither
-should be the public Lite v1 contract.
+same way. Neither should be the public Lite v1 contract.
+
+Because this is new, unreleased code, v1 should not carry a legacy fallback or
+pre-release importer. `.aflite` readers should accept the documented v1 format
+and reject unknown versions or incomplete files loudly. Compatibility branches
+should only be added after a format has shipped and users can reasonably have
+files that need preservation.
 
 The extension meanings should stay distinct:
 
@@ -531,6 +536,8 @@ query-visible results should match within documented index rebuild semantics.
 - Run existing DB conformance tests against the native `.aflite` backend.
 - Keep filesystem-backed LSM and LSM-container profiles as developer/test-only
   bridge paths.
+- Do not add legacy fallback code for pre-release Lite layouts; reject unknown
+  versions and invalid headers with explicit errors.
 
 ### Phase 2: Name And CLI Shell
 
