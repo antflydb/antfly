@@ -240,6 +240,14 @@ pub const NativeFile = struct {
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
+        return try createWithMode(allocator, path, false);
+    }
+
+    pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
+        return try createWithMode(allocator, path, true);
+    }
+
+    fn createWithMode(allocator: Allocator, path: []const u8, exclusive: bool) !NativeFile {
         var io_impl = std.Io.Threaded.init(allocator, .{});
         errdefer io_impl.deinit();
         const io = io_impl.io();
@@ -253,7 +261,10 @@ pub const NativeFile = struct {
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, .{});
 
-        const file = try createDataFile(io, path, true);
+        const file = try createDataFile(io, path, .{
+            .truncate = true,
+            .exclusive = exclusive,
+        });
         errdefer file.close(io);
 
         try file.writePositionalAll(io, &encoded, 0);
@@ -1325,7 +1336,7 @@ pub fn create(io: std.Io, path: []const u8) !void {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
 
-    var file = try createDataFile(io, path, true);
+    var file = try createDataFile(io, path, .{ .truncate = true });
     defer file.close(io);
 
     try file.writePositionalAll(io, &encoded, 0);
@@ -1345,10 +1356,16 @@ fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File 
     };
 }
 
-fn createDataFile(io: std.Io, path: []const u8, truncate: bool) !std.Io.File {
+const CreateDataFileOptions = struct {
+    truncate: bool = true,
+    exclusive: bool = false,
+};
+
+fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !std.Io.File {
     return std.Io.Dir.cwd().createFile(io, path, .{
         .read = true,
-        .truncate = truncate,
+        .truncate = opts.truncate,
+        .exclusive = opts.exclusive,
     });
 }
 
@@ -2066,6 +2083,30 @@ test "lite native create writes inspectable aflite file" {
     try std.testing.expectEqual(@as(u8, 0), report.active_checkpoint);
     try std.testing.expectEqual(@as(u64, 0), report.commit_sequence);
     try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native createNew rejects existing aflite without truncating" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-create-new-existing.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:keep", "survives");
+    }
+
+    try std.testing.expectError(error.PathAlreadyExists, NativeFile.createNew(allocator, path));
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+    const value = (try reopened.getDocumentAlloc(allocator, "doc:keep")) orelse return error.TestExpectedEqual;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("survives", value);
 }
 
 test "lite native open rejects unsupported format version" {

@@ -54,6 +54,26 @@ const LiteDb = struct {
         };
     }
 
+    fn create(allocator: Allocator, path: []const u8, exclusive: bool) !LiteDb {
+        var backend = try antfly.lite.backend.Handle.create(allocator, path, exclusive);
+        errdefer backend.deinit();
+
+        var opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+        };
+        try backend.configureDbOpenOptions(&opts);
+
+        const db = db_mod.DB.open(allocator, path, opts) catch |err| {
+            return err;
+        };
+
+        return .{
+            .backend = backend,
+            .db = db,
+        };
+    }
+
     fn close(self: *LiteDb) void {
         self.db.close();
         self.backend.deinit();
@@ -148,7 +168,7 @@ fn initLite(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) 
         cli.fatal("database already exists: {s}", .{path});
     }
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try LiteDb.create(allocator, path, true);
     defer lite.close();
 
     cli.writeStdout(io, "{\"format\":\"aflite\",\"path\":");
@@ -556,12 +576,10 @@ fn restoreFromSourceFile(
     const body = try readPortableRestoreSourceAlloc(allocator, io, source_path);
     defer allocator.free(body);
 
-    if (pathExists(io, out_path)) {
-        if (!replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
-        try deleteFilePath(io, out_path);
-    }
+    const target_exists = pathExists(io, out_path);
+    if (target_exists and !replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
 
-    var lite = try LiteDb.open(allocator, out_path, .writer);
+    var lite = try LiteDb.create(allocator, out_path, !replace);
     defer lite.close();
 
     try portable_backup.importPortable(allocator, lite.db.core.store, body);
@@ -1223,6 +1241,49 @@ test "lite restore source can be an aflite database" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
     }
+}
+
+test "lite restore replace fails before truncating active writer target" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-replace-source.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-replace-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:source\":{\"title\":\"source\"}}}");
+        defer allocator.free(json);
+    }
+
+    var target = try LiteDb.create(allocator, dst_path, true);
+    errdefer target.close();
+    {
+        const json = try batchJson(allocator, &target.db, "{\"inserts\":{\"doc:target\":{\"title\":\"target survives\"}}}");
+        defer allocator.free(json);
+    }
+
+    try std.testing.expectError(error.WouldBlock, restoreFromSourceFile(allocator, io, src_path, dst_path, true));
+
+    const live_json = try lookupJson(allocator, &target.db, "doc:target", "");
+    defer allocator.free(live_json);
+    try std.testing.expect(std.mem.indexOf(u8, live_json, "\"target survives\"") != null);
+    target.close();
+
+    var reopened = try LiteDb.open(allocator, dst_path, .query_readonly);
+    defer reopened.close();
+    const reopened_json = try lookupJson(allocator, &reopened.db, "doc:target", "");
+    defer allocator.free(reopened_json);
+    try std.testing.expect(std.mem.indexOf(u8, reopened_json, "\"target survives\"") != null);
 }
 
 test "lite status json includes pending work" {

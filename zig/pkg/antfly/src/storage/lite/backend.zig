@@ -181,6 +181,11 @@ pub const Handle = struct {
         };
     }
 
+    pub fn create(allocator: Allocator, path: []const u8, exclusive: bool) !Handle {
+        if (!isAflitePath(path)) return error.InvalidArgument;
+        return try createNativeSingleFile(allocator, path, exclusive);
+    }
+
     pub fn deinit(self: *Handle) void {
         switch (self.engine) {
             .bridge_lsm_container => {
@@ -316,10 +321,23 @@ fn openBridgeLsmContainer(allocator: Allocator, path: []const u8, opts: OpenOpti
 }
 
 fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOptions) !Handle {
+    var initial_store = try docstore.Store.open(allocator, path, opts.read_only);
+    errdefer initial_store.close();
+    return try initNativeSingleFile(allocator, &initial_store);
+}
+
+fn createNativeSingleFile(allocator: Allocator, path: []const u8, exclusive: bool) !Handle {
+    var initial_store = try docstore.Store.create(allocator, path, exclusive);
+    errdefer initial_store.close();
+    return try initNativeSingleFile(allocator, &initial_store);
+}
+
+fn initNativeSingleFile(allocator: Allocator, initial_store: *docstore.Store) !Handle {
     const store = try allocator.create(docstore.Store);
     errdefer allocator.destroy(store);
 
-    store.* = try docstore.Store.open(allocator, path, opts.read_only);
+    store.* = initial_store.*;
+    initial_store.* = undefined;
     errdefer store.close();
 
     const native_index_storage = try allocator.create(index_storage.Store);

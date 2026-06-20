@@ -51,6 +51,18 @@ pub const Store = struct {
         };
     }
 
+    pub fn create(allocator: Allocator, path: []const u8, exclusive: bool) !Store {
+        const file = if (exclusive)
+            try native.NativeFile.createNew(allocator, path)
+        else
+            try native.NativeFile.create(allocator, path);
+        return .{
+            .allocator = allocator,
+            .file = file,
+            .read_only = false,
+        };
+    }
+
     pub fn close(self: *Store) void {
         self.file.close();
         self.* = undefined;
