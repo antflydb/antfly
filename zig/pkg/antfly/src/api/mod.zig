@@ -20,6 +20,7 @@ pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");
 pub const relational_rows = @import("relational_rows.zig");
 pub const relational_sql = @import("relational_sql.zig");
+const sql_routines = @import("sql_routines.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -85,6 +86,7 @@ pub const ApiHttpClient = http_client.ApiHttpClient;
 
 test {
     _ = auth_sql_adapter;
+    _ = sql_routines;
     _ = openapi_contract.metadata_generated.server.ServerRouter(httpx_handler.AntflyApiHandler);
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "queryNamespaceTable"));
     try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "batchNamespaceTable"));

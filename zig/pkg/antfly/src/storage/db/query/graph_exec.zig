@@ -1010,7 +1010,10 @@ pub fn executeSingleNonPatternQueryWithSets(
 
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
-    const metric_status = try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status);
+    const metric_status = if (named.query.include_metric_status)
+        try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status)
+    else
+        @constCast((&[_]types.GraphMetricStatus{})[0..]);
 
     return .{
         .name = try alloc.dupe(u8, named.name),
@@ -3278,6 +3281,98 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 77), result.hits[0].doc_ordinal);
     try std.testing.expect(result.hits[0].stored_data != null);
     try std.testing.expectEqualStrings("{\"title\":\"child\",\"body\":\"details about the architecture\"}", result.hits[0].stored_data.?);
+}
+
+test "executeSingleNonPatternQueryWithSets hides metric status unless requested" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn findShortestPath(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!?types.GraphPath {
+            return null;
+        }
+
+        fn findKShortestPaths(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]types.GraphPath {
+            return try alloc_inner.alloc(types.GraphPath, 0);
+        }
+
+        fn executeGraphQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const []const u8,
+            _: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const metric_status = try alloc_inner.alloc(graph_query_mod.GraphMetricStatus, 1);
+            metric_status[0] = .{
+                .name = try alloc_inner.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            };
+            return .{
+                .nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 0),
+                .matches = &.{},
+                .metric_status = metric_status,
+            };
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    var named = types.NamedGraphQuery{
+        .name = "tree_search",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "doc_hierarchy",
+            .start_nodes = .{ .keys = &.{"doc:root"} },
+            .params = .{},
+            .order_by = &graph_metric_orders,
+        },
+    };
+    const executor = NonPatternQueryExecutor{
+        .ctx = null,
+        .find_shortest_path = Harness.findShortestPath,
+        .find_k_shortest_paths = Harness.findKShortestPaths,
+        .execute_graph_query = Harness.executeGraphQuery,
+        .load_projected_document = Harness.loadProjectedDocument,
+    };
+
+    var hidden = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer hidden.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), hidden.metric_status.len);
+
+    named.query.include_metric_status = true;
+    var included = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer included.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), included.metric_status.len);
+    try std.testing.expectEqualStrings("pagerank", included.metric_status[0].name);
+    try std.testing.expectEqual(@as(u64, 5), included.metric_status[0].published_generation);
 }
 
 test "executeSearchGraphWithSets preserves node ordinals" {

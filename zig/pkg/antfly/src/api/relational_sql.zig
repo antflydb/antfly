@@ -444,6 +444,7 @@ const sqlKeywordStartsScalarPredicate = sql_adapter.sqlKeywordStartsScalarPredic
 
 pub const LoweredSelect = sql_adapter.LoweredSelect;
 pub const LoweredQueryPlan = sql_adapter.LoweredQueryPlan;
+pub const LoweredRecursiveCtePlan = sql_adapter.LoweredRecursiveCtePlan;
 pub const LoweredSetOperationPlan = sql_adapter.LoweredSetOperationPlan;
 pub const LoweredWindowPlan = sql_adapter.LoweredWindowPlan;
 
@@ -941,6 +942,14 @@ fn lowerReadPlanWithOptionalSourceSchemaAlloc(
         else => return err,
     }
 
+    if (lowerRecursiveCtePlanAlloc(alloc, sql, schema, params, function_bindings)) |lowered| {
+        return .{ .recursive_cte = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        error.InvalidSqlCatalog => saw_invalid_catalog = true,
+        else => return err,
+    }
+
     if (lowerJoinWithSchemasAlloc(alloc, sql, schema, joined_source_schema, params)) |lowered| {
         return .{ .join = lowered };
     } else |err| switch (err) {
@@ -963,6 +972,27 @@ fn lowerReadPlanWithOptionalSourceSchemaAlloc(
         error.InvalidSqlCatalog => return error.InvalidSqlCatalog,
         else => return err,
     }
+}
+
+pub fn lowerRecursiveCtePlanAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRecursiveCtePlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    var parser = Parser{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+    };
+    return try parser.parseRecursiveCtePlan();
 }
 
 pub fn lowerSetOperationPlanAlloc(
@@ -2076,6 +2106,37 @@ fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpu
         },
         else => return error.InvalidSqlCatalog,
     }
+}
+
+fn recursiveMemberReferencesCte(tokens: []const Token, cte_name: []const u8) bool {
+    return tokensContainTopLevelSourceName(tokens, cte_name);
+}
+
+fn finalRecursiveCteSelectReferencesName(tokens: []const Token, cte_name: []const u8) bool {
+    return tokensContainTopLevelSourceName(tokens, cte_name);
+}
+
+fn tokensContainTopLevelSourceName(tokens: []const Token, name: []const u8) bool {
+    var depth: usize = 0;
+    var previous_source_keyword = false;
+    for (tokens) |token| {
+        switch (token.kind) {
+            .lparen => {
+                depth += 1;
+                previous_source_keyword = false;
+            },
+            .rparen => {
+                if (depth > 0) depth -= 1;
+                previous_source_keyword = false;
+            },
+            .identifier => {
+                if (depth == 0 and previous_source_keyword and std.ascii.eqlIgnoreCase(token.text, name)) return true;
+                previous_source_keyword = depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "from") or std.ascii.eqlIgnoreCase(token.text, "join"));
+            },
+            else => previous_source_keyword = false,
+        }
+    }
+    return false;
 }
 
 const Parser = struct {
@@ -4362,6 +4423,77 @@ const Parser = struct {
                 .ctes = owned_ctes,
                 .query = final.query,
             },
+        };
+    }
+
+    fn parseRecursiveCtePlan(self: *@This()) !LoweredRecursiveCtePlan {
+        try self.expectKeyword("with");
+        try self.expectKeyword("recursive");
+
+        const cte_name = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) self.alloc.free(cte_name);
+
+        const cte_column_aliases = try sql_adapter.parseOptionalCteColumnAliasesAlloc(self.alloc, self.tokens, &self.pos);
+        defer freeStringSlice(self.alloc, cte_column_aliases);
+        try self.expectKeyword("as");
+        try sql_adapter.consumeCteMaterializationHint(self.tokens, &self.pos);
+        try self.expect(.lparen);
+
+        const close_index = (sql_adapter.findMatchingRParenAfterOpenIndex(self.tokens, self.pos) orelse return error.UnsupportedSqlShape);
+        var body = Parser{
+            .alloc = self.alloc,
+            .tokens = self.tokens[self.pos..close_index],
+            .schema = self.schema,
+            .params = self.params,
+            .function_bindings = self.function_bindings,
+            .allow_select_set_boundary = true,
+        };
+        var anchor = try body.parseSelectWithSetBoundary(true);
+        errdefer anchor.deinit(self.alloc);
+        try sql_adapter.applyCteColumnAliasesAlloc(self.alloc, &anchor, cte_column_aliases);
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |name| self.alloc.free(name);
+        try sql_adapter.resolveSelectSourceForPlanAlloc(self.alloc, &anchor, &.{}, &base_table_name);
+        if (body.atEnd()) return error.UnsupportedSqlShape;
+        const operation = try sql_adapter.parseSelectSetOperation(body.tokens, &body.pos);
+        switch (operation) {
+            .union_all, .union_distinct => {},
+            .intersect, .except => return error.UnsupportedSqlShape,
+        }
+        const recursive_member_references_cte = recursiveMemberReferencesCte(body.tokens[body.pos..], cte_name);
+        if (!recursive_member_references_cte) return error.UnsupportedSqlShape;
+        self.pos = close_index + 1;
+        if (self.match(.comma) != null) return error.UnsupportedSqlShape;
+
+        if (!self.peekKeyword("select")) return error.UnsupportedSqlShape;
+        if (!finalRecursiveCteSelectReferencesName(self.tokens[self.pos..], cte_name)) return error.UnsupportedSqlShape;
+
+        const output_columns = try self.setOperationOutputColumnsAlloc(anchor);
+        var output_columns_transferred = false;
+        errdefer if (!output_columns_transferred) freeDdlRelationalColumns(self.alloc, output_columns);
+
+        const anchor_table_name = anchor.table_name;
+        anchor.table_name = "";
+        anchor.clearSelectOutputs(self.alloc);
+        var anchor_plan = LoweredQueryPlan{
+            .table_name = anchor_table_name,
+            .plan = .{ .query = anchor.query },
+        };
+        anchor.query = .{};
+        errdefer anchor_plan.deinit(self.alloc);
+
+        cte_name_transferred = true;
+        output_columns_transferred = true;
+        return .{
+            .cte_name = cte_name,
+            .operation = operation,
+            .anchor = anchor_plan,
+            .output_columns = output_columns,
+            .recursive_member_references_cte = recursive_member_references_cte,
+            .max_rows = db_mod.types.default_relational_rows_cte_max_rows,
+            .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
+            .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
         };
     }
 
@@ -9673,7 +9805,7 @@ const Parser = struct {
                 const field = try sql_adapter.normalizeRowExpressionFieldAlloc(self.alloc, self.schema, parsed_field, self.field_expression_qualifiers, self.returning_expression_qualifiers, self.defer_row_expression_field_validation);
                 var field_transferred = false;
                 errdefer if (!field_transferred) self.alloc.free(field);
-                if (self.peekKind(.lparen) or sql_adapter.peekJsonExtractOperator(self.tokens, self.pos)) return error.UnsupportedSqlShape;
+                if (sql_adapter.peekUnsupportedSimpleFieldTail(self.tokens, self.pos)) return error.UnsupportedSqlShape;
                 if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
                 try sql_adapter.consumeProjectionAlias(self.alloc, self.tokens, &self.pos, field);
                 try outputs.append(self.alloc, .{ .kind = .field, .index = fields.items.len });
@@ -10281,75 +10413,7 @@ const Parser = struct {
     }
 
     fn parseAggregateInputExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        if (self.peekKind(.lparen)) {
-            return try self.parseRowExpressionAlloc();
-        }
-        if (self.peekKind(.minus)) {
-            return try self.parseRowExpressionAlloc();
-        }
-        if (sql_adapter.jsonExtractExpressionCanStartAt(self.tokens, self.pos)) {
-            return try self.parseRowExpressionAlloc();
-        }
-        if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonTypeofFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonArrayLengthFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonBuildObjectFunction) or
-            sql_adapter.peekConvertFromFunctionCall(self.tokens, self.pos) or
-            sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction) or
-            sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction) or
-            self.peekKeyword("case") or
-            self.peekKeyword("cast") or
-            self.peekKeyword("coalesce") or
-            self.peekKeyword("array_append") or
-            self.peekKeyword("array_prepend") or
-            self.peekKeyword("array_cat") or
-            self.peekKeyword("array_remove") or
-            self.peekKeyword("array_replace") or
-            self.peekKeyword("array_to_string") or
-            self.peekKeyword("string_to_array") or
-            self.peekKeyword("lower") or
-            self.peekKeyword("upper") or
-            self.peekKeyword("trim") or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction) or
-            self.peekKeyword("replace") or
-            self.peekKeyword("regexp_replace") or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction) or
-            self.peekKeyword("concat") or
-            self.peekKeyword("concat_ws") or
-            self.peekKeyword("nullif") or
-            sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction) or
-            sql_adapter.peekSubstringFunctionKeyword(self.tokens, self.pos) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsOverlayFunction) or
-            sql_adapter.peekSplitPartFunctionKeyword(self.tokens, self.pos) or
-            sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsLeftRightFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsPadFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRepeatFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsReverseFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsStartsWithFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsEndsWithFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction) or
-            self.peekKeyword("position") or
-            self.peekKeyword("abs") or
-            self.peekKeyword("round") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "trunc") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "floor") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "ceil") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "sqrt") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "sign") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "mod") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "power") or
-            self.peekKeyword("greatest") or
-            self.peekKeyword("least"))
-        {
+        if (sql_adapter.peekAggregateExpressionInput(self.tokens, self.pos)) {
             return try self.parseRowExpressionAlloc();
         }
 
@@ -10447,7 +10511,7 @@ const Parser = struct {
                 if (!enabled) try sql_adapter.appendBooleanConstantExpressionCondition(self.alloc, &expressions, false);
             } else if (try self.parseAggregateFilterBooleanIsNotGroups(&any_groups)) {
                 // Expanded as native expression OR groups.
-            } else if (self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment()) {
+            } else if (self.stringToArrayPredicateIsContainment()) {
                 const predicate = try self.parseExpressionArrayContainsPredicateAlloc();
                 var predicate_transferred = false;
                 errdefer if (!predicate_transferred) freeExpressionArrayContainsOne(self.alloc, predicate);
@@ -10884,7 +10948,7 @@ const Parser = struct {
         right_alias: []const u8,
     ) !void {
         while (true) {
-            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, left_alias, right_alias, self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment())) |_| {
+            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, left_alias, right_alias, self.stringToArrayPredicateIsContainment())) |_| {
                 var unused_left_expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
                 defer {
                     freeExpressionConditions(self.alloc, unused_left_expression_predicates.items);
@@ -11055,7 +11119,7 @@ const Parser = struct {
         right_alias: []const u8,
     ) !void {
         while (true) {
-            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, left_alias, right_alias, self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment())) |expression_side| {
+            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, left_alias, right_alias, self.stringToArrayPredicateIsContainment())) |expression_side| {
                 try self.parseJoinedMutationExpressionWhereCondition(
                     expression_side,
                     left_expression_predicates,
@@ -11578,7 +11642,7 @@ const Parser = struct {
         source_alias: []const u8,
     ) !void {
         while (true) {
-            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, target_alias, source_alias, self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment())) |expression_side| {
+            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, target_alias, source_alias, self.stringToArrayPredicateIsContainment())) |expression_side| {
                 try self.parseJoinedMutationExpressionWhereCondition(
                     expression_side,
                     left_expression_predicates,
@@ -11833,7 +11897,7 @@ const Parser = struct {
             return;
         }
 
-        if (self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment()) {
+        if (self.stringToArrayPredicateIsContainment()) {
             const predicate = try self.parseExpressionArrayContainsPredicateAlloc();
             var predicate_transferred = false;
             errdefer if (!predicate_transferred) freeExpressionArrayContainsOne(self.alloc, predicate);
@@ -11900,7 +11964,7 @@ const Parser = struct {
         correlations: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsLateralCorrelation),
     ) !void {
         while (true) {
-            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, left_alias, right_alias, self.peekKeyword("string_to_array") and self.stringToArrayPredicateIsContainment())) |expression_side| {
+            if (try sql_adapter.joinedMutationExpressionSideAt(self.tokens, self.pos, left_alias, right_alias, self.stringToArrayPredicateIsContainment())) |expression_side| {
                 switch (expression_side) {
                     .single => |single| if (single != .right) return error.UnsupportedSqlShape,
                     .mixed => {},
@@ -13188,7 +13252,7 @@ const Parser = struct {
             if (column.field_type != .json) return error.InvalidSqlCatalog;
             return try self.parseConflictJsonbBuildObjectAlloc(insert_columns, insert_values);
         }
-        if (self.peekKeyword("coalesce")) {
+        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
             return try self.parseConflictCoalesceValueJsonAlloc(column, insert_columns, insert_values);
         }
         if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
@@ -13213,7 +13277,7 @@ const Parser = struct {
             .path = column.path,
             .field_type = item_type,
         };
-        if (self.peekKeyword("coalesce")) {
+        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
             const value_json = try self.parseConflictCoalesceValueJsonAlloc(element_column, insert_columns, insert_values);
             errdefer self.alloc.free(value_json);
             try sql_adapter.validateSqlArrayElementValueJson(self.alloc, column, value_json);
@@ -13478,26 +13542,26 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (self.peekKeyword("cast")) return try self.parseConflictCastExpressionAlloc(column, insert_columns);
-        if (self.peekKeyword("case")) return try self.parseConflictCaseExpressionAlloc(column, insert_columns);
-        if (self.peekKeyword("lower") or self.peekKeyword("upper") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsInitcapFunction) or self.peekKeyword("trim") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction)) return try self.parseConflictCaseFoldExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("replace")) return try self.parseConflictReplaceExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("regexp_replace")) return try self.parseConflictRegexpReplaceExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos)) return try self.parseConflictCastExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos)) return try self.parseConflictCaseExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) return try self.parseConflictCaseFoldExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos)) return try self.parseConflictReplaceExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos)) return try self.parseConflictRegexpReplaceExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction)) return try self.parseConflictRegexpMatchExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction)) return try self.parseConflictRegexpSubstrExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction)) return try self.parseConflictRegexpCountExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction)) return try self.parseConflictRegexpInstrExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction)) return try self.parseConflictTranslateExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return try self.parseConflictConcatExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("coalesce")) return try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("nullif")) return try self.parseConflictNullifExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) return try self.parseConflictConcatExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) return try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekNullifFunctionCall(self.tokens, self.pos)) return try self.parseConflictNullifExpressionAlloc(column, insert_columns);
         if (sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos)) return try self.parseConflictLengthExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction)) return try self.parseConflictAsciiExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction)) return try self.parseConflictChrExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekSubstringFunctionKeyword(self.tokens, self.pos)) return try self.parseConflictSubstringExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsOverlayFunction)) return try self.parseConflictOverlayExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekSplitPartFunctionKeyword(self.tokens, self.pos)) return try self.parseConflictSplitPartExpressionAlloc(column, insert_columns, expected_type);
-        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or self.peekKeyword("position")) return try self.parseConflictStrposExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos)) return try self.parseConflictStrposExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsLeftRightFunction)) return try self.parseConflictLeftRightExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsPadFunction)) return try self.parseConflictPadExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRepeatFunction)) return try self.parseConflictRepeatExpressionAlloc(column, insert_columns, expected_type);
@@ -13508,30 +13572,30 @@ const Parser = struct {
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction)) return try self.parseConflictDateTruncExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction)) return try self.parseConflictDateBinExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction)) return try self.parseConflictDatePartExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("abs")) return try self.parseConflictAbsExpressionAlloc(column, insert_columns);
-        if (self.peekKeyword("round")) return try self.parseConflictRoundExpressionAlloc(column, insert_columns);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "trunc")) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .trunc);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "floor")) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .floor);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "ceil")) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .ceil);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "sqrt")) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .sqrt);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "sign")) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .sign);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "mod")) return try self.parseConflictModuloExpressionAlloc(column, insert_columns);
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "power")) return try self.parseConflictPowerExpressionAlloc(column, insert_columns);
-        if (self.peekKeyword("greatest") or self.peekKeyword("least")) return try self.parseConflictGreatestLeastExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs)) return try self.parseConflictAbsExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round)) return try self.parseConflictRoundExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc)) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .trunc);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor)) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .floor);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil)) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .ceil);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt)) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .sqrt);
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign)) return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .sign);
+        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod)) return try self.parseConflictModuloExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power)) return try self.parseConflictPowerExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos)) return try self.parseConflictGreatestLeastExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction)) return try self.parseConflictJsonExtractPathExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonBuildObjectFunction)) return try self.parseConflictJsonBuildObjectExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonTypeofFunction)) return try self.parseConflictJsonTypeofExpressionAlloc(column, insert_columns);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonArrayLengthFunction)) return try self.parseConflictJsonArrayLengthExpressionAlloc(column, insert_columns);
         if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction)) return try self.parseConflictArrayLengthExpressionAlloc(insert_columns);
         if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction)) return try self.parseConflictArrayPositionExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace")) return try self.parseConflictArrayElementTransformExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("array_to_string")) return try self.parseConflictArrayToStringExpressionAlloc(column, insert_columns, expected_type);
-        if (self.peekKeyword("string_to_array")) return try self.parseConflictStringToArrayExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos)) return try self.parseConflictArrayElementTransformExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos)) return try self.parseConflictArrayToStringExpressionAlloc(column, insert_columns, expected_type);
+        if (sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) return try self.parseConflictStringToArrayExpressionAlloc(column, insert_columns, expected_type);
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsUuidV4Function)) return try self.parseConflictUuidV4ExpressionAlloc(expected_type);
-        if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) return try self.parseConflictNowExpressionAlloc(expected_type);
-        if (self.peekKeyword("current_date")) return try self.parseConflictCurrentDateExpressionAlloc(expected_type);
+        if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) return try self.parseConflictNowExpressionAlloc(expected_type);
+        if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) return try self.parseConflictCurrentDateExpressionAlloc(expected_type);
         if (sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos)) return try self.parseConflictTypedDatetimeLiteralExpressionAlloc(expected_type);
-        if (self.peekKeyword("interval")) {
+        if (sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos)) {
             if (expected_type) |field_type| {
                 if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
             }
@@ -13612,29 +13676,25 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (self.peekKind(.minus)) {
+        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseConflictUnaryNegativeExpressionAlloc(column, insert_columns, expected_type);
         }
-        if (self.peekKind(.lparen)) {
+        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseParenthesizedConflictExpressionAlloc(column, insert_columns, expected_type);
         }
-        if (self.peekKeyword("cast") or
-            self.peekKeyword("case") or
-            self.peekKeyword("lower") or
-            self.peekKeyword("upper") or
-            self.peekKeyword("trim") or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction) or
-            self.peekKeyword("replace") or
-            self.peekKeyword("regexp_replace") or
+        if (sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos) or
+            sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos) or
+            sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction) or
-            self.peekKeyword("concat") or
-            self.peekKeyword("concat_ws") or
-            self.peekKeyword("coalesce") or
-            self.peekKeyword("nullif") or
+            sql_adapter.peekConcatFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekNullifFunctionCall(self.tokens, self.pos) or
             sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction) or
@@ -13652,36 +13712,30 @@ const Parser = struct {
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction) or
-            self.peekKeyword("position") or
-            self.peekKeyword("abs") or
-            self.peekKeyword("round") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "trunc") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "floor") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "ceil") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "sqrt") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "sign") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "mod") or
-            sql_adapter.peekFunctionCall(self.tokens, self.pos, "power") or
-            self.peekKeyword("greatest") or
-            self.peekKeyword("least") or
+            sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt) or
+            sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign) or
+            sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod) or
+            sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power) or
+            sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonTypeofFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonArrayLengthFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonBuildObjectFunction) or
             sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction) or
             sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction) or
-            self.peekKeyword("array_append") or
-            self.peekKeyword("array_prepend") or
-            self.peekKeyword("array_cat") or
-            self.peekKeyword("array_remove") or
-            self.peekKeyword("array_replace") or
-            self.peekKeyword("array_to_string") or
-            self.peekKeyword("string_to_array") or
-            self.peekKeyword("now") or
-            self.peekKeyword("current_timestamp") or
-            self.peekKeyword("current_date") or
+            sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos) or
+            sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos) or
+            sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos) or
             sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos) or
-            self.peekKeyword("interval"))
+            sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos))
         {
             return try self.parseConflictExpressionAlloc(column, insert_columns);
         }
@@ -14105,8 +14159,8 @@ const Parser = struct {
         column: runtime_schema.RelationalColumn,
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (self.peekKeyword("not")) return try self.parseConflictBooleanNotExpressionAlloc(column, insert_columns);
-        if (self.peekKind(.lparen)) return try self.parseParenthesizedConflictBooleanExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekBooleanNotExpressionSyntax(self.tokens, self.pos)) return try self.parseConflictBooleanNotExpressionAlloc(column, insert_columns);
+        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) return try self.parseParenthesizedConflictBooleanExpressionAlloc(column, insert_columns);
         return try self.parseConflictRowExpressionAlloc(column, insert_columns, .boolean);
     }
 
@@ -15385,7 +15439,7 @@ const Parser = struct {
         while (sql_adapter.peekArithmeticOperator(self.tokens, self.pos)) |op| {
             if (op.precedence < min_precedence) break;
             _ = self.match(op.token) orelse unreachable;
-            if (self.peekKeyword("interval")) {
+            if (sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos)) {
                 try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(current);
                 const interval = try sql_adapter.parseSqlIntervalLiteral(self.tokens, &self.pos);
                 const next = try sql_adapter.buildIntervalLiteralArithmeticAlloc(self.alloc, current, op.kind, interval);
@@ -15473,7 +15527,7 @@ const Parser = struct {
             true
         else
             return error.UnsupportedSqlShape;
-        if (self.peekKeyword("coalesce")) {
+        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
             const expression = try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, column.field_type);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
@@ -15793,7 +15847,7 @@ const Parser = struct {
                 try self.parseExpressionNotWhere(expression_not_predicates);
             } else if (sql_adapter.canParseAccessNotWhere(self.tokens, self.pos)) {
                 try self.parseAccessNotWhere(access_not_predicates);
-            } else if (self.peekKeyword("string_to_array")) {
+            } else if (sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) {
                 if (self.stringToArrayPredicateIsContainment()) {
                     const predicate = try self.parseExpressionArrayContainsPredicateAlloc();
                     var predicate_transferred = false;
@@ -16933,7 +16987,7 @@ const Parser = struct {
     }
 
     fn stringToArrayPredicateIsContainment(self: *@This()) bool {
-        if (!self.peekKeyword("string_to_array")) return false;
+        if (!sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) return false;
         var depth: usize = 0;
         var index = self.pos;
         while (index < self.tokens.len) : (index += 1) {
@@ -17677,7 +17731,7 @@ const Parser = struct {
             field_transferred = true;
             return .{ .field = field, .null_test = null_test };
         }
-        if (self.peekKind(.lparen)) {
+        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
             const expression = try self.parseParenthesizedRowExpressionAlloc();
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
@@ -17711,7 +17765,7 @@ const Parser = struct {
             self.returning_expression_qualifiers,
             self.defer_row_expression_field_validation,
         )) |field| return .{ .field = field };
-        if (self.peekKeyword("lower") or self.peekKeyword("upper") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsInitcapFunction) or self.peekKeyword("trim") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction)) {
+        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) {
             const expression = try self.parseCaseFoldRowExpressionAlloc();
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
@@ -17729,7 +17783,7 @@ const Parser = struct {
             expression_transferred = true;
             return .{ .expression = expression };
         }
-        if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) {
+        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) {
             const expression = try self.parseRowExpressionAlloc();
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
@@ -17742,9 +17796,9 @@ const Parser = struct {
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonArrayLengthFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonBuildObjectFunction) or
             sql_adapter.peekToJsonbFunctionCall(self.tokens, self.pos) or
-            sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction) or sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction) or self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace") or self.peekKeyword("array_to_string") or self.peekKeyword("case") or self.peekKeyword("cast") or self.peekKeyword("coalesce") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction) or self.peekKeyword("replace") or self.peekKeyword("regexp_replace") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction) or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction) or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction) or
+            sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction) or sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction) or sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos) or sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos) or sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos) or sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos) or sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos) or sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos) or sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos) or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction) or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction) or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction) or
-            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction) or self.peekKeyword("nullif") or sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos) or
+            sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction) or sql_adapter.peekNullifFunctionCall(self.tokens, self.pos) or sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction) or
             sql_adapter.peekSubstringFunctionKeyword(self.tokens, self.pos) or
@@ -17761,7 +17815,7 @@ const Parser = struct {
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction) or
             sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction) or
-            self.peekKeyword("position") or self.peekKeyword("abs") or self.peekKeyword("round") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "trunc") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "floor") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "ceil") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "sqrt") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "sign") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "mod") or sql_adapter.peekFunctionCall(self.tokens, self.pos, "power") or self.peekKeyword("greatest") or self.peekKeyword("least"))
+            sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt) or sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign) or sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod) or sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power) or sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos))
         {
             const expression = try self.parseRowExpressionAlloc();
             var expression_transferred = false;
@@ -17770,7 +17824,7 @@ const Parser = struct {
             expression_transferred = true;
             return .{ .expression = expression };
         }
-        if (self.peekKind(.minus)) {
+        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) {
             const expression = try self.parseRowExpressionAlloc();
             try self.rowExpressionTypeContext().validateNumericRowExpression(expression);
             return .{ .expression = expression };
@@ -17799,7 +17853,7 @@ const Parser = struct {
             const field = try self.parseFieldExpressionOwned();
             var field_transferred = false;
             errdefer if (!field_transferred) self.alloc.free(field);
-            if (self.peekKind(.lparen) or sql_adapter.peekJsonExtractOperator(self.tokens, self.pos)) return error.UnsupportedSqlShape;
+            if (sql_adapter.peekUnsupportedSimpleFieldTail(self.tokens, self.pos)) return error.UnsupportedSqlShape;
             if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
             try group_by.append(self.alloc, field);
             field_transferred = true;
@@ -18409,11 +18463,11 @@ const Parser = struct {
             const default_value = column.default_value orelse return error.UnsupportedSqlShape;
             return try relational_rows.relationalDefaultValueJsonAlloc(self.alloc, default_value);
         }
-        if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) {
+        if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) {
             if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
             return try sql_adapter.parseSqlNowValueJsonAlloc(self.alloc, self.tokens, &self.pos, platform_time.realtimeNs());
         }
-        if (self.peekKeyword("current_date")) {
+        if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) {
             if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
             return try sql_adapter.parseSqlCurrentDateValueJsonAlloc(self.alloc, self.tokens, &self.pos, sql_adapter.sqlCurrentUtcDateStartNs(platform_time.realtimeNs()));
         }
@@ -18524,8 +18578,8 @@ const Parser = struct {
     fn parseSqlRangeConstructorEndpointJsonAlloc(self: *@This(), field_type: runtime_schema.AntflyType) ![]const u8 {
         if (self.matchKeyword("null")) return try self.alloc.dupe(u8, "null");
         if (field_type == .datetime) {
-            if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) return try sql_adapter.parseSqlNowValueJsonAlloc(self.alloc, self.tokens, &self.pos, platform_time.realtimeNs());
-            if (self.peekKeyword("current_date")) return try sql_adapter.parseSqlCurrentDateValueJsonAlloc(self.alloc, self.tokens, &self.pos, sql_adapter.sqlCurrentUtcDateStartNs(platform_time.realtimeNs()));
+            if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) return try sql_adapter.parseSqlNowValueJsonAlloc(self.alloc, self.tokens, &self.pos, platform_time.realtimeNs());
+            if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) return try sql_adapter.parseSqlCurrentDateValueJsonAlloc(self.alloc, self.tokens, &self.pos, sql_adapter.sqlCurrentUtcDateStartNs(platform_time.realtimeNs()));
             if (sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos)) return try sql_adapter.parseSqlTypedDatetimeLiteralValueJsonAlloc(self.alloc, self.tokens, &self.pos);
         }
         if (self.match(.placeholder)) |token| {
@@ -18619,11 +18673,9 @@ const Parser = struct {
             fields.deinit(self.alloc);
         }
         while (true) {
-            const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
+            const field = try sql_adapter.parseSimpleReturningFieldOwnedAlloc(self.alloc, self.tokens, &self.pos, self.schema);
             var field_transferred = false;
             errdefer if (!field_transferred) self.alloc.free(field);
-            if (self.peekKind(.lparen) or sql_adapter.peekJsonExtractOperator(self.tokens, self.pos)) return error.UnsupportedSqlShape;
-            if (relationalColumnForReturningField(self.schema, field) == null) return error.InvalidSqlCatalog;
             try fields.append(self.alloc, field);
             field_transferred = true;
             if (self.match(.comma) == null) break;
@@ -18978,11 +19030,11 @@ const Parser = struct {
 
     fn parseSelectItem(self: *@This()) !SelectItem {
         if (sql_adapter.rowExpressionHasTopLevelPipeConcat(self.tokens, self.pos)) return .{ .expression = try self.parseTextExpressionProjectionAlloc() };
-        if (self.peekKind(.minus)) return .{ .expression = try self.parseGenericExpressionProjectionAlloc() };
-        if (self.peekKeyword("not")) return .{ .expression = try self.parseBooleanExpressionProjectionAlloc() };
+        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseGenericExpressionProjectionAlloc() };
+        if (sql_adapter.peekBooleanNotExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseBooleanExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsUuidV4Function)) return .{ .expression = try self.parseUuidV4ExpressionProjectionAlloc() };
-        if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) return .{ .expression = try self.parseNowExpressionProjectionAlloc() };
-        if (self.peekKeyword("current_date")) return .{ .expression = try self.parseCurrentDateExpressionProjectionAlloc() };
+        if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseNowExpressionProjectionAlloc() };
+        if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseCurrentDateExpressionProjectionAlloc() };
         if (sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos)) return .{ .expression = try self.parseTypedDatetimeLiteralExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction)) return .{ .expression = try self.parseJsonExtractPathExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonTypeofFunction)) return .{ .expression = try self.parseJsonTypeofExpressionProjectionAlloc() };
@@ -18992,27 +19044,27 @@ const Parser = struct {
         if (sql_adapter.peekToJsonbFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseToJsonbExpressionProjectionAlloc() };
         if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayLengthFunction)) return .{ .expression = try self.parseArrayLengthExpressionProjectionAlloc() };
         if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction)) return .{ .expression = try self.parseArrayPositionExpressionProjectionAlloc() };
-        if (self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace")) return .{ .expression = try self.parseArrayElementTransformExpressionProjectionAlloc() };
-        if (self.peekKeyword("array_to_string")) return .{ .expression = try self.parseArrayToStringExpressionProjectionAlloc() };
-        if (self.peekKeyword("string_to_array")) return .{ .expression = try self.parseStringToArrayExpressionProjectionAlloc() };
-        if (self.peekKeyword("coalesce")) return .{ .expression = try self.parseCoalesceExpressionProjectionAlloc() };
-        if (self.peekKeyword("lower") or self.peekKeyword("upper") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsInitcapFunction) or self.peekKeyword("trim") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction)) return .{ .expression = try self.parseCaseFoldExpressionProjectionAlloc() };
-        if (self.peekKeyword("replace")) return .{ .expression = try self.parseReplaceExpressionProjectionAlloc() };
-        if (self.peekKeyword("regexp_replace")) return .{ .expression = try self.parseRegexpReplaceExpressionProjectionAlloc() };
+        if (sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseArrayElementTransformExpressionProjectionAlloc() };
+        if (sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseArrayToStringExpressionProjectionAlloc() };
+        if (sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseStringToArrayExpressionProjectionAlloc() };
+        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseCoalesceExpressionProjectionAlloc() };
+        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseCaseFoldExpressionProjectionAlloc() };
+        if (sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseReplaceExpressionProjectionAlloc() };
+        if (sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseRegexpReplaceExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction)) return .{ .expression = try self.parseRegexpSubstrExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpMatchFunction)) return .{ .expression = try self.parseRegexpMatchExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpCountFunction)) return .{ .expression = try self.parseRegexpCountExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpInstrFunction)) return .{ .expression = try self.parseRegexpInstrExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction)) return .{ .expression = try self.parseTranslateExpressionProjectionAlloc() };
-        if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) return .{ .expression = try self.parseConcatExpressionProjectionAlloc() };
-        if (self.peekKeyword("nullif")) return .{ .expression = try self.parseNullifExpressionProjectionAlloc() };
+        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseConcatExpressionProjectionAlloc() };
+        if (sql_adapter.peekNullifFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseNullifExpressionProjectionAlloc() };
         if (sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos)) return .{ .expression = try self.parseLengthExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsAsciiFunction)) return .{ .expression = try self.parseAsciiExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsChrFunction)) return .{ .expression = try self.parseChrExpressionProjectionAlloc() };
         if (sql_adapter.peekSubstringFunctionKeyword(self.tokens, self.pos)) return .{ .expression = try self.parseSubstringExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsOverlayFunction)) return .{ .expression = try self.parseOverlayExpressionProjectionAlloc() };
         if (sql_adapter.peekSplitPartFunctionKeyword(self.tokens, self.pos)) return .{ .expression = try self.parseSplitPartExpressionProjectionAlloc() };
-        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or self.peekKeyword("position")) return .{ .expression = try self.parseStrposExpressionProjectionAlloc() };
+        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseStrposExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsLeftRightFunction)) return .{ .expression = try self.parseLeftRightExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsPadFunction)) return .{ .expression = try self.parsePadExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRepeatFunction)) return .{ .expression = try self.parseRepeatExpressionProjectionAlloc() };
@@ -19023,21 +19075,21 @@ const Parser = struct {
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateTruncFunction)) return .{ .expression = try self.parseDateTruncExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDateBinFunction)) return .{ .expression = try self.parseDateBinExpressionProjectionAlloc() };
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction)) return .{ .expression = try self.parseDatePartExpressionProjectionAlloc() };
-        if (self.peekKeyword("abs")) return .{ .expression = try self.parseAbsExpressionProjectionAlloc() };
-        if (self.peekKeyword("round")) return .{ .expression = try self.parseRoundExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "trunc")) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.trunc) };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "floor")) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.floor) };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "ceil")) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.ceil) };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "sqrt")) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sqrt) };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "sign")) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sign) };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "mod")) return .{ .expression = try self.parseModuloExpressionProjectionAlloc() };
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "power")) return .{ .expression = try self.parsePowerExpressionProjectionAlloc() };
-        if (self.peekKeyword("greatest") or self.peekKeyword("least")) return .{ .expression = try self.parseGreatestLeastExpressionProjectionAlloc() };
-        if (self.peekKeyword("case")) return .{ .expression = try self.parseCaseExpressionProjectionAlloc() };
-        if (self.peekKeyword("cast")) return .{ .expression = try self.parseCastExpressionProjectionAlloc() };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs)) return .{ .expression = try self.parseAbsExpressionProjectionAlloc() };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round)) return .{ .expression = try self.parseRoundExpressionProjectionAlloc() };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.trunc) };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.floor) };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.ceil) };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sqrt) };
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign)) return .{ .expression = try self.parseFloorCeilExpressionProjectionAlloc(.sign) };
+        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod)) return .{ .expression = try self.parseModuloExpressionProjectionAlloc() };
+        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power)) return .{ .expression = try self.parsePowerExpressionProjectionAlloc() };
+        if (sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos)) return .{ .expression = try self.parseGreatestLeastExpressionProjectionAlloc() };
+        if (sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseCaseExpressionProjectionAlloc() };
+        if (sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos)) return .{ .expression = try self.parseCastExpressionProjectionAlloc() };
         if (sql_adapter.peekExtensionFunctionCall(self.tokens, self.pos, self.function_bindings.extension_functions)) return .{ .expression = try self.parseExtensionFunctionExpressionProjectionAlloc() };
         if (sql_adapter.peekRoutineExpressionCall(self.tokens, self.pos, self.function_bindings.routine_expressions)) return .{ .expression = try self.parseRoutineExpressionProjectionAlloc() };
-        if (self.peekKind(.lparen)) {
+        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
             if (sql_adapter.peekParenthesizedNullTestProjection(self.tokens, self.pos)) {
                 return .{ .expression = try self.parseParenthesizedNullTestExpressionProjectionAlloc() };
             }
@@ -19345,7 +19397,7 @@ const Parser = struct {
         while (sql_adapter.peekArithmeticOperator(self.tokens, self.pos)) |op| {
             if (op.precedence < min_precedence) break;
             _ = self.match(op.token) orelse unreachable;
-            if (self.peekKeyword("interval")) {
+            if (sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos)) {
                 try self.rowExpressionTypeContext().validateNumericOrDatetimeRowExpression(current);
                 const interval = try sql_adapter.parseSqlIntervalLiteral(self.tokens, &self.pos);
                 const next = try sql_adapter.buildIntervalLiteralArithmeticAlloc(self.alloc, current, op.kind, interval);
@@ -19355,7 +19407,7 @@ const Parser = struct {
                 continue;
             }
 
-            var rhs = if (self.peekKind(.lparen))
+            var rhs = if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos))
                 try self.parseParenthesizedBooleanRowExpressionAlloc()
             else
                 try self.parseRowExpressionOperandAlloc();
@@ -20366,25 +20418,25 @@ const Parser = struct {
     }
 
     fn parseRowExpressionOperandAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        if (self.peekKind(.lparen)) {
+        if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseParenthesizedRowExpressionAlloc();
         }
-        if (self.peekKind(.minus)) {
+        if (sql_adapter.peekUnaryNegativeExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseUnaryNegativeRowExpressionAlloc();
         }
-        if (self.peekKeyword("not")) {
+        if (sql_adapter.peekBooleanNotExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseBooleanNotRowExpressionAlloc();
         }
-        if (self.peekKeyword("cast")) {
+        if (sql_adapter.peekCastExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseCastRowExpressionAlloc();
         }
-        if (self.peekKeyword("case")) {
+        if (sql_adapter.peekCaseExpressionSyntax(self.tokens, self.pos)) {
             return try self.parseCaseRowExpressionAlloc();
         }
-        if (self.peekKeyword("now") or self.peekKeyword("current_timestamp")) {
+        if (sql_adapter.peekSqlNowExpressionSyntax(self.tokens, self.pos)) {
             return try sql_adapter.parseSqlNowRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
         }
-        if (self.peekKeyword("current_date")) {
+        if (sql_adapter.peekSqlCurrentDateExpressionSyntax(self.tokens, self.pos)) {
             return try sql_adapter.parseSqlCurrentDateRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
         }
         if (sql_adapter.peekSqlTypedDatetimeLiteral(self.tokens, self.pos)) {
@@ -20393,16 +20445,16 @@ const Parser = struct {
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsUuidV4Function)) {
             return try sql_adapter.parseSqlUuidV4RowExpression(self.tokens, &self.pos);
         }
-        if (self.peekKeyword("interval")) {
+        if (sql_adapter.peekSqlIntervalExpressionSyntax(self.tokens, self.pos)) {
             return try sql_adapter.parseSqlIntervalRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
         }
-        if (self.peekKeyword("lower") or self.peekKeyword("upper") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsInitcapFunction) or self.peekKeyword("trim") or sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTrimVariantFunction)) {
+        if (sql_adapter.peekCaseFoldFunctionCall(self.tokens, self.pos)) {
             return try self.parseCaseFoldRowExpressionAlloc();
         }
-        if (self.peekKeyword("replace")) {
+        if (sql_adapter.peekReplaceFunctionCall(self.tokens, self.pos)) {
             return try self.parseReplaceRowExpressionAlloc();
         }
-        if (self.peekKeyword("regexp_replace")) {
+        if (sql_adapter.peekRegexpReplaceFunctionCall(self.tokens, self.pos)) {
             return try self.parseRegexpReplaceRowExpressionAlloc();
         }
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsRegexpSubstrFunction)) {
@@ -20420,13 +20472,13 @@ const Parser = struct {
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsTranslateFunction)) {
             return try self.parseTranslateRowExpressionAlloc();
         }
-        if (self.peekKeyword("concat") or self.peekKeyword("concat_ws")) {
+        if (sql_adapter.peekConcatFunctionCall(self.tokens, self.pos)) {
             return try self.parseConcatRowExpressionAlloc();
         }
-        if (self.peekKeyword("coalesce")) {
+        if (sql_adapter.peekCoalesceFunctionCall(self.tokens, self.pos)) {
             return try self.parseCoalesceRowExpressionAlloc();
         }
-        if (self.peekKeyword("nullif")) {
+        if (sql_adapter.peekNullifFunctionCall(self.tokens, self.pos)) {
             return try self.parseNullifRowExpressionAlloc();
         }
         if (sql_adapter.peekTextLengthFunctionKeyword(self.tokens, self.pos)) {
@@ -20447,7 +20499,7 @@ const Parser = struct {
         if (sql_adapter.peekSplitPartFunctionKeyword(self.tokens, self.pos)) {
             return try self.parseSplitPartRowExpressionAlloc();
         }
-        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or self.peekKeyword("position")) {
+        if (sql_adapter.peekStrposFunctionKeyword(self.tokens, self.pos) or sql_adapter.peekPositionFunctionSyntax(self.tokens, self.pos)) {
             return try self.parseStrposRowExpressionAlloc();
         }
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsLeftRightFunction)) {
@@ -20480,34 +20532,34 @@ const Parser = struct {
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsDatePartFunction)) {
             return try self.parseDatePartRowExpressionAlloc();
         }
-        if (self.peekKeyword("abs")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .abs)) {
             return try self.parseAbsRowExpressionAlloc();
         }
-        if (self.peekKeyword("round")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .round)) {
             return try self.parseRoundRowExpressionAlloc();
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "trunc")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .trunc)) {
             return try self.parseFloorCeilRowExpressionAlloc(.trunc);
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "floor")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .floor)) {
             return try self.parseFloorCeilRowExpressionAlloc(.floor);
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "ceil")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .ceil)) {
             return try self.parseFloorCeilRowExpressionAlloc(.ceil);
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "sqrt")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sqrt)) {
             return try self.parseFloorCeilRowExpressionAlloc(.sqrt);
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "sign")) {
+        if (sql_adapter.peekFixedUnaryFunctionCall(self.tokens, self.pos, .sign)) {
             return try self.parseFloorCeilRowExpressionAlloc(.sign);
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "mod")) {
+        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .mod)) {
             return try self.parseModuloRowExpressionAlloc();
         }
-        if (sql_adapter.peekFunctionCall(self.tokens, self.pos, "power")) {
+        if (sql_adapter.peekFixedBinaryFunctionCall(self.tokens, self.pos, .power)) {
             return try self.parsePowerRowExpressionAlloc();
         }
-        if (self.peekKeyword("greatest") or self.peekKeyword("least")) {
+        if (sql_adapter.peekGreatestLeastFunctionCall(self.tokens, self.pos)) {
             return try self.parseGreatestLeastRowExpressionAlloc();
         }
         if (sql_adapter.peekFunctionCallIf(self.tokens, self.pos, sqlKeywordIsJsonExtractPathFunction)) {
@@ -20536,13 +20588,13 @@ const Parser = struct {
         if (sql_adapter.functionCallStartsAtIf(self.tokens, self.pos, sqlKeywordIsArrayPositionFunction)) {
             return try self.parseArrayPositionRowExpressionAlloc();
         }
-        if (self.peekKeyword("array_append") or self.peekKeyword("array_prepend") or self.peekKeyword("array_cat") or self.peekKeyword("array_remove") or self.peekKeyword("array_replace")) {
+        if (sql_adapter.peekArrayElementTransformFunctionCall(self.tokens, self.pos)) {
             return try self.parseArrayElementTransformRowExpressionAlloc();
         }
-        if (self.peekKeyword("array_to_string")) {
+        if (sql_adapter.peekArrayToStringFunctionCall(self.tokens, self.pos)) {
             return try self.parseArrayToStringRowExpressionAlloc();
         }
-        if (self.peekKeyword("string_to_array")) {
+        if (sql_adapter.peekStringToArrayFunctionCall(self.tokens, self.pos)) {
             return try self.parseStringToArrayRowExpressionAlloc();
         }
         if (try self.parseExtensionFunctionRowExpressionAlloc()) |expression| {
@@ -20699,7 +20751,7 @@ const Parser = struct {
 
     fn parseBooleanNotRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
         try self.expectKeyword("not");
-        const operand = if (self.peekKind(.lparen))
+        const operand = if (sql_adapter.peekParenthesizedExpressionSyntax(self.tokens, self.pos))
             try self.parseParenthesizedBooleanRowExpressionAlloc()
         else
             try self.parseRowExpressionOperandAlloc();
@@ -21586,7 +21638,7 @@ const Parser = struct {
     }
 
     fn parseFieldExpressionOwned(self: *@This()) ![]const u8 {
-        if (try sql_adapter.parseGeneratedFieldExpressionOwnedAlloc(
+        return try sql_adapter.parseRowExpressionFieldOwnedAlloc(
             self.alloc,
             self.tokens,
             &self.pos,
@@ -21594,8 +21646,7 @@ const Parser = struct {
             self.field_expression_qualifiers,
             self.returning_expression_qualifiers,
             self.defer_row_expression_field_validation,
-        )) |field| return field;
-        return try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
+        );
     }
 
     fn cursor(self: *@This()) sql_adapter.Cursor {
@@ -41301,6 +41352,10 @@ fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) 
             const fingerprint = try setOperationFingerprintAlloc(alloc, set_operation);
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "set_operation");
         },
+        .recursive_cte => |recursive_cte| blk: {
+            const fingerprint = try recursiveCteFingerprintAlloc(alloc, recursive_cte);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "recursive_cte");
+        },
         .aggregate => |aggregate| blk: {
             var fingerprint = try aggregatePlanFingerprintAlloc(alloc, aggregate);
             fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", aggregate.plan.aggregate.offset);
@@ -41322,6 +41377,25 @@ fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) 
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "window");
         },
     };
+}
+
+fn recursiveCteFingerprintAlloc(alloc: std.mem.Allocator, recursive_cte: LoweredRecursiveCtePlan) ![]u8 {
+    const anchor = try queryFingerprintAlloc(alloc, "anchor", recursive_cte.anchor.table_name, recursive_cte.anchor.plan.query, recursive_cte.anchor.plan.ctes.len);
+    defer alloc.free(anchor);
+    return try std.fmt.allocPrint(
+        alloc,
+        "recursive_cte:name={s}:op={s}:anchor={s}:outputs={d}:self_ref={}:max_rows={d}:max_bytes={d}:spill_after={d}",
+        .{
+            recursive_cte.cte_name,
+            @tagName(recursive_cte.operation),
+            anchor,
+            recursive_cte.output_columns.len,
+            recursive_cte.recursive_member_references_cte,
+            recursive_cte.max_rows orelse 0,
+            recursive_cte.max_bytes orelse 0,
+            recursive_cte.spill_after_bytes orelse 0,
+        },
+    );
 }
 
 fn setOperationFingerprintAlloc(alloc: std.mem.Allocator, set_operation: LoweredSetOperationPlan) ![]u8 {
@@ -41528,6 +41602,13 @@ fn expectAppParityReadSummary(summary: AppParityPlanSummary, lowered: LoweredRea
             try expectOptionalU32(summary.limit, set_operation.limit orelse set_operation.left.plan.query.limit);
             if (summary.offset) |expected| try std.testing.expectEqual(expected, if (set_operation.offset != 0) set_operation.offset else set_operation.left.plan.query.offset);
             if (summary.right_offset) |expected| try std.testing.expectEqual(expected, set_operation.right.plan.query.offset);
+        },
+        .recursive_cte => |recursive_cte| {
+            try expectOptionalTableName(summary.table_name, recursive_cte.anchor.table_name);
+            try expectOptionalUsize(summary.ctes, 1);
+            try expectOptionalUsize(summary.select, recursive_cte.anchor.plan.query.select.len);
+            try expectOptionalUsize(summary.order_by, recursive_cte.anchor.plan.query.order_by.len);
+            try expectOptionalU32(summary.limit, recursive_cte.anchor.plan.query.limit);
         },
         .aggregate => |aggregate| {
             try expectOptionalTableName(summary.table_name, aggregate.table_name);

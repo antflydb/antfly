@@ -2172,6 +2172,27 @@ pub fn parseGeneratedFieldExpressionOrNullOwnedAlloc(
     };
 }
 
+pub fn parseRowExpressionFieldOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) ![]const u8 {
+    if (try parseGeneratedFieldExpressionOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    )) |field| return field;
+    return try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+}
+
 fn generatedUnaryOpKeyword(keyword: []const u8) ?runtime_schema.RelationalGeneratedOp {
     if (std.ascii.eqlIgnoreCase(keyword, "lower")) return .lower;
     if (std.ascii.eqlIgnoreCase(keyword, "upper")) return .upper;
@@ -4109,7 +4130,8 @@ pub fn writeRowExpressionPredicateGroupsJson(
 
 pub fn rowExpressionOpName(kind: db_mod.types.RelationalRowsExpressionKind) []const u8 {
     return switch (kind) {
-        .field, .value => unreachable,
+        .field => "field",
+        .value => "value",
         .now => "now",
         .uuid_v4 => "uuid_v4",
         .coalesce => "coalesce",
@@ -4170,9 +4192,9 @@ pub fn rowExpressionOpName(kind: db_mod.types.RelationalRowsExpressionKind) []co
         .mul => "mul",
         .div => "div",
         .mod => "mod",
-        .case => unreachable,
-        .cast => unreachable,
-        .json_extract => unreachable,
+        .case => "case",
+        .cast => "cast",
+        .json_extract => "json_extract",
         .json_path_exists => "json_path_exists",
         .json_typeof => "json_typeof",
         .json_array_length => "json_array_length",
@@ -7592,6 +7614,103 @@ pub fn peekFunctionCallIf(
     return functionCallStartsAtIf(tokens, pos, predicate);
 }
 
+pub fn peekCaseFoldFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "lower") or
+        peekFunctionCall(tokens, pos, "upper") or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsInitcapFunction) or
+        peekFunctionCall(tokens, pos, "trim") or
+        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction);
+}
+
+pub fn peekCaseExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "case");
+}
+
+pub fn peekCastExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "cast");
+}
+
+pub fn peekBooleanNotExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "not");
+}
+
+pub fn peekUnaryNegativeExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return pos < tokens.len and tokens[pos].kind == .minus;
+}
+
+pub fn peekParenthesizedExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return pos < tokens.len and tokens[pos].kind == .lparen;
+}
+
+pub fn peekReplaceFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "replace");
+}
+
+pub fn peekRegexpReplaceFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "regexp_replace");
+}
+
+pub fn peekConcatFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "concat") or
+        peekFunctionCall(tokens, pos, "concat_ws");
+}
+
+pub fn peekCoalesceFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "coalesce");
+}
+
+pub fn peekNullifFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "nullif");
+}
+
+pub fn peekArrayElementTransformFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "array_append") or
+        peekFunctionCall(tokens, pos, "array_prepend") or
+        peekFunctionCall(tokens, pos, "array_cat") or
+        peekFunctionCall(tokens, pos, "array_remove") or
+        peekFunctionCall(tokens, pos, "array_replace");
+}
+
+pub fn peekArrayToStringFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "array_to_string");
+}
+
+pub fn peekStringToArrayFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "string_to_array");
+}
+
+pub fn peekFixedUnaryFunctionCall(tokens: []const Token, pos: usize, kind: db_mod.types.RelationalRowsExpressionKind) bool {
+    const keyword = fixedUnaryFunctionKeyword(kind) orelse return false;
+    return peekFunctionCall(tokens, pos, keyword);
+}
+
+pub fn peekFixedBinaryFunctionCall(tokens: []const Token, pos: usize, kind: db_mod.types.RelationalRowsExpressionKind) bool {
+    const keyword = fixedBinaryFunctionKeyword(kind) orelse return false;
+    return peekFunctionCall(tokens, pos, keyword);
+}
+
+pub fn peekGreatestLeastFunctionCall(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "greatest") or
+        peekFunctionCall(tokens, pos, "least");
+}
+
+pub fn peekPositionFunctionSyntax(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "position");
+}
+
+pub fn peekSqlNowExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return peekFunctionCall(tokens, pos, "now") or
+        parser.peekKeyword(tokens, pos, "current_timestamp");
+}
+
+pub fn peekSqlCurrentDateExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "current_date");
+}
+
+pub fn peekSqlIntervalExpressionSyntax(tokens: []const Token, pos: usize) bool {
+    return parser.peekKeyword(tokens, pos, "interval");
+}
+
 pub fn peekTextLengthFunctionKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     const token = tokens[pos];
@@ -7617,6 +7736,23 @@ pub fn peekStrposFunctionKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     const token = tokens[pos];
     return token.kind == .identifier and sqlKeywordIsStrposFunction(token.text);
+}
+
+pub fn peekUnsupportedSimpleFieldTail(tokens: []const Token, pos: usize) bool {
+    return parser.peekKind(tokens, pos, .lparen) or peekJsonExtractOperator(tokens, pos);
+}
+
+pub fn parseSimpleReturningFieldOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+) ![]const u8 {
+    const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    errdefer alloc.free(field);
+    if (peekUnsupportedSimpleFieldTail(tokens, pos.*)) return error.UnsupportedSqlShape;
+    if (binder.relationalColumnForReturningField(schema, field) == null) return error.InvalidSqlCatalog;
+    return field;
 }
 
 pub fn peekSimpleReturningField(tokens: []const Token, pos: usize) bool {
@@ -7760,38 +7896,28 @@ pub fn peekAggregateExpressionInput(tokens: []const Token, pos: usize) bool {
         peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
-        parser.peekKeyword(tokens, pos, "convert_from") or
+        value_mod.peekConvertFromFunctionCall(tokens, pos) or
         functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
         functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
         parser.peekKeyword(tokens, pos, "case") or
         parser.peekKeyword(tokens, pos, "cast") or
-        parser.peekKeyword(tokens, pos, "coalesce") or
-        parser.peekKeyword(tokens, pos, "array_append") or
-        parser.peekKeyword(tokens, pos, "array_prepend") or
-        parser.peekKeyword(tokens, pos, "array_cat") or
-        parser.peekKeyword(tokens, pos, "array_remove") or
-        parser.peekKeyword(tokens, pos, "array_replace") or
-        parser.peekKeyword(tokens, pos, "array_to_string") or
-        parser.peekKeyword(tokens, pos, "string_to_array") or
-        parser.peekKeyword(tokens, pos, "lower") or
-        parser.peekKeyword(tokens, pos, "upper") or
-        parser.peekKeyword(tokens, pos, "trim") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction) or
-        parser.peekKeyword(tokens, pos, "concat") or
-        parser.peekKeyword(tokens, pos, "concat_ws") or
-        parser.peekKeyword(tokens, pos, "replace") or
-        parser.peekKeyword(tokens, pos, "regexp_replace") or
+        peekCoalesceFunctionCall(tokens, pos) or
+        peekArrayElementTransformFunctionCall(tokens, pos) or
+        peekArrayToStringFunctionCall(tokens, pos) or
+        peekStringToArrayFunctionCall(tokens, pos) or
+        peekCaseFoldFunctionCall(tokens, pos) or
+        peekConcatFunctionCall(tokens, pos) or
+        peekReplaceFunctionCall(tokens, pos) or
+        peekRegexpReplaceFunctionCall(tokens, pos) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
-        parser.peekKeyword(tokens, pos, "concat") or
-        parser.peekKeyword(tokens, pos, "concat_ws") or
-        parser.peekKeyword(tokens, pos, "nullif") or
+        peekNullifFunctionCall(tokens, pos) or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFixedUnaryFunctionCall(tokens, pos, .ascii) or
+        peekFixedUnaryFunctionCall(tokens, pos, .chr) or
         peekSubstringFunctionKeyword(tokens, pos) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
@@ -7806,17 +7932,16 @@ pub fn peekAggregateExpressionInput(tokens: []const Token, pos: usize) bool {
         peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
         peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
         parser.peekKeyword(tokens, pos, "position") or
-        parser.peekKeyword(tokens, pos, "abs") or
-        parser.peekKeyword(tokens, pos, "round") or
-        peekFunctionCall(tokens, pos, "trunc") or
-        peekFunctionCall(tokens, pos, "floor") or
-        peekFunctionCall(tokens, pos, "ceil") or
-        peekFunctionCall(tokens, pos, "sqrt") or
-        peekFunctionCall(tokens, pos, "sign") or
-        peekFunctionCall(tokens, pos, "mod") or
-        peekFunctionCall(tokens, pos, "power") or
-        parser.peekKeyword(tokens, pos, "greatest") or
-        parser.peekKeyword(tokens, pos, "least"))
+        peekFixedUnaryFunctionCall(tokens, pos, .abs) or
+        peekFixedUnaryFunctionCall(tokens, pos, .round) or
+        peekFixedUnaryFunctionCall(tokens, pos, .trunc) or
+        peekFixedUnaryFunctionCall(tokens, pos, .floor) or
+        peekFixedUnaryFunctionCall(tokens, pos, .ceil) or
+        peekFixedUnaryFunctionCall(tokens, pos, .sqrt) or
+        peekFixedUnaryFunctionCall(tokens, pos, .sign) or
+        peekFixedBinaryFunctionCall(tokens, pos, .mod) or
+        peekFixedBinaryFunctionCall(tokens, pos, .power) or
+        peekGreatestLeastFunctionCall(tokens, pos))
     {
         return true;
     }
@@ -9445,6 +9570,57 @@ test "sql adapter expression keyword predicates classify function and tail token
     var greatest_pos: usize = 0;
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.greatest, try parseGreatestLeastFunctionCallStart(greatest_tokens[0..], &greatest_pos));
     try std.testing.expectEqual(@as(usize, 2), greatest_pos);
+    try std.testing.expect(peekGreatestLeastFunctionCall(greatest_tokens[0..], 0));
+
+    const case_fold_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "upper" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekCaseFoldFunctionCall(case_fold_tokens[0..], 0));
+
+    const case_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "case" },
+    };
+    try std.testing.expect(peekCaseExpressionSyntax(case_tokens[0..], 0));
+
+    const cast_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "cast" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekCastExpressionSyntax(cast_tokens[0..], 0));
+
+    const not_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "not" },
+    };
+    try std.testing.expect(peekBooleanNotExpressionSyntax(not_tokens[0..], 0));
+
+    const grouped_tokens = [_]Token{
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekParenthesizedExpressionSyntax(grouped_tokens[0..], 0));
+
+    const negative_tokens = [_]Token{
+        .{ .kind = .minus, .text = "-" },
+    };
+    try std.testing.expect(peekUnaryNegativeExpressionSyntax(negative_tokens[0..], 0));
+
+    const concat_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "concat_ws" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekConcatFunctionCall(concat_tokens[0..], 0));
+
+    const coalesce_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "coalesce" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekCoalesceFunctionCall(coalesce_tokens[0..], 0));
+
+    const array_transform_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "array_remove" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekArrayElementTransformFunctionCall(array_transform_tokens[0..], 0));
 
     const json_array_length_tokens = [_]Token{
         .{ .kind = .identifier, .text = "jsonb_array_length" },
@@ -9469,6 +9645,28 @@ test "sql adapter expression keyword predicates classify function and tail token
     var json_build_object_pos: usize = 0;
     try parseJsonBuildObjectFunctionCallStart(json_build_object_tokens[0..], &json_build_object_pos);
     try std.testing.expectEqual(@as(usize, 2), json_build_object_pos);
+
+    const position_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "position" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekPositionFunctionSyntax(position_tokens[0..], 0));
+
+    const now_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "now" },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    try std.testing.expect(peekSqlNowExpressionSyntax(now_tokens[0..], 0));
+
+    const current_date_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "current_date" },
+    };
+    try std.testing.expect(peekSqlCurrentDateExpressionSyntax(current_date_tokens[0..], 0));
+
+    const interval_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "interval" },
+    };
+    try std.testing.expect(peekSqlIntervalExpressionSyntax(interval_tokens[0..], 0));
 
     const to_jsonb_tokens = [_]Token{
         .{ .kind = .identifier, .text = "to_jsonb" },
@@ -9912,6 +10110,14 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.case, expression.operands[1].kind);
     try std.testing.expectEqual(@as(usize, 0), groups[0].conditions.len);
     try std.testing.expectEqual(@as(usize, 0), groups[1].conditions.len);
+}
+
+test "sql adapter lower expr names every row expression kind" {
+    inline for (std.meta.fields(runtime_schema.RelationalRowsExpressionKind)) |field| {
+        const kind: runtime_schema.RelationalRowsExpressionKind = @field(runtime_schema.RelationalRowsExpressionKind, field.name);
+        try std.testing.expect(rowExpressionOpName(kind).len > 0);
+        try std.testing.expect(rowExpressionDefaultOutputName(kind).len > 0);
+    }
 }
 
 test "sql adapter lower expr compares row expressions" {

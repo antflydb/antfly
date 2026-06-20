@@ -147,6 +147,7 @@ pub fn mergeSearchResults(
         for (graph_results) |*graph_result| graph_result.deinit(alloc);
         if (graph_results.len > 0) alloc.free(graph_results);
     }
+    stripUnrequestedGraphSearchMetricStatuses(alloc, req, graph_results);
     const graph_metric_results = if (req.graph_metric_queries.len > 0 or has_graph_metric_results)
         try mergeGraphMetricResults(alloc, req, results)
     else
@@ -507,6 +508,17 @@ fn validateGraphMetricPublishedStatus(status: db_mod.types.GraphMetricStatus) !v
     if (!std.math.isFinite(status.delta)) return error.UnsupportedQueryRequest;
 }
 
+fn validateGraphMetricUnpublishedStatus(status: db_mod.types.GraphMetricStatus) !void {
+    if (status.published_generation != 0) return error.UnsupportedQueryRequest;
+    switch (status.state) {
+        .not_ready, .building, .failed => {},
+        .fresh, .stale, .disabled => return error.UnsupportedQueryRequest,
+    }
+    if (!std.math.isFinite(status.progress)) return error.UnsupportedQueryRequest;
+    if (status.progress < 0.0 or status.progress > 1.0) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(status.delta)) return error.UnsupportedQueryRequest;
+}
+
 fn validateGraphMetricStatusGenerationShape(status: db_mod.types.GraphMetricStatus) !void {
     const published = status.published_generation;
     if (published == 0) return error.UnsupportedQueryRequest;
@@ -772,6 +784,33 @@ fn mergeGraphSearchResults(
     return merged;
 }
 
+fn stripUnrequestedGraphSearchMetricStatuses(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    graph_results: []db_mod.types.GraphSearchResult,
+) void {
+    for (graph_results) |*graph_result| {
+        if (graphSearchQueryIncludesMetricStatus(req, graph_result.name)) continue;
+        freeGraphSearchMetricStatuses(alloc, graph_result);
+    }
+}
+
+fn graphSearchQueryIncludesMetricStatus(req: db_mod.types.SearchRequest, name: []const u8) bool {
+    for (req.graph_queries) |query| {
+        if (std.mem.eql(u8, query.name, name)) return query.query.include_metric_status;
+    }
+    return false;
+}
+
+fn freeGraphSearchMetricStatuses(
+    alloc: std.mem.Allocator,
+    graph_result: *db_mod.types.GraphSearchResult,
+) void {
+    for (graph_result.metric_status) |*status| status.deinit(alloc);
+    if (graph_result.metric_status.len > 0) alloc.free(graph_result.metric_status);
+    graph_result.metric_status = &.{};
+}
+
 fn validateGraphResultNodePayload(node: graph_query_mod.GraphResultNode) !void {
     if (!std.math.isFinite(node.distance)) return error.UnsupportedQueryRequest;
     if (node.path) |path_nodes| {
@@ -896,14 +935,14 @@ fn validateGraphSearchMetricStatuses(
         query.query.order_by.len > 0 or
         query.query.where_metric.len > 0;
     if (!expects_metric_status and graph_result.metric_status.len > 0) return error.UnsupportedQueryRequest;
-    try validateGraphSearchMetricStatusList(graph_result.metric_status);
+    try validateGraphSearchMetricStatusList(query, graph_result.metric_status);
     if (!query.query.include_metric_status) {
         try validateGraphSearchMetricStatusNamesRequested(query, graph_result.metric_status);
     }
     try validateGraphSearchMetricPayloads(query, graph_result);
-    for (query.query.metrics) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness);
-    for (query.query.order_by) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness);
-    for (query.query.where_metric) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness);
+    for (query.query.metrics) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness, false);
+    for (query.query.order_by) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness, true);
+    for (query.query.where_metric) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness, true);
 }
 
 fn validateGraphSearchProjectedMetricNamesUnique(metrics: []const graph_query_mod.GraphMetricRead) !void {
@@ -922,10 +961,20 @@ fn validateGraphSearchOrderMetricNamesUnique(metrics: []const graph_query_mod.Gr
     }
 }
 
-fn validateGraphSearchMetricStatusList(statuses: []const db_mod.types.GraphMetricStatus) !void {
+fn validateGraphSearchMetricStatusList(
+    query: db_mod.types.NamedGraphQuery,
+    statuses: []const db_mod.types.GraphMetricStatus,
+) !void {
     for (statuses, 0..) |status, i| {
-        if (status.published_generation == 0) return error.UnsupportedQueryRequest;
-        try validateGraphMetricPublishedStatus(status);
+        const require_published = graphSearchMetricScoreReadRequested(query, status.name);
+        const allow_unpublished = !require_published and
+            (query.query.include_metric_status or graphSearchMetricProjected(query, status.name));
+        if (status.published_generation == 0) {
+            if (!allow_unpublished) return error.UnsupportedQueryRequest;
+            try validateGraphMetricUnpublishedStatus(status);
+        } else {
+            try validateGraphMetricPublishedStatus(status);
+        }
         for (statuses[0..i]) |previous| {
             if (std.mem.eql(u8, previous.name, status.name)) return error.UnsupportedQueryRequest;
         }
@@ -944,8 +993,20 @@ fn validateHitsPairMetricStatusList(statuses: []const db_mod.types.GraphMetricSt
         }
     }
     if (authority) |authority_status| {
-        if (hub) |hub_status| try validateHitsPairMetricStatusesCompatible(authority_status, hub_status);
+        if (hub) |hub_status| try validateGraphSearchHitsPairMetricStatusesCompatible(authority_status, hub_status);
     }
+}
+
+fn validateGraphSearchHitsPairMetricStatusesCompatible(
+    authority: db_mod.types.GraphMetricStatus,
+    hub: db_mod.types.GraphMetricStatus,
+) !void {
+    if (authority.published_generation == 0 or hub.published_generation == 0) {
+        if (authority.published_generation != 0 or hub.published_generation != 0) return error.UnsupportedQueryRequest;
+        try validateGraphMetricStatusCompatible(authority, hub);
+        return;
+    }
+    try validateHitsPairMetricStatusesCompatible(authority, hub);
 }
 
 fn validateGraphSearchMetricStatusNamesRequested(
@@ -961,9 +1022,25 @@ fn graphSearchMetricNameRequested(
     query: db_mod.types.NamedGraphQuery,
     metric_name: []const u8,
 ) bool {
+    if (graphSearchMetricProjected(query, metric_name)) return true;
+    if (graphSearchMetricScoreReadRequested(query, metric_name)) return true;
+    return false;
+}
+
+fn graphSearchMetricProjected(
+    query: db_mod.types.NamedGraphQuery,
+    metric_name: []const u8,
+) bool {
     for (query.query.metrics) |metric| {
         if (std.mem.eql(u8, metric.name, metric_name)) return true;
     }
+    return false;
+}
+
+fn graphSearchMetricScoreReadRequested(
+    query: db_mod.types.NamedGraphQuery,
+    metric_name: []const u8,
+) bool {
     for (query.query.order_by) |metric| {
         if (std.mem.eql(u8, metric.name, metric_name)) return true;
     }
@@ -1021,13 +1098,14 @@ fn validateGraphSearchMetricStatus(
     graph_result: db_mod.types.GraphSearchResult,
     metric_name: []const u8,
     freshness: graph_query_mod.GraphMetricFreshness,
+    require_published: bool,
 ) !void {
     var found = false;
     for (graph_result.metric_status) |status| {
         if (!std.mem.eql(u8, status.name, metric_name)) continue;
         if (found) return error.UnsupportedQueryRequest;
         found = true;
-        try validateGraphQueryMetricFreshness(freshness, status);
+        try validateGraphQueryMetricFreshness(freshness, status, require_published);
     }
     if (!found) return error.UnsupportedQueryRequest;
 }
@@ -1035,7 +1113,10 @@ fn validateGraphSearchMetricStatus(
 fn validateGraphQueryMetricFreshness(
     freshness: graph_query_mod.GraphMetricFreshness,
     status: db_mod.types.GraphMetricStatus,
+    require_published: bool,
 ) !void {
+    if (require_published and status.published_generation == 0) return error.UnsupportedQueryRequest;
+    if (freshness == .fresh and status.published_generation == 0) return error.UnsupportedQueryRequest;
     if (freshness == .fresh and status.state != .fresh) return error.UnsupportedQueryRequest;
 }
 
@@ -2214,6 +2295,7 @@ test "query profile reports failed graph metric status across read surfaces" {
             .index_name = "graph_idx",
             .start_nodes = .{ .keys = &.{"doc:a"} },
             .metrics = &graph_metric_reads,
+            .include_metric_status = true,
         },
     }};
 
@@ -3070,6 +3152,7 @@ test "query merge rejects inconsistent graph metric fan-in status state" {
             .index_name = "graph_idx",
             .start_nodes = .{ .keys = &.{"doc:a"} },
             .metrics = &graph_metric_reads,
+            .include_metric_status = true,
         },
     }};
     const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
@@ -4809,6 +4892,7 @@ test "query merge requires comparable graph search metric generations across sha
             .index_name = "graph_idx",
             .start_nodes = .{ .keys = &.{"doc:a"} },
             .metrics = &graph_metric_reads,
+            .include_metric_status = true,
         },
     }};
     const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
@@ -4925,6 +5009,143 @@ test "query merge requires comparable graph search metric generations across sha
     };
     defer missing.deinit();
     try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, missing }, 0, 10));
+}
+
+test "query merge allows unpublished projected graph search metric status" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = null },
+        }),
+    };
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .not_ready,
+                .published_generation = 0,
+                .edge_generation = 3,
+                .target_edge_generation = 3,
+                .progress = 0.0,
+                .converged = false,
+            },
+        }),
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer result.deinit();
+
+    var merged = try mergeSearchResults(alloc, req, &.{result}, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expect(merged.graph_results[0].nodes[0].metrics[0].score == null);
+    try std.testing.expectEqual(@as(usize, 0), merged.graph_results[0].metric_status.len);
+
+    const include_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+            .include_metric_status = true,
+        },
+    }};
+    var included = try mergeSearchResults(alloc, .{ .graph_queries = &include_graph_queries }, &.{result}, 0, 10);
+    defer included.deinit();
+    try std.testing.expectEqual(@as(usize, 1), included.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, included.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 0), included.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .fresh,
+    }};
+    const fresh_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &fresh_graph_metric_reads,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &fresh_graph_queries }, &.{result}, 0, 10));
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const order_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &graph_metric_orders,
+        },
+    }};
+    const order_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    order_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .not_ready,
+                .published_generation = 0,
+                .edge_generation = 3,
+                .target_edge_generation = 3,
+                .progress = 0.0,
+                .converged = false,
+            },
+        }),
+    };
+    var order_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = order_results,
+    };
+    defer order_result.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &order_graph_queries }, &.{order_result}, 0, 10));
 }
 
 test "query merge rejects ambiguous graph search fan-in metric status" {
@@ -5141,6 +5362,7 @@ test "query merge preserves failed graph search metric status across shards" {
             .index_name = "graph_idx",
             .start_nodes = .{ .keys = &.{"doc:a"} },
             .metrics = &graph_metric_reads,
+            .include_metric_status = true,
         },
     }};
     const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
@@ -5273,6 +5495,7 @@ test "query merge enforces graph search order and filter metric generations acro
             .start_nodes = .{ .keys = &.{"doc:a"} },
             .order_by = &graph_metric_orders,
             .where_metric = &graph_metric_filters,
+            .include_metric_status = true,
         },
     }};
     const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
@@ -5339,6 +5562,21 @@ test "query merge enforces graph search order and filter metric generations acro
     try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, merged.graph_results[0].metric_status[0].state);
     try std.testing.expectEqual(@as(u64, 5), merged.graph_results[0].metric_status[0].published_generation);
     try std.testing.expectEqual(@as(u64, 6), merged.graph_results[0].metric_status[0].building_generation);
+
+    const no_status_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &graph_metric_orders,
+            .where_metric = &graph_metric_filters,
+        },
+    }};
+    var no_status_merged = try mergeSearchResults(alloc, .{ .graph_queries = &no_status_graph_queries }, &.{ left, right }, 0, 10);
+    defer no_status_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), no_status_merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 0), no_status_merged.graph_results[0].metric_status.len);
 
     right_results[0].metric_status[0].state = .failed;
     right_results[0].metric_status[0].retry_count = 2;

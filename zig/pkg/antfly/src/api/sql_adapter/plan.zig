@@ -299,6 +299,24 @@ pub const LoweredSetOperationPlan = struct {
     }
 };
 
+pub const LoweredRecursiveCtePlan = struct {
+    cte_name: []const u8,
+    operation: SelectSetOperation,
+    anchor: LoweredQueryPlan,
+    output_columns: []const runtime_schema.RelationalColumn = &.{},
+    recursive_member_references_cte: bool = false,
+    max_rows: ?u32 = db_mod.types.default_relational_rows_cte_max_rows,
+    max_bytes: ?u64 = db_mod.types.default_relational_rows_cte_max_bytes,
+    spill_after_bytes: ?u64 = db_mod.types.default_relational_rows_cte_spill_after_bytes,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.cte_name);
+        self.anchor.deinit(alloc);
+        freeSetOperationOutputColumns(alloc, self.output_columns);
+        self.* = undefined;
+    }
+};
+
 fn freeSetOperationOutputColumns(alloc: std.mem.Allocator, columns: []const runtime_schema.RelationalColumn) void {
     for (columns) |column| {
         if (column.name.len > 0) alloc.free(column.name);
@@ -789,6 +807,7 @@ pub const LateralSubquery = struct {
 pub const LoweredReadPlan = union(enum) {
     query: LoweredQueryPlan,
     set_operation: LoweredSetOperationPlan,
+    recursive_cte: LoweredRecursiveCtePlan,
     aggregate: LoweredAggregatePlan,
     join: LoweredJoin,
     lateral: LoweredLateralPlan,
@@ -798,6 +817,7 @@ pub const LoweredReadPlan = union(enum) {
         switch (self.*) {
             .query => |*query| query.deinit(alloc),
             .set_operation => |*set_operation| set_operation.deinit(alloc),
+            .recursive_cte => |*recursive_cte| recursive_cte.deinit(alloc),
             .aggregate => |*aggregate| aggregate.deinit(alloc),
             .join => |*join| join.deinit(alloc),
             .lateral => |*lateral| lateral.deinit(alloc),

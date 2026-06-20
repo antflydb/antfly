@@ -4643,6 +4643,7 @@ pub fn executeLoweredSqlReadPlanAlloc(
             errdefer result.deinit(alloc);
             break :blk .{ .set_operation = result };
         },
+        .recursive_cte => return error.UnsupportedRowsQuery,
         .aggregate => |lowered| blk: {
             const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
             defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);

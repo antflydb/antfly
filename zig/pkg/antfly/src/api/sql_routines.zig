@@ -581,6 +581,63 @@ test "sql routine runtime executes nested safe expression bodies" {
     try std.testing.expectEqualStrings("8", clamped);
 }
 
+test "sql routine runtime executes native row expression bodies and rejects ambient fields" {
+    const alloc = std.testing.allocator;
+    var runtime = Runtime.init(alloc);
+    defer runtime.deinit();
+
+    var redact_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION redact_digits(text) RETURNS text LANGUAGE sql AS 'SELECT regexp_replace($1, ''[0-9]'', ''#'', ''g'')';",
+    );
+    defer redact_plan.deinit(alloc);
+    try runtime.apply(switch (redact_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const redacted = try runtime.executeExpressionRoutineAlloc(alloc, "redact_digits", "\"acct-123\"");
+    defer alloc.free(redacted);
+    try std.testing.expectEqualStrings("\"acct-###\"", redacted);
+
+    var replace_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION normalize_dash(text) RETURNS text LANGUAGE sql AS 'SELECT replace($1::text, ''-'', ''_'')';",
+    );
+    defer replace_plan.deinit(alloc);
+    try runtime.apply(switch (replace_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const normalized = try runtime.executeExpressionRoutineAlloc(alloc, "normalize_dash", "\"a-b-c\"");
+    defer alloc.free(normalized);
+    try std.testing.expectEqualStrings("\"a_b_c\"", normalized);
+
+    var cast_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION cast_amount(text) RETURNS numeric LANGUAGE sql AS 'SELECT cast($1 AS numeric) + 1';",
+    );
+    defer cast_plan.deinit(alloc);
+    try runtime.apply(switch (cast_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+
+    const casted = try runtime.executeExpressionRoutineAlloc(alloc, "cast_amount", "\"41\"");
+    defer alloc.free(casted);
+    try std.testing.expectEqualStrings("42", casted);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION missing_arg(text) RETURNS text LANGUAGE sql AS 'SELECT lower($2)';"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION ambient_field(text) RETURNS text LANGUAGE sql AS 'SELECT lower(status)';"),
+    );
+}
+
 test "sql routine runtime replaces ready extension query function bindings" {
     const alloc = std.testing.allocator;
     var runtime = Runtime.init(alloc);
