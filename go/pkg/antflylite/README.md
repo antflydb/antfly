@@ -28,3 +28,7 @@ maintenance reports while keeping the raw JSON methods available.
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
 wants hosted/manual maintenance and will call `RunUntilIdle` itself.
+
+Use `BackupToFile` to write a portable `.afb` archive from an open Lite handle.
+Use `RestoreBackupFile` or `RestoreBackup` to stage a portable backup into a
+new `.aflite` database without publishing a partial target on import failure.

@@ -121,6 +121,54 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("unexpected vacuum report: %#v", vacuumReport)
 	}
 
+	backupPath := filepath.Join(t.TempDir(), "go-backup.afb")
+	if err := db.BackupToFile(backupPath); err != nil {
+		t.Fatalf("backup to file: %v", err)
+	}
+	if info, err := os.Stat(backupPath); err != nil {
+		t.Fatalf("backup file: %v", err)
+	} else if info.Size() == 0 {
+		t.Fatalf("backup file is empty: %s", backupPath)
+	}
+
+	restoredPath := filepath.Join(t.TempDir(), "go-restored.aflite")
+	if err := RestoreBackupFile(restoredPath, backupPath, false); err != nil {
+		t.Fatalf("restore backup file: %v", err)
+	}
+	restored, err := OpenReadonly(restoredPath)
+	if err != nil {
+		t.Fatalf("open restored Lite database: %v", err)
+	}
+	restoredLookup, err := restored.LookupJSON("doc:go-smoke")
+	if err != nil {
+		t.Fatalf("lookup restored document: %v", err)
+	}
+	if !bytes.Contains(restoredLookup, []byte("go api lite")) {
+		t.Fatalf("restored lookup JSON %q did not contain written document", restoredLookup)
+	}
+	if err := restored.Close(); err != nil {
+		t.Fatalf("close restored Lite database: %v", err)
+	}
+
+	backupBytes, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup file: %v", err)
+	}
+	restoredFromBytesPath := filepath.Join(t.TempDir(), "go-restored-bytes.aflite")
+	if err := RestoreBackup(restoredFromBytesPath, backupBytes, false); err != nil {
+		t.Fatalf("restore backup bytes: %v", err)
+	}
+	if err := RestoreBackup(restoredFromBytesPath, backupBytes, false); err == nil {
+		t.Fatalf("restore without replace unexpectedly overwrote target")
+	}
+	malformedRestorePath := filepath.Join(t.TempDir(), "go-malformed-restore.aflite")
+	if err := RestoreBackup(malformedRestorePath, []byte("not an afb"), false); err == nil {
+		t.Fatalf("malformed restore unexpectedly succeeded")
+	}
+	if _, err := os.Stat(malformedRestorePath); !os.IsNotExist(err) {
+		t.Fatalf("malformed restore left target behind: %v", err)
+	}
+
 	hostedPath := filepath.Join(t.TempDir(), "go-hosted.aflite")
 	hosted, err := OpenHosted(hostedPath)
 	if err != nil {
