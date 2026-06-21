@@ -1828,6 +1828,10 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
     return .ok;
 }
 
+pub export fn antfly_lite_export(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    return antfly_lite_backup(handle_ptr, out_buf);
+}
+
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
@@ -1837,6 +1841,10 @@ pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Sl
     const bytes = backup.bytes();
     lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, bytes) catch |err| return capi.mapError(err);
     return .ok;
+}
+
+pub export fn antfly_lite_import(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
+    return antfly_lite_import_backup(handle_ptr, backup);
 }
 
 const LiteRestoreReport = struct {
@@ -6774,9 +6782,18 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_buffer_free(backup.ptr, backup.len);
     try std.testing.expect(backup.len > 0);
 
+    var exported_backup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_export(src_handle, &exported_backup));
+    defer antfly_db_buffer_free(exported_backup.ptr, exported_backup.len);
+    try std.testing.expect(exported_backup.len > 0);
+
     var dst_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(dst_path, &dst_handle));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(dst_handle, .{
+        .ptr = null,
+        .len = 16,
+    }));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import(dst_handle, .{
         .ptr = null,
         .len = 16,
     }));
@@ -6850,9 +6867,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_buffer_free(schema_after_valid_rejected.ptr, schema_after_valid_rejected.len);
     try std.testing.expectEqualStrings(schema_json, schema_after_valid_rejected.ptr.?[0..schema_after_valid_rejected.len]);
 
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import_backup(dst_handle, .{
-        .ptr = backup.ptr,
-        .len = backup.len,
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_import(dst_handle, .{
+        .ptr = exported_backup.ptr,
+        .len = exported_backup.len,
     }));
 
     var lookup: capi.Buffer = .{};

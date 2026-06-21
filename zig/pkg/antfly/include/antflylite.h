@@ -201,7 +201,9 @@ antfly_error_code antfly_lite_open_status_only(const char *path, void **out_hand
 antfly_error_code antfly_lite_status_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_capabilities_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_backup(void *handle, antfly_buffer *out);
+antfly_error_code antfly_lite_export(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_import_backup(void *handle, antfly_slice backup);
+antfly_error_code antfly_lite_import(void *handle, antfly_slice backup);
 antfly_error_code antfly_lite_restore_backup_json(
     const char *dest_path,
     antfly_slice backup,

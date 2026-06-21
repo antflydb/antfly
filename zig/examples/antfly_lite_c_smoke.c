@@ -146,6 +146,21 @@ int main(void) {
         return 1;
     }
 
+    antfly_buffer exported_backup = {0};
+    if (expect_ok(antfly_lite_export(handle, &exported_backup), "export lite database") != 0) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    if (exported_backup.len == 0) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(bad_path);
+        return fail_with_buffer("export alias returned an empty portable backup", &exported_backup);
+    }
+    antfly_buffer_free(&exported_backup);
+
     antfly_buffer lookup = {0};
     if (expect_ok(antfly_db_lookup_json(handle, write.key, &lookup), "lookup json") != 0) {
         antfly_db_close(handle);
