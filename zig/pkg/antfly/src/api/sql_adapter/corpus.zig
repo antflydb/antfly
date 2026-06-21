@@ -458,6 +458,7 @@ pub const app_parity_coverage_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
 pub const sql_adapter_edge_case_fixture_format: u64 = 1;
+pub const sql_adapter_edge_coverage_fixture_format: u64 = 1;
 
 pub const AppParityFixtureRoot = struct {
     fixture_format: u64,
@@ -566,6 +567,111 @@ pub const SqlAdapterEdgeCase = struct {
 pub const SqlAdapterEdgeCaseRoot = struct {
     edge_case_format: u64,
     cases: []const SqlAdapterEdgeCase,
+};
+
+pub const SqlAdapterEdgeCaseCoverageRequirementsRoot = struct {
+    coverage_format: u64,
+    required: []const []const u8,
+};
+
+pub const SqlAdapterEdgeCaseCoverageRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: SqlAdapterEdgeCaseCoverageRequirementsRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeSqlAdapterEdgeCaseCoverageRequirementsRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const SqlAdapterEdgeCaseCoverage = struct {
+    action_classify_write: bool = false,
+    action_ddl: bool = false,
+    action_delete: bool = false,
+    action_insert: bool = false,
+    action_select: bool = false,
+    action_update: bool = false,
+    action_write_plan: bool = false,
+    cte_write_classification: bool = false,
+    cte_write_plan_rejection: bool = false,
+    expected_error_invalid_sql_catalog: bool = false,
+    expected_error_unsupported_rows_selector: bool = false,
+    expected_error_unsupported_sql_shape: bool = false,
+    expression_conflict_target_rejection: bool = false,
+    fail_closed_unterminated_comment: bool = false,
+    malformed_placeholder_suffix: bool = false,
+    point_lowerer_boundary: bool = false,
+    preserved_comments_success: bool = false,
+    typed_create_table_ddl: bool = false,
+    typed_insert_batch: bool = false,
+    typed_select_predicate: bool = false,
+    typed_update_mutation: bool = false,
+    write_kind_delete: bool = false,
+    write_kind_update: bool = false,
+
+    pub fn observe(self: *@This(), edge_case: SqlAdapterEdgeCase) void {
+        switch (edge_case.action) {
+            .classify_write => self.action_classify_write = true,
+            .ddl => self.action_ddl = true,
+            .delete => self.action_delete = true,
+            .insert => self.action_insert = true,
+            .select => self.action_select = true,
+            .update => self.action_update = true,
+            .write_plan => self.action_write_plan = true,
+        }
+
+        self.expected_error_invalid_sql_catalog = self.expected_error_invalid_sql_catalog or
+            std.mem.eql(u8, edge_case.expected_error, "invalid_sql_catalog");
+        self.expected_error_unsupported_rows_selector = self.expected_error_unsupported_rows_selector or
+            std.mem.eql(u8, edge_case.expected_error, "unsupported_rows_selector");
+        self.expected_error_unsupported_sql_shape = self.expected_error_unsupported_sql_shape or
+            std.mem.eql(u8, edge_case.expected_error, "unsupported_sql_shape");
+        self.cte_write_classification = self.cte_write_classification or
+            (edge_case.action == .classify_write and
+                std.mem.startsWith(u8, edge_case.sql, "WITH ") and
+                edge_case.expected_write_kind != null);
+        self.cte_write_plan_rejection = self.cte_write_plan_rejection or
+            (edge_case.action == .write_plan and
+                std.mem.startsWith(u8, edge_case.sql, "WITH ") and
+                std.mem.eql(u8, edge_case.expected_error, "unsupported_rows_selector"));
+        self.expression_conflict_target_rejection = self.expression_conflict_target_rejection or
+            (edge_case.action == .insert and
+                std.mem.indexOf(u8, edge_case.sql, "ON CONFLICT (upper(") != null and
+                std.mem.eql(u8, edge_case.expected_error, "invalid_sql_catalog"));
+        self.fail_closed_unterminated_comment = self.fail_closed_unterminated_comment or
+            (std.mem.indexOf(u8, edge_case.sql, "unterminated") != null and
+                std.mem.eql(u8, edge_case.expected_error, "unsupported_sql_shape"));
+        self.malformed_placeholder_suffix = self.malformed_placeholder_suffix or
+            (std.mem.indexOf(u8, edge_case.sql, "$1abc") != null and
+                std.mem.eql(u8, edge_case.expected_error, "unsupported_sql_shape"));
+        self.point_lowerer_boundary = self.point_lowerer_boundary or
+            ((edge_case.action == .select or edge_case.action == .update or edge_case.action == .delete) and
+                std.mem.eql(u8, edge_case.expected_error, "unsupported_sql_shape") and
+                (std.mem.indexOf(u8, edge_case.sql, " JOIN ") != null or
+                    std.mem.indexOf(u8, edge_case.sql, "organization_id =") != null));
+        self.preserved_comments_success = self.preserved_comments_success or
+            (edge_case.expected_error.len == 0 and
+                (std.mem.indexOf(u8, edge_case.sql, "/*") != null or
+                    std.mem.indexOf(u8, edge_case.sql, "--") != null));
+        self.typed_create_table_ddl = self.typed_create_table_ddl or
+            (edge_case.action == .ddl and
+                edge_case.expected_error.len == 0 and
+                edge_case.expected_ddl_tag == .create_table);
+        self.typed_insert_batch = self.typed_insert_batch or
+            (edge_case.action == .insert and
+                edge_case.expected_error.len == 0 and
+                edge_case.expected_inserted != null);
+        self.typed_select_predicate = self.typed_select_predicate or
+            (edge_case.action == .select and
+                edge_case.expected_error.len == 0 and
+                edge_case.expected_predicates != null);
+        self.typed_update_mutation = self.typed_update_mutation or
+            (edge_case.action == .update and
+                edge_case.expected_error.len == 0 and
+                edge_case.expected_transformed != null);
+        self.write_kind_delete = self.write_kind_delete or edge_case.expected_write_kind == .delete;
+        self.write_kind_update = self.write_kind_update or edge_case.expected_write_kind == .update;
+    }
 };
 
 pub const AppParityFixtureEncodedEntry = struct {
@@ -1141,6 +1247,93 @@ pub fn freeSqlAdapterEdgeCaseRoot(
 ) void {
     for (root.cases) |case| freeSqlAdapterEdgeCase(alloc, case);
     if (root.cases.len > 0) alloc.free(root.cases);
+}
+
+fn sqlAdapterEdgeCaseCoverageRequirementKnown(name: []const u8) bool {
+    inline for (std.meta.fields(SqlAdapterEdgeCaseCoverage)) |field| {
+        if (std.mem.eql(u8, name, field.name)) return field.type == bool;
+    }
+    return false;
+}
+
+fn sqlAdapterEdgeCaseCoverageRequirementSatisfied(
+    coverage: SqlAdapterEdgeCaseCoverage,
+    name: []const u8,
+) !bool {
+    inline for (std.meta.fields(SqlAdapterEdgeCaseCoverage)) |field| {
+        if (std.mem.eql(u8, name, field.name)) {
+            if (field.type == bool) return @field(coverage, field.name);
+            return error.TestUnexpectedResult;
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+pub fn parseSqlAdapterEdgeCaseCoverageRequirementsRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlAdapterEdgeCaseCoverageRequirementsRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "coverage_format", "required" });
+    const coverage_format = try fixtureJsonOptionalU64(root, "coverage_format", 0);
+    if (coverage_format != sql_adapter_edge_coverage_fixture_format) return error.TestUnexpectedResult;
+    const required = try parseFixtureStringListAlloc(alloc, root, "required");
+    errdefer if (required.len > 0) alloc.free(required);
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    for (required, 0..) |name, i| {
+        if (name.len == 0 or seen.contains(name) or !sqlAdapterEdgeCaseCoverageRequirementKnown(name)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
+        try seen.put(alloc, name, {});
+    }
+    inline for (std.meta.fields(SqlAdapterEdgeCaseCoverage)) |field| {
+        if (field.type == bool and !seen.contains(field.name)) {
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    return .{
+        .coverage_format = coverage_format,
+        .required = required,
+    };
+}
+
+pub fn freeSqlAdapterEdgeCaseCoverageRequirementsRoot(
+    alloc: std.mem.Allocator,
+    root: SqlAdapterEdgeCaseCoverageRequirementsRoot,
+) void {
+    if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn parseSqlAdapterEdgeCaseCoverageRequirementsAlloc(alloc: std.mem.Allocator) !SqlAdapterEdgeCaseCoverageRequirements {
+    const coverage_json = @embedFile("../fixtures/sql_api_adapter_edge_required_coverage.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSqlAdapterEdgeCaseCoverageRequirementsRootAlloc(alloc, parsed.value);
+    errdefer freeSqlAdapterEdgeCaseCoverageRequirementsRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+pub fn expectSqlAdapterEdgeCaseCoverageRequirements(
+    coverage: SqlAdapterEdgeCaseCoverage,
+    required: []const []const u8,
+) !void {
+    if (required.len == 0) return error.TestUnexpectedResult;
+    for (required) |name| {
+        if (!try sqlAdapterEdgeCaseCoverageRequirementSatisfied(coverage, name)) {
+            std.debug.print("missing sql adapter edge coverage: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 fn parseSqlAdapterEdgeCaseAlloc(
@@ -4596,6 +4789,37 @@ test "sql adapter corpus parses adapter edge case fixtures" {
     var parsed_invalid_kind = try std.json.parseFromSlice(std.json.Value, alloc, invalid_kind_json, .{});
     defer parsed_invalid_kind.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_invalid_kind.value));
+}
+
+test "sql adapter corpus validates adapter edge case coverage requirements" {
+    const alloc = std.testing.allocator;
+    var required_coverage = try parseSqlAdapterEdgeCaseCoverageRequirementsAlloc(alloc);
+    defer required_coverage.deinit(alloc);
+    try std.testing.expectEqual(sql_adapter_edge_coverage_fixture_format, required_coverage.root.coverage_format);
+    try std.testing.expect(required_coverage.root.required.len > 0);
+
+    const incomplete_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": ["action_select"]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlAdapterEdgeCaseCoverageRequirementsRootAlloc(alloc, parsed_incomplete.value));
+
+    const unknown_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": [
+        \\    "action_classify_write",
+        \\    "not_a_coverage_bucket"
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown = try std.json.parseFromSlice(std.json.Value, alloc, unknown_json, .{});
+    defer parsed_unknown.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlAdapterEdgeCaseCoverageRequirementsRootAlloc(alloc, parsed_unknown.value));
 }
 
 fn appParitySqlHasComputedPattern(sql: []const u8) bool {

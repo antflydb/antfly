@@ -1208,9 +1208,13 @@ edge cases that are not golden typed-plan entries, such as comment preservation,
 malformed placeholder suffixes, statement-kind classification, and fail-closed
 point-lowerer boundaries, live in
 `api/fixtures/sql_api_adapter_edge_cases.json` and are interpreted by one
-generic lowerer runner. Those cases should only move into the source corpus when
-they assert a durable typed plan, adapter no-op, or unsupported model-feature
-classification. Prepared
+generic lowerer runner. Required edge-case buckets live in
+`api/fixtures/sql_api_adapter_edge_required_coverage.json`; those names resolve
+directly against `corpus.zig` edge-coverage fields, must stay sorted, and must
+enumerate every edge-coverage dimension so adding a new edge class fails closed
+until review policy is updated. Those cases should only move into the source
+corpus when they assert a durable typed plan, adapter no-op, or unsupported
+model-feature classification. Prepared
 statement, cursor portal, `EXPLAIN` wrapper, maintenance, transaction-control,
 catalog DDL, collation/operator/aggregate/cast catalog syntax, and adapter-only
 catalog no-op examples use this path because their expected behavior is fully
@@ -6765,7 +6769,8 @@ predicate queries, parenthesized arithmetic projection/order queries, and
 array/computed-array expression queries, and portable read-classifier
 query/aggregate examples. The adapter edge-case fixture carries lowerer/parser
 examples that have no golden typed-plan fingerprint but still need reviewable
-SQL text and exact success/error expectations. The embedded Zig case list is
+SQL text, exact success/error expectations, and required coverage in
+`sql_api_adapter_edge_required_coverage.json`. The embedded Zig case list is
 intentionally empty; if a future regression needs in-process fixture
 construction, the long-term shape is to add an explicit source-fixture or
 edge-fixture field and parser/validator support so the case remains reviewable

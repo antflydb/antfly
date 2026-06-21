@@ -35262,8 +35262,13 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
     defer parsed_fixture.deinit();
     const root = try sql_adapter.parseSqlAdapterEdgeCaseRootAlloc(alloc, parsed_fixture.value);
     defer sql_adapter.freeSqlAdapterEdgeCaseRoot(alloc, root);
+    var required_coverage = try sql_adapter.parseSqlAdapterEdgeCaseCoverageRequirementsAlloc(alloc);
+    defer required_coverage.deinit(alloc);
 
+    var coverage = sql_adapter.SqlAdapterEdgeCaseCoverage{};
     for (root.cases) |edge_case| {
+        coverage.observe(edge_case);
         try expectSqlAdapterEdgeCase(alloc, edge_case, schema, resolver_ctx.resolver());
     }
+    try sql_adapter.expectSqlAdapterEdgeCaseCoverageRequirements(coverage, required_coverage.root.required);
 }
