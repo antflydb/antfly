@@ -32,7 +32,9 @@ Use constants such as `InferenceModeCallerSuppliedArtifacts`,
 branching on inference status or capabilities.
 Typed `PendingWorkStats`, `RunUntilIdleStatus`, `Check`, `Vacuum`, and
 `CopyStableSnapshot` helpers cover the stable Lite maintenance reports while
-keeping the raw JSON methods available.
+keeping the raw JSON methods available. `ReplayGeneratedEnrichments` recreates
+generated enrichment work from stored documents after a manual-maintenance or
+restore pause.
 
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application

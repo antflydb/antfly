@@ -1948,6 +1948,19 @@ pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: 
     return .ok;
 }
 
+const LiteReplayGeneratedEnrichmentsReport = struct {
+    replayed: usize,
+};
+
+pub export fn antfly_lite_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    const replayed = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
+    out.* = stringifyJson(LiteReplayGeneratedEnrichmentsReport{ .replayed = replayed }) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
@@ -6413,6 +6426,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(@as(usize, 0), null_snapshot_dest.len);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_vacuum_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_replay_generated_enrichments_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_pending_work_stats_json(src_handle, null));
 
     var status: capi.Buffer = .{};
@@ -6510,6 +6524,12 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     const idle_json = idle.ptr.?[0..idle.len];
     try std.testing.expect(std.mem.indexOf(u8, idle_json, "\"derived_target_sequence\":") != null);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
+
+    var replayed: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_replay_generated_enrichments_json(src_handle, &replayed));
+    defer antfly_db_buffer_free(replayed.ptr, replayed.len);
+    const replayed_json = replayed.ptr.?[0..replayed.len];
+    try std.testing.expect(std.mem.indexOf(u8, replayed_json, "\"replayed\":") != null);
 
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_index(src_handle, .{
         .ptr = "missing-index",

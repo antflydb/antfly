@@ -98,6 +98,12 @@ type Status struct {
 	Capabilities Capabilities      `json:"capabilities"`
 }
 
+// ReplayGeneratedEnrichmentsResult reports how many generated enrichment
+// references were recreated from stored documents.
+type ReplayGeneratedEnrichmentsResult struct {
+	Replayed uint64 `json:"replayed"`
+}
+
 // Status returns the typed Lite status document for the database.
 func (db *DB) Status() (*Status, error) {
 	body, err := db.StatusJSON()
@@ -136,6 +142,20 @@ func (db *DB) RunUntilIdleStatus() (*PendingWorkStatus, error) {
 		return nil, err
 	}
 	return &pending, nil
+}
+
+// ReplayGeneratedEnrichments recreates generated enrichment work from stored
+// documents and returns the replay count.
+func (db *DB) ReplayGeneratedEnrichments() (*ReplayGeneratedEnrichmentsResult, error) {
+	body, err := db.ReplayGeneratedEnrichmentsJSON()
+	if err != nil {
+		return nil, err
+	}
+	var result ReplayGeneratedEnrichmentsResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // Capabilities returns the typed Lite capability document for the database.

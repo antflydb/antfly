@@ -268,6 +268,13 @@ func TestLiteCAPI(t *testing.T) {
 	if !bytes.Contains(pendingJSON, []byte("has_async_indexes")) {
 		t.Fatalf("pending work JSON %q did not include async index status", pendingJSON)
 	}
+	replayed, err := db.ReplayGeneratedEnrichments()
+	if err != nil {
+		t.Fatalf("replay generated enrichments: %v", err)
+	}
+	if replayed.Replayed != 0 {
+		t.Fatalf("fresh Go smoke database replayed generated enrichments = %#v, want 0", replayed)
+	}
 	scan, err := db.ScanJSON([]byte(`{"from":"doc:go-","to":"doc:go~","include_documents":true,"limit":10}`))
 	if err != nil {
 		t.Fatalf("scan: %v", err)

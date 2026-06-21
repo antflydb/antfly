@@ -255,6 +255,14 @@ func (db *DB) CapabilitiesJSON() ([]byte, error) {
 	})
 }
 
+// ReplayGeneratedEnrichmentsJSON replays generated enrichment work from stored
+// documents and returns {"replayed":N}.
+func (db *DB) ReplayGeneratedEnrichmentsJSON() ([]byte, error) {
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_lite_replay_generated_enrichments_json(handle, out)
+	})
+}
+
 // Backup returns a portable Antfly backup archive for this Lite database.
 func (db *DB) Backup() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
