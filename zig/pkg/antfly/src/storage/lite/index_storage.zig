@@ -135,6 +135,7 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    if (self.docs.read_only) return error.ReadOnly;
     return try NativeAtomicWriteSink.create(allocator, self, path);
 }
 
@@ -433,9 +434,7 @@ test "lite native index storage read-only open rejects mutations" {
         try std.testing.expectError(error.ReadOnly, storage.deleteFileAbsolute("/indexes/ft/stable.tbl"));
         try std.testing.expectError(error.ReadOnly, storage.deleteTree("/indexes/ft"));
 
-        var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/atomic.tbl");
-        try writer.appendSlice("atomic");
-        try std.testing.expectError(error.ReadOnly, writer.finish());
+        try std.testing.expectError(error.ReadOnly, storage.beginAtomicWrite(allocator, "/indexes/ft/atomic.tbl"));
     }
 
     {
