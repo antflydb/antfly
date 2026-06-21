@@ -5020,6 +5020,7 @@ pub const AppParityCorpusCoverage = struct {
     cte_aggregate: bool = false,
     cte_window: bool = false,
     catalog_setup_sql: bool = false,
+    catalog_tables_fixture_metadata: bool = false,
     applied_catalog_plan: bool = false,
     applied_catalog_rebuild: bool = false,
     applied_catalog_validation: bool = false,
@@ -5810,6 +5811,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.observeMigrationEquivalentDataBackfill(entry);
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
+        self.catalog_tables_fixture_metadata = self.catalog_tables_fixture_metadata or entry.catalog_tables.len > 0;
         if (entry.applied_plan.len > 0) {
             self.applied_catalog_plan = true;
             self.applied_catalog_rebuild = self.applied_catalog_rebuild or applied_rebuild;

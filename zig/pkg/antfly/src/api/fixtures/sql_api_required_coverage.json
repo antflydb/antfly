@@ -48,6 +48,7 @@
     "boolean_is_predicate",
     "boolean_unknown_predicate",
     "catalog_setup_sql",
+    "catalog_tables_fixture_metadata",
     "conflict_bit_length_expression_update",
     "conflict_boolean_expression_update",
     "conflict_case_expression_update",

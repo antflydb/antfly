@@ -6521,7 +6521,12 @@
         "join_on": 1
       },
       "plan": "merge_mutation:target=usage_records:source=archived_records:ctes=0:source_cte=0:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=3:not_matched_noop=0:returning=2:returning_expr=0:returning_all=0",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}",
+      "catalog_tables": [
+        {
+          "name": "archived_records",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archive_id\":{\"type\":\"keyword\"},\"archive_status\":{\"type\":\"keyword\"},\"archive_amount\":{\"type\":\"numeric\"}},\"required\":[\"archive_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"archive_id\"]}}"
+        }
+      ],
       "sql": "MERGE INTO usage_records AS target USING archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, amount) VALUES (source.archive_id, source.archive_status, source.archive_amount) RETURNING target.id, target.status"
     },
     {
