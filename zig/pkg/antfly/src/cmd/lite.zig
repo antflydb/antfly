@@ -1757,6 +1757,128 @@ test "lite read file parser accepts explicit readonly flag" {
     try std.testing.expectEqualStrings("query.json", parseReadFileFlag(&args));
 }
 
+test "lite schema index and enrichment commands round trip catalogs" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/catalog-commands.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const schema_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/catalog-schema.json", .{tmp.sub_path});
+    defer allocator.free(schema_path);
+    const index_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/catalog-index.json", .{tmp.sub_path});
+    defer allocator.free(index_path);
+    const enrichment_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/catalog-enrichment.json", .{tmp.sub_path});
+    defer allocator.free(enrichment_path);
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const schema_path_z = try allocator.dupeZ(u8, schema_path);
+    defer allocator.free(schema_path_z);
+    const index_path_z = try allocator.dupeZ(u8, index_path);
+    defer allocator.free(index_path_z);
+    const enrichment_path_z = try allocator.dupeZ(u8, enrichment_path);
+    defer allocator.free(enrichment_path_z);
+
+    {
+        const argv = [_][*:0]const u8{path_z.ptr};
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try initLite(allocator, io, &args);
+    }
+
+    const schema_json =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    try writeFileAtomically(allocator, io, schema_path, schema_json);
+    {
+        const argv = [_][*:0]const u8{ "set", path_z.ptr, "--file", schema_path_z.ptr };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try schemaCommand(allocator, io, &args);
+    }
+    {
+        const argv = [_][*:0]const u8{ "get", path_z.ptr };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try schemaCommand(allocator, io, &args);
+    }
+
+    try writeFileAtomically(allocator, io, index_path,
+        \\{"name":"cmd_ft_body","kind":"full_text","config_json":"{}"}
+    );
+    {
+        const argv = [_][*:0]const u8{ "create", path_z.ptr, "--file", index_path_z.ptr };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try indexCommand(allocator, io, &args);
+    }
+    {
+        const argv = [_][*:0]const u8{ "list", path_z.ptr };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try indexCommand(allocator, io, &args);
+    }
+
+    try writeFileAtomically(allocator, io, enrichment_path,
+        \\{"name":"cmd_body_chunks","kind":"chunk","field":"body","chunk_size":64,"chunk_overlap":8}
+    );
+    {
+        const argv = [_][*:0]const u8{ "create", path_z.ptr, "--file", enrichment_path_z.ptr };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try enrichmentCommand(allocator, io, &args);
+    }
+    {
+        const argv = [_][*:0]const u8{ "list", path_z.ptr };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try enrichmentCommand(allocator, io, &args);
+    }
+
+    {
+        var lite = try LiteDb.open(allocator, path, .status_only);
+        defer lite.close();
+
+        const schema = (try lite.db.getSchemaJson(allocator)) orelse return error.MissingLiteSchemaJson;
+        defer allocator.free(schema);
+        try std.testing.expectEqualStrings(schema_json, schema);
+
+        const indexes = try lite.db.listIndexes(allocator);
+        defer db_types.freeIndexConfigs(allocator, indexes);
+        try std.testing.expectEqual(@as(usize, 1), indexes.len);
+        try std.testing.expectEqualStrings("cmd_ft_body", indexes[0].name);
+
+        const enrichments = try lite.db.listEnrichments(allocator);
+        defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("cmd_body_chunks", enrichments[0].name);
+        try std.testing.expectEqual(db_types.EnrichmentKind.chunk, enrichments[0].kind);
+    }
+
+    {
+        const argv = [_][*:0]const u8{ "drop", path_z.ptr, "--index", "cmd_ft_body" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try indexCommand(allocator, io, &args);
+    }
+    {
+        const argv = [_][*:0]const u8{ "drop", path_z.ptr, "--kind", "chunk", "--name", "cmd_body_chunks" };
+        var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+        try enrichmentCommand(allocator, io, &args);
+    }
+
+    {
+        var lite = try LiteDb.open(allocator, path, .status_only);
+        defer lite.close();
+
+        const indexes = try lite.db.listIndexes(allocator);
+        defer db_types.freeIndexConfigs(allocator, indexes);
+        try std.testing.expectEqual(@as(usize, 0), indexes.len);
+
+        const enrichments = try lite.db.listEnrichments(allocator);
+        defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 0), enrichments.len);
+    }
+}
+
 test "lite query readonly runs while writer handle is open" {
     const allocator = std.testing.allocator;
 
