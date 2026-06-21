@@ -6435,15 +6435,49 @@ fn extractSourceText(
         if (cell.value_type != .bytes_val or cell.is_json) return null;
         return try alloc.dupe(u8, cell.value.bytes_val);
     }
+    if (try extractRelationalJsonSourceTextAlloc(alloc, raw_doc, request.source_field)) |text| return text;
     if (relational_row_codec.looksLikeRow(raw_doc)) return null; // row without that column
 
     // Document-mode blob: extract the single source_field from the JSON.
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
+    return try extractJsonSourceTextAlloc(alloc, raw_doc, request.source_field);
+}
+
+fn extractRelationalJsonSourceTextAlloc(
+    alloc: Allocator,
+    raw_doc: []const u8,
+    source_field: []const u8,
+) !?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, source_field, '.') orelse return null;
+    const root = source_field[0..dot];
+    const json_path = source_field[dot + 1 ..];
+    if (root.len == 0 or json_path.len == 0) return null;
+    const cell = (try relational_row_codec.findCellByPath(raw_doc, root)) orelse return null;
+    if (cell.value_type != .bytes_val or !cell.is_json) return null;
+    return try extractJsonSourceTextAlloc(alloc, cell.value.bytes_val, json_path);
+}
+
+fn extractJsonSourceTextAlloc(
+    alloc: Allocator,
+    json: []const u8,
+    source_field: []const u8,
+) !?[]const u8 {
+    if (source_field.len == 0) return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = jsonValueAtDottedPath(parsed.value, source_field) orelse return null;
     if (source != .string) return null;
     return try alloc.dupe(u8, source.string);
+}
+
+fn jsonValueAtDottedPath(value: std.json.Value, path: []const u8) ?std.json.Value {
+    if (value != .object) return null;
+    var current = value;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |segment| {
+        if (segment.len == 0 or current != .object) return null;
+        current = current.object.get(segment) orelse return null;
+    }
+    return current;
 }
 
 fn extractAssetSourceValue(
@@ -6845,6 +6879,58 @@ test "extractSourceText reads a single field straight from a typed row (Seam B)"
         .source_field = "nope",
     };
     try std.testing.expect((try extractSourceText(alloc, .{}, row, missing_request)) == null);
+}
+
+test "extractSourceText reads embedded json fields from typed rows" {
+    const alloc = std.testing.allocator;
+    const cells = [_]relational_row_codec.Cell{
+        .{ .path = "id", .value_type = .bytes_val, .value = .{ .bytes_val = "doc:1" } },
+        .{ .path = "attrs", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"plan\":\"pro\",\"body\":\"embedded text\",\"nested\":{\"title\":\"deep text\"},\"rank\":7}" } },
+    };
+    const row = try relational_row_codec.serialize(alloc, &cells);
+    defer alloc.free(row);
+
+    const body_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "attrs.body",
+    };
+    const body = try extractSourceText(alloc, .{}, row, body_request) orelse return error.TestUnexpectedResult;
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("embedded text", body);
+
+    const nested_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "attrs.nested.title",
+    };
+    const nested = try extractSourceText(alloc, .{}, row, nested_request) orelse return error.TestUnexpectedResult;
+    defer alloc.free(nested);
+    try std.testing.expectEqualStrings("deep text", nested);
+
+    const numeric_request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "attrs.rank",
+    };
+    try std.testing.expect((try extractSourceText(alloc, .{}, row, numeric_request)) == null);
+}
+
+test "extractSourceText reads dotted fields from document blobs" {
+    const alloc = std.testing.allocator;
+    const doc = "{\"attrs\":{\"body\":\"document embedded text\"}}";
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "attrs.body",
+    };
+    const result = try extractSourceText(alloc, .{}, doc, request) orelse return error.TestUnexpectedResult;
+    defer alloc.free(result);
+    try std.testing.expectEqualStrings("document embedded text", result);
 }
 
 test "extractSourceText with template skips _embeddings field" {

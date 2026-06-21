@@ -24,6 +24,7 @@ pub const grammar = @import("grammar.zig");
 pub const lexer = @import("lexer.zig");
 pub const lowering_context = @import("lowering_context.zig");
 pub const lower_dml = @import("lower_dml.zig");
+const lower_dml_test = @import("lower_dml_test.zig");
 pub const lower_expr = @import("lower_expr.zig");
 pub const parser = @import("parser.zig");
 pub const parser_context = @import("parser_context.zig");
@@ -2534,6 +2535,7 @@ test {
     _ = diagnostics;
     _ = ddl_plan;
     _ = lower_dml;
+    _ = lower_dml_test;
     _ = plan;
     _ = query_function;
     _ = strings;

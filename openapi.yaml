@@ -4747,17 +4747,19 @@ paths:
 
         whose target side carries the row claim. Insert-source requests expose
 
-        the native source-to-target insert plan shape and fail closed until the
+        the native source-to-target insert plan shape: the server reads the
 
-        runtime insert-source executor is available. The server claims selected
+        typed source query, applies target-column assignments and conflict
 
-        target rows for update/delete, records committed-version predicates,
+        actions through the row-batch constraint path, and returns optional
 
-        stages intents into the existing transaction, and returns optional
+        projections from the planned final target image. Update/delete plans
 
-        projections from the planned final target image or deleted target row
+        claim selected target rows, record committed-version predicates, stage
 
-        image.
+        intents into the existing transaction, and return optional projections
+
+        from the planned final target image or deleted target row image.
       requestBody:
         required: true
         content:
@@ -4769,7 +4771,7 @@ paths:
                 - $ref: '#/components/schemas/RowsJoinedMutationSourceRequest'
       responses:
         '200':
-          description: Rows staged into the claimed transaction
+          description: Rows staged into the claimed transaction or inserted from a typed source
           content:
             application/json:
               schema:

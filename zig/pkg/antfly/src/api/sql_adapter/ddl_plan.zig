@@ -392,6 +392,10 @@ pub fn parseDdlPlanAlloc(
         if (cursor.peekKeyword("index")) {
             return .{ .create_index = try parseCreateIndexPlanAlloc(alloc, tokens, pos, unique, options.create_index_options) };
         }
+        if (cursor.peekKeyword("graph")) {
+            if (unique) return error.UnsupportedSqlShape;
+            return .{ .create_index = try parseCreateGraphIndexPlanAlloc(alloc, tokens, pos) };
+        }
         if (unique) return error.UnsupportedSqlShape;
         if (cursor.peekKeyword("trigger")) {
             return .{ .create_update_policy = try parseCreateUpdatePolicyTriggerPlanTailAlloc(alloc, tokens, pos) };
@@ -4594,6 +4598,85 @@ pub fn parseIdentityAllocatorPlanAlloc(
     };
 }
 
+pub fn parseCreateGraphIndexPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateIndexPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("graph");
+    try cursor.expectKeyword("index");
+    const if_not_exists = if (cursor.matchKeyword("if")) blk: {
+        try cursor.expectKeyword("not");
+        try cursor.expectKeyword("exists");
+        break :blk true;
+    } else false;
+    const index_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var index_transferred = false;
+    errdefer if (!index_transferred) alloc.free(index_name);
+    try cursor.expectKeyword("on");
+    const table_name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+    try cursor.expectKeyword("edge");
+    try cursor.expectToken(.lparen);
+    const source_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_field);
+    _ = cursor.matchToken(.arrow_json) orelse return error.UnsupportedSqlShape;
+    const target_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target_field);
+    try cursor.expectToken(.rparen);
+
+    var type_field: ?[]const u8 = null;
+    defer if (type_field) |field| alloc.free(field);
+    var weight_field: ?[]const u8 = null;
+    defer if (weight_field) |field| alloc.free(field);
+    while (true) {
+        if (cursor.matchKeyword("type")) {
+            if (type_field != null) return error.UnsupportedSqlShape;
+            type_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+            continue;
+        }
+        if (cursor.matchKeyword("weight")) {
+            if (weight_field != null) return error.UnsupportedSqlShape;
+            weight_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+            continue;
+        }
+        break;
+    }
+
+    const config_json = try graphIndexConfigJsonAlloc(alloc, tokens, pos, source_field, target_field, type_field, weight_field);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const columns = try alloc.alloc([]const u8, 2);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) {
+        alloc.free(columns);
+    };
+    columns[0] = source_field;
+    columns[1] = target_field;
+
+    index_transferred = true;
+    table_transferred = true;
+    source_transferred = true;
+    target_transferred = true;
+    config_transferred = true;
+    columns_transferred = true;
+    return .{
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = if_not_exists,
+        .unique = false,
+        .method = .antfly_graph,
+        .columns = columns,
+        .derived_index_config_json = config_json,
+    };
+}
+
 pub fn parseCreateIndexPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -4819,16 +4902,10 @@ fn parseDerivedIndexIdentifierOrJsonOperatorPathAlloc(
     var root_transferred = false;
     errdefer if (!root_transferred) alloc.free(root);
 
-    const operator: ?parser.TokenKind = if (cursor.matchToken(.arrow_json) != null)
-        .arrow_json
-    else if (cursor.matchToken(.arrow_text) != null)
-        .arrow_text
-    else if (cursor.matchToken(.path_arrow_json) != null)
-        .path_arrow_json
-    else if (cursor.matchToken(.path_arrow_text) != null)
-        .path_arrow_text
-    else
-        null;
+    const operator: ?parser.TokenKind = if (parseDerivedIndexJsonOperatorKind(tokens, pos.*)) |kind| blk: {
+        _ = cursor.matchToken(kind) orelse unreachable;
+        break :blk kind;
+    } else null;
 
     if (operator) |kind| {
         const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, &.{}, kind);
@@ -4841,6 +4918,19 @@ fn parseDerivedIndexIdentifierOrJsonOperatorPathAlloc(
 
     root_transferred = true;
     return root;
+}
+
+fn parseDerivedIndexJsonOperatorKind(tokens: []const grammar.Token, pos: usize) ?parser.TokenKind {
+    if (pos + 1 >= tokens.len) return null;
+    const kind = tokens[pos].kind;
+    switch (kind) {
+        .arrow_json, .arrow_text, .path_arrow_json, .path_arrow_text => {},
+        else => return null,
+    }
+    return switch (tokens[pos + 1].kind) {
+        .string, .number, .placeholder => kind,
+        else => null,
+    };
 }
 
 fn parseDerivedIndexJsonExtractPathFunctionAlloc(
@@ -5053,6 +5143,43 @@ fn appendJsonCommaStringArrayField(
     }
     if (item_index == 0) return error.UnsupportedSqlShape;
     try out.append(alloc, ']');
+}
+
+fn graphIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    source_field: []const u8,
+    target_field: []const u8,
+    type_field: ?[]const u8,
+    weight_field: ?[]const u8,
+) ![]u8 {
+    const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, pos);
+    defer freeDerivedIndexOptions(alloc, options);
+    if (derivedIndexOption(options, "type_field") != null or derivedIndexOption(options, "weight_field") != null) return error.UnsupportedSqlShape;
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    try appendJsonStringField(alloc, &out, &first, "type", "graph");
+    try out.append(alloc, ',');
+    try appendJsonStringLiteral(alloc, &out, "edge_table");
+    try out.appendSlice(alloc, ":{");
+    var edge_first = true;
+    try appendJsonStringField(alloc, &out, &edge_first, "source_field", source_field);
+    try appendJsonStringField(alloc, &out, &edge_first, "target_field", target_field);
+    if (type_field) |field| try appendJsonStringField(alloc, &out, &edge_first, "type_field", field);
+    if (weight_field) |field| try appendJsonStringField(alloc, &out, &edge_first, "weight_field", field);
+    try out.append(alloc, '}');
+    try appendJsonStringField(alloc, &out, &first, "edge_policy", derivedIndexOptionString(options, "edge_policy") orelse "all");
+
+    for (options) |option| {
+        if (std.ascii.eqlIgnoreCase(option.name, "edge_policy")) continue;
+        try appendJsonOptionField(alloc, &out, &first, option);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn appendJsonOptionField(
@@ -7663,6 +7790,50 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
+    var graph_syntax = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');",
+    );
+    defer graph_syntax.deinit(alloc);
+    switch (graph_syntax) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqualStrings("docs_edge_graph_syntax", plan.index_name);
+            try std.testing.expectEqualStrings("doc_edges", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("source_doc", plan.columns[0]);
+            try std.testing.expectEqualStrings("target_doc", plan.columns[1]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"source_field\":\"source_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target_field\":\"target_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type_field\":\"edge_type\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"weight_field\":\"confidence\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_json_syntax = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE GRAPH INDEX docs_attrs_graph_syntax ON doc_edges EDGE ((attrs->>'source') -> (attrs->>'target')) TYPE attrs.edge_type WEIGHT attrs.confidence;",
+    );
+    defer graph_json_syntax.deinit(alloc);
+    switch (graph_json_syntax) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqualStrings("doc_edges", plan.table_name);
+            try std.testing.expectEqualStrings("attrs.source", plan.columns[0]);
+            try std.testing.expectEqualStrings("attrs.target", plan.columns[1]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"source_field\":\"attrs.source\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target_field\":\"attrs.target\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type_field\":\"attrs.edge_type\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"weight_field\":\"attrs.confidence\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var graph_metric = try lowerDdlPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_edge_graph_pagerank ON doc_edges USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', damping = 0.85, max_iterations = 40);",
@@ -9098,6 +9269,103 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
+    ));
+}
+
+test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
+    const alloc = std.testing.allocator;
+    var replace_if_not_exists = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE OR REPLACE TABLE IF NOT EXISTS audit_log (id uuid PRIMARY KEY)",
+    );
+    defer replace_if_not_exists.deinit(alloc);
+    const replace_if_not_exists_plan = switch (replace_if_not_exists) {
+        .create_table => |create_table| create_table,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(replace_if_not_exists_plan.replace_existing);
+    try std.testing.expect(replace_if_not_exists_plan.if_not_exists);
+    try std.testing.expectEqualStrings("audit_log", replace_if_not_exists_plan.table_name);
+    try std.testing.expectEqual(@as(usize, 1), replace_if_not_exists_plan.columns.len);
+    try std.testing.expect(replace_if_not_exists_plan.primary_key != null);
+    try std.testing.expectEqualStrings("id", replace_if_not_exists_plan.primary_key.?.columns[0]);
+
+    var no_primary_key = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE audit_log (id uuid, payload jsonb)",
+    );
+    defer no_primary_key.deinit(alloc);
+    const no_primary_key_plan = switch (no_primary_key) {
+        .create_table => |create_table| create_table,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(no_primary_key_plan.primary_key == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric DEFAULT 0::text)",
+    ));
+    var text_cast_numeric_default = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric DEFAULT '0'::text)",
+    );
+    defer text_cast_numeric_default.deinit(alloc);
+    switch (text_cast_numeric_default) {
+        .create_table => |plan| try std.testing.expectError(error.UnsupportedSqlShape, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE audit_log (id uuid PRIMARY KEY, amount numeric COLLATE \"C\")",
+    ));
+    var alter_type_rewrite = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE audit_log ALTER COLUMN amount TYPE numeric USING amount + 1",
+    );
+    defer alter_type_rewrite.deinit(alloc);
+    switch (alter_type_rewrite) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("audit_log", plan.table_name);
+            try std.testing.expect(!plan.if_exists);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .alter_column_type => |operation| {
+                    try std.testing.expectEqualStrings("amount", operation.column_name);
+                    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, operation.field_type);
+                    try std.testing.expect(operation.rewrite_expression != null);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var nulls_not_distinct_unique_index = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX audit_log_external_id_key ON audit_log (external_id) NULLS NOT DISTINCT",
+    );
+    defer nulls_not_distinct_unique_index.deinit(alloc);
+    const nulls_not_distinct_unique_index_plan = switch (nulls_not_distinct_unique_index) {
+        .create_index => |create_index| create_index,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(nulls_not_distinct_unique_index_plan.unique);
+    try std.testing.expect(nulls_not_distinct_unique_index_plan.nulls_not_distinct);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TRIGGER audit_row AFTER UPDATE ON usage_records EXECUTE FUNCTION audit_changes()",
+    ));
+    var drop_cascade = try lowerDdlPlanForTestAlloc(alloc, "DROP TABLE usage_records CASCADE");
+    defer drop_cascade.deinit(alloc);
+    const drop_cascade_plan = switch (drop_cascade) {
+        .drop_table => |drop_table| drop_table,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(drop_cascade_plan.cascade);
+    try std.testing.expect(!drop_cascade_plan.if_exists);
+    try std.testing.expectEqualStrings("usage_records", drop_cascade_plan.table_name);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "DROP TABLE usage_records, archived_usage_records",
     ));
 }
 

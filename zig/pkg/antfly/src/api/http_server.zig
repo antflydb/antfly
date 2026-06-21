@@ -1875,6 +1875,28 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"source_field\":\"id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"target_field\":\"body\"") != null);
 
+    const graph_syntax_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON docs EDGE (id -> body) TYPE edge_type WITH (edge_policy = 'all');";
+    var graph_syntax_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        graph_syntax_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer graph_syntax_target.deinit(alloc);
+    var graph_syntax = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        graph_syntax_target,
+        graph_syntax_sql,
+        .{},
+    )).?;
+    defer graph_syntax.deinit(alloc);
+    try std.testing.expect(graph_syntax.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, graph_syntax.table.indexes_json, "\"docs_edge_graph_syntax\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_syntax.table.indexes_json, "\"source_field\":\"id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_syntax.table.indexes_json, "\"target_field\":\"body\"") != null);
+
     const graph_metric_sql = "CREATE INDEX docs_pagerank ON docs USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', max_iterations = 40);";
     var graph_metric_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
         alloc,
@@ -1919,7 +1941,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"type\":\"hybrid\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"sources\":[\"docs_body_fts\",\"docs_embedding_hnsw\",\"docs_pagerank\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"fusion\":\"rrf\"") != null);
-    try std.testing.expectEqual(@as(usize, 6), service.upsert_count);
+    try std.testing.expectEqual(@as(usize, 7), service.upsert_count);
 }
 
 test "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL" {
@@ -11859,6 +11881,11 @@ pub const ApiHttpServer = struct {
         };
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
+        const request_kind = rowsMutationSourceRequestKind(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+        if (request_kind == .insert) {
+            return try self.handlePublicTableRowsInsertSource(table_name, body, authenticated_identity, source, schema);
+        }
+
         var rows_req = relational_rows_api.parseRowsMutationSourceRequest(self.alloc, body, schema) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
         defer rows_req.deinit(self.alloc);
 
@@ -11896,6 +11923,191 @@ pub const ApiHttpServer = struct {
         const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    fn handlePublicTableRowsInsertSource(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        write_source: table_writes.TableWriteSource,
+        target_schema: runtime_schema_mod.TableSchema,
+    ) !http_common.HttpResponse {
+        const read_source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
+        const source_table_hint = rowsInsertSourceTableNameAlloc(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid rows mutation source request");
+        defer if (source_table_hint.len > 0) self.alloc.free(source_table_hint);
+        const source_table_name = rowsPlanEffectiveSideTable(table_name, source_table_hint);
+        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "forbidden"),
+        };
+
+        const source_schema = self.runtimeSchemaForPublicRows(source_table_name) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, source_schema);
+
+        var rows_req = relational_rows_api.parseRowsInsertSourceRequestWithSchemas(self.alloc, body, target_schema, source_schema) catch |err| switch (err) {
+            error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
+            else => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+        };
+        defer rows_req.deinit(self.alloc);
+
+        self.applyRowsQueryRequestRowFilterForDatabase(tables_api.default_database_name, source_table_name, authenticated_identity, source_schema, &rows_req.req.source) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return try textResponse(self.alloc, 403, "row filter pushdown required"),
+            else => return err,
+        };
+
+        var source_result = (read_source.rowsQueryPlan(self.alloc, source_table_name, source_schema, .{ .query = rows_req.req.source }, .read_index) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows mutation source backpressured"),
+            error.UnsupportedOperation, error.UnsupportedRowsQuery => return try textResponse(self.alloc, 501, "rows mutation source unavailable"),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+            else => {
+                std.log.err("public table rows insert source read failed table={s} source={s} err={}", .{ table_name, source_table_name, err });
+                return try textResponse(self.alloc, 500, "rows mutation source failed");
+            },
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer source_result.deinit(self.alloc);
+
+        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
+            self.alloc,
+            table_name,
+            target_schema,
+            source_schema,
+            rows_req.req,
+            source_result.rows,
+            unique_resolver_ctx.resolver(),
+        ) catch |err| switch (err) {
+            error.UnsupportedRowsSelector => return try textResponse(self.alloc, 400, "unsupported rows selector"),
+            error.RowSelectorNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
+            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            else => {
+                std.log.err("public table rows insert source plan failed table={s} source={s} err={}", .{ table_name, source_table_name, err });
+                return try textResponse(self.alloc, 500, "rows mutation source failed");
+            },
+        };
+        defer rows_batch.deinit(self.alloc);
+
+        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(tables_api.default_database_name, table_name, null, rows_batch, authenticated_identity) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "row filter rejected rows mutation source"),
+            else => return err,
+        };
+
+        if (rows_batch.writes.len != 0 or rows_batch.deletes.len != 0 or rows_batch.transforms.len != 0 or rows_batch.predicates.len != 0) {
+            var committed_via_txn = false;
+            if (target_schema.storage_mode == .relational) {
+                const txn_writes = try self.alloc.alloc(db_mod.types.TransactionWrite, rows_batch.writes.len);
+                defer self.alloc.free(txn_writes);
+                for (rows_batch.writes, 0..) |write, i| {
+                    txn_writes[i] = .{ .key = write.key, .value = write.value };
+                }
+                const txn_tables = [_]distributed_txn.TableCommitRequest{.{
+                    .table_name = table_name,
+                    .writes = txn_writes,
+                    .deletes = rows_batch.deletes,
+                    .transforms = rows_batch.transforms,
+                    .predicates = rows_batch.predicates,
+                }};
+                if (write_source.commitTransaction(self.alloc, txn_tables[0..], rows_batch.req.sync_level) catch |err| switch (err) {
+                    error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+                    error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+                    error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                    error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                    error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                    error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                    error.UnsupportedOperation => null,
+                    else => {
+                        std.log.err("public table rows insert source transaction failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows mutation source failed");
+                    },
+                }) |outcome| {
+                    switch (outcome) {
+                        .committed => committed_via_txn = true,
+                        .conflict => return try textResponse(self.alloc, 409, "version conflict"),
+                    }
+                }
+            }
+
+            if (!committed_via_txn) {
+                _ = (write_source.batch(self.alloc, table_name, rows_batch.req) catch |err| switch (err) {
+                    error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+                    error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+                    error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                    error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                    error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                    else => {
+                        std.log.err("public table rows insert source batch failed table={s} err={}", .{ table_name, err });
+                        return try textResponse(self.alloc, 500, "rows mutation source failed");
+                    },
+                }) orelse return try textResponse(self.alloc, 404, "not found");
+            }
+        }
+
+        var result = rowsInsertSourceMutationResultAlloc(self.alloc, source_result.rows.len, rows_batch) catch |err| switch (err) {
+            error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows mutation source request"),
+            else => return err,
+        };
+        defer result.deinit(self.alloc);
+        const response_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    const RowsMutationSourceRequestKind = enum {
+        insert,
+        update,
+        delete,
+    };
+
+    fn rowsMutationSourceRequestKind(alloc: std.mem.Allocator, body: []const u8) !RowsMutationSourceRequestKind {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const op = parsed.value.object.get("op") orelse return error.InvalidRowsRequest;
+        if (op != .string) return error.InvalidRowsRequest;
+        if (std.mem.eql(u8, op.string, "insert")) return .insert;
+        if (std.mem.eql(u8, op.string, "update")) return .update;
+        if (std.mem.eql(u8, op.string, "delete")) return .delete;
+        return error.InvalidRowsRequest;
+    }
+
+    fn rowsInsertSourceTableNameAlloc(alloc: std.mem.Allocator, body: []const u8) ![]const u8 {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        const value = parsed.value.object.get("source_table") orelse return "";
+        if (value != .string) return error.InvalidRowsRequest;
+        if (value.string.len == 0) return "";
+        return try alloc.dupe(u8, value.string);
+    }
+
+    fn rowsInsertSourceMutationResultAlloc(
+        alloc: std.mem.Allocator,
+        matched_len: usize,
+        rows_batch: relational_rows_api.OwnedRowsBatchRequest,
+    ) !db_mod.types.RelationalRowsMutationSourceResult {
+        const matched = std.math.cast(u32, matched_len) orelse return error.ResourceBudgetExceeded;
+        const staged = std.math.add(u32, rows_batch.inserted, rows_batch.transformed) catch return error.ResourceBudgetExceeded;
+        const returning_rows = try alloc.alloc([]const u8, rows_batch.returning_rows.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (returning_rows[0..initialized]) |row| alloc.free(@constCast(row));
+            alloc.free(returning_rows);
+        }
+        for (rows_batch.returning_rows, 0..) |row, i| {
+            returning_rows[i] = try alloc.dupe(u8, row);
+            initialized += 1;
+        }
+        return .{
+            .matched = matched,
+            .staged = staged,
+            .returning_rows = returning_rows,
+        };
     }
 
     fn stageRowsMutationSourceSessionParticipant(
@@ -27989,6 +28201,37 @@ test "api http server executes public relational row plan endpoints" {
     defer parsed_archived_get.deinit();
     const archived_row = parsed_archived_get.value.object.get("rows").?.array.items[0].object.get("row").?.object;
     try std.testing.expectEqualStrings("archived", archived_row.get("status").?.string);
+
+    var insert_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows/mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"insert\",\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"tenant\",\"op\":\"eq\",\"value\":\"t1\"},{\"field\":\"id\",\"op\":\"eq\",\"value\":\"o1\"}]}},\"assignments\":[{\"target_field\":\"kind\",\"expr\":{\"field\":\"kind\"}},{\"target_field\":\"tenant\",\"expr\":{\"field\":\"tenant\"}},{\"target_field\":\"id\",\"expr\":{\"op\":\"concat\",\"args\":[{\"field\":\"id\"},{\"value\":\"-copy\"}]}},{\"target_field\":\"customer_id\",\"expr\":{\"field\":\"customer_id\"}},{\"target_field\":\"status\",\"expr\":{\"value\":\"copied\"}},{\"target_field\":\"amount\",\"expr\":{\"field\":\"amount\"}},{\"target_field\":\"created_at\",\"expr\":{\"field\":\"created_at\"}}],\"returning\":[\"tenant\",\"id\",\"status\",\"amount\"]}",
+    });
+    defer insert_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), insert_source_resp.status);
+    var parsed_insert_source = try std.json.parseFromSlice(std.json.Value, alloc, insert_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_insert_source.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_insert_source.value.object.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), parsed_insert_source.value.object.get("staged").?.integer);
+    const insert_source_returning = parsed_insert_source.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("t1", insert_source_returning.get("tenant").?.string);
+    try std.testing.expectEqualStrings("o1-copy", insert_source_returning.get("id").?.string);
+    try std.testing.expectEqualStrings("copied", insert_source_returning.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 10), insert_source_returning.get("amount").?.integer);
+
+    var copied_get_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows/get",
+        .content_type = "application/json",
+        .body = "{\"keys\":[{\"primary\":{\"kind\":\"order\",\"tenant\":\"t1\",\"id\":\"o1-copy\"}}]}",
+    });
+    defer copied_get_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), copied_get_resp.status);
+    var parsed_copied_get = try std.json.parseFromSlice(std.json.Value, alloc, copied_get_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_copied_get.deinit();
+    const copied_row = parsed_copied_get.value.object.get("rows").?.array.items[0].object.get("row").?.object;
+    try std.testing.expectEqualStrings("copied", copied_row.get("status").?.string);
 
     var cross_tenant_resp = try server.handle(.{
         .method = .POST,
