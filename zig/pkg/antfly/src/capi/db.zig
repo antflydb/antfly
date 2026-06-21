@@ -6381,6 +6381,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"storage\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format\":\"aflite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"engine\":\"native_single_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"primary_layout\":\"native_document_pages\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm_logical_files_in_native_index_catalog\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status_json, "\"compatibility_fallback\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);

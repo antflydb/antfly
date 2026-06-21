@@ -329,6 +329,11 @@ func TestLiteCAPI(t *testing.T) {
 	if typedStatus.Storage.Format != "aflite" || typedStatus.Storage.Engine != "native_single_file" {
 		t.Fatalf("typed status storage = %#v", typedStatus.Storage)
 	}
+	if typedStatus.Storage.PrimaryLayout != "native_document_pages" ||
+		typedStatus.Storage.IndexLayout != "lsm_logical_files_in_native_index_catalog" ||
+		typedStatus.Storage.CompatibilityFallback {
+		t.Fatalf("typed status storage layout = %#v", typedStatus.Storage)
+	}
 	if typedStatus.Inference.Mode != InferenceModeCallerSuppliedOrDisabled {
 		t.Fatalf("typed status inference mode = %q", typedStatus.Inference.Mode)
 	}
