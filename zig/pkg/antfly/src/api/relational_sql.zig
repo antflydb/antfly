@@ -10928,40 +10928,6 @@ const Parser = struct {
         return try groups.toOwnedSlice(self.alloc);
     }
 
-    fn parseConflictActionWhereConditionGroupAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) !db_mod.types.RelationalRowsExpressionPredicateGroup {
-        var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
-        errdefer {
-            freeExpressionConditions(self.alloc, conditions.items);
-            conditions.deinit(self.alloc);
-        }
-        while (true) {
-            const condition = try self.parseConflictActionWhereConditionAlloc(column, insert_columns);
-            var condition_transferred = false;
-            errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
-            try conditions.append(self.alloc, condition);
-            condition_transferred = true;
-            if (!self.matchKeyword("and")) break;
-        }
-        if (conditions.items.len == 0) return error.UnsupportedSqlShape;
-        return .{ .conditions = try conditions.toOwnedSlice(self.alloc) };
-    }
-
-    fn parseConflictActionWhereConditionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) !db_mod.types.RelationalRowsExpressionCondition {
-        const parenthesized = self.match(.lparen) != null;
-        const condition = try sql_adapter.parseConflictExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.conflict_existing_qualifiers, column, insert_columns, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.conflictExpressionConditionParserHooks());
-        errdefer freeExpressionCondition(self.alloc, condition);
-        if (parenthesized) try self.expect(.rparen);
-        return condition;
-    }
-
     fn parseConflictTarget(self: *@This(), table_name: []const u8) !ConflictTarget {
         return try sql_adapter.parseConflictTargetAlloc(self.alloc, self.tokens, &self.pos, self.schema, table_name, self.conflictTargetParserHooks());
     }
