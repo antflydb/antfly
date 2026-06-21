@@ -624,6 +624,12 @@ pub const CoalesceProjectionParserHooks = struct {
     parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
 };
 
+pub const ExpressionProjectionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+    parse_boolean_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const NullifRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
@@ -2496,6 +2502,173 @@ pub fn parseParenthesizedNullTestExpressionProjectionAlloc(
     errdefer freeExpression(alloc, expression);
     output_transferred = true;
     return buildExpressionProjection(output, expression);
+}
+
+pub fn buildExpressionProjectionFromOwnedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    expression: db_mod.types.RelationalRowsExpression,
+    default_output: []const u8,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, default_output);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+    const projection = buildExpressionProjection(output, expression);
+    expression_transferred = true;
+    output_transferred = true;
+    return projection;
+}
+
+pub fn buildOpExpressionProjectionFromOwnedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    expression: db_mod.types.RelationalRowsExpression,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, rowExpressionOpName(expression.kind));
+}
+
+pub fn buildDefaultExpressionProjectionFromOwnedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    expression: db_mod.types.RelationalRowsExpression,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, rowExpressionDefaultOutputName(expression.kind));
+}
+
+pub fn buildTextExpressionProjectionFromOwnedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    expression: db_mod.types.RelationalRowsExpression,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateTextRowExpression(expression);
+    const default_output = if (expression.kind == .field and expression.field.len != 0)
+        expression.field
+    else
+        rowExpressionOpName(expression.kind);
+    expression_transferred = true;
+    const projection = try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
+    return projection;
+}
+
+pub fn buildNumericExpressionProjectionFromOwnedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    expression: db_mod.types.RelationalRowsExpression,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateNumericRowExpression(expression);
+    expression_transferred = true;
+    const projection = try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+    return projection;
+}
+
+pub fn buildBooleanExpressionProjectionFromOwnedExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    expression: db_mod.types.RelationalRowsExpression,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    try type_context.validateBooleanRowExpression(expression);
+    expression_transferred = true;
+    const projection = try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+    return projection;
+}
+
+pub fn parseTextExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_expression(hooks.ptr);
+    return try buildTextExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
+}
+
+pub fn parseGenericExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_expression(hooks.ptr);
+    return try buildNumericExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
+}
+
+pub fn parseBooleanExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_boolean_expression(hooks.ptr);
+    return try buildBooleanExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
+}
+
+pub fn parseParenthesizedExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    try parser.expectToken(tokens, pos, .lparen);
+    const expression = try hooks.parse_boolean_expression(hooks.ptr);
+    errdefer freeExpression(alloc, expression);
+    try parser.expectToken(tokens, pos, .rparen);
+    return try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+}
+
+pub fn parseNowExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try parseSqlNowRowExpressionAlloc(alloc, tokens, pos);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "now");
+}
+
+pub fn parseCurrentDateExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "current_date");
+}
+
+pub fn parseTypedDatetimeLiteralExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "datetime_literal");
+}
+
+pub fn parseUuidV4ExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try parseSqlUuidV4RowExpression(tokens, pos);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "gen_random_uuid");
 }
 
 pub fn parseNullifRowExpressionAlloc(
