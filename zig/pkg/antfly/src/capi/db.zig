@@ -1928,6 +1928,30 @@ pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
     return .invalid_argument;
 }
 
+pub export fn antfly_lite_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_lite_run_until_idle_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
+    out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
+}
+
+pub export fn antfly_lite_pending_work_stats_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend == null) return .invalid_argument;
+    out.* = stringifyJson(handle.db.pendingWorkStats()) catch return .internal;
+    return .ok;
+}
+
 fn restorePortableBackupToLiteFile(
     alloc: Allocator,
     io: std.Io,
@@ -6318,6 +6342,15 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_backup(plain_handle, &invalid_backup));
     try std.testing.expect(invalid_backup.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), invalid_backup.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle(plain_handle));
+    var invalid_idle: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(plain_handle, &invalid_idle));
+    try std.testing.expect(invalid_idle.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_idle.len);
+    var invalid_pending: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_pending_work_stats_json(plain_handle, &invalid_pending));
+    try std.testing.expect(invalid_pending.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_pending.len);
 
     var invalid_lite_sentinel: u8 = 0;
     var invalid_lite_handle: ?*anyopaque = &invalid_lite_sentinel;
@@ -6350,6 +6383,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(null_snapshot_dest.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), null_snapshot_dest.len);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_vacuum_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_pending_work_stats_json(src_handle, null));
 
     var status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(src_handle, &status));
@@ -6422,6 +6457,19 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"remote_shard_fanout\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"distributed_transaction_coordination\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_heartbeat_status_aggregation\":false") != null);
+
+    var pending: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_pending_work_stats_json(src_handle, &pending));
+    defer antfly_db_buffer_free(pending.ptr, pending.len);
+    const pending_json = pending.ptr.?[0..pending.len];
+    try std.testing.expect(std.mem.indexOf(u8, pending_json, "\"has_async_indexes\":") != null);
+
+    var idle: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle_json(src_handle, &idle));
+    defer antfly_db_buffer_free(idle.ptr, idle.len);
+    const idle_json = idle.ptr.?[0..idle.len];
+    try std.testing.expect(std.mem.indexOf(u8, idle_json, "\"derived_target_sequence\":") != null);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
 
     const schema_json =
         \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}

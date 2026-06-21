@@ -216,6 +216,9 @@ antfly_error_code antfly_lite_copy_stable_snapshot_json(
     antfly_buffer *out
 );
 antfly_error_code antfly_lite_vacuum_json(void *handle, antfly_buffer *out);
+antfly_error_code antfly_lite_run_until_idle(void *handle);
+antfly_error_code antfly_lite_run_until_idle_json(void *handle, antfly_buffer *out);
+antfly_error_code antfly_lite_pending_work_stats_json(void *handle, antfly_buffer *out);
 
 void antfly_db_close(void *handle);
 void antfly_buffer_free(antfly_buffer *buffer);

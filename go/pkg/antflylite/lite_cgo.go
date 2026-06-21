@@ -371,21 +371,21 @@ func (db *DB) RunUntilIdle() error {
 	if err != nil {
 		return err
 	}
-	return check(C.antfly_db_run_until_idle(handle))
+	return check(C.antfly_lite_run_until_idle(handle))
 }
 
 // RunUntilIdleJSON drains pending enrichment and index work and returns the
 // post-drain pending work stats JSON.
 func (db *DB) RunUntilIdleJSON() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
-		return C.antfly_db_run_until_idle_json(handle, out)
+		return C.antfly_lite_run_until_idle_json(handle, out)
 	})
 }
 
 // PendingWorkStatsJSON returns pending index/enrichment work as JSON.
 func (db *DB) PendingWorkStatsJSON() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
-		return C.antfly_db_pending_work_stats_json(handle, out)
+		return C.antfly_lite_pending_work_stats_json(handle, out)
 	})
 }
 
