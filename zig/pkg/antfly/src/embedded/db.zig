@@ -128,6 +128,9 @@ pub const DB = struct {
     }
 
     pub fn capabilities(self: *DB) Capabilities {
+        if (self.lite_inference_status) |status| {
+            return support.lite.backend.capabilitiesForProfileWithInferenceStatus(self.profile, status);
+        }
         return capabilitiesForProfile(self.profile);
     }
 
@@ -140,6 +143,7 @@ pub const DB = struct {
         const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
         var status = try backend.fullStatus(alloc, &self.inner, self.profile);
         status.inference = self.lite_inference_status orelse status.inference;
+        status.capabilities = support.lite.backend.capabilitiesForProfileWithInferenceStatus(self.profile, status.inference);
         return status;
     }
 
@@ -429,6 +433,12 @@ test "embedded db liteStatus reflects explicitly configured remote inference" {
     try std.testing.expect(!status.inference.local_runtime_available);
     try std.testing.expect(status.inference.caller_supplied_artifacts);
     try std.testing.expect(status.inference.no_inference_configured_ok);
+    try std.testing.expectEqualStrings("remote_provider", status.capabilities.inference_mode);
+    try std.testing.expect(!status.capabilities.local_inference_runtime);
+
+    const caps = db.capabilities();
+    try std.testing.expectEqualStrings("remote_provider", caps.inference_mode);
+    try std.testing.expect(!caps.local_inference_runtime);
 }
 
 test "embedded db liteStatus reflects explicitly configured local inference" {
@@ -456,6 +466,12 @@ test "embedded db liteStatus reflects explicitly configured local inference" {
     try std.testing.expect(status.inference.local_runtime_available);
     try std.testing.expect(status.inference.caller_supplied_artifacts);
     try std.testing.expect(status.inference.no_inference_configured_ok);
+    try std.testing.expectEqualStrings("local_embedded", status.capabilities.inference_mode);
+    try std.testing.expect(status.capabilities.local_inference_runtime);
+
+    const caps = db.capabilities();
+    try std.testing.expectEqualStrings("local_embedded", caps.inference_mode);
+    try std.testing.expect(caps.local_inference_runtime);
 }
 
 test "embedded db openLite can run ttl cleanup over aflite file" {
