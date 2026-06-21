@@ -2854,27 +2854,29 @@ pub export fn antfly_db_scan_hash_result_free(result: *capi.ScanHashResult) void
 
 pub export fn antfly_db_begin_transaction_with_id(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
+    txn_id_ptr: ?*const [16]u8,
     timestamp_ns: u64,
     participants_ptr: ?[*]const capi.Slice,
     participant_count: usize,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    beginWithIdAndParticipants(handle, txn_id_ptr.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    beginWithIdAndParticipants(handle, txn_id.*, timestamp_ns, participants_ptr, participant_count) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_write_transaction(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
+    txn_id_ptr: ?*const [16]u8,
     writes_ptr: ?[*]const capi.WriteIntent,
     write_count: usize,
     predicates_ptr: ?[*]const capi.VersionPredicate,
     predicate_count: usize,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
-    writeIntentsInternal(handle, txn_id_ptr.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
+    writeIntentsInternal(handle, txn_id.*, writes_ptr, write_count, predicates_ptr, predicate_count) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -2895,39 +2897,46 @@ pub export fn antfly_db_batch(
 
 pub export fn antfly_db_resolve_intents(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
+    txn_id_ptr: ?*const [16]u8,
     status: u8,
     commit_version: u64,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
     const txn_status: transactions_mod.TxnStatus = switch (status) {
         0 => .pending,
         1 => .committed,
         2 => .aborted,
         else => return .invalid_argument,
     };
-    handle.db.resolveTransactionIntents(txn_id_ptr.*, txn_status, commit_version) catch |err| return capi.mapError(err);
+    handle.db.resolveTransactionIntents(txn_id.*, txn_status, commit_version) catch |err| return capi.mapError(err);
     return .ok;
 }
 
 pub export fn antfly_db_get_transaction_status(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
-    out_status: *u8,
+    txn_id_ptr: ?*const [16]u8,
+    out_status: ?*u8,
 ) capi.ErrorCode {
+    const out = out_status orelse return .invalid_argument;
+    out.* = 0;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    const status = handle.db.getTransactionStatus(txn_id_ptr.*) catch |err| return capi.mapError(err);
-    out_status.* = @intFromEnum(status);
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    const status = handle.db.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
+    out.* = @intFromEnum(status);
     return .ok;
 }
 
 pub export fn antfly_db_get_commit_version(
     handle_ptr: ?*anyopaque,
-    txn_id_ptr: *const [16]u8,
-    out_commit_version: *u64,
+    txn_id_ptr: ?*const [16]u8,
+    out_commit_version: ?*u64,
 ) capi.ErrorCode {
+    const out = out_commit_version orelse return .invalid_argument;
+    out.* = 0;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    out_commit_version.* = handle.db.getCommitVersion(txn_id_ptr.*) catch |err| return capi.mapError(err);
+    const txn_id = txn_id_ptr orelse return .invalid_argument;
+    out.* = handle.db.getCommitVersion(txn_id.*) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -6212,6 +6221,18 @@ test "capi transaction lifecycle" {
     defer antfly_db_close(handle_ptr);
 
     const txn_id: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_begin_transaction_with_id(handle_ptr, null, 1_000, null, 0));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_write_transaction(handle_ptr, null, null, 0, null, 0));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, &txn_id, null));
+    var reset_status: u8 = 99;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, null, &reset_status));
+    try std.testing.expectEqual(@as(u8, 0), reset_status);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_commit_version(handle_ptr, &txn_id, null));
+    var reset_commit_version: u64 = 99;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_commit_version(handle_ptr, null, &reset_commit_version));
+    try std.testing.expectEqual(@as(u64, 0), reset_commit_version);
+
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_begin_transaction_with_id(handle_ptr, &txn_id, 1_000, null, 0));
 
     const writes = [_]capi.WriteIntent{
