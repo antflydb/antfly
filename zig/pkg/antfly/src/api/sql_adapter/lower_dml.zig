@@ -169,6 +169,12 @@ pub const ConflictUpdateAssignmentValueParserHooks = struct {
     ) anyerror![]const u8,
 };
 
+pub const ConflictUpdateSetAssignmentParserHooks = struct {
+    ptr: *anyopaque,
+    value: ConflictUpdateAssignmentValueParserHooks,
+    note_primary_key_assignment: *const fn (*anyopaque, []const u8) anyerror!void,
+};
+
 pub const ConflictAssignmentExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_expression: *const fn (
@@ -1557,6 +1563,167 @@ pub fn parseIncrementAssignmentAlloc(
     });
     field_transferred = true;
     value_transferred = true;
+}
+
+pub fn parseConflictUpdateSetAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
+    hooks: ConflictUpdateSetAssignmentParserHooks,
+) !void {
+    if (parser.peekKind(tokens, pos.*, .lparen)) {
+        return try parseConflictUpdateRowAssignmentAlloc(alloc, tokens, pos, schema, params, conflict_existing_qualifiers, insert_columns, insert_values, patch, patch_expr, increment, increment_expr, json_set, array_update, hooks);
+    }
+    return try parseConflictUpdateAssignmentAlloc(alloc, tokens, pos, schema, params, conflict_existing_qualifiers, insert_columns, insert_values, patch, patch_expr, increment, increment_expr, json_set, array_update, hooks);
+}
+
+fn parseConflictUpdateRowAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
+    hooks: ConflictUpdateSetAssignmentParserHooks,
+) !void {
+    try parser.expectToken(tokens, pos, .lparen);
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (fields.items) |field| {
+            if (field.len != 0) alloc.free(field);
+        }
+        fields.deinit(alloc);
+    }
+    while (true) {
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try fields.append(alloc, field);
+        field_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (fields.items.len == 0) return error.UnsupportedSqlShape;
+    try grammar.validateSqlIdentifierListUnique(fields.items);
+    try parser.expectToken(tokens, pos, .rparen);
+    try parser.expectToken(tokens, pos, .eq);
+    try expectConflictRowAssignmentRhsStart(tokens, pos);
+    for (fields.items, 0..) |field, i| {
+        const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+        try hooks.note_primary_key_assignment(hooks.ptr, field);
+        var field_transferred = false;
+        try parseConflictUpdateAssignmentValueAlloc(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            params,
+            conflict_existing_qualifiers,
+            field,
+            column,
+            patch,
+            patch_expr,
+            increment,
+            increment_expr,
+            json_set,
+            array_update,
+            &field_transferred,
+            .{
+                .ptr = hooks.value.ptr,
+                .insert_columns = insert_columns,
+                .insert_values = insert_values,
+                .parse_json_set_value = hooks.value.parse_json_set_value,
+                .parse_array_element_value_json = hooks.value.parse_array_element_value_json,
+                .parse_json_document_value = hooks.value.parse_json_document_value,
+                .parse_boolean_expression = hooks.value.parse_boolean_expression,
+                .parse_assignment_expression = hooks.value.parse_assignment_expression,
+                .parse_coalesce_expression = hooks.value.parse_coalesce_expression,
+                .parse_value_json = hooks.value.parse_value_json,
+            },
+        );
+        if (field_transferred) fields.items[i] = "";
+        if (i + 1 < fields.items.len) {
+            try parser.expectToken(tokens, pos, .comma);
+        }
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+}
+
+fn expectConflictRowAssignmentRhsStart(tokens: []const Token, pos: *usize) !void {
+    _ = parser.matchKeyword(tokens, pos, "row");
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+fn parseConflictUpdateAssignmentAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    patch: *std.ArrayListUnmanaged(FieldJsonValue),
+    patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    increment: *std.ArrayListUnmanaged(FieldJsonValue),
+    increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
+    json_set: *std.ArrayListUnmanaged(JsonSetValue),
+    array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
+    hooks: ConflictUpdateSetAssignmentParserHooks,
+) !void {
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var field_transferred = false;
+    defer if (!field_transferred) alloc.free(field);
+    const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
+    try hooks.note_primary_key_assignment(hooks.ptr, field);
+    try parser.expectToken(tokens, pos, .eq);
+    try parseConflictUpdateAssignmentValueAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        params,
+        conflict_existing_qualifiers,
+        field,
+        column,
+        patch,
+        patch_expr,
+        increment,
+        increment_expr,
+        json_set,
+        array_update,
+        &field_transferred,
+        .{
+            .ptr = hooks.value.ptr,
+            .insert_columns = insert_columns,
+            .insert_values = insert_values,
+            .parse_json_set_value = hooks.value.parse_json_set_value,
+            .parse_array_element_value_json = hooks.value.parse_array_element_value_json,
+            .parse_json_document_value = hooks.value.parse_json_document_value,
+            .parse_boolean_expression = hooks.value.parse_boolean_expression,
+            .parse_assignment_expression = hooks.value.parse_assignment_expression,
+            .parse_coalesce_expression = hooks.value.parse_coalesce_expression,
+            .parse_value_json = hooks.value.parse_value_json,
+        },
+    );
 }
 
 pub fn parseConflictUpdateAssignmentValueAlloc(

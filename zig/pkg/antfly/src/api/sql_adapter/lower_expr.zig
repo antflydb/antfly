@@ -60,6 +60,47 @@ pub const AggregateOutputFieldExpressionConditionParserHooks = struct {
     parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
 };
 
+pub const AggregateOutputExpressionConditionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_condition: *const fn (
+        *anyopaque,
+        runtime_schema.TableSchema,
+    ) anyerror!db_mod.types.RelationalRowsExpressionCondition,
+};
+
+pub const BareBooleanAggregateHavingExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_bare_boolean: *const fn (
+        *anyopaque,
+        runtime_schema.TableSchema,
+        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    ) anyerror!void,
+};
+
+pub const AggregateOutputOrderExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_order: *const fn (
+        *anyopaque,
+        runtime_schema.TableSchema,
+    ) anyerror!db_mod.types.RelationalRowsQueryOrder,
+};
+
+pub const WindowOutputOrderExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_order: *const fn (
+        *anyopaque,
+        runtime_schema.TableSchema,
+    ) anyerror!db_mod.types.RelationalRowsQueryOrder,
+};
+
+pub const JoinOutputOrderExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_order: *const fn (
+        *anyopaque,
+        runtime_schema.TableSchema,
+    ) anyerror!db_mod.types.RelationalRowsQueryOrder,
+};
+
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
 const cloneExpressionConditionsConcatAlloc = plan_mod.cloneExpressionConditionsConcatAlloc;
@@ -5708,6 +5749,92 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         .op = op,
         .rhs = rhs,
     };
+}
+
+pub fn parseAggregateOutputExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    hooks: AggregateOutputExpressionConditionParserHooks,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    defer if (output_columns.len > 0) alloc.free(output_columns);
+    const aggregate_schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = output_columns,
+    };
+    return try hooks.parse_condition(hooks.ptr, aggregate_schema);
+}
+
+pub fn parseAggregateOutputOrderExpressionAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    hooks: AggregateOutputOrderExpressionParserHooks,
+) !db_mod.types.RelationalRowsQueryOrder {
+    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    defer if (output_columns.len > 0) alloc.free(output_columns);
+    const aggregate_schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = output_columns,
+    };
+    return try hooks.parse_order(hooks.ptr, aggregate_schema);
+}
+
+pub fn parseWindowOutputOrderExpressionAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    select: plan_mod.WindowSelectList,
+    hooks: WindowOutputOrderExpressionParserHooks,
+) !db_mod.types.RelationalRowsQueryOrder {
+    const output_columns = try windowOutputColumnsAlloc(alloc, schema, type_context, select);
+    defer if (output_columns.len > 0) alloc.free(output_columns);
+    const window_schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = output_columns,
+    };
+    return try hooks.parse_order(hooks.ptr, window_schema);
+}
+
+pub fn parseJoinOutputOrderExpressionAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    select: []const db_mod.types.RelationalRowsJoinProjection,
+    hooks: JoinOutputOrderExpressionParserHooks,
+) !db_mod.types.RelationalRowsQueryOrder {
+    const output_columns = try joinOutputColumnsAlloc(alloc, schema, select);
+    defer if (output_columns.len > 0) alloc.free(output_columns);
+    const join_schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = output_columns,
+    };
+    return try hooks.parse_order(hooks.ptr, join_schema);
+}
+
+pub fn parseBareBooleanAggregateHavingExpression(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    hooks: BareBooleanAggregateHavingExpressionParserHooks,
+) !void {
+    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    defer if (output_columns.len > 0) alloc.free(output_columns);
+    const aggregate_schema: runtime_schema.TableSchema = .{
+        .storage_mode = .relational,
+        .relational_columns = output_columns,
+    };
+    try hooks.parse_bare_boolean(hooks.ptr, aggregate_schema, expressions);
 }
 
 pub fn parseAggregateHavingBooleanIsNotGroups(

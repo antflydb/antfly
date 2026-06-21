@@ -3160,9 +3160,78 @@ const Parser = struct {
         };
     }
 
+    fn aggregateOutputExpressionConditionParserHooks(self: *@This()) sql_adapter.AggregateOutputExpressionConditionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_condition = parseAggregateOutputExpressionConditionHook,
+        };
+    }
+
+    fn bareBooleanAggregateHavingExpressionParserHooks(self: *@This()) sql_adapter.BareBooleanAggregateHavingExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_bare_boolean = parseBareBooleanAggregateHavingExpressionHook,
+        };
+    }
+
+    fn aggregateOutputOrderExpressionParserHooks(self: *@This()) sql_adapter.AggregateOutputOrderExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_order = parseOutputOrderExpressionWithSchemaHook,
+        };
+    }
+
+    fn windowOutputOrderExpressionParserHooks(self: *@This()) sql_adapter.WindowOutputOrderExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_order = parseOutputOrderExpressionWithSchemaHook,
+        };
+    }
+
+    fn joinOutputOrderExpressionParserHooks(self: *@This()) sql_adapter.JoinOutputOrderExpressionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_order = parseOutputOrderExpressionWithSchemaHook,
+        };
+    }
+
+    fn parseAggregateOutputExpressionConditionHook(
+        ptr: *anyopaque,
+        aggregate_schema: runtime_schema.TableSchema,
+    ) anyerror!db_mod.types.RelationalRowsExpressionCondition {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const prior_schema = self.schema;
+        self.schema = aggregate_schema;
+        defer self.schema = prior_schema;
+        return try sql_adapter.parseCaseExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.caseExpressionParserHooks());
+    }
+
+    fn parseBareBooleanAggregateHavingExpressionHook(
+        ptr: *anyopaque,
+        aggregate_schema: runtime_schema.TableSchema,
+        expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    ) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const prior_schema = self.schema;
+        self.schema = aggregate_schema;
+        defer self.schema = prior_schema;
+        try self.parseBareBooleanWhereExpression(expressions);
+    }
+
+    fn parseOutputOrderExpressionWithSchemaHook(
+        ptr: *anyopaque,
+        output_schema: runtime_schema.TableSchema,
+    ) anyerror!db_mod.types.RelationalRowsQueryOrder {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const prior_schema = self.schema;
+        self.schema = output_schema;
+        defer self.schema = prior_schema;
+        return try self.parseOrderExpressionAlloc();
+    }
+
     fn parseUniquePredicateWhereExpressionConditionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpressionCondition {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseCaseExpressionConditionAlloc();
+        return try sql_adapter.parseCaseExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.caseExpressionParserHooks());
     }
 
     fn parseAggregateOutputFieldHook(
@@ -3284,6 +3353,23 @@ const Parser = struct {
             .parse_coalesce_expression = parseConflictIncrementCoalesceExpressionHook,
             .parse_value_json = parseConflictIncrementValueJsonHook,
         };
+    }
+
+    fn conflictUpdateSetAssignmentParserHooks(
+        self: *@This(),
+        insert_columns: []const []const u8,
+        insert_values: []const []const u8,
+    ) sql_adapter.ConflictUpdateSetAssignmentParserHooks {
+        return .{
+            .ptr = self,
+            .value = self.conflictUpdateAssignmentValueParserHooks(insert_columns, insert_values),
+            .note_primary_key_assignment = notePrimaryKeyAssignmentHook,
+        };
+    }
+
+    fn notePrimaryKeyAssignmentHook(ptr: *anyopaque, field: []const u8) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.notePrimaryKeyAssignment(field);
     }
 
     fn conflictAssignmentExpressionParserHooks(self: *@This()) sql_adapter.ConflictAssignmentExpressionParserHooks {
@@ -6306,7 +6392,23 @@ const Parser = struct {
             self.saw_primary_key_assignment = previous_saw_primary_key_assignment;
         }
         while (true) {
-            try self.parseConflictUpdateSetAssignment(&.{}, &.{}, &patch, &patch_expr, &increment, &increment_expr, &json_set, &array_update);
+            try sql_adapter.parseConflictUpdateSetAssignmentAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                self.schema,
+                self.params,
+                self.conflict_existing_qualifiers,
+                &.{},
+                &.{},
+                &patch,
+                &patch_expr,
+                &increment,
+                &increment_expr,
+                &json_set,
+                &array_update,
+                self.conflictUpdateSetAssignmentParserHooks(&.{}, &.{}),
+            );
             if (self.match(.comma) == null) break;
         }
         const rewrite_identity = self.saw_primary_key_assignment;
@@ -6455,7 +6557,23 @@ const Parser = struct {
             self.saw_primary_key_assignment = previous_saw_primary_key_assignment;
         }
         while (true) {
-            try self.parseConflictUpdateSetAssignment(&.{}, &.{}, &patch, &patch_expr, &increment, &increment_expr, &json_set, &array_update);
+            try sql_adapter.parseConflictUpdateSetAssignmentAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                self.schema,
+                self.params,
+                self.conflict_existing_qualifiers,
+                &.{},
+                &.{},
+                &patch,
+                &patch_expr,
+                &increment,
+                &increment_expr,
+                &json_set,
+                &array_update,
+                self.conflictUpdateSetAssignmentParserHooks(&.{}, &.{}),
+            );
             if (self.match(.comma) == null) break;
         }
         const rewrite_identity = self.saw_primary_key_assignment;
@@ -10682,7 +10800,7 @@ const Parser = struct {
                 }
                 break :blk db_mod.types.RelationalRowsQueryOrder{ .field = field };
             } else if (sql_adapter.peekAggregateOutputOrderExpression(self.tokens, self.pos)) blk: {
-                break :blk try self.parseJoinOutputOrderExpressionAlloc(select);
+                break :blk try sql_adapter.parseJoinOutputOrderExpressionAlloc(self.alloc, self.schema, select, self.joinOutputOrderExpressionParserHooks());
             } else blk: {
                 const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
                 if (!joinProjectionOutputIsUnique(select, field)) {
@@ -10701,21 +10819,6 @@ const Parser = struct {
             order_transferred = true;
             if (self.match(.comma) == null) break;
         }
-    }
-
-    fn parseJoinOutputOrderExpressionAlloc(
-        self: *@This(),
-        select: []const db_mod.types.RelationalRowsJoinProjection,
-    ) !db_mod.types.RelationalRowsQueryOrder {
-        const output_columns = try sql_adapter.joinOutputColumnsAlloc(self.alloc, self.schema, select);
-        defer if (output_columns.len > 0) self.alloc.free(output_columns);
-        const prior_schema = self.schema;
-        self.schema = .{
-            .storage_mode = .relational,
-            .relational_columns = output_columns,
-        };
-        defer self.schema = prior_schema;
-        return try self.parseOrderExpressionAlloc();
     }
 
     fn parseConflictClause(
@@ -10791,7 +10894,23 @@ const Parser = struct {
             where_not.deinit(self.alloc);
         }
         while (true) {
-            try self.parseConflictUpdateSetAssignment(insert_columns, insert_values, &patch, &patch_expr, &increment, &increment_expr, &json_set, &array_update);
+            try sql_adapter.parseConflictUpdateSetAssignmentAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                self.schema,
+                self.params,
+                self.conflict_existing_qualifiers,
+                insert_columns,
+                insert_values,
+                &patch,
+                &patch_expr,
+                &increment,
+                &increment_expr,
+                &json_set,
+                &array_update,
+                self.conflictUpdateSetAssignmentParserHooks(insert_columns, insert_values),
+            );
             if (self.match(.comma) == null) break;
         }
         if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
@@ -10867,127 +10986,6 @@ const Parser = struct {
             try identities.append(self.alloc, identity);
             identity_transferred = true;
         }
-    }
-
-    fn parseConflictUpdateSetAssignment(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-        patch: *std.ArrayListUnmanaged(FieldJsonValue),
-        patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        increment: *std.ArrayListUnmanaged(FieldJsonValue),
-        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        json_set: *std.ArrayListUnmanaged(JsonSetValue),
-        array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
-    ) !void {
-        if (self.peekKind(.lparen)) {
-            return try self.parseConflictUpdateRowAssignment(insert_columns, insert_values, patch, patch_expr, increment, increment_expr, json_set, array_update);
-        }
-        return try self.parseConflictUpdateAssignment(insert_columns, insert_values, patch, patch_expr, increment, increment_expr, json_set, array_update);
-    }
-
-    fn parseConflictUpdateRowAssignment(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-        patch: *std.ArrayListUnmanaged(FieldJsonValue),
-        patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        increment: *std.ArrayListUnmanaged(FieldJsonValue),
-        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        json_set: *std.ArrayListUnmanaged(JsonSetValue),
-        array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
-    ) !void {
-        try self.expect(.lparen);
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (fields.items) |field| {
-                if (field.len != 0) self.alloc.free(field);
-            }
-            fields.deinit(self.alloc);
-        }
-        while (true) {
-            const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-            var field_transferred = false;
-            errdefer if (!field_transferred) self.alloc.free(field);
-            try fields.append(self.alloc, field);
-            field_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (fields.items.len == 0) return error.UnsupportedSqlShape;
-        try sql_adapter.validateSqlIdentifierListUnique(fields.items);
-        try self.expect(.rparen);
-        try self.expect(.eq);
-        try self.expectRowAssignmentRhsStart();
-        for (fields.items, 0..) |field, i| {
-            const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
-            try self.notePrimaryKeyAssignment(field);
-            var field_transferred = false;
-            try sql_adapter.parseConflictUpdateAssignmentValueAlloc(
-                self.alloc,
-                self.tokens,
-                &self.pos,
-                self.schema,
-                self.params,
-                self.conflict_existing_qualifiers,
-                field,
-                column,
-                patch,
-                patch_expr,
-                increment,
-                increment_expr,
-                json_set,
-                array_update,
-                &field_transferred,
-                self.conflictUpdateAssignmentValueParserHooks(insert_columns, insert_values),
-            );
-            if (field_transferred) fields.items[i] = "";
-            if (i + 1 < fields.items.len) {
-                try self.expect(.comma);
-            }
-        }
-        try self.expect(.rparen);
-    }
-
-    fn expectRowAssignmentRhsStart(self: *@This()) !void {
-        _ = self.matchKeyword("row");
-        try self.expect(.lparen);
-    }
-
-    fn parseConflictUpdateAssignment(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-        patch: *std.ArrayListUnmanaged(FieldJsonValue),
-        patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        increment: *std.ArrayListUnmanaged(FieldJsonValue),
-        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        json_set: *std.ArrayListUnmanaged(JsonSetValue),
-        array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
-    ) !void {
-        const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
-        var field_transferred = false;
-        defer if (!field_transferred) self.alloc.free(field);
-        const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
-        try self.notePrimaryKeyAssignment(field);
-        try self.expect(.eq);
-        try sql_adapter.parseConflictUpdateAssignmentValueAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.schema,
-            self.params,
-            self.conflict_existing_qualifiers,
-            field,
-            column,
-            patch,
-            patch_expr,
-            increment,
-            increment_expr,
-            json_set,
-            array_update,
-            &field_transferred,
-            self.conflictUpdateAssignmentValueParserHooks(insert_columns, insert_values),
-        );
     }
 
     fn notePrimaryKeyAssignment(self: *@This(), field: []const u8) !void {
@@ -13201,7 +13199,7 @@ const Parser = struct {
                 const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
                 break :blk db_mod.types.RelationalRowsQueryOrder{ .field = try sql_adapter.aggregateOutputFieldByOrdinalAlloc(self.alloc, group_fields, group_expressions, aggregations, ordinal) };
             } else if (sql_adapter.peekAggregateOutputOrderExpression(self.tokens, self.pos)) blk: {
-                break :blk try self.parseAggregateOutputOrderExpressionAlloc(group_fields, group_expressions, aggregations);
+                break :blk try sql_adapter.parseAggregateOutputOrderExpressionAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations, self.aggregateOutputOrderExpressionParserHooks());
             } else blk: {
                 const field = try self.parseAggregateOutputFieldAlloc(group_fields, group_expressions, aggregations);
                 if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) {
@@ -13222,23 +13220,6 @@ const Parser = struct {
         }
     }
 
-    fn parseAggregateOutputOrderExpressionAlloc(
-        self: *@This(),
-        group_fields: []const []const u8,
-        group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-        aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    ) !db_mod.types.RelationalRowsQueryOrder {
-        const output_columns = try sql_adapter.aggregateOutputColumnsAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations);
-        defer if (output_columns.len > 0) self.alloc.free(output_columns);
-        const prior_schema = self.schema;
-        self.schema = .{
-            .storage_mode = .relational,
-            .relational_columns = output_columns,
-        };
-        defer self.schema = prior_schema;
-        return try self.parseOrderExpressionAlloc();
-    }
-
     fn parseWindowOutputOrderBy(
         self: *@This(),
         order_by: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder),
@@ -13254,7 +13235,7 @@ const Parser = struct {
                 }
                 break :blk db_mod.types.RelationalRowsQueryOrder{ .field = field };
             } else if (sql_adapter.peekWindowOutputOrderExpression(self.tokens, self.pos)) blk: {
-                break :blk try self.parseWindowOutputOrderExpressionAlloc(select);
+                break :blk try sql_adapter.parseWindowOutputOrderExpressionAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), select, self.windowOutputOrderExpressionParserHooks());
             } else blk: {
                 const field = try sql_adapter.parseIdentifierOwnedAlloc(self.alloc, self.tokens, &self.pos);
                 if (!windowOutputFieldIsUnique(select.fields, select.windows, field)) {
@@ -13275,21 +13256,6 @@ const Parser = struct {
         }
     }
 
-    fn parseWindowOutputOrderExpressionAlloc(
-        self: *@This(),
-        select: WindowSelectList,
-    ) !db_mod.types.RelationalRowsQueryOrder {
-        const output_columns = try sql_adapter.windowOutputColumnsAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), select);
-        defer if (output_columns.len > 0) self.alloc.free(output_columns);
-        const prior_schema = self.schema;
-        self.schema = .{
-            .storage_mode = .relational,
-            .relational_columns = output_columns,
-        };
-        defer self.schema = prior_schema;
-        return try self.parseOrderExpressionAlloc();
-    }
-
     fn parseAggregateHaving(
         self: *@This(),
         predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
@@ -13301,7 +13267,7 @@ const Parser = struct {
         aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     ) !void {
         if (try sql_adapter.canParseBareBooleanAggregateHavingExpression(self.alloc, self.tokens, self.pos, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations)) {
-            try self.parseBareBooleanAggregateHavingExpression(expressions, group_fields, group_expressions, aggregations);
+            try sql_adapter.parseBareBooleanAggregateHavingExpression(self.alloc, self.schema, self.rowExpressionTypeContext(), expressions, group_fields, group_expressions, aggregations, self.bareBooleanAggregateHavingExpressionParserHooks());
             return;
         }
         if (sql_adapter.hasTopLevelOrBeforeTail(self.tokens, self.pos, sql_adapter.sqlWhereTailClauseKeyword) or sql_adapter.aggregateHavingHasBooleanIsNot(self.tokens, self.pos)) {
@@ -13314,7 +13280,7 @@ const Parser = struct {
             } else if (sql_adapter.matchStandaloneSqlBooleanLiteral(self.tokens, &self.pos)) |enabled| {
                 if (!enabled) try sql_adapter.appendBooleanConstantExpressionCondition(self.alloc, expressions, false);
             } else if (sql_adapter.peekAggregateHavingExpression(self.tokens, self.pos)) {
-                const condition = try self.parseAggregateOutputExpressionConditionAlloc(group_fields, group_expressions, aggregations);
+                const condition = try sql_adapter.parseAggregateOutputExpressionConditionAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations, self.aggregateOutputExpressionConditionParserHooks());
                 var condition_transferred = false;
                 errdefer if (!condition_transferred) freeExpressionCondition(self.alloc, condition);
                 try expressions.append(self.alloc, condition);
@@ -13371,24 +13337,6 @@ const Parser = struct {
             }
             if (!self.matchKeyword("and")) break;
         }
-    }
-
-    fn parseBareBooleanAggregateHavingExpression(
-        self: *@This(),
-        expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-        group_fields: []const []const u8,
-        group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-        aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    ) !void {
-        const output_columns = try sql_adapter.aggregateOutputColumnsAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations);
-        defer if (output_columns.len > 0) self.alloc.free(output_columns);
-        const prior_schema = self.schema;
-        self.schema = .{
-            .storage_mode = .relational,
-            .relational_columns = output_columns,
-        };
-        defer self.schema = prior_schema;
-        try self.parseBareBooleanWhereExpression(expressions);
     }
 
     fn parseAggregateHavingNotGroup(
@@ -13475,7 +13423,7 @@ const Parser = struct {
         }
 
         const condition = if (sql_adapter.peekAggregateHavingExpression(self.tokens, self.pos))
-            try self.parseAggregateOutputExpressionConditionAlloc(group_fields, group_expressions, aggregations)
+            try sql_adapter.parseAggregateOutputExpressionConditionAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations, self.aggregateOutputExpressionConditionParserHooks())
         else
             try sql_adapter.parseAggregateOutputFieldExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations, self.aggregateOutputFieldExpressionConditionParserHooks());
         var condition_transferred = false;
@@ -13488,23 +13436,6 @@ const Parser = struct {
         condition_transferred = true;
         try alternatives.append(self.alloc, .{ .conditions = conditions });
         conditions_transferred = true;
-    }
-
-    fn parseAggregateOutputExpressionConditionAlloc(
-        self: *@This(),
-        group_fields: []const []const u8,
-        group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-        aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    ) !db_mod.types.RelationalRowsExpressionCondition {
-        const output_columns = try sql_adapter.aggregateOutputColumnsAlloc(self.alloc, self.schema, self.rowExpressionTypeContext(), group_fields, group_expressions, aggregations);
-        defer if (output_columns.len > 0) self.alloc.free(output_columns);
-        const prior_schema = self.schema;
-        self.schema = .{
-            .storage_mode = .relational,
-            .relational_columns = output_columns,
-        };
-        defer self.schema = prior_schema;
-        return try self.parseCaseExpressionConditionAlloc();
     }
 
     fn parseAggregateOutputFieldAlloc(
@@ -14726,10 +14657,6 @@ const Parser = struct {
 
     fn parseCaseRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
         return try sql_adapter.parseCaseRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.caseExpressionParserHooks());
-    }
-
-    fn parseCaseExpressionConditionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpressionCondition {
-        return try sql_adapter.parseCaseExpressionConditionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.caseExpressionParserHooks());
     }
 
     fn parseCaseFoldRowExpressionAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
