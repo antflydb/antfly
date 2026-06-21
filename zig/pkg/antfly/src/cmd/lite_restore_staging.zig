@@ -23,6 +23,7 @@ const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const query_api = antfly.public_api.query;
 const group_ids = antfly.common.group_ids;
+const tables_api = antfly.public_api.tables;
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
@@ -511,6 +512,11 @@ fn fileExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
+fn freeBackupShards(allocator: Allocator, shards: []const backups_api.ShardSnapshot) void {
+    for (shards) |shard| shard.deinit(allocator);
+    allocator.free(@constCast(shards));
+}
+
 test "lite restore staging preserves portable afb schema index and enrichment metadata" {
     const allocator = std.testing.allocator;
 
@@ -791,5 +797,202 @@ test "lite restore staging accepts aflite input for normal restore" {
         );
         defer allocator.free(hybrid);
         try std.testing.expect(std.mem.indexOf(u8, hybrid, "\"doc:restore:a\"") != null);
+    }
+}
+
+test "lite portable backup roundtrips through normal table backup APIs" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-normal-lite-src.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const normal_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/normal-middle-db", .{tmp.sub_path});
+    defer allocator.free(normal_path);
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-normal-lite-restored.aflite", .{tmp.sub_path});
+    defer allocator.free(restored_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/lite-normal-lite-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+
+    const schema_json: []const u8 =
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    ;
+    const enrichment_json: []const u8 = "{\"name\":\"roundtrip_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":128,\"chunk_overlap\":16}";
+    const index_jsons = [_][]const u8{
+        "{\"name\":\"roundtrip_ft_body\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+        "{\"name\":\"roundtrip_dense\",\"kind\":\"dense_vector\",\"config_json\":\"{\\\"field\\\":\\\"embedding\\\",\\\"dims\\\":2,\\\"metric\\\":\\\"l2_squared\\\",\\\"external\\\":true}\"}",
+        "{\"name\":\"roundtrip_sparse\",\"kind\":\"sparse_vector\",\"config_json\":\"{\\\"field\\\":\\\"sparse_embedding\\\",\\\"external\\\":true}\"}",
+        "{\"name\":\"roundtrip_graph\",\"kind\":\"graph\",\"config_json\":\"{}\"}",
+    };
+
+    {
+        var source = try LiteDb.open(allocator, src_path, .writer);
+        defer source.close();
+
+        try source.db.setSchemaJson(allocator, schema_json);
+
+        var enrichment = try std.json.parseFromSlice(db_types.EnrichmentConfig, allocator, enrichment_json, .{
+            .ignore_unknown_fields = true,
+        });
+        defer enrichment.deinit();
+        try source.db.addEnrichment(enrichment.value);
+
+        for (index_jsons) |index_json| {
+            var index = try std.json.parseFromSlice(db_types.IndexConfig, allocator, index_json, .{
+                .ignore_unknown_fields = true,
+            });
+            defer index.deinit();
+            try source.db.addIndex(index.value);
+        }
+
+        try source.db.batch(.{
+            .writes = &.{
+                .{
+                    .key = "doc:roundtrip:a",
+                    .value = "{\"title\":\"normal hop alpha\",\"body\":\"lite normal lite hybrid alpha\",\"_embeddings\":{\"roundtrip_dense\":[1,0],\"roundtrip_sparse\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"_edges\":{\"roundtrip_graph\":{\"links\":[{\"target\":\"doc:roundtrip:c\",\"weight\":1.0}]}}}",
+                },
+                .{
+                    .key = "doc:roundtrip:b",
+                    .value = "{\"title\":\"normal hop beta\",\"body\":\"lite normal lite hybrid beta\",\"_embeddings\":{\"roundtrip_dense\":[0,1],\"roundtrip_sparse\":{\"indices\":[99],\"values\":[2.0]}}}",
+                },
+                .{
+                    .key = "doc:roundtrip:c",
+                    .value = "{\"title\":\"normal hop graph target\"}",
+                },
+            },
+            .sync_level = .full_index,
+        });
+        try source.db.runUntilIdle();
+    }
+
+    var staged = try stageInputRestoreBackup(allocator, src_path, "docs", "lite-normal-lite-in", location);
+    defer staged.deinit(allocator);
+
+    var backup_location = try backups_api.openBackupLocation(allocator, location);
+    defer backup_location.deinit(allocator);
+    var lite_manifest = try backups_api.readManifestFromLocation(allocator, &backup_location, "lite-normal-lite-in");
+    defer lite_manifest.deinit(allocator);
+    try std.testing.expectEqualStrings(schema_json, lite_manifest.schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, lite_manifest.indexes_json, "\"roundtrip_dense\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lite_manifest.indexes_json, "\"roundtrip_chunks_v1\"") != null);
+
+    var normal_db = try db_mod.DB.open(allocator, normal_path, .{});
+    defer normal_db.close();
+    var normal_source = antfly.public_api.BoundTableWriteSource.init("docs", &normal_db);
+    _ = try normal_source.source().restoreTable(allocator, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &lite_manifest,
+    });
+    try normal_db.core.loadIndexes();
+    _ = try normal_db.rebuildDenseIndexesForTargetCoverage(allocator);
+    _ = try normal_db.rebuildSparseIndexesForTargetCoverage(allocator);
+    try normal_db.rebuildGraphIndexesForTargetCoverage(allocator);
+    _ = try normal_db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+    try normal_db.runUntilIdle();
+
+    {
+        const dense = try searchJson(
+            allocator,
+            &normal_db,
+            "{\"embeddings\":{\"roundtrip_dense\":[1,0]},\"indexes\":[\"roundtrip_dense\"],\"limit\":1}",
+        );
+        defer allocator.free(dense);
+        try std.testing.expect(std.mem.indexOf(u8, dense, "\"doc:roundtrip:a\"") != null);
+    }
+
+    const normal_shards = (try normal_source.source().backupTable(allocator, "docs", .{
+        .backup_root = backup_root,
+        .backup_id = "lite-normal-lite-out",
+        .format = .portable,
+    })).?;
+    defer freeBackupShards(allocator, normal_shards);
+    try std.testing.expectEqual(@as(usize, 1), normal_shards.len);
+    try std.testing.expectEqualStrings("lite-normal-lite-out.afb", normal_shards[0].snapshot_path);
+
+    const table_schema_json = try allocator.dupe(u8, schema_json);
+    defer allocator.free(table_schema_json);
+    const table_indexes_json = try allocator.dupe(u8, lite_manifest.indexes_json);
+    defer allocator.free(table_indexes_json);
+    const table = tables_api.deriveTableRecord("docs", .{
+        .schema_json = table_schema_json,
+        .indexes_json = table_indexes_json,
+    });
+    var normal_manifest = try backups_api.createManifest(allocator, "lite-normal-lite-out", &table, normal_shards);
+    defer normal_manifest.deinit(allocator);
+    try std.testing.expectEqualStrings(schema_json, normal_manifest.schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, normal_manifest.indexes_json, "\"roundtrip_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, normal_manifest.indexes_json, "\"roundtrip_chunks_v1\"") != null);
+
+    const normal_afb_path = try std.fmt.allocPrint(allocator, "{s}/lite-normal-lite-out.afb", .{backup_root});
+    defer allocator.free(normal_afb_path);
+    const normal_portable = try readFileAlloc(allocator, normal_afb_path, max_afb_file_bytes);
+    defer allocator.free(normal_portable);
+    try portable_backup.validatePortable(allocator, normal_portable);
+
+    {
+        var restored = try LiteDb.open(allocator, restored_path, .writer);
+        defer restored.close();
+
+        try portable_backup.importPortable(allocator, restored.db.core.store, normal_portable);
+        try restored.db.core.loadIndexes();
+        _ = try restored.db.rebuildDenseIndexesForTargetCoverage(allocator);
+        _ = try restored.db.rebuildSparseIndexesForTargetCoverage(allocator);
+        try restored.db.rebuildGraphIndexesForTargetCoverage(allocator);
+        _ = try restored.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+        try restored.db.runUntilIdle();
+
+        const schema = (try restored.db.getSchemaJson(allocator)) orelse return error.MissingLiteSchemaJson;
+        defer allocator.free(schema);
+        try std.testing.expectEqualStrings(schema_json, schema);
+
+        const indexes = try restored.db.listIndexes(allocator);
+        defer db_types.freeIndexConfigs(allocator, indexes);
+        try std.testing.expectEqual(@as(usize, 4), indexes.len);
+
+        const enrichments = try restored.db.listEnrichments(allocator);
+        defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("roundtrip_chunks_v1", enrichments[0].name);
+
+        const dense = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"embeddings\":{\"roundtrip_dense\":[1,0]},\"indexes\":[\"roundtrip_dense\"],\"limit\":1}",
+        );
+        defer allocator.free(dense);
+        try std.testing.expect(std.mem.indexOf(u8, dense, "\"doc:roundtrip:a\"") != null);
+
+        const sparse = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"embeddings\":{\"roundtrip_sparse\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"indexes\":[\"roundtrip_sparse\"],\"limit\":1}",
+        );
+        defer allocator.free(sparse);
+        try std.testing.expect(std.mem.indexOf(u8, sparse, "\"doc:roundtrip:a\"") != null);
+
+        const graph = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"roundtrip_graph\",\"start_nodes\":{\"keys\":[\"doc:roundtrip:a\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+        );
+        defer allocator.free(graph);
+        try std.testing.expect(std.mem.indexOf(u8, graph, "\"doc:roundtrip:c\"") != null);
+
+        const hybrid = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"roundtrip_dense\":[1,0]},\"indexes\":[\"roundtrip_dense\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+        );
+        defer allocator.free(hybrid);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid, "\"doc:roundtrip:a\"") != null);
     }
 }
