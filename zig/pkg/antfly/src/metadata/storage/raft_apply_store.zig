@@ -5357,6 +5357,14 @@ fn appendSchemaRewriteJobRecord(
     } else {
         try out.append(alloc, 0);
     }
+    try out.append(alloc, if (record.full_row_rewrite) 1 else 0);
+    try appendInt(alloc, out, u32, @intCast(record.rewrite_renames.len));
+    for (record.rewrite_renames) |rename| {
+        try appendRequiredString(alloc, out, rename.old_path);
+        try appendRequiredString(alloc, out, rename.new_path);
+    }
+    try appendInt(alloc, out, u32, @intCast(record.rewrite_drops.len));
+    for (record.rewrite_drops) |drop| try appendRequiredString(alloc, out, drop);
     try appendRequiredString(alloc, out, record.lease_owner);
     try appendInt(alloc, out, u64, record.lease_expires_at_ms);
     try appendInt(alloc, out, u32, record.attempts);
@@ -6255,6 +6263,39 @@ fn readSchemaRewriteJobRecord(
         break :blk try parseSchemaRewriteExpressionJsonAlloc(alloc, expression_json);
     } else null;
     errdefer if (expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
+    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+    const full_row_rewrite = encoded[pos.*] != 0;
+    pos.* += 1;
+    const rewrite_renames_len = try readInt(encoded, pos, u32);
+    const rewrite_renames = try alloc.alloc(metadata.SchemaRewriteRename, rewrite_renames_len);
+    var rewrite_renames_initialized: usize = 0;
+    errdefer {
+        for (rewrite_renames[0..rewrite_renames_initialized]) |rename| {
+            alloc.free(rename.old_path);
+            alloc.free(rename.new_path);
+        }
+        alloc.free(rewrite_renames);
+    }
+    for (rewrite_renames, 0..) |*rename, i| {
+        const old_path = try readRequiredString(alloc, encoded, pos);
+        var old_path_transferred = false;
+        errdefer if (!old_path_transferred) alloc.free(old_path);
+        const new_path = try readRequiredString(alloc, encoded, pos);
+        rename.* = .{ .old_path = old_path, .new_path = new_path };
+        old_path_transferred = true;
+        rewrite_renames_initialized = i + 1;
+    }
+    const rewrite_drops_len = try readInt(encoded, pos, u32);
+    const rewrite_drops = try alloc.alloc([]const u8, rewrite_drops_len);
+    var rewrite_drops_initialized: usize = 0;
+    errdefer {
+        for (rewrite_drops[0..rewrite_drops_initialized]) |drop| alloc.free(drop);
+        alloc.free(rewrite_drops);
+    }
+    for (rewrite_drops, 0..) |*drop, i| {
+        drop.* = try readRequiredString(alloc, encoded, pos);
+        rewrite_drops_initialized = i + 1;
+    }
     const lease_owner = try readRequiredString(alloc, encoded, pos);
     errdefer alloc.free(lease_owner);
     const lease_expires_at_ms = try readInt(encoded, pos, u64);
@@ -6276,6 +6317,9 @@ fn readSchemaRewriteJobRecord(
         .state = state,
         .target_column = target_column,
         .expression = expression,
+        .full_row_rewrite = full_row_rewrite,
+        .rewrite_renames = rewrite_renames,
+        .rewrite_drops = rewrite_drops,
         .lease_owner = lease_owner,
         .lease_expires_at_ms = lease_expires_at_ms,
         .attempts = attempts,
@@ -7566,6 +7610,34 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         },
     });
     defer std.testing.allocator.free(rewrite_cmd);
+    const full_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_schema_rewrite_job = .{
+            .job_id = 9104,
+            .table_id = 41,
+            .group_id = 9004,
+            .schema_generation = 42,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "order:a",
+            .end_row_key = "order:m",
+            .full_row_rewrite = true,
+        },
+    });
+    defer std.testing.allocator.free(full_rewrite_cmd);
+    const row_plan_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_schema_rewrite_job = .{
+            .job_id = 9105,
+            .table_id = 41,
+            .group_id = 9005,
+            .schema_generation = 42,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "order:m",
+            .rewrite_renames = &.{.{ .old_path = "status", .new_path = "state" }},
+            .rewrite_drops = &.{"legacy_status"},
+        },
+    });
+    defer std.testing.allocator.free(row_plan_rewrite_cmd);
     const begin_rewrite_cmd = try encodeTransitionCommand(std.testing.allocator, .{
         .begin_schema_rewrite_job = .{
             .job_id = 9101,
@@ -7642,6 +7714,8 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         .{ .term = 1, .index = 7, .entry_type = .normal, .data = invalidated_cmd },
         .{ .term = 1, .index = 8, .entry_type = .normal, .data = begin_invalidated_cmd },
         .{ .term = 1, .index = 9, .entry_type = .normal, .data = invalidate_cmd },
+        .{ .term = 1, .index = 10, .entry_type = .normal, .data = full_rewrite_cmd },
+        .{ .term = 1, .index = 11, .entry_type = .normal, .data = row_plan_rewrite_cmd },
     });
     defer std.testing.allocator.free(encoded_entries);
 
@@ -7650,7 +7724,7 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
         defer store.deinit();
         try store.snapshotBuilder().applyBatch(.{
             .group_id = 41,
-            .commit_index = 9,
+            .commit_index = 11,
             .entries_bytes = encoded_entries,
         });
     }
@@ -7659,10 +7733,12 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
     defer reopened.deinit();
     const jobs = try reopened.listSchemaRewriteJobs(std.testing.allocator, 41);
     defer reopened.freeSchemaRewriteJobs(std.testing.allocator, jobs);
-    try std.testing.expectEqual(@as(usize, 2), jobs.len);
+    try std.testing.expectEqual(@as(usize, 4), jobs.len);
 
     var saw_ready = false;
     var saw_invalid = false;
+    var saw_full_rewrite = false;
+    var saw_row_plan = false;
     for (jobs) |job| {
         try std.testing.expectEqual(@as(u64, 41), job.table_id);
         try std.testing.expectEqual(@as(u64, 42), job.schema_generation);
@@ -7687,9 +7763,26 @@ test "metadata raft apply store persists schema rewrite jobs across reopen" {
             try std.testing.expectEqualStrings(metadata_table_manager.schema_rewrite_invalid, job.state);
             try std.testing.expectEqualStrings("schema generation moved", job.last_error);
             saw_invalid = true;
+        } else if (job.job_id == 9104) {
+            try std.testing.expectEqualStrings("rewrite", job.action);
+            try std.testing.expectEqualStrings("row_images", job.reason);
+            try std.testing.expect(job.full_row_rewrite);
+            try std.testing.expectEqualStrings("order:a", job.start_row_key);
+            try std.testing.expectEqualStrings("order:m", job.end_row_key.?);
+            saw_full_rewrite = true;
+        } else if (job.job_id == 9105) {
+            try std.testing.expectEqualStrings("rewrite", job.action);
+            try std.testing.expectEqualStrings("row_images", job.reason);
+            try std.testing.expect(!job.full_row_rewrite);
+            try std.testing.expectEqual(@as(usize, 1), job.rewrite_renames.len);
+            try std.testing.expectEqualStrings("status", job.rewrite_renames[0].old_path);
+            try std.testing.expectEqualStrings("state", job.rewrite_renames[0].new_path);
+            try std.testing.expectEqual(@as(usize, 1), job.rewrite_drops.len);
+            try std.testing.expectEqualStrings("legacy_status", job.rewrite_drops[0]);
+            saw_row_plan = true;
         }
     }
-    try std.testing.expect(saw_ready and saw_invalid);
+    try std.testing.expect(saw_ready and saw_invalid and saw_full_rewrite and saw_row_plan);
 }
 
 test "metadata raft apply store rejects stale schema rewrite lease owners" {

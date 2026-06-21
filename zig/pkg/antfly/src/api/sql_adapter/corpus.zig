@@ -3271,6 +3271,8 @@ fn consumeAppliedWorkItems(text: []const u8, index: *usize, expected_count: usiz
             if (!consumeLiteral(text, index, "rewrite/table/row_images")) return false;
             if (consumeLiteral(text, index, "(target=")) {
                 if (!consumeAppliedRewriteExpression(text, index)) return false;
+            } else if (consumeLiteral(text, index, "(row_plan=")) {
+                if (!consumeAppliedRowRewritePlan(text, index)) return false;
             }
         }
         if (count + 1 < expected_count and !consumeLiteral(text, index, ",")) return false;
@@ -3283,6 +3285,33 @@ fn consumeAppliedRewriteExpression(text: []const u8, index: *usize) bool {
     if (!consumeLiteral(text, index, ":expr=")) return false;
     if (!consumeRowRewriteExpressionFingerprint(text, index)) return false;
     return consumeLiteral(text, index, ")");
+}
+
+fn consumeAppliedRowRewritePlan(text: []const u8, index: *usize) bool {
+    var count: usize = 0;
+    while (true) : (count += 1) {
+        if (consumeLiteral(text, index, ":rename(")) {
+            if (!consumeRowRewritePath(text, index)) return false;
+            if (!consumeLiteral(text, index, "->")) return false;
+            if (!consumeRowRewritePath(text, index)) return false;
+            if (!consumeLiteral(text, index, ")")) return false;
+        } else if (consumeLiteral(text, index, ":drop(")) {
+            if (!consumeRowRewritePath(text, index)) return false;
+            if (!consumeLiteral(text, index, ")")) return false;
+        } else {
+            break;
+        }
+    }
+    return count > 0 and consumeLiteral(text, index, ")");
+}
+
+fn consumeRowRewritePath(text: []const u8, index: *usize) bool {
+    const start = index.*;
+    while (index.* < text.len) : (index.* += 1) {
+        const ch = text[index.*];
+        if (!(std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '.' or ch == '[' or ch == ']')) break;
+    }
+    return index.* > start;
 }
 
 fn consumeIdentifierValue(text: []const u8, index: *usize) bool {
@@ -4022,6 +4051,7 @@ test "sql adapter corpus plan predicates are exact and structured" {
     try std.testing.expect(!appliedPlanHasExactUsizeToken(applied, "unvalidated_unique=", 1));
     try std.testing.expect(!appliedPlanHasExactBoolToken("applied:rebuild=true:rewrite=false", "rebuild=", true));
     try std.testing.expect(appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images"));
+    try std.testing.expect(appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(row_plan=:rename(status->state):drop(legacy_status))"));
     try std.testing.expect(!appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints"));
     try std.testing.expect(!appliedPlanIsStructured("applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=0:work=none:extra=1"));
 

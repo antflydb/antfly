@@ -793,6 +793,7 @@ pub const AppliedDdlWorkItem = struct {
     action: AppliedDdlWorkAction,
     subject: AppliedDdlWorkSubject,
     reason: AppliedDdlWorkReason,
+    full_row_rewrite: bool = false,
     rewrite_expression: ?AppliedDdlRewriteExpression = null,
     row_rewrite_plan: AppliedDdlRowRewritePlan = .{},
 

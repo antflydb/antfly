@@ -27,6 +27,12 @@ pub const RelationalSchemaJsonParts = struct {
     properties: *std.json.ObjectMap,
 };
 
+pub fn runtimeSchemaFromSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !runtime_schema.TableSchema {
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    return try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+}
+
 pub fn schemaJsonFromCreateTablePlanAlloc(
     alloc: std.mem.Allocator,
     plan: ddl_plan.CreateTablePlan,
@@ -45,9 +51,7 @@ pub fn schemaJsonFromCreateTablePlanAlloc(
 }
 
 pub fn validateDdlAppliedSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !void {
-    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    const runtime = try runtimeSchemaFromSchemaJsonAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, runtime);
     if (runtime.storage_mode != .relational) return error.InvalidSqlCatalog;
 }

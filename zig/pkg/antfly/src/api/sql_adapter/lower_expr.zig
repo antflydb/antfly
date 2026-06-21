@@ -588,6 +588,11 @@ pub const SqlFunctionBindings = struct {
     routine_expressions: []const RoutineExpressionBinding = &.{},
 };
 
+pub const RowExpressionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
 pub const ExtensionFunctionRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
@@ -628,6 +633,11 @@ pub const ExpressionProjectionParserHooks = struct {
     ptr: *anyopaque,
     parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
     parse_boolean_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const JsonValueExpressionProjectionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
 };
 
 pub const NullifRowExpressionParserHooks = struct {
@@ -2671,6 +2681,102 @@ pub fn parseUuidV4ExpressionProjectionAlloc(
     return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "gen_random_uuid");
 }
 
+pub fn parseFixedOutputExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    default_output: []const u8,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_expression(hooks.ptr);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
+}
+
+pub fn parseOpOutputExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_expression(hooks.ptr);
+    return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+}
+
+pub fn parseDefaultOutputExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_expression(hooks.ptr);
+    return try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+}
+
+pub fn parseRegexpMatchExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const default_output = if (parser.peekKeyword(tokens, pos.*, "regexp_like")) "regexp_like" else "regexp_match";
+    const expression = try hooks.parse_expression(hooks.ptr);
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
+}
+
+pub fn parseJsonExtractPathExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: ExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = try hooks.parse_expression(hooks.ptr);
+    const default_output = if (expression.json_as_text) "json_extract_path_text" else "json_extract_path";
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        expression,
+        default_output,
+    );
+}
+
+pub fn parseExtensionFunctionExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    bindings: []const ExtensionFunctionBinding,
+    hooks: ExtensionFunctionRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = (try parseExtensionFunctionRowExpressionOrNullAlloc(alloc, tokens, pos, bindings, hooks)) orelse return error.UnsupportedSqlShape;
+    return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+}
+
+pub fn parseRoutineExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    bindings: []const RoutineExpressionBinding,
+    hooks: RoutineExpressionRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const expression = (try parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, bindings, hooks)) orelse return error.UnsupportedSqlShape;
+    return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
+}
+
+pub fn parseJsonValueExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    default_output: []const u8,
+    hooks: JsonValueExpressionProjectionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    const value_json = try hooks.parse_value_json(hooks.ptr);
+    const expression: db_mod.types.RelationalRowsExpression = .{
+        .kind = .value,
+        .value_json = value_json,
+    };
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
+}
+
 pub fn parseNullifRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3675,6 +3781,34 @@ pub fn parseBooleanExpressionRestAlloc(
 
     current_owned = false;
     return current;
+}
+
+pub fn parseRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: RowExpressionTypeContext,
+    hooks: RowExpressionParserHooks,
+    arithmetic_hooks: ArithmeticExpressionParserHooks,
+    variadic_hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    var expression = try hooks.parse_operand(hooks.ptr);
+    var expression_owned = true;
+    errdefer if (expression_owned) freeExpression(alloc, expression);
+    if (peekArithmeticOperator(tokens, pos.*)) |_| {
+        try type_context.validateNumericOrDatetimeRowExpression(expression);
+        expression_owned = false;
+        expression = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, expression, 0, type_context, arithmetic_hooks);
+        expression_owned = true;
+        try type_context.validateNumericRowExpression(expression);
+    }
+    if (parser.peekKind(tokens, pos.*, .pipe_concat)) {
+        expression_owned = false;
+        expression = try parsePipeConcatExpressionRestAlloc(alloc, tokens, pos, expression, type_context, variadic_hooks);
+        expression_owned = true;
+    }
+    expression_owned = false;
+    return expression;
 }
 
 pub fn parseArithmeticExpressionProjectionFromFieldAlloc(

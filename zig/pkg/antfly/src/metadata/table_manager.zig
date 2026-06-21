@@ -211,6 +211,7 @@ pub const SchemaRewriteJobRecord = struct {
     state: []const u8 = schema_rewrite_declared,
     target_column: []const u8 = "",
     expression: ?runtime_schema.RelationalRowsExpression = null,
+    full_row_rewrite: bool = false,
     rewrite_renames: []const SchemaRewriteRename = &.{},
     rewrite_drops: []const []const u8 = &.{},
     lease_owner: []const u8 = "",
@@ -846,8 +847,10 @@ pub const TableManager = struct {
         const has_row_rewrite = record.rewrite_renames.len != 0 or record.rewrite_drops.len != 0;
         if (has_expression_rewrite) {
             if (record.expression == null or record.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
-            if (has_row_rewrite) return error.InvalidSchemaRewriteExpression;
-        } else if (std.mem.eql(u8, record.action, "rewrite") and std.mem.eql(u8, record.reason, "row_images") and !has_row_rewrite) {
+            if (has_row_rewrite or record.full_row_rewrite) return error.InvalidSchemaRewriteExpression;
+        } else if (record.full_row_rewrite and has_row_rewrite) {
+            return error.InvalidSchemaRewriteExpression;
+        } else if (std.mem.eql(u8, record.action, "rewrite") and std.mem.eql(u8, record.reason, "row_images") and !has_row_rewrite and !record.full_row_rewrite) {
             return error.InvalidSchemaRewriteExpression;
         }
         for (record.rewrite_renames) |rename| {
@@ -2403,6 +2406,7 @@ pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobR
         .state = state,
         .target_column = target_column,
         .expression = expression,
+        .full_row_rewrite = record.full_row_rewrite,
         .rewrite_renames = rewrite_renames,
         .rewrite_drops = rewrite_drops,
         .lease_owner = lease_owner,
@@ -3558,6 +3562,27 @@ test "table manager owns schema rewrite jobs" {
         .completed_row_count = 12,
         .progress_row_key = "order:z",
     });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9104,
+        .table_id = 7,
+        .group_id = 9003,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "z",
+        .rewrite_renames = &.{.{ .old_path = "status", .new_path = "state" }},
+        .rewrite_drops = &.{"legacy_status"},
+    });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9105,
+        .table_id = 7,
+        .group_id = 9004,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "zz",
+        .full_row_rewrite = true,
+    });
     try std.testing.expectError(error.UnknownTable, manager.upsertSchemaRewriteJob(.{
         .job_id = 9199,
         .table_id = 99,
@@ -3605,6 +3630,26 @@ test "table manager owns schema rewrite jobs" {
         .start_row_key = "",
         .expression = status_expr,
     }));
+    try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .full_row_rewrite = true,
+        .rewrite_drops = &.{"legacy_status"},
+    }));
 
     try manager.upsertSchemaRewriteJob(.{
         .job_id = 9101,
@@ -3623,10 +3668,12 @@ test "table manager owns schema rewrite jobs" {
 
     const listed = try manager.listSchemaRewriteJobs(std.testing.allocator);
     defer manager.freeSchemaRewriteJobs(std.testing.allocator, listed);
-    try std.testing.expectEqual(@as(usize, 2), listed.len);
+    try std.testing.expectEqual(@as(usize, 4), listed.len);
 
     var saw_replaced = false;
     var saw_ready = false;
+    var saw_row_plan = false;
+    var saw_full_row_rewrite = false;
     for (listed) |record| {
         if (record.job_id == 9101) {
             try std.testing.expectEqual(@as(u64, 43), record.schema_generation);
@@ -3643,13 +3690,25 @@ test "table manager owns schema rewrite jobs" {
             try std.testing.expectEqual(@as(u64, 12), record.completed_row_count);
             try std.testing.expectEqualStrings("order:z", record.progress_row_key);
             saw_ready = true;
+        } else if (record.job_id == 9104) {
+            try std.testing.expectEqual(@as(usize, 1), record.rewrite_renames.len);
+            try std.testing.expectEqualStrings("status", record.rewrite_renames[0].old_path);
+            try std.testing.expectEqualStrings("state", record.rewrite_renames[0].new_path);
+            try std.testing.expectEqual(@as(usize, 1), record.rewrite_drops.len);
+            try std.testing.expectEqualStrings("legacy_status", record.rewrite_drops[0]);
+            saw_row_plan = true;
+        } else if (record.job_id == 9105) {
+            try std.testing.expect(record.full_row_rewrite);
+            try std.testing.expectEqual(@as(usize, 0), record.rewrite_renames.len);
+            try std.testing.expectEqual(@as(usize, 0), record.rewrite_drops.len);
+            saw_full_row_rewrite = true;
         }
     }
-    try std.testing.expect(saw_replaced and saw_ready);
+    try std.testing.expect(saw_replaced and saw_ready and saw_row_plan and saw_full_row_rewrite);
 
     try std.testing.expect(manager.removeSchemaRewriteJob(9102));
     try std.testing.expect(!manager.removeSchemaRewriteJob(9102));
-    try std.testing.expectEqual(@as(usize, 1), manager.removeSchemaRewriteJobsForTable(7));
+    try std.testing.expectEqual(@as(usize, 3), manager.removeSchemaRewriteJobsForTable(7));
     const remaining = try manager.listSchemaRewriteJobs(std.testing.allocator);
     defer manager.freeSchemaRewriteJobs(std.testing.allocator, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);

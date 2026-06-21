@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "d93121fb58021c45209cb7b68765c651587e2cbd6d244c52236ec3ea5f9cc214",
+  "source_sha256": "087e79473e750503cd7ec5059edf8471516f7f0697a41a51e8e833ea6e11c5b0",
   "source_entry_count": 1006,
   "entry_count": 1006,
   "skipped_entries": [
@@ -7988,7 +7988,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:rename_col=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, tenant_status_key text GENERATED ALWAYS AS (concat(id, ':', status)) STORED, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(row_plan=:rename(status->state))",
       "sql": "ALTER TABLE usage_records RENAME COLUMN status TO state;"
     },
     {
@@ -8284,7 +8284,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:drop_col=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images(row_plan=:drop(metadata))",
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
     {

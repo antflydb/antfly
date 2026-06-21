@@ -257,6 +257,21 @@ pub const ConflictExpressionOperandParserHooks = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
+pub const ConflictExpressionDispatchHooks = struct {
+    row: ConflictRowExpressionParserHooks,
+    arithmetic: ConflictArithmeticExpressionParserHooks,
+    pipe_concat: ConflictPipeConcatExpressionParserHooks,
+    operand: ConflictExpressionOperandParserHooks,
+    unary: ConflictUnaryExpressionParserHooks,
+    coalesce: ConflictCoalesceExpressionParserHooks,
+    nullif: ConflictNullifExpressionParserHooks,
+    json_build_object: ConflictJsonBuildObjectExpressionParserHooks,
+    array_length: ConflictArrayLengthExpressionParserHooks,
+    boolean: ConflictBooleanExpressionParserHooks,
+    case_expression: ConflictCaseExpressionParserHooks,
+    case_fold: ConflictCaseFoldExpressionParserHooks,
+};
+
 pub const ConflictExpressionStart = enum {
     cast,
     case,
@@ -2182,6 +2197,106 @@ pub fn parseConflictRowExpressionAlloc(
     }
     expression_owned = false;
     return expression;
+}
+
+pub fn parseConflictExpressionWithExpectedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    hooks: ConflictExpressionDispatchHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (conflictExpressionStartAt(tokens, pos.*)) |start| {
+        switch (start) {
+            .cast => return try parseConflictCastExpressionAlloc(alloc, tokens, pos, column, insert_columns, hooks.unary),
+            .case => return try parseConflictCaseExpressionAlloc(alloc, tokens, pos, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, hooks.case_expression),
+            .case_fold => return try parseConflictCaseFoldExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.case_fold),
+            .replace => return try parseConflictTextTernaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .replace, type_context, hooks.unary),
+            .regexp_replace => return try parseConflictRegexpListExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_replace, type_context, hooks.unary),
+            .regexp_match => return try parseConflictRegexpListExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_match, type_context, hooks.unary),
+            .regexp_substr => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_substr, type_context, hooks.unary),
+            .regexp_count => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_count, type_context, hooks.unary),
+            .regexp_instr => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_instr, type_context, hooks.unary),
+            .translate => return try parseConflictTextTernaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .translate, type_context, hooks.unary),
+            .concat => return try parseConflictConcatExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .coalesce => return try parseConflictCoalesceExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, hooks.coalesce),
+            .nullif => return try parseConflictNullifExpressionAlloc(alloc, tokens, pos, column, insert_columns, hooks.nullif),
+            .text_length => return try parseConflictLengthExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .ascii => return try parseConflictAsciiExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .chr => return try parseConflictChrExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .substring => return try parseConflictMixedTextFunctionExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .substring, type_context, hooks.unary, hooks.coalesce),
+            .overlay => return try parseConflictMixedTextFunctionExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .overlay, type_context, hooks.unary, hooks.coalesce),
+            .split_part => return try parseConflictMixedTextFunctionExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .split_part, type_context, hooks.unary, hooks.coalesce),
+            .strpos => return try parseConflictStrposExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .left_right => return try parseConflictTextNumericBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .left, type_context, hooks.unary, hooks.coalesce),
+            .pad => return try parseConflictMixedTextFunctionExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .lpad, type_context, hooks.unary, hooks.coalesce),
+            .repeat => return try parseConflictTextNumericBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .repeat, type_context, hooks.unary, hooks.coalesce),
+            .reverse => return try parseConflictTextUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .reverse, type_context, hooks.unary),
+            .md5 => return try parseConflictTextUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .md5, type_context, hooks.unary),
+            .starts_with => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .starts_with, type_context, hooks.unary),
+            .ends_with => return try parseConflictTextBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .ends_with, type_context, hooks.unary),
+            .date_trunc => return try parseConflictDateExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .date_trunc, type_context, hooks.unary),
+            .date_bin => return try parseConflictDateExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .date_bin, type_context, hooks.unary),
+            .date_part => return try parseConflictDateExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .date_part, type_context, hooks.unary),
+            .abs => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .abs, type_context, hooks.unary, hooks.arithmetic),
+            .round => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .round, type_context, hooks.unary, hooks.arithmetic),
+            .trunc => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .trunc, type_context, hooks.unary, hooks.arithmetic),
+            .floor => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .floor, type_context, hooks.unary, hooks.arithmetic),
+            .ceil => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .ceil, type_context, hooks.unary, hooks.arithmetic),
+            .sqrt => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .sqrt, type_context, hooks.unary, hooks.arithmetic),
+            .sign => return try parseConflictNumericUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .sign, type_context, hooks.unary, hooks.arithmetic),
+            .mod => return try parseConflictNumericBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .mod, type_context, hooks.unary),
+            .power => return try parseConflictNumericBinaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .power, type_context, hooks.unary),
+            .greatest_least => return try parseConflictGreatestLeastExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, hooks.coalesce),
+            .json_extract_path => return try parseConflictJsonExtractPathExpressionAlloc(alloc, tokens, pos, params, column, insert_columns, expected_type, type_context, hooks.unary),
+            .json_build_object => return try parseConflictJsonBuildObjectExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.json_build_object),
+            .json_typeof => return try parseConflictJsonUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .json_typeof, type_context, hooks.unary),
+            .json_array_length => return try parseConflictJsonUnaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, .json_array_length, type_context, hooks.unary),
+            .array_length => return try parseConflictArrayLengthExpressionAlloc(alloc, tokens, pos, params, insert_columns, hooks.array_length),
+            .array_position => return try parseConflictArrayPositionExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .array_element_transform => return try parseConflictArrayElementTransformExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.unary),
+            .array_to_string => return try parseConflictTextArrayExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .array_to_string, type_context, hooks.unary),
+            .string_to_array => return try parseConflictTextArrayExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .string_to_array, type_context, hooks.unary),
+            .uuid_v4 => {
+                if (expected_type) |field_type| {
+                    if (field_type != .keyword and field_type != .text and field_type != .link) return error.UnsupportedSqlShape;
+                }
+                return try lower_expr.parseSqlUuidV4RowExpression(tokens, pos);
+            },
+            .now => {
+                if (expected_type) |field_type| {
+                    if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+                }
+                return try lower_expr.parseSqlNowRowExpressionAlloc(alloc, tokens, pos);
+            },
+            .current_date => {
+                if (expected_type) |field_type| {
+                    if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+                }
+                return try lower_expr.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos);
+            },
+            .typed_datetime_literal => {
+                if (expected_type) |field_type| {
+                    if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+                }
+                return try lower_expr.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos);
+            },
+            .interval => {
+                if (expected_type) |field_type| {
+                    if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
+                }
+                return try lower_expr.parseSqlIntervalRowExpressionAlloc(alloc, tokens, pos);
+            },
+        }
+    }
+    return try hooks.operand.parse_operand(hooks.operand.ptr, column, insert_columns, expected_type);
 }
 
 pub fn parseParenthesizedConflictExpressionAlloc(

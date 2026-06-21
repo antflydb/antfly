@@ -636,6 +636,15 @@ const AppliedDdlRewriteExpressionSource = struct {
     expression: db_mod.types.RelationalRowsExpression,
 };
 
+const AppliedDdlRowRewritePlanSource = struct {
+    renames: []const ddl_plan.AppliedDdlRowRewriteRename = &.{},
+    drops: []const []const u8 = &.{},
+
+    fn empty(self: @This()) bool {
+        return self.renames.len == 0 and self.drops.len == 0;
+    }
+};
+
 fn valueRowExpressionAlloc(
     alloc: std.mem.Allocator,
     value_json: []const u8,
@@ -785,6 +794,19 @@ fn freeAppliedDdlRewriteExpressionSource(
     runtime_schema.freeRelationalRowsExpression(alloc, source.expression);
 }
 
+fn freeAppliedDdlRowRewritePlanSource(
+    alloc: std.mem.Allocator,
+    source: AppliedDdlRowRewritePlanSource,
+) void {
+    for (source.renames) |rename| {
+        alloc.free(rename.old_path);
+        alloc.free(rename.new_path);
+    }
+    alloc.free(source.renames);
+    for (source.drops) |drop| alloc.free(drop);
+    alloc.free(source.drops);
+}
+
 fn alterTableRewriteExpressionSourceAlloc(alloc: std.mem.Allocator, plan: ddl_plan.AlterTablePlan) !?AppliedDdlRewriteExpressionSource {
     var out: ?AppliedDdlRewriteExpressionSource = null;
     errdefer if (out) |source| freeAppliedDdlRewriteExpressionSource(alloc, source);
@@ -812,6 +834,72 @@ fn alterTableRewriteExpressionSourceAlloc(alloc: std.mem.Allocator, plan: ddl_pl
     return result;
 }
 
+fn relationalColumnPathExists(columns: []const runtime_schema.RelationalColumn, path: []const u8) bool {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.path, path)) return true;
+    }
+    return false;
+}
+
+fn rowRewritePlanSourceRenameOldPath(plan: AppliedDdlRowRewritePlanSource, path: []const u8) bool {
+    for (plan.renames) |rename| {
+        if (std.mem.eql(u8, rename.old_path, path)) return true;
+    }
+    return false;
+}
+
+fn alterTableRowRewritePlanSourceAlloc(
+    alloc: std.mem.Allocator,
+    old_schema: runtime_schema.TableSchema,
+    new_schema: runtime_schema.TableSchema,
+    plan: ddl_plan.AlterTablePlan,
+) !AppliedDdlRowRewritePlanSource {
+    if (old_schema.storage_mode != .relational or new_schema.storage_mode != .relational) return error.InvalidSqlCatalog;
+    var renames = std.ArrayListUnmanaged(ddl_plan.AppliedDdlRowRewriteRename).empty;
+    var drops = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (renames.items) |rename| {
+            alloc.free(rename.old_path);
+            alloc.free(rename.new_path);
+        }
+        renames.deinit(alloc);
+        for (drops.items) |drop| alloc.free(drop);
+        drops.deinit(alloc);
+    }
+
+    for (plan.operations) |operation| switch (operation) {
+        .rename_column => |rename| {
+            const old_path = try alloc.dupe(u8, rename.old_name);
+            errdefer alloc.free(old_path);
+            const new_path = try alloc.dupe(u8, rename.new_name);
+            errdefer alloc.free(new_path);
+            try renames.append(alloc, .{ .old_path = old_path, .new_path = new_path });
+        },
+        else => {},
+    };
+
+    const partial_plan = AppliedDdlRowRewritePlanSource{ .renames = renames.items, .drops = drops.items };
+    for (old_schema.relational_columns) |old_column| {
+        if (relationalColumnPathExists(new_schema.relational_columns, old_column.path)) continue;
+        if (rowRewritePlanSourceRenameOldPath(partial_plan, old_column.path)) continue;
+        try drops.append(alloc, try alloc.dupe(u8, old_column.path));
+    }
+
+    const owned_renames = try renames.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_renames) |rename| {
+            alloc.free(rename.old_path);
+            alloc.free(rename.new_path);
+        }
+        alloc.free(owned_renames);
+    }
+    const owned_drops = try drops.toOwnedSlice(alloc);
+    return .{
+        .renames = owned_renames,
+        .drops = owned_drops,
+    };
+}
+
 pub fn applyDdlPlanToSchemaJsonAlloc(
     alloc: std.mem.Allocator,
     current_schema_json: []const u8,
@@ -829,6 +917,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
                     true,
                     true,
                     null,
+                    .{},
                 );
                 if (!create_table.if_not_exists) return error.InvalidSqlCatalog;
                 return .{ .schema_json = try alloc.dupe(u8, current_schema_json) };
@@ -842,6 +931,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
             table_clone.options.constraints or table_clone.options.checks,
             false,
             null,
+            .{},
         ),
         .drop_table => |drop_table| {
             if (current_schema_json.len == 0) {
@@ -975,11 +1065,24 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
         },
     }
     const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(updated_schema_json);
     const rewrite_source = switch (plan) {
         .alter_table => |alter_table| try alterTableRewriteExpressionSourceAlloc(alloc, alter_table),
         else => null,
     };
     defer if (rewrite_source) |source| freeAppliedDdlRewriteExpressionSource(alloc, source);
+    const row_rewrite_source = switch (plan) {
+        .alter_table => |alter_table| blk: {
+            const old_schema = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, current_schema_json);
+            defer runtime_schema.freeSchema(alloc, old_schema);
+            const new_schema = try schema_json.runtimeSchemaFromSchemaJsonAlloc(alloc, updated_schema_json);
+            defer runtime_schema.freeSchema(alloc, new_schema);
+            break :blk try alterTableRowRewritePlanSourceAlloc(alloc, old_schema, new_schema, alter_table);
+        },
+        else => AppliedDdlRowRewritePlanSource{},
+    };
+    defer freeAppliedDdlRowRewritePlanSource(alloc, row_rewrite_source);
+    if (rewrite_source != null and !row_rewrite_source.empty()) return error.UnsupportedSqlShape;
     result = try appliedDdlSchemaJsonWithFlagsAlloc(
         alloc,
         updated_schema_json,
@@ -987,6 +1090,7 @@ pub fn applyDdlPlanToSchemaJsonAlloc(
         result.validation_required,
         result.rewrite_required,
         rewrite_source,
+        row_rewrite_source,
     );
     errdefer result.deinit(alloc);
     try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, result.schema_json);
@@ -999,7 +1103,7 @@ pub fn appliedDdlTableWorkItemsForFlagsAlloc(
     validation_required: bool,
     rewrite_required: bool,
 ) ![]const ddl_plan.AppliedDdlWorkItem {
-    return try appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(alloc, requires_rebuild, validation_required, rewrite_required, null);
+    return try appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(alloc, requires_rebuild, validation_required, rewrite_required, null, .{});
 }
 
 fn appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(
@@ -1008,6 +1112,7 @@ fn appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(
     validation_required: bool,
     rewrite_required: bool,
     rewrite_expression: ?AppliedDdlRewriteExpressionSource,
+    row_rewrite_plan: AppliedDdlRowRewritePlanSource,
 ) ![]const ddl_plan.AppliedDdlWorkItem {
     const count: usize =
         (if (requires_rebuild) @as(usize, 1) else 0) +
@@ -1043,6 +1148,7 @@ fn appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(
         initialized = i;
     }
     if (rewrite_required) {
+        if (rewrite_expression != null and !row_rewrite_plan.empty()) return error.UnsupportedSqlShape;
         const owned_rewrite: ?ddl_plan.AppliedDdlRewriteExpression = if (rewrite_expression) |rewrite| blk: {
             const target_column = try alloc.dupe(u8, rewrite.target_column);
             errdefer alloc.free(target_column);
@@ -1053,11 +1159,44 @@ fn appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(
                 .expression = expression,
             };
         } else null;
+        var owned_row_plan = ddl_plan.AppliedDdlRowRewritePlan{};
+        if (!row_rewrite_plan.empty()) {
+            const renames = try alloc.alloc(ddl_plan.AppliedDdlRowRewriteRename, row_rewrite_plan.renames.len);
+            var rename_count: usize = 0;
+            errdefer {
+                for (renames[0..rename_count]) |rename| {
+                    alloc.free(rename.old_path);
+                    alloc.free(rename.new_path);
+                }
+                alloc.free(renames);
+            }
+            for (row_rewrite_plan.renames, 0..) |rename, rename_i| {
+                const old_path = try alloc.dupe(u8, rename.old_path);
+                errdefer alloc.free(old_path);
+                const new_path = try alloc.dupe(u8, rename.new_path);
+                errdefer alloc.free(new_path);
+                renames[rename_i] = .{ .old_path = old_path, .new_path = new_path };
+                rename_count += 1;
+            }
+            const drops = try alloc.alloc([]const u8, row_rewrite_plan.drops.len);
+            var drop_count: usize = 0;
+            errdefer {
+                for (drops[0..drop_count]) |drop| alloc.free(drop);
+                alloc.free(drops);
+            }
+            for (row_rewrite_plan.drops, 0..) |drop, drop_i| {
+                drops[drop_i] = try alloc.dupe(u8, drop);
+                drop_count += 1;
+            }
+            owned_row_plan = .{ .renames = renames, .drops = drops };
+        }
         items[i] = .{
             .action = .rewrite,
             .subject = .table,
             .reason = .row_images,
+            .full_row_rewrite = owned_rewrite == null and owned_row_plan.empty(),
             .rewrite_expression = owned_rewrite,
+            .row_rewrite_plan = owned_row_plan,
         };
         i += 1;
         initialized = i;
@@ -1072,9 +1211,10 @@ fn appliedDdlSchemaJsonWithFlagsAlloc(
     validation_required: bool,
     rewrite_required: bool,
     rewrite_expression: ?AppliedDdlRewriteExpressionSource,
+    row_rewrite_plan: AppliedDdlRowRewritePlanSource,
 ) !ddl_plan.AppliedDdlSchemaJson {
     errdefer alloc.free(schema_json_text);
-    const work_items = try appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(alloc, requires_rebuild, validation_required, rewrite_required, rewrite_expression);
+    const work_items = try appliedDdlTableWorkItemsForFlagsAndRewriteAlloc(alloc, requires_rebuild, validation_required, rewrite_required, rewrite_expression, row_rewrite_plan);
     return .{
         .schema_json = schema_json_text,
         .requires_rebuild = requires_rebuild,
@@ -1414,4 +1554,65 @@ fn addRelationalPrimaryKeyAlloc(
     try lower_expr.validatePrimaryKeyColumns(schema.relational_columns, primary_key);
     try binder.validatePrimaryKeyTemporalCatalog(schema.periods, primary_key);
     schema.primary_key = try ddl_plan.cloneDdlPrimaryKey(alloc, primary_key);
+}
+
+test "catalog apply emits typed row rewrite plan for column rename" {
+    const alloc = std.testing.allocator;
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, schema_v1, .{ .alter_table = .{
+        .table_name = "events",
+        .operations = &.{.{ .rename_column = .{ .old_name = "status", .new_name = "state" } }},
+    } });
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(applied.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 3), applied.work_items.len);
+    const rewrite = applied.work_items[2];
+    try std.testing.expectEqual(ddl_plan.AppliedDdlWorkAction.rewrite, rewrite.action);
+    try std.testing.expect(!rewrite.full_row_rewrite);
+    try std.testing.expect(rewrite.rewrite_expression == null);
+    try std.testing.expectEqual(@as(usize, 1), rewrite.row_rewrite_plan.renames.len);
+    try std.testing.expectEqualStrings("status", rewrite.row_rewrite_plan.renames[0].old_path);
+    try std.testing.expectEqualStrings("state", rewrite.row_rewrite_plan.renames[0].new_path);
+    try std.testing.expectEqual(@as(usize, 0), rewrite.row_rewrite_plan.drops.len);
+}
+
+test "catalog apply emits typed row rewrite plan for column drop" {
+    const alloc = std.testing.allocator;
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"keyword"},"status":{"type":"keyword"},"legacy_status":{"type":"keyword"}},"required":["title","status"],"additionalProperties":false}}}}
+    ;
+    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, schema_v1, .{ .alter_table = .{
+        .table_name = "events",
+        .operations = &.{.{ .drop_column = .{ .name = "legacy_status" } }},
+    } });
+    defer applied.deinit(alloc);
+
+    try std.testing.expect(applied.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 3), applied.work_items.len);
+    const rewrite = applied.work_items[2];
+    try std.testing.expectEqual(ddl_plan.AppliedDdlWorkAction.rewrite, rewrite.action);
+    try std.testing.expect(!rewrite.full_row_rewrite);
+    try std.testing.expect(rewrite.rewrite_expression == null);
+    try std.testing.expectEqual(@as(usize, 0), rewrite.row_rewrite_plan.renames.len);
+    try std.testing.expectEqual(@as(usize, 1), rewrite.row_rewrite_plan.drops.len);
+    try std.testing.expectEqualStrings("legacy_status", rewrite.row_rewrite_plan.drops[0]);
+}
+
+test "catalog apply marks generic row rewrite work explicitly full" {
+    const alloc = std.testing.allocator;
+    const work_items = try appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, true, true);
+    defer {
+        for (work_items) |*item| @constCast(item).deinit(alloc);
+        alloc.free(work_items);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), work_items.len);
+    const rewrite = work_items[2];
+    try std.testing.expectEqual(ddl_plan.AppliedDdlWorkAction.rewrite, rewrite.action);
+    try std.testing.expect(rewrite.full_row_rewrite);
+    try std.testing.expect(rewrite.rewrite_expression == null);
+    try std.testing.expect(rewrite.row_rewrite_plan.empty());
 }

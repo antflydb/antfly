@@ -1392,7 +1392,7 @@ fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
     var ordinal: u32 = 0;
     for (applied.work_items) |item| {
         if (item.action != .rewrite) continue;
-        if (item.rewrite_expression == null) return error.UnsupportedSqlShape;
+        if (item.rewrite_expression == null and item.row_rewrite_plan.empty() and !item.full_row_rewrite) return error.UnsupportedSqlShape;
         ordinal += 1;
         for (snapshot.ranges) |range| {
             if (range.table_id != applied.table.table_id) continue;
@@ -1400,6 +1400,12 @@ fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
             try svc.upsertSchemaRewriteJob(job);
         }
     }
+}
+
+fn schemaRewriteRenamesForAppliedRowRewritePlan(plan: relational_sql.AppliedDdlRowRewritePlan) []const metadata_table_manager.SchemaRewriteRename {
+    if (plan.renames.len == 0) return &.{};
+    const ptr: [*]const metadata_table_manager.SchemaRewriteRename = @ptrCast(@alignCast(plan.renames.ptr));
+    return ptr[0..plan.renames.len];
 }
 
 fn schemaRewriteJobForAppliedDdlWorkItem(
@@ -1435,6 +1441,24 @@ fn schemaRewriteJobForAppliedDdlWorkItem(
         defer alloc.free(expression);
         hasher.update(expression);
     }
+    if (item.full_row_rewrite) {
+        hasher.update("full_row_rewrite");
+        hasher.update(&[_]u8{0});
+    }
+    for (item.row_rewrite_plan.renames) |rename| {
+        hasher.update("rename");
+        hasher.update(&[_]u8{0});
+        hasher.update(rename.old_path);
+        hasher.update(&[_]u8{0});
+        hasher.update(rename.new_path);
+        hasher.update(&[_]u8{0});
+    }
+    for (item.row_rewrite_plan.drops) |drop| {
+        hasher.update("drop");
+        hasher.update(&[_]u8{0});
+        hasher.update(drop);
+        hasher.update(&[_]u8{0});
+    }
     const job_id = nonZeroId(hasher.final());
     const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
     return .{
@@ -1448,6 +1472,9 @@ fn schemaRewriteJobForAppliedDdlWorkItem(
         .end_row_key = range.end_key,
         .target_column = if (item.rewrite_expression) |rewrite| rewrite.target_column else "",
         .expression = if (item.rewrite_expression) |rewrite| rewrite.expression else null,
+        .full_row_rewrite = item.full_row_rewrite,
+        .rewrite_renames = schemaRewriteRenamesForAppliedRowRewritePlan(item.row_rewrite_plan),
+        .rewrite_drops = item.row_rewrite_plan.drops,
     };
 }
 
@@ -1701,6 +1728,169 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     try std.testing.expectEqual(@as(u64, 9002), service.jobs.items[1].group_id);
     try std.testing.expectEqualStrings("m", service.jobs.items[1].start_row_key);
     try std.testing.expect(service.jobs.items[1].end_row_key == null);
+}
+
+test "api http server schedules row-plan schema rewrite jobs from applied SQL DDL work" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        ranges: [1]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9001, .range_id = 9101, .table_id = 77, .start_key = "", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.jobs.items) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.jobs.deinit(allocator);
+            self.* = undefined;
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+            try self.jobs.append(std.testing.allocator, owned);
+        }
+    };
+
+    const table = try metadata_table_manager.cloneTable(alloc, .{
+        .table_id = 77,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"state\":{\"type\":\"keyword\"}}}}}}",
+    });
+    errdefer metadata_table_manager.freeTable(alloc, table);
+    const renames = try alloc.alloc(relational_sql.AppliedDdlRowRewriteRename, 1);
+    renames[0] = .{
+        .old_path = try alloc.dupe(u8, "status"),
+        .new_path = try alloc.dupe(u8, "state"),
+    };
+    const drops = try alloc.alloc([]const u8, 1);
+    drops[0] = try alloc.dupe(u8, "legacy_status");
+    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    work_items[0] = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+        .row_rewrite_plan = .{ .renames = renames, .drops = drops },
+    };
+    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+        .table = table,
+        .rewrite_required = true,
+        .work_items = work_items,
+    };
+
+    var service = FakeService{};
+    defer service.deinit(alloc);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
+
+    const same_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
+    const alternate_item: relational_sql.AppliedDdlWorkItem = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+        .row_rewrite_plan = .{ .drops = &.{"legacy_status"} },
+    };
+    const alternate_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], alternate_item, 1);
+    try std.testing.expect(same_row_plan_job.job_id != alternate_row_plan_job.job_id);
+
+    applied.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), service.jobs.items.len);
+    const job = service.jobs.items[0];
+    try std.testing.expectEqual(@as(usize, 1), job.rewrite_renames.len);
+    try std.testing.expectEqualStrings("status", job.rewrite_renames[0].old_path);
+    try std.testing.expectEqualStrings("state", job.rewrite_renames[0].new_path);
+    try std.testing.expectEqual(@as(usize, 1), job.rewrite_drops.len);
+    try std.testing.expectEqualStrings("legacy_status", job.rewrite_drops[0]);
+}
+
+test "api http server schedules full row schema rewrite jobs from applied SQL DDL work" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        ranges: [1]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9001, .range_id = 9101, .table_id = 77, .start_key = "", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.jobs.items) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.jobs.deinit(allocator);
+            self.* = undefined;
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+            try self.jobs.append(std.testing.allocator, owned);
+        }
+    };
+
+    const table = try metadata_table_manager.cloneTable(alloc, .{
+        .table_id = 77,
+        .name = "events",
+        .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"state\":{\"type\":\"keyword\"}}}}}}",
+    });
+    errdefer metadata_table_manager.freeTable(alloc, table);
+    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    work_items[0] = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+        .full_row_rewrite = true,
+    };
+    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+        .table = table,
+        .rewrite_required = true,
+        .work_items = work_items,
+    };
+
+    var service = FakeService{};
+    defer service.deinit(alloc);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
+
+    const same_full_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
+    const alternate_item: relational_sql.AppliedDdlWorkItem = .{
+        .action = .rewrite,
+        .subject = .table,
+        .reason = .row_images,
+        .row_rewrite_plan = .{ .drops = &.{"legacy_status"} },
+    };
+    const alternate_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], alternate_item, 1);
+    try std.testing.expect(same_full_job.job_id != alternate_row_plan_job.job_id);
+
+    applied.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), service.jobs.items.len);
+    const job = service.jobs.items[0];
+    try std.testing.expect(job.full_row_rewrite);
+    try std.testing.expectEqual(@as(usize, 0), job.rewrite_renames.len);
+    try std.testing.expectEqual(@as(usize, 0), job.rewrite_drops.len);
 }
 
 test "api http server rejects schema rewrite jobs without typed row operation" {
