@@ -298,7 +298,7 @@ fn initNativeSingleFile(allocator: Allocator, initial_store: *docstore.Store) !H
 
     const native_index_storage = try allocator.create(index_storage.Store);
     errdefer allocator.destroy(native_index_storage);
-    native_index_storage.* = index_storage.Store.init(allocator, store);
+    native_index_storage.* = index_storage.Store.initWithNamespace(allocator, store, native_index_base_path);
 
     const runtime_store = try allocator.create(backend_erased.Store);
     errdefer allocator.destroy(runtime_store);

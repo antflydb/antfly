@@ -32,6 +32,7 @@ const StorageIo = storage_io.Storage;
 pub const Store = struct {
     allocator: Allocator,
     docs: *docstore.Store,
+    namespace_prefix: []const u8,
 
     const vtable: StorageIo.VTable = .{
         .create_dir_path = createDirPath,
@@ -49,9 +50,14 @@ pub const Store = struct {
     };
 
     pub fn init(allocator: Allocator, docs: *docstore.Store) Store {
+        return initWithNamespace(allocator, docs, "");
+    }
+
+    pub fn initWithNamespace(allocator: Allocator, docs: *docstore.Store, namespace_prefix: []const u8) Store {
         return .{
             .allocator = allocator,
             .docs = docs,
+            .namespace_prefix = namespace_prefix,
         };
     }
 
@@ -63,20 +69,31 @@ pub const Store = struct {
     }
 };
 
-fn createDirPath(_: *anyopaque, _: []const u8) !void {}
+fn createDirPath(ptr: *anyopaque, path: []const u8) !void {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
+}
 
 fn lockStore(store: *docstore.Store) void {
     platform_sync.lockYielding(&store.mutex);
 }
 
 fn pathContains(prefix: []const u8, path: []const u8) bool {
+    if (prefix.len == 0) return true;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     if (path.len == prefix.len) return true;
     return path[prefix.len] == '/';
 }
 
+fn validateIndexPath(self: *const Store, path: []const u8) !void {
+    if (path.len == 0) return error.InvalidNativeIndexPath;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativeIndexPath;
+    if (!pathContains(self.namespace_prefix, path)) return error.InvalidNativeIndexPath;
+}
+
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -88,6 +105,7 @@ fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_by
 
 fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -96,6 +114,7 @@ fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, o
 
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -105,6 +124,7 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
 
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -115,6 +135,7 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     try writeFileReserved(self, path, contents);
 }
 
@@ -127,6 +148,7 @@ fn writeFileReserved(self: *Store, path: []const u8, contents: []const u8) !void
 fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
     _ = sync;
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -135,12 +157,15 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     if (self.docs.read_only) return error.ReadOnly;
     return try NativeAtomicWriteSink.create(allocator, self, path);
 }
 
 fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, old_path);
+    try validateIndexPath(self, new_path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -149,6 +174,7 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
     try self.docs.file.deleteIndexCatalogRecord(path);
@@ -156,6 +182,7 @@ fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
 
 fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
@@ -304,6 +331,35 @@ test "lite native index storage persists logical files across reopen" {
         defer allocator.free(range);
         try std.testing.expectEqualStrings("cdef", range);
     }
+}
+
+test "lite native index storage can be scoped to the Lite index namespace" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-index-storage-namespace.aflite");
+    defer allocator.free(path);
+
+    var docs = try docstore.Store.open(allocator, path, false);
+    defer docs.close();
+    var index_store = Store.initWithNamespace(allocator, &docs, "__antfly_lite");
+    const storage = index_store.storage();
+
+    try storage.createDirPath("__antfly_lite/indexes/ft");
+    try storage.writeFileAbsolute("__antfly_lite/indexes/ft/a.tbl", "scoped");
+    const got = try storage.readFileAlloc(allocator, "__antfly_lite/indexes/ft/a.tbl", 64);
+    defer allocator.free(got);
+    try std.testing.expectEqualStrings("scoped", got);
+
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.createDirPath("__antfly_lite_other/indexes/ft"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("__antfly_lite_other/indexes/ft/a.tbl", "bad"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.readFileAlloc(allocator, "__antfly_lite_other/indexes/ft/a.tbl", 64));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.beginAtomicWrite(allocator, "__antfly_lite_other/indexes/ft/a.tbl"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.renameAbsolute("__antfly_lite/indexes/ft/a.tbl", "__antfly_lite_other/indexes/ft/a.tbl"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.deleteTree("__antfly_lite_other"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("", "bad"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("__antfly_lite/indexes/ft/\x00bad", "bad"));
 }
 
 test "lite native index storage handles large files rename and delete tree" {
