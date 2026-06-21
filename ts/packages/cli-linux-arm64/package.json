@@ -10,6 +10,8 @@
   },
   "files": [
     "bin",
+    "include",
+    "lib",
     "share",
     "README.md"
   ],
