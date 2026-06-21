@@ -85,4 +85,10 @@ func main() {
 		log.Fatalf("write backup: %v", err)
 	}
 	fmt.Printf("wrote portable backup: %s\n", *backupPath)
+
+	check, err := antflylite.CheckFile(*dbPath)
+	if err != nil {
+		log.Fatalf("check Lite file: %v", err)
+	}
+	fmt.Printf("check: valid=%t size=%d compact_size=%d\n", check.Valid, check.FileSize, check.CompactSize)
 }

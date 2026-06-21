@@ -2,7 +2,8 @@
 
 This example embeds Antfly Lite in a Go application. It opens a live `.aflite`
 database, writes a JSON document, reads it back, prints Lite status, and exports
-a portable `.afb` backup.
+a portable `.afb` backup. It also checks the `.aflite` file directly without
+opening another database handle.
 
 ## Run
 
