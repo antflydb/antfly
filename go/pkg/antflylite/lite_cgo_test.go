@@ -361,6 +361,11 @@ func TestLiteCAPI(t *testing.T) {
 		remoteStatus.Inference.LocalRuntimeConfigured {
 		t.Fatalf("remote inference status = %#v", remoteStatus.Inference)
 	}
+	if remoteStatus.Capabilities.InferenceMode != InferenceModeRemoteProvider ||
+		!remoteStatus.Capabilities.RemoteInferenceProviders ||
+		remoteStatus.Capabilities.LocalInferenceRuntime {
+		t.Fatalf("remote inference status capabilities = %#v", remoteStatus.Capabilities)
+	}
 
 	localPath := filepath.Join(t.TempDir(), "go-local-inference.aflite")
 	localDB, err := OpenWithOptions(localPath, OpenOptions{
