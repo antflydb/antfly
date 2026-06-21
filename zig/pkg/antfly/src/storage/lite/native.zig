@@ -2204,8 +2204,10 @@ fn selectActiveCheckpoint(
 
 fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
     var best: ?u8 = null;
+    var saw_valid_slot = false;
     for (header.checkpoints, 0..) |slot, index| {
         if (!validCheckpointSlot(slot)) continue;
+        saw_valid_slot = true;
         const expected_size = checkpointPrefixSize(slot, header.page_size) catch continue;
         if (expected_size > file_size) continue;
         const slot_index: u8 = @intCast(index);
@@ -2220,7 +2222,8 @@ fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
             best = slot_index;
         }
     }
-    return best orelse error.TruncatedNativeFile;
+    if (best) |index| return index;
+    return if (saw_valid_slot) error.TruncatedNativeFile else error.InvalidNativeCheckpoint;
 }
 
 fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
@@ -3918,4 +3921,41 @@ test "lite native checkFile reports corrupted header" {
     const report = try checkFile(allocator, path);
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
+}
+
+test "lite native checkFile reports invalid checkpoint metadata separately from truncation" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-invalid-checkpoint.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    var header_bytes = try readHeaderForTest(path);
+    var header = try decodeHeader(&header_bytes);
+    for (&header.checkpoints) |*slot| {
+        slot.catalog_root_page = slot.page_count;
+        slot.document_root_page = slot.page_count;
+        slot.index_catalog_root_page = slot.page_count;
+        slot.free_map_root_page = slot.page_count;
+    }
+    encodeHeader(&header_bytes, header);
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
+        try raw.sync(std.testing.io);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_checkpoint", report.issue.?);
 }
