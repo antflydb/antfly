@@ -455,6 +455,7 @@ pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityC
 
 pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
+pub const app_parity_coverage_regression_requirement_fixture_format: u64 = 1;
 pub const app_parity_summary_assertion_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
@@ -479,6 +480,21 @@ pub const AppParitySourceCorpusRoot = struct {
 pub const AppParityCoverageRequirementsRoot = struct {
     coverage_format: u64,
     required: []const []const u8,
+};
+
+pub const AppParityCoverageRegressionRequirementsRoot = struct {
+    coverage_format: u64,
+    required: []const []const u8,
+};
+
+pub const AppParityCoverageRegressionRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParityCoverageRegressionRequirementsRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeCoverageRegressionRequirementsRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
 };
 
 pub const AppParitySummaryAssertionRequirementsRoot = struct {
@@ -1268,6 +1284,55 @@ pub fn freeCoverageRequirementsRoot(
     if (root.required.len > 0) alloc.free(root.required);
 }
 
+pub fn parseCoverageRegressionRequirementsRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !AppParityCoverageRegressionRequirementsRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "coverage_format", "required" });
+    const coverage_format = try fixtureJsonOptionalU64(root, "coverage_format", 0);
+    if (coverage_format != app_parity_coverage_regression_requirement_fixture_format) return error.TestUnexpectedResult;
+    const required = try parseFixtureStringListAlloc(alloc, root, "required");
+    errdefer if (required.len > 0) alloc.free(required);
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    for (required, 0..) |name, i| {
+        if (name.len == 0 or seen.contains(name) or !appParityCoverageRequirementKnown(name)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
+        try seen.put(alloc, name, {});
+    }
+
+    return .{
+        .coverage_format = coverage_format,
+        .required = required,
+    };
+}
+
+pub fn freeCoverageRegressionRequirementsRoot(
+    alloc: std.mem.Allocator,
+    root: AppParityCoverageRegressionRequirementsRoot,
+) void {
+    if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn parseAppParityCoverageRegressionRequirementsAlloc(alloc: std.mem.Allocator) !AppParityCoverageRegressionRequirements {
+    const coverage_json = @embedFile("../fixtures/sql_api_coverage_regression_required_buckets.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseCoverageRegressionRequirementsRootAlloc(alloc, parsed.value);
+    errdefer freeCoverageRegressionRequirementsRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
 pub fn parseSqlAdapterEdgeCaseRootAlloc(
     alloc: std.mem.Allocator,
     value: std.json.Value,
@@ -1543,7 +1608,22 @@ pub fn expectAppParityCoverageRequirements(
     }
 }
 
-fn checkCoverageRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) !void {
+fn recordCoverageRegressionBuckets(
+    alloc: std.mem.Allocator,
+    seen_buckets: *std.StringHashMapUnmanaged(void),
+    buckets: []const []const u8,
+) !void {
+    for (buckets) |name| {
+        if (!appParityCoverageRequirementKnown(name)) return error.TestUnexpectedResult;
+        try seen_buckets.put(alloc, name, {});
+    }
+}
+
+fn checkCoverageRegressionCase(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    seen_buckets: *std.StringHashMapUnmanaged(void),
+) !void {
     const object = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(object, &.{ "name", "entries", "expect_true", "expect_false" });
 
@@ -1562,6 +1642,8 @@ fn checkCoverageRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) 
         if (expect_false.len > 0) alloc.free(expect_false);
     }
     if (expect_true.len == 0 and expect_false.len == 0) return error.TestUnexpectedResult;
+    try recordCoverageRegressionBuckets(alloc, seen_buckets, expect_true);
+    try recordCoverageRegressionBuckets(alloc, seen_buckets, expect_false);
 
     var coverage = AppParityCorpusCoverage{};
     for (entries) |entry_value| {
@@ -4859,6 +4941,8 @@ test "sql adapter corpus data-driven coverage regressions" {
     const fixture_json = @embedFile("../fixtures/sql_api_coverage_regressions.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed.deinit();
+    var required_buckets = try parseAppParityCoverageRegressionRequirementsAlloc(alloc);
+    defer required_buckets.deinit(alloc);
 
     const root = try fixtureJsonObject(parsed.value);
     try fixtureRequireOnlyKeys(root, &.{ "coverage_format", "cases" });
@@ -4869,9 +4953,51 @@ test "sql adapter corpus data-driven coverage regressions" {
         else => return error.TestUnexpectedResult,
     };
     if (cases.len == 0) return error.TestUnexpectedResult;
+    var seen_buckets = std.StringHashMapUnmanaged(void){};
+    defer seen_buckets.deinit(alloc);
     for (cases) |regression_case| {
-        try checkCoverageRegressionCase(alloc, regression_case);
+        try checkCoverageRegressionCase(alloc, regression_case, &seen_buckets);
     }
+    for (required_buckets.root.required) |name| {
+        if (!seen_buckets.contains(name)) {
+            std.debug.print("missing coverage regression bucket: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "sql adapter corpus validates coverage regression bucket requirements" {
+    const alloc = std.testing.allocator;
+    var required_buckets = try parseAppParityCoverageRegressionRequirementsAlloc(alloc);
+    defer required_buckets.deinit(alloc);
+    try std.testing.expectEqual(app_parity_coverage_regression_requirement_fixture_format, required_buckets.root.coverage_format);
+    try std.testing.expect(required_buckets.root.required.len > 0);
+
+    const unknown_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": [
+        \\    "aggregate_distinct_group_projection",
+        \\    "not_a_coverage_bucket"
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown = try std.json.parseFromSlice(std.json.Value, alloc, unknown_json, .{});
+    defer parsed_unknown.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRegressionRequirementsRootAlloc(alloc, parsed_unknown.value));
+
+    const unsorted_json =
+        \\{
+        \\  "coverage_format": 1,
+        \\  "required": [
+        \\    "conflict_do_nothing_returning_all",
+        \\    "aggregate_distinct_group_projection"
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
+    defer parsed_unsorted.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseCoverageRegressionRequirementsRootAlloc(alloc, parsed_unsorted.value));
 }
 
 test "sql adapter corpus parses data-driven coverage requirements" {

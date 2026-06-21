@@ -1171,7 +1171,11 @@ wrapped read classifier plans, live in checked-in fixture JSON under
 `api/fixtures/` and are interpreted by a generic `corpus.zig` runner with named
 expected coverage buckets. Expectation names resolve directly against boolean
 fields in the coverage accumulator, so adding a reviewable regression case does
-not require extending a second Zig-side name map. Summary-shape regressions
+not require extending a second Zig-side name map. Required coverage-regression
+buckets live in
+`api/fixtures/sql_api_coverage_regression_required_buckets.json`, must stay
+sorted, and `api/fixtures/sql_api_coverage_regressions.json` must reference
+each required bucket at least once. Summary-shape regressions
 that need named predicate checks live in
 `api/fixtures/sql_api_summary_regressions.json`; `corpus.zig` owns the small
 assertion-name map and parser, while the entry data and positive/negative
