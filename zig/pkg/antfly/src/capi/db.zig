@@ -1917,6 +1917,20 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     return .invalid_argument;
 }
 
+pub export fn antfly_lite_copy_stable_snapshot_file_json(
+    src_path: ?[*:0]const u8,
+    dest_path: ?[*:0]const u8,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    _ = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    var handle_ptr: ?*anyopaque = null;
+    const open_status = antfly_lite_open_readonly(src_path, &handle_ptr);
+    if (open_status != .ok) return open_status;
+    defer antfly_db_close(handle_ptr);
+    return antfly_lite_copy_stable_snapshot_json(handle_ptr, dest_path, replace, out_buf);
+}
+
 const LiteCompactReport = struct {
     compacted: bool,
     vacuum: lite_backend.VacuumReport,
@@ -6315,6 +6329,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(schema_dst_path);
     const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
+    const snapshot_file_path = try tempTestAflitePath(alloc, "capi-lite-snapshot-file");
+    defer alloc.free(snapshot_file_path);
     const pinned_snapshot_path = try tempTestAflitePath(alloc, "capi-lite-pinned-snapshot");
     defer alloc.free(pinned_snapshot_path);
     const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
@@ -6327,6 +6343,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(restore_malformed_path);
     const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
     defer alloc.free(invalid_snapshot_path);
+    const invalid_snapshot_file_path = try tempTestPath(alloc, "capi-lite-snapshot-file-invalid");
+    defer alloc.free(invalid_snapshot_file_path);
     cleanupTestDir(plain_path);
     cleanupTestFile(invalid_lite_path);
     cleanupTestFile(short_lite_path);
@@ -6337,12 +6355,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(bad_dst_path);
     cleanupTestFile(schema_dst_path);
     cleanupTestFile(snapshot_path);
+    cleanupTestFile(snapshot_file_path);
     cleanupTestFile(pinned_snapshot_path);
     cleanupTestFile(restore_path);
     cleanupTestFile(restore_alias_path);
     cleanupTestFile(locked_restore_path);
     cleanupTestFile(restore_malformed_path);
     cleanupTestFile(invalid_snapshot_path);
+    cleanupTestFile(invalid_snapshot_file_path);
     defer cleanupTestDir(plain_path);
     defer cleanupTestFile(invalid_lite_path);
     defer cleanupTestFile(short_lite_path);
@@ -6353,12 +6373,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(bad_dst_path);
     defer cleanupTestFile(schema_dst_path);
     defer cleanupTestFile(snapshot_path);
+    defer cleanupTestFile(snapshot_file_path);
     defer cleanupTestFile(pinned_snapshot_path);
     defer cleanupTestFile(restore_path);
     defer cleanupTestFile(restore_alias_path);
     defer cleanupTestFile(locked_restore_path);
     defer cleanupTestFile(restore_malformed_path);
     defer cleanupTestFile(invalid_snapshot_path);
+    defer cleanupTestFile(invalid_snapshot_file_path);
 
     try std.testing.expectEqual(@as(u32, 1), antfly_lite_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
@@ -6450,6 +6472,15 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, null, false, &null_snapshot_dest));
     try std.testing.expect(null_snapshot_dest.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), null_snapshot_dest.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, null));
+    var null_snapshot_file_src: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(null, snapshot_file_path, false, &null_snapshot_file_src));
+    try std.testing.expect(null_snapshot_file_src.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_snapshot_file_src.len);
+    var null_snapshot_file_dest: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, null, false, &null_snapshot_file_dest));
+    try std.testing.expect(null_snapshot_file_dest.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_snapshot_file_dest.len);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_compact_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_vacuum_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(src_handle, null));
@@ -6813,6 +6844,36 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &snapshot_lookup));
     defer antfly_db_buffer_free(snapshot_lookup.ptr, snapshot_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_lookup.ptr.?[0..snapshot_lookup.len], "\"second\"") != null);
+
+    var invalid_snapshot_file_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, invalid_snapshot_file_path, false, &invalid_snapshot_file_report));
+    try std.testing.expect(invalid_snapshot_file_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_snapshot_file_report.len);
+
+    var snapshot_file_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_report));
+    defer antfly_db_buffer_free(snapshot_file_report.ptr, snapshot_file_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_report.ptr.?[0..snapshot_file_report.len], "\"tail_bytes\":4") != null);
+    var snapshot_file_existing_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_file_json(src_path, snapshot_file_path, false, &snapshot_file_existing_report));
+    try std.testing.expect(snapshot_file_existing_report.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), snapshot_file_existing_report.len);
+
+    var snapshot_file_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(snapshot_file_path, &snapshot_file_handle));
+    defer antfly_db_close(snapshot_file_handle);
+    var snapshot_file_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(snapshot_file_handle, &snapshot_file_check));
+    defer antfly_db_buffer_free(snapshot_file_check.ptr, snapshot_file_check.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_check.ptr.?[0..snapshot_file_check.len], "\"valid\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_check.ptr.?[0..snapshot_file_check.len], "\"tail_bytes\":0") != null);
+    var snapshot_file_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(snapshot_file_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &snapshot_file_lookup));
+    defer antfly_db_buffer_free(snapshot_file_lookup.ptr, snapshot_file_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot_file_lookup.ptr.?[0..snapshot_file_lookup.len], "\"second\"") != null);
 
     var compacted: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_compact_json(src_handle, &compacted));

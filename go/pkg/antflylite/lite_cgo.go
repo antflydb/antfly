@@ -374,6 +374,24 @@ func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, err
 	return takeBuffer(out), nil
 }
 
+// CopyStableSnapshotFileJSON opens srcPath read-only, copies a stable Lite
+// snapshot to destPath, and returns the JSON result.
+func CopyStableSnapshotFileJSON(srcPath, destPath string, replace bool) ([]byte, error) {
+	if err := ValidateABI(); err != nil {
+		return nil, err
+	}
+	cSrc := C.CString(srcPath)
+	defer C.free(unsafe.Pointer(cSrc))
+	cDest := C.CString(destPath)
+	defer C.free(unsafe.Pointer(cDest))
+
+	var out C.antfly_buffer
+	if err := check(C.antfly_lite_copy_stable_snapshot_file_json(cSrc, cDest, C.bool(replace), &out)); err != nil {
+		return nil, err
+	}
+	return takeBuffer(out), nil
+}
+
 // Batch applies write intents at timestampNS.
 func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
 	handle, err := db.requireHandle()

@@ -11,6 +11,7 @@
 package antflylite
 
 import (
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -47,18 +48,15 @@ func CopyStableSnapshotFile(srcPath, destPath string, replace bool) (*StableSnap
 	if !strings.HasSuffix(srcPath, ".aflite") || !strings.HasSuffix(destPath, ".aflite") {
 		return nil, InvalidArgument
 	}
-	db, err := OpenReadonly(srcPath)
+	body, err := CopyStableSnapshotFileJSON(srcPath, destPath, replace)
 	if err != nil {
 		return nil, err
 	}
-	report, copyErr := db.CopyStableSnapshot(destPath, replace)
-	if closeErr := db.Close(); closeErr != nil && copyErr == nil {
-		copyErr = closeErr
+	var report StableSnapshotReport
+	if err := json.Unmarshal(body, &report); err != nil {
+		return nil, err
 	}
-	if copyErr != nil {
-		return nil, copyErr
-	}
-	return report, nil
+	return &report, nil
 }
 
 // RestoreBackupFile creates or replaces a Lite database from a portable Antfly
