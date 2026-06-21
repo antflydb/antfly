@@ -22,59 +22,38 @@ pub const CapturedGraph = struct {
     exec: driver_mod.CUgraphExec = null,
 
     pub fn instantiate(ctx: *context_mod.CudaContext, graph: driver_mod.CUgraph) Error!CapturedGraph {
-        const instantiate_with_flags = ctx.driver.fns.cuGraphInstantiateWithFlags orelse return error.CudaGraphUnavailable;
-        var exec: driver_mod.CUgraphExec = null;
-        try ctx.makeCurrent();
-        try ctx.driver.check(instantiate_with_flags(&exec, graph, 0));
+        const exec = try ctx.instantiateGraph(graph);
         return .{ .graph = graph, .exec = exec };
     }
 
     pub fn launch(self: *const CapturedGraph, ctx: *context_mod.CudaContext) Error!void {
-        const launch_fn = ctx.driver.fns.cuGraphLaunch orelse return error.CudaGraphUnavailable;
         if (self.exec == null) return error.InvalidCudaState;
-        try ctx.makeCurrent();
-        try ctx.driver.check(launch_fn(self.exec, ctx.stream));
+        try ctx.launchGraph(self.exec);
     }
 
     pub fn deinit(self: *CapturedGraph, ctx: *context_mod.CudaContext) void {
-        ctx.makeCurrent() catch {};
         if (self.exec) |exec| {
-            if (ctx.driver.fns.cuGraphExecDestroy) |destroy_exec| {
-                _ = destroy_exec(exec);
-            }
+            ctx.destroyGraphExec(exec);
             self.exec = null;
         }
         if (self.graph) |graph| {
-            if (ctx.driver.fns.cuGraphDestroy) |destroy_graph| {
-                _ = destroy_graph(graph);
-            }
+            ctx.destroyGraph(graph);
             self.graph = null;
         }
     }
 };
 
 pub fn available(ctx: *const context_mod.CudaContext) bool {
-    return ctx.driver.fns.cuStreamBeginCapture != null and
-        ctx.driver.fns.cuStreamEndCapture != null and
-        ctx.driver.fns.cuGraphInstantiateWithFlags != null and
-        ctx.driver.fns.cuGraphLaunch != null and
-        ctx.driver.fns.cuGraphExecDestroy != null and
-        ctx.driver.fns.cuGraphDestroy != null and
-        ctx.driver.fns.cuMemAllocHost != null and
+    return ctx.driver.fns.cuMemAllocHost != null and
         ctx.driver.fns.cuMemFreeHost != null;
 }
 
 pub fn beginCapture(ctx: *context_mod.CudaContext) Error!void {
-    const begin_fn = ctx.driver.fns.cuStreamBeginCapture orelse return error.CudaGraphUnavailable;
-    try ctx.makeCurrent();
-    try ctx.driver.check(begin_fn(ctx.stream, driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED));
+    try ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
 }
 
 pub fn endCapture(ctx: *context_mod.CudaContext) Error!CapturedGraph {
-    const end_fn = ctx.driver.fns.cuStreamEndCapture orelse return error.CudaGraphUnavailable;
-    var graph: driver_mod.CUgraph = null;
-    try ctx.makeCurrent();
-    try ctx.driver.check(end_fn(ctx.stream, &graph));
-    if (graph == null) return error.CudaGraphCaptureFailed;
+    const graph = try ctx.endStreamCapture();
+    errdefer ctx.destroyGraph(graph);
     return CapturedGraph.instantiate(ctx, graph);
 }

@@ -2772,6 +2772,13 @@ fn mapDenseTensorNameToClapGguf(allocator: std.mem.Allocator, source_name: []con
 
 fn mapDenseTensorNameToGguf(allocator: std.mem.Allocator, config: gpt_mod.Config, source_name: []const u8) !OutputName {
     var name = source_name;
+    var canonical_name: ?[]u8 = null;
+    defer if (canonical_name) |owned| allocator.free(owned);
+
+    if (std.mem.startsWith(u8, name, "model.language_model.")) {
+        canonical_name = try std.fmt.allocPrint(allocator, "model.{s}", .{name["model.language_model.".len..]});
+        name = canonical_name.?;
+    }
     if (std.mem.startsWith(u8, name, "language_model.")) {
         name = name["language_model.".len..];
     }
@@ -2982,6 +2989,9 @@ fn mapDenseTensorNameToGguf(allocator: std.mem.Allocator, config: gpt_mod.Config
     if (std.mem.eql(u8, suffix, "per_layer_input.layer_output_scale.weight")) {
         return .{ .name = try std.fmt.allocPrint(allocator, "blk.{d}.layer_output_scale.weight", .{layer}), .owned = true };
     }
+    if (std.mem.eql(u8, suffix, "layer_scalar")) {
+        return .{ .name = try std.fmt.allocPrint(allocator, "blk.{d}.layer_output_scale.weight", .{layer}), .owned = true };
+    }
     if (std.mem.eql(u8, suffix, "per_layer_input.post_norm.weight")) {
         return .{ .name = try std.fmt.allocPrint(allocator, "blk.{d}.post_norm.weight", .{layer}), .owned = true };
     }
@@ -3177,6 +3187,9 @@ fn isMultimodalAuxTensor(name: []const u8) bool {
         std.mem.startsWith(u8, name, "multi_modal_projector.") or
         std.mem.startsWith(u8, name, "visual.") or
         std.mem.startsWith(u8, name, "model.visual.") or
+        std.mem.startsWith(u8, name, "model.embed_audio.") or
+        std.mem.startsWith(u8, name, "model.embed_vision.") or
+        std.mem.startsWith(u8, name, "model.vision_embedder.") or
         std.mem.startsWith(u8, name, "vlm.model.visual.") or
         std.mem.startsWith(u8, name, "vision_model.") or
         std.mem.startsWith(u8, name, "audio_tower.") or
@@ -4787,7 +4800,7 @@ fn parseArgs(args: []const []const u8) !Options {
                 return error.InvalidArguments;
             };
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--quantize") and i + 1 < args.len) {
+        } else if ((std.mem.eql(u8, args[i], "--quantize") or std.mem.eql(u8, args[i], "--format")) and i + 1 < args.len) {
             opts.quantization = parseQuantizationMode(args[i + 1]) orelse {
                 printUsage();
                 return error.InvalidArguments;
@@ -7132,6 +7145,34 @@ test "dense gpt neo export maps transformer names to native gguf names" {
     try std.testing.expectEqual(gguf_mod.tensor_types.TensorType{ .known = .Q8_0 }, q_proj.tensor_type);
     try std.testing.expectEqualSlices(u64, &.{ 32, 32 }, q_proj.dimensions);
     try std.testing.expectEqual(gguf_mod.tensor_types.TensorType{ .known = .F32 }, catalog.find("ln_f.weight").?.tensor_type);
+}
+
+test "dense gpt export maps model language model wrapper names" {
+    const allocator = std.testing.allocator;
+    const config = gpt_mod.Config{ .family = .gemma };
+
+    const embed = try mapDenseTensorNameToGguf(allocator, config, "model.language_model.embed_tokens.weight");
+    defer if (embed.owned) allocator.free(embed.name);
+    try std.testing.expectEqualStrings("token_embd.weight", embed.name);
+
+    const q_proj = try mapDenseTensorNameToGguf(allocator, config, "model.language_model.layers.3.self_attn.q_proj.weight");
+    defer if (q_proj.owned) allocator.free(q_proj.name);
+    try std.testing.expectEqualStrings("blk.3.attn_q.weight", q_proj.name);
+
+    const final_norm = try mapDenseTensorNameToGguf(allocator, config, "model.language_model.norm.weight");
+    defer if (final_norm.owned) allocator.free(final_norm.name);
+    try std.testing.expectEqualStrings("output_norm.weight", final_norm.name);
+
+    const layer_scalar = try mapDenseTensorNameToGguf(allocator, config, "model.language_model.layers.3.layer_scalar");
+    defer if (layer_scalar.owned) allocator.free(layer_scalar.name);
+    try std.testing.expectEqualStrings("blk.3.layer_output_scale.weight", layer_scalar.name);
+}
+
+test "gemma4 unified multimodal tensors are projector aux tensors" {
+    try std.testing.expect(isMultimodalAuxTensor("model.embed_audio.embedding_projection.weight"));
+    try std.testing.expect(isMultimodalAuxTensor("model.embed_vision.embedding_projection.weight"));
+    try std.testing.expect(isMultimodalAuxTensor("model.vision_embedder.patch_dense.weight"));
+    try std.testing.expect(!isMultimodalAuxTensor("model.language_model.layers.0.self_attn.q_proj.weight"));
 }
 
 test "dense gptj export maps transformer names to generic model-layer names" {

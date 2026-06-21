@@ -3,6 +3,7 @@ package v1
 import (
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilvalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
 var (
@@ -20,6 +22,12 @@ var (
 	ec2InstancePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*\.[a-z0-9]+$`)
 	// productTierTokenPattern accepts stable external tier/catalog identifiers.
 	productTierTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+	// envVarNamePattern accepts shell-safe environment variable names accepted by
+	// the Zig HA CLI/runtime token resolvers.
+	envVarNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	// haIdentifierPattern matches HA node IDs and slot names accepted by the Zig
+	// HA runtime validators.
+	haIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 )
 
 // ValidateCreate validates the cluster configuration when creating a new cluster.
@@ -156,6 +164,10 @@ func (r *AntflyCluster) ValidateAntflyCluster() error {
 	}
 
 	if err := r.validateProductTierMapping(); err != nil {
+		allErrors = append(allErrors, err.Error())
+	}
+
+	if err := r.validateHighAvailabilitySpec(); err != nil {
 		allErrors = append(allErrors, err.Error())
 	}
 
@@ -1115,6 +1127,515 @@ func resourceSpecHasCPUAndMemory(resources ResourceSpec) bool {
 	hasCPU := resources.CPU != "" || resources.Limits.CPU != ""
 	hasMemory := resources.Memory != "" || resources.Limits.Memory != ""
 	return hasCPU && hasMemory
+}
+
+func (r *AntflyCluster) validateHighAvailabilitySpec() error {
+	ha := r.Spec.HighAvailability
+	if ha == nil {
+		return nil
+	}
+	if ha.modeOrDefault() == HAModeDisabled {
+		if highAvailabilityHasManagedConfig(ha) {
+			return fmt.Errorf("high availability validation failed:\n  - spec.highAvailability.mode must be HotStandby when HA configuration fields are set")
+		}
+		return nil
+	}
+
+	var errors []string
+	names := map[string]struct{}{}
+	desiredNames := map[string]struct{}{}
+	slotNames := map[string]int{}
+	desiredStandbys := 0
+	desiredStandbyWithRouteSelector := false
+	for i, standby := range ha.Standbys {
+		name := strings.TrimSpace(standby.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name is required", i))
+			continue
+		}
+		if standby.Name != name {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name must not have leading or trailing whitespace", i))
+		} else if !validHAIdentifier(name) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name must be a valid HA identifier", i))
+		}
+		if _, exists := names[name]; exists {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].name %q is duplicated", i, name))
+		}
+		names[name] = struct{}{}
+		slotName := strings.TrimSpace(standby.SlotName)
+		if slotName == "" && standby.SlotName != "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not be whitespace", i))
+		} else if standby.SlotName != "" && standby.SlotName != slotName {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must not have leading or trailing whitespace", i))
+		} else if standby.SlotName != "" && !validHAIdentifier(slotName) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName must be a valid HA identifier", i))
+		}
+		if slotName == "" {
+			slotName = name
+		}
+		if slotName != "" {
+			if first, exists := slotNames[slotName]; exists {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].slotName %q duplicates standby slot identity from spec.highAvailability.standbys[%d]", i, slotName, first))
+			}
+			slotNames[slotName] = i
+		}
+		errors = append(errors, validateHAAdminURL(standby.AdminURL, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL", i))...)
+		errors = append(errors, validateHARouteSelector(standby.RouteSelector, fmt.Sprintf("spec.highAvailability.standbys[%d].routeSelector", i))...)
+		errors = append(errors, validateHAOptionalPath(standby.SeedManifestPath, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath", i))...)
+		errors = append(errors, validateHAOptionalPath(standby.SeedContentRoot, fmt.Sprintf("spec.highAvailability.standbys[%d].seedContentRoot", i))...)
+		if strings.TrimSpace(standby.SeedContentRoot) != "" && strings.TrimSpace(standby.SeedManifestPath) == "" {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].seedManifestPath is required when seedContentRoot is set", i))
+		}
+		if standby.DropSlotOnRemoval && standbyDesiredBySpec(standby) {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].dropSlotOnRemoval requires desired=false", i))
+		}
+		if standbyDesiredBySpec(standby) {
+			desiredStandbys++
+			desiredNames[name] = struct{}{}
+			if len(standby.RouteSelector) > 0 {
+				desiredStandbyWithRouteSelector = true
+			}
+		}
+	}
+
+	if admin := ha.Admin; admin != nil {
+		errors = append(errors, validateHAAdminURL(admin.PrimaryURL, "spec.highAvailability.admin.primaryURL")...)
+		if strings.TrimSpace(admin.TokenEnvVar) == "" && admin.TokenEnvVar != "" {
+			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must not be whitespace")
+		}
+		if tokenEnvVar := admin.TokenEnvVar; tokenEnvVar != "" && !envVarNamePattern.MatchString(tokenEnvVar) {
+			errors = append(errors, "spec.highAvailability.admin.tokenEnvVar must be a valid environment variable name")
+		}
+		if admin.JobBackoffLimit != nil && *admin.JobBackoffLimit < 0 {
+			errors = append(errors, "spec.highAvailability.admin.jobBackoffLimit must not be negative")
+		}
+		if admin.JobTimeoutSeconds != nil && *admin.JobTimeoutSeconds <= 0 {
+			errors = append(errors, "spec.highAvailability.admin.jobTimeoutSeconds must be greater than 0")
+		}
+		if admin.JobTTLSecondsAfterFinished != nil && *admin.JobTTLSecondsAfterFinished < 0 {
+			errors = append(errors, "spec.highAvailability.admin.jobTTLSecondsAfterFinished must not be negative")
+		}
+		errors = append(errors, validateHAAdminJobPodSpec(admin)...)
+		if admin.ExecutePlannedActions {
+			if strings.TrimSpace(admin.PrimaryURL) == "" {
+				errors = append(errors, "spec.highAvailability.admin.primaryURL is required when executePlannedActions is true")
+			}
+			if ha.Identity == nil {
+				errors = append(errors, "spec.highAvailability.admin.executePlannedActions requires spec.highAvailability.identity")
+			}
+		}
+	}
+
+	if ha.Runtime != nil && r.effectiveMode() != ClusterModeSwarm {
+		errors = append(errors, "spec.highAvailability.runtime is only supported when spec.mode=Swarm")
+	}
+	errors = append(errors, validateHARuntime(ha)...)
+	errors = append(errors, r.validateHARuntimeAdminTokenSource(ha)...)
+
+	if identity := ha.Identity; identity != nil {
+		if identity.ClusterID == 0 {
+			errors = append(errors, "spec.highAvailability.identity.clusterID must be greater than 0")
+		}
+		if identity.TimelineID == 0 {
+			errors = append(errors, "spec.highAvailability.identity.timelineID must be greater than 0")
+		}
+		if identity.Epoch == 0 {
+			errors = append(errors, "spec.highAvailability.identity.epoch must be greater than 0")
+		}
+		if strings.TrimSpace(identity.CurrentPrimaryID) == "" {
+			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID is required")
+		} else if identity.CurrentPrimaryID != strings.TrimSpace(identity.CurrentPrimaryID) {
+			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID must not have leading or trailing whitespace")
+		} else if !validHAIdentifier(identity.CurrentPrimaryID) {
+			errors = append(errors, "spec.highAvailability.identity.currentPrimaryID must be a valid HA identifier")
+		}
+	}
+
+	if sync := ha.SyncPolicy; sync != nil {
+		if sync.Required < 0 {
+			errors = append(errors, "spec.highAvailability.syncPolicy.required must not be negative")
+		}
+		if sync.modeOrDefault() == HADurabilityModeAsync {
+			if sync.Required != 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.required must be omitted when mode is Async")
+			}
+			if len(sync.StandbyNames) > 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames must be omitted when mode is Async")
+			}
+			if sync.Selection != "" && sync.Selection != HAStandbySelectionAny {
+				errors = append(errors, "spec.highAvailability.syncPolicy.selection must be Any or omitted when mode is Async")
+			}
+			if sync.FailurePolicy != "" && sync.FailurePolicy != HAFailurePolicyBlock {
+				errors = append(errors, "spec.highAvailability.syncPolicy.failurePolicy must be Block or omitted when mode is Async")
+			}
+		} else {
+			if sync.requiredOrDefault() == 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.required must be at least 1 for synchronous modes")
+			}
+			if len(sync.StandbyNames) == 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.standbyNames is required for synchronous modes")
+			}
+			required := sync.requiredOrDefault()
+			selection := sync.selectionOrDefault()
+			if selection == HAStandbySelectionAll && sync.Required != 0 {
+				errors = append(errors, "spec.highAvailability.syncPolicy.required must be omitted when selection is All")
+			}
+			if selection != HAStandbySelectionAll && int64(required) > int64(len(sync.StandbyNames)) {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.required (%d) cannot exceed standbyNames length (%d) for %s selection", required, len(sync.StandbyNames), selection))
+			}
+			seenSyncNames := map[string]int{}
+			for i, name := range sync.StandbyNames {
+				trimmedName := strings.TrimSpace(name)
+				if trimmedName == "" {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] is empty", i))
+					continue
+				}
+				if name != trimmedName {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] must not have leading or trailing whitespace", i))
+				} else if !validHAIdentifier(trimmedName) {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] must be a valid HA identifier", i))
+				}
+				if first, exists := seenSyncNames[trimmedName]; exists {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q duplicates standbyNames[%d]", i, trimmedName, first))
+				}
+				seenSyncNames[trimmedName] = i
+				if _, ok := names[trimmedName]; !ok {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q is not declared in spec.highAvailability.standbys", i, name))
+				} else if _, desired := desiredNames[trimmedName]; !desired {
+					errors = append(errors, fmt.Sprintf("spec.highAvailability.syncPolicy.standbyNames[%d] %q must reference a desired standby", i, name))
+				}
+			}
+		}
+	}
+
+	if failover := ha.AutomaticFailover; failover != nil && failover.Enabled {
+		if len(names) == 0 {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one declared standby")
+		}
+		if len(names) > 0 && desiredStandbys == 0 {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one desired standby")
+		}
+		if !desiredStandbyWithRouteSelector {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires at least one desired standby with routeSelector")
+		}
+		fencingAuthority := failover.fencingAuthorityOrDefault()
+		if fencingAuthority == HAFencingAuthorityNone {
+			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must not be None when automatic failover is enabled")
+		} else if fencingAuthority != HAFencingAuthorityKubernetesLease {
+			errors = append(errors, "spec.highAvailability.automaticFailover.fencingAuthority must be KubernetesLease for operator-managed automatic failover")
+		}
+		if ha.Admin == nil || !ha.Admin.ExecutePlannedActions {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.admin.executePlannedActions=true")
+		}
+		for i, standby := range ha.Standbys {
+			if standbyDesiredBySpec(standby) && strings.TrimSpace(standby.AdminURL) == "" {
+				errors = append(errors, fmt.Sprintf("spec.highAvailability.standbys[%d].adminURL is required when automaticFailover is enabled", i))
+			}
+		}
+		if ha.Identity == nil {
+			errors = append(errors, "spec.highAvailability.automaticFailover requires spec.highAvailability.identity")
+		}
+		if failover.requireRemoteApplyOrDefault() && ha.SyncPolicy != nil && ha.SyncPolicy.modeOrDefault() == HADurabilityModeRemoteWrite {
+			errors = append(errors, "spec.highAvailability.automaticFailover.requireRemoteApply requires syncPolicy.mode RemoteApply or Async")
+		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("high availability validation failed:\n  - %s", strings.Join(errors, "\n  - "))
+	}
+	return nil
+}
+
+func validateHAAdminURL(raw string, fieldPath string) []string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		if raw != "" {
+			return []string{fmt.Sprintf("%s must not be whitespace", fieldPath)}
+		}
+		return nil
+	}
+	if raw != trimmed {
+		return []string{fmt.Sprintf("%s must not have leading or trailing whitespace", fieldPath)}
+	}
+	if containsASCIIWhitespace(raw) {
+		return []string{fmt.Sprintf("%s must not contain whitespace", fieldPath)}
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return []string{fmt.Sprintf("%s must be an absolute http or https URL", fieldPath)}
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return []string{fmt.Sprintf("%s must use http or https", fieldPath)}
+	}
+	return nil
+}
+
+func containsASCIIWhitespace(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+			return true
+		}
+	}
+	return false
+}
+
+func validateHARuntime(ha *HighAvailabilitySpec) []string {
+	if ha == nil || ha.Runtime == nil {
+		return nil
+	}
+	runtime := ha.Runtime
+	var errors []string
+	nodeID := strings.TrimSpace(runtime.NodeID)
+	currentPrimaryID := ""
+	if ha.Identity != nil {
+		currentPrimaryID = strings.TrimSpace(ha.Identity.CurrentPrimaryID)
+	}
+	switch runtime.Role {
+	case HARuntimeRolePrimary:
+		if nodeID != "" && currentPrimaryID != "" && nodeID != currentPrimaryID {
+			errors = append(errors, "spec.highAvailability.runtime.nodeID must match spec.highAvailability.identity.currentPrimaryID when runtime.role is Primary")
+		}
+		if runtime.Standby != nil {
+			errors = append(errors, "spec.highAvailability.runtime.standby may only be set when runtime.role is Standby")
+		}
+		if primary := runtime.Primary; primary != nil {
+			errors = append(errors, validateHAOptionalPath(primary.LogPath, "spec.highAvailability.runtime.primary.logPath")...)
+			errors = append(errors, validateHAOptionalPath(primary.SlotsPath, "spec.highAvailability.runtime.primary.slotsPath")...)
+		}
+	case HARuntimeRoleStandby:
+		if nodeID != "" && currentPrimaryID != "" && nodeID == currentPrimaryID {
+			errors = append(errors, "spec.highAvailability.runtime.nodeID must not match spec.highAvailability.identity.currentPrimaryID when runtime.role is Standby")
+		}
+		if runtime.Primary != nil {
+			errors = append(errors, "spec.highAvailability.runtime.primary may only be set when runtime.role is Primary")
+		}
+		if standby := runtime.Standby; standby != nil {
+			errors = append(errors, validateHAOptionalPath(standby.LogPath, "spec.highAvailability.runtime.standby.logPath")...)
+			errors = append(errors, validateHAOptionalPath(standby.ProgressPath, "spec.highAvailability.runtime.standby.progressPath")...)
+			errors = append(errors, validateHAAdminURL(standby.UpstreamURL, "spec.highAvailability.runtime.standby.upstreamURL")...)
+			slotName := strings.TrimSpace(standby.SlotName)
+			upstreamURL := strings.TrimSpace(standby.UpstreamURL)
+			if slotName == "" && standby.SlotName != "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not be whitespace")
+			} else if standby.SlotName != "" && standby.SlotName != slotName {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must not have leading or trailing whitespace")
+			} else if standby.SlotName != "" && !validHAIdentifier(slotName) {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName must be a valid HA identifier")
+			}
+			if upstreamURL != "" && slotName == "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.slotName is required when upstreamURL is set")
+			}
+			if slotName != "" && upstreamURL == "" {
+				errors = append(errors, "spec.highAvailability.runtime.standby.upstreamURL is required when slotName is set")
+			}
+		}
+	default:
+		errors = append(errors, "spec.highAvailability.runtime.role must be Primary or Standby")
+	}
+	if nodeID == "" {
+		errors = append(errors, "spec.highAvailability.runtime.nodeID is required")
+	} else if runtime.NodeID != nodeID {
+		errors = append(errors, "spec.highAvailability.runtime.nodeID must not have leading or trailing whitespace")
+	} else if !validHAIdentifier(nodeID) {
+		errors = append(errors, "spec.highAvailability.runtime.nodeID must be a valid HA identifier")
+	}
+	errors = append(errors, validateHAOptionalPath(runtime.FencePath, "spec.highAvailability.runtime.fencePath")...)
+	errors = append(errors, validateHAOptionalPath(runtime.FormerPrimaryLogPath, "spec.highAvailability.runtime.formerPrimaryLogPath")...)
+	if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" && runtime.AdminTokenEnvVar != "" {
+		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must not be whitespace")
+	}
+	if envVar := runtime.AdminTokenEnvVar; envVar != "" && !envVarNamePattern.MatchString(envVar) {
+		errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar must be a valid environment variable name")
+	}
+	if ref := runtime.AdminTokenSecretRef; ref != nil {
+		if strings.TrimSpace(runtime.AdminTokenEnvVar) == "" {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenEnvVar is required when adminTokenSecretRef is set")
+		}
+		refName := strings.TrimSpace(ref.Name)
+		refKey := strings.TrimSpace(ref.Key)
+		if refName == "" {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.name is required")
+		} else if ref.Name != refName {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.name must not have leading or trailing whitespace")
+		} else if nameErrs := utilvalidation.IsDNS1123Subdomain(refName); len(nameErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.runtime.adminTokenSecretRef.name %q is invalid: %s", refName, strings.Join(nameErrs, "; ")))
+		}
+		if refKey == "" {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.key is required")
+		} else if ref.Key != refKey {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.key must not have leading or trailing whitespace")
+		} else if keyErrs := utilvalidation.IsConfigMapKey(refKey); len(keyErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("spec.highAvailability.runtime.adminTokenSecretRef.key %q is invalid: %s", refKey, strings.Join(keyErrs, "; ")))
+		}
+		if ref.Optional != nil && *ref.Optional {
+			errors = append(errors, "spec.highAvailability.runtime.adminTokenSecretRef.optional must be false")
+		}
+	}
+	if ha.Identity == nil {
+		errors = append(errors, "spec.highAvailability.runtime requires spec.highAvailability.identity")
+	}
+	return errors
+}
+
+func validateHAOptionalTrimmedString(value string, fieldPath string) []string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		if value == "" {
+			return nil
+		}
+		return []string{fmt.Sprintf("%s must not be whitespace", fieldPath)}
+	}
+	if value != trimmed {
+		return []string{fmt.Sprintf("%s must not have leading or trailing whitespace", fieldPath)}
+	}
+	return nil
+}
+
+func validateHAOptionalPath(value string, fieldPath string) []string {
+	if errors := validateHAOptionalTrimmedString(value, fieldPath); len(errors) > 0 || strings.TrimSpace(value) == "" {
+		return errors
+	}
+	if !filepath.IsAbs(value) {
+		return []string{fmt.Sprintf("%s must be an absolute normalized path", fieldPath)}
+	}
+	if filepath.Clean(value) != value {
+		return []string{fmt.Sprintf("%s must be an absolute normalized path", fieldPath)}
+	}
+	return nil
+}
+
+func validHAIdentifier(value string) bool {
+	return haIdentifierPattern.MatchString(value)
+}
+
+func (r *AntflyCluster) validateHARuntimeAdminTokenSource(ha *HighAvailabilitySpec) []string {
+	if ha == nil || ha.Runtime == nil || strings.TrimSpace(ha.Runtime.AdminTokenEnvVar) == "" {
+		return nil
+	}
+	if ha.Runtime.AdminTokenSecretRef != nil {
+		return nil
+	}
+	if r.effectiveMode() == ClusterModeSwarm && r.Spec.Swarm != nil && len(r.Spec.Swarm.EnvFrom) > 0 {
+		return nil
+	}
+	return []string{"spec.highAvailability.runtime.adminTokenEnvVar requires spec.highAvailability.runtime.adminTokenSecretRef or spec.swarm.envFrom"}
+}
+
+func validateHARouteSelector(selector map[string]string, fieldPath string) []string {
+	if len(selector) == 0 {
+		return nil
+	}
+	var errors []string
+	for key, value := range selector {
+		if keyErrs := utilvalidation.IsQualifiedName(key); len(keyErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s key %q is invalid: %s", fieldPath, key, strings.Join(keyErrs, "; ")))
+		}
+		if valueErrs := utilvalidation.IsValidLabelValue(value); len(valueErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s[%q] value %q is invalid: %s", fieldPath, key, value, strings.Join(valueErrs, "; ")))
+		}
+	}
+	return errors
+}
+
+func validateHAAdminJobPodSpec(admin *HAAdminSpec) []string {
+	var errors []string
+	for i, source := range admin.EnvFrom {
+		if err := validateEnvFromSource(source, fmt.Sprintf("spec.highAvailability.admin.envFrom[%d]", i)); err != nil {
+			errors = append(errors, err.Error())
+		}
+	}
+	volumes := map[string]struct{}{}
+	for i, volume := range admin.Volumes {
+		path := fmt.Sprintf("spec.highAvailability.admin.volumes[%d]", i)
+		name := strings.TrimSpace(volume.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("%s.name is required", path))
+			continue
+		}
+		if nameErrs := utilvalidation.IsDNS1123Label(name); len(nameErrs) > 0 {
+			errors = append(errors, fmt.Sprintf("%s.name %q is invalid: %s", path, name, strings.Join(nameErrs, "; ")))
+			continue
+		}
+		if _, exists := volumes[name]; exists {
+			errors = append(errors, fmt.Sprintf("%s.name %q is duplicated", path, name))
+		}
+		volumes[name] = struct{}{}
+	}
+	for i, mount := range admin.VolumeMounts {
+		path := fmt.Sprintf("spec.highAvailability.admin.volumeMounts[%d]", i)
+		name := strings.TrimSpace(mount.Name)
+		if name == "" {
+			errors = append(errors, fmt.Sprintf("%s.name is required", path))
+			continue
+		}
+		if _, ok := volumes[name]; !ok {
+			errors = append(errors, fmt.Sprintf("%s.name %q must reference spec.highAvailability.admin.volumes", path, name))
+		}
+		if strings.TrimSpace(mount.MountPath) == "" {
+			errors = append(errors, fmt.Sprintf("%s.mountPath is required", path))
+		}
+	}
+	return errors
+}
+
+func standbyDesiredBySpec(standby HAStandbySpec) bool {
+	return standby.Desired == nil || *standby.Desired
+}
+
+func highAvailabilityHasManagedConfig(ha *HighAvailabilitySpec) bool {
+	if ha == nil {
+		return false
+	}
+	return len(ha.Standbys) > 0 ||
+		ha.Identity != nil ||
+		ha.Admin != nil ||
+		ha.Runtime != nil ||
+		ha.SyncPolicy != nil ||
+		ha.Retention != nil ||
+		ha.AutomaticFailover != nil
+}
+
+func (s *HighAvailabilitySpec) modeOrDefault() HAMode {
+	if s == nil || s.Mode == "" {
+		return HAModeDisabled
+	}
+	return s.Mode
+}
+
+func (p *HASyncPolicy) modeOrDefault() HADurabilityMode {
+	if p == nil || p.Mode == "" {
+		return HADurabilityModeAsync
+	}
+	return p.Mode
+}
+
+func (p *HASyncPolicy) selectionOrDefault() HAStandbySelection {
+	if p == nil || p.Selection == "" {
+		return HAStandbySelectionAny
+	}
+	return p.Selection
+}
+
+func (p *HASyncPolicy) requiredOrDefault() int32 {
+	if p == nil || p.Required == 0 {
+		return 1
+	}
+	return p.Required
+}
+
+func (p *HAAutomaticFailoverPolicy) fencingAuthorityOrDefault() HAFencingAuthority {
+	if p == nil || p.FencingAuthority == "" {
+		return HAFencingAuthorityNone
+	}
+	return p.FencingAuthority
+}
+
+func (p *HAAutomaticFailoverPolicy) requireRemoteApplyOrDefault() bool {
+	if p == nil || p.RequireRemoteApply == nil {
+		return true
+	}
+	return *p.RequireRemoteApply
 }
 
 // validateResourceQuantities validates that resource quantity strings are parseable.

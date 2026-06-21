@@ -3,6 +3,7 @@ from enum import Enum
 
 class ExtensionObjectKind(str, Enum):
     A2A_AGENT = "a2a_agent"
+    AGENT = "agent"
     API_ENDPOINT = "api_endpoint"
     AUTH_POLICY = "auth_policy"
     CONNECTOR = "connector"
@@ -18,6 +19,7 @@ class ExtensionObjectKind(str, Enum):
     PROVIDER_CONFIG = "provider_config"
     QUERY_FUNCTION = "query_function"
     RESOLVER = "resolver"
+    SKILL = "skill"
     TABLE_SCHEMA = "table_schema"
     TEXT_ANALYZER = "text_analyzer"
     TEXT_TOKENIZER = "text_tokenizer"

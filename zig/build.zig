@@ -412,6 +412,8 @@ const AntflyRootImports = struct {
     generating_api_openapi: *std.Build.Module,
     eval_openapi: *std.Build.Module,
     query_openapi: *std.Build.Module,
+    admin_openapi: *std.Build.Module,
+    internal_openapi: *std.Build.Module,
     metadata_openapi: *std.Build.Module,
     usermgr_openapi: *std.Build.Module,
     logging_openapi: *std.Build.Module,
@@ -475,6 +477,8 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_generating_api_openapi", .field = "generating_api_openapi" },
         .{ .name = "antfly_eval_openapi", .field = "eval_openapi" },
         .{ .name = "antfly_query_openapi", .field = "query_openapi" },
+        .{ .name = "antfly_admin_openapi", .field = "admin_openapi" },
+        .{ .name = "antfly_internal_openapi", .field = "internal_openapi" },
         .{ .name = "antfly_metadata_openapi", .field = "metadata_openapi" },
         .{ .name = "antfly_usermgr_openapi", .field = "usermgr_openapi" },
         .{ .name = "antfly_logging_openapi", .field = "logging_openapi" },
@@ -973,6 +977,8 @@ fn addOpenApiRegenStep(
             .{ "../shared/generating.yaml", "antfly_generating_openapi" },
         }),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}),
+        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
         addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
             .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
@@ -1152,6 +1158,8 @@ pub fn build(b: *std.Build) void {
     const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
     const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
     const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
+    const admin_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", httpx_mod);
+    const internal_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", httpx_mod);
     const usermgr_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", httpx_mod);
     const metadata_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", httpx_mod);
     const logging_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi");
@@ -1594,6 +1602,8 @@ pub fn build(b: *std.Build) void {
         .generating_api_openapi = generating_api_openapi_mod,
         .eval_openapi = eval_openapi_mod,
         .query_openapi = query_openapi_mod,
+        .admin_openapi = admin_openapi_mod,
+        .internal_openapi = internal_openapi_mod,
         .metadata_openapi = metadata_openapi_mod,
         .usermgr_openapi = usermgr_openapi_mod,
         .logging_openapi = logging_openapi_mod,
@@ -2625,6 +2635,9 @@ pub fn build(b: *std.Build) void {
         "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
         "provisioned table write cache retires stale db when index metadata changes",
+        "retrieval agent treats aggregations as first-class tool capability",
+        "retrieval agent requires filter and aggregate tools for filtered aggregations",
+        "retrieval agent ignores empty map-valued tool fields for policy and strategy",
     };
     const lib_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -2742,6 +2755,42 @@ pub fn build(b: *std.Build) void {
     const run_lib_lsm_backend_chaos_tests = b.addRunArtifact(lib_lsm_backend_chaos_tests);
     const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
     lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
+    const lib_ha_chaos_default_filters = [_][]const u8{
+        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
+        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
+        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
+        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
+        "storage.ha chaos crash after apply before ack reports durable progress on resume",
+        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
+        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
+        "storage.ha chaos network partition requires fence before standby promotion",
+    };
+    const lib_ha_chaos_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
+    });
+    const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
+    const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
+    lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
+    const lib_ha_compat_default_filters = [_][]const u8{
+        "storage.ha compat decodes v1 replication record fixture",
+        "storage.ha compat keeps v1 replication record encoding stable",
+        "storage.ha compat decodes v1 timeline switch record fixture",
+        "storage.ha compat keeps v1 timeline switch encoding stable",
+        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
+        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
+        "storage.ha compat decodes v1 backup manifest fixture",
+        "storage.ha compat keeps v1 backup manifest encoding stable",
+        "storage.ha compat keeps v1 backup manifest file kind tags stable",
+        "storage.ha compat keeps v1 record kind tags stable",
+    };
+    const lib_ha_compat_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
+    });
+    const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
+    const lib_ha_compat_test_step = b.step("ha-compat-test", "Run HA replication format compatibility tests");
+    lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
@@ -2803,6 +2852,17 @@ pub fn build(b: *std.Build) void {
         "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
+        "data server wires configured HA executors into API server",
+        "data server mirrors managed primary writes into HA replication log",
+        "data server fail-closed sync policy rejects primary writes before local commit",
+        "data server block sync policy waits for standby acknowledgement before commit returns",
+        "data server propagates standby HA write gate into provisioned write sources",
+        "storage.ha data server rejects writes and owner jobs after primary promotion fence",
+        "data server applies routed HA replication records through standby write gate",
+        "data server pulls and applies HA standby replication through internal HTTP client",
+        "data server resumes HA standby replication from durable progress after restart",
+        "data runtime records HA standby replication round failures",
+        "data runtime records HA standby apply failures without stopping run round",
     };
     const lib_data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
@@ -3217,6 +3277,8 @@ pub fn build(b: *std.Build) void {
 
     const public_api_parity_default_filters = [_][]const u8{
         "public openapi contract module is generated and wired",
+        "admin openapi contract module is generated and wired",
+        "internal openapi contract module is generated and wired",
         "metadata openapi module generates extractor surface for routed endpoints",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "client openapi module resolves shared refs through owner modules",
@@ -3307,6 +3369,8 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
+            "api http server dispatches HA admin and internal executors",
+            "api http server protects HA admin routes while exempting HA internal routes",
             "api http server forbids non-admin secret access when auth is enabled",
             "api http server query builder requires table read permission when auth is enabled",
             "api http server restricts runtime schema debug to admins when auth is enabled",
@@ -3562,6 +3626,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "provisioned read cache invalidates repeated ownership moves with pinned leases",
             "parseRemoteSearchResult preserves fused index scores",
+            "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -3572,8 +3637,12 @@ pub fn build(b: *std.Build) void {
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
+            "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
+            "public table query handler maps HA read gate errors",
             "public table query view handler maps doc identity unavailable errors",
+            "public table query view handler maps HA read gate errors",
+            "public document artifact manifest handlers map HA read gate errors",
             "public document artifact manifest handler returns summary and raw state",
             "public document artifact reprocess handler returns accepted",
         },
@@ -3611,6 +3680,10 @@ pub fn build(b: *std.Build) void {
     const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
     const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
     const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
+    const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
+    api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
+    const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
+    api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
     const lib_docid_lifecycle_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{
@@ -3783,6 +3856,18 @@ pub fn build(b: *std.Build) void {
     const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
     lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
 
+    const ha_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"storage.ha"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_ha_tests = b.addRunArtifact(ha_tests);
+    const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
+    ha_test_step.dependOn(&run_ha_tests.step);
+
     const lib_storage_progress_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = selectTestFilters(b, &lib_storage_default_filters),
@@ -3843,6 +3928,7 @@ pub fn build(b: *std.Build) void {
     var chaos_progress_tail: ?*std.Build.Step = null;
     chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
+    chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
@@ -4008,6 +4094,12 @@ pub fn build(b: *std.Build) void {
             "parse cli accepts secret store path",
             "parse cli accepts ARD identity flags",
             "parse cli accepts canonical host port and models dir flags",
+            "parse cli accepts HA primary runtime flags",
+            "parse cli accepts HA primary sync policy flags",
+            "parse cli accepts HA standby runtime flags",
+            "swarm HA standby replication flags require upstream and slot",
+            "swarm HA string classifier distinguishes missing padded and valid values",
+            "swarm HA runtime rejects ambiguous role flags",
             "antfly config uses cli override before common config",
             "swarm public api caps keep alive request reuse",
             "swarm public api body limit matches common http listener",
@@ -4068,6 +4160,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
     unit_test_step.dependOn(lib_swarm_runtime_test_step);
+    unit_test_step.dependOn(ha_test_step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 
@@ -5209,6 +5302,7 @@ pub fn build(b: *std.Build) void {
     run_compat.addArg("compat/cases");
     const compat_step = b.step("compat", "Run the shared compatibility corpus");
     compat_step.dependOn(&run_compat.step);
+    compat_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const search_benchmark_index_mod = b.createModule(.{
         .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),

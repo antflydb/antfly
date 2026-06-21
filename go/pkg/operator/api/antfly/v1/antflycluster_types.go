@@ -80,6 +80,27 @@ const (
 	// TypeInferenceReady indicates whether inference is ready when managed in swarm mode.
 	TypeInferenceReady = "InferenceReady"
 
+	// TypeHAAvailable indicates whether hot-standby HA has an available standby.
+	TypeHAAvailable = "HAAvailable"
+
+	// TypeHADegraded indicates whether the configured HA durability policy is degraded.
+	TypeHADegraded = "HADegraded"
+
+	// TypeHAUnhealthy indicates whether one or more desired HA standbys are unhealthy.
+	TypeHAUnhealthy = "HAUnhealthy"
+
+	// TypeHALagging indicates whether one or more desired HA standbys are lagging.
+	TypeHALagging = "HALagging"
+
+	// TypeHARetentionPressure indicates whether HA slots are forcing WAL retention beyond policy.
+	TypeHARetentionPressure = "HARetentionPressure"
+
+	// TypeHAReseedRequired indicates whether one or more HA standbys require reseeding.
+	TypeHAReseedRequired = "HAReseedRequired"
+
+	// TypeHAAutomaticFailoverReady indicates whether fenced automatic promotion is allowed.
+	TypeHAAutomaticFailoverReady = "HAAutomaticFailoverReady"
+
 	// TypeAvailable indicates whether the cluster is serving.
 	TypeAvailable = "Available"
 
@@ -179,6 +200,99 @@ const (
 	// ReasonAvailable indicates the cluster is available.
 	ReasonAvailable = "Available"
 
+	// ReasonHADisabled indicates hot-standby HA is disabled.
+	ReasonHADisabled = "HADisabled"
+
+	// ReasonHAStandbyAvailable indicates at least one standby is caught up enough to serve.
+	ReasonHAStandbyAvailable = "HAStandbyAvailable"
+
+	// ReasonHANoHealthyStandby indicates no desired standby is currently healthy.
+	ReasonHANoHealthyStandby = "HANoHealthyStandby"
+
+	// ReasonHASyncPolicyUnsatisfied indicates synchronous HA durability is not satisfied.
+	ReasonHASyncPolicyUnsatisfied = "HASyncPolicyUnsatisfied"
+
+	// ReasonHASyncPolicySatisfied indicates synchronous HA durability is satisfied or not configured.
+	ReasonHASyncPolicySatisfied = "HASyncPolicySatisfied"
+
+	// ReasonHAPrimaryAdminUnavailable indicates the primary HA admin endpoint could not be observed.
+	ReasonHAPrimaryAdminUnavailable = "HAPrimaryAdminUnavailable"
+
+	// ReasonHAAdminStatusUnavailable indicates one or more HA admin status endpoints could not be observed.
+	ReasonHAAdminStatusUnavailable = "HAAdminStatusUnavailable"
+
+	// ReasonHAAdminJobFailed indicates an HA admin execution failed.
+	ReasonHAAdminJobFailed = "HAAdminJobFailed"
+
+	// ReasonHAAdminUnauthorized indicates an HA admin execution was rejected by authentication.
+	ReasonHAAdminUnauthorized = "HAAdminUnauthorized"
+
+	// ReasonHAAdminActionRetrying indicates an HA admin action hit a retryable error and will be retried.
+	ReasonHAAdminActionRetrying = "HAAdminActionRetrying"
+
+	// ReasonHAStandbyUnhealthy indicates at least one desired standby is unhealthy.
+	ReasonHAStandbyUnhealthy = "HAStandbyUnhealthy"
+
+	// ReasonHAStandbysHealthy indicates desired standbys are healthy.
+	ReasonHAStandbysHealthy = "HAStandbysHealthy"
+
+	// ReasonHAStandbyLagging indicates at least one desired standby has replication lag.
+	ReasonHAStandbyLagging = "HAStandbyLagging"
+
+	// ReasonHANoLaggingStandbys indicates no desired standby has replication lag.
+	ReasonHANoLaggingStandbys = "HANoLaggingStandbys"
+
+	// ReasonHARetentionCapExceeded indicates HA WAL retention exceeds policy.
+	ReasonHARetentionCapExceeded = "HARetentionCapExceeded"
+
+	// ReasonHARetentionWithinPolicy indicates HA WAL retention is within policy.
+	ReasonHARetentionWithinPolicy = "HARetentionWithinPolicy"
+
+	// ReasonHAStandbyRequiresReseed indicates at least one desired standby requires reseed.
+	ReasonHAStandbyRequiresReseed = "HAStandbyRequiresReseed"
+
+	// ReasonHANoReseedRequired indicates no desired standby requires reseed.
+	ReasonHANoReseedRequired = "HANoReseedRequired"
+
+	// ReasonHAFencedPromotionReady indicates automatic failover can perform a fenced promotion.
+	ReasonHAFencedPromotionReady = "HAFencedPromotionReady"
+
+	// ReasonHAAutomaticFailoverDisabled indicates automatic failover is disabled.
+	ReasonHAAutomaticFailoverDisabled = "HAAutomaticFailoverDisabled"
+
+	// ReasonHAAutomaticFailoverExecutionDisabled indicates automatic failover cannot execute planned admin actions.
+	ReasonHAAutomaticFailoverExecutionDisabled = "HAAutomaticFailoverExecutionDisabled"
+
+	// ReasonHAFencingAuthorityMissing indicates automatic failover lacks fencing.
+	ReasonHAFencingAuthorityMissing = "HAFencingAuthorityMissing"
+
+	// ReasonHAFencingAuthorityUnsupported indicates automatic failover is configured with a fencing authority this operator cannot manage.
+	ReasonHAFencingAuthorityUnsupported = "HAFencingAuthorityUnsupported"
+
+	// ReasonHAFencingNotReady indicates automatic failover lacks an observed ready fence.
+	ReasonHAFencingNotReady = "HAFencingNotReady"
+
+	// ReasonHAPrimaryStillReachable indicates automatic failover is blocked while the primary admin endpoint is reachable.
+	ReasonHAPrimaryStillReachable = "HAPrimaryStillReachable"
+
+	// ReasonHAPromotionBoundaryMissing indicates automatic failover lacks an observed primary LSN boundary.
+	ReasonHAPromotionBoundaryMissing = "HAPromotionBoundaryMissing"
+
+	// ReasonHAPromotionAlreadyRecorded indicates automatic failover already recorded a promotion for this identity.
+	ReasonHAPromotionAlreadyRecorded = "HAPromotionAlreadyRecorded"
+
+	// ReasonHAPromotionReceiptMissing indicates a completed promotion lacks the receipt needed for fenced rejoin.
+	ReasonHAPromotionReceiptMissing = "HAPromotionReceiptMissing"
+
+	// ReasonHAAdminResultMissing indicates a completed HA admin action lacks typed result evidence.
+	ReasonHAAdminResultMissing = "HAAdminResultMissing"
+
+	// ReasonHAAdminURLMissing indicates an executable HA admin action lacks a target admin endpoint.
+	ReasonHAAdminURLMissing = "HAAdminURLMissing"
+
+	// ReasonHAPrimaryRouteSelectorMissing indicates the promoted standby lacks a public-api route selector.
+	ReasonHAPrimaryRouteSelectorMissing = "HAPrimaryRouteSelectorMissing"
+
 	// DataScaleDownSourceManual indicates the scale-down target came from spec.dataNodes.replicas.
 	DataScaleDownSourceManual = "Manual"
 
@@ -223,6 +337,11 @@ type AntflyClusterSpec struct {
 	// pools, or referenced as platform-managed shared pools.
 	// +optional
 	Inference *AntflyInferenceSpec `json:"inference,omitempty"`
+
+	// HighAvailability configures Postgres-style hot-standby HA for the Zig runtime.
+	// This mode is separate from Raft-backed distributed write ownership.
+	// +optional
+	HighAvailability *HighAvailabilitySpec `json:"highAvailability,omitempty"`
 
 	// ProductTier records the CloudAF/product tier intent that was expanded
 	// into the explicit operator fields below. The operator does not resolve
@@ -392,6 +511,365 @@ type InferencePoolReference struct {
 	// higher-level platform wiring may resolve the URL from the referenced pool.
 	// +optional
 	APIURL string `json:"apiURL,omitempty"`
+}
+
+// HAMode selects the HA strategy managed by the operator.
+type HAMode string
+
+const (
+	// HAModeDisabled disables hot-standby HA management.
+	HAModeDisabled HAMode = "Disabled"
+
+	// HAModeHotStandby enables single-primary hot standby WAL replication.
+	HAModeHotStandby HAMode = "HotStandby"
+)
+
+// HADurabilityMode selects when a primary write may be acknowledged.
+type HADurabilityMode string
+
+const (
+	HADurabilityModeAsync       HADurabilityMode = "Async"
+	HADurabilityModeRemoteWrite HADurabilityMode = "RemoteWrite"
+	HADurabilityModeRemoteApply HADurabilityMode = "RemoteApply"
+)
+
+// HAStandbySelection selects which named standbys satisfy synchronous commit.
+type HAStandbySelection string
+
+const (
+	HAStandbySelectionAny   HAStandbySelection = "Any"
+	HAStandbySelectionFirst HAStandbySelection = "First"
+	HAStandbySelectionAll   HAStandbySelection = "All"
+)
+
+// HAFailurePolicy selects what happens when synchronous durability cannot be met.
+type HAFailurePolicy string
+
+const (
+	HAFailurePolicyBlock          HAFailurePolicy = "Block"
+	HAFailurePolicyFailClosed     HAFailurePolicy = "FailClosed"
+	HAFailurePolicyDegradeToAsync HAFailurePolicy = "DegradeToAsync"
+)
+
+// HAFencingAuthority selects the authority used before automatic promotion.
+type HAFencingAuthority string
+
+const (
+	HAFencingAuthorityNone            HAFencingAuthority = "None"
+	HAFencingAuthorityKubernetesLease HAFencingAuthority = "KubernetesLease"
+	HAFencingAuthorityStorageFence    HAFencingAuthority = "StorageFence"
+	HAFencingAuthorityMetadataRaft    HAFencingAuthority = "MetadataRaft"
+	HAFencingAuthorityExternal        HAFencingAuthority = "External"
+)
+
+// HARuntimeRole selects how this Antfly process opens the HA runtime.
+type HARuntimeRole string
+
+const (
+	// HARuntimeRolePrimary opens the local process as the HA primary.
+	HARuntimeRolePrimary HARuntimeRole = "Primary"
+
+	// HARuntimeRoleStandby opens the local process as an HA standby.
+	HARuntimeRoleStandby HARuntimeRole = "Standby"
+)
+
+// HighAvailabilitySpec configures hot-standby HA for an AntflyCluster.
+type HighAvailabilitySpec struct {
+	// Mode selects whether hot standby is managed.
+	// +kubebuilder:validation:Enum=Disabled;HotStandby
+	// +kubebuilder:default=Disabled
+	// +optional
+	Mode HAMode `json:"mode,omitempty"`
+
+	// Standbys declares desired standby replicas and replication slots.
+	// +optional
+	Standbys []HAStandbySpec `json:"standbys,omitempty"`
+
+	// Identity identifies the replicated HA unit for admin/fencing commands.
+	// +optional
+	Identity *HAReplicationIdentitySpec `json:"identity,omitempty"`
+
+	// Admin configures HA admin endpoints and optional operator execution.
+	// +optional
+	Admin *HAAdminSpec `json:"admin,omitempty"`
+
+	// Runtime configures the local Zig antfly swarm HA runtime role and durable WAL paths.
+	// Supported only when spec.mode=Swarm; split metadata/data topology HA process wiring is not yet modeled here.
+	// +optional
+	Runtime *HARuntimeSpec `json:"runtime,omitempty"`
+
+	// SyncPolicy configures async, remote-write, or remote-apply durability.
+	// +optional
+	SyncPolicy *HASyncPolicy `json:"syncPolicy,omitempty"`
+
+	// Retention caps WAL retention pressure from replication slots.
+	// +optional
+	Retention *HARetentionPolicy `json:"retention,omitempty"`
+
+	// AutomaticFailover configures fenced automatic promotion.
+	// +optional
+	AutomaticFailover *HAAutomaticFailoverPolicy `json:"automaticFailover,omitempty"`
+}
+
+// HAStandbySpec declares one desired hot standby.
+type HAStandbySpec struct {
+	// Name is the logical standby and default replication slot name.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// SlotName overrides the replication slot name. Defaults to name.
+	// +optional
+	SlotName string `json:"slotName,omitempty"`
+
+	// Desired controls whether the operator should keep this standby attached.
+	// +kubebuilder:default=true
+	// +optional
+	Desired *bool `json:"desired,omitempty"`
+
+	// DropSlotOnRemoval lets the operator drop this standby's replication slot after desired is set false.
+	// This releases WAL retention and is destructive for the standby; keep false to pause the slot instead.
+	// +optional
+	DropSlotOnRemoval bool `json:"dropSlotOnRemoval,omitempty"`
+
+	// InitialLSN optionally pins slot creation to an existing primary LSN.
+	// +optional
+	InitialLSN *uint64 `json:"initialLSN,omitempty"`
+
+	// AdminURL is the standby HA admin endpoint used for typed status and promotion actions.
+	// +optional
+	AdminURL string `json:"adminURL,omitempty"`
+
+	// SeedManifestPath is the base-backup manifest path visible to CLI-backed HA admin Jobs.
+	// When set, the operator can run seed finish on the primary and seed bootstrap on this standby.
+	// +optional
+	SeedManifestPath string `json:"seedManifestPath,omitempty"`
+
+	// SeedContentRoot is the copied base-backup content root visible to the standby CLI-backed HA admin Job.
+	// Defaults to the manifest parent directory when omitted.
+	// +optional
+	SeedContentRoot string `json:"seedContentRoot,omitempty"`
+
+	// RouteSelector is the public-api Service selector to use when this standby is promoted.
+	// +optional
+	RouteSelector map[string]string `json:"routeSelector,omitempty"`
+}
+
+// HARuntimeSpec configures how the operator starts this Antfly process in the HA runtime.
+// It is only supported when spec.mode=Swarm because those flags are currently wired through the Swarm StatefulSet.
+type HARuntimeSpec struct {
+	// Role selects whether this process opens primary or standby HA runtime state.
+	// +kubebuilder:validation:Enum=Primary;Standby
+	Role HARuntimeRole `json:"role"`
+
+	// NodeID is the logical HA node id used in typed admin receipts and fencing.
+	// +kubebuilder:validation:MinLength=1
+	NodeID string `json:"nodeID"`
+
+	// FencePath is the durable promotion fence WAL path shared by HA admin fence and promotion operations.
+	// Defaults to /antflydb/ha/fence.wal.
+	// +optional
+	FencePath string `json:"fencePath,omitempty"`
+
+	// FormerPrimaryLogPath is the durable HA replication log used by former-primary rewind admin workflows.
+	// Set this on nodes that may need to rejoin after failover; for a primary this is usually the same path
+	// as primary.logPath, and the Swarm runtime wiring defaults it to primary.logPath when omitted.
+	// +optional
+	FormerPrimaryLogPath string `json:"formerPrimaryLogPath,omitempty"`
+
+	// AdminTokenEnvVar is the Antfly process environment variable containing the bearer token required by /admin/v1/ha.
+	// When set, the operator passes --ha-admin-token-env and the runtime rejects typed HA admin requests without a matching Authorization header.
+	// Populate it with adminTokenSecretRef or spec.swarm.envFrom.
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z_][A-Za-z0-9_]*$`
+	// +optional
+	AdminTokenEnvVar string `json:"adminTokenEnvVar,omitempty"`
+
+	// AdminTokenSecretRef injects AdminTokenEnvVar from a required Secret key into the Antfly runtime container.
+	// Use this when the token is not already provided by spec.swarm.envFrom. optional must not be true.
+	// +optional
+	AdminTokenSecretRef *corev1.SecretKeySelector `json:"adminTokenSecretRef,omitempty"`
+
+	// Primary configures primary-side durable HA state. Defaults are under /antflydb/ha.
+	// +optional
+	Primary *HAPrimaryRuntimeSpec `json:"primary,omitempty"`
+
+	// Standby configures standby-side durable HA state and optional continuous pull source.
+	// +optional
+	Standby *HAStandbyRuntimeSpec `json:"standby,omitempty"`
+}
+
+// HAPrimaryRuntimeSpec configures primary-side HA WAL and replication slot state.
+type HAPrimaryRuntimeSpec struct {
+	// LogPath is the durable HA primary replication log path.
+	// Defaults to /antflydb/ha/primary.wal.
+	// +optional
+	LogPath string `json:"logPath,omitempty"`
+
+	// SlotsPath is the durable HA replication slot store path.
+	// Defaults to /antflydb/ha/slots.
+	// +optional
+	SlotsPath string `json:"slotsPath,omitempty"`
+}
+
+// HAStandbyRuntimeSpec configures standby-side HA WAL, progress state, and pull source.
+type HAStandbyRuntimeSpec struct {
+	// LogPath is the durable received-WAL log path.
+	// Defaults to /antflydb/ha/standby.wal.
+	// +optional
+	LogPath string `json:"logPath,omitempty"`
+
+	// ProgressPath is the durable standby apply progress WAL path.
+	// Defaults to /antflydb/ha/standby-progress.wal.
+	// +optional
+	ProgressPath string `json:"progressPath,omitempty"`
+
+	// UpstreamURL is the primary internal replication base URL for continuous pull/apply.
+	// +optional
+	UpstreamURL string `json:"upstreamURL,omitempty"`
+
+	// SlotName is the upstream replication slot used by this standby.
+	// +optional
+	SlotName string `json:"slotName,omitempty"`
+}
+
+// HAAdminSpec configures operator access to HA admin endpoints.
+type HAAdminSpec struct {
+	// PrimaryURL is the primary HA admin endpoint used for typed status, slot, seed, and fence actions.
+	// +optional
+	PrimaryURL string `json:"primaryURL,omitempty"`
+
+	// ExecutePlannedActions lets the operator execute planned HA actions.
+	// The operator prefers typed /admin/v1/ha calls and uses CLI-backed Kubernetes Jobs for pod-local files, shared backup volumes, or break-glass workflows.
+	// +optional
+	ExecutePlannedActions bool `json:"executePlannedActions,omitempty"`
+
+	// TokenEnvVar is the operator process environment variable containing the bearer token for typed /admin/v1/ha calls.
+	// This lets Kubernetes inject the token from a Secret into the operator pod without granting the operator Secret read permissions.
+	// Defaults to ANTFLY_HA_ADMIN_TOKEN when omitted and that environment variable is set.
+	// CLI-backed HA admin Jobs pass --ha-token-env only when this field is explicitly set; inject the same variable into those Jobs with envFrom when authenticated CLI fallback is needed.
+	// +kubebuilder:validation:Pattern=`^$|^[A-Za-z_][A-Za-z0-9_]*$`
+	// +optional
+	TokenEnvVar string `json:"tokenEnvVar,omitempty"`
+
+	// JobBackoffLimit is the CLI-backed HA admin Job retry count before Kubernetes marks it failed.
+	// +optional
+	JobBackoffLimit *int32 `json:"jobBackoffLimit,omitempty"`
+
+	// JobTimeoutSeconds is the CLI-backed HA admin Job active deadline.
+	// +optional
+	JobTimeoutSeconds *int64 `json:"jobTimeoutSeconds,omitempty"`
+
+	// JobTTLSecondsAfterFinished controls how long completed CLI-backed HA admin Jobs are retained.
+	// +optional
+	JobTTLSecondsAfterFinished *int32 `json:"jobTTLSecondsAfterFinished,omitempty"`
+
+	// EnvFrom is applied to CLI-backed HA admin Job containers, commonly for backup object-store credentials.
+	// +optional
+	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
+
+	// Volumes are added to CLI-backed HA admin Job pods, commonly for shared base-backup manifests and contents.
+	// +optional
+	Volumes []corev1.Volume `json:"volumes,omitempty"`
+
+	// VolumeMounts are added to the CLI-backed HA admin Job container.
+	// +optional
+	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+}
+
+// HAReplicationIdentitySpec identifies one replicated HA unit.
+type HAReplicationIdentitySpec struct {
+	// ClusterID is the stable replicated cluster identifier.
+	// +optional
+	ClusterID uint64 `json:"clusterID,omitempty"`
+
+	// ShardID is the replicated shard identifier. Zero means whole-instance or default shard scope.
+	// +optional
+	ShardID uint64 `json:"shardID,omitempty"`
+
+	// TableID is the replicated table identifier. Zero means whole-instance or default table scope.
+	// +optional
+	TableID uint64 `json:"tableID,omitempty"`
+
+	// TimelineID is the current primary timeline.
+	// +optional
+	TimelineID uint64 `json:"timelineID,omitempty"`
+
+	// Epoch is the current primary epoch.
+	// +optional
+	Epoch uint64 `json:"epoch,omitempty"`
+
+	// CurrentPrimaryID is the logical id of the current primary.
+	// +optional
+	CurrentPrimaryID string `json:"currentPrimaryID,omitempty"`
+}
+
+// HASyncPolicy configures synchronous standby durability.
+type HASyncPolicy struct {
+	// Mode selects async, remote-write, or remote-apply acknowledgement.
+	// +kubebuilder:validation:Enum=Async;RemoteWrite;RemoteApply
+	// +kubebuilder:default=Async
+	// +optional
+	Mode HADurabilityMode `json:"mode,omitempty"`
+
+	// Selection chooses how named standbys satisfy the policy.
+	// +kubebuilder:validation:Enum=Any;First;All
+	// +kubebuilder:default=Any
+	// +optional
+	Selection HAStandbySelection `json:"selection,omitempty"`
+
+	// Required is the number of standbys needed for Any/First policies.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Required int32 `json:"required,omitempty"`
+
+	// StandbyNames are the synchronous standby names in priority order.
+	// +optional
+	StandbyNames []string `json:"standbyNames,omitempty"`
+
+	// FailurePolicy controls writes when synchronous durability is unavailable.
+	// +kubebuilder:validation:Enum=Block;FailClosed;DegradeToAsync
+	// +kubebuilder:default=Block
+	// +optional
+	FailurePolicy HAFailurePolicy `json:"failurePolicy,omitempty"`
+}
+
+// HARetentionPolicy caps WAL retained for HA slots.
+type HARetentionPolicy struct {
+	// MaxLagLSN marks standbys for reseed after this many retained LSNs.
+	// Zero disables the cap.
+	// +optional
+	MaxLagLSN uint64 `json:"maxLagLSN,omitempty"`
+
+	// MaxRetainedBytes marks oldest standbys for reseed when retained WAL bytes exceed this cap.
+	// Zero disables the cap.
+	// +optional
+	MaxRetainedBytes uint64 `json:"maxRetainedBytes,omitempty"`
+
+	// MaxRetainedAgeNS marks oldest standbys for reseed when retained WAL timestamp span exceeds this cap.
+	// Zero disables the cap.
+	// +optional
+	MaxRetainedAgeNS uint64 `json:"maxRetainedAgeNS,omitempty"`
+}
+
+// HAAutomaticFailoverPolicy configures automatic standby promotion.
+type HAAutomaticFailoverPolicy struct {
+	// Enabled allows the operator to promote a standby automatically.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// FencingAuthority must be set to a concrete authority before automatic promotion.
+	// +kubebuilder:validation:Enum=None;KubernetesLease;StorageFence;MetadataRaft;External
+	// +kubebuilder:default=None
+	// +optional
+	FencingAuthority HAFencingAuthority `json:"fencingAuthority,omitempty"`
+
+	// RequireRemoteApply requires an applied standby before automatic promotion.
+	// +kubebuilder:default=true
+	// +optional
+	RequireRemoteApply *bool `json:"requireRemoteApply,omitempty"`
+
+	// MaximumLagLSN is the tolerated standby lag for automatic promotion.
+	// +optional
+	MaximumLagLSN uint64 `json:"maximumLagLSN,omitempty"`
 }
 
 // MetadataNodesSpec defines the configuration for metadata nodes
@@ -900,6 +1378,10 @@ type AntflyClusterStatus struct {
 	// +optional
 	StorageAutoGrowStatus *StorageAutoGrowStatus `json:"storageAutoGrowStatus,omitempty"`
 
+	// HAStatus reports hot-standby replication and failover state.
+	// +optional
+	HAStatus *HAStatus `json:"haStatus,omitempty"`
+
 	// ProductTierStatus reports the concrete shape observed for spec.productTier.
 	// +optional
 	ProductTierStatus *ProductTierStatus `json:"productTierStatus,omitempty"`
@@ -1014,6 +1496,638 @@ type StorageAutoGrowStatus struct {
 
 	// LastEvaluationTime records when auto-grow was last evaluated.
 	LastEvaluationTime *metav1.Time `json:"lastEvaluationTime,omitempty"`
+}
+
+// HAStatus reports hot-standby replication and failover state.
+type HAStatus struct {
+	// Mode is the observed HA mode.
+	// +optional
+	Mode HAMode `json:"mode,omitempty"`
+
+	// PrimaryLSN is the current primary replication LSN.
+	// +optional
+	PrimaryLSN uint64 `json:"primaryLSN,omitempty"`
+
+	// PrimaryAdminReachable reports whether the operator most recently reached the primary HA admin endpoint.
+	// Automatic promotion requires this to be false with PrimaryAdminLastError set.
+	// +optional
+	PrimaryAdminReachable bool `json:"primaryAdminReachable,omitempty"`
+
+	// PrimaryAdminLastError reports the latest primary HA admin observation error.
+	// +optional
+	PrimaryAdminLastError string `json:"primaryAdminLastError,omitempty"`
+
+	// PrimaryAdminStatusCode records the latest typed /admin/v1 HA status-observation HTTP status code.
+	// +optional
+	PrimaryAdminStatusCode int `json:"primaryAdminStatusCode,omitempty"`
+
+	// DesiredStandbyCount is the count requested by spec.highAvailability.
+	// +optional
+	DesiredStandbyCount int32 `json:"desiredStandbyCount,omitempty"`
+
+	// HealthyStandbyCount is the count of desired standbys caught up to apply.
+	// +optional
+	HealthyStandbyCount int32 `json:"healthyStandbyCount,omitempty"`
+
+	// UnhealthyStandbyCount is the count of desired standbys missing, inactive, or reporting replication errors.
+	// +optional
+	UnhealthyStandbyCount int32 `json:"unhealthyStandbyCount,omitempty"`
+
+	// LaggingStandbyCount is the count of desired standbys with non-zero replication lag.
+	// +optional
+	LaggingStandbyCount int32 `json:"laggingStandbyCount,omitempty"`
+
+	// ReadSafeStandbyCount is the count of desired standbys safe for reads.
+	// +optional
+	ReadSafeStandbyCount int32 `json:"readSafeStandbyCount,omitempty"`
+
+	// ReseedRequiredCount is the count of desired standbys requiring reseed.
+	// +optional
+	ReseedRequiredCount int32 `json:"reseedRequiredCount,omitempty"`
+
+	// AutomaticPromotionAllowed reports whether the operator planner allows promotion.
+	// +optional
+	AutomaticPromotionAllowed bool `json:"automaticPromotionAllowed,omitempty"`
+
+	// Standbys contains per-standby slot state.
+	// +optional
+	Standbys []HAStandbyStatus `json:"standbys,omitempty"`
+
+	// PlannedActions reports HA reconciliation actions the operator plans to take.
+	// +optional
+	PlannedActions []HAPlannedActionStatus `json:"plannedActions,omitempty"`
+
+	// PrimaryRoute reports the operator-facing primary endpoint target.
+	// +optional
+	PrimaryRoute HAPrimaryRouteStatus `json:"primaryRoute,omitempty"`
+
+	// Sync reports the observed synchronous durability policy state.
+	// +optional
+	Sync HASyncStatus `json:"sync,omitempty"`
+
+	// Fencing reports the observed fencing authority state used for automatic promotion.
+	// +optional
+	Fencing HAFencingStatus `json:"fencing,omitempty"`
+
+	// Retention summarizes primary WAL retention pressure.
+	// +optional
+	Retention HARetentionStatus `json:"retention,omitempty"`
+
+	// FormerPrimary reports the old primary's rejoin disposition after promotion.
+	// +optional
+	FormerPrimary *HAFormerPrimaryStatus `json:"formerPrimary,omitempty"`
+
+	// LastPromotion records the last completed promotion.
+	// +optional
+	LastPromotion *HAPromotionStatus `json:"lastPromotion,omitempty"`
+}
+
+// HAStandbyStatus reports one hot standby slot.
+type HAStandbyStatus struct {
+	Name string `json:"name,omitempty"`
+
+	SlotName string `json:"slotName,omitempty"`
+
+	Active bool `json:"active,omitempty"`
+
+	ReseedRequired bool `json:"reseedRequired,omitempty"`
+
+	TimelineID uint64 `json:"timelineID,omitempty"`
+
+	RestartLSN uint64 `json:"restartLSN,omitempty"`
+
+	ReceivedLSN uint64 `json:"receivedLSN,omitempty"`
+
+	AppliedLSN uint64 `json:"appliedLSN,omitempty"`
+
+	SafeReadLSN uint64 `json:"safeReadLSN,omitempty"`
+
+	UpstreamLSN uint64 `json:"upstreamLSN,omitempty"`
+
+	WriteLagLSN uint64 `json:"writeLagLSN,omitempty"`
+
+	ReceiveLagLSN uint64 `json:"receiveLagLSN,omitempty"`
+
+	ApplyLagLSN uint64 `json:"applyLagLSN,omitempty"`
+
+	SafeReadLagLSN uint64 `json:"safeReadLagLSN,omitempty"`
+
+	UnappliedLSNCount uint64 `json:"unappliedLSNCount,omitempty"`
+
+	CaughtUpToReceived bool `json:"caughtUpToReceived,omitempty"`
+
+	CanServeSafeReads bool `json:"canServeSafeReads,omitempty"`
+
+	Status string `json:"status,omitempty"`
+
+	LastError string `json:"lastError,omitempty"`
+
+	// AdminStatusCode records the latest typed /admin/v1 HA standby status-observation HTTP status code.
+	// +optional
+	AdminStatusCode int `json:"adminStatusCode,omitempty"`
+
+	LastAttemptNs uint64 `json:"lastAttemptNs,omitempty"`
+
+	LastSuccessNs uint64 `json:"lastSuccessNs,omitempty"`
+
+	ReplicationFailuresTotal uint64 `json:"replicationFailuresTotal,omitempty"`
+}
+
+// HASyncStatus reports the current synchronous durability policy state.
+type HASyncStatus struct {
+	Mode HADurabilityMode `json:"mode,omitempty"`
+
+	Selection HAStandbySelection `json:"selection,omitempty"`
+
+	Required int32 `json:"required,omitempty"`
+
+	Satisfied int32 `json:"satisfied,omitempty"`
+
+	Candidates int32 `json:"candidates,omitempty"`
+
+	FailurePolicy HAFailurePolicy `json:"failurePolicy,omitempty"`
+
+	Degraded bool `json:"degraded,omitempty"`
+
+	Action string `json:"action,omitempty"`
+}
+
+// HAFencingStatus reports the observed fencing state for automatic promotion.
+type HAFencingStatus struct {
+	// Authority is the observed fencing authority.
+	// +kubebuilder:validation:Enum=None;KubernetesLease;StorageFence;MetadataRaft;External
+	// +optional
+	Authority HAFencingAuthority `json:"authority,omitempty"`
+
+	// Ready reports whether the fencing authority has been observed and can fence a primary.
+	// +optional
+	Ready bool `json:"ready,omitempty"`
+
+	// Holder identifies the actor that currently holds or can acquire the fence.
+	// +optional
+	Holder string `json:"holder,omitempty"`
+
+	// Generation is the observed fencing epoch used to order promotions.
+	// +optional
+	Generation uint64 `json:"generation,omitempty"`
+
+	// Reason describes the latest fencing readiness decision.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+}
+
+// HAPlannedActionStatus reports one planned HA operator action.
+type HAPlannedActionStatus struct {
+	Kind string `json:"kind,omitempty"`
+
+	// Phase groups the action into the HA workflow stage.
+	// +optional
+	Phase string `json:"phase,omitempty"`
+
+	// Executor identifies whether typed /admin/v1, a CLI-backed Job, or the Kubernetes controller executes this action.
+	// +optional
+	Executor string `json:"executor,omitempty"`
+
+	// DependsOn names the action kind that must complete before this action runs.
+	// +optional
+	DependsOn string `json:"dependsOn,omitempty"`
+
+	StandbyName string `json:"standbyName,omitempty"`
+
+	SlotName string `json:"slotName,omitempty"`
+
+	TargetLSN uint64 `json:"targetLSN,omitempty"`
+
+	ObservedLSN uint64 `json:"observedLSN,omitempty"`
+
+	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
+
+	RouteFrom string `json:"routeFrom,omitempty"`
+
+	RouteTo string `json:"routeTo,omitempty"`
+
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
+	FenceHolder string `json:"fenceHolder,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	FenceReason string `json:"fenceReason,omitempty"`
+
+	// AdminCommand is a compatibility CLI argv hint for HA actions that need a Kubernetes Job or break-glass execution.
+	// +optional
+	AdminCommand []string `json:"adminCommand,omitempty"`
+
+	// AdminURL is the HA admin endpoint for typed /admin/v1/ha execution or CLI-backed job targeting.
+	// +optional
+	AdminURL string `json:"adminURL,omitempty"`
+
+	// AdminNodeID is the node id expected in the typed HA admin action receipt from AdminURL.
+	// +optional
+	AdminNodeID string `json:"adminNodeID,omitempty"`
+
+	// AdminMethod is the HTTP method for the typed /admin/v1 operation that executes this action.
+	// +optional
+	AdminMethod string `json:"adminMethod,omitempty"`
+
+	// AdminPath is the typed /admin/v1 operation path that executes this action.
+	// +optional
+	AdminPath string `json:"adminPath,omitempty"`
+
+	// AdminResult records stable identifiers returned by a successful typed /admin/v1 HA operation.
+	// +optional
+	AdminResult *HAAdminActionResultStatus `json:"adminResult,omitempty"`
+
+	// SeedManifestPath is the base-backup manifest path used by seed finish/bootstrap actions.
+	// +optional
+	SeedManifestPath string `json:"seedManifestPath,omitempty"`
+
+	// SeedContentRoot is the copied base-backup content root used by seed bootstrap actions.
+	// +optional
+	SeedContentRoot string `json:"seedContentRoot,omitempty"`
+
+	// AdminJobName records direct-admin-api for typed execution or the Kubernetes Job created for CLI-backed execution.
+	// +optional
+	AdminJobName string `json:"adminJobName,omitempty"`
+
+	// AdminJobPhase summarizes dependency wait state, direct admin API execution, or CLI-backed Kubernetes Job state.
+	// +optional
+	AdminJobPhase string `json:"adminJobPhase,omitempty"`
+
+	// AdminError records the latest direct /admin/v1 HA execution or result-validation error for this action.
+	// +optional
+	AdminError string `json:"adminError,omitempty"`
+
+	// AdminStatusCode records the latest typed /admin/v1 HA HTTP status code for this action.
+	// +optional
+	AdminStatusCode int `json:"adminStatusCode,omitempty"`
+
+	Reason string `json:"reason,omitempty"`
+}
+
+// HAAdminActionResultStatus records correlation fields from a typed HA admin action response.
+type HAAdminActionResultStatus struct {
+	// SchemaVersion is the response schema version returned by the HA admin API.
+	// +optional
+	SchemaVersion uint32 `json:"schemaVersion,omitempty"`
+
+	// ActionID is the stable typed HA admin action correlation id.
+	// +optional
+	ActionID string `json:"actionID,omitempty"`
+
+	// ActionKind is the typed HA admin action kind that produced this result.
+	// +optional
+	ActionKind string `json:"actionKind,omitempty"`
+
+	// ActionTarget is the node id, slot name, manifest id, or promotion boundary acted on.
+	// +optional
+	ActionTarget string `json:"actionTarget,omitempty"`
+
+	// ActionState is the idempotency state returned by the HA admin action.
+	// +optional
+	ActionState string `json:"actionState,omitempty"`
+
+	// ActionNodeID is the node id of the node-local HA admin endpoint that produced this result.
+	// +optional
+	ActionNodeID string `json:"actionNodeID,omitempty"`
+
+	// SlotAction is the executed replication slot action.
+	// +optional
+	SlotAction string `json:"slotAction,omitempty"`
+
+	// SlotName is the affected replication slot or base-backup standby slot.
+	// +optional
+	SlotName string `json:"slotName,omitempty"`
+
+	// ManifestID is the base-backup manifest/action id returned by seed operations.
+	// +optional
+	ManifestID string `json:"manifestID,omitempty"`
+
+	// BackupLSN is the base-backup stream boundary returned by seed operations.
+	// +optional
+	BackupLSN uint64 `json:"backupLSN,omitempty"`
+
+	// StartRecordLSN is the durable backup_start record LSN returned by seed begin.
+	// +optional
+	StartRecordLSN uint64 `json:"startRecordLSN,omitempty"`
+
+	// EndRecordLSN is the durable backup_end record LSN returned by seed finish.
+	// +optional
+	EndRecordLSN uint64 `json:"endRecordLSN,omitempty"`
+
+	// CheckpointLSN is the standby checkpoint LSN returned by seed bootstrap.
+	// +optional
+	CheckpointLSN uint64 `json:"checkpointLSN,omitempty"`
+
+	// PromotionRequiredLSN is the minimum LSN checked by a promotion assessment.
+	// +optional
+	PromotionRequiredLSN uint64 `json:"promotionRequiredLSN,omitempty"`
+
+	// PromotionReceivedLSN is the standby received LSN observed by a promotion assessment.
+	// +optional
+	PromotionReceivedLSN uint64 `json:"promotionReceivedLSN,omitempty"`
+
+	// PromotionAppliedLSN is the standby applied LSN observed by a promotion assessment.
+	// +optional
+	PromotionAppliedLSN uint64 `json:"promotionAppliedLSN,omitempty"`
+
+	// PromotionCanPromote reports whether a promotion assessment permits promotion.
+	// +optional
+	PromotionCanPromote bool `json:"promotionCanPromote,omitempty"`
+
+	// PromotionFenced reports whether promotion assessment observed a fence.
+	// +optional
+	PromotionFenced bool `json:"promotionFenced,omitempty"`
+
+	// PromotionSafe reports whether a promotion assessment found no safety violation.
+	// +optional
+	PromotionSafe bool `json:"promotionSafe,omitempty"`
+
+	// PromotionForce reports whether a promotion assessment used force.
+	// +optional
+	PromotionForce bool `json:"promotionForce,omitempty"`
+
+	// PromotionMode is the explicit promotion assessment mode reported by the admin API.
+	// +optional
+	PromotionMode string `json:"promotionMode,omitempty"`
+
+	// PromotionDataLossPossible reports whether a promotion assessment found possible data loss.
+	// +optional
+	PromotionDataLossPossible bool `json:"promotionDataLossPossible,omitempty"`
+
+	// PromotionRequiresFencing reports whether a promotion assessment still needs fencing.
+	// +optional
+	PromotionRequiresFencing bool `json:"promotionRequiresFencing,omitempty"`
+
+	// PromotionRequiresForce reports whether a promotion assessment needs force to proceed.
+	// +optional
+	PromotionRequiresForce bool `json:"promotionRequiresForce,omitempty"`
+
+	// FenceGeneration is the promotion fence generation returned by fence operations.
+	// +optional
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	// FenceToken is the opaque promotion fence receipt token returned by fence operations.
+	// +optional
+	FenceToken string `json:"fenceToken,omitempty"`
+
+	// FenceClusterID is the cluster identity carried by a promotion fence receipt.
+	// +optional
+	FenceClusterID uint64 `json:"fenceClusterID,omitempty"`
+
+	// FenceShardID is the shard identity carried by a promotion fence receipt.
+	// +optional
+	FenceShardID uint64 `json:"fenceShardID,omitempty"`
+
+	// FenceTableID is the table identity carried by a promotion fence receipt.
+	// +optional
+	FenceTableID uint64 `json:"fenceTableID,omitempty"`
+
+	// FenceOldPrimaryID is the fenced primary node id carried by a promotion fence receipt.
+	// +optional
+	FenceOldPrimaryID string `json:"fenceOldPrimaryID,omitempty"`
+
+	// FencePromotedNodeID is the promoted standby node id carried by a promotion fence receipt.
+	// +optional
+	FencePromotedNodeID string `json:"fencePromotedNodeID,omitempty"`
+
+	// FenceParentTimelineID is the parent timeline carried by a promotion fence receipt.
+	// +optional
+	FenceParentTimelineID uint64 `json:"fenceParentTimelineID,omitempty"`
+
+	// FenceParentEpoch is the parent epoch carried by a promotion fence receipt.
+	// +optional
+	FenceParentEpoch uint64 `json:"fenceParentEpoch,omitempty"`
+
+	// FenceNewTimelineID is the promoted timeline carried by a promotion fence receipt.
+	// +optional
+	FenceNewTimelineID uint64 `json:"fenceNewTimelineID,omitempty"`
+
+	// FenceNewEpoch is the promoted epoch carried by a promotion fence receipt.
+	// +optional
+	FenceNewEpoch uint64 `json:"fenceNewEpoch,omitempty"`
+
+	// FenceRequiredLSN is the minimum promotion LSN carried by a promotion fence receipt.
+	// +optional
+	FenceRequiredLSN uint64 `json:"fenceRequiredLSN,omitempty"`
+
+	// FenceObservedLSN is the observed standby LSN carried by a promotion fence receipt.
+	// +optional
+	FenceObservedLSN uint64 `json:"fenceObservedLSN,omitempty"`
+
+	// FenceForced reports whether the promotion fence was acquired with force.
+	// +optional
+	FenceForced bool `json:"fenceForced,omitempty"`
+
+	// FenceReason is the reason carried by a promotion fence receipt.
+	// +optional
+	FenceReason string `json:"fenceReason,omitempty"`
+
+	// RejoinAction is the former-primary rejoin action returned by a rejoin assessment.
+	// +optional
+	RejoinAction string `json:"rejoinAction,omitempty"`
+
+	// RejoinReason is the former-primary rejoin reason returned by a rejoin assessment.
+	// +optional
+	RejoinReason string `json:"rejoinReason,omitempty"`
+
+	// FormerNodeID is the former-primary node id returned by a rejoin assessment.
+	// +optional
+	FormerNodeID string `json:"formerNodeID,omitempty"`
+
+	// TargetTimelineID is the promoted timeline returned by a rejoin assessment.
+	// +optional
+	TargetTimelineID uint64 `json:"targetTimelineID,omitempty"`
+
+	// TargetEpoch is the promoted epoch returned by a rejoin assessment.
+	// +optional
+	TargetEpoch uint64 `json:"targetEpoch,omitempty"`
+
+	// ForkLSN is the timeline fork LSN returned by a rejoin assessment.
+	// +optional
+	ForkLSN uint64 `json:"forkLSN,omitempty"`
+
+	// FormerLastLSN is the former primary's last observed LSN returned by a rejoin assessment.
+	// +optional
+	FormerLastLSN uint64 `json:"formerLastLSN,omitempty"`
+
+	// RetainedFromLSN is the earliest retained WAL LSN used by a rejoin assessment.
+	// +optional
+	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
+
+	// DataLossDiscarded reports whether rewind would discard former-primary data.
+	// +optional
+	DataLossDiscarded bool `json:"dataLossDiscarded,omitempty"`
+
+	// RewindExecuted reports that `/admin/v1/ha/rejoin/rewind` returned a concrete rewind result.
+	// +optional
+	RewindExecuted bool `json:"rewindExecuted,omitempty"`
+
+	// RewindPreviousLastLSN is the former-primary log tail before rewind execution.
+	// +optional
+	RewindPreviousLastLSN uint64 `json:"rewindPreviousLastLSN,omitempty"`
+
+	// RewindCurrentLastLSN is the former-primary log tail after rewind execution.
+	// +optional
+	RewindCurrentLastLSN uint64 `json:"rewindCurrentLastLSN,omitempty"`
+
+	// RewindNextLSN is the next append LSN after rewind execution.
+	// +optional
+	RewindNextLSN uint64 `json:"rewindNextLSN,omitempty"`
+
+	// RewindDiscardedLSNCount is the count of divergent former-primary LSNs discarded by rewind.
+	// +optional
+	RewindDiscardedLSNCount uint64 `json:"rewindDiscardedLSNCount,omitempty"`
+
+	// ReseedExecuted reports that `/admin/v1/ha/rejoin/reseed` marked the former-primary slot for reseed.
+	// +optional
+	ReseedExecuted bool `json:"reseedExecuted,omitempty"`
+
+	// ReseedSlotName is the replication slot marked for former-primary reseed.
+	// +optional
+	ReseedSlotName string `json:"reseedSlotName,omitempty"`
+
+	// ReseedRequired reports that the former-primary slot is now reseed-required.
+	// +optional
+	ReseedRequired bool `json:"reseedRequired,omitempty"`
+
+	// ReseedBaseBackupRequired reports that a new base backup must be taken before bootstrap.
+	// +optional
+	ReseedBaseBackupRequired bool `json:"reseedBaseBackupRequired,omitempty"`
+}
+
+// HAPrimaryRouteStatus reports the operator-facing primary endpoint target.
+type HAPrimaryRouteStatus struct {
+	ServiceName string `json:"serviceName,omitempty"`
+
+	CurrentTarget string `json:"currentTarget,omitempty"`
+
+	DesiredTarget string `json:"desiredTarget,omitempty"`
+
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	Stale bool `json:"stale,omitempty"`
+
+	Action string `json:"action,omitempty"`
+
+	Reason string `json:"reason,omitempty"`
+}
+
+// HARetentionStatus reports HA WAL retention pressure.
+type HARetentionStatus struct {
+	OldestRestartLSN uint64 `json:"oldestRestartLSN,omitempty"`
+
+	RetainedLSNCount uint64 `json:"retainedLSNCount,omitempty"`
+
+	// RetainedByteCount is the encoded HA WAL bytes retained for active slots.
+	RetainedByteCount uint64 `json:"retainedByteCount,omitempty"`
+
+	// RetainedAgeNS is the HA WAL timestamp span retained for active slots.
+	RetainedAgeNS uint64 `json:"retainedAgeNS,omitempty"`
+
+	ActiveSlots int32 `json:"activeSlots,omitempty"`
+
+	ReseedRecommended int32 `json:"reseedRecommended,omitempty"`
+}
+
+// HAFormerPrimaryStatus reports the old primary's rejoin disposition after promotion.
+type HAFormerPrimaryStatus struct {
+	NodeID string `json:"nodeID,omitempty"`
+
+	Fenced bool `json:"fenced,omitempty"`
+
+	RejoinRequired bool `json:"rejoinRequired,omitempty"`
+
+	RewindPossible bool `json:"rewindPossible,omitempty"`
+
+	ReseedRequired bool `json:"reseedRequired,omitempty"`
+
+	Diverged bool `json:"diverged,omitempty"`
+
+	ParentTimelineID uint64 `json:"parentTimelineID,omitempty"`
+
+	NewTimelineID uint64 `json:"newTimelineID,omitempty"`
+
+	ObservedTimelineID uint64 `json:"observedTimelineID,omitempty"`
+
+	SwitchLSN uint64 `json:"switchLSN,omitempty"`
+
+	ObservedLSN uint64 `json:"observedLSN,omitempty"`
+
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
+	FenceHolder string `json:"fenceHolder,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	TargetTimelineID uint64 `json:"targetTimelineID,omitempty"`
+
+	TargetEpoch uint64 `json:"targetEpoch,omitempty"`
+
+	ForkLSN uint64 `json:"forkLSN,omitempty"`
+
+	FormerLastLSN uint64 `json:"formerLastLSN,omitempty"`
+
+	RetainedFromLSN uint64 `json:"retainedFromLSN,omitempty"`
+
+	DataLossDiscarded bool `json:"dataLossDiscarded,omitempty"`
+
+	AssessedAction string `json:"assessedAction,omitempty"`
+
+	AssessedReason string `json:"assessedReason,omitempty"`
+
+	Action string `json:"action,omitempty"`
+
+	Reason string `json:"reason,omitempty"`
+}
+
+// HAPromotionStatus reports a completed HA promotion.
+type HAPromotionStatus struct {
+	// ClusterID is the replicated cluster identity of the promotion scope.
+	// +optional
+	ClusterID uint64 `json:"clusterID,omitempty"`
+
+	// ShardID is the replicated shard identity of the promotion scope. Zero means whole-instance or default shard scope.
+	// +optional
+	ShardID uint64 `json:"shardID,omitempty"`
+
+	// TableID is the replicated table identity of the promotion scope. Zero means whole-instance or default table scope.
+	// +optional
+	TableID uint64 `json:"tableID,omitempty"`
+
+	OldPrimaryID string `json:"oldPrimaryID,omitempty"`
+
+	PromotedStandbyID string `json:"promotedStandbyID,omitempty"`
+
+	ParentTimelineID uint64 `json:"parentTimelineID,omitempty"`
+
+	ParentEpoch uint64 `json:"parentEpoch,omitempty"`
+
+	NewTimelineID uint64 `json:"newTimelineID,omitempty"`
+
+	NewEpoch uint64 `json:"newEpoch,omitempty"`
+
+	SwitchLSN uint64 `json:"switchLSN,omitempty"`
+
+	RequiredLSN uint64 `json:"requiredLSN,omitempty"`
+
+	ObservedLSN uint64 `json:"observedLSN,omitempty"`
+
+	FenceGeneration uint64 `json:"fenceGeneration,omitempty"`
+
+	FenceAuthority HAFencingAuthority `json:"fenceAuthority,omitempty"`
+
+	FenceToken string `json:"fenceToken,omitempty"`
+
+	FenceReason string `json:"fenceReason,omitempty"`
+
+	Forced bool `json:"forced,omitempty"`
+
+	DataLossPossible bool `json:"dataLossPossible,omitempty"`
+
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
 }
 
 // ProductTierStatus reports the concrete operator fields produced from a tier.

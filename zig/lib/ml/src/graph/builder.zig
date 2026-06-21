@@ -577,6 +577,21 @@ pub const Builder = struct {
         return fused;
     }
 
+    /// Fused `(a + b) * scalar[0]`.
+    pub fn addMulScalar(self: *Builder, a: NodeId, b: NodeId, scalar: NodeId) !NodeId {
+        const sum = try self.add(a, b);
+        const decomposed = try self.mul(sum, scalar);
+
+        const fused = try self.graph.addNode(.{
+            .op = .{ .fused_add_mul_scalar = {} },
+            .output_shape = self.graph.node(decomposed).output_shape,
+            .inputs = .{ a, b, scalar, null_node },
+            .num_inputs = 3,
+            .vjp_alternate = decomposed,
+        });
+        return fused;
+    }
+
     /// Fused softmax: exp(x - max(x)) / sum(exp(x - max(x))) along last axis.
     pub fn softmax(self: *Builder, input: NodeId) !NodeId {
         const in_shape = self.graph.node(input).output_shape;

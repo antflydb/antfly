@@ -84,7 +84,7 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     defer out.deinit();
     const writer = &out.writer;
 
-    try writer.writeAll("{\"config\":{");
+    try writer.writeAll("{");
     try writer.print("\"name\":\"{s}\"", .{name});
     if (idx_type) |t| try writer.print(",\"type\":\"{s}\"", .{t});
     if (field) |f| try writer.print(",\"field\":\"{s}\"", .{f});
@@ -92,10 +92,10 @@ fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyClient
     if (embedder_json) |e| try writer.print(",\"embedder\":{s}", .{e});
     if (generator_json) |g| try writer.print(",\"generator\":{s}", .{g});
     if (chunker_json) |c| try writer.print(",\"chunker\":{s}", .{c});
-    try writer.writeAll("}}");
+    try writer.writeAll("}");
 
     const json_body = out.written();
-    var parsed = std.json.parseFromSlice(antfly_client.AntflyClient.IndexConfig, allocator, json_body, .{ .ignore_unknown_fields = true }) catch |err| {
+    var parsed = std.json.parseFromSlice(antfly_client.AntflyClient.IndexConfig, allocator, json_body, .{}) catch |err| {
         cli.fatal("failed to build index config: {}", .{err});
     };
     defer parsed.deinit();

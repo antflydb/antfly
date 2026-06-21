@@ -84,7 +84,7 @@ const AVAILABLE_TOOLS = [
     label: "Ask Clarification",
     desc: "Request user input",
   },
-  { name: "websearch" as ChatToolName, label: "Web Search", desc: "Search the web" },
+  { name: "web_search" as ChatToolName, label: "Web Search", desc: "Search the web" },
 ] as const;
 
 const DEFAULT_ENABLED_TOOLS: ChatToolName[] = ["semantic_search", "full_text_search", "add_filter"];
