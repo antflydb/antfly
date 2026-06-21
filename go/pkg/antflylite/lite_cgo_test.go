@@ -50,6 +50,7 @@ func containsString(values []string, value string) bool {
 
 func TestLiteOpenReadOnlyMissingDoesNotCreate(t *testing.T) {
 	for name, open := range map[string]func(string) (*DB, error){
+		"writer":      Open,
 		"readonly":    OpenReadonly,
 		"status-only": OpenStatusOnly,
 	} {
@@ -76,7 +77,7 @@ func TestLiteOpenReadOnlyMissingDoesNotCreate(t *testing.T) {
 func TestLiteOpenModeConcurrency(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "go-open-modes.aflite")
 
-	writer, err := Open(path)
+	writer, err := Create(path)
 	if err != nil {
 		t.Fatalf("open writer: %v", err)
 	}
@@ -139,7 +140,7 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 func TestLiteHostedPauseResumeGeneratedEnrichment(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "go-hosted-resume.aflite")
 
-	hosted, err := OpenHosted(path)
+	hosted, err := CreateHosted(path)
 	if err != nil {
 		t.Fatalf("open hosted Lite database: %v", err)
 	}
@@ -249,7 +250,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "go-smoke.aflite")
-	db, err := OpenWithOptions(path, OpenOptions{
+	db, err := CreateWithOptions(path, OpenOptions{
 		Mode:    OpenModeWriter,
 		Profile: ProfileNative,
 		NoSync:  true,
@@ -495,7 +496,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	remotePath := filepath.Join(t.TempDir(), "go-remote-inference.aflite")
-	remoteDB, err := OpenWithOptions(remotePath, OpenOptions{
+	remoteDB, err := CreateWithOptions(remotePath, OpenOptions{
 		Mode:                     OpenModeWriter,
 		Profile:                  ProfileNative,
 		RemoteProviderConfigured: true,
@@ -523,7 +524,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	localPath := filepath.Join(t.TempDir(), "go-local-inference.aflite")
-	localDB, err := OpenWithOptions(localPath, OpenOptions{
+	localDB, err := CreateWithOptions(localPath, OpenOptions{
 		Mode:                   OpenModeWriter,
 		Profile:                ProfileNative,
 		LocalRuntimeConfigured: true,
@@ -882,7 +883,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	lockedRestorePath := filepath.Join(t.TempDir(), "go-locked-restore.aflite")
-	lockedRestore, err := Open(lockedRestorePath)
+	lockedRestore, err := Create(lockedRestorePath)
 	if err != nil {
 		t.Fatalf("open locked restore target: %v", err)
 	}
@@ -910,7 +911,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	importedPath := filepath.Join(t.TempDir(), "go-imported.aflite")
-	imported, err := Open(importedPath)
+	imported, err := Create(importedPath)
 	if err != nil {
 		t.Fatalf("open imported Lite database: %v", err)
 	}
@@ -942,7 +943,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	ttlPath := filepath.Join(t.TempDir(), "go-ttl.aflite")
-	ttlDB, err := OpenWithOptions(ttlPath, OpenOptions{
+	ttlDB, err := CreateWithOptions(ttlPath, OpenOptions{
 		Mode:    OpenModeWriter,
 		Profile: ProfileNative,
 		NoSync:  true,
@@ -972,7 +973,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	hostedPath := filepath.Join(t.TempDir(), "go-hosted.aflite")
-	hosted, err := OpenHosted(hostedPath)
+	hosted, err := CreateHosted(hostedPath)
 	if err != nil {
 		t.Fatalf("open hosted Lite database: %v", err)
 	}
@@ -1020,7 +1021,7 @@ func TestLiteCAPI(t *testing.T) {
 	}
 
 	hostedTTLPath := filepath.Join(t.TempDir(), "go-hosted-ttl.aflite")
-	hostedWithTTL, err := OpenWithOptions(hostedTTLPath, OpenOptions{
+	hostedWithTTL, err := CreateWithOptions(hostedTTLPath, OpenOptions{
 		Mode:       OpenModeWriter,
 		Profile:    ProfileHosted,
 		TTLCleanup: &TTLCleanupOptions{Enabled: true},

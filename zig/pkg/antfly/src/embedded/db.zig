@@ -73,8 +73,16 @@ pub const DB = struct {
         return try openLiteWithProfile(alloc, path, opts, .native);
     }
 
+    pub fn createLite(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
+        return try createLiteWithProfile(alloc, path, opts, .native);
+    }
+
     pub fn openLiteHosted(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
         return try openLiteWithProfile(alloc, path, opts, .hosted);
+    }
+
+    pub fn createLiteHosted(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
+        return try createLiteWithProfile(alloc, path, opts, .hosted);
     }
 
     pub fn openWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
@@ -92,6 +100,19 @@ pub const DB = struct {
             .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
             .no_sync = opts.no_sync,
         });
+        return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
+    }
+
+    pub fn createLiteWithProfile(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile) !DB {
+        if (!openModeCanWrite(opts.open_mode)) return error.InvalidArgument;
+        var lite_backend = try support.lite.backend.Handle.createWithOptions(alloc, path, .{
+            .exclusive = true,
+            .no_sync = opts.no_sync,
+        });
+        return try openWithLiteBackend(alloc, path, opts, profile, &lite_backend);
+    }
+
+    fn openWithLiteBackend(alloc: Allocator, path: []const u8, opts: OpenOptions, profile: Profile, lite_backend: *support.lite.backend.Handle) !DB {
         errdefer lite_backend.deinit();
 
         var db_opts = toDbOpenOptions(opts, profile);
@@ -101,13 +122,15 @@ pub const DB = struct {
             return err;
         };
 
+        const moved_lite_backend = lite_backend.*;
+        lite_backend.* = undefined;
         return .{
             .allocator = alloc,
             .inner = inner,
             .profile = profile,
             .open_mode = opts.open_mode,
             .lite_inference_status = support.lite.backend.inferenceStatusForProfileWithOptions(profile, opts.inference),
-            .owned_lite_backend = lite_backend,
+            .owned_lite_backend = moved_lite_backend,
         };
     }
 
@@ -342,8 +365,10 @@ test "embedded db openLite persists documents in aflite file" {
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     };
 
+    try std.testing.expectError(error.FileNotFound, DB.openLite(alloc, path, opts));
+
     {
-        var db = try DB.openLite(alloc, path, opts);
+        var db = try DB.createLite(alloc, path, opts);
         defer db.close();
 
         try db.batch(.{
@@ -376,7 +401,7 @@ test "embedded db openLite close syncs unsynced batch before readonly reopen" {
     defer alloc.free(path);
 
     {
-        var db = try DB.openLite(alloc, path, .{});
+        var db = try DB.createLite(alloc, path, .{});
         defer db.close();
 
         try db.batch(.{
@@ -410,7 +435,7 @@ test "embedded db openLite propagates no_sync to aflite backend" {
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-no-sync.aflite");
     defer alloc.free(path);
 
-    var db = try DB.openLite(alloc, path, .{
+    var db = try DB.createLite(alloc, path, .{
         .no_sync = true,
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
@@ -482,7 +507,7 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     const path = try testLitePath(alloc, tmp, "embedded-status.aflite");
     defer alloc.free(path);
 
-    var db = try DB.openLite(alloc, path, .{
+    var db = try DB.createLite(alloc, path, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
     defer db.close();
@@ -528,7 +553,7 @@ test "embedded db liteStatus reflects explicitly configured remote inference" {
     const path = try testLitePath(alloc, tmp, "embedded-status-remote-inference.aflite");
     defer alloc.free(path);
 
-    var db = try DB.openLite(alloc, path, .{
+    var db = try DB.createLite(alloc, path, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .inference = .{ .remote_provider_configured = true },
     });
@@ -561,7 +586,7 @@ test "embedded db liteStatus reflects explicitly configured local inference" {
     const path = try testLitePath(alloc, tmp, "embedded-status-local-inference.aflite");
     defer alloc.free(path);
 
-    var db = try DB.openLite(alloc, path, .{
+    var db = try DB.createLite(alloc, path, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .inference = .{ .local_runtime_configured = true },
     });
@@ -594,7 +619,7 @@ test "embedded db openLite can run ttl cleanup over aflite file" {
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-ttl-cleanup.aflite");
     defer alloc.free(path);
 
-    var db = try DB.openLite(alloc, path, .{
+    var db = try DB.createLite(alloc, path, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .ttl_cleanup = .{
             .enabled = true,
@@ -645,7 +670,7 @@ test "embedded db openLiteHosted exposes manual maintenance capabilities" {
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-hosted.aflite");
     defer alloc.free(path);
 
-    var db = try DB.openLiteHosted(alloc, path, .{
+    var db = try DB.createLiteHosted(alloc, path, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
     });
     defer db.close();
@@ -668,7 +693,7 @@ test "embedded db openLite query_readonly rejects writes" {
     defer alloc.free(path);
 
     {
-        var db = try DB.openLite(alloc, path, .{
+        var db = try DB.createLite(alloc, path, .{
             .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         });
         defer db.close();
@@ -715,7 +740,7 @@ test "embedded db openLite persists schema json in aflite file" {
     ;
 
     {
-        var db = try DB.openLite(alloc, path, .{});
+        var db = try DB.createLite(alloc, path, .{});
         defer db.close();
 
         try db.setSchemaJson(alloc, schema_json);
@@ -744,7 +769,7 @@ test "embedded db openLite persists index and enrichment catalogs in aflite file
     defer alloc.free(path);
 
     {
-        var db = try DB.openLite(alloc, path, .{});
+        var db = try DB.createLite(alloc, path, .{});
         defer db.close();
 
         try db.addEnrichment(.{

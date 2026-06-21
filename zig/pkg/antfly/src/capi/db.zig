@@ -1711,6 +1711,7 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
 fn openLiteHandle(
     path: []const u8,
     resolved: LiteResolvedOpenOptions,
+    create: bool,
     out_handle: ?*?*anyopaque,
 ) capi.ErrorCode {
     const out = out_handle orelse return .invalid_argument;
@@ -1719,10 +1720,17 @@ fn openLiteHandle(
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
 
-    var backend = lite_backend.Handle.open(alloc, path, .{
-        .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
-        .no_sync = resolved.no_sync,
-    }) catch |err| return capi.mapError(err);
+    if (create and !liteOpenModeCanWrite(resolved.open_mode)) return .invalid_argument;
+    var backend = if (create)
+        lite_backend.Handle.createWithOptions(alloc, path, .{
+            .exclusive = true,
+            .no_sync = resolved.no_sync,
+        }) catch |err| return capi.mapError(err)
+    else
+        lite_backend.Handle.open(alloc, path, .{
+            .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
+            .no_sync = resolved.no_sync,
+        }) catch |err| return capi.mapError(err);
     errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
@@ -1767,7 +1775,15 @@ pub export fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) 
         if (out_handle) |out| out.* = null;
         return .invalid_argument;
     };
-    return openLiteHandle(path_slice, .{}, out_handle);
+    return openLiteHandle(path_slice, .{}, false, out_handle);
+}
+
+pub export fn antfly_lite_create(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{}, true, out_handle);
 }
 
 pub export fn antfly_lite_open_with_options(path: ?[*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -1775,7 +1791,15 @@ pub export fn antfly_lite_open_with_options(path: ?[*:0]const u8, options: ?*con
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
-    return openLiteHandle(path_slice, resolved, out);
+    return openLiteHandle(path_slice, resolved, false, out);
+}
+
+pub export fn antfly_lite_create_with_options(path: ?[*:0]const u8, options: ?*const capi.LiteOpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveLiteOpenOptions(options) catch |err| return capi.mapError(err);
+    return openLiteHandle(path_slice, resolved, true, out);
 }
 
 pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -1783,7 +1807,15 @@ pub export fn antfly_lite_open_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyo
         if (out_handle) |out| out.* = null;
         return .invalid_argument;
     };
-    return openLiteHandle(path_slice, .{ .profile = .hosted }, out_handle);
+    return openLiteHandle(path_slice, .{ .profile = .hosted }, false, out_handle);
+}
+
+pub export fn antfly_lite_create_hosted(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const path_slice = cStringSpan(path) orelse {
+        if (out_handle) |out| out.* = null;
+        return .invalid_argument;
+    };
+    return openLiteHandle(path_slice, .{ .profile = .hosted }, true, out_handle);
 }
 
 pub export fn antfly_lite_open_readonly(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -1791,7 +1823,7 @@ pub export fn antfly_lite_open_readonly(path: ?[*:0]const u8, out_handle: ?*?*an
         if (out_handle) |out| out.* = null;
         return .invalid_argument;
     };
-    return openLiteHandle(path_slice, .{ .open_mode = .query_readonly }, out_handle);
+    return openLiteHandle(path_slice, .{ .open_mode = .query_readonly }, false, out_handle);
 }
 
 pub export fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -1799,7 +1831,7 @@ pub export fn antfly_lite_open_status_only(path: ?[*:0]const u8, out_handle: ?*?
         if (out_handle) |out| out.* = null;
         return .invalid_argument;
     };
-    return openLiteHandle(path_slice, .{ .open_mode = .status_only }, out_handle);
+    return openLiteHandle(path_slice, .{ .open_mode = .status_only }, false, out_handle);
 }
 
 fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
@@ -6473,7 +6505,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.TruncatedNativeHeader));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, capi.mapError(error.UnsupportedNativeFormatVersion));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(src_path, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_create(src_path, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(src_path, null, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_create_with_options(src_path, null, null));
     var null_path_sentinel: u8 = 0;
     var null_path_handle: ?*anyopaque = &null_path_sentinel;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(null, &null_path_handle));
@@ -6511,6 +6545,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(invalid_lite_handle == null);
     defer antfly_db_close(invalid_lite_handle);
 
+    try std.testing.expect(!testPathExists(src_path));
+    var missing_writer_sentinel: u8 = 0;
+    var missing_writer_handle: ?*anyopaque = &missing_writer_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_lite_open(src_path, &missing_writer_handle));
+    try std.testing.expect(missing_writer_handle == null);
+    try std.testing.expect(!testPathExists(src_path));
+    defer antfly_db_close(missing_writer_handle);
+
     try std.testing.expect(!testPathExists(missing_readonly_path));
     var missing_readonly_sentinel: u8 = 0;
     var missing_readonly_handle: ?*anyopaque = &missing_readonly_sentinel;
@@ -6546,7 +6588,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, short_check_json, "\"issue\":\"truncated_header\"") != null);
 
     var src_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(src_path, &src_handle));
     defer antfly_db_close(src_handle);
 
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_status_json(src_handle, null));
@@ -6614,7 +6656,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .flags = capi.lite_open_flag_remote_provider_configured,
     };
     var remote_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(remote_inference_path, &remote_options, &remote_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(remote_inference_path, &remote_options, &remote_handle));
     defer antfly_db_close(remote_handle);
     var remote_status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(remote_handle, &remote_status));
@@ -6630,7 +6672,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .flags = capi.lite_open_flag_local_runtime_configured,
     };
     var local_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(local_inference_path, &local_options, &local_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(local_inference_path, &local_options, &local_handle));
     defer antfly_db_close(local_handle);
     var local_status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(local_handle, &local_status));
@@ -6994,7 +7036,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(exported_backup.len > 0);
 
     var dst_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(dst_path, &dst_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(dst_path, &dst_handle));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_import_backup(dst_handle, .{
         .ptr = null,
         .len = 16,
@@ -7009,7 +7051,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }));
 
     var bad_dst_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(bad_dst_path, &bad_dst_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(bad_dst_path, &bad_dst_handle));
     defer antfly_db_close(bad_dst_handle);
 
     const target_writes = [_]capi.WriteIntent{.{
@@ -7058,7 +7100,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, target_after_valid_rejected.ptr.?[0..target_after_valid_rejected.len], "\"target survives bad capi import\"") != null);
 
     var schema_dst_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(schema_dst_path, &schema_dst_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(schema_dst_path, &schema_dst_handle));
     defer antfly_db_close(schema_dst_handle);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(schema_dst_handle, .{
         .ptr = schema_json,
@@ -7183,7 +7225,7 @@ test "capi lite exposes hosted and status-only profiles" {
     defer cleanupTestFile(path);
 
     var hosted_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_hosted(path, &hosted_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_hosted(path, &hosted_handle));
 
     var hosted_caps: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(hosted_handle, &hosted_caps));
@@ -7284,6 +7326,10 @@ test "capi lite open options validate and configure ttl cleanup" {
     for (defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
 
     var default_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &defaults, &default_handle));
     antfly_db_close(default_handle);
     default_handle = null;
@@ -7331,7 +7377,7 @@ test "capi lite open options validate and configure ttl cleanup" {
     };
 
     var handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &open_options, &handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &open_options, &handle));
     defer antfly_db_close(handle);
 
     const schema_json =

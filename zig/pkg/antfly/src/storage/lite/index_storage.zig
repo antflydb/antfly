@@ -303,7 +303,7 @@ test "lite native index storage persists logical files across reopen" {
     defer allocator.free(path);
 
     {
-        var docs = try docstore.Store.open(allocator, path, false);
+        var docs = try docstore.Store.create(allocator, path, true);
         defer docs.close();
         var index_store = Store.init(allocator, &docs);
         const storage = index_store.storage();
@@ -350,7 +350,7 @@ test "lite native index storage can be scoped to the Lite index namespace" {
     const path = try testPath(allocator, tmp, "native-index-storage-namespace.aflite");
     defer allocator.free(path);
 
-    var docs = try docstore.Store.open(allocator, path, false);
+    var docs = try docstore.Store.create(allocator, path, true);
     defer docs.close();
     var index_store = Store.initWithNamespace(allocator, &docs, "__antfly_lite");
     const storage = index_store.storage();
@@ -386,7 +386,7 @@ test "lite native index storage handles large files rename and delete tree" {
     defer allocator.free(large);
     for (large, 0..) |*byte, i| byte.* = @intCast(i % 251);
 
-    var docs = try docstore.Store.open(allocator, path, false);
+    var docs = try docstore.Store.create(allocator, path, true);
     defer docs.close();
     var index_store = Store.init(allocator, &docs);
     const storage = index_store.storage();
@@ -436,7 +436,7 @@ test "lite native index storage aborts atomic writes without publishing partial 
     defer allocator.free(path);
 
     {
-        var docs = try docstore.Store.open(allocator, path, false);
+        var docs = try docstore.Store.create(allocator, path, true);
         defer docs.close();
         var index_store = Store.init(allocator, &docs);
         const storage = index_store.storage();
@@ -480,7 +480,7 @@ test "lite native index storage read-only open rejects mutations" {
     defer allocator.free(path);
 
     {
-        var docs = try docstore.Store.open(allocator, path, false);
+        var docs = try docstore.Store.create(allocator, path, true);
         defer docs.close();
         var index_store = Store.init(allocator, &docs);
         const storage = index_store.storage();
@@ -530,7 +530,7 @@ test "lite native index storage recovers previous checkpoint after interrupted u
     defer allocator.free(path);
 
     {
-        var docs = try docstore.Store.open(allocator, path, false);
+        var docs = try docstore.Store.create(allocator, path, true);
         defer docs.close();
         var index_store = Store.init(allocator, &docs);
         const storage = index_store.storage();
@@ -571,7 +571,7 @@ test "lite native index storage serializes physical writes without taking docume
     const path = try testPath(allocator, tmp, "native-index-storage-single-writer.aflite");
     defer allocator.free(path);
 
-    var docs = try docstore.Store.open(allocator, path, false);
+    var docs = try docstore.Store.create(allocator, path, true);
     defer docs.close();
     var index_store = Store.init(allocator, &docs);
     const storage = index_store.storage();

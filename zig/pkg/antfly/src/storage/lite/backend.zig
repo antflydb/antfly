@@ -65,6 +65,11 @@ pub const OpenOptions = struct {
     no_sync: bool = false,
 };
 
+pub const CreateOptions = struct {
+    exclusive: bool = false,
+    no_sync: bool = false,
+};
+
 pub fn isAflitePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".aflite");
 }
@@ -136,8 +141,12 @@ pub const Handle = struct {
     }
 
     pub fn create(allocator: Allocator, path: []const u8, exclusive: bool) !Handle {
+        return try createWithOptions(allocator, path, .{ .exclusive = exclusive });
+    }
+
+    pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !Handle {
         if (!isAflitePath(path)) return error.InvalidArgument;
-        return try createNativeSingleFile(allocator, path, exclusive);
+        return try createNativeSingleFile(allocator, path, opts);
     }
 
     pub fn deinit(self: *Handle) void {
@@ -293,8 +302,11 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     return try initNativeSingleFile(allocator, &initial_store);
 }
 
-fn createNativeSingleFile(allocator: Allocator, path: []const u8, exclusive: bool) !Handle {
-    var initial_store = try docstore.Store.create(allocator, path, exclusive);
+fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOptions) !Handle {
+    var initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+        .exclusive = opts.exclusive,
+        .no_sync = opts.no_sync,
+    });
     errdefer initial_store.close();
     return try initNativeSingleFile(allocator, &initial_store);
 }
@@ -580,7 +592,7 @@ test "lite backend native engine creates and checks aflite file" {
     const path = try testPath(allocator, tmp, "native-backend.aflite");
     defer allocator.free(path);
 
-    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
@@ -621,6 +633,11 @@ test "lite backend propagates no_sync to native engine" {
     defer allocator.free(path);
 
     {
+        var created = try Handle.create(allocator, path, true);
+        defer created.deinit();
+    }
+
+    {
         var handle = try Handle.open(allocator, path, .{
             .engine = .native_single_file,
             .no_sync = true,
@@ -655,7 +672,7 @@ test "lite backend reports native storage status from active checkpoint" {
     const path = try testPath(allocator, tmp, "native-status.aflite");
     defer allocator.free(path);
 
-    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:status", "value");
@@ -686,7 +703,7 @@ test "lite backend native stable snapshot uses open handle checkpoint" {
     const snapshot_path = try testPath(allocator, tmp, "native-backend-snapshot-copy.aflite");
     defer allocator.free(snapshot_path);
 
-    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:1", "value");
@@ -728,7 +745,7 @@ test "lite backend native stable snapshot is consistent with active writer" {
     const snapshot_path = try testPath(allocator, tmp, "native-backend-snapshot-writer-copy.aflite");
     defer allocator.free(snapshot_path);
 
-    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    var handle = try Handle.create(allocator, path, true);
     defer handle.deinit();
 
     try handle.native_docstore.?.file.putDocument("doc:committed", "committed");
@@ -750,7 +767,7 @@ test "lite backend native stable snapshot is consistent with active writer" {
     try std.testing.expectEqual(@as(?[]u8, null), try snapshot.getDocumentAlloc(allocator, "doc:pending"));
 }
 
-test "lite backend auto creates new aflite files with native engine" {
+test "lite backend auto open requires existing native aflite file" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -759,9 +776,10 @@ test "lite backend auto creates new aflite files with native engine" {
     const path = try testPath(allocator, tmp, "auto-native.aflite");
     defer allocator.free(path);
 
-    var handle = try Handle.open(allocator, path, .{});
-    defer handle.deinit();
+    try std.testing.expectError(error.FileNotFound, Handle.open(allocator, path, .{}));
 
+    var handle = try Handle.create(allocator, path, true);
+    defer handle.deinit();
     try std.testing.expectEqual(EngineKind.native_single_file, handle.engine);
     try handle.native_docstore.?.file.putDocument("doc:auto", "native");
 
@@ -787,7 +805,7 @@ test "lite backend rejects non-aflite paths" {
     try std.testing.expectError(error.InvalidArgument, Handle.open(allocator, path, .{}));
     try std.testing.expectError(error.InvalidArgument, checkFile(allocator, path));
 
-    var handle = try Handle.open(allocator, lite_path, .{ .engine = .native_single_file });
+    var handle = try Handle.create(allocator, lite_path, true);
     defer handle.deinit();
     try std.testing.expectError(error.InvalidArgument, handle.copyStableSnapshot(snapshot_path, false));
 }
@@ -864,7 +882,7 @@ test "lite backend native engine can back db primary documents" {
     defer allocator.free(path);
 
     {
-        var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+        var handle = try Handle.create(allocator, path, true);
         defer handle.deinit();
 
         var db_opts = db_mod.OpenOptions{
@@ -915,7 +933,7 @@ test "lite backend native engine can back db primary documents" {
     }
 }
 
-test "lite backend native read-only open requires an existing file" {
+test "lite backend native open requires an existing file" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -924,6 +942,7 @@ test "lite backend native read-only open requires an existing file" {
     const path = try testPath(allocator, tmp, "native-missing.aflite");
     defer allocator.free(path);
 
+    try std.testing.expectError(error.FileNotFound, Handle.open(allocator, path, .{ .engine = .native_single_file }));
     try std.testing.expectError(error.FileNotFound, Handle.open(allocator, path, .{
         .engine = .native_single_file,
         .read_only = true,

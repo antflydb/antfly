@@ -218,12 +218,19 @@ const char *antfly_error_code_description(antfly_error_code code);
 antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *options);
 
 antfly_error_code antfly_lite_open(const char *path, void **out_handle);
+antfly_error_code antfly_lite_create(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_with_options(
     const char *path,
     const antfly_lite_open_options *options,
     void **out_handle
 );
+antfly_error_code antfly_lite_create_with_options(
+    const char *path,
+    const antfly_lite_open_options *options,
+    void **out_handle
+);
 antfly_error_code antfly_lite_open_hosted(const char *path, void **out_handle);
+antfly_error_code antfly_lite_create_hosted(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_readonly(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_status_only(const char *path, void **out_handle);
 

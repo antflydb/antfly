@@ -117,7 +117,7 @@ test "storage.lite native docstore conforms to bound backend contract" {
     const path = try testPath(allocator, tmp, "native-docstore-conformance.aflite");
     defer allocator.free(path);
 
-    var store = try docstore.Store.open(allocator, path, false);
+    var store = try docstore.Store.create(allocator, path, true);
     defer store.close();
 
     var runtime = try store.runtimeStore(allocator);
@@ -135,7 +135,7 @@ test "storage.lite native docstore conformance survives reopen" {
     defer allocator.free(path);
 
     {
-        var store = try docstore.Store.open(allocator, path, false);
+        var store = try docstore.Store.create(allocator, path, true);
         defer store.close();
 
         var runtime = try store.runtimeStore(allocator);

@@ -49,6 +49,8 @@ test "pkg antfly embedded db Lite surface compiles" {
     _ = LiteStatus;
     _ = LiteStorageStatus;
     _ = LiteVacuumReport;
+    _ = DB.createLite;
+    _ = DB.createLiteHosted;
     _ = DB.openLite;
     _ = DB.openLiteHosted;
     _ = DB.liteStatus;

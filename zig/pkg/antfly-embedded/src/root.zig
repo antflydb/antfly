@@ -82,7 +82,7 @@ test "pkg antfly embedded exposes Lite path-level snapshot helpers" {
     defer allocator.free(snapshot_path);
 
     {
-        var lite = try db.DB.openLite(allocator, path, .{});
+        var lite = try db.DB.createLite(allocator, path, .{});
         defer lite.close();
         try lite.batch(.{
             .writes = &.{.{

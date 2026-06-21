@@ -21,6 +21,8 @@ pub const copyStableLiteSnapshotFileJson = embedded.copyStableLiteSnapshotFileJs
 
 test "pkg antfly embedded api Lite surface compiles" {
     _ = OpenOptions;
+    _ = Api.createLite;
+    _ = Api.createLiteHosted;
     _ = Api.openLite;
     _ = Api.openLiteHosted;
     _ = Api.statusJson;

@@ -62,10 +62,28 @@ pub const Api = struct {
         };
     }
 
+    pub fn createLite(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
+        return .{
+            .allocator = allocator,
+            .db = try embedded_db.DB.createLiteWithProfile(allocator, path, opts.db, opts.profile),
+            .table_name = try allocator.dupe(u8, opts.table_name),
+            .semantic_resolver = opts.semantic_resolver,
+        };
+    }
+
     pub fn openLiteHosted(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
         return .{
             .allocator = allocator,
             .db = try embedded_db.DB.openLiteHosted(allocator, path, opts.db),
+            .table_name = try allocator.dupe(u8, opts.table_name),
+            .semantic_resolver = opts.semantic_resolver,
+        };
+    }
+
+    pub fn createLiteHosted(allocator: Allocator, path: []const u8, opts: OpenOptions) !Api {
+        return .{
+            .allocator = allocator,
+            .db = try embedded_db.DB.createLiteHosted(allocator, path, opts.db),
             .table_name = try allocator.dupe(u8, opts.table_name),
             .semantic_resolver = opts.semantic_resolver,
         };
@@ -681,7 +699,7 @@ test "embedded api openLite round-trips batch lookup over aflite file" {
     defer alloc.free(path);
 
     {
-        var api = try Api.openLite(alloc, path, .{
+        var api = try Api.createLite(alloc, path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -727,7 +745,7 @@ test "embedded api openLite manages index and enrichment definitions over aflite
     defer alloc.free(path);
 
     {
-        var api = try Api.openLite(alloc, path, .{
+        var api = try Api.createLite(alloc, path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -787,7 +805,7 @@ test "embedded api openLite resumes generated enrichment after hosted maintenanc
     defer alloc.free(path);
 
     {
-        var hosted = try Api.openLiteHosted(alloc, path, .{
+        var hosted = try Api.createLiteHosted(alloc, path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -868,7 +886,7 @@ test "embedded api openLite keeps full text index inside native aflite file" {
     defer alloc.free(applied_sequence_checkpoint_path);
 
     {
-        var api = try Api.openLite(alloc, path, .{
+        var api = try Api.createLite(alloc, path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -948,7 +966,7 @@ test "embedded api openLite persists schema json over aflite file" {
     ;
 
     {
-        var api = try Api.openLite(alloc, path, .{
+        var api = try Api.createLite(alloc, path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -1011,7 +1029,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     try std.testing.expect(std.mem.indexOf(u8, malformed_check_json, "\"issue\":\"truncated_header\"") != null);
 
     {
-        var api = try Api.openLite(alloc, src_path, .{
+        var api = try Api.createLite(alloc, src_path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -1162,7 +1180,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     }
 
     {
-        var malformed_target = try Api.openLite(alloc, malformed_dst_path, .{
+        var malformed_target = try Api.createLite(alloc, malformed_dst_path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -1197,7 +1215,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     }
 
     {
-        var restored = try Api.openLite(alloc, dst_path, .{
+        var restored = try Api.createLite(alloc, dst_path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
@@ -1270,7 +1288,7 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     }
 
     {
-        var roundtrip = try Api.openLite(alloc, roundtrip_path, .{
+        var roundtrip = try Api.createLite(alloc, roundtrip_path, .{
             .table_name = "docs",
             .db = .{
                 .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },

@@ -56,7 +56,7 @@ const (
 	InferenceModeDisabledDeferred         = C.ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED
 )
 
-// OpenOptions configures OpenWithOptions.
+// OpenOptions configures OpenWithOptions and CreateWithOptions.
 type OpenOptions struct {
 	Mode                      OpenMode
 	Profile                   Profile
@@ -125,9 +125,17 @@ func cABIErrorCodeDescription(code ErrorCode) string {
 	return C.GoString(C.antfly_error_code_description(C.antfly_error_code(code)))
 }
 
-// Open opens or creates a native Antfly Lite database file for writing.
+// Open opens an existing native Antfly Lite database file for writing.
 func Open(path string) (*DB, error) {
 	return OpenWithOptions(path, OpenOptions{
+		Mode:    OpenModeWriter,
+		Profile: ProfileNative,
+	})
+}
+
+// Create creates a new native Antfly Lite database file for writing.
+func Create(path string) (*DB, error) {
+	return CreateWithOptions(path, OpenOptions{
 		Mode:    OpenModeWriter,
 		Profile: ProfileNative,
 	})
@@ -149,7 +157,7 @@ func OpenStatusOnly(path string) (*DB, error) {
 	})
 }
 
-// OpenHosted opens or creates an Antfly Lite database in hosted/manual
+// OpenHosted opens an existing Antfly Lite database in hosted/manual
 // maintenance mode. In this profile callers drive pending work explicitly with
 // RunUntilIdle.
 func OpenHosted(path string) (*DB, error) {
@@ -167,8 +175,34 @@ func OpenHosted(path string) (*DB, error) {
 	return newDB(handle), nil
 }
 
+// CreateHosted creates a new Antfly Lite database in hosted/manual maintenance
+// mode. In this profile callers drive pending work explicitly with RunUntilIdle.
+func CreateHosted(path string) (*DB, error) {
+	if err := ValidateABI(); err != nil {
+		return nil, err
+	}
+
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	var handle unsafe.Pointer
+	if err := check(C.antfly_lite_create_hosted(cPath, &handle)); err != nil {
+		return nil, err
+	}
+	return newDB(handle), nil
+}
+
 // OpenWithOptions opens an Antfly Lite database using explicit C ABI options.
 func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
+	return openWithOptions(path, opts, false)
+}
+
+// CreateWithOptions creates an Antfly Lite database using explicit C ABI options.
+func CreateWithOptions(path string, opts OpenOptions) (*DB, error) {
+	return openWithOptions(path, opts, true)
+}
+
+func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 	if err := ValidateABI(); err != nil {
 		return nil, err
 	}
@@ -209,7 +243,13 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	}
 
 	var handle unsafe.Pointer
-	if err := check(C.antfly_lite_open_with_options(cPath, &cOpts, &handle)); err != nil {
+	var code C.antfly_error_code
+	if create {
+		code = C.antfly_lite_create_with_options(cPath, &cOpts, &handle)
+	} else {
+		code = C.antfly_lite_open_with_options(cPath, &cOpts, &handle)
+	}
+	if err := check(code); err != nil {
 		return nil, err
 	}
 	return newDB(handle), nil

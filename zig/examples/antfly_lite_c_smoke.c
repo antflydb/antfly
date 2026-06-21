@@ -142,7 +142,7 @@ int main(void) {
     (void)remove(bad_path);
 
     void *handle = NULL;
-    if (expect_ok(antfly_lite_open_with_options(path, &options, &handle), "open lite database") != 0) {
+    if (expect_ok(antfly_lite_create_with_options(path, &options, &handle), "create lite database") != 0) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);

@@ -49,20 +49,10 @@ pub const Store = struct {
     }
 
     pub fn openWithOptions(allocator: Allocator, path: []const u8, opts: OpenOptions) !Store {
-        const file = native.NativeFile.openWithOptions(allocator, path, .{
+        const file = try native.NativeFile.openWithOptions(allocator, path, .{
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
-        }) catch |err| switch (err) {
-            error.FileNotFound => {
-                if (opts.read_only) return err;
-                return .{
-                    .allocator = allocator,
-                    .file = try native.NativeFile.createWithOptions(allocator, path, .{ .no_sync = opts.no_sync }),
-                    .read_only = opts.read_only,
-                };
-            },
-            else => return err,
-        };
+        });
         return .{
             .allocator = allocator,
             .file = file,
@@ -792,7 +782,7 @@ test "lite native docstore runtime persists atomic batch" {
     defer allocator.free(path);
 
     {
-        var store = try Store.open(allocator, path, false);
+        var store = try Store.create(allocator, path, true);
         defer store.close();
 
         var runtime = try store.runtimeStore(allocator);
@@ -829,7 +819,7 @@ test "lite native docstore runtime scans ordered snapshot" {
     const path = try testPath(allocator, tmp, "native-docstore-scan.aflite");
     defer allocator.free(path);
 
-    var store = try Store.open(allocator, path, false);
+    var store = try Store.create(allocator, path, true);
     defer store.close();
 
     var runtime = try store.runtimeStore(allocator);
@@ -877,7 +867,7 @@ test "lite native docstore persists replay lanes across reopen and truncation" {
     defer allocator.free(payload);
 
     {
-        var store = try Store.open(allocator, path, false);
+        var store = try Store.create(allocator, path, true);
         defer store.close();
 
         var runtime = try store.runtimeStore(allocator);
@@ -966,7 +956,7 @@ test "lite native docstore reserves one writer until abort or commit" {
     const path = try testPath(allocator, tmp, "native-docstore-single-writer.aflite");
     defer allocator.free(path);
 
-    var store = try Store.open(allocator, path, false);
+    var store = try Store.create(allocator, path, true);
     defer store.close();
 
     var writer = try store.beginWrite();

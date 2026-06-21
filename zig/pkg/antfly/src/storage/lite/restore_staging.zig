@@ -52,6 +52,23 @@ const LiteDb = struct {
         };
     }
 
+    fn create(allocator: Allocator, path: []const u8) !LiteDb {
+        var lite_backend = try backend.Handle.create(allocator, path, true);
+        errdefer lite_backend.deinit();
+
+        var opts = db_mod.OpenOptions{
+            .open_mode = .writer,
+            .external_derived_checkpoints = false,
+        };
+        try lite_backend.configureDbOpenOptions(&opts);
+
+        return .{
+            .backend = lite_backend,
+            .db = try db_mod.DB.open(allocator, path, opts),
+            .open_mode = .writer,
+        };
+    }
+
     fn close(self: *LiteDb) void {
         if (liteOpenModeCanWrite(self.open_mode)) {
             self.db.sync(true) catch {};
@@ -581,7 +598,7 @@ test "lite restore staging writer close syncs unsynced batch before readonly reo
     defer allocator.free(path);
 
     {
-        var lite = try LiteDb.open(allocator, path, .writer);
+        var lite = try LiteDb.create(allocator, path);
         defer lite.close();
 
         try lite.db.batch(.{
@@ -633,7 +650,7 @@ test "lite restore staging preserves portable afb schema index and enrichment me
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(allocator);
     {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path);
         defer source.close();
 
         try source.db.setSchemaJson(allocator, schema_json);
@@ -770,7 +787,7 @@ test "lite restore staging accepts aflite input for normal restore" {
     };
 
     {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path);
         defer source.close();
 
         try source.db.setSchemaJson(allocator, schema_json);
@@ -842,7 +859,7 @@ test "lite restore staging accepts aflite input for normal restore" {
     const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/normal-restore-roundtrip.aflite", .{tmp.sub_path});
     defer allocator.free(restored_path);
     {
-        var restored = try LiteDb.open(allocator, restored_path, .writer);
+        var restored = try LiteDb.create(allocator, restored_path);
         defer restored.close();
         try importPortableIntoLiteDb(allocator, &restored.db, portable);
 
@@ -901,7 +918,7 @@ test "lite restore staging exports stable aflite data while writer has open tran
     const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
     defer allocator.free(location);
 
-    var source = try LiteDb.open(allocator, src_path, .writer);
+    var source = try LiteDb.create(allocator, src_path);
     defer source.close();
 
     try source.db.batch(.{
@@ -933,7 +950,7 @@ test "lite restore staging exports stable aflite data while writer has open tran
     defer allocator.free(portable);
     try portable_backup.validatePortable(allocator, portable);
 
-    var restored = try LiteDb.open(allocator, restored_path, .writer);
+    var restored = try LiteDb.create(allocator, restored_path);
     defer restored.close();
     try importPortableIntoLiteDb(allocator, &restored.db, portable);
 
@@ -979,7 +996,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     };
 
     {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path);
         defer source.close();
 
         try source.db.setSchemaJson(allocator, schema_json);
@@ -1083,7 +1100,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     try portable_backup.validatePortable(allocator, normal_portable);
 
     {
-        var restored = try LiteDb.open(allocator, restored_path, .writer);
+        var restored = try LiteDb.create(allocator, restored_path);
         defer restored.close();
 
         try importPortableIntoLiteDb(allocator, &restored.db, normal_portable);

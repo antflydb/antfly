@@ -1938,7 +1938,7 @@ test "lite query readonly runs while writer handle is open" {
     const query_path_z = try allocator.dupeZ(u8, query_path);
     defer allocator.free(query_path_z);
 
-    var writer = try LiteDb.open(allocator, path, .writer);
+    var writer = try LiteDb.create(allocator, path, true);
     defer writer.close();
 
     try writer.db.addIndex(.{
@@ -1977,7 +1977,7 @@ test "lite init target check treats existing aflite as occupied" {
 
     try std.testing.expect(!initTargetExists(io, path));
     {
-        var lite = try LiteDb.open(allocator, path, .writer);
+        var lite = try LiteDb.create(allocator, path, true);
         defer lite.close();
     }
     try std.testing.expect(initTargetExists(io, path));
@@ -2026,7 +2026,7 @@ test "lite backup command exports stable data while writer has open transaction"
     const backup_path_z = try allocator.dupeZ(u8, backup_path);
     defer allocator.free(backup_path_z);
 
-    var writer = try LiteDb.open(allocator, path, .writer);
+    var writer = try LiteDb.create(allocator, path, true);
     defer writer.close();
 
     const committed = try batchJson(allocator, &writer.db,
@@ -2087,7 +2087,7 @@ test "lite export subcommand dispatches portable backup alias" {
     defer allocator.free(backup_path_z);
 
     {
-        var lite = try LiteDb.open(allocator, path, .writer);
+        var lite = try LiteDb.create(allocator, path, true);
         defer lite.close();
 
         const json = try batchJson(allocator, &lite.db,
@@ -2131,7 +2131,7 @@ test "lite restore source can be an aflite database" {
     defer allocator.free(dst_path);
 
     {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path, true);
         defer source.close();
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:lite-restore\":{\"title\":\"from aflite source\"}}}");
         defer allocator.free(json);
@@ -2710,7 +2710,7 @@ test "lite status json includes pending work" {
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-pending.aflite", .{tmp.sub_path});
     defer allocator.free(path);
 
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var lite = try LiteDb.create(allocator, path, true);
     defer lite.close();
 
     const index_json =
@@ -3076,7 +3076,7 @@ test "lite snapshot copies stable aflite prefix without source tail" {
     defer allocator.free(snapshot_path);
 
     const source_size = blk: {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path, true);
         defer source.close();
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:lite-snapshot\":{\"title\":\"stable snapshot\"}}}");
         defer allocator.free(json);
@@ -3133,7 +3133,7 @@ test "lite promote stages portable afb and table manifest" {
     const index_json = "{\"name\":\"promote_ft_body\",\"kind\":\"full_text\",\"config_json\":\"{\\\"chunk_name\\\":\\\"promote_chunks_v1\\\"}\"}";
 
     {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path, true);
         defer source.close();
 
         try source.db.setSchemaJson(allocator, schema_json);
@@ -3207,7 +3207,7 @@ test "lite promote helper stages backup then submits normal restore request" {
     defer allocator.free(location);
 
     {
-        var source = try LiteDb.open(allocator, src_path, .writer);
+        var source = try LiteDb.create(allocator, src_path, true);
         defer source.close();
 
         const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:promote-command\":{\"title\":\"restore request\"}}}");
