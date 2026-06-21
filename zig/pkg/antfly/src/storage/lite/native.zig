@@ -206,6 +206,10 @@ pub const OwnedCatalogRecord = struct {
     value: []u8,
 };
 
+pub const OwnedCatalogKey = struct {
+    key: []u8,
+};
+
 pub const NativeFile = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
@@ -568,6 +572,10 @@ pub const NativeFile = struct {
         return try self.snapshotCatalogRecordsFromRootAlloc(allocator, .index);
     }
 
+    pub fn snapshotIndexCatalogKeysAlloc(self: *NativeFile, allocator: Allocator) ![]OwnedCatalogKey {
+        return try self.snapshotCatalogKeysFromRootAlloc(allocator, .index);
+    }
+
     fn snapshotCatalogRecordsFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogRecord {
         var map = std.StringHashMapUnmanaged(?[]u8).empty;
         defer {
@@ -622,11 +630,60 @@ pub const NativeFile = struct {
         return try records.toOwnedSlice(allocator);
     }
 
+    fn snapshotCatalogKeysFromRootAlloc(self: *NativeFile, allocator: Allocator, root: CatalogRoot) ![]OwnedCatalogKey {
+        var map = std.StringHashMapUnmanaged(bool).empty;
+        defer {
+            var it = map.iterator();
+            while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+            map.deinit(allocator);
+        }
+
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .catalog);
+            defer allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+
+            if (!map.contains(entry.key)) {
+                const owned_key = try allocator.dupe(u8, entry.key);
+                errdefer allocator.free(owned_key);
+                try map.put(allocator, owned_key, !entry.is_delete);
+            }
+            page_id = entry.previous_page;
+        }
+
+        var keys = std.ArrayListUnmanaged(OwnedCatalogKey).empty;
+        errdefer {
+            for (keys.items) |record| allocator.free(record.key);
+            keys.deinit(allocator);
+        }
+        var it = map.iterator();
+        while (it.next()) |entry| {
+            if (!entry.value_ptr.*) continue;
+            const key = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(key);
+            try keys.append(allocator, .{ .key = key });
+        }
+
+        std.mem.sort(OwnedCatalogKey, keys.items, {}, struct {
+            fn lessThan(_: void, lhs: OwnedCatalogKey, rhs: OwnedCatalogKey) bool {
+                return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+            }
+        }.lessThan);
+
+        return try keys.toOwnedSlice(allocator);
+    }
+
     pub fn freeSnapshotCatalogRecords(allocator: Allocator, records: []OwnedCatalogRecord) void {
         for (records) |record| {
             allocator.free(record.key);
             allocator.free(record.value);
         }
+        allocator.free(records);
+    }
+
+    pub fn freeSnapshotCatalogKeys(allocator: Allocator, records: []OwnedCatalogKey) void {
+        for (records) |record| allocator.free(record.key);
         allocator.free(records);
     }
 
@@ -2639,6 +2696,39 @@ test "lite native catalog supports tombstones and spilled values" {
 
     const report = try reopened.check();
     try std.testing.expect(report.valid);
+}
+
+test "lite native index catalog snapshots live keys without values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-index-catalog-keys.aflite");
+    defer allocator.free(path);
+
+    const large = try allocator.alloc(u8, default_page_size * 2);
+    defer allocator.free(large);
+    @memset(large, 'x');
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putIndexCatalogRecord("/index/b.tbl", large);
+        try file.putIndexCatalogRecord("/index/a.tbl", "small");
+        try file.putIndexCatalogRecord("/index/deleted.tbl", "gone");
+        try file.deleteIndexCatalogRecord("/index/deleted.tbl");
+        try file.putIndexCatalogRecord("/index/a.tbl", "newer");
+    }
+
+    var reopened = try NativeFile.open(allocator, path, true);
+    defer reopened.close();
+
+    const keys = try reopened.snapshotIndexCatalogKeysAlloc(allocator);
+    defer NativeFile.freeSnapshotCatalogKeys(allocator, keys);
+    try std.testing.expectEqual(@as(usize, 2), keys.len);
+    try std.testing.expectEqualStrings("/index/a.tbl", keys[0].key);
+    try std.testing.expectEqualStrings("/index/b.tbl", keys[1].key);
 }
 
 test "lite native catalog detects corrupted root page" {

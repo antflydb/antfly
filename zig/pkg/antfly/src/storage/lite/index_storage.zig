@@ -173,8 +173,8 @@ fn deleteTree(ptr: *anyopaque, path: []const u8) !void {
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const index_records = try self.docs.file.snapshotIndexCatalogRecordsAlloc(self.allocator);
-    defer native.NativeFile.freeSnapshotCatalogRecords(self.allocator, index_records);
+    const index_records = try self.docs.file.snapshotIndexCatalogKeysAlloc(self.allocator);
+    defer native.NativeFile.freeSnapshotCatalogKeys(self.allocator, index_records);
 
     var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
     defer {
@@ -356,6 +356,10 @@ test "lite native index storage handles large files rename and delete tree" {
     try storage.deleteTree("/dense/a");
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob2", 8));
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/sub/file", 8));
+
+    const keys = try docs.file.snapshotIndexCatalogKeysAlloc(allocator);
+    defer native.NativeFile.freeSnapshotCatalogKeys(allocator, keys);
+    try std.testing.expectEqual(@as(usize, 0), keys.len);
 }
 
 test "lite native index storage aborts atomic writes without publishing partial files" {
