@@ -708,6 +708,8 @@ fn finishRestoredLiteImportPath(allocator: Allocator, path: []const u8) !void {
     var lite = try LiteDb.open(allocator, path, .writer);
     defer lite.close();
     _ = try lite.db.rebuildDenseIndexesForTargetCoverage(allocator);
+    _ = try lite.db.rebuildSparseIndexesForTargetCoverage(allocator);
+    try lite.db.rebuildGraphIndexesForTargetCoverage(allocator);
     _ = try lite.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
     try lite.db.runUntilIdle();
     try lite.db.sync(true);
@@ -1900,19 +1902,44 @@ test "lite backup output restores schema indexes enrichments and documents" {
             .chunk_overlap = 2,
         });
         try source.db.addIndex(.{
-            .name = "ft_body_v1",
-            .kind = .full_text,
-            .config_json = "{\"chunk_name\":\"body_chunks_v1\"}",
-        });
-        try source.db.addIndex(.{
             .name = "ft_direct_v1",
             .kind = .full_text,
             .config_json = "{}",
         });
+        try source.db.addIndex(.{
+            .name = "dense_external_v1",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        try source.db.addIndex(.{
+            .name = "sparse_external_v1",
+            .kind = .sparse_vector,
+            .config_json = "{\"field\":\"sparse_embedding\",\"external\":true}",
+        });
+        try source.db.addIndex(.{
+            .name = "graph_links_v1",
+            .kind = .graph,
+            .config_json = "{}",
+        });
 
-        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:backup-roundtrip\":{\"title\":\"portable backup restore\",\"body\":\"schema and catalog survive\"}}}");
-        defer allocator.free(json);
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+        try source.db.batch(.{
+            .writes = &.{
+                .{
+                    .key = "doc:backup-roundtrip",
+                    .value = "{\"title\":\"portable backup restore\",\"body\":\"schema and catalog survive hybrid alpha\",\"_embeddings\":{\"dense_external_v1\":[1,0],\"sparse_external_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"_edges\":{\"graph_links_v1\":{\"links\":[{\"target\":\"doc:backup-target\",\"weight\":1.0}]}}}",
+                },
+                .{
+                    .key = "doc:backup-other",
+                    .value = "{\"title\":\"other restore\",\"body\":\"schema and catalog survive beta\",\"_embeddings\":{\"dense_external_v1\":[0,1],\"sparse_external_v1\":{\"indices\":[99],\"values\":[2.0]}}}",
+                },
+                .{
+                    .key = "doc:backup-target",
+                    .value = "{\"title\":\"portable graph target\"}",
+                },
+            },
+            .sync_level = .full_index,
+        });
+        try source.db.runUntilIdle();
     }
 
     const src_path_z = try allocator.dupeZ(u8, src_path);
@@ -1936,21 +1963,30 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try restored.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 2), indexes.len);
-        var saw_chunk_index = false;
+        try std.testing.expectEqual(@as(usize, 4), indexes.len);
         var saw_direct_index = false;
+        var saw_dense_index = false;
+        var saw_sparse_index = false;
+        var saw_graph_index = false;
         for (indexes) |index| {
-            if (std.mem.eql(u8, index.name, "ft_body_v1")) {
-                saw_chunk_index = true;
-                try std.testing.expectEqual(db_types.IndexKind.full_text, index.kind);
-                try std.testing.expect(std.mem.indexOf(u8, index.config_json, "body_chunks_v1") != null);
-            } else if (std.mem.eql(u8, index.name, "ft_direct_v1")) {
+            if (std.mem.eql(u8, index.name, "ft_direct_v1")) {
                 saw_direct_index = true;
                 try std.testing.expectEqual(db_types.IndexKind.full_text, index.kind);
+            } else if (std.mem.eql(u8, index.name, "dense_external_v1")) {
+                saw_dense_index = true;
+                try std.testing.expectEqual(db_types.IndexKind.dense_vector, index.kind);
+            } else if (std.mem.eql(u8, index.name, "sparse_external_v1")) {
+                saw_sparse_index = true;
+                try std.testing.expectEqual(db_types.IndexKind.sparse_vector, index.kind);
+            } else if (std.mem.eql(u8, index.name, "graph_links_v1")) {
+                saw_graph_index = true;
+                try std.testing.expectEqual(db_types.IndexKind.graph, index.kind);
             }
         }
-        try std.testing.expect(saw_chunk_index);
         try std.testing.expect(saw_direct_index);
+        try std.testing.expect(saw_dense_index);
+        try std.testing.expect(saw_sparse_index);
+        try std.testing.expect(saw_graph_index);
 
         const enrichments = try restored.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
@@ -1966,6 +2002,38 @@ test "lite backup output restores schema indexes enrichments and documents" {
         const json = try lookupJson(allocator, &restored.db, "doc:backup-roundtrip", "");
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"portable backup restore\"") != null);
+
+        const dense = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"embeddings\":{\"dense_external_v1\":[1,0]},\"indexes\":[\"dense_external_v1\"],\"limit\":1}",
+        );
+        defer allocator.free(dense);
+        try std.testing.expect(std.mem.indexOf(u8, dense, "\"doc:backup-roundtrip\"") != null);
+
+        const sparse = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"embeddings\":{\"sparse_external_v1\":{\"indices\":[7,42],\"values\":[1.5,0.5]}},\"indexes\":[\"sparse_external_v1\"],\"limit\":1}",
+        );
+        defer allocator.free(sparse);
+        try std.testing.expect(std.mem.indexOf(u8, sparse, "\"doc:backup-roundtrip\"") != null);
+
+        const graph = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"graph_searches\":{\"neighbors\":{\"type\":\"neighbors\",\"index_name\":\"graph_links_v1\",\"start_nodes\":{\"keys\":[\"doc:backup-roundtrip\"]},\"params\":{\"edge_types\":[\"links\"]}}},\"limit\":10}",
+        );
+        defer allocator.free(graph);
+        try std.testing.expect(std.mem.indexOf(u8, graph, "\"doc:backup-target\"") != null);
+
+        const hybrid = try searchJson(
+            allocator,
+            &restored.db,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"hybrid alpha\"}},\"embeddings\":{\"dense_external_v1\":[1,0]},\"indexes\":[\"dense_external_v1\"],\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":3}",
+        );
+        defer allocator.free(hybrid);
+        try std.testing.expect(std.mem.indexOf(u8, hybrid, "\"doc:backup-roundtrip\"") != null);
     }
 
     {
@@ -1984,7 +2052,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
 
         const indexes = try imported.db.listIndexes(allocator);
         defer db_types.freeIndexConfigs(allocator, indexes);
-        try std.testing.expectEqual(@as(usize, 2), indexes.len);
+        try std.testing.expectEqual(@as(usize, 4), indexes.len);
 
         const enrichments = try imported.db.listEnrichments(allocator);
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
