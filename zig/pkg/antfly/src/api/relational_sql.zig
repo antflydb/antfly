@@ -10797,8 +10797,24 @@ const Parser = struct {
         if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
         try validateSqlUpdateTargetPaths(self.schema, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items);
         if (self.matchKeyword("where")) {
-            if (self.schema.relational_columns.len == 0) return error.InvalidSqlCatalog;
-            try self.parseConflictActionWhereClause(insert_columns, &where_expression, &where_expressions, &where_any, &where_not);
+            try sql_adapter.parseConflictActionWhereClause(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                self.params,
+                self.schema,
+                self.conflict_existing_qualifiers,
+                insert_columns,
+                self.rowExpressionTypeContext(),
+                self.defer_row_expression_field_validation,
+                &where_expression,
+                &where_expressions,
+                &where_any,
+                &where_not,
+                self.conflictExpressionConditionParserHooks(),
+                self.conflictExpressionDispatchHooks(),
+                self.conflictActionWhereConditionParserHooks(),
+            );
         }
 
         return .{
@@ -10815,117 +10831,6 @@ const Parser = struct {
             .where_any = try where_any.toOwnedSlice(self.alloc),
             .where_not = try where_not.toOwnedSlice(self.alloc),
         };
-    }
-
-    fn parseConflictActionWhereClause(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        where_expression: *?db_mod.types.RelationalRowsExpressionCondition,
-        where_expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-        where_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-        where_not: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) !void {
-        const column = self.schema.relational_columns[0];
-        if (self.matchKeyword("not")) {
-            try self.expect(.lparen);
-            while (true) {
-                const branch_groups = try self.parseConflictActionWhereBranchGroupsAlloc(column, insert_columns);
-                var branch_groups_transferred = false;
-                errdefer if (!branch_groups_transferred) {
-                    freeExpressionPredicateGroups(self.alloc, branch_groups);
-                    self.alloc.free(branch_groups);
-                };
-                try where_not.appendSlice(self.alloc, branch_groups);
-                branch_groups_transferred = true;
-                self.alloc.free(branch_groups);
-                if (!self.matchKeyword("or")) break;
-            }
-            try self.expect(.rparen);
-            return;
-        }
-
-        const wrapped_disjunction = sql_adapter.conflictParenthesizedDisjunctionCanStart(self.tokens, self.pos);
-        if (wrapped_disjunction) try self.expect(.lparen);
-
-        var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
-        var groups_transferred = false;
-        defer groups.deinit(self.alloc);
-        errdefer if (!groups_transferred) freeExpressionPredicateGroups(self.alloc, groups.items);
-        while (true) {
-            const branch_groups = try self.parseConflictActionWhereBranchGroupsAlloc(column, insert_columns);
-            var branch_groups_transferred = false;
-            errdefer if (!branch_groups_transferred) {
-                freeExpressionPredicateGroups(self.alloc, branch_groups);
-                self.alloc.free(branch_groups);
-            };
-            try groups.appendSlice(self.alloc, branch_groups);
-            branch_groups_transferred = true;
-            self.alloc.free(branch_groups);
-            if (!self.matchKeyword("or")) break;
-        }
-        if (wrapped_disjunction) try self.expect(.rparen);
-
-        if (groups.items.len == 1) {
-            const conditions = groups.items[0].conditions;
-            groups.items[0].conditions = &.{};
-            if (conditions.len == 1) {
-                where_expression.* = conditions[0];
-                self.alloc.free(conditions);
-            } else {
-                try where_expressions.appendSlice(self.alloc, conditions);
-                self.alloc.free(conditions);
-            }
-            groups_transferred = true;
-            return;
-        }
-
-        try where_any.appendSlice(self.alloc, groups.items);
-        groups_transferred = true;
-    }
-
-    fn parseConflictActionWhereBranchGroupsAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) ![]const db_mod.types.RelationalRowsExpressionPredicateGroup {
-        const parenthesized = sql_adapter.conflictParenthesizedConjunctionCanStart(self.tokens, self.pos);
-        if (parenthesized) try self.expect(.lparen);
-
-        var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
-        errdefer {
-            freeExpressionPredicateGroups(self.alloc, groups.items);
-            groups.deinit(self.alloc);
-        }
-        try groups.append(self.alloc, .{ .conditions = &.{} });
-
-        while (true) {
-            var alternatives = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
-            defer alternatives.deinit(self.alloc);
-            errdefer freeExpressionPredicateGroups(self.alloc, alternatives.items);
-            try sql_adapter.parseConflictActionWhereConditionAlternatives(
-                self.alloc,
-                self.tokens,
-                &self.pos,
-                self.params,
-                self.schema,
-                self.conflict_existing_qualifiers,
-                column,
-                insert_columns,
-                self.rowExpressionTypeContext(),
-                self.defer_row_expression_field_validation,
-                &alternatives,
-                self.conflictExpressionConditionParserHooks(),
-                self.conflictExpressionDispatchHooks(),
-                self.conflictActionWhereConditionParserHooks(),
-            );
-            try sql_adapter.andExpressionPredicateAlternatives(self.alloc, &groups, alternatives.items);
-            freeExpressionPredicateGroups(self.alloc, alternatives.items);
-            if (!self.matchKeyword("and")) break;
-        }
-
-        if (groups.items.len == 0) return error.UnsupportedSqlShape;
-        if (parenthesized) try self.expect(.rparen);
-        return try groups.toOwnedSlice(self.alloc);
     }
 
     fn parseConflictTarget(self: *@This(), table_name: []const u8) !ConflictTarget {

@@ -994,6 +994,7 @@ pub const parseConflictConcatExpressionAlloc = lower_dml.parseConflictConcatExpr
 pub const parseConflictDateExpressionAlloc = lower_dml.parseConflictDateExpressionAlloc;
 pub const parseConflictExpressionConditionAlloc = lower_dml.parseConflictExpressionConditionAlloc;
 pub const parseConflictActionWhereConditionAlternatives = lower_dml.parseConflictActionWhereConditionAlternatives;
+pub const parseConflictActionWhereClause = lower_dml.parseConflictActionWhereClause;
 pub const parseConflictExpressionOperandAlloc = lower_dml.parseConflictExpressionOperandAlloc;
 pub const parseConflictFieldExpressionAlloc = lower_dml.parseConflictFieldExpressionAlloc;
 pub const parseConflictFieldOrJsonExtractExpressionAlloc = lower_dml.parseConflictFieldOrJsonExtractExpressionAlloc;

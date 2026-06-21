@@ -2933,6 +2933,138 @@ pub fn parseConflictActionWhereConditionAlternatives(
     if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
 }
 
+pub fn parseConflictActionWhereClause(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    where_expression: *?db_mod.types.RelationalRowsExpressionCondition,
+    where_expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
+    where_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    where_not: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    condition_hooks: ConflictExpressionConditionParserHooks,
+    dispatch_hooks: ConflictExpressionDispatchHooks,
+    action_hooks: ConflictActionWhereConditionParserHooks,
+) !void {
+    if (schema.relational_columns.len == 0) return error.InvalidSqlCatalog;
+    const column = schema.relational_columns[0];
+    if (parser.matchKeyword(tokens, pos, "not")) {
+        try parser.expectToken(tokens, pos, .lparen);
+        while (true) {
+            const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks, dispatch_hooks, action_hooks);
+            var branch_groups_transferred = false;
+            errdefer if (!branch_groups_transferred) {
+                freeExpressionPredicateGroups(alloc, branch_groups);
+                alloc.free(branch_groups);
+            };
+            try where_not.appendSlice(alloc, branch_groups);
+            branch_groups_transferred = true;
+            alloc.free(branch_groups);
+            if (!parser.matchKeyword(tokens, pos, "or")) break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+        return;
+    }
+
+    const wrapped_disjunction = conflictParenthesizedDisjunctionCanStart(tokens, pos.*);
+    if (wrapped_disjunction) try parser.expectToken(tokens, pos, .lparen);
+
+    var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    var groups_transferred = false;
+    defer groups.deinit(alloc);
+    errdefer if (!groups_transferred) freeExpressionPredicateGroups(alloc, groups.items);
+    while (true) {
+        const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks, dispatch_hooks, action_hooks);
+        var branch_groups_transferred = false;
+        errdefer if (!branch_groups_transferred) {
+            freeExpressionPredicateGroups(alloc, branch_groups);
+            alloc.free(branch_groups);
+        };
+        try groups.appendSlice(alloc, branch_groups);
+        branch_groups_transferred = true;
+        alloc.free(branch_groups);
+        if (!parser.matchKeyword(tokens, pos, "or")) break;
+    }
+    if (wrapped_disjunction) try parser.expectToken(tokens, pos, .rparen);
+
+    if (groups.items.len == 1) {
+        const conditions = groups.items[0].conditions;
+        groups.items[0].conditions = &.{};
+        if (conditions.len == 1) {
+            where_expression.* = conditions[0];
+            alloc.free(conditions);
+        } else {
+            try where_expressions.appendSlice(alloc, conditions);
+            alloc.free(conditions);
+        }
+        groups_transferred = true;
+        return;
+    }
+
+    try where_any.appendSlice(alloc, groups.items);
+    groups_transferred = true;
+}
+
+fn parseConflictActionWhereBranchGroupsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    condition_hooks: ConflictExpressionConditionParserHooks,
+    dispatch_hooks: ConflictExpressionDispatchHooks,
+    action_hooks: ConflictActionWhereConditionParserHooks,
+) ![]const db_mod.types.RelationalRowsExpressionPredicateGroup {
+    const parenthesized = conflictParenthesizedConjunctionCanStart(tokens, pos.*);
+    if (parenthesized) try parser.expectToken(tokens, pos, .lparen);
+
+    var groups = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+    errdefer {
+        freeExpressionPredicateGroups(alloc, groups.items);
+        groups.deinit(alloc);
+    }
+    try groups.append(alloc, .{ .conditions = &.{} });
+
+    while (true) {
+        var alternatives = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        defer alternatives.deinit(alloc);
+        errdefer freeExpressionPredicateGroups(alloc, alternatives.items);
+        try parseConflictActionWhereConditionAlternatives(
+            alloc,
+            tokens,
+            pos,
+            params,
+            schema,
+            conflict_existing_qualifiers,
+            column,
+            insert_columns,
+            type_context,
+            defer_row_expression_field_validation,
+            &alternatives,
+            condition_hooks,
+            dispatch_hooks,
+            action_hooks,
+        );
+        try lower_expr.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+        freeExpressionPredicateGroups(alloc, alternatives.items);
+        if (!parser.matchKeyword(tokens, pos, "and")) break;
+    }
+
+    if (groups.items.len == 0) return error.UnsupportedSqlShape;
+    if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
+    return try groups.toOwnedSlice(alloc);
+}
+
 fn parseBareBooleanConflictExpressionConditionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
