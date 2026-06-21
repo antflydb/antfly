@@ -11705,6 +11705,99 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
+test "sql adapter lower dml lowers on conflict unique do update" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"existing\"}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = excluded.status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"pending\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 8), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"pending\"}", lowered.batch.returning_rows[0]);
+
+    var named_unique = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT ON CONSTRAINT usage_records_email_key DO UPDATE SET status = excluded.status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer named_unique.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), named_unique.batch.transformed);
+    try std.testing.expectEqualStrings("status", named_unique.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"pending\"", named_unique.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 8), named_unique.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"pending\"}", named_unique.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending'), ('u3', 'a@example.test', 'blocked') ON CONFLICT (email) DO UPDATE SET status = excluded.status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    var concat_lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = status || ':' || excluded.status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer concat_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), concat_lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", concat_lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"existing:pending\"", concat_lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 8), concat_lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"existing:pending\"}", concat_lowered.batch.returning_rows[0]);
+
+    var alias_concat_lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records AS u (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = u.status || ':' || excluded.status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer alias_concat_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), alias_concat_lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", alias_concat_lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"existing:pending\"", alias_concat_lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 8), alias_concat_lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"existing:pending\"}", alias_concat_lowered.batch.returning_rows[0]);
+
+    var initcap_lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'ready for review') ON CONFLICT (email) DO UPDATE SET status = initcap(excluded.status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer initcap_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), initcap_lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", initcap_lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"Ready For Review\"", initcap_lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 8), initcap_lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"Ready For Review\"}", initcap_lowered.batch.returning_rows[0]);
+}
+
 test "sql adapter lower dml lowers cross-column excluded conflict values" {
     const alloc = std.testing.allocator;
     const schema_json =
