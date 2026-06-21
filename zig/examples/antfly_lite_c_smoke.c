@@ -62,10 +62,12 @@ int main(void) {
     const char *path = "/tmp/antfly-lite-c-smoke.aflite";
     const char *restored_path = "/tmp/antfly-lite-c-smoke-restored.aflite";
     const char *snapshot_path = "/tmp/antfly-lite-c-smoke-snapshot.aflite";
+    const char *missing_path = "/tmp/antfly-lite-c-smoke-missing.aflite";
     const char *bad_path = "/tmp/antfly-lite-c-smoke-bad.aflite";
     (void)remove(path);
     (void)remove(restored_path);
     (void)remove(snapshot_path);
+    (void)remove(missing_path);
     (void)remove(bad_path);
 
     if (antfly_lite_abi_version() != 1) {
@@ -94,6 +96,35 @@ int main(void) {
     options.profile = ANTFLY_LITE_PROFILE_NATIVE;
     options.flags = ANTFLY_LITE_OPEN_FLAG_NO_SYNC;
 
+    int missing_sentinel = 0;
+    void *missing_handle = &missing_sentinel;
+    antfly_error_code missing_code = antfly_lite_open(missing_path, &missing_handle);
+    if (missing_code != ANTFLY_NOT_FOUND || missing_handle != NULL) {
+        fprintf(
+            stderr,
+            "missing lite open returned %s with handle=%p, expected ANTFLY_NOT_FOUND and null handle\n",
+            antfly_error_code_name(missing_code),
+            missing_handle
+        );
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(missing_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    FILE *unexpected_missing_file = fopen(missing_path, "rb");
+    if (unexpected_missing_file != NULL) {
+        fclose(unexpected_missing_file);
+        fprintf(stderr, "missing lite open created a database file unexpectedly\n");
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(missing_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+
     const char *bad_body = "short native lite header";
     FILE *bad_file = fopen(bad_path, "wb");
     if (bad_file == NULL) {
@@ -101,6 +132,7 @@ int main(void) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
+        (void)remove(missing_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -110,6 +142,7 @@ int main(void) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
+        (void)remove(missing_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -118,6 +151,7 @@ int main(void) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
+        (void)remove(missing_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -127,6 +161,7 @@ int main(void) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
+        (void)remove(missing_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -135,6 +170,7 @@ int main(void) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
+        (void)remove(missing_path);
         (void)remove(bad_path);
         return fail_with_buffer("file-level check did not report truncated lite file", &check_file);
     }
@@ -146,6 +182,7 @@ int main(void) {
         (void)remove(path);
         (void)remove(restored_path);
         (void)remove(snapshot_path);
+        (void)remove(missing_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -343,6 +380,7 @@ int main(void) {
     (void)remove(path);
     (void)remove(restored_path);
     (void)remove(snapshot_path);
+    (void)remove(missing_path);
     (void)remove(bad_path);
     return 0;
 }
