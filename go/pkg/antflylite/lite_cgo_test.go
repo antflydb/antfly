@@ -135,6 +135,41 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("lookup JSON %q did not contain written document", lookup)
 	}
 
+	txnID := TxnID{0x67, 0x6f, 0x2d, 0x6c, 0x69, 0x74, 0x65, 0x2d, 0x74, 0x78, 0x6e, 0x2d, 0, 0, 0, 1}
+	if err := db.BeginTransaction(txnID, 3, nil); err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	if err := db.WriteTransaction(txnID, []WriteIntent{{
+		Key:   "doc:go-txn",
+		Value: []byte(`{"title":"go transaction"}`),
+	}}); err != nil {
+		t.Fatalf("write transaction: %v", err)
+	}
+	if err := db.ResolveTransaction(txnID, TxnCommitted, 4); err != nil {
+		t.Fatalf("commit transaction: %v", err)
+	}
+	txnStatus, err := db.TransactionStatus(txnID)
+	if err != nil {
+		t.Fatalf("transaction status: %v", err)
+	}
+	if txnStatus != TxnCommitted {
+		t.Fatalf("transaction status = %d, want committed", txnStatus)
+	}
+	commitVersion, err := db.CommitVersion(txnID)
+	if err != nil {
+		t.Fatalf("transaction commit version: %v", err)
+	}
+	if commitVersion != 4 {
+		t.Fatalf("commit version = %d, want 4", commitVersion)
+	}
+	txnLookup, err := db.LookupJSON("doc:go-txn")
+	if err != nil {
+		t.Fatalf("lookup transaction document: %v", err)
+	}
+	if !bytes.Contains(txnLookup, []byte("go transaction")) {
+		t.Fatalf("transaction lookup JSON %q did not contain committed document", txnLookup)
+	}
+
 	schema := []byte(`{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","required":["title"]}}}}`)
 	if err := db.SetSchemaJSON(schema); err != nil {
 		t.Fatalf("set schema: %v", err)
