@@ -14,6 +14,7 @@
 
 pub const backend = @import("backend.zig");
 pub const capabilities = @import("capabilities.zig");
+pub const connection = @import("connection.zig");
 pub const docstore = @import("docstore.zig");
 pub const index_storage = @import("index_storage.zig");
 pub const native = @import("native.zig");
@@ -24,6 +25,7 @@ test {
     _ = backend;
     _ = @import("bridge.zig");
     _ = capabilities;
+    _ = connection;
     _ = docstore;
     _ = index_storage;
     _ = native;

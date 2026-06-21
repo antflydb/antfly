@@ -31,76 +31,10 @@ const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
+const LiteDb = antfly.lite.connection.Connection;
 
 var active_lite_http_state: ?*LiteHttpState = null;
 const lite_http_state_key = "antfly.lite.state";
-
-const LiteDb = struct {
-    backend: antfly.lite.backend.Handle,
-    db: db_mod.DB,
-    open_mode: db_mod.OpenOptions.OpenMode,
-
-    fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
-        var backend = try antfly.lite.backend.Handle.open(allocator, path, .{
-            .read_only = openModeRequiresReadOnlyBackends(open_mode),
-        });
-        errdefer backend.deinit();
-
-        var opts = db_mod.OpenOptions{
-            .open_mode = open_mode,
-            .external_derived_checkpoints = false,
-        };
-        try backend.configureDbOpenOptions(&opts);
-
-        const db = db_mod.DB.open(allocator, path, opts) catch |err| {
-            return err;
-        };
-
-        return .{
-            .backend = backend,
-            .db = db,
-            .open_mode = open_mode,
-        };
-    }
-
-    fn create(allocator: Allocator, path: []const u8, exclusive: bool) !LiteDb {
-        var backend = try antfly.lite.backend.Handle.create(allocator, path, exclusive);
-        errdefer backend.deinit();
-
-        var opts = db_mod.OpenOptions{
-            .open_mode = .writer,
-            .external_derived_checkpoints = false,
-        };
-        try backend.configureDbOpenOptions(&opts);
-
-        const db = db_mod.DB.open(allocator, path, opts) catch |err| {
-            return err;
-        };
-
-        return .{
-            .backend = backend,
-            .db = db,
-            .open_mode = .writer,
-        };
-    }
-
-    fn close(self: *LiteDb) void {
-        if (liteOpenModeCanWrite(self.open_mode)) {
-            self.db.sync(true) catch {};
-            self.db.syncIndexes(true) catch {};
-        }
-        self.db.close();
-        self.backend.deinit();
-        self.* = undefined;
-    }
-};
-
-fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
-    return switch (open_mode) {
-        .writer, .writer_no_replay => true,
-        else => false,
-    };
-}
 
 const CompactReport = struct {
     compacted: bool,
@@ -1289,10 +1223,6 @@ fn liteHttpVacuum(ctx: *httpx.Context) anyerror!httpx.Response {
     const json = std.json.Stringify.valueAlloc(ctx.allocator, report, .{}) catch |err| return liteHttpError(ctx, err);
     defer ctx.allocator.free(json);
     return liteHttpJson(ctx, 200, json);
-}
-
-fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool {
-    return open_mode == .query_readonly or open_mode == .status_only;
 }
 
 fn batchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
