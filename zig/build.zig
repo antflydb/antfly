@@ -3930,6 +3930,8 @@ pub fn build(b: *std.Build) void {
             "api http server applies SQL derived index DDL to catalog index metadata",
             "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL",
             "api http server wakes durable schema worker after SQL ALTER validation DDL",
+            "api schema rewrite wake continues after unclaimed terminal progress",
+            "api schema rewrite wake stops on busy-only pass",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.

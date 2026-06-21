@@ -6861,16 +6861,21 @@ skipped so one concurrent worker does not block later claimable jobs in the same
 drain pass. If the owner-local route observes that a raced job reached a
 terminal `ready` or `invalid` state before this worker claimed it, the
 schema-rewrite pass reports that terminal state instead of counting the job as a
-busy lease. Storage still does not store or interpret SQL text; only
+busy lease. API-triggered durable wake jobs treat claimed work and observed
+terminal state as progress, continue bounded passes while that progress is
+being made, stop immediately on busy-only passes, and hand long batches back to
+the runtime for a later maintenance job rather than monopolizing the worker.
+Storage still does not store or interpret SQL text; only
 `SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross the
 boundary. The provisioned/hosted table-write source boundary now exposes a
 schema-rewrite worker pass plus group-local internal route: catalog scans
 select range-scoped jobs, hosted routing forwards remote owner work through the
 internal group route, local owners open the current range DB, and completed or
 invalid metadata state is observed through the same catalog lifecycle. The
-remaining production step is controller orchestration that schedules these
-passes continuously and triggers schema compare-and-swap promotion once every
-required rewrite, rebuild, and validation record is complete.
+remaining production step is a catalog controller that schedules periodic
+catch-up passes for work that was not request-triggered and triggers schema
+compare-and-swap promotion once every required rewrite, rebuild, and validation
+record is complete.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from

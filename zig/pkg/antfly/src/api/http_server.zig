@@ -1598,9 +1598,12 @@ const SchemaRewriteWakeJob = struct {
             )) orelse return;
             defer pass.deinit(alloc);
 
-            if (pass.jobs_claimed == 0) return;
-            made_progress = true;
             if (pass.complete) return;
+            const pass_made_progress = pass.jobs_claimed != 0 or
+                pass.jobs_completed != 0 or
+                pass.jobs_invalidated != 0;
+            if (!pass_made_progress) return;
+            made_progress = true;
         }
         if (!made_progress or self.runtime.backend == .manual) return;
         SchemaRewriteWakeJob.submit(self.runtime, self.owner_id, self.source, self.table_name) catch |err| switch (err) {
@@ -2563,6 +2566,130 @@ test "api http server wakes durable schema worker after SQL ALTER validation DDL
     try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
     try std.testing.expectEqualStrings("audit_log", writes.last_table_name_buf[0..writes.last_table_name_len]);
     try std.testing.expectEqualStrings("api-schema-rewrite", writes.last_worker_id_buf[0..writes.last_worker_id_len]);
+}
+
+test "api schema rewrite wake continues after unclaimed terminal progress" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            if (!std.mem.eql(u8, table_name, "audit_log")) return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, worker_id, "api-schema-rewrite")) return error.TestUnexpectedResult;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            if (self.pass_count == 1) {
+                return .{
+                    .complete = false,
+                    .jobs_scanned = 2,
+                    .jobs_completed = 1,
+                };
+            }
+            return .{
+                .complete = true,
+                .jobs_scanned = 0,
+            };
+        }
+    };
+
+    var writes = FakeWrites{};
+    try SchemaRewriteWakeJob.submit(
+        runtime.ptr(),
+        runtime.ptr().allocOwnerId(),
+        writes.iface(),
+        "audit_log",
+    );
+    try std.testing.expectEqual(@as(usize, 2), writes.pass_count);
+}
+
+test "api schema rewrite wake stops on busy-only pass" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            if (!std.mem.eql(u8, table_name, "audit_log")) return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, worker_id, "api-schema-rewrite")) return error.TestUnexpectedResult;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            return .{
+                .complete = false,
+                .jobs_scanned = 1,
+                .jobs_busy = 1,
+            };
+        }
+    };
+
+    var writes = FakeWrites{};
+    try SchemaRewriteWakeJob.submit(
+        runtime.ptr(),
+        runtime.ptr().allocOwnerId(),
+        writes.iface(),
+        "audit_log",
+    );
+    try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
 }
 
 test "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs" {
