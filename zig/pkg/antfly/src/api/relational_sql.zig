@@ -11133,45 +11133,6 @@ const Parser = struct {
         );
     }
 
-    fn parseConflictValueJsonAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        return try sql_adapter.parseConflictValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.params, column, self.conflictValueParserHooks(insert_columns, insert_values));
-    }
-
-    fn parseConflictArrayElementValueJsonAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        return try sql_adapter.parseConflictArrayElementValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, column, self.conflictValueParserHooks(insert_columns, insert_values));
-    }
-
-    fn parseConflictIncrementAssignment(
-        self: *@This(),
-        field: []const u8,
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-        increment: *std.ArrayListUnmanaged(FieldJsonValue),
-        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-    ) !void {
-        return try sql_adapter.parseConflictIncrementAssignmentAlloc(self.alloc, self.tokens, &self.pos, field, column, increment, increment_expr, self.conflictIncrementParserHooks(insert_columns, insert_values));
-    }
-
-    fn parseIncrementAssignment(
-        self: *@This(),
-        field: []const u8,
-        column: runtime_schema.RelationalColumn,
-        increment: *std.ArrayListUnmanaged(FieldJsonValue),
-    ) !void {
-        return try sql_adapter.parseIncrementAssignmentAlloc(self.alloc, self.tokens, &self.pos, field, column, increment, self.incrementParserHooks());
-    }
-
     fn parseUpdateAssignment(
         self: *@This(),
         patch: *std.ArrayListUnmanaged(FieldJsonValue),
