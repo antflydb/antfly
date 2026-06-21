@@ -4166,6 +4166,12 @@ pub fn parseCreateIndexHeaderAlloc(
             method = .hnsw;
         } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_aknn")) {
             method = .antfly_aknn;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_graph")) {
+            method = .antfly_graph;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_graph_metric")) {
+            method = .antfly_graph_metric;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_hybrid")) {
+            method = .antfly_hybrid;
         } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_algebraic")) {
             method = .antfly_algebraic;
         } else return error.UnsupportedSqlShape;

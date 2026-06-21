@@ -735,6 +735,41 @@ pub const CatalogBoundReadPlanSourceSchema = struct {
     }
 };
 
+pub const ReadPlanCatalogLoweringHooks = struct {
+    ptr: *anyopaque,
+    lower_with_source_schema: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!plan_mod.LoweredReadPlan,
+    lower_without_source_schema: *const fn (*anyopaque) anyerror!plan_mod.LoweredReadPlan,
+};
+
+pub const WritePlanCatalogLoweringHooks = struct {
+    ptr: *anyopaque,
+    lower_with_options: *const fn (*anyopaque, plan_mod.LowerWritePlanOptions) anyerror!plan_mod.LoweredWritePlan,
+};
+
+pub fn lowerReadPlanWithCatalogSourceSchemaAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    catalog: table_catalog.CatalogSource,
+    hooks: ReadPlanCatalogLoweringHooks,
+) !plan_mod.LoweredReadPlan {
+    var resolved = try resolveReadPlanCatalogSourceSchemaAlloc(alloc, sql, catalog);
+    defer resolved.deinit(alloc);
+    if (resolved.source_schema) |source_schema| return try hooks.lower_with_source_schema(hooks.ptr, source_schema);
+    return try hooks.lower_without_source_schema(hooks.ptr);
+}
+
+pub fn lowerWritePlanWithCatalogOptionsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    hooks: WritePlanCatalogLoweringHooks,
+) !plan_mod.LoweredWritePlan {
+    var resolved = try resolveWritePlanCatalogOptionsAlloc(alloc, sql, options, catalog);
+    defer resolved.deinit(alloc);
+    return try hooks.lower_with_options(hooks.ptr, resolved.options);
+}
+
 const SelectReadTableNames = struct {
     left: []const u8,
     source: ?[]const u8 = null,

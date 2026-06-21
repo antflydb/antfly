@@ -78,7 +78,7 @@ pub const SelectParserOptions = struct {
     allow_select_set_boundary: bool = false,
     allow_select_set_result_tail_boundary: bool = false,
     context_hooks: SelectParserContextHooks,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
     row_expression_hooks: RowExpressionParserHooks,
     arithmetic_hooks: ArithmeticExpressionParserHooks,
     variadic_hooks: VariadicRowExpressionParserHooks,
@@ -146,7 +146,7 @@ pub const LateralSubqueryParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     left_alias: []const u8,
     context_hooks: JoinParserContextHooks,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
     order_expression_hooks: OrderExpressionParserOptions,
     expression_where_options: JoinedMutationExpressionWhereConditionParserOptions,
     realtime_ns: u64,
@@ -158,14 +158,14 @@ pub const AggregateParserOptions = struct {
     function_bindings: SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     context_hooks: SelectParserContextHooks,
-    aggregate_spec_hooks: AggregateSpecParserHooks,
-    select_item_hooks: SelectItemParserHooks,
+    aggregate_spec_options: AggregateSpecParserOptions,
+    select_item_options: SelectItemParserOptions,
     fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
-    output_field_hooks: AggregateOutputFieldParserHooks,
-    output_field_condition_hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    output_field_options: AggregateOutputFieldParserOptions,
+    output_field_condition_options: AggregateOutputFieldExpressionConditionParserOptions,
     case_expression_hooks: CaseExpressionParserHooks,
     output_order_expression_options: OutputOrderExpressionParserOptions,
     realtime_ns: u64,
@@ -177,9 +177,9 @@ pub const UniquePredicateWhereExpressionParserOptions = struct {
     case_expression_hooks: CaseExpressionParserHooks,
 };
 
-pub const AggregateOutputFieldExpressionConditionParserHooks = struct {
+pub const AggregateOutputFieldExpressionConditionParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
-    output_field_hooks: AggregateOutputFieldParserHooks,
+    output_field_options: AggregateOutputFieldParserOptions,
 };
 
 pub const ReturningProjectionParserOptions = struct {
@@ -187,7 +187,7 @@ pub const ReturningProjectionParserOptions = struct {
     function_bindings: SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     context_hooks: SelectParserContextHooks,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
 };
 
 pub const JoinedMutationReturningProjectionParserOptions = struct {
@@ -196,7 +196,7 @@ pub const JoinedMutationReturningProjectionParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
 };
 
 pub const AggregateOutputExpressionConditionParserOptions = struct {
@@ -213,13 +213,13 @@ pub const BareBooleanWhereExpressionParserOptions = struct {
     boolean_hooks: BooleanRowExpressionParserHooks,
 };
 
-pub const AggregateOutputFieldParserHooks = struct {
+pub const AggregateOutputFieldParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     context_hooks: SelectParserContextHooks,
-    aggregate_spec_hooks: AggregateSpecParserHooks,
+    aggregate_spec_options: AggregateSpecParserOptions,
 };
 
-pub const AggregateSpecParserHooks = struct {
+pub const AggregateSpecParserOptions = struct {
     function_bindings: SqlFunctionBindings = .{},
     order_expression_hooks: OrderExpressionParserOptions,
     aggregate_input: AggregateInputExpressionParserOptions,
@@ -8054,21 +8054,21 @@ pub fn parseAggregateOutputFieldAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    hooks: AggregateOutputFieldParserHooks,
+    options: AggregateOutputFieldParserOptions,
 ) ![]const u8 {
     if (nextIsAggregateFunction(tokens, pos.*)) {
-        const context = hooks.context_hooks.get_context(hooks.context_hooks.ptr);
+        const context = options.context_hooks.get_context(options.context_hooks.ptr);
         const candidate = try parseAggregateSpecAlloc(
             alloc,
             tokens,
             pos,
-            hooks.params,
+            options.params,
             context.schema,
-            hooks.context_hooks.row_expression_type_context(hooks.context_hooks.ptr),
+            options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
             context.field_expression_qualifiers,
             context.returning_expression_qualifiers,
             context.defer_row_expression_field_validation,
-            hooks.aggregate_spec_hooks,
+            options.aggregate_spec_options,
         );
         defer plan_mod.freeAggregateSpec(alloc, candidate);
         for (aggregations) |aggregation| {
@@ -8094,7 +8094,7 @@ pub fn parseAggregateSpecAlloc(
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
-    hooks: AggregateSpecParserHooks,
+    options: AggregateSpecParserOptions,
 ) !db_mod.types.RelationalRowsAggregateSpec {
     const function_name = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
     const op = aggregateOpForName(function_name.text) orelse return error.UnsupportedSqlShape;
@@ -8135,12 +8135,12 @@ pub fn parseAggregateSpecAlloc(
             tokens,
             pos,
             schema,
-            hooks.function_bindings,
+            options.function_bindings,
             field_expression_qualifiers,
             returning_expression_qualifiers,
             defer_row_expression_field_validation,
             type_context,
-            hooks.order_expression_hooks,
+            options.order_expression_hooks,
         );
         defer {
             if (order.field.len > 0) alloc.free(order.field);
@@ -8175,12 +8175,12 @@ pub fn parseAggregateSpecAlloc(
             tokens,
             pos,
             schema,
-            hooks.function_bindings,
+            options.function_bindings,
             field_expression_qualifiers,
             returning_expression_qualifiers,
             defer_row_expression_field_validation,
             type_context,
-            hooks.order_expression_hooks,
+            options.order_expression_hooks,
         );
         defer {
             if (order.field.len > 0) alloc.free(order.field);
@@ -8219,7 +8219,7 @@ pub fn parseAggregateSpecAlloc(
                 field_expression_qualifiers,
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
-                hooks.aggregate_input,
+                options.aggregate_input,
             );
             var parsed_expression_transferred = false;
             errdefer if (!parsed_expression_transferred) freeExpression(alloc, parsed_expression);
@@ -8275,12 +8275,12 @@ pub fn parseAggregateSpecAlloc(
             pos,
             &array_order_by,
             schema,
-            hooks.function_bindings,
+            options.function_bindings,
             field_expression_qualifiers,
             returning_expression_qualifiers,
             defer_row_expression_field_validation,
             type_context,
-            hooks.order_expression_hooks,
+            options.order_expression_hooks,
         );
     }
     if (!isSqlPercentileAggregateOp(op) and op != .mode) try parser.expectToken(tokens, pos, .rparen);
@@ -8294,10 +8294,10 @@ pub fn parseAggregateSpecAlloc(
         defer_row_expression_field_validation,
         params,
         type_context,
-        hooks.expression_alternatives,
-        hooks.expression_conditions,
-        hooks.fixed_binary,
-        hooks.realtime_ns,
+        options.expression_alternatives,
+        options.expression_conditions,
+        options.fixed_binary,
+        options.realtime_ns,
     );
     var filter_transferred = false;
     errdefer if (!filter_transferred) freeAggregateFilter(alloc, filter);
@@ -8858,7 +8858,7 @@ pub fn parseReturningProjectionAlloc(
             .function_bindings = options.function_bindings,
             .field_source = options.field_source,
             .context_hooks = options.context_hooks,
-            .select_item_hooks = options.select_item_hooks,
+            .select_item_options = options.select_item_options,
         });
         var item_owned = true;
         errdefer if (item_owned) plan_mod.freeSelectItem(alloc, item);
@@ -9029,7 +9029,7 @@ pub fn parseJoinedMutationReturningProjectionAlloc(
             .field_source = options.field_source,
             .select_context_hooks = options.select_context_hooks,
             .joined_context_hooks = options.joined_context_hooks,
-            .select_item_hooks = options.select_item_hooks,
+            .select_item_options = options.select_item_options,
         });
         var item_owned = true;
         errdefer if (item_owned) plan_mod.freeSelectItem(alloc, item);
@@ -9272,9 +9272,9 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    options: AggregateOutputFieldExpressionConditionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
-    const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, hooks.output_field_hooks);
+    const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, options.output_field_options);
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(field);
     if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
@@ -9326,7 +9326,7 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
     const rhs = switch (op) {
         .is_null, .is_not_null => &.{},
         else => blk: {
-            const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, hooks.params);
+            const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, options.params);
             var value_transferred = false;
             errdefer if (!value_transferred) alloc.free(value_json);
             const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
@@ -9494,10 +9494,10 @@ pub fn parseAggregateHavingBooleanIsNotGroups(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    options: AggregateOutputFieldExpressionConditionParserOptions,
 ) !bool {
     const saved_pos = pos.*;
-    const field = parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, hooks.output_field_hooks) catch |err| {
+    const field = parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, options.output_field_options) catch |err| {
         pos.* = saved_pos;
         return switch (err) {
             error.UnsupportedSqlShape => false,
@@ -9998,21 +9998,21 @@ pub fn parseAggregateHavingConditionAlternativesAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field_hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    field_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_options: AggregateOutputExpressionConditionParserOptions,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
         try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
-    if (try parseAggregateHavingBooleanIsNotGroups(alloc, tokens, pos, schema, type_context, alternatives, group_fields, group_expressions, aggregations, field_hooks)) {
+    if (try parseAggregateHavingBooleanIsNotGroups(alloc, tokens, pos, schema, type_context, alternatives, group_fields, group_expressions, aggregations, field_options)) {
         return;
     }
 
     const condition = if (peekAggregateHavingExpression(tokens, pos.*))
         try parseAggregateOutputExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, expression_options)
     else
-        try parseAggregateOutputFieldExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, field_hooks);
+        try parseAggregateOutputFieldExpressionConditionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, field_options);
     var condition_transferred = false;
     errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
 
@@ -10035,7 +10035,7 @@ pub fn parseAggregateHavingNotGroupAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field_hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    field_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_options: AggregateOutputExpressionConditionParserOptions,
 ) !void {
     try parser.expectKeyword(tokens, pos, "not");
@@ -10062,7 +10062,7 @@ pub fn parseAggregateHavingNotGroupAlloc(
             group_fields,
             group_expressions,
             aggregations,
-            field_hooks,
+            field_options,
             expression_options,
         );
         try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
@@ -10086,7 +10086,7 @@ pub fn parseAggregateHavingOrGroupsAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field_hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    field_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_options: AggregateOutputExpressionConditionParserOptions,
 ) !void {
     while (true) {
@@ -10113,7 +10113,7 @@ pub fn parseAggregateHavingOrGroupsAlloc(
                 group_fields,
                 group_expressions,
                 aggregations,
-                field_hooks,
+                field_options,
                 expression_options,
             );
             try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
@@ -10143,8 +10143,8 @@ pub fn parseAggregateHavingAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    output_field_hooks: AggregateOutputFieldParserHooks,
-    field_condition_hooks: AggregateOutputFieldExpressionConditionParserHooks,
+    output_field_options: AggregateOutputFieldParserOptions,
+    field_condition_options: AggregateOutputFieldExpressionConditionParserOptions,
     expression_condition_options: AggregateOutputExpressionConditionParserOptions,
     bare_boolean_options: BareBooleanAggregateHavingExpressionParserOptions,
 ) !void {
@@ -10153,12 +10153,12 @@ pub fn parseAggregateHavingAlloc(
         return;
     }
     if (parser.hasTopLevelOrBeforeTail(tokens, pos.*, sqlWhereTailClauseKeyword) or aggregateHavingHasBooleanIsNot(tokens, pos.*)) {
-        try parseAggregateHavingOrGroupsAlloc(alloc, tokens, pos, schema, type_context, any_groups, group_fields, group_expressions, aggregations, field_condition_hooks, expression_condition_options);
+        try parseAggregateHavingOrGroupsAlloc(alloc, tokens, pos, schema, type_context, any_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options);
         return;
     }
     while (true) {
         if (canParseAggregateHavingNot(tokens, pos.*)) {
-            try parseAggregateHavingNotGroupAlloc(alloc, tokens, pos, schema, type_context, not_groups, group_fields, group_expressions, aggregations, field_condition_hooks, expression_condition_options);
+            try parseAggregateHavingNotGroupAlloc(alloc, tokens, pos, schema, type_context, not_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options);
         } else if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
             if (!enabled) try appendBooleanConstantExpressionCondition(alloc, expressions, false);
         } else if (peekAggregateHavingExpression(tokens, pos.*)) {
@@ -10168,7 +10168,7 @@ pub fn parseAggregateHavingAlloc(
             try expressions.append(alloc, condition);
             condition_transferred = true;
         } else {
-            const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, output_field_hooks);
+            const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, output_field_options);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
             if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
@@ -10377,7 +10377,7 @@ pub fn parseAggregateGroupByAlloc(
     group_by: *std.ArrayListUnmanaged([]const u8),
     group_expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection),
     select: plan_mod.AggregateSelectList,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
 ) !void {
     while (true) {
         if (parser.matchToken(tokens, pos, .number)) |token| {
@@ -10417,7 +10417,7 @@ pub fn parseAggregateGroupByAlloc(
                 defer_row_expression_field_validation,
                 field_source,
                 type_context,
-                select_item_hooks,
+                select_item_options,
             );
             var item_transferred = false;
             errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
@@ -10442,7 +10442,7 @@ pub fn parseAggregateOrderByAlloc(
     group_fields: []const []const u8,
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field_hooks: AggregateOutputFieldParserHooks,
+    field_options: AggregateOutputFieldParserOptions,
     order_expression_options: OutputOrderExpressionParserOptions,
 ) !void {
     while (true) {
@@ -10452,7 +10452,7 @@ pub fn parseAggregateOrderByAlloc(
         } else if (peekAggregateOutputOrderExpression(tokens, pos.*)) blk: {
             break :blk try parseAggregateOutputOrderExpressionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, order_expression_options);
         } else blk: {
-            const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, field_hooks);
+            const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, field_options);
             if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) {
                 alloc.free(field);
                 return error.UnsupportedSqlShape;
@@ -10765,8 +10765,8 @@ pub fn parseAggregateSelectListAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
-    aggregate_spec_hooks: AggregateSpecParserHooks,
-    select_item_hooks: SelectItemParserHooks,
+    aggregate_spec_options: AggregateSpecParserOptions,
+    select_item_options: SelectItemParserOptions,
 ) !plan_mod.AggregateSelectList {
     var group_fields = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -10798,7 +10798,7 @@ pub fn parseAggregateSelectListAlloc(
                 field_expression_qualifiers,
                 returning_expression_qualifiers,
                 defer_row_expression_field_validation,
-                aggregate_spec_hooks,
+                aggregate_spec_options,
             );
             var spec_transferred = false;
             errdefer if (!spec_transferred) plan_mod.freeAggregateSpec(alloc, spec);
@@ -10818,7 +10818,7 @@ pub fn parseAggregateSelectListAlloc(
                 defer_row_expression_field_validation,
                 field_source,
                 type_context,
-                select_item_hooks,
+                select_item_options,
             );
             var item_transferred = false;
             errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
@@ -12936,6 +12936,26 @@ pub fn sqlExpressionTypeIsOrderKey(field_type: runtime_schema.AntflyType) bool {
 
 pub fn sqlExpressionResultTypesCompatible(lhs: runtime_schema.AntflyType, rhs: runtime_schema.AntflyType) bool {
     return sqlExpressionTypesComparable(lhs, rhs);
+}
+
+pub fn rowExpressionTypeContext(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    defer_row_expression_field_validation: bool,
+) RowExpressionTypeContext {
+    return .{
+        .alloc = alloc,
+        .schema = schema,
+        .joined_source_schema = joined_source_schema,
+        .defer_row_expression_field_validation = defer_row_expression_field_validation,
+    };
+}
+
+pub fn rowExpressionFieldSourceOrDefault(
+    override: ?db_mod.types.RelationalRowsExpressionFieldSource,
+) db_mod.types.RelationalRowsExpressionFieldSource {
+    return override orelse .row;
 }
 
 pub const RowExpressionTypeContext = struct {
@@ -15213,7 +15233,7 @@ pub fn parseSelectAlloc(
             .returning_expression_qualifiers = current_context.returning_expression_qualifiers,
             .defer_row_expression_field_validation = current_context.defer_row_expression_field_validation,
             .field_source = options.field_source,
-            .select_item_hooks = options.select_item_hooks,
+            .select_item_options = options.select_item_options,
         },
     );
     errdefer strings.freeStringSlice(alloc, select.fields);
@@ -15498,8 +15518,8 @@ pub fn parseAggregateAlloc(
         select_context.returning_expression_qualifiers,
         select_context.defer_row_expression_field_validation,
         options.field_source,
-        options.aggregate_spec_hooks,
-        options.select_item_hooks,
+        options.aggregate_spec_options,
+        options.select_item_options,
     );
     var select_group_expressions_transferred = false;
     defer {
@@ -15706,7 +15726,7 @@ pub fn parseAggregateAlloc(
                 &group_by,
                 &group_expressions,
                 select,
-                options.select_item_hooks,
+                options.select_item_options,
             );
         } else if (parser.matchKeyword(tokens, pos, "having")) {
             if (distinct_group_only) return error.UnsupportedSqlShape;
@@ -15724,8 +15744,8 @@ pub fn parseAggregateAlloc(
                 select.group_fields,
                 select.group_expressions,
                 select.aggregations,
-                options.output_field_hooks,
-                options.output_field_condition_hooks,
+                options.output_field_options,
+                options.output_field_condition_options,
                 .{
                     .context_hooks = options.context_hooks,
                     .case_expression_hooks = options.case_expression_hooks,
@@ -15747,7 +15767,7 @@ pub fn parseAggregateAlloc(
                 select.group_fields,
                 select.group_expressions,
                 select.aggregations,
-                options.output_field_hooks,
+                options.output_field_options,
                 options.output_order_expression_options,
             );
         } else if (parser.matchKeyword(tokens, pos, "limit")) {
@@ -16548,7 +16568,7 @@ pub fn parseLateralSubqueryAlloc(
                 .joined_source_schema = select_context.joined_source_schema,
             },
             .field_source = options.field_source,
-            .select_item_hooks = options.select_item_hooks,
+            .select_item_options = options.select_item_options,
         },
     );
     defer freeSelectListAlloc(alloc, select);
@@ -19500,8 +19520,7 @@ pub const SelectFieldItemParserOptions = struct {
     boolean_hooks: BooleanExpressionParserHooks,
 };
 
-pub const SelectItemParserHooks = struct {
-    ptr: *anyopaque,
+pub const SelectItemParserOptions = struct {
     expression: ExpressionProjectionParserOptions,
     json_value_expression: JsonValueExpressionProjectionParserOptions,
     select_field: SelectFieldItemParserOptions,
@@ -19519,7 +19538,7 @@ pub const SelectListParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
 };
 
 pub const ReturningSelectItemParserOptions = struct {
@@ -19527,7 +19546,7 @@ pub const ReturningSelectItemParserOptions = struct {
     function_bindings: SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     context_hooks: SelectParserContextHooks,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
 };
 
 pub fn parseReturningSelectItemWithQualifiersAlloc(
@@ -19557,7 +19576,7 @@ pub fn parseReturningSelectItemWithQualifiersAlloc(
         current_context.defer_row_expression_field_validation,
         options.field_source,
         options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
-        options.select_item_hooks,
+        options.select_item_options,
     );
 }
 
@@ -19567,7 +19586,7 @@ pub const JoinedReturningSelectItemParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
-    select_item_hooks: SelectItemParserHooks,
+    select_item_options: SelectItemParserOptions,
 };
 
 pub fn parseJoinedReturningSelectItemWithQualifiersAlloc(
@@ -19609,7 +19628,7 @@ pub fn parseJoinedReturningSelectItemWithQualifiersAlloc(
         current_context.defer_row_expression_field_validation,
         options.field_source,
         options.select_context_hooks.row_expression_type_context(options.select_context_hooks.ptr),
-        options.select_item_hooks,
+        options.select_item_options,
     );
 }
 
@@ -19773,7 +19792,7 @@ pub fn parseSelectListAlloc(
             options.defer_row_expression_field_validation,
             options.field_source,
             options.type_context,
-            options.select_item_hooks,
+            options.select_item_options,
         );
         var item_transferred = false;
         errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
@@ -19970,71 +19989,71 @@ pub fn parseSelectItemAlloc(
     defer_row_expression_field_validation: bool,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     type_context: RowExpressionTypeContext,
-    hooks: SelectItemParserHooks,
+    options: SelectItemParserOptions,
 ) !plan_mod.SelectItem {
     if (selectItemStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
         switch (start) {
-            .pipe_concat => return .{ .expression = try parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, hooks.expression) },
-            .unary_negative => return .{ .expression = try parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, hooks.expression) },
-            .boolean_not => return .{ .expression = try parseBooleanExpressionProjectionAlloc(alloc, tokens, pos, type_context, hooks.expression) },
-            .extension_function => return .{ .expression = try parseExtensionFunctionExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.extension_functions, hooks.extension_function) },
-            .routine_expression => return .{ .expression = try parseRoutineExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.routine_expressions, hooks.routine_expression) },
+            .pipe_concat => return .{ .expression = try parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .unary_negative => return .{ .expression = try parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .boolean_not => return .{ .expression = try parseBooleanExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .extension_function => return .{ .expression = try parseExtensionFunctionExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.extension_functions, options.extension_function) },
+            .routine_expression => return .{ .expression = try parseRoutineExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.routine_expressions, options.routine_expression) },
             .uuid_v4 => return .{ .expression = try parseUuidV4ExpressionProjectionAlloc(alloc, tokens, pos) },
             .now => return .{ .expression = try parseNowExpressionProjectionAlloc(alloc, tokens, pos) },
             .current_date => return .{ .expression = try parseCurrentDateExpressionProjectionAlloc(alloc, tokens, pos) },
             .typed_datetime_literal => return .{ .expression = try parseTypedDatetimeLiteralExpressionProjectionAlloc(alloc, tokens, pos) },
-            .json_extract_path => return .{ .expression = try parseJsonExtractPathExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .json_typeof => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_typeof", hooks.expression) },
-            .json_array_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_array_length", hooks.expression) },
-            .json_build_object => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "jsonb_build_object", hooks.expression) },
-            .convert_from => return .{ .expression = try parseJsonValueExpressionProjectionAlloc(alloc, tokens, pos, "convert_from", hooks.json_value_expression) },
-            .to_jsonb => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "to_jsonb", hooks.expression) },
+            .json_extract_path => return .{ .expression = try parseJsonExtractPathExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .json_typeof => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_typeof", options.expression) },
+            .json_array_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_array_length", options.expression) },
+            .json_build_object => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "jsonb_build_object", options.expression) },
+            .convert_from => return .{ .expression = try parseJsonValueExpressionProjectionAlloc(alloc, tokens, pos, "convert_from", options.json_value_expression) },
+            .to_jsonb => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "to_jsonb", options.expression) },
             .array_length => return .{ .expression = try parseArrayLengthExpressionProjectionAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source) },
-            .array_position => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .array_element_transform => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .array_to_string => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "array_to_string", hooks.expression) },
-            .string_to_array => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "string_to_array", hooks.expression) },
-            .coalesce => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "coalesce", hooks.expression) },
-            .case_fold => return .{ .expression = try parseDefaultOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .replace => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "replace", hooks.expression) },
-            .regexp_replace => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_replace", hooks.expression) },
-            .regexp_substr => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_substr", hooks.expression) },
-            .regexp_match => return .{ .expression = try parseRegexpMatchExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .regexp_count => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_count", hooks.expression) },
-            .regexp_instr => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_instr", hooks.expression) },
-            .translate => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "translate", hooks.expression) },
-            .concat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .nullif => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "nullif", hooks.expression) },
-            .text_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "length", hooks.expression) },
-            .ascii => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .chr => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .substring => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .overlay => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .split_part => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .strpos => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .left_right => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .pad => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .repeat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .reverse => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .md5 => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .starts_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .ends_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .date_trunc => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .date_bin => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .date_part => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .abs => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "abs", hooks.expression) },
-            .round => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "round", hooks.expression) },
-            .trunc, .floor, .ceil, .sqrt, .sign => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .mod => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "mod", hooks.expression) },
-            .power => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "power", hooks.expression) },
-            .greatest_least => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) },
-            .case => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "case", hooks.expression) },
-            .cast => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "cast", hooks.expression) },
+            .array_position => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .array_element_transform => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .array_to_string => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "array_to_string", options.expression) },
+            .string_to_array => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "string_to_array", options.expression) },
+            .coalesce => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "coalesce", options.expression) },
+            .case_fold => return .{ .expression = try parseDefaultOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .replace => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "replace", options.expression) },
+            .regexp_replace => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_replace", options.expression) },
+            .regexp_substr => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_substr", options.expression) },
+            .regexp_match => return .{ .expression = try parseRegexpMatchExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .regexp_count => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_count", options.expression) },
+            .regexp_instr => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_instr", options.expression) },
+            .translate => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "translate", options.expression) },
+            .concat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .nullif => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "nullif", options.expression) },
+            .text_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "length", options.expression) },
+            .ascii => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .chr => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .substring => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .overlay => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .split_part => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .strpos => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .left_right => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .pad => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .repeat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .reverse => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .md5 => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .starts_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .ends_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .date_trunc => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .date_bin => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .date_part => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .abs => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "abs", options.expression) },
+            .round => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "round", options.expression) },
+            .trunc, .floor, .ceil, .sqrt, .sign => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .mod => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "mod", options.expression) },
+            .power => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "power", options.expression) },
+            .greatest_least => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .case => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "case", options.expression) },
+            .cast => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "cast", options.expression) },
             .parenthesized => {
                 if (peekParenthesizedNullTestProjection(tokens, pos.*)) {
                     return .{ .expression = try parseParenthesizedNullTestExpressionProjectionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source) };
                 }
-                return .{ .expression = try parseParenthesizedExpressionProjectionAlloc(alloc, tokens, pos, hooks.expression) };
+                return .{ .expression = try parseParenthesizedExpressionProjectionAlloc(alloc, tokens, pos, options.expression) };
             },
         }
     }
@@ -20049,7 +20068,7 @@ pub fn parseSelectItemAlloc(
         returning_expression_qualifiers,
         defer_row_expression_field_validation,
         field_source,
-        hooks.select_field,
+        options.select_field,
     );
 }
 

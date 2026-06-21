@@ -16,6 +16,7 @@ const std = @import("std");
 
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
+const platform_time = @import("../../platform/time.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
@@ -751,6 +752,10 @@ pub fn parseSqlTypedDatetimeLiteralValueJsonAlloc(
 
 pub fn sqlCurrentUtcDateStartNs(now_ns: u64) u64 {
     return now_ns - (now_ns % ns_per_day);
+}
+
+pub fn currentRealtimeNs() u64 {
+    return platform_time.realtimeNs();
 }
 
 fn checkedRealtimeNsU64(value: i128) !u64 {

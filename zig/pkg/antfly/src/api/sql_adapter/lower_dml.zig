@@ -84,19 +84,18 @@ pub const MergeMutationParserContextHooks = struct {
     set_context: *const fn (*anyopaque, MergeMutationParserContext) void,
 };
 
-pub const MergeMutationParserHooks = struct {
-    ptr: *anyopaque,
+pub const MergeMutationParserOptions = struct {
     params: []const sql_value.SqlValue = &.{},
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema = null,
     context_hooks: MergeMutationParserContextHooks,
     condition_options: MergeArmConditionParserOptions,
-    assignment_hooks: MergeAssignmentParserHooks,
+    assignment_options: MergeAssignmentParserOptions,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
 
-pub const MergeMutationParserOptions = struct {
+pub const MergeMutationBodyOptions = struct {
     ctes: []const db_mod.types.RelationalRowsCte,
     base_table_name: ?*?[]const u8,
 };
@@ -585,7 +584,7 @@ pub const RecursiveJoinedMutationSourceKind = enum {
     delete,
 };
 
-pub const MergeAssignmentParserHooks = struct {
+pub const MergeAssignmentParserOptions = struct {
     assignment_expression: MergeAssignmentExpressionParserOptions,
 };
 
@@ -727,6 +726,19 @@ pub const FieldJsonValue = struct {
     field: []const u8,
     value_json: []const u8,
 };
+
+pub fn mutationRowClaimAlloc(
+    alloc: std.mem.Allocator,
+    maybe_claim: ?db_mod.types.RowClaimRequest,
+    skip_locked_default: bool,
+) !db_mod.types.RowClaimRequest {
+    var claim = maybe_claim orelse db_mod.types.RowClaimRequest{
+        .skip_locked = skip_locked_default,
+        .wait_policy = if (skip_locked_default) .skip_locked else .wait,
+    };
+    claim.owner_id = if (claim.owner_id.len > 0) try alloc.dupe(u8, claim.owner_id) else "";
+    return claim;
+}
 
 pub fn parseInsertSourceAlloc(
     alloc: std.mem.Allocator,
@@ -951,9 +963,9 @@ pub fn parseMergeMutationPlanAlloc(
     tokens: []const Token,
     pos: *usize,
     cte_hooks: plan_mod.CteSelectParserHooks,
-    hooks: MergeMutationParserHooks,
+    parser_options: MergeMutationParserOptions,
 ) !plan_mod.LoweredMergeMutationPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseMergeMutationBodyAlloc(alloc, tokens, pos, hooks, .{
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseMergeMutationBodyAlloc(alloc, tokens, pos, parser_options, .{
         .ctes = &.{},
         .base_table_name = null,
     });
@@ -963,7 +975,7 @@ pub fn parseMergeMutationPlanAlloc(
     var ctes = try plan_mod.parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
     errdefer plan_mod.freePlanCtes(alloc, ctes);
 
-    var final = try parseMergeMutationBodyAlloc(alloc, tokens, pos, hooks, .{
+    var final = try parseMergeMutationBodyAlloc(alloc, tokens, pos, parser_options, .{
         .ctes = ctes,
         .base_table_name = &base_table_name,
     });
@@ -980,8 +992,8 @@ pub fn parseMergeMutationBodyAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
-    hooks: MergeMutationParserHooks,
-    options: MergeMutationParserOptions,
+    parser_options: MergeMutationParserOptions,
+    options: MergeMutationBodyOptions,
 ) !plan_mod.LoweredMergeMutationPlan {
     try parser.expectKeyword(tokens, pos, "merge");
     try parser.expectKeyword(tokens, pos, "into");
@@ -995,13 +1007,13 @@ pub fn parseMergeMutationBodyAlloc(
     var source = db_mod.types.RelationalRowsQueryRequest{};
     errdefer source.deinit(alloc);
     var resolved_source_table = source_table.name;
-    const base_source_schema = hooks.joined_source_schema orelse hooks.schema;
+    const base_source_schema = parser_options.joined_source_schema orelse parser_options.schema;
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
     defer relational_rows.freeRowsPlannedCtes(alloc, planned_ctes);
 
-    const previous_context = hooks.context_hooks.get_context(hooks.context_hooks.ptr);
+    const previous_context = parser_options.context_hooks.get_context(parser_options.context_hooks.ptr);
     var parse_context = previous_context;
-    parse_context.joined_source_schema = hooks.joined_source_schema;
+    parse_context.joined_source_schema = parser_options.joined_source_schema;
     parse_context.available_ctes = options.ctes;
     if (options.ctes.len != 0) {
         planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, base_source_schema, options.ctes);
@@ -1018,23 +1030,23 @@ pub fn parseMergeMutationBodyAlloc(
             }
         }
     }
-    hooks.context_hooks.set_context(hooks.context_hooks.ptr, parse_context);
-    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
+    parser_options.context_hooks.set_context(parser_options.context_hooks.ptr, parse_context);
+    defer parser_options.context_hooks.set_context(parser_options.context_hooks.ptr, previous_context);
 
     const clauses = try parseMergeMutationClausesAlloc(
         alloc,
         tokens,
         pos,
-        hooks.schema,
+        parser_options.schema,
         parse_context.joined_source_schema,
         target_table,
         source_table,
         options.ctes.len,
-        hooks.params,
-        hooks.realtime_ns,
-        hooks.condition_options,
-        hooks.assignment_hooks,
-        hooks.returning_hooks,
+        parser_options.params,
+        parser_options.realtime_ns,
+        parser_options.condition_options,
+        parser_options.assignment_options,
+        parser_options.returning_hooks,
     );
     errdefer {
         var owned_clauses = clauses;
@@ -2965,7 +2977,7 @@ pub fn parseMergeMutationClausesAlloc(
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
     condition_options: MergeArmConditionParserOptions,
-    assignment_hooks: MergeAssignmentParserHooks,
+    assignment_options: MergeAssignmentParserOptions,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
 ) !ParsedMergeMutationClauses {
     const match_fields = try parseMergeMatchFieldsAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table);
@@ -2996,7 +3008,7 @@ pub fn parseMergeMutationClausesAlloc(
                 params,
                 realtime_ns,
                 condition_options,
-                assignment_hooks,
+                assignment_options,
             );
             var arm_transferred = false;
             errdefer if (!arm_transferred) freeMergeMatchedArmValue(alloc, arm);
@@ -3014,7 +3026,7 @@ pub fn parseMergeMutationClausesAlloc(
                 params,
                 realtime_ns,
                 condition_options,
-                assignment_hooks,
+                assignment_options,
             );
             var arm_transferred = false;
             errdefer if (!arm_transferred) freeMergeNotMatchedArmValue(alloc, arm);
@@ -5647,7 +5659,7 @@ pub fn parseMergeMatchedArmAlloc(
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
     condition_options: MergeArmConditionParserOptions,
-    assignment_hooks: MergeAssignmentParserHooks,
+    assignment_options: MergeAssignmentParserOptions,
 ) !MergeMatchedArm {
     var predicates = std.ArrayListUnmanaged(MergeArmPredicate).empty;
     errdefer {
@@ -5707,7 +5719,7 @@ pub fn parseMergeMatchedArmAlloc(
     if (parser.matchKeyword(tokens, pos, "update")) {
         try parser.expectKeyword(tokens, pos, "set");
         while (true) {
-            const assignment = try parseMergeUpdateAssignmentAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, assignment_hooks);
+            const assignment = try parseMergeUpdateAssignmentAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, assignment_options);
             switch (assignment) {
                 .mapping => |mapping| try update.append(alloc, mapping),
                 .expression => |expression| try update_expressions.append(alloc, expression),
@@ -5749,7 +5761,7 @@ pub fn parseMergeNotMatchedArmAlloc(
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
     condition_options: MergeArmConditionParserOptions,
-    assignment_hooks: MergeAssignmentParserHooks,
+    assignment_options: MergeAssignmentParserOptions,
 ) !MergeNotMatchedArm {
     try parser.expectKeyword(tokens, pos, "matched");
     var predicates = std.ArrayListUnmanaged(MergeArmPredicate).empty;
@@ -5807,7 +5819,7 @@ pub fn parseMergeNotMatchedArmAlloc(
     }
     var not_matched_do_nothing = false;
     if (parser.matchKeyword(tokens, pos, "insert")) {
-        try parseMergeInsertMappingsAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, &insert, &insert_expressions, assignment_hooks);
+        try parseMergeInsertMappingsAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, &insert, &insert_expressions, assignment_options);
     } else if (parser.matchKeyword(tokens, pos, "do")) {
         try parser.expectKeyword(tokens, pos, "nothing");
         not_matched_do_nothing = true;
@@ -5914,13 +5926,13 @@ pub fn parseMergeUpdateAssignmentAlloc(
     joined_source_schema: ?runtime_schema.TableSchema,
     target_table: TableAlias,
     source_table: TableAlias,
-    hooks: MergeAssignmentParserHooks,
+    options: MergeAssignmentParserOptions,
 ) !MergeParsedAssignment {
     const target_field = try parseMergeTargetFieldOwnedAlloc(alloc, tokens, pos, target_table);
     errdefer alloc.free(target_field);
     try parser.expectToken(tokens, pos, .eq);
     const target_column = binder.relationalColumnForField(schema, target_field, null) orelse return error.InvalidSqlCatalog;
-    const expression = try parseMergeAssignmentExpressionAlloc(alloc, tokens, pos, target_column, target_table, source_table, hooks.assignment_expression);
+    const expression = try parseMergeAssignmentExpressionAlloc(alloc, tokens, pos, target_column, target_table, source_table, options.assignment_expression);
     var expression_transferred = false;
     errdefer if (!expression_transferred) freeExpression(alloc, expression);
     if (expression.kind == .field and expression.field_source == .source) {
@@ -5949,7 +5961,7 @@ pub fn parseMergeInsertMappingsAlloc(
     source_table: TableAlias,
     mappings: *std.ArrayListUnmanaged(MergeFieldMapping),
     expressions: *std.ArrayListUnmanaged(MergeExpressionAssignment),
-    hooks: MergeAssignmentParserHooks,
+    options: MergeAssignmentParserOptions,
 ) !void {
     try parser.expectToken(tokens, pos, .lparen);
     const target_fields = try grammar.parseIdentifierListAlloc(alloc, tokens, pos);
@@ -5964,7 +5976,7 @@ pub fn parseMergeInsertMappingsAlloc(
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(owned_target_field);
         const target_column = binder.relationalColumnForField(schema, owned_target_field, null) orelse return error.InvalidSqlCatalog;
-        const expression = try parseMergeAssignmentExpressionAlloc(alloc, tokens, pos, target_column, target_table, source_table, hooks.assignment_expression);
+        const expression = try parseMergeAssignmentExpressionAlloc(alloc, tokens, pos, target_column, target_table, source_table, options.assignment_expression);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
         if (expression.kind == .field and expression.field_source == .source) {
@@ -7131,7 +7143,7 @@ pub fn parseRecursiveMergeMutationAlloc(
     tokens: []const Token,
     pos: *usize,
     recursive_hooks: plan_mod.RecursiveCteParserHooks,
-    merge_hooks: MergeMutationParserHooks,
+    merge_options: MergeMutationParserOptions,
 ) !plan_mod.LoweredRecursiveMergeMutation {
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(alloc, tokens, pos, recursive_hooks);
     errdefer recursive.deinit(alloc);
@@ -7144,7 +7156,7 @@ pub fn parseRecursiveMergeMutationAlloc(
         .name = recursive.cte_name,
         .query = recursive.anchor.plan.query,
     }};
-    var merge = try parseMergeMutationBodyAlloc(alloc, tokens, pos, merge_hooks, .{
+    var merge = try parseMergeMutationBodyAlloc(alloc, tokens, pos, merge_options, .{
         .ctes = recursive_ctes[0..],
         .base_table_name = &base_table_name,
     });

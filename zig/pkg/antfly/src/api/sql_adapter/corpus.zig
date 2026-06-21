@@ -15,8 +15,14 @@
 const std = @import("std");
 const sql_adapter = @This();
 
+const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
 const diagnostics = @import("diagnostics.zig");
+const metadata_api = @import("../../metadata/api.zig");
+const metadata_table_manager = @import("../../metadata/table_manager.zig");
+const metadata_transition_state = @import("../../metadata/transition_state.zig");
+const raft_reconciler = @import("../../raft/reconciler.zig");
+const table_catalog = @import("../table_catalog.zig");
 const value_mod = @import("value.zig");
 
 pub const SqlValue = value_mod.SqlValue;
@@ -316,6 +322,75 @@ pub const AppParityCorpusEntry = struct {
     resolver_exists: ?bool = null,
     source_schema_json: []const u8 = "",
 };
+
+pub const AppParitySourceSchemaCatalog = struct {
+    tables: [1]metadata_table_manager.TableRecord,
+
+    pub fn init(table_name: []const u8, source_schema_json: []const u8) @This() {
+        return .{ .tables = .{
+            .{ .table_id = 90_001, .name = table_name, .placement_role = "data", .schema_json = source_schema_json },
+        } };
+    }
+
+    pub fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = self.tables[0..],
+            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?[]const u8 {
+    if (entry.source_schema_json.len == 0) return null;
+
+    switch (entry.family) {
+        .insert_source => {
+            var tables = (try binder.insertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            defer tables.deinit(alloc);
+            return try alloc.dupe(u8, tables.source);
+        },
+        .recursive_insert_source => {
+            var tables = (try binder.recursiveInsertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            defer tables.deinit(alloc);
+            return try alloc.dupe(u8, tables.source);
+        },
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => {
+            var tables = (try binder.joinedWriteSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            defer tables.deinit(alloc);
+            return try alloc.dupe(u8, tables.source);
+        },
+        .read,
+        .join,
+        .lateral,
+        => {
+            var tables = (try binder.readSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            defer tables.deinit(alloc);
+            return try alloc.dupe(u8, tables.source);
+        },
+        else => return error.InvalidSqlCatalog,
+    }
+}
 
 pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;

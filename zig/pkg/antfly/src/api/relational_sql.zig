@@ -20,8 +20,8 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
-const platform_time = @import("../platform/time.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const query_contract = @import("query_contract.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -41,7 +41,6 @@ const SelectOutputKind = sql_adapter.SelectOutputKind;
 pub const SelectSetOperation = sql_adapter.SelectSetOperation;
 const SqlPatternQuantifier = sql_adapter.SqlPatternQuantifier;
 const SqlRowClaimClause = sql_adapter.SqlRowClaimClause;
-const Token = sql_adapter.Token;
 const aggregateOpName = sql_adapter.aggregateOpName;
 const aggregateOutputColumnExists = sql_adapter.aggregateOutputColumnExists;
 const aggregateDescendingPercentileCount = sql_adapter.aggregateDescendingPercentileCount;
@@ -161,7 +160,6 @@ const freeRelationalChecks = sql_adapter.freeRelationalChecks;
 const freeArrayTransformValues = sql_adapter.freeArrayTransformValues;
 const freeConflictClause = sql_adapter.freeConflictClause;
 const freeConflictTarget = sql_adapter.freeConflictTarget;
-const freeNamedWindowSpecs = sql_adapter.freeNamedWindowSpecs;
 const freeStringSlice = sql_adapter.freeStringSlice;
 const freeTableAlias = sql_adapter.freeTableAlias;
 const freeTextPatterns = sql_adapter.freeTextPatterns;
@@ -344,8 +342,6 @@ const ConflictTarget = sql_adapter.ConflictTarget;
 const conflictActionToken = sql_adapter.conflictActionToken;
 const JoinedMutationExpressionSide = sql_adapter.JoinedMutationExpressionSide;
 const JsonSetParsedValue = sql_adapter.JsonSetParsedValue;
-const LateralSubquery = sql_adapter.LateralSubquery;
-const NamedWindowSpec = sql_adapter.NamedWindowSpec;
 const QualifiedField = sql_adapter.QualifiedField;
 const QualifiedProjection = sql_adapter.QualifiedProjection;
 const SelectList = sql_adapter.SelectList;
@@ -638,9 +634,9 @@ pub fn lowerSelectAlloc(
         tokens.items,
         &parser.pos,
         params,
-        parser.cteSelectParserHooks(),
-        parser.queryPlanParserHooks(),
-        parser.simpleSelectSetTailHooks(),
+        Parser.ContextAccessors.cteSelectParserHooks(&parser),
+        Parser.ContextAccessors.queryPlanParserHooks(&parser),
+        Parser.ContextAccessors.simpleSelectSetTailHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
@@ -709,9 +705,9 @@ pub fn lowerQueryPlanWithFunctionBindingsAlloc(
         tokens.items,
         &parser.pos,
         params,
-        parser.cteSelectParserHooks(),
-        parser.queryPlanParserHooks(),
-        parser.simpleSelectSetTailHooks(),
+        Parser.ContextAccessors.cteSelectParserHooks(&parser),
+        Parser.ContextAccessors.queryPlanParserHooks(&parser),
+        Parser.ContextAccessors.simpleSelectSetTailHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
@@ -795,75 +791,24 @@ fn lowerReadPlanWithOptionalSourceSchemaAlloc(
     params: []const SqlValue,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
-    const ReadLoweringContext = struct {
-        alloc: std.mem.Allocator,
-        sql: []const u8,
-        schema: runtime_schema.TableSchema,
-        source_schema: ?runtime_schema.TableSchema,
-        params: []const SqlValue,
-        function_bindings: SqlFunctionBindings,
-
-        fn hooks(self: *@This()) sql_adapter.ReadPlanLoweringHooks {
-            return .{
-                .ptr = self,
-                .lower_lateral = lowerLateralHook,
-                .lower_window = lowerWindowHook,
-                .lower_aggregate = lowerAggregateHook,
-                .lower_recursive_cte = lowerRecursiveCteHook,
-                .lower_join = lowerJoinHook,
-                .lower_query = lowerQueryHook,
-                .lower_set_operation = lowerSetOperationHook,
-            };
-        }
-
-        fn joinedSourceSchema(self: *@This()) runtime_schema.TableSchema {
-            return self.source_schema orelse self.schema;
-        }
-
-        fn lowerLateralHook(ptr: *anyopaque) anyerror!LoweredLateralPlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerLateralPlanWithSchemasAlloc(self.alloc, self.sql, self.schema, self.joinedSourceSchema(), self.params);
-        }
-
-        fn lowerWindowHook(ptr: *anyopaque) anyerror!LoweredWindowPlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerWindowPlanAlloc(self.alloc, self.sql, self.schema, self.params);
-        }
-
-        fn lowerAggregateHook(ptr: *anyopaque) anyerror!LoweredAggregatePlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerAggregatePlanAlloc(self.alloc, self.sql, self.schema, self.params);
-        }
-
-        fn lowerRecursiveCteHook(ptr: *anyopaque) anyerror!LoweredRecursiveCtePlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerRecursiveCtePlanAlloc(self.alloc, self.sql, self.schema, self.params, self.function_bindings);
-        }
-
-        fn lowerJoinHook(ptr: *anyopaque) anyerror!LoweredJoin {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerJoinWithSchemasAlloc(self.alloc, self.sql, self.schema, self.joinedSourceSchema(), self.params);
-        }
-
-        fn lowerQueryHook(ptr: *anyopaque) anyerror!LoweredQueryPlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerQueryPlanWithFunctionBindingsAlloc(self.alloc, self.sql, self.schema, self.params, self.function_bindings);
-        }
-
-        fn lowerSetOperationHook(ptr: *anyopaque) anyerror!LoweredSetOperationPlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try lowerSetOperationPlanWithOptionalSourceSchemaAlloc(self.alloc, self.sql, self.schema, self.source_schema, self.params, self.function_bindings);
-        }
-    };
-    var context = ReadLoweringContext{
+    var context = sql_adapter.ReadPlanLoweringContext{
         .alloc = alloc,
         .sql = sql,
         .schema = schema,
         .source_schema = source_schema,
         .params = params,
         .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_lateral_with_schemas = lowerLateralPlanWithSchemasAlloc,
+            .lower_window = lowerWindowPlanAlloc,
+            .lower_aggregate_plan = lowerAggregatePlanAlloc,
+            .lower_recursive_cte_plan = lowerRecursiveCtePlanAlloc,
+            .lower_join_with_schemas = lowerJoinWithSchemasAlloc,
+            .lower_query_plan = lowerQueryPlanWithFunctionBindingsAlloc,
+            .lower_set_operation_optional_source_schema = lowerSetOperationPlanWithOptionalSourceSchemaAlloc,
+        },
     };
-    return try sql_adapter.lowerReadPlanWithHooks(context.hooks());
+    return try context.lower();
 }
 
 pub fn lowerRecursiveCtePlanAlloc(
@@ -884,7 +829,7 @@ pub fn lowerRecursiveCtePlanAlloc(
         .params = params,
         .function_bindings = function_bindings,
     };
-    return try sql_adapter.parseRecursiveCtePlanAlloc(alloc, tokens.items, &parser.pos, parser.recursiveCteParserHooks());
+    return try sql_adapter.parseRecursiveCtePlanAlloc(alloc, tokens.items, &parser.pos, Parser.ContextAccessors.recursiveCteParserHooks(&parser));
 }
 
 pub fn lowerSetOperationPlanAlloc(
@@ -956,7 +901,7 @@ fn lowerSetOperationPlanWithOptionalSourceSchemaAlloc(
         &parser.pos,
         source_schema orelse schema,
         source_schema != null,
-        parser.setOperationParserHooks(),
+        Parser.ContextAccessors.setOperationParserHooks(&parser),
     );
 }
 
@@ -989,12 +934,18 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsAlloc(
     catalog: table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
-    var resolved = try sql_adapter.resolveReadPlanCatalogSourceSchemaAlloc(alloc, sql, catalog);
-    defer resolved.deinit(alloc);
-    if (resolved.source_schema) |source_schema| {
-        return try lowerReadPlanWithSchemasAndFunctionBindingsAlloc(alloc, sql, schema, source_schema, params, function_bindings);
-    }
-    return try lowerReadPlanWithFunctionBindingsAlloc(alloc, sql, schema, params, function_bindings);
+    var context = sql_adapter.CatalogReadPlanLoweringContext{
+        .alloc = alloc,
+        .sql = sql,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_with_source_schema = lowerReadPlanWithSchemasAndFunctionBindingsAlloc,
+            .lower_without_source_schema = lowerReadPlanWithFunctionBindingsAlloc,
+        },
+    };
+    return try context.lower(catalog);
 }
 
 pub fn lowerExplainPlanAlloc(
@@ -1035,47 +986,21 @@ pub fn lowerExplainPlanWithOptionsCatalogAndFunctionBindingsAlloc(
     catalog: ?table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredExplainPlan {
-    const ExplainLoweringContext = struct {
-        alloc: std.mem.Allocator,
-        schema: runtime_schema.TableSchema,
-        params: []const SqlValue,
-        options: LowerWritePlanOptions,
-        catalog: ?table_catalog.CatalogSource,
-        function_bindings: SqlFunctionBindings,
-
-        fn hooks(self: *@This()) sql_adapter.ExplainPlanLoweringHooks {
-            return .{
-                .ptr = self,
-                .lower_read = lowerReadHook,
-                .lower_write = lowerWriteHook,
-            };
-        }
-
-        fn lowerReadHook(ptr: *anyopaque, inner_sql: []const u8) anyerror!LoweredReadPlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.catalog) |source_catalog| {
-                return try lowerReadPlanWithCatalogAndFunctionBindingsAlloc(self.alloc, inner_sql, self.schema, self.params, source_catalog, self.function_bindings);
-            }
-            return try lowerReadPlanWithFunctionBindingsAlloc(self.alloc, inner_sql, self.schema, self.params, self.function_bindings);
-        }
-
-        fn lowerWriteHook(ptr: *anyopaque, inner_sql: []const u8) anyerror!LoweredWritePlan {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.catalog) |source_catalog| {
-                return try lowerWritePlanWithCatalogAlloc(self.alloc, inner_sql, self.schema, self.params, self.options, source_catalog);
-            }
-            return try lowerWritePlanAlloc(self.alloc, inner_sql, self.schema, self.params, self.options);
-        }
-    };
-    var context = ExplainLoweringContext{
+    var context = sql_adapter.ExplainPlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
         .params = params,
         .options = options,
         .catalog = catalog,
         .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_read_with_catalog = lowerReadPlanWithCatalogAndFunctionBindingsAlloc,
+            .lower_read_without_catalog = lowerReadPlanWithFunctionBindingsAlloc,
+            .lower_write_with_catalog = lowerWritePlanWithCatalogAlloc,
+            .lower_write_without_catalog = lowerWritePlanAlloc,
+        },
     };
-    return try sql_adapter.lowerExplainPlanWithHooksAlloc(sql, context.hooks());
+    return try context.lower(sql);
 }
 
 pub fn lowerRelationPopulationPlanAlloc(
@@ -1105,14 +1030,18 @@ pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(
     catalog: ?table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredRelationPopulationPlan {
-    var parsed = try sql_adapter.parseRelationPopulationSqlAlloc(alloc, sql);
-    defer parsed.deinit(alloc);
-    var source = if (catalog) |source_catalog|
-        try lowerReadPlanWithCatalogAndFunctionBindingsAlloc(alloc, parsed.source_sql, schema, params, source_catalog, function_bindings)
-    else
-        try lowerReadPlanWithFunctionBindingsAlloc(alloc, parsed.source_sql, schema, params, function_bindings);
-    errdefer source.deinit(alloc);
-    return try sql_adapter.relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
+    var context = sql_adapter.RelationPopulationLoweringContext{
+        .alloc = alloc,
+        .schema = schema,
+        .params = params,
+        .catalog = catalog,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_read_with_catalog = lowerReadPlanWithCatalogAndFunctionBindingsAlloc,
+            .lower_read_without_catalog = lowerReadPlanWithFunctionBindingsAlloc,
+        },
+    };
+    return try context.lower(sql);
 }
 
 pub fn lowerWindowPlanAlloc(
@@ -1136,8 +1065,8 @@ pub fn lowerWindowPlanAlloc(
         alloc,
         tokens.items,
         &parser.pos,
-        parser.cteSelectParserHooks(),
-        parser.windowPlanParserHooks(),
+        Parser.ContextAccessors.cteSelectParserHooks(&parser),
+        Parser.ContextAccessors.windowPlanParserHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
@@ -1168,7 +1097,7 @@ pub fn lowerInsertAlloc(
         .schema = schema,
         .params = params,
     };
-    return parser.parseInsert() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseInsert(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1192,7 +1121,7 @@ pub fn lowerInsertWithResolverAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return parser.parseInsert() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseInsert(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1216,7 +1145,7 @@ pub fn lowerInsertWithResolverStrictAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return try parser.parseInsert();
+    return try Parser.ContextAccessors.parseInsert(&parser);
 }
 
 pub fn lowerInsertSourceWithResolverAlloc(
@@ -1237,7 +1166,7 @@ pub fn lowerInsertSourceWithResolverAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return sql_adapter.parseInsertSourceAlloc(alloc, tokens.items, &parser.pos, parser.joinCteSelectParserHooks(), parser.insertSourceParserHooks()) catch |err| switch (err) {
+    return sql_adapter.parseInsertSourceAlloc(alloc, tokens.items, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.insertSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1265,7 +1194,7 @@ pub fn lowerInsertSourceWithSchemasAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return sql_adapter.parseInsertSourceAlloc(alloc, tokens.items, &parser.pos, parser.joinCteSelectParserHooks(), parser.insertSourceParserHooks()) catch |err| switch (err) {
+    return sql_adapter.parseInsertSourceAlloc(alloc, tokens.items, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.insertSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1293,7 +1222,7 @@ pub fn lowerRecursiveInsertSourceWithSchemasAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return parser.parseRecursiveInsertSource() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseRecursiveInsertSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1321,7 +1250,7 @@ pub fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return parser.parseRecursiveUpdateJoinedMutationSource() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1349,7 +1278,7 @@ pub fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return parser.parseRecursiveDeleteJoinedMutationSource() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1373,7 +1302,7 @@ pub fn lowerUpdateAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return parser.parseUpdate() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseUpdate(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1397,7 +1326,7 @@ pub fn lowerUpdateStrictAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return try parser.parseUpdate();
+    return try Parser.ContextAccessors.parseUpdate(&parser);
 }
 
 pub fn lowerDeleteAlloc(
@@ -1418,7 +1347,7 @@ pub fn lowerDeleteAlloc(
         .params = params,
         .unique_resolver = unique_resolver,
     };
-    return parser.parseDelete() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseDelete(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1443,7 +1372,7 @@ pub fn lowerUpdateMutationSourceAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return parser.parseUpdateMutationSource() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseUpdateMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
         else => return err,
     };
@@ -1468,7 +1397,7 @@ pub fn lowerDeleteMutationSourceAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return parser.parseDeleteMutationSource() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseDeleteMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
         else => return err,
     };
@@ -1491,7 +1420,7 @@ pub fn lowerTruncateMutationSourceAlloc(
         .schema = schema,
         .mutation_claim = row_claim,
     };
-    return parser.parseTruncateMutationSource() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseTruncateMutationSource(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1516,7 +1445,7 @@ pub fn lowerMergeMutationPlanAlloc(
         .joined_source_schema = source_schema,
         .params = params,
     };
-    return try sql_adapter.parseMergeMutationPlanAlloc(alloc, tokens.items, &parser.pos, parser.joinCteSelectParserHooks(), parser.mergeMutationParserHooks());
+    return try sql_adapter.parseMergeMutationPlanAlloc(alloc, tokens.items, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.mergeMutationParserOptions(&parser));
 }
 
 pub fn lowerRecursiveMergeMutationWithSchemasAlloc(
@@ -1538,7 +1467,7 @@ pub fn lowerRecursiveMergeMutationWithSchemasAlloc(
         .joined_source_schema = source_schema,
         .params = params,
     };
-    return parser.parseRecursiveMergeMutation() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseRecursiveMergeMutation(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1663,7 +1592,7 @@ pub fn lowerUpdateJoinedMutationSourceWithSchemasAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return sql_adapter.parseJoinedMutationSourceAlloc(alloc, tokens.items, &parser.pos, parser.joinCteSelectParserHooks(), parser.updateJoinedMutationSourceParserHooks()) catch |err| switch (err) {
+    return sql_adapter.parseJoinedMutationSourceAlloc(alloc, tokens.items, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => error.UnsupportedRowsQuery,
         else => err,
     };
@@ -1701,7 +1630,7 @@ pub fn lowerDeleteJoinedMutationSourceWithSchemasAlloc(
         .params = params,
         .mutation_claim = row_claim,
     };
-    return sql_adapter.parseJoinedMutationSourceAlloc(alloc, tokens.items, &parser.pos, parser.joinCteSelectParserHooks(), parser.deleteJoinedMutationSourceParserHooks()) catch |err| switch (err) {
+    return sql_adapter.parseJoinedMutationSourceAlloc(alloc, tokens.items, &parser.pos, Parser.ContextAccessors.joinCteSelectParserHooks(&parser), Parser.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser)) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
         else => return err,
     };
@@ -1714,130 +1643,30 @@ pub fn lowerWritePlanAlloc(
     params: []const SqlValue,
     options: LowerWritePlanOptions,
 ) !LoweredWritePlan {
-    var context = struct {
-        alloc: std.mem.Allocator,
-        sql: []const u8,
-        schema: runtime_schema.TableSchema,
-        params: []const SqlValue,
-
-        fn hooks(self: *@This()) sql_adapter.WritePlanLoweringHooks {
-            return .{
-                .ptr = self,
-                .has_recursive_insert_source = hasRecursiveInsertSource,
-                .lower_recursive_insert_source = lowerRecursiveInsertSource,
-                .lower_recursive_update_joined_source = lowerRecursiveUpdateJoinedSource,
-                .lower_recursive_delete_joined_source = lowerRecursiveDeleteJoinedSource,
-                .lower_recursive_merge_mutation = lowerRecursiveMergeMutation,
-                .lower_insert = lowerInsert,
-                .lower_insert_source = lowerInsertSource,
-                .lower_insert_source_with_schema = lowerInsertSourceWithSchema,
-                .lower_update_joined_source = lowerUpdateJoinedSource,
-                .lower_update = lowerUpdate,
-                .lower_update_source = lowerUpdateSource,
-                .lower_delete_joined_source = lowerDeleteJoinedSource,
-                .lower_delete = lowerDelete,
-                .lower_delete_source = lowerDeleteSource,
-                .lower_truncate_source = lowerTruncateSource,
-                .lower_merge_mutation = lowerMergeMutation,
-            };
-        }
-
-        fn fromPtr(ptr: *anyopaque) *@This() {
-            return @ptrCast(@alignCast(ptr));
-        }
-
-        fn hasRecursiveInsertSource(ptr: *anyopaque, tokens: []const Token) anyerror!bool {
-            const self = fromPtr(ptr);
-            const maybe_recursive_tables = try sql_adapter.recursiveInsertSourceTableNamesFromTokensAlloc(self.alloc, tokens);
-            if (maybe_recursive_tables) |resolved_recursive_tables| {
-                var recursive_tables = resolved_recursive_tables;
-                recursive_tables.deinit(self.alloc);
-                return true;
-            }
-            return false;
-        }
-
-        fn lowerRecursiveInsertSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!LoweredRecursiveInsertSource {
-            const self = fromPtr(ptr);
-            return try lowerRecursiveInsertSourceWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params, resolver);
-        }
-
-        fn lowerRecursiveUpdateJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredRecursiveJoinedMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params, row_claim);
-        }
-
-        fn lowerRecursiveDeleteJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredRecursiveJoinedMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params, row_claim);
-        }
-
-        fn lowerRecursiveMergeMutation(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!LoweredRecursiveMergeMutation {
-            const self = fromPtr(ptr);
-            return try lowerRecursiveMergeMutationWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params);
-        }
-
-        fn lowerInsert(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!LoweredInsert {
-            const self = fromPtr(ptr);
-            return try lowerInsertWithResolverAlloc(self.alloc, self.sql, self.schema, self.params, resolver);
-        }
-
-        fn lowerInsertSource(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!LoweredInsertSource {
-            const self = fromPtr(ptr);
-            return try lowerInsertSourceWithResolverAlloc(self.alloc, self.sql, self.schema, self.params, resolver);
-        }
-
-        fn lowerInsertSourceWithSchema(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!LoweredInsertSource {
-            const self = fromPtr(ptr);
-            return try lowerInsertSourceWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params, resolver);
-        }
-
-        fn lowerUpdateJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredJoinedMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerUpdateJoinedMutationSourceWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params, row_claim);
-        }
-
-        fn lowerUpdate(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!LoweredMutation {
-            const self = fromPtr(ptr);
-            return try lowerUpdateAlloc(self.alloc, self.sql, self.schema, self.params, resolver);
-        }
-
-        fn lowerUpdateSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerUpdateMutationSourceAlloc(self.alloc, self.sql, self.schema, self.params, row_claim);
-        }
-
-        fn lowerDeleteJoinedSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredJoinedMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerDeleteJoinedMutationSourceWithSchemasAlloc(self.alloc, self.sql, self.schema, source_schema, self.params, row_claim);
-        }
-
-        fn lowerDelete(ptr: *anyopaque, resolver: relational_rows.UniqueSelectorResolver) anyerror!LoweredMutation {
-            const self = fromPtr(ptr);
-            return try lowerDeleteAlloc(self.alloc, self.sql, self.schema, self.params, resolver);
-        }
-
-        fn lowerDeleteSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerDeleteMutationSourceAlloc(self.alloc, self.sql, self.schema, self.params, row_claim);
-        }
-
-        fn lowerTruncateSource(ptr: *anyopaque, row_claim: db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource {
-            const self = fromPtr(ptr);
-            return try lowerTruncateMutationSourceAlloc(self.alloc, self.sql, self.schema, row_claim);
-        }
-
-        fn lowerMergeMutation(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!LoweredMergeMutationPlan {
-            const self = fromPtr(ptr);
-            return try lowerMergeMutationPlanAlloc(self.alloc, self.sql, self.schema, source_schema, self.params);
-        }
-    }{
+    var context = sql_adapter.WritePlanLoweringContext{
         .alloc = alloc,
         .sql = sql,
         .schema = schema,
         .params = params,
+        .callbacks = .{
+            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasAlloc,
+            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasAlloc,
+            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasAlloc,
+            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasAlloc,
+            .lower_insert_with_resolver = lowerInsertWithResolverAlloc,
+            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverAlloc,
+            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasAlloc,
+            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasAlloc,
+            .lower_update_with_resolver = lowerUpdateAlloc,
+            .lower_update_source = lowerUpdateMutationSourceAlloc,
+            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasAlloc,
+            .lower_delete_with_resolver = lowerDeleteAlloc,
+            .lower_delete_source = lowerDeleteMutationSourceAlloc,
+            .lower_truncate_source = lowerTruncateMutationSourceAlloc,
+            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanAlloc,
+        },
     };
-    return try sql_adapter.lowerWritePlanWithHooksAlloc(alloc, sql, schema, options, context.hooks());
+    return try context.lower(options);
 }
 
 pub fn lowerWritePlanWithCatalogAlloc(
@@ -1848,18 +1677,19 @@ pub fn lowerWritePlanWithCatalogAlloc(
     options: LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !LoweredWritePlan {
-    var resolved = try sql_adapter.resolveWritePlanCatalogOptionsAlloc(alloc, sql, options, catalog);
-    defer resolved.deinit(alloc);
-    return try lowerWritePlanAlloc(alloc, sql, schema, params, resolved.options);
+    var context = sql_adapter.CatalogWritePlanLoweringContext{
+        .alloc = alloc,
+        .sql = sql,
+        .schema = schema,
+        .params = params,
+        .callbacks = .{
+            .lower_with_options = lowerWritePlanAlloc,
+        },
+    };
+    return try context.lower(options, catalog);
 }
 
 const sqlWritePlanFallbackAllowed = sql_adapter.sqlWritePlanFallbackAllowed;
-
-fn checkedPlatformRealtimeNsU64() !u64 {
-    const value = platform_time.realtimeNs();
-    if (value < 0 or value > std.math.maxInt(u64)) return error.UnsupportedSqlShape;
-    return @intCast(value);
-}
 
 pub fn lowerAggregateAlloc(
     alloc: std.mem.Allocator,
@@ -1877,7 +1707,7 @@ pub fn lowerAggregateAlloc(
         .schema = schema,
         .params = params,
     };
-    return parser.parseAggregate() catch |err| switch (err) {
+    return Parser.ContextAccessors.parseAggregate(&parser) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
@@ -1904,8 +1734,8 @@ pub fn lowerAggregatePlanAlloc(
         alloc,
         tokens.items,
         &parser.pos,
-        parser.cteSelectParserHooks(),
-        parser.aggregatePlanParserHooks(),
+        Parser.ContextAccessors.cteSelectParserHooks(&parser),
+        Parser.ContextAccessors.aggregatePlanParserHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
@@ -1953,8 +1783,8 @@ pub fn lowerJoinWithSchemasAlloc(
         alloc,
         tokens.items,
         &parser.pos,
-        parser.joinCteSelectParserHooks(),
-        parser.joinPlanParserHooks(),
+        Parser.ContextAccessors.joinCteSelectParserHooks(&parser),
+        Parser.ContextAccessors.joinPlanParserHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
@@ -2002,8 +1832,8 @@ pub fn lowerLateralPlanWithSchemasAlloc(
         alloc,
         tokens.items,
         &parser.pos,
-        parser.cteSelectParserHooks(),
-        parser.lateralPlanParserHooks(),
+        Parser.ContextAccessors.cteSelectParserHooks(&parser),
+        Parser.ContextAccessors.lateralPlanParserHooks(&parser),
     ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
@@ -2043,15 +1873,19 @@ pub fn lowerDdlPlanWithFunctionBindingsAlloc(
         .field_expression_qualifiers = parser.field_expression_qualifiers,
         .returning_expression_qualifiers = parser.returning_expression_qualifiers,
         .defer_row_expression_field_validation = parser.defer_row_expression_field_validation,
-        .column_definition_options = parser.ddlColumnDefinitionOptions(),
-        .domain_options = parser.ddlDomainOptions(),
-        .create_index_options = parser.createIndexOptions(),
-        .row_security_policy_options = parser.rowSecurityPolicyOptions(),
+        .column_definition_options = Parser.ContextAccessors.ddlColumnDefinitionOptions(&parser),
+        .domain_options = Parser.ContextAccessors.ddlDomainOptions(&parser),
+        .create_index_options = Parser.ContextAccessors.createIndexOptions(&parser),
+        .row_security_policy_options = Parser.ContextAccessors.rowSecurityPolicyOptions(&parser),
     }) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
         else => return err,
     };
 }
+
+pub const lowerAntflyQueryFunctionSqlAlloc = sql_adapter.lowerAntflyQueryFunctionSqlAlloc;
+const AppParitySourceSchemaCatalog = sql_adapter.AppParitySourceSchemaCatalog;
+const appParitySourceTableNameAlloc = sql_adapter.appParitySourceTableNameAlloc;
 
 fn expectAppliedDdlWorkActions(applied: AppliedDdlSchemaJson, expected: []const AppliedDdlWorkAction) !void {
     try std.testing.expectEqual(expected.len, applied.work_items.len);
@@ -2074,1653 +1908,7 @@ fn expectAlterRoleLiteralSettingValue(expected: []const u8, value: ?AlterRolePla
     }
 }
 
-const AppParitySourceSchemaCatalog = struct {
-    tables: [1]metadata_table_manager.TableRecord,
-
-    fn init(table_name: []const u8, source_schema_json: []const u8) @This() {
-        return .{ .tables = .{
-            .{ .table_id = 90_001, .name = table_name, .placement_role = "data", .schema_json = source_schema_json },
-        } };
-    }
-
-    fn iface(self: *@This()) table_catalog.CatalogSource {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .admin_snapshot = adminSnapshot,
-                .free_admin_snapshot = freeAdminSnapshot,
-            },
-        };
-    }
-
-    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = self.tables[0..],
-            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
-            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
-            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
-            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
-            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
-        };
-    }
-
-    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-};
-
-fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?[]const u8 {
-    if (entry.source_schema_json.len == 0) return null;
-
-    switch (entry.family) {
-        .insert_source => {
-            var tables = (try sql_adapter.insertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
-            defer tables.deinit(alloc);
-            return try alloc.dupe(u8, tables.source);
-        },
-        .recursive_insert_source => {
-            var tables = (try sql_adapter.recursiveInsertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
-            defer tables.deinit(alloc);
-            return try alloc.dupe(u8, tables.source);
-        },
-        .update_joined_source,
-        .delete_joined_source,
-        .merge_mutation,
-        => {
-            var tables = (try sql_adapter.joinedWriteSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
-            defer tables.deinit(alloc);
-            return try alloc.dupe(u8, tables.source);
-        },
-        .read,
-        .join,
-        .lateral,
-        => {
-            var tables = (try sql_adapter.readSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
-            defer tables.deinit(alloc);
-            return try alloc.dupe(u8, tables.source);
-        },
-        else => return error.InvalidSqlCatalog,
-    }
-}
-
-const Parser = struct {
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: usize = 0,
-    schema: runtime_schema.TableSchema = .{},
-    joined_source_schema: ?runtime_schema.TableSchema = null,
-    params: []const SqlValue = &.{},
-    function_bindings: SqlFunctionBindings = .{},
-    unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
-    available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    mutation_claim: ?db_mod.types.RowClaimRequest = null,
-    returning_expression_qualifiers: []const []const u8 = &.{},
-    field_expression_qualifiers: []const []const u8 = &.{},
-    joined_target_expression_qualifiers: []const []const u8 = &.{},
-    joined_source_expression_qualifiers: []const []const u8 = &.{},
-    pending_joined_source_alias: ?[]const u8 = null,
-    named_window_specs: []const NamedWindowSpec = &.{},
-    insert_source_allows_different_table: bool = false,
-    row_expression_field_source_override: ?db_mod.types.RelationalRowsExpressionFieldSource = null,
-    defer_row_expression_field_validation: bool = false,
-    conflict_existing_qualifiers: []const []const u8 = &.{},
-    allow_primary_key_assignment: bool = false,
-    saw_primary_key_assignment: bool = false,
-    allow_select_set_boundary: bool = false,
-    allow_select_set_result_tail_boundary: bool = false,
-
-    fn mutationRowClaimAlloc(self: *@This(), skip_locked_default: bool) !db_mod.types.RowClaimRequest {
-        var claim = self.mutation_claim orelse db_mod.types.RowClaimRequest{
-            .skip_locked = skip_locked_default,
-            .wait_policy = if (skip_locked_default) .skip_locked else .wait,
-        };
-        claim.owner_id = if (claim.owner_id.len > 0) try self.alloc.dupe(u8, claim.owner_id) else "";
-        return claim;
-    }
-
-    fn ddlColumnDefinitionOptions(self: *@This()) sql_adapter.DdlColumnDefinitionOptions {
-        return .{
-            .expression_options = self.ddlExpressionOptions(),
-            .parse_rewrite_expression = true,
-        };
-    }
-
-    fn ddlDomainOptions(self: *@This()) sql_adapter.DdlDomainOptions {
-        return .{
-            .params = self.params,
-            .realtime_ns = platform_time.realtimeNs(),
-        };
-    }
-
-    fn ddlExpressionOptions(self: *@This()) sql_adapter.DdlExpressionOptions {
-        return .{
-            .params = self.params,
-            .realtime_ns = platform_time.realtimeNs(),
-            .function_bindings = self.function_bindings,
-            .context_hooks = self.selectParserContextHooks(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .condition_alternatives = self.expressionWhereConditionAlternativesParserHooks(),
-        };
-    }
-
-    fn createIndexOptions(self: *@This()) sql_adapter.CreateIndexOptions {
-        return .{
-            .context_hooks = self.selectParserContextHooks(),
-            .case_expression_hooks = self.caseExpressionParserHooks(),
-        };
-    }
-
-    fn insertSourceParserHooks(self: *@This()) sql_adapter.InsertSourceParserHooks {
-        return .{
-            .ptr = self,
-            .params = self.params,
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
-            .insert_source_allows_different_table = self.insert_source_allows_different_table,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .conflict_context_hooks = self.conflictClauseParserContextHooks(),
-            .conflict_target_options = self.conflictTargetParserOptions(),
-            .conflict_assignment_hooks = self.conflictUpdateSetAssignmentParserOptions(&.{}, &.{}),
-            .conflict_condition_options = self.conflictAssignmentExpressionParserOptions(),
-            .conflict_dispatch_options = self.conflictExpressionDispatchOptions(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .parse_select = parseInsertSourceSelectHook,
-        };
-    }
-
-    fn conflictClauseParserContextHooks(self: *@This()) sql_adapter.ConflictClauseParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getConflictClauseParserContextHook,
-            .set_context = setConflictClauseParserContextHook,
-            .row_expression_type_context = selectParserRowExpressionTypeContextHook,
-        };
-    }
-
-    fn updateJoinedMutationSourceParserHooks(self: *@This()) sql_adapter.JoinedMutationSourceParserHooks {
-        return .{
-            .ptr = self,
-            .parse_joined_mutation_source = parseUpdateJoinedMutationSourceWithCtesHook,
-        };
-    }
-
-    fn deleteJoinedMutationSourceParserHooks(self: *@This()) sql_adapter.JoinedMutationSourceParserHooks {
-        return .{
-            .ptr = self,
-            .parse_joined_mutation_source = parseDeleteJoinedMutationSourceWithCtesHook,
-        };
-    }
-
-    fn joinedMutationSourceParserContextHooks(self: *@This()) sql_adapter.JoinedMutationSourceParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getJoinedMutationSourceParserContextHook,
-            .set_context = setJoinedMutationSourceParserContextHook,
-        };
-    }
-
-    fn mergeMutationParserHooks(self: *@This()) sql_adapter.MergeMutationParserHooks {
-        return .{
-            .ptr = self,
-            .params = self.params,
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
-            .context_hooks = self.mergeMutationParserContextHooks(),
-            .condition_options = self.mergeArmConditionParserOptions(),
-            .assignment_hooks = self.mergeAssignmentParserHooks(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .realtime_ns = platform_time.realtimeNs(),
-        };
-    }
-
-    fn cteSelectParserHooks(self: *@This()) sql_adapter.CteSelectParserHooks {
-        return .{
-            .ptr = self,
-            .parse_select = parseCteSelectHook,
-        };
-    }
-
-    fn joinCteSelectParserHooks(self: *@This()) sql_adapter.CteSelectParserHooks {
-        return .{
-            .ptr = self,
-            .parse_select = parseJoinCteSelectHook,
-        };
-    }
-
-    fn queryPlanParserHooks(self: *@This()) sql_adapter.QueryPlanParserHooks {
-        return .{
-            .ptr = self,
-            .context_hooks = self.readPlanParserContextHooks(),
-            .parse_select = parseQueryPlanSelectHook,
-        };
-    }
-
-    fn windowPlanParserHooks(self: *@This()) sql_adapter.WindowPlanParserHooks {
-        return .{
-            .ptr = self,
-            .context_hooks = self.readPlanParserContextHooks(),
-            .parse_window = parseWindowPlanHook,
-        };
-    }
-
-    fn aggregatePlanParserHooks(self: *@This()) sql_adapter.AggregatePlanParserHooks {
-        return .{
-            .ptr = self,
-            .context_hooks = self.readPlanParserContextHooks(),
-            .parse_aggregate = parseAggregatePlanHook,
-        };
-    }
-
-    fn joinPlanParserHooks(self: *@This()) sql_adapter.JoinPlanParserHooks {
-        return .{
-            .ptr = self,
-            .context_hooks = self.readPlanParserContextHooks(),
-            .parse_join = parseJoinPlanHook,
-        };
-    }
-
-    fn lateralPlanParserHooks(self: *@This()) sql_adapter.LateralPlanParserHooks {
-        return .{
-            .ptr = self,
-            .context_hooks = self.readPlanParserContextHooks(),
-            .parse_lateral = parseLateralPlanHook,
-        };
-    }
-
-    fn recursiveCteParserHooks(self: *@This()) sql_adapter.RecursiveCteParserHooks {
-        return .{
-            .ptr = self,
-            .parse_select_with_set_boundary = parseRecursiveCteSelectWithSetBoundaryHook,
-            .select_output_columns = recursiveCteSelectOutputColumnsHook,
-            .parse_recursive_member = parseRecursiveCteMemberHook,
-        };
-    }
-
-    fn recursiveCteMemberParserHooks(self: *@This()) sql_adapter.RecursiveCteMemberParserHooks {
-        return .{
-            .ptr = self,
-            .parse_projection_expression = parseRecursiveCteMemberProjectionExpressionHook,
-            .parse_join_on = parseRecursiveCteMemberJoinOnHook,
-        };
-    }
-
-    fn setOperationParserHooks(self: *@This()) sql_adapter.SetOperationParserHooks {
-        return .{
-            .ptr = self,
-            .context_hooks = self.readPlanParserContextHooks(),
-            .parse_select = parseSetOperationSelectHook,
-            .select_output_columns = setOperationSelectOutputColumnsHook,
-            .parse_result_tail = parseSetOperationResultTailHook,
-        };
-    }
-
-    fn simpleSelectSetTailHooks(self: *@This()) sql_adapter.SimpleSelectSetTailHooks {
-        return .{
-            .ptr = self,
-            .parse_order_by = parseSimpleSelectSetTailOrderByHook,
-        };
-    }
-
-    fn parseCteSelectHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        available_ctes: []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredSelect {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .schema = self.schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-            .available_ctes = available_ctes,
-        };
-        return try sub.parseSelect();
-    }
-
-    fn parseJoinCteSelectHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        available_ctes: []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredSelect {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .schema = self.joined_source_schema orelse self.schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-            .available_ctes = available_ctes,
-        };
-        return try sub.parseSelect();
-    }
-
-    fn parseWindowPlanHook(ptr: *anyopaque) anyerror!LoweredWindowPlan {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseWindowSelect();
-    }
-
-    fn parseAggregatePlanHook(ptr: *anyopaque) anyerror!LoweredAggregate {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseAggregate();
-    }
-
-    fn parseJoinPlanHook(ptr: *anyopaque) anyerror!LoweredJoin {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseJoin();
-    }
-
-    fn parseLateralPlanHook(ptr: *anyopaque) anyerror!LoweredLateralPlan {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseLateral();
-    }
-
-    fn parseQueryPlanSelectHook(ptr: *anyopaque) anyerror!LoweredSelect {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseSelect();
-    }
-
-    fn parseInsertSourceSelectHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        schema: runtime_schema.TableSchema,
-    ) anyerror!LoweredSelect {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .schema = schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-        };
-        return try sub.parseSelect();
-    }
-
-    fn parseUpdateJoinedMutationSourceWithCtesHook(
-        ptr: *anyopaque,
-        ctes: []const db_mod.types.RelationalRowsCte,
-        base_table_name: ?*?[]const u8,
-    ) anyerror!LoweredJoinedMutationSource {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseUpdateJoinedMutationSourceWithCtes(ctes, base_table_name);
-    }
-
-    fn parseDeleteJoinedMutationSourceWithCtesHook(
-        ptr: *anyopaque,
-        ctes: []const db_mod.types.RelationalRowsCte,
-        base_table_name: ?*?[]const u8,
-    ) anyerror!LoweredJoinedMutationSource {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseDeleteJoinedMutationSourceWithCtes(ctes, base_table_name);
-    }
-
-    fn parseRecursiveCteSelectWithSetBoundaryHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        pos: *usize,
-        available_ctes: []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredSelect {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .pos = pos.*,
-            .schema = self.schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-            .available_ctes = available_ctes,
-            .allow_select_set_boundary = true,
-        };
-        const lowered = try sub.parseSelect();
-        pos.* = sub.pos;
-        return lowered;
-    }
-
-    fn recursiveCteSelectOutputColumnsHook(
-        ptr: *anyopaque,
-        lowered: LoweredSelect,
-    ) anyerror![]runtime_schema.RelationalColumn {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.loweredSelectOutputColumnsAlloc(self.alloc, self.rowExpressionTypeContext(), lowered);
-    }
-
-    fn parseRecursiveCteMemberHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        pos: *usize,
-        available_ctes: []const db_mod.types.RelationalRowsCte,
-        cte_name: []const u8,
-    ) anyerror!LoweredRecursiveCteMemberPlan {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .pos = pos.*,
-            .schema = self.schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-            .available_ctes = available_ctes,
-        };
-        const member = try sql_adapter.parseRecursiveCteMemberPlanAlloc(
-            self.alloc,
-            tokens,
-            &sub.pos,
-            self.schema,
-            available_ctes,
-            cte_name,
-            self.recursiveCteMemberParserHooks(),
-        );
-        pos.* = sub.pos;
-        return member;
-    }
-
-    fn parseRecursiveCteMemberProjectionExpressionHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        pos: *usize,
-        cte_schema: runtime_schema.TableSchema,
-        target_qualifiers: []const []const u8,
-        source_qualifiers: []const []const u8,
-    ) anyerror!sql_adapter.RecursiveCteMemberProjectionExpression {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var projection_parser = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .pos = pos.*,
-            .schema = self.schema,
-            .joined_source_schema = cte_schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .joined_target_expression_qualifiers = target_qualifiers,
-            .joined_source_expression_qualifiers = source_qualifiers,
-        };
-        const parsed = try sql_adapter.parseRecursiveCteMemberProjectionExpressionAlloc(
-            projection_parser.alloc,
-            projection_parser.tokens,
-            &projection_parser.pos,
-            .{
-                .type_context = projection_parser.rowExpressionTypeContext(),
-                .row_expression_hooks = projection_parser.rowExpressionParserHooks(),
-                .arithmetic_hooks = projection_parser.arithmeticExpressionParserHooks(),
-                .variadic_hooks = projection_parser.variadicRowExpressionParserHooks(),
-            },
-        );
-        pos.* = projection_parser.pos;
-        return parsed;
-    }
-
-    fn parseRecursiveCteMemberJoinOnHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        pos: *usize,
-        cte_schema: runtime_schema.TableSchema,
-        left_is_cte: bool,
-        right_is_cte: bool,
-        join_type: db_mod.types.RelationalRowsJoinType,
-        left_alias: []const u8,
-        right_alias: []const u8,
-    ) anyerror![]const db_mod.types.RelationalRowsJoinOn {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .pos = pos.*,
-            .schema = if (left_is_cte) cte_schema else self.schema,
-            .joined_source_schema = if (right_is_cte) cte_schema else self.schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-        };
-        const on = try sql_adapter.parseRecursiveCteMemberJoinOnAlloc(self.alloc, sub.tokens, &sub.pos, .{
-            .params = sub.params,
-            .schema = sub.schema,
-            .joined_source_schema = sub.joined_source_schema,
-            .join_type = join_type,
-            .left_alias = left_alias,
-            .right_alias = right_alias,
-            .string_to_array_predicate_is_containment = sql_adapter.stringToArrayPredicateIsContainment(sub.tokens, sub.pos),
-            .expression_where_options = sub.joinedMutationExpressionWhereOptions(),
-            .realtime_ns = @intCast(platform_time.realtimeNs()),
-        });
-        pos.* = sub.pos;
-        return on;
-    }
-
-    fn parseSetOperationSelectHook(ptr: *anyopaque) anyerror!LoweredSelect {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseSelect();
-    }
-
-    fn setOperationSelectOutputColumnsHook(
-        ptr: *anyopaque,
-        lowered: LoweredSelect,
-    ) anyerror![]runtime_schema.RelationalColumn {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.loweredSelectOutputColumnsAlloc(self.alloc, self.rowExpressionTypeContext(), lowered);
-    }
-
-    fn parseSetOperationResultTailHook(
-        ptr: *anyopaque,
-        lowered: LoweredSelect,
-    ) anyerror!SetOperationResultTail {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseSetOperationResultTailAlloc(self.alloc, self.tokens, &self.pos, self.params, lowered, self.simpleSelectSetTailHooks());
-    }
-
-    fn parseSimpleSelectSetTailOrderByHook(
-        ptr: *anyopaque,
-        order_by: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder),
-        select: SelectList,
-    ) anyerror!void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseSelectOutputOrderByAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            order_by,
-            select,
-            self.orderByParserOptions(),
-        );
-    }
-
-    fn rowSecurityPolicyOptions(self: *@This()) sql_adapter.RowSecurityPolicyOptions {
-        return .{
-            .function_bindings = self.function_bindings,
-            .context_hooks = self.selectParserContextHooks(),
-            .boolean_hooks = self.booleanRowExpressionParserHooks(),
-        };
-    }
-
-    fn conflictTargetParserOptions(self: *@This()) sql_adapter.ConflictTargetParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .case_expression_hooks = self.caseExpressionParserHooks(),
-        };
-    }
-
-    fn aggregateOutputFieldExpressionConditionParserHooks(self: *@This()) sql_adapter.AggregateOutputFieldExpressionConditionParserHooks {
-        return .{
-            .params = self.params,
-            .output_field_hooks = self.aggregateOutputFieldParserHooks(),
-        };
-    }
-
-    fn bareBooleanWhereExpressionParserOptions(self: *@This()) sql_adapter.BareBooleanWhereExpressionParserOptions {
-        return .{
-            .boolean_hooks = self.booleanRowExpressionParserHooks(),
-        };
-    }
-
-    fn outputOrderExpressionParserOptions(self: *@This()) sql_adapter.OutputOrderExpressionParserOptions {
-        return .{
-            .function_bindings = self.function_bindings,
-            .context_hooks = self.selectParserContextHooks(),
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-        };
-    }
-
-    fn returningProjectionParserOptions(self: *@This()) sql_adapter.ReturningProjectionParserOptions {
-        return .{
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .field_source = self.rowExpressionFieldSource(),
-            .context_hooks = self.selectParserContextHooks(),
-            .select_item_hooks = self.selectItemParserHooks(),
-        };
-    }
-
-    fn joinedMutationReturningProjectionParserOptions(self: *@This()) sql_adapter.JoinedMutationReturningProjectionParserOptions {
-        return .{
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .field_source = self.rowExpressionFieldSource(),
-            .select_context_hooks = self.selectParserContextHooks(),
-            .joined_context_hooks = self.joinedExpressionParserContextHooks(),
-            .select_item_hooks = self.selectItemParserHooks(),
-        };
-    }
-
-    fn orderByParserOptions(self: *@This()) sql_adapter.OrderByParserOptions {
-        return .{
-            .schema = self.schema,
-            .function_bindings = self.function_bindings,
-            .field_expression_qualifiers = self.field_expression_qualifiers,
-            .returning_expression_qualifiers = self.returning_expression_qualifiers,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .type_context = self.rowExpressionTypeContext(),
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-        };
-    }
-
-    fn orderExpressionParserOptions(self: *@This()) sql_adapter.OrderExpressionParserOptions {
-        return .{
-            .field_source = self.rowExpressionFieldSource(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .parenthesized = self.parenthesizedRowExpressionParserOptions(),
-            .case_fold_hooks = self.caseFoldRowExpressionParserOptions(),
-            .fixed_unary = self.fixedUnaryRowExpressionParserOptions(),
-        };
-    }
-
-    fn aggregateSpecParserHooks(self: *@This()) sql_adapter.AggregateSpecParserHooks {
-        return .{
-            .function_bindings = self.function_bindings,
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-            .aggregate_input = .{
-                .context_hooks = self.selectParserContextHooks(),
-                .row_expression_hooks = self.rowExpressionParserHooks(),
-                .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-                .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            },
-            .expression_alternatives = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_conditions = self.expressionWhereConditionsParserHooks(),
-            .fixed_binary = self.fixedBinaryRowExpressionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        };
-    }
-
-    fn aggregateOutputFieldParserHooks(self: *@This()) sql_adapter.AggregateOutputFieldParserHooks {
-        return .{
-            .params = self.params,
-            .context_hooks = self.selectParserContextHooks(),
-            .aggregate_spec_hooks = self.aggregateSpecParserHooks(),
-        };
-    }
-
-    fn joinedMutationExpressionWhereOptions(self: *@This()) sql_adapter.JoinedMutationExpressionWhereConditionParserOptions {
-        return .{
-            .params = self.params,
-            .joined_source_schema = self.joined_source_schema,
-            .select_context_hooks = self.selectParserContextHooks(),
-            .joined_context_hooks = self.joinedExpressionParserContextHooks(),
-            .alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-        };
-    }
-
-    fn expressionWhereConditionsParserHooks(self: *@This()) sql_adapter.ExpressionWhereConditionsParserOptions {
-        return .{
-            .select_context_hooks = self.selectParserContextHooks(),
-            .joined_context_hooks = self.joinedExpressionParserContextHooks(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn expressionWhereConditionAlternativesParserHooks(self: *@This()) sql_adapter.ExpressionWhereConditionAlternativesParserOptions {
-        return .{
-            .select_context_hooks = self.selectParserContextHooks(),
-            .joined_context_hooks = self.joinedExpressionParserContextHooks(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn conflictJsonSetSqlValueParserOptions(
-        self: *@This(),
-        insert_columns: []const []const u8,
-    ) sql_adapter.JsonSetSqlValueParserOptions {
-        const type_context = self.rowExpressionTypeContext();
-        return .{
-            .params = self.params,
-            .schema = self.schema,
-            .conflict_existing_qualifiers = self.conflict_existing_qualifiers,
-            .insert_columns = insert_columns,
-            .type_context = type_context,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .conflict_dispatch_options = self.conflictExpressionDispatchOptions(),
-        };
-    }
-
-    fn conflictUpdateAssignmentValueParserOptions(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) sql_adapter.ConflictUpdateAssignmentValueParserOptions {
-        return .{
-            .schema = self.schema,
-            .params = self.params,
-            .insert_columns = insert_columns,
-            .insert_values = insert_values,
-            .realtime_ns = platform_time.realtimeNs(),
-            .json_set = self.conflictJsonSetSqlValueParserOptions(insert_columns),
-            .expression_options = .{
-                .type_context = self.rowExpressionTypeContext(),
-                .assignment_options = self.conflictAssignmentExpressionParserOptions(),
-            },
-        };
-    }
-
-    fn conflictUpdateSetAssignmentParserOptions(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) sql_adapter.ConflictUpdateSetAssignmentParserOptions {
-        return .{
-            .value = self.conflictUpdateAssignmentValueParserOptions(insert_columns, insert_values),
-            .primary_key_assignment = .{ .allow_and_mark = .{
-                .allow = self.allow_primary_key_assignment,
-                .saw = &self.saw_primary_key_assignment,
-            } },
-        };
-    }
-
-    fn conflictAssignmentExpressionParserOptions(self: *@This()) sql_adapter.ConflictAssignmentExpressionParserOptions {
-        return .{
-            .params = self.params,
-            .schema = self.schema,
-            .conflict_existing_qualifiers = self.conflict_existing_qualifiers,
-            .type_context = self.rowExpressionTypeContext(),
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .dispatch_options = self.conflictExpressionDispatchOptions(),
-        };
-    }
-
-    fn conflictExpressionDispatchOptions(self: *@This()) sql_adapter.ConflictExpressionDispatchOptions {
-        return .{
-            .array_length = self.conflictArrayLengthExpressionParserOptions(),
-            .case_fold = self.conflictCaseFoldExpressionParserOptions(),
-        };
-    }
-
-    fn selectFieldItemParserOptions(self: *@This()) sql_adapter.SelectFieldItemParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .boolean_hooks = self.booleanExpressionParserHooks(),
-        };
-    }
-
-    fn selectItemParserHooks(self: *@This()) sql_adapter.SelectItemParserHooks {
-        return .{
-            .ptr = self,
-            .expression = self.expressionProjectionParserOptions(),
-            .json_value_expression = self.jsonValueExpressionProjectionParserOptions(),
-            .select_field = self.selectFieldItemParserOptions(),
-            .extension_function = self.extensionFunctionRowExpressionParserOptions(),
-            .routine_expression = self.routineExpressionRowExpressionParserOptions(),
-        };
-    }
-
-    fn windowSpecParserOptions(self: *@This()) sql_adapter.WindowSpecParserOptions {
-        return .{
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .boolean_hooks = self.booleanRowExpressionParserHooks(),
-            .expression_alternatives = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_conditions = self.expressionWhereConditionsParserHooks(),
-            .fixed_binary = self.fixedBinaryRowExpressionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        };
-    }
-
-    fn rowExpressionOperandParserOptions(self: *@This()) sql_adapter.RowExpressionOperandParserOptions {
-        return .{
-            .extension_function = self.extensionFunctionRowExpressionParserOptions(),
-            .routine_expression = self.routineExpressionRowExpressionParserOptions(),
-            .parenthesized = self.parenthesizedRowExpressionParserOptions(),
-            .cast = self.castRowExpressionParserOptions(),
-            .case_expression = self.caseExpressionParserHooks(),
-            .case_fold = self.caseFoldRowExpressionParserOptions(),
-            .coalesce = self.coalesceRowExpressionParserOptions(),
-            .fixed_unary = self.fixedUnaryRowExpressionParserOptions(),
-            .fixed_binary = self.fixedBinaryRowExpressionParserOptions(),
-            .variadic = self.variadicRowExpressionParserHooks(),
-            .json_build_object = self.jsonBuildObjectRowExpressionParserOptions(),
-        };
-    }
-
-    fn extensionFunctionRowExpressionParserOptions(self: *@This()) sql_adapter.ExtensionFunctionRowExpressionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn routineExpressionRowExpressionParserOptions(self: *@This()) sql_adapter.RoutineExpressionRowExpressionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .boolean_hooks = self.booleanRowExpressionParserHooks(),
-        };
-    }
-
-    fn parenthesizedRowExpressionParserOptions(self: *@This()) sql_adapter.ParenthesizedRowExpressionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .boolean_hooks = self.booleanRowExpressionParserHooks(),
-        };
-    }
-
-    fn castRowExpressionParserOptions(self: *@This()) sql_adapter.CastRowExpressionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn coalesceRowExpressionParserOptions(self: *@This()) sql_adapter.CoalesceRowExpressionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn coalesceProjectionParserOptions(self: *@This()) sql_adapter.CoalesceProjectionParserOptions {
-        return .{
-            .params = self.params,
-        };
-    }
-
-    fn jsonValueExpressionProjectionParserOptions(self: *@This()) sql_adapter.JsonValueExpressionProjectionParserOptions {
-        return .{
-            .params = self.params,
-        };
-    }
-
-    fn expressionProjectionParserOptions(self: *@This()) sql_adapter.ExpressionProjectionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .boolean_hooks = self.booleanRowExpressionParserHooks(),
-        };
-    }
-
-    fn rowExpressionParserHooks(self: *@This()) sql_adapter.RowExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_operand = parseRowExpressionOperandHook,
-        };
-    }
-
-    fn fixedUnaryRowExpressionParserOptions(self: *@This()) sql_adapter.FixedUnaryRowExpressionParserOptions {
-        return .{
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn fixedBinaryRowExpressionParserOptions(self: *@This()) sql_adapter.FixedBinaryRowExpressionParserOptions {
-        return .{
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn variadicRowExpressionParserHooks(self: *@This()) sql_adapter.VariadicRowExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
-            .parse_operand = parseRowExpressionOperandHook,
-        };
-    }
-
-    fn arithmeticExpressionParserHooks(self: *@This()) sql_adapter.ArithmeticExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_operand = parseRowExpressionOperandHook,
-            .parenthesized = self.parenthesizedRowExpressionParserOptions(),
-        };
-    }
-
-    fn booleanExpressionParserHooks(self: *@This()) sql_adapter.BooleanExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_operand = parseRowExpressionOperandHook,
-        };
-    }
-
-    fn booleanRowExpressionParserHooks(self: *@This()) sql_adapter.BooleanRowExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
-            .parse_operand = parseRowExpressionOperandHook,
-        };
-    }
-
-    fn caseExpressionParserHooks(self: *@This()) sql_adapter.CaseExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_expression = parseFixedUnaryRowExpressionOperandHook,
-            .parse_operand = parseRowExpressionOperandHook,
-        };
-    }
-
-    fn caseFoldRowExpressionParserOptions(self: *@This()) sql_adapter.CaseFoldRowExpressionParserOptions {
-        return .{
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn jsonBuildObjectRowExpressionParserOptions(self: *@This()) sql_adapter.JsonBuildObjectRowExpressionParserOptions {
-        return .{
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-        };
-    }
-
-    fn conflictArrayLengthExpressionParserOptions(self: *@This()) sql_adapter.ConflictArrayLengthExpressionParserOptions {
-        return .{
-            .schema = self.schema,
-            .conflict_existing_qualifiers = self.conflict_existing_qualifiers,
-        };
-    }
-
-    fn conflictCaseFoldExpressionParserOptions(self: *@This()) sql_adapter.ConflictCaseFoldExpressionParserOptions {
-        return .{
-            .period_bound = .{
-                .schema = self.schema,
-                .field_expression_qualifiers = self.field_expression_qualifiers,
-                .returning_expression_qualifiers = self.returning_expression_qualifiers,
-                .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-                .field_source = self.rowExpressionFieldSource(),
-            },
-        };
-    }
-
-    fn parseRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseRowExpressionOperandFromContextAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.params,
-            self.joined_source_schema,
-            self.function_bindings,
-            self.rowExpressionFieldSource(),
-            self.selectParserContextHooks(),
-            self.joinedExpressionParserContextHooks(),
-            self.rowExpressionOperandParserOptions(),
-        );
-    }
-
-    fn parseFixedUnaryRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseRowExpressionFromContextAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.selectParserContextHooks(),
-            self.rowExpressionParserHooks(),
-            self.arithmeticExpressionParserHooks(),
-            self.variadicRowExpressionParserHooks(),
-        );
-    }
-
-    fn joinedMutationJsonSetSqlValueParserOptions(self: *@This()) sql_adapter.JoinedMutationJsonSetSqlValueParserOptions {
-        return .{
-            .params = self.params,
-            .pending_joined_source_alias = self.pending_joined_source_alias,
-            .row_expression_options = .{
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .row_expression_hooks = self.rowExpressionParserHooks(),
-                .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-                .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            },
-        };
-    }
-
-    fn joinedMutationAssignmentValueParserOptions(self: *@This()) sql_adapter.JoinedMutationAssignmentValueParserOptions {
-        return .{
-            .json_set = self.joinedMutationJsonSetSqlValueParserOptions(),
-            .assignment_expression = self.joinedMutationAssignmentExpressionParserOptions(),
-        };
-    }
-
-    fn joinedMutationAssignmentExpressionParserOptions(self: *@This()) sql_adapter.JoinedMutationAssignmentExpressionParserOptions {
-        return .{
-            .pending_joined_source_alias = self.pending_joined_source_alias,
-            .type_context = self.rowExpressionTypeContext(),
-            .row_expression_options = .{
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .row_expression_hooks = self.rowExpressionParserHooks(),
-                .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-                .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            },
-            .boolean_expression_options = .{
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .boolean_hooks = self.booleanRowExpressionParserHooks(),
-            },
-        };
-    }
-
-    fn semiJoinSourceQueryParserContextHooks(self: *@This()) sql_adapter.SemiJoinSourceQueryParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getSemiJoinSourceQueryParserContextHook,
-            .set_context = setSemiJoinSourceQueryParserContextHook,
-        };
-    }
-
-    fn mergeAssignmentParserHooks(self: *@This()) sql_adapter.MergeAssignmentParserHooks {
-        return .{
-            .assignment_expression = self.mergeAssignmentExpressionParserOptions(),
-        };
-    }
-
-    fn mergeAssignmentExpressionParserOptions(self: *@This()) sql_adapter.MergeAssignmentExpressionParserOptions {
-        return .{
-            .type_context = self.rowExpressionTypeContext(),
-            .row_expression_options = .{
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .row_expression_hooks = self.rowExpressionParserHooks(),
-                .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-                .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            },
-        };
-    }
-
-    fn mergeArmConditionParserOptions(self: *@This()) sql_adapter.MergeArmConditionParserOptions {
-        return .{
-            .expression_predicates_options = self.mergeArmExpressionPredicatesParserOptions(),
-        };
-    }
-
-    fn mergeArmExpressionPredicatesParserOptions(self: *@This()) sql_adapter.MergeArmExpressionPredicatesParserOptions {
-        return .{
-            .not_where_options = .{
-                .params = self.params,
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            },
-            .or_where_options = .{
-                .params = self.params,
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            },
-            .where_condition_options = .{
-                .params = self.params,
-                .context_hooks = self.joinedExpressionParserContextHooks(),
-                .condition_hooks = self.expressionWhereConditionsParserHooks(),
-            },
-        };
-    }
-
-    fn parseSelect(self: *@This()) !LoweredSelect {
-        return try sql_adapter.parseSelectAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .available_ctes = self.available_ctes,
-            .function_bindings = self.function_bindings,
-            .field_source = self.rowExpressionFieldSource(),
-            .allow_select_set_boundary = self.allow_select_set_boundary,
-            .allow_select_set_result_tail_boundary = self.allow_select_set_result_tail_boundary,
-            .context_hooks = self.selectParserContextHooks(),
-            .select_item_hooks = self.selectItemParserHooks(),
-            .row_expression_hooks = self.rowExpressionParserHooks(),
-            .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
-            .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseWindowSelect(self: *@This()) !LoweredWindowPlan {
-        return try sql_adapter.parseWindowSelectAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .available_ctes = self.available_ctes,
-            .context_hooks = self.selectParserContextHooks(),
-            .named_window_hooks = self.namedWindowSpecsContextHooks(),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .function_bindings = self.function_bindings,
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-            .window_spec_options = self.windowSpecParserOptions(),
-            .output_order_expression_options = self.outputOrderExpressionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseAggregate(self: *@This()) !LoweredAggregate {
-        return try sql_adapter.parseAggregateAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .available_ctes = self.available_ctes,
-            .function_bindings = self.function_bindings,
-            .field_source = self.rowExpressionFieldSource(),
-            .context_hooks = self.selectParserContextHooks(),
-            .aggregate_spec_hooks = self.aggregateSpecParserHooks(),
-            .select_item_hooks = self.selectItemParserHooks(),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .output_field_hooks = self.aggregateOutputFieldParserHooks(),
-            .output_field_condition_hooks = self.aggregateOutputFieldExpressionConditionParserHooks(),
-            .case_expression_hooks = self.caseExpressionParserHooks(),
-            .output_order_expression_options = self.outputOrderExpressionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseJoin(self: *@This()) !LoweredJoin {
-        return try sql_adapter.parseJoinAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .available_ctes = self.available_ctes,
-            .context_hooks = self.joinParserContextHooks(),
-            .expression_where_options = self.joinedMutationExpressionWhereOptions(),
-            .output_order_expression_options = self.outputOrderExpressionParserOptions(),
-            .string_to_array_predicate_is_containment = sql_adapter.stringToArrayPredicateIsContainment(self.tokens, self.pos),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseLateral(self: *@This()) !LoweredLateralPlan {
-        return try sql_adapter.parseLateralAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .available_ctes = self.available_ctes,
-            .context_hooks = self.joinParserContextHooks(),
-            .subquery_hooks = self.lateralSubqueryParserHooks(),
-            .expression_where_options = self.joinedMutationExpressionWhereOptions(),
-            .output_order_expression_options = self.outputOrderExpressionParserOptions(),
-            .string_to_array_predicate_is_containment = sql_adapter.stringToArrayPredicateIsContainment(self.tokens, self.pos),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseInsert(self: *@This()) !LoweredInsert {
-        return try sql_adapter.parseInsertAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .unique_resolver = self.unique_resolver,
-            .type_context = self.rowExpressionTypeContext(),
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .target_options = self.conflictTargetParserOptions(),
-            .assignment_value_hooks = self.conflictUpdateAssignmentValueParserOptions(&.{}, &.{}),
-            .condition_options = self.conflictAssignmentExpressionParserOptions(),
-            .dispatch_options = self.conflictExpressionDispatchOptions(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseRecursiveInsertSource(self: *@This()) !LoweredRecursiveInsertSource {
-        return try sql_adapter.parseRecursiveInsertSourceAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.recursiveCteParserHooks(),
-            self.insertSourceParserHooks(),
-        );
-    }
-
-    fn parseRecursiveUpdateJoinedMutationSource(self: *@This()) !LoweredRecursiveJoinedMutationSource {
-        return try sql_adapter.parseRecursiveJoinedMutationSourceAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            .update,
-            self.recursiveCteParserHooks(),
-            self.updateJoinedMutationSourceParserHooks(),
-        );
-    }
-
-    fn parseRecursiveDeleteJoinedMutationSource(self: *@This()) !LoweredRecursiveJoinedMutationSource {
-        return try sql_adapter.parseRecursiveJoinedMutationSourceAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            .delete,
-            self.recursiveCteParserHooks(),
-            self.deleteJoinedMutationSourceParserHooks(),
-        );
-    }
-
-    fn parseRecursiveMergeMutation(self: *@This()) !LoweredRecursiveMergeMutation {
-        return try sql_adapter.parseRecursiveMergeMutationAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.recursiveCteParserHooks(),
-            self.mergeMutationParserHooks(),
-        );
-    }
-
-    fn parseInsertSourceWithCtes(
-        self: *@This(),
-        ctes: []const db_mod.types.RelationalRowsCte,
-        base_table_name: ?*?[]const u8,
-    ) !LoweredInsertSource {
-        return try sql_adapter.parseInsertSourceWithCtesAlloc(self.alloc, self.tokens, &self.pos, self.insertSourceParserHooks(), .{
-            .ctes = ctes,
-            .base_table_name = base_table_name,
-        });
-    }
-
-    fn parseUpdate(self: *@This()) !LoweredMutation {
-        return try sql_adapter.parseUpdateAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .unique_resolver = self.unique_resolver,
-            .conflict_existing_qualifiers = self.conflict_existing_qualifiers,
-            .assignment_value_hooks = self.conflictUpdateAssignmentValueParserOptions(&.{}, &.{}),
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseDelete(self: *@This()) !LoweredMutation {
-        return try sql_adapter.parseDeleteAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .unique_resolver = self.unique_resolver,
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn parseUpdateMutationSource(self: *@This()) !LoweredMutationSource {
-        return try sql_adapter.parseUpdateMutationSourceAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .row_claim = try self.mutationRowClaimAlloc(false),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .context_hooks = self.mutationSourceParserContextHooks(),
-            .assignment_value_hooks = self.conflictUpdateAssignmentValueParserOptions(&.{}, &.{}),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .function_bindings = self.function_bindings,
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-        });
-    }
-
-    fn parseDeleteMutationSource(self: *@This()) !LoweredMutationSource {
-        return try sql_adapter.parseDeleteMutationSourceAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .row_claim = try self.mutationRowClaimAlloc(false),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .context_hooks = self.mutationSourceParserContextHooks(),
-            .assignment_value_hooks = self.conflictUpdateAssignmentValueParserOptions(&.{}, &.{}),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .function_bindings = self.function_bindings,
-            .order_expression_hooks = self.orderExpressionParserOptions(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-        });
-    }
-
-    fn parseTruncateMutationSource(self: *@This()) !LoweredMutationSource {
-        return try sql_adapter.parseTruncateMutationSourceAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.schema,
-            try self.mutationRowClaimAlloc(false),
-        );
-    }
-
-    fn parseMergeMutationBody(
-        self: *@This(),
-        ctes: []const db_mod.types.RelationalRowsCte,
-        base_table_name: ?*?[]const u8,
-    ) !LoweredMergeMutationPlan {
-        return try sql_adapter.parseMergeMutationBodyAlloc(self.alloc, self.tokens, &self.pos, self.mergeMutationParserHooks(), .{
-            .ctes = ctes,
-            .base_table_name = base_table_name,
-        });
-    }
-
-    fn parseUpdateJoinedMutationSourceWithCtes(
-        self: *@This(),
-        ctes: []const db_mod.types.RelationalRowsCte,
-        base_table_name: ?*?[]const u8,
-    ) !LoweredJoinedMutationSource {
-        return try sql_adapter.parseUpdateJoinedMutationSourceWithCtesAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
-            .row_claim = try self.mutationRowClaimAlloc(false),
-            .ctes = ctes,
-            .base_table_name = base_table_name,
-            .string_to_array_predicate_is_containment = sql_adapter.stringToArrayPredicateIsContainment(self.tokens, self.pos),
-            .context_hooks = self.joinedMutationSourceParserContextHooks(),
-            .assignment_options = self.joinedMutationAssignmentValueParserOptions(),
-            .source_query_context_hooks = self.semiJoinSourceQueryParserContextHooks(),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .expression_where_options = self.joinedMutationExpressionWhereOptions(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .joined_returning_hooks = self.joinedMutationReturningProjectionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-            .field_expression_qualifiers = self.field_expression_qualifiers,
-            .returning_expression_qualifiers = self.returning_expression_qualifiers,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-        });
-    }
-
-    fn parseDeleteJoinedMutationSourceWithCtes(
-        self: *@This(),
-        ctes: []const db_mod.types.RelationalRowsCte,
-        base_table_name: ?*?[]const u8,
-    ) !LoweredJoinedMutationSource {
-        return try sql_adapter.parseDeleteJoinedMutationSourceWithCtesAlloc(self.alloc, self.tokens, &self.pos, .{
-            .params = self.params,
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
-            .row_claim = try self.mutationRowClaimAlloc(false),
-            .ctes = ctes,
-            .base_table_name = base_table_name,
-            .string_to_array_predicate_is_containment = sql_adapter.stringToArrayPredicateIsContainment(self.tokens, self.pos),
-            .context_hooks = self.joinedMutationSourceParserContextHooks(),
-            .source_query_context_hooks = self.semiJoinSourceQueryParserContextHooks(),
-            .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
-            .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
-            .expression_alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
-            .expression_condition_hooks = self.expressionWhereConditionsParserHooks(),
-            .expression_where_options = self.joinedMutationExpressionWhereOptions(),
-            .returning_hooks = self.returningProjectionParserOptions(),
-            .joined_returning_hooks = self.joinedMutationReturningProjectionParserOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-            .field_expression_qualifiers = self.field_expression_qualifiers,
-            .returning_expression_qualifiers = self.returning_expression_qualifiers,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-        });
-    }
-
-    fn rowExpressionTypeContext(self: *@This()) sql_adapter.RowExpressionTypeContext {
-        return .{
-            .alloc = self.alloc,
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-        };
-    }
-
-    fn selectParserContextHooks(self: *@This()) sql_adapter.SelectParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getSelectParserContextHook,
-            .set_context = setSelectParserContextHook,
-            .row_expression_type_context = selectParserRowExpressionTypeContextHook,
-        };
-    }
-
-    fn namedWindowSpecsContextHooks(self: *@This()) sql_adapter.NamedWindowSpecsContextHooks {
-        return .{
-            .ptr = self,
-            .get_specs = getNamedWindowSpecsHook,
-            .set_specs = setNamedWindowSpecsHook,
-        };
-    }
-
-    fn joinParserContextHooks(self: *@This()) sql_adapter.JoinParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getJoinParserContextHook,
-            .set_context = setJoinParserContextHook,
-        };
-    }
-
-    fn joinedExpressionParserContextHooks(self: *@This()) sql_adapter.JoinedExpressionParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getJoinedExpressionParserContextHook,
-            .set_context = setJoinedExpressionParserContextHook,
-            .row_expression_type_context = selectParserRowExpressionTypeContextHook,
-        };
-    }
-
-    fn lateralSubqueryParserHooks(self: *@This()) sql_adapter.LateralSubqueryParserHooks {
-        return .{
-            .ptr = self,
-            .parse_subquery = parseLateralSubqueryHook,
-        };
-    }
-
-    fn mutationSourceParserContextHooks(self: *@This()) sql_adapter.MutationSourceParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getMutationSourceParserContextHook,
-            .set_context = setMutationSourceParserContextHook,
-        };
-    }
-
-    fn readPlanParserContextHooks(self: *@This()) sql_adapter.ReadPlanParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getReadPlanParserContextHook,
-            .set_context = setReadPlanParserContextHook,
-        };
-    }
-
-    fn getReadPlanParserContextHook(ptr: *anyopaque) sql_adapter.ReadPlanParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .schema = self.schema,
-            .available_ctes = self.available_ctes,
-            .allow_select_set_boundary = self.allow_select_set_boundary,
-            .allow_select_set_result_tail_boundary = self.allow_select_set_result_tail_boundary,
-        };
-    }
-
-    fn setReadPlanParserContextHook(ptr: *anyopaque, context: sql_adapter.ReadPlanParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.schema = context.schema;
-        self.available_ctes = context.available_ctes;
-        self.allow_select_set_boundary = context.allow_select_set_boundary;
-        self.allow_select_set_result_tail_boundary = context.allow_select_set_result_tail_boundary;
-    }
-
-    fn getMutationSourceParserContextHook(ptr: *anyopaque) sql_adapter.MutationSourceParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .field_expression_qualifiers = self.field_expression_qualifiers,
-        };
-    }
-
-    fn setMutationSourceParserContextHook(ptr: *anyopaque, context: sql_adapter.MutationSourceParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.field_expression_qualifiers = context.field_expression_qualifiers;
-    }
-
-    fn mergeMutationParserContextHooks(self: *@This()) sql_adapter.MergeMutationParserContextHooks {
-        return .{
-            .ptr = self,
-            .get_context = getMergeMutationParserContextHook,
-            .set_context = setMergeMutationParserContextHook,
-        };
-    }
-
-    fn getMergeMutationParserContextHook(ptr: *anyopaque) sql_adapter.MergeMutationParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .joined_source_schema = self.joined_source_schema,
-            .available_ctes = self.available_ctes,
-        };
-    }
-
-    fn setMergeMutationParserContextHook(ptr: *anyopaque, context: sql_adapter.MergeMutationParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.joined_source_schema = context.joined_source_schema;
-        self.available_ctes = context.available_ctes;
-    }
-
-    fn getJoinedMutationSourceParserContextHook(ptr: *anyopaque) sql_adapter.JoinedMutationSourceParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .joined_source_schema = self.joined_source_schema,
-            .pending_joined_source_alias = self.pending_joined_source_alias,
-        };
-    }
-
-    fn setJoinedMutationSourceParserContextHook(ptr: *anyopaque, context: sql_adapter.JoinedMutationSourceParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.joined_source_schema = context.joined_source_schema;
-        self.pending_joined_source_alias = context.pending_joined_source_alias;
-    }
-
-    fn getJoinedExpressionParserContextHook(ptr: *anyopaque) sql_adapter.JoinedExpressionParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .joined_target_expression_qualifiers = self.joined_target_expression_qualifiers,
-            .joined_source_expression_qualifiers = self.joined_source_expression_qualifiers,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-        };
-    }
-
-    fn setJoinedExpressionParserContextHook(ptr: *anyopaque, context: sql_adapter.JoinedExpressionParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.joined_target_expression_qualifiers = context.joined_target_expression_qualifiers;
-        self.joined_source_expression_qualifiers = context.joined_source_expression_qualifiers;
-        self.defer_row_expression_field_validation = context.defer_row_expression_field_validation;
-    }
-
-    fn getConflictClauseParserContextHook(ptr: *anyopaque) sql_adapter.ConflictClauseParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .conflict_existing_qualifiers = self.conflict_existing_qualifiers,
-            .joined_source_schema = self.joined_source_schema,
-        };
-    }
-
-    fn setConflictClauseParserContextHook(ptr: *anyopaque, context: sql_adapter.ConflictClauseParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.conflict_existing_qualifiers = context.conflict_existing_qualifiers;
-        self.joined_source_schema = context.joined_source_schema;
-    }
-
-    fn getSemiJoinSourceQueryParserContextHook(ptr: *anyopaque) sql_adapter.SemiJoinSourceQueryParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .schema = self.schema,
-            .field_expression_qualifiers = self.field_expression_qualifiers,
-        };
-    }
-
-    fn setSemiJoinSourceQueryParserContextHook(ptr: *anyopaque, context: sql_adapter.SemiJoinSourceQueryParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.schema = context.schema;
-        self.field_expression_qualifiers = context.field_expression_qualifiers;
-    }
-
-    fn getSelectParserContextHook(ptr: *anyopaque) sql_adapter.SelectParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .schema = self.schema,
-            .field_expression_qualifiers = self.field_expression_qualifiers,
-            .returning_expression_qualifiers = self.returning_expression_qualifiers,
-            .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-        };
-    }
-
-    fn setSelectParserContextHook(ptr: *anyopaque, context: sql_adapter.SelectParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.schema = context.schema;
-        self.field_expression_qualifiers = context.field_expression_qualifiers;
-        self.returning_expression_qualifiers = context.returning_expression_qualifiers;
-        self.defer_row_expression_field_validation = context.defer_row_expression_field_validation;
-    }
-
-    fn selectParserRowExpressionTypeContextHook(ptr: *anyopaque) sql_adapter.RowExpressionTypeContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.rowExpressionTypeContext();
-    }
-
-    fn getNamedWindowSpecsHook(ptr: *anyopaque) []const NamedWindowSpec {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.named_window_specs;
-    }
-
-    fn setNamedWindowSpecsHook(ptr: *anyopaque, specs: []const NamedWindowSpec) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.named_window_specs = specs;
-    }
-
-    fn getJoinParserContextHook(ptr: *anyopaque) sql_adapter.JoinParserContext {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .schema = self.schema,
-            .joined_source_schema = self.joined_source_schema,
-        };
-    }
-
-    fn setJoinParserContextHook(ptr: *anyopaque, context: sql_adapter.JoinParserContext) void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        self.schema = context.schema;
-        self.joined_source_schema = context.joined_source_schema;
-    }
-
-    fn parseLateralSubqueryHook(
-        ptr: *anyopaque,
-        tokens: []const Token,
-        schema: runtime_schema.TableSchema,
-        joined_source_schema: runtime_schema.TableSchema,
-        left_alias: []const u8,
-        available_ctes: []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LateralSubquery {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        var sub = Parser{
-            .alloc = self.alloc,
-            .tokens = tokens,
-            .schema = schema,
-            .joined_source_schema = joined_source_schema,
-            .params = self.params,
-            .function_bindings = self.function_bindings,
-            .unique_resolver = self.unique_resolver,
-            .available_ctes = available_ctes,
-        };
-        return try sql_adapter.parseLateralSubqueryAlloc(sub.alloc, sub.tokens, &sub.pos, .{
-            .params = sub.params,
-            .available_ctes = sub.available_ctes,
-            .function_bindings = sub.function_bindings,
-            .field_source = sub.rowExpressionFieldSource(),
-            .left_alias = left_alias,
-            .context_hooks = sub.joinParserContextHooks(),
-            .select_item_hooks = sub.selectItemParserHooks(),
-            .order_expression_hooks = sub.orderExpressionParserOptions(),
-            .expression_where_options = sub.joinedMutationExpressionWhereOptions(),
-            .realtime_ns = try checkedPlatformRealtimeNsU64(),
-        });
-    }
-
-    fn rowExpressionFieldSource(self: *@This()) db_mod.types.RelationalRowsExpressionFieldSource {
-        return self.row_expression_field_source_override orelse .row;
-    }
-};
+const Parser = sql_adapter.ParserState;
 
 test "postgres sql adapter lowers create table ddl into typed schema plan" {
     const alloc = std.testing.allocator;
@@ -5198,6 +3386,67 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         else => return error.TestUnexpectedResult,
     }
 
+    var graph = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_edge_graph ON doc_edges USING antfly_graph (source_doc, target_doc) WITH (type_field = 'edge_type', weight_field = 'confidence', edge_policy = 'all');",
+    );
+    defer graph.deinit(alloc);
+    switch (graph) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("source_doc", plan.columns[0]);
+            try std.testing.expectEqualStrings("target_doc", plan.columns[1]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_table\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"source_field\":\"source_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target_field\":\"target_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type_field\":\"edge_type\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"weight_field\":\"confidence\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_metric = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_edge_graph_pagerank ON doc_edges USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', damping = 0.85, max_iterations = 40);",
+    );
+    defer graph_metric.deinit(alloc);
+    switch (graph_metric) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.antfly_graph_metric, plan.method);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph_metric\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"pagerank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"publish\":\"on_convergence\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var hybrid = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_hybrid_search ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_body_semantic,docs_edge_graph_pagerank', fusion = 'rrf', reranker = 'cross_encoder');",
+    );
+    defer hybrid.deinit(alloc);
+    switch (hybrid) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.antfly_hybrid, plan.method);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"hybrid\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"sources\":[\"docs_body_fts\",\"docs_body_semantic\",\"docs_edge_graph_pagerank\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"fusion\":\"rrf\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"reranker\":\"cross_encoder\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var public_qualified = try lowerDdlPlanAlloc(
         alloc,
         "CREATE INDEX public.usage_records_status_idx ON public.usage_records (status);",
@@ -5813,6 +4062,184 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "postgres sql adapter lowers antfly query functions into native search requests" {
+    const alloc = std.testing.allocator;
+
+    const Resolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            semantic_search: []const u8,
+            embedding_template: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(index_name.len > 0);
+            try std.testing.expect(semantic_search.len > 0);
+            try std.testing.expect(embedding_template == null or embedding_template.?.len > 0);
+            return .{
+                .vector = try allocator.dupe(f32, &[_]f32{ 0.25, 0.5, 0.75 }),
+                .k = limit,
+            };
+        }
+    };
+    var resolver_state: u8 = 0;
+    const resolver = query_contract.SemanticResolver{
+        .ptr = &resolver_state,
+        .vtable = &.{ .resolve_dense_query = Resolver.resolve },
+    };
+
+    var full_text = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5);",
+    );
+    defer full_text.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), full_text.req.limit);
+    try std.testing.expectEqualStrings("docs_body_fts", full_text.req.primary_text_index_name.?);
+    try std.testing.expect(full_text.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", full_text.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("refund policy", full_text.req.full_text.?.match.text);
+
+    var semantic = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        resolver,
+        "SELECT * FROM antfly.semantic_search(table => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7);",
+    );
+    defer semantic.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), semantic.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_body_semantic", semantic.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(u32, 7), semantic.req.dense_queries[0].query.k);
+    try std.testing.expectEqual(@as(usize, 3), semantic.req.dense_queries[0].query.vector.len);
+
+    var vector = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.vector_search(table_name = 'docs', index = 'docs_embedding_hnsw', vector = '[1.0,0.0,0.5]', limit = 3);",
+    );
+    defer vector.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), vector.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_embedding_hnsw", vector.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(u32, 3), vector.req.dense_queries[0].query.k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), vector.req.dense_queries[0].query.vector[2], 0.0001);
+
+    var traverse = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', edge_types => 'cites, references', max_depth => 2, max_results => 11, metrics => 'pagerank', freshness => 'fresh', include_metric_status => true, include_paths => true);",
+    );
+    defer traverse.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), traverse.req.graph_queries.len);
+    try std.testing.expectEqualStrings("citation_walk", traverse.req.graph_queries[0].name);
+    const traverse_query = traverse.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(traverse_query.query_type), .traverse), traverse_query.query_type);
+    try std.testing.expectEqualStrings("docs_edge_graph", traverse_query.index_name);
+    switch (traverse_query.start_nodes) {
+        .keys => |keys| {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings("doc:root", keys[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(@TypeOf(traverse_query.params.direction), .out), traverse_query.params.direction);
+    try std.testing.expectEqual(@as(u32, 2), traverse_query.params.max_depth);
+    try std.testing.expectEqual(@as(u32, 11), traverse_query.params.max_results);
+    try std.testing.expectEqual(@as(usize, 2), traverse_query.params.edge_types.len);
+    try std.testing.expectEqualStrings("cites", traverse_query.params.edge_types[0]);
+    try std.testing.expectEqualStrings("references", traverse_query.params.edge_types[1]);
+    try std.testing.expect(traverse_query.params.include_paths);
+    try std.testing.expect(traverse_query.include_metric_status);
+    try std.testing.expectEqual(@as(usize, 1), traverse_query.metrics.len);
+    try std.testing.expectEqualStrings("pagerank", traverse_query.metrics[0].name);
+    try std.testing.expect(traverse_query.metrics[0].freshness == .fresh);
+
+    var shortest_path = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', direction => 'both', max_depth => 4, weight_mode => 'min_weight');",
+    );
+    defer shortest_path.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), shortest_path.req.graph_queries.len);
+    const shortest_path_query = shortest_path.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(shortest_path_query.query_type), .shortest_path), shortest_path_query.query_type);
+    try std.testing.expectEqual(@as(@TypeOf(shortest_path_query.params.direction), .both), shortest_path_query.params.direction);
+    try std.testing.expectEqual(@as(u32, 4), shortest_path_query.params.max_depth);
+    try std.testing.expectEqual(@as(@TypeOf(shortest_path_query.params.weight_mode), .min_weight), shortest_path_query.params.weight_mode);
+    const shortest_path_target = shortest_path_query.target_nodes orelse return error.TestUnexpectedResult;
+    switch (shortest_path_target) {
+        .keys => |keys| {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings("doc:z", keys[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var k_shortest_paths = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', result_ref => '$full_text_results', target_result_ref => '$graph_results.targets', start_limit => 5, target_limit => 2, k => 3, max_depth => 6);",
+    );
+    defer k_shortest_paths.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), k_shortest_paths.req.graph_queries.len);
+    const k_shortest_paths_query = k_shortest_paths.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(k_shortest_paths_query.query_type), .k_shortest_paths), k_shortest_paths_query.query_type);
+    try std.testing.expectEqual(@as(u32, 3), k_shortest_paths_query.k);
+    try std.testing.expectEqual(@as(u32, 6), k_shortest_paths_query.params.max_depth);
+    switch (k_shortest_paths_query.start_nodes) {
+        .result_ref => |ref| {
+            try std.testing.expectEqualStrings("$full_text_results", ref.ref);
+            try std.testing.expectEqual(@as(u32, 5), ref.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (k_shortest_paths_query.target_nodes orelse return error.TestUnexpectedResult) {
+        .result_ref => |ref| {
+            try std.testing.expectEqualStrings("$graph_results.targets", ref.ref);
+            try std.testing.expectEqual(@as(u32, 2), ref.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_metric = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh');",
+    );
+    defer graph_metric.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), graph_metric.req.graph_metric_queries.len);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_metric.req.graph_metric_queries[0].query.index_name);
+    try std.testing.expectEqualStrings("pagerank", graph_metric.req.graph_metric_queries[0].query.metric_name);
+    try std.testing.expectEqual(@as(u32, 2), graph_metric.req.graph_metric_queries[0].query.top_k);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, graph_metric.req.graph_metric_queries[0].query.freshness);
+
+    var rerank = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25);",
+    );
+    defer rerank.deinit(alloc);
+    try std.testing.expectEqualStrings("docs_body_fts", rerank.req.primary_text_index_name.?);
+    try std.testing.expect(rerank.req.graph_metric_rerank != null);
+    try std.testing.expectEqualStrings("docs_edge_graph", rerank.req.graph_metric_rerank.?.index_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), rerank.req.graph_metric_rerank.?.weight, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), rerank.req.graph_metric_rerank.?.base_weight, 0.0001);
+
+    var hybrid = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        resolver,
+        "SELECT * FROM antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9);",
+    );
+    defer hybrid.deinit(alloc);
+    try std.testing.expectEqualStrings("docs_body_fts", hybrid.req.primary_text_index_name.?);
+    try std.testing.expect(hybrid.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 1), hybrid.req.dense_queries.len);
+    try std.testing.expect(hybrid.req.graph_metric_rerank != null);
+    try std.testing.expect(hybrid.req.merge_config != null);
+    try std.testing.expectEqual(@as(u32, 9), hybrid.req.limit);
 }
 
 test "postgres sql adapter lowers alter table ddl into typed schema plan" {

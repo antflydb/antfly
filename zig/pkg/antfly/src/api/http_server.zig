@@ -2171,6 +2171,31 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"external\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"metric\":\"l2_squared\"") != null);
 
+    const aknn_sql = "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384);";
+    var aknn_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        aknn_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer aknn_target.deinit(alloc);
+    var aknn = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        aknn_target,
+        aknn_sql,
+        .{},
+    )).?;
+    defer aknn.deinit(alloc);
+    try std.testing.expect(aknn.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"docs_body_semantic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"type\":\"embeddings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"external\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"name\":\"body_embedding_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"expected_dims\":384") != null);
+
     const noop_sql = "CREATE INDEX IF NOT EXISTS docs_embedding_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 3);";
     var noop_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
         alloc,
@@ -2189,7 +2214,76 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     )).?;
     defer noop.deinit(alloc);
     try std.testing.expect(noop.noop);
-    try std.testing.expectEqual(@as(usize, 2), service.upsert_count);
+    try std.testing.expectEqual(@as(usize, 3), service.upsert_count);
+
+    const graph_sql = "CREATE INDEX docs_edge_graph ON docs USING antfly_graph (id, body) WITH (type_field = 'edge_type', edge_policy = 'all');";
+    var graph_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        graph_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer graph_target.deinit(alloc);
+    var graph = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        graph_target,
+        graph_sql,
+        .{},
+    )).?;
+    defer graph.deinit(alloc);
+    try std.testing.expect(graph.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"docs_edge_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"type\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"source_field\":\"id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"target_field\":\"body\"") != null);
+
+    const graph_metric_sql = "CREATE INDEX docs_pagerank ON docs USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', max_iterations = 40);";
+    var graph_metric_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        graph_metric_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer graph_metric_target.deinit(alloc);
+    var graph_metric = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        graph_metric_target,
+        graph_metric_sql,
+        .{},
+    )).?;
+    defer graph_metric.deinit(alloc);
+    try std.testing.expect(graph_metric.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"docs_pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"type\":\"graph_metric\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"graph_index\":\"docs_edge_graph\"") != null);
+
+    const hybrid_sql = "CREATE INDEX docs_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_embedding_hnsw,docs_pagerank', fusion = 'rrf');";
+    var hybrid_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        hybrid_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer hybrid_target.deinit(alloc);
+    var hybrid = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        hybrid_target,
+        hybrid_sql,
+        .{},
+    )).?;
+    defer hybrid.deinit(alloc);
+    try std.testing.expect(hybrid.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"docs_hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"type\":\"hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"sources\":[\"docs_body_fts\",\"docs_embedding_hnsw\",\"docs_pagerank\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"fusion\":\"rrf\"") != null);
+    try std.testing.expectEqual(@as(usize, 6), service.upsert_count);
 }
 
 test "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL" {

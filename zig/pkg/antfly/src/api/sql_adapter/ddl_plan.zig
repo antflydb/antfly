@@ -965,6 +965,9 @@ pub const DdlIndexMethod = enum {
     antfly_full_text,
     hnsw,
     antfly_aknn,
+    antfly_graph,
+    antfly_graph_metric,
+    antfly_hybrid,
     antfly_algebraic,
 };
 
@@ -979,7 +982,7 @@ pub const DdlIndexOpClass = enum {
 
 pub fn ddlIndexMethodIsDerived(method: DdlIndexMethod) bool {
     return switch (method) {
-        .antfly_full_text, .hnsw, .antfly_aknn, .antfly_algebraic => true,
+        .antfly_full_text, .hnsw, .antfly_aknn, .antfly_graph, .antfly_graph_metric, .antfly_hybrid, .antfly_algebraic => true,
         .btree, .gin => false,
     };
 }
@@ -4618,8 +4621,11 @@ pub fn parseCreateIndexPlanAlloc(
     var without_overlaps_period: ?[]const u8 = null;
     errdefer if (without_overlaps_period) |period| alloc.free(period);
     try cursor.expectToken(.lparen);
-    const empty_algebraic_index = method == .antfly_algebraic and cursor.matchToken(.rparen) != null;
-    while (!empty_algebraic_index) {
+    const empty_derived_index = switch (method) {
+        .antfly_algebraic, .antfly_graph_metric, .antfly_hybrid => cursor.matchToken(.rparen) != null,
+        else => false,
+    };
+    while (!empty_derived_index) {
         if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
             const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
             if (unique) {
@@ -4657,15 +4663,20 @@ pub fn parseCreateIndexPlanAlloc(
         }
         if (cursor.matchToken(.comma) == null) break;
     }
-    if (!empty_algebraic_index) try cursor.expectToken(.rparen);
-    if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null) return error.UnsupportedSqlShape;
+    if (!empty_derived_index) try cursor.expectToken(.rparen);
+    if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null and
+        method != .antfly_algebraic and method != .antfly_graph_metric and method != .antfly_hybrid) return error.UnsupportedSqlShape;
     try grammar.validateSqlIdentifierListUnique(columns.items);
     try lower_expr.validateSqlUniqueExpressionListUnique(expressions.items);
 
     if (ddlIndexMethodIsDerived(method)) {
         if (unique or expressions.items.len != 0 or generated_expression != null or without_overlaps_period != null) return error.UnsupportedSqlShape;
-        if (columns.items.len != 1 and method != .antfly_algebraic) return error.UnsupportedSqlShape;
-        if (method == .antfly_algebraic and columns.items.len != 0) return error.UnsupportedSqlShape;
+        switch (method) {
+            .antfly_full_text, .hnsw, .antfly_aknn => if (columns.items.len != 1) return error.UnsupportedSqlShape,
+            .antfly_graph => if (columns.items.len != 2) return error.UnsupportedSqlShape,
+            .antfly_graph_metric, .antfly_hybrid, .antfly_algebraic => if (columns.items.len != 0) return error.UnsupportedSqlShape,
+            .btree, .gin => unreachable,
+        }
         const derived_index_config_json = try derivedIndexConfigJsonAlloc(alloc, tokens, pos, method, opclass, columns.items);
         var derived_transferred = false;
         errdefer if (!derived_transferred) alloc.free(derived_index_config_json);
@@ -4915,6 +4926,30 @@ fn appendJsonNumberField(
     try out.appendSlice(alloc, value);
 }
 
+fn appendJsonCommaStringArrayField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    csv: []const u8,
+) !void {
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try appendJsonStringLiteral(alloc, out, name);
+    try out.appendSlice(alloc, ":[");
+    var split = std.mem.splitScalar(u8, csv, ',');
+    var item_index: usize = 0;
+    while (split.next()) |raw_item| {
+        const item = std.mem.trim(u8, raw_item, " \t\r\n");
+        if (item.len == 0) return error.UnsupportedSqlShape;
+        if (item_index > 0) try out.append(alloc, ',');
+        try appendJsonStringLiteral(alloc, out, item);
+        item_index += 1;
+    }
+    if (item_index == 0) return error.UnsupportedSqlShape;
+    try out.append(alloc, ']');
+}
+
 fn appendJsonOptionField(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -4983,6 +5018,31 @@ fn derivedIndexConfigJsonAlloc(
             if (derivedIndexOptionString(options, "model")) |model| try appendJsonStringField(alloc, &out, &enrichment_first, "model", model);
             try out.appendSlice(alloc, "}]");
         },
+        .antfly_graph => {
+            try appendJsonStringField(alloc, &out, &first, "type", "graph");
+            try out.append(alloc, ',');
+            try appendJsonStringLiteral(alloc, &out, "edge_table");
+            try out.appendSlice(alloc, ":{");
+            var edge_first = true;
+            try appendJsonStringField(alloc, &out, &edge_first, "source_field", columns[0]);
+            try appendJsonStringField(alloc, &out, &edge_first, "target_field", columns[1]);
+            if (derivedIndexOptionString(options, "type_field")) |type_field| try appendJsonStringField(alloc, &out, &edge_first, "type_field", type_field);
+            if (derivedIndexOptionString(options, "weight_field")) |weight_field| try appendJsonStringField(alloc, &out, &edge_first, "weight_field", weight_field);
+            try out.append(alloc, '}');
+            try appendJsonStringField(alloc, &out, &first, "edge_policy", derivedIndexOptionString(options, "edge_policy") orelse "all");
+        },
+        .antfly_graph_metric => {
+            try appendJsonStringField(alloc, &out, &first, "type", "graph_metric");
+            try appendJsonStringField(alloc, &out, &first, "graph_index", derivedIndexOptionString(options, "graph_index") orelse return error.UnsupportedSqlShape);
+            try appendJsonStringField(alloc, &out, &first, "metric", derivedIndexOptionString(options, "metric") orelse return error.UnsupportedSqlShape);
+            try appendJsonStringField(alloc, &out, &first, "metric_freshness", derivedIndexOptionString(options, "metric_freshness") orelse "published");
+            try appendJsonStringField(alloc, &out, &first, "publish", derivedIndexOptionString(options, "publish") orelse "on_convergence");
+        },
+        .antfly_hybrid => {
+            try appendJsonStringField(alloc, &out, &first, "type", "hybrid");
+            try appendJsonCommaStringArrayField(alloc, &out, &first, "sources", derivedIndexOptionString(options, "sources") orelse return error.UnsupportedSqlShape);
+            try appendJsonStringField(alloc, &out, &first, "fusion", derivedIndexOptionString(options, "fusion") orelse "rrf");
+        },
         .antfly_algebraic => {
             try appendJsonStringField(alloc, &out, &first, "type", "algebraic");
             if (derivedIndexOption(options, "derive_from_schema")) |value| switch (value) {
@@ -4999,6 +5059,14 @@ fn derivedIndexConfigJsonAlloc(
         if (std.ascii.eqlIgnoreCase(option.name, "metric") or
             std.ascii.eqlIgnoreCase(option.name, "embedding_name") or
             std.ascii.eqlIgnoreCase(option.name, "dimension") or
+            std.ascii.eqlIgnoreCase(option.name, "type_field") or
+            std.ascii.eqlIgnoreCase(option.name, "weight_field") or
+            std.ascii.eqlIgnoreCase(option.name, "edge_policy") or
+            std.ascii.eqlIgnoreCase(option.name, "graph_index") or
+            std.ascii.eqlIgnoreCase(option.name, "metric_freshness") or
+            std.ascii.eqlIgnoreCase(option.name, "publish") or
+            std.ascii.eqlIgnoreCase(option.name, "sources") or
+            std.ascii.eqlIgnoreCase(option.name, "fusion") or
             std.ascii.eqlIgnoreCase(option.name, "derive_from_schema"))
         {
             continue;

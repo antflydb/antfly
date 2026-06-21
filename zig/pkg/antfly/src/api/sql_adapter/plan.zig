@@ -2023,6 +2023,23 @@ pub fn relationPopulationPlanFromSyntaxAlloc(
     return out;
 }
 
+pub const RelationPopulationLoweringHooks = struct {
+    ptr: *anyopaque,
+    lower_read: *const fn (*anyopaque, []const u8) anyerror!LoweredReadPlan,
+};
+
+pub fn lowerRelationPopulationPlanWithHooksAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    hooks: RelationPopulationLoweringHooks,
+) !LoweredRelationPopulationPlan {
+    var parsed = try grammar.parseRelationPopulationSqlAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+    var source = try hooks.lower_read(hooks.ptr, parsed.source_sql);
+    errdefer source.deinit(alloc);
+    return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
+}
+
 pub const ExplainFormat = ast.SqlExplainFormat;
 
 pub const LoweredExplainPlan = struct {
