@@ -57,6 +57,7 @@ pub const DB = struct {
     allocator: Allocator,
     inner: db_mod.DB,
     profile: Profile,
+    open_mode: db_mod.OpenOptions.OpenMode,
     lite_inference_status: ?InferenceStatus = null,
     owned_lite_backend: ?support.lite.backend.Handle = null,
 
@@ -81,6 +82,7 @@ pub const DB = struct {
             .allocator = alloc,
             .inner = try db_mod.DB.open(alloc, path, toDbOpenOptions(opts, profile)),
             .profile = profile,
+            .open_mode = opts.open_mode,
             .lite_inference_status = null,
         };
     }
@@ -103,12 +105,17 @@ pub const DB = struct {
             .allocator = alloc,
             .inner = inner,
             .profile = profile,
+            .open_mode = opts.open_mode,
             .lite_inference_status = support.lite.backend.inferenceStatusForProfileWithOptions(profile, opts.inference),
             .owned_lite_backend = lite_backend,
         };
     }
 
     pub fn close(self: *DB) void {
+        if (self.owned_lite_backend != null and openModeCanWrite(self.open_mode)) {
+            self.inner.sync(true) catch {};
+            self.inner.syncIndexes(true) catch {};
+        }
         self.inner.close();
         if (self.owned_lite_backend) |*lite_backend| {
             lite_backend.deinit();
@@ -311,6 +318,13 @@ fn openModeRequiresReadOnlyBackends(open_mode: db_mod.OpenOptions.OpenMode) bool
     return open_mode == .query_readonly or open_mode == .status_only;
 }
 
+fn openModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return switch (open_mode) {
+        .writer, .writer_no_replay => true,
+        else => false,
+    };
+}
+
 fn testLitePath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
@@ -349,6 +363,41 @@ test "embedded db openLite persists documents in aflite file" {
         defer result.deinit(alloc);
 
         try std.testing.expect(std.mem.indexOf(u8, result.json, "\"lite persisted\"") != null);
+    }
+}
+
+test "embedded db openLite close syncs unsynced batch before readonly reopen" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-close-sync.aflite");
+    defer alloc.free(path);
+
+    {
+        var db = try DB.openLite(alloc, path, .{});
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:embedded-close-sync",
+                .value = "{\"title\":\"embedded close persists\"}",
+            }},
+            .sync_level = .propose,
+        });
+    }
+
+    {
+        var reopened = try DB.openLite(alloc, path, .{
+            .open_mode = .query_readonly,
+        });
+        defer reopened.close();
+
+        var result = (try reopened.lookup(alloc, "doc:embedded-close-sync", .{})) orelse return error.MissingLiteDocument;
+        defer result.deinit(alloc);
+
+        try std.testing.expect(std.mem.indexOf(u8, result.json, "\"embedded close persists\"") != null);
     }
 }
 
