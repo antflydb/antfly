@@ -3158,6 +3158,14 @@ pub const IndexManager = struct {
                 return true;
             }
         }
+        for (self.text_indexes.items) |entry| {
+            if (excluded_index_name) |index_name| {
+                if (std.mem.eql(u8, entry.config.name, index_name)) continue;
+            }
+            const chunk_name = entry.chunk_name orelse continue;
+            const chunk_cfg = self.getEnrichmentExcluding(.chunk, chunk_name, excluded_enrichment) orelse continue;
+            if (chunk_cfg.source_artifact_name.len == 0) return true;
+        }
         for (self.enrichments.items) |entry| {
             if (excluded_enrichment) |skip| {
                 if (entry.kind == skip.kind and std.mem.eql(u8, entry.name, skip.name)) continue;

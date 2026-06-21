@@ -13638,6 +13638,7 @@ fn encodeThinReplayRecordPayload(
 
     for (changed_artifact_keys) |key| {
         try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+        if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
         if (internal_keys.isGraphEdgeArtifactKey(key) or internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         if (internal_keys.isAssetArtifactKey(key)) {
             try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
@@ -13667,6 +13668,7 @@ fn encodeThinReplayRecordPayload(
         try appendUniqueReplayRecordKeyWithSet(alloc, &deleted_doc_keys, &deleted_doc_key_set, key);
         if (internal_keys.isAssetArtifactKey(key) or internal_keys.isChunkArtifactRecordKey(key) or internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &thin_changed_artifact_keys, &thin_changed_artifact_key_set, key);
+            if (internal_keys.isChunkArtifactRecordKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
             if (internal_keys.isAssetArtifactKey(key)) try appendUniqueReplayRecordHint(alloc, &target_hints, .resolution);
         }
@@ -40253,11 +40255,13 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
 }
 
-test "db thin replay marks deleted asset and graph artifacts for graph apply" {
+test "db thin replay marks artifact-derived target hints" {
     const alloc = std.testing.allocator;
 
     const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(asset_key);
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
     const graph_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
     defer alloc.free(graph_key);
 
@@ -40265,7 +40269,7 @@ test "db thin replay marks deleted asset and graph artifacts for graph apply" {
         alloc,
         .{},
         &.{},
-        &.{ asset_key, graph_key },
+        &.{ asset_key, chunk_key, graph_key },
         &.{},
         &.{},
         44,
@@ -40277,9 +40281,11 @@ test "db thin replay marks deleted asset and graph artifacts for graph apply" {
     defer decoded.deinit();
 
     try std.testing.expectEqual(@as(u64, 44), decoded.record.sequence);
-    try std.testing.expectEqual(@as(usize, 2), decoded.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 3), decoded.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings(asset_key, decoded.record.changed_artifact_keys[0]);
-    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expectEqualStrings(chunk_key, decoded.record.changed_artifact_keys[1]);
+    try std.testing.expectEqualStrings(graph_key, decoded.record.changed_artifact_keys[2]);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
     try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
 }
 
