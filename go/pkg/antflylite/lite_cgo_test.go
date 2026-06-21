@@ -69,6 +69,13 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 		readonly.Close()
 		t.Fatalf("readonly status: %v", err)
 	}
+	if err := readonly.Batch([]WriteIntent{{
+		Key:   "doc:readonly-write",
+		Value: []byte(`{"title":"readonly write"}`),
+	}}, 2); err != InvalidArgument {
+		readonly.Close()
+		t.Fatalf("readonly batch error = %v, want %v", err, InvalidArgument)
+	}
 	if err := readonly.Close(); err != nil {
 		t.Fatalf("close readonly: %v", err)
 	}
@@ -80,6 +87,13 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	if _, err := statusOnly.Status(); err != nil {
 		statusOnly.Close()
 		t.Fatalf("status-only status: %v", err)
+	}
+	if err := statusOnly.Batch([]WriteIntent{{
+		Key:   "doc:status-only-write",
+		Value: []byte(`{"title":"status only write"}`),
+	}}, 3); err != InvalidArgument {
+		statusOnly.Close()
+		t.Fatalf("status-only batch error = %v, want %v", err, InvalidArgument)
 	}
 	if err := statusOnly.Close(); err != nil {
 		t.Fatalf("close status-only: %v", err)
