@@ -597,6 +597,7 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
     try std.testing.expectEqualStrings(native_index_base_path, db_opts.index_base_path.?);
     try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
+    try std.testing.expect(!db_opts.external_derived_checkpoints);
 
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(report.file_size, vacuumed.before_size);

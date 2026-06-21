@@ -848,6 +848,8 @@ test "embedded api openLite keeps full text index inside native aflite file" {
     defer alloc.free(path);
     const sidecar_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{path});
     defer alloc.free(sidecar_path);
+    const applied_sequence_checkpoint_path = try support.db.apply_state.checkpointPathAlloc(alloc, path);
+    defer alloc.free(applied_sequence_checkpoint_path);
 
     {
         var api = try Api.openLite(alloc, path, .{
@@ -906,6 +908,14 @@ test "embedded api openLite keeps full text index inside native aflite file" {
         break :blk false;
     };
     try std.testing.expect(sidecar_missing);
+    const applied_sequence_checkpoint_missing = blk: {
+        std.Io.Dir.cwd().access(std.testing.io, applied_sequence_checkpoint_path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => break :blk true,
+            else => return err,
+        };
+        break :blk false;
+    };
+    try std.testing.expect(applied_sequence_checkpoint_missing);
 }
 
 test "embedded api openLite persists schema json over aflite file" {
@@ -1078,7 +1088,13 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"storage\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format\":\"aflite\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"engine\":\"native_single_file\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"primary_layout\":\"native_document_pages\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"replay_layout\":\"native_replay_lanes_in_document_catalog\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_layout\":\"lsm_logical_files_in_native_index_catalog\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"index_namespace\":\"__antfly_lite\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"format_version\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"page_size\":4096") != null);
+        try std.testing.expect(std.mem.indexOf(u8, status_json, "\"active_checkpoint\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"stats\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"pending_work\":") != null);
         try std.testing.expect(std.mem.indexOf(u8, status_json, "\"capabilities\":") != null);
