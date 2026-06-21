@@ -304,20 +304,23 @@ For full upgrade, downgrade, restore, snapshot, and enrichment behavior, see the
 ## Zig Embedded Package
 
 Zig applications can use the `antfly-embedded` package directly. The Lite DB
-surface opens native `.aflite` files with `db.DB.openLite`, while package-level
-helpers inspect and snapshot files without requiring the caller to keep a DB
-handle open:
+surface creates native `.aflite` files with `db.DB.createLite` and opens
+existing files with `db.DB.openLite`. Package-level helpers inspect and
+snapshot files without requiring the caller to keep a DB handle open:
 
 ```zig
 const antfly = @import("antfly-embedded");
 
-const report = try antfly.db.checkLiteFile(allocator, "app.aflite");
+var db = try antfly.db.DB.createLite(allocator, "zig-app.aflite", .{});
+defer db.close();
+
+const report = try antfly.db.checkLiteFile(allocator, "zig-app.aflite");
 _ = report.valid;
 
 _ = try antfly.db.copyStableLiteSnapshotFile(
     allocator,
-    "app.aflite",
-    "copy.aflite",
+    "zig-app.aflite",
+    "zig-copy.aflite",
     false,
 );
 ```
@@ -346,7 +349,7 @@ import (
 )
 
 func main() {
-	db, err := antflylite.Open("app.aflite")
+	db, err := antflylite.Create("go-app.aflite")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -368,6 +371,10 @@ func main() {
 }
 ```
 
+Use `antflylite.Open` for an existing `.aflite` file. `Create` is the explicit
+first-use path; `Open` does not create missing files or upgrade pre-release
+layouts.
+
 When building from the source tree, build the C ABI first:
 
 ```bash
@@ -386,10 +393,11 @@ capability responses without hard-coding JSON strings.
 
 The repository includes runnable Lite templates:
 
-- `examples/antfly-lite-go`: minimal open, write, lookup, status, and backup.
-- `examples/antfly-lite-retrieval-go`: schema, full-text index, dense vector
-  index with caller-supplied embeddings, full-text search, dense search, hybrid
-  search, status, and portable backup.
+- `examples/antfly-lite-go`: minimal create/open, write, lookup, status, and
+  backup.
+- `examples/antfly-lite-retrieval-go`: create/open, schema, full-text index,
+  dense vector index with caller-supplied embeddings, full-text search, dense
+  search, hybrid search, status, and portable backup.
 
 Both examples are gated by `zig build lite-core` against the built
 `libantflylite` C ABI.

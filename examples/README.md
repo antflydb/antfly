@@ -69,7 +69,8 @@ export a portable `.afb` backup for restore or promotion.
 - Tests and demos that should not start a server
 
 **Features:**
-- Opens a native `.aflite` database through the Go Lite binding
+- Creates a native `.aflite` database on first run, then reopens it through the
+  Go Lite binding
 - Writes and reads JSON documents without a server process
 - Exports a portable `.afb` backup
 
@@ -93,7 +94,9 @@ hybrid search.
 - Seeded retrieval fixtures that can later promote into normal Antfly
 
 **Features:**
-- Creates schema, full-text, and dense vector indexes in one `.aflite` file
+- Creates a native `.aflite` database on first run, then reopens it through the
+  Go Lite binding
+- Initializes schema, full-text, and dense vector indexes in one `.aflite` file
 - Writes documents with caller-supplied embeddings
 - Runs full-text, dense, and hybrid search locally
 - Exports a portable `.afb` backup for restore, promotion, or archival use
