@@ -366,6 +366,49 @@ test "embedded db openLite propagates no_sync to aflite backend" {
     try std.testing.expect(db.owned_lite_backend.?.native_docstore.?.file.no_sync);
 }
 
+test "embedded db openLite does not fall back to internal bridge files" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-open-lite-bridge.aflite");
+    defer alloc.free(path);
+
+    {
+        var bridge = try support.lite.backend.Handle.open(alloc, path, .{ .engine = .bridge_lsm_container });
+        defer bridge.deinit();
+        try std.testing.expectEqual(support.lite.backend.EngineKind.bridge_lsm_container, bridge.engine);
+    }
+
+    {
+        var bridge_readonly = try support.lite.backend.Handle.open(alloc, path, .{
+            .engine = .bridge_lsm_container,
+            .read_only = true,
+        });
+        defer bridge_readonly.deinit();
+        try std.testing.expectEqual(support.lite.backend.EngineKind.bridge_lsm_container, bridge_readonly.engine);
+    }
+
+    const report = try checkLiteFile(alloc, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expect(report.issue != null);
+
+    var opened = DB.openLite(alloc, path, .{}) catch |err| {
+        switch (err) {
+            error.TruncatedNativeHeader,
+            error.InvalidNativeMagic,
+            error.UnsupportedNativeFormatVersion,
+            error.InvalidNativeHeaderSize,
+            error.NativeHeaderChecksumMismatch,
+            => return,
+            else => return err,
+        }
+    };
+    opened.close();
+    return error.ExpectedNativeLiteOpenFailure;
+}
+
 test "embedded db liteStatus exposes storage stats work and capabilities" {
     const alloc = std.testing.allocator;
 
