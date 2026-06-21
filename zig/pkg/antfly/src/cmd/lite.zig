@@ -1757,6 +1757,49 @@ test "lite read file parser accepts explicit readonly flag" {
     try std.testing.expectEqualStrings("query.json", parseReadFileFlag(&args));
 }
 
+test "lite query readonly runs while writer handle is open" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/query-readonly-active-writer.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const query_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/query-readonly-active-writer.json", .{tmp.sub_path});
+    defer allocator.free(query_path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const query_path_z = try allocator.dupeZ(u8, query_path);
+    defer allocator.free(query_path_z);
+
+    var writer = try LiteDb.open(allocator, path, .writer);
+    defer writer.close();
+
+    try writer.db.addIndex(.{
+        .name = "ft_body",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    const batch_response = try batchJson(allocator, &writer.db,
+        \\{"inserts":{"doc:readonly-query":{"body":"readonly query active writer"}},"sync_level":"full_index"}
+    );
+    defer allocator.free(batch_response);
+    try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":1") != null);
+
+    try writeFileAtomically(allocator, io, query_path,
+        \\{"full_text_search":{"match":{"field":"body","text":"active writer"}},"limit":1}
+    );
+
+    const argv = [_][*:0]const u8{ path_z.ptr, "--readonly", "--file", query_path_z.ptr };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try query(allocator, io, &args);
+}
+
 test "lite init target check treats existing aflite as occupied" {
     const allocator = std.testing.allocator;
 
