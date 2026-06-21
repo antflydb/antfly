@@ -269,6 +269,10 @@ pub const Api = struct {
         return try std.json.Stringify.valueAlloc(alloc, try self.db.copyStableLiteSnapshot(dest_path, replace), .{});
     }
 
+    pub fn copyStableLiteSnapshotFileJson(alloc: Allocator, source_path: []const u8, dest_path: []const u8, replace: bool) ![]u8 {
+        return try std.json.Stringify.valueAlloc(alloc, try embedded_db.copyStableLiteSnapshotFile(alloc, source_path, dest_path, replace), .{});
+    }
+
     pub fn vacuumLiteJson(self: *Api, alloc: Allocator) ![]u8 {
         return try std.json.Stringify.valueAlloc(alloc, try self.db.vacuumLite(), .{});
     }
@@ -276,6 +280,10 @@ pub const Api = struct {
 
 pub fn checkLiteFileJson(alloc: Allocator, path: []const u8) ![]u8 {
     return try Api.checkLiteFileJson(alloc, path);
+}
+
+pub fn copyStableLiteSnapshotFileJson(alloc: Allocator, source_path: []const u8, dest_path: []const u8, replace: bool) ![]u8 {
+    return try Api.copyStableLiteSnapshotFileJson(alloc, source_path, dest_path, replace);
 }
 
 const ParsedLookupRequest = struct {

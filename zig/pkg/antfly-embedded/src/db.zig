@@ -34,6 +34,7 @@ pub const EnrichmentConfig = embedded.enrichment_runtime.Config;
 pub const DenseEmbedder = embedded.enrichment_embedder.DenseEmbedder;
 pub const capabilitiesForProfile = embedded.capabilitiesForProfile;
 pub const checkLiteFile = embedded.checkLiteFile;
+pub const copyStableLiteSnapshotFile = embedded.copyStableLiteSnapshotFile;
 pub const setRemoteTemplateRenderer = embedded.setRemoteTemplateRenderer;
 pub const renderRemoteTemplateText = embedded.renderRemoteTemplateText;
 
@@ -54,4 +55,5 @@ test "pkg antfly embedded db Lite surface compiles" {
     _ = DB.checkLite;
     _ = capabilitiesForProfile;
     _ = checkLiteFile;
+    _ = copyStableLiteSnapshotFile;
 }

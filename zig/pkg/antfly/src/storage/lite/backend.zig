@@ -107,6 +107,11 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     return try native.checkFile(allocator, path);
 }
 
+pub fn copyStableSnapshotFile(allocator: Allocator, source_path: []const u8, dest_path: []const u8, replace: bool) !StableSnapshotReport {
+    if (!isAflitePath(source_path) or !isAflitePath(dest_path)) return error.InvalidArgument;
+    return try native.copyStableSnapshot(allocator, source_path, dest_path, replace);
+}
+
 pub const Handle = struct {
     allocator: Allocator,
     engine: EngineKind,

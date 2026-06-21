@@ -270,6 +270,10 @@ pub fn checkLiteFile(alloc: Allocator, path: []const u8) !LiteCheckReport {
     return try support.lite.backend.checkFile(alloc, path);
 }
 
+pub fn copyStableLiteSnapshotFile(alloc: Allocator, source_path: []const u8, dest_path: []const u8, replace: bool) !LiteStableSnapshotReport {
+    return try support.lite.backend.copyStableSnapshotFile(alloc, source_path, dest_path, replace);
+}
+
 pub fn setRemoteTemplateRenderer(renderer: ?RemoteTemplateRenderer) void {
     template_remote_host.setHostRenderer(renderer);
 }
