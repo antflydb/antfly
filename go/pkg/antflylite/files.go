@@ -29,6 +29,18 @@ func (db *DB) BackupToFile(path string) error {
 	return writeFileAtomically(path, backup, 0o600)
 }
 
+// ExportToFile writes a portable Antfly backup archive for this Lite database.
+func (db *DB) ExportToFile(path string) error {
+	if !strings.HasSuffix(path, ".afb") {
+		return InvalidArgument
+	}
+	backup, err := db.Export()
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(path, backup, 0o600)
+}
+
 // RestoreBackupFile creates or replaces a Lite database from a portable Antfly
 // backup archive.
 func RestoreBackupFile(path, backupPath string, replace bool) error {

@@ -270,11 +270,25 @@ func (db *DB) Backup() ([]byte, error) {
 	})
 }
 
+// Export returns a portable Antfly backup archive for this Lite database.
+func (db *DB) Export() ([]byte, error) {
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_lite_export(handle, out)
+	})
+}
+
 // ImportBackup imports a portable Antfly backup archive into this Lite
 // database.
 func (db *DB) ImportBackup(backup []byte) error {
 	return db.withInput(backup, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
 		return C.antfly_lite_import_backup(handle, input)
+	})
+}
+
+// Import imports a portable Antfly backup archive into this Lite database.
+func (db *DB) Import(backup []byte) error {
+	return db.withInput(backup, func(handle unsafe.Pointer, input C.antfly_slice) C.antfly_error_code {
+		return C.antfly_lite_import(handle, input)
 	})
 }
 

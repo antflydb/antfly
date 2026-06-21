@@ -622,6 +622,16 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("backup file is empty: %s", backupPath)
 	}
 
+	exportPath := filepath.Join(t.TempDir(), "go-export.afb")
+	if err := db.ExportToFile(exportPath); err != nil {
+		t.Fatalf("export to file: %v", err)
+	}
+	if info, err := os.Stat(exportPath); err != nil {
+		t.Fatalf("export file: %v", err)
+	} else if info.Size() == 0 {
+		t.Fatalf("export file is empty: %s", exportPath)
+	}
+
 	restoredPath := filepath.Join(t.TempDir(), "go-restored.aflite")
 	if err := RestoreBackupFile(restoredPath, backupPath, false); err != nil {
 		t.Fatalf("restore backup file: %v", err)
@@ -691,8 +701,15 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open imported Lite database: %v", err)
 	}
-	if err := imported.ImportBackup(backupBytes); err != nil {
-		t.Fatalf("import backup bytes: %v", err)
+	exportBytes, err := db.Export()
+	if err != nil {
+		t.Fatalf("export bytes: %v", err)
+	}
+	if len(exportBytes) == 0 {
+		t.Fatalf("export bytes are empty")
+	}
+	if err := imported.Import(exportBytes); err != nil {
+		t.Fatalf("import bytes: %v", err)
 	}
 	assertSearchContains(imported, "imported full-text", fullTextQuery, "go binding full text search")
 	assertSearchContains(imported, "imported dense", denseQuery, "doc:go-search")

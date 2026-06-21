@@ -55,9 +55,10 @@ Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
 local transaction/OCC path exposed by the Lite C ABI.
 
-Use `BackupToFile` to write a portable `.afb` archive from an open Lite handle.
-Use `RestoreBackupFile` or `RestoreBackup` to stage a portable backup into a
-new `.aflite` database without publishing a partial target on import failure.
+Use `ExportToFile` or `BackupToFile` to write a portable `.afb` archive from an
+open Lite handle. Use `RestoreBackupFile`, `RestoreBackup`, or handle-level
+`Import` to stage a portable backup into a new `.aflite` database without
+publishing a partial target on import failure.
 
 The repository-level `zig build lite-core` gate builds `libantflylite` and runs
 the Go binding tests against it.
