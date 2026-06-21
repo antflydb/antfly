@@ -7086,7 +7086,9 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported_insert => self.unsupported_insert = true,
             .unsupported_update => {},
             .unsupported_update_source => self.unsupported_update_source = true,
+            .unsupported_delete => {},
             .unsupported_update_joined_source => self.unsupported_update_joined_source = true,
+            .unsupported_delete_joined_source => {},
             .unsupported_merge_mutation => self.unsupported_merge_mutation = true,
             .read => {
                 const is_read_query = std.mem.startsWith(u8, entry.plan, "read:query:");
