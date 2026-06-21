@@ -81,6 +81,31 @@ cd ../examples/antfly-lite-go
 GOWORK=off go run . --reset
 ```
 
+### [Antfly Lite Retrieval Template](./antfly-lite-retrieval-go/)
+
+Build a local-first retrieval app on Antfly Lite with a native `.aflite`
+database, caller-supplied embeddings, full-text search, dense vector search, and
+hybrid search.
+
+**Use cases:**
+- Embedded retrieval in desktop, edge, or single-user apps
+- Local demos that should not require an inference service
+- Seeded retrieval fixtures that can later promote into normal Antfly
+
+**Features:**
+- Creates schema, full-text, and dense vector indexes in one `.aflite` file
+- Writes documents with caller-supplied embeddings
+- Runs full-text, dense, and hybrid search locally
+- Exports a portable `.afb` backup for restore, promotion, or archival use
+
+**Quick start:**
+```bash
+cd zig
+zig build lite-capi
+cd ../examples/antfly-lite-retrieval-go
+GOWORK=off go run . --reset
+```
+
 ### [memoryaf + docsaf](./memoryaf/)
 
 Turn documentation into `memoryaf` records from local files, Git, S3, Google Drive, or web sources, with local watch mode for filesystem sync.
