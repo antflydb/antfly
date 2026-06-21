@@ -14,16 +14,15 @@ import "encoding/json"
 
 // StorageStatus describes the physical Lite database file backing a handle.
 type StorageStatus struct {
-	Format                string  `json:"format"`
-	Engine                string  `json:"engine"`
-	PrimaryLayout         string  `json:"primary_layout"`
-	IndexLayout           string  `json:"index_layout"`
-	CompatibilityFallback bool    `json:"compatibility_fallback"`
-	FormatVersion         *uint32 `json:"format_version,omitempty"`
-	PageSize              *uint32 `json:"page_size,omitempty"`
-	ActiveCheckpoint      *uint8  `json:"active_checkpoint,omitempty"`
-	CheckpointSequence    *uint64 `json:"checkpoint_sequence,omitempty"`
-	PageCount             *uint64 `json:"page_count,omitempty"`
+	Format             string  `json:"format"`
+	Engine             string  `json:"engine"`
+	PrimaryLayout      string  `json:"primary_layout"`
+	IndexLayout        string  `json:"index_layout"`
+	FormatVersion      *uint32 `json:"format_version,omitempty"`
+	PageSize           *uint32 `json:"page_size,omitempty"`
+	ActiveCheckpoint   *uint8  `json:"active_checkpoint,omitempty"`
+	CheckpointSequence *uint64 `json:"checkpoint_sequence,omitempty"`
+	PageCount          *uint64 `json:"page_count,omitempty"`
 }
 
 // InferenceStatus reports the configured inference execution mode for a Lite

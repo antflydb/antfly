@@ -330,8 +330,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("typed status storage = %#v", typedStatus.Storage)
 	}
 	if typedStatus.Storage.PrimaryLayout != "native_document_pages" ||
-		typedStatus.Storage.IndexLayout != "lsm_logical_files_in_native_index_catalog" ||
-		typedStatus.Storage.CompatibilityFallback {
+		typedStatus.Storage.IndexLayout != "lsm_logical_files_in_native_index_catalog" {
 		t.Fatalf("typed status storage layout = %#v", typedStatus.Storage)
 	}
 	if typedStatus.Inference.Mode != InferenceModeCallerSuppliedOrDisabled {
