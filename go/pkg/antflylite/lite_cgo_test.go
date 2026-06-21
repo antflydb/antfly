@@ -458,7 +458,16 @@ func TestLiteCAPI(t *testing.T) {
 		!containsString(typedCaps.AvailableInferenceModes, InferenceModeDisabledDeferred) {
 		t.Fatalf("typed capabilities inference modes = supported=%#v available=%#v", typedCaps.SupportedInferenceModes, typedCaps.AvailableInferenceModes)
 	}
-	if typedCaps.RaftReplication || typedCaps.ClusterPlacement || typedCaps.DistributedTransactionCoordination {
+	if typedCaps.DistributedShardOwnership ||
+		typedCaps.RaftReplication ||
+		typedCaps.ClusterPlacement ||
+		typedCaps.CrossNodeJoins ||
+		typedCaps.RemoteShardFanout ||
+		typedCaps.DistributedTransactionCoordination ||
+		typedCaps.ClusterHeartbeatStatusAggregation ||
+		typedCaps.ServerSideAutoscaling ||
+		typedCaps.KubernetesOperator ||
+		typedCaps.ObjectStoragePrimary {
 		t.Fatalf("typed capabilities should not advertise distributed features: %#v", typedCaps)
 	}
 
