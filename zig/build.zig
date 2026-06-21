@@ -3890,6 +3890,8 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml lowers update patch with explicit version predicate",
             "sql adapter lower dml lowers partial unique point selectors",
             "sql adapter lower dml lowers delete with explicit version predicate",
+            "sql adapter lower dml lowers truncate into claimed table-emptying mutation source",
+            "sql adapter lower dml lowers temporal portion mutation sources",
             "sql adapter lower dml lowers claimed update mutation source",
             "sql adapter lower dml lowers claimed delete mutation source",
             "sql adapter lower expr assembles boolean predicate groups",

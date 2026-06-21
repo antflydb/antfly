@@ -6989,23 +6989,16 @@
       "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
-      "name": "unsupported multi-output subquery delete selector",
-      "family": "unsupported_delete",
-      "plan": "unsupported:delete:requires=multi_output_subquery_delete_selector",
-      "classification_reason": "multi_output_subquery_delete_selector",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "unsupported multi-output subquery joined update selector",
-      "family": "unsupported_update_joined_source",
-      "plan": "unsupported:update_joined_source:requires=multi_output_subquery_update_selector",
+      "name": "invalid multi-output scalar subquery update selector",
+      "family": "invalid_update",
+      "plan": "invalid:update:reason=multi_output_subquery_update_selector",
       "classification_reason": "multi_output_subquery_update_selector",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id, status FROM archived_records)"
     },
     {
-      "name": "unsupported multi-output subquery joined delete selector",
-      "family": "unsupported_delete_joined_source",
-      "plan": "unsupported:delete_joined_source:requires=multi_output_subquery_delete_selector",
+      "name": "invalid multi-output scalar subquery delete selector",
+      "family": "invalid_delete",
+      "plan": "invalid:delete:reason=multi_output_subquery_delete_selector",
       "classification_reason": "multi_output_subquery_delete_selector",
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
     },

@@ -11507,6 +11507,32 @@ fn lowerDeleteMutationSourceForTestAlloc(
     };
 }
 
+fn lowerTruncateMutationSourceForTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredMutationSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseTruncateMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
 const TestPrimaryResolver = struct {
     row_json: []const u8,
     version: u64,
@@ -12890,6 +12916,254 @@ test "sql adapter lower dml lowers delete with explicit version predicate" {
     try std.testing.expectEqualStrings("test-existing-primary", unique_selector.batch.deletes[0]);
     try std.testing.expectEqual(@as(u64, 7), unique_selector.batch.predicates[0].expected_version);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"deleted_status\":\"disabled\"}", unique_selector.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers truncate into claimed table-emptying mutation source" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"name":"usage_records_id_pk","columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    const txn_id = [_]u8{ 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "truncate-worker",
+        .txn_id = txn_id,
+    };
+
+    var lowered = try lowerTruncateMutationSourceForTestAlloc(
+        alloc,
+        "TRUNCATE TABLE ONLY usage_records RESTRICT;",
+        schema,
+        claim,
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, lowered.mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.source.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.source.order_by.len);
+    try std.testing.expectEqual(@as(?u32, null), lowered.mutation.req.source.limit);
+    try std.testing.expect(lowered.mutation.req.source.row_claim != null);
+    try std.testing.expect(!lowered.mutation.req.source.row_claim.?.skip_locked);
+    try std.testing.expectEqualStrings("truncate-worker", lowered.mutation.req.source.row_claim.?.owner_id);
+    try std.testing.expectEqualSlices(u8, &txn_id, &lowered.mutation.req.source.row_claim.?.txn_id.?);
+    try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.operations.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.returning.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.returning_expressions.len);
+    try std.testing.expect(!lowered.mutation.req.returning_all);
+
+    var continue_identity = try lowerTruncateMutationSourceForTestAlloc(
+        alloc,
+        "TRUNCATE usage_records CONTINUE IDENTITY",
+        schema,
+        claim,
+    );
+    defer continue_identity.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", continue_identity.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, continue_identity.mutation.req.kind);
+    try std.testing.expectEqual(@as(?u32, null), continue_identity.mutation.req.source.limit);
+    try std.testing.expect(continue_identity.mutation.req.source.row_claim != null);
+    try std.testing.expect(!continue_identity.restart_identity);
+
+    var restart_identity = try lowerTruncateMutationSourceForTestAlloc(
+        alloc,
+        "TRUNCATE usage_records RESTART IDENTITY",
+        schema,
+        claim,
+    );
+    defer restart_identity.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", restart_identity.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, restart_identity.mutation.req.kind);
+    try std.testing.expectEqual(@as(?u32, null), restart_identity.mutation.req.source.limit);
+    try std.testing.expect(restart_identity.mutation.req.source.row_claim != null);
+    try std.testing.expect(restart_identity.restart_identity);
+    try std.testing.expect(restart_identity.mutation.req.restart_identity);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceForTestAlloc(
+        alloc,
+        "TRUNCATE usage_records, other_records",
+        schema,
+        claim,
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceForTestAlloc(
+        alloc,
+        "TRUNCATE usage_records CASCADE",
+        schema,
+        claim,
+    ));
+}
+
+test "sql adapter lower dml lowers temporal portion mutation sources" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    const txn_id = [_]u8{ 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "temporal-worker",
+        .txn_id = txn_id,
+    };
+
+    var update = try lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a' RETURNING *",
+        schema,
+        &.{},
+        claim,
+    );
+    defer update.deinit(alloc);
+    try std.testing.expectEqualStrings("prices", update.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update.mutation.req.kind);
+    try std.testing.expect(update.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_time", update.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("3", update.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("7", update.mutation.req.temporal_portion.?.to_json);
+    try std.testing.expectEqual(@as(usize, 1), update.mutation.req.operations.len);
+    try std.testing.expectEqualStrings("price", update.mutation.req.operations[0].path);
+    try std.testing.expectEqualStrings("99", update.mutation.req.operations[0].value_json.?);
+    try std.testing.expect(update.mutation.req.source.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, update.mutation.req.source.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, update.mutation.req.source.row_claim.?.effectiveWaitPolicy());
+    try std.testing.expect(update.mutation.req.returning_all);
+
+    var delete = try lowerDeleteMutationSourceForTestAlloc(
+        alloc,
+        "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b' RETURNING *",
+        schema,
+        &.{},
+        claim,
+    );
+    defer delete.deinit(alloc);
+    try std.testing.expectEqualStrings("prices", delete.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete.mutation.req.kind);
+    try std.testing.expect(delete.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_time", delete.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("2", delete.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("8", delete.mutation.req.temporal_portion.?.to_json);
+    try std.testing.expect(delete.mutation.req.source.row_claim != null);
+    try std.testing.expectEqual(db_mod.types.RowClaimMode.for_update, delete.mutation.req.source.row_claim.?.mode);
+    try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, delete.mutation.req.source.row_claim.?.effectiveWaitPolicy());
+    try std.testing.expect(delete.mutation.req.returning_all);
+
+    const range_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"product_id":{"type":"numeric"},"product_name":{"type":"keyword"},"valid_at_start":{"type":"datetime"},"valid_at_end":{"type":"datetime"},"price":{"type":"numeric"}},"required":["product_id","product_name","valid_at_start","valid_at_end"],"additionalProperties":false}}},"periods":[{"name":"valid_at","start_column":"valid_at_start","end_column":"valid_at_end"}],"primary_key":{"columns":["product_id"],"without_overlaps_period":"valid_at"}}
+    ;
+    const range_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, range_schema_json);
+    defer runtime_schema.freeSchema(alloc, range_schema);
+
+    var range_update = try lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-02-01' TO DATE '2025-03-01' SET price = 17.5 WHERE product_id = 1 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer range_update.deinit(alloc);
+    try std.testing.expectEqualStrings("products", range_update.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, range_update.mutation.req.kind);
+    try std.testing.expect(range_update.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", range_update.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1738368000000000000", range_update.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1740787200000000000", range_update.mutation.req.temporal_portion.?.to_json);
+    try std.testing.expectEqual(@as(usize, 1), range_update.mutation.req.operations.len);
+    try std.testing.expectEqualStrings("price", range_update.mutation.req.operations[0].path);
+    try std.testing.expectEqualStrings("17.5", range_update.mutation.req.operations[0].value_json.?);
+    try std.testing.expect(range_update.mutation.req.returning_all);
+
+    var range_delete = try lowerDeleteMutationSourceForTestAlloc(
+        alloc,
+        "DELETE FROM products FOR PORTION OF valid_at FROM DATE '2025-04-01' TO DATE '2025-05-01' WHERE product_id = 2 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer range_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("products", range_delete.table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, range_delete.mutation.req.kind);
+    try std.testing.expect(range_delete.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", range_delete.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1743465600000000000", range_delete.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1746057600000000000", range_delete.mutation.req.temporal_portion.?.to_json);
+    try std.testing.expect(range_delete.mutation.req.returning_all);
+
+    var timestamp_update = try lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMP '2025-02-01 12:30:00' TO TIMESTAMP '2025-02-02 15:45:00' SET price = 18.5 WHERE product_id = 1 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamp_update.deinit(alloc);
+    try std.testing.expect(timestamp_update.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamp_update.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1738413000000000000", timestamp_update.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1738511100000000000", timestamp_update.mutation.req.temporal_portion.?.to_json);
+
+    var timestamptz_update = try lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-02-01T01:30:00+01:30' TO TIMESTAMPTZ '2025-02-02T02:45:00-05:00' SET price = 19.5 WHERE product_id = 1 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamptz_update.deinit(alloc);
+    try std.testing.expect(timestamptz_update.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamptz_update.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1738368000000000000", timestamptz_update.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1738482300000000000", timestamptz_update.mutation.req.temporal_portion.?.to_json);
+
+    var timestamp_delete = try lowerDeleteMutationSourceForTestAlloc(
+        alloc,
+        "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMP '2025-04-01 08:00:00' TO TIMESTAMP '2025-04-02 09:30:00' WHERE product_id = 2 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamp_delete.deinit(alloc);
+    try std.testing.expect(timestamp_delete.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamp_delete.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1743494400000000000", timestamp_delete.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1743586200000000000", timestamp_delete.mutation.req.temporal_portion.?.to_json);
+
+    var timestamptz_delete = try lowerDeleteMutationSourceForTestAlloc(
+        alloc,
+        "DELETE FROM products FOR PORTION OF valid_at FROM TIMESTAMPTZ '2025-04-01T08:00:00+02:00' TO TIMESTAMPTZ '2025-04-02T09:30:00-04:00' WHERE product_id = 2 RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    );
+    defer timestamptz_delete.deinit(alloc);
+    try std.testing.expect(timestamptz_delete.mutation.req.temporal_portion != null);
+    try std.testing.expectEqualStrings("valid_at", timestamptz_delete.mutation.req.temporal_portion.?.period);
+    try std.testing.expectEqualStrings("1743487200000000000", timestamptz_delete.mutation.req.temporal_portion.?.from_json);
+    try std.testing.expectEqualStrings("1743600600000000000", timestamptz_delete.mutation.req.temporal_portion.?.to_json);
+
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE prices FOR PORTION OF valid_time FROM 7 TO 3 SET price = 99 WHERE sku = 'sku:a' FOR UPDATE RETURNING *",
+        schema,
+        &.{},
+        claim,
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteMutationSourceForTestAlloc(
+        alloc,
+        "DELETE FROM prices FOR PORTION OF valid_time FROM NULL TO 8 WHERE sku = 'sku:b' FOR UPDATE RETURNING *",
+        schema,
+        &.{},
+        claim,
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-03-01' TO DATE '2025-02-01' SET price = 17.5 WHERE product_id = 1 FOR UPDATE RETURNING *",
+        range_schema,
+        &.{},
+        claim,
+    ));
 }
 
 test "sql adapter lower dml lowers claimed update mutation source" {

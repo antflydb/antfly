@@ -9,8 +9,6 @@
     "enforced_unique_conflict_target",
     "invalid_expression_conflict_target",
     "invalid_named_conflict_target",
-    "multi_output_subquery_delete_selector",
-    "multi_output_subquery_update_selector",
     "multi_table_generation_barrier",
     "routine_body_plan",
     "routine_option_plan",
