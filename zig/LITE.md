@@ -96,6 +96,11 @@ antfly lite serve app.aflite --addr 127.0.0.1:8080
 `antfly lite init` should be non-destructive: it creates a new `.aflite` file
 and rejects an existing database path. Destructive replacement should stay on
 explicit restore/import flows where the source and target are both known.
+`antfly lite import <db.aflite> --from <backup.afb>` may import into an existing
+empty Lite database. `antfly lite import <db.aflite> --from <source.aflite>`
+must be treated as a physical snapshot replacement and require `--replace` when
+the target already exists; it should not silently merge one live Lite database
+into another.
 
 `antfly lite status` should include a storage block that identifies the live
 file format, the selected engine, the primary, replay, and index layouts, the

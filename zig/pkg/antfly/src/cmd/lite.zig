@@ -575,17 +575,30 @@ fn importBackup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
         }
     }
     const resolved_from = from_path orelse cli.fatal("--from is required", .{});
-    if (!replace and pathExists(io, path)) {
-        if (!std.mem.endsWith(u8, resolved_from, ".afb")) {
-            cli.fatal("import into an existing Lite database requires a portable .afb source; use restore --replace for .aflite snapshots", .{});
+    importFromSourceFile(allocator, io, resolved_from, path, replace) catch |err| switch (err) {
+        error.AfliteImportRequiresReplace => cli.fatal("import into an existing Lite database requires a portable .afb source; use restore --replace for .aflite snapshots", .{}),
+        error.LiteImportTargetNotEmpty => cli.fatal("target database is not empty; pass --replace to replace it: {s}", .{path}),
+        else => return err,
+    };
+}
+
+fn importFromSourceFile(
+    allocator: Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    target_path: []const u8,
+    replace: bool,
+) !void {
+    try requireRestoreSourcePath(source_path);
+    try requireAflitePath(target_path);
+    if (!replace and pathExists(io, target_path)) {
+        if (!std.mem.endsWith(u8, source_path, ".afb")) {
+            return error.AfliteImportRequiresReplace;
         }
-        importPortableIntoExistingLite(allocator, io, resolved_from, path) catch |err| switch (err) {
-            error.LiteImportTargetNotEmpty => cli.fatal("target database is not empty; pass --replace to replace it: {s}", .{path}),
-            else => return err,
-        };
+        try importPortableIntoExistingLite(allocator, io, source_path, target_path);
         return;
     }
-    try restoreFromSourceFile(allocator, io, resolved_from, path, replace);
+    try restoreFromSourceFile(allocator, io, source_path, target_path, replace);
 }
 
 fn importPortableIntoExistingLite(
@@ -2210,6 +2223,60 @@ test "lite restore replace fails before truncating active writer target" {
     const reopened_json = try lookupJson(allocator, &reopened.db, "doc:target", "");
     defer allocator.free(reopened_json);
     try std.testing.expect(std.mem.indexOf(u8, reopened_json, "\"target survives\"") != null);
+}
+
+test "lite import from aflite requires replace for existing target" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/import-aflite-source.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/import-aflite-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:source-import\":{\"title\":\"source import\"}}}");
+        defer allocator.free(json);
+    }
+
+    {
+        var target = try LiteDb.create(allocator, dst_path, true);
+        defer target.close();
+        const json = try batchJson(allocator, &target.db, "{\"inserts\":{\"doc:target-import\":{\"title\":\"target import survives\"}}}");
+        defer allocator.free(json);
+    }
+
+    try std.testing.expectError(error.AfliteImportRequiresReplace, importFromSourceFile(allocator, io, src_path, dst_path, false));
+
+    {
+        var target = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer target.close();
+        const json = try lookupJson(allocator, &target.db, "doc:target-import", "");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"target import survives\"") != null);
+    }
+
+    try importFromSourceFile(allocator, io, src_path, dst_path, true);
+
+    {
+        var replaced = try LiteDb.open(allocator, dst_path, .query_readonly);
+        defer replaced.close();
+        const source_json = try lookupJson(allocator, &replaced.db, "doc:source-import", "");
+        defer allocator.free(source_json);
+        try std.testing.expect(std.mem.indexOf(u8, source_json, "\"source import\"") != null);
+
+        const target_json = try lookupJson(allocator, &replaced.db, "doc:target-import", "");
+        defer allocator.free(target_json);
+        try std.testing.expect(std.mem.indexOf(u8, target_json, "\"found\":false") != null);
+    }
 }
 
 test "lite restore rejects same existing aflite through different path spelling" {
