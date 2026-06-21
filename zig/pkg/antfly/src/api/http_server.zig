@@ -1524,7 +1524,7 @@ const SchemaRewriteWakeJob = struct {
             made_progress = true;
         }
         if (!made_progress or self.runtime.backend == .manual) return;
-        SchemaRewriteWakeJob.submit(self.runtime, self.owner_id, self.source, self.table_name) catch |err| switch (err) {
+        SchemaRewriteWakeJob.submitWithPromotion(self.runtime, self.owner_id, self.source, self.table_name, self.catalog, self.promoted_table) catch |err| switch (err) {
             error.BackgroundOwnerClosing => return,
             else => return err,
         };
@@ -1551,6 +1551,44 @@ const SchemaRewriteWakeJob = struct {
         alloc.destroy(self);
     }
 };
+
+fn schemaRewriteJobNeedsCatalogCatchup(job: metadata_table_manager.SchemaRewriteJobRecord) bool {
+    return std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_declared) or
+        std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_running) or
+        std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_ready);
+}
+
+fn schemaRewriteGenerationHasInvalidJob(
+    snapshot: *const metadata_api.AdminSnapshot,
+    job: metadata_table_manager.SchemaRewriteJobRecord,
+) bool {
+    for (snapshot.schema_rewrite_jobs) |candidate| {
+        if (candidate.table_id == job.table_id and
+            candidate.schema_generation == job.schema_generation and
+            std.mem.eql(u8, candidate.state, metadata_table_manager.schema_rewrite_invalid))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn schemaRewriteSnapshotTableById(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_id: u64,
+) ?metadata_table_manager.TableRecord {
+    for (snapshot.tables) |table| {
+        if (table.table_id == table_id) return table;
+    }
+    return null;
+}
+
+fn schemaRewriteCatchupAlreadyScheduled(table_ids: []const u64, table_id: u64) bool {
+    for (table_ids) |scheduled_table_id| {
+        if (scheduled_table_id == table_id) return true;
+    }
+    return false;
+}
 
 fn droppedRelationalSqlTableRecordAlloc(
     alloc: std.mem.Allocator,
@@ -2252,6 +2290,187 @@ test "api schema rewrite wake stops on busy-only pass" {
         writes.iface(),
         "audit_log",
     );
+    try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
+}
+
+test "api session maintenance runs schema rewrite catalog catch-up" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeSource = struct {
+        snapshot_count: usize = 0,
+        compare_count: usize = 0,
+        tables: [2]metadata_table_manager.TableRecord = .{
+            .{
+                .table_id = 88,
+                .name = "audit_log",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+                .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .indexes_json = "{}",
+                .replication_sources_json = "[]",
+                .placement_role = "data",
+            },
+            .{
+                .table_id = 89,
+                .name = "events",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+                .schema_json = "{\"version\":1,\"storage_mode\":\"relational\"}",
+                .indexes_json = "{}",
+                .replication_sources_json = "[]",
+                .placement_role = "data",
+            },
+        },
+        jobs: [4]metadata_table_manager.SchemaRewriteJobRecord = .{
+            .{
+                .job_id = 1,
+                .table_id = 88,
+                .group_id = 100,
+                .schema_generation = 2,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .state = metadata_table_manager.schema_rewrite_ready,
+            },
+            .{
+                .job_id = 2,
+                .table_id = 88,
+                .group_id = 101,
+                .schema_generation = 2,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "m",
+                .state = metadata_table_manager.schema_rewrite_declared,
+            },
+            .{
+                .job_id = 3,
+                .table_id = 89,
+                .group_id = 102,
+                .schema_generation = 1,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .state = metadata_table_manager.schema_rewrite_invalid,
+            },
+            .{
+                .job_id = 4,
+                .table_id = 404,
+                .group_id = 103,
+                .schema_generation = 1,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .state = metadata_table_manager.schema_rewrite_ready,
+            },
+        },
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_count += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .schema_rewrite_jobs = self.jobs[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn compareAndSwapTableSchema(
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.compare_count += 1;
+            try std.testing.expectEqual(@as(u64, 88), request.table_id);
+            try std.testing.expectEqual(@as(u64, 88), request.promoted_table.table_id);
+            try std.testing.expectEqualStrings("audit_log", request.promoted_table.name);
+            try std.testing.expectEqualStrings(request.promoted_table.schema_json, request.expected_schema_json);
+        }
+    };
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            if (!std.mem.eql(u8, table_name, "audit_log")) return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, worker_id, "api-schema-rewrite")) return error.TestUnexpectedResult;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            return .{
+                .complete = true,
+                .jobs_scanned = 2,
+                .jobs_completed = 2,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(
+        alloc,
+        .{ .backend_runtime = runtime.ptr() },
+        source.iface(),
+        null,
+        writes.iface(),
+    );
+    defer server.deinit();
+
+    try server.runSessionMaintenanceOnce();
+
+    try std.testing.expectEqual(@as(usize, 1), source.snapshot_count);
+    try std.testing.expectEqual(@as(usize, 1), source.compare_count);
     try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
 }
 
@@ -3163,6 +3382,36 @@ pub const ApiHttpServer = struct {
         try self.maybeCleanupExpiredSessions();
         try self.maybeRenewOwnedSessionLeases();
         self.join_job_store.cleanupExpiredJoinJobs();
+        _ = try self.runSchemaRewriteCatalogCatchupOnce();
+    }
+
+    pub fn runSchemaRewriteCatalogCatchupOnce(self: *ApiHttpServer) !usize {
+        const runtime = self.cfg.backend_runtime orelse return 0;
+        const write_source = self.table_writes orelse return 0;
+        var snapshot = (try self.source.adminSnapshot()) orelse return 0;
+        defer self.source.freeAdminSnapshot(&snapshot);
+
+        var scheduled_table_ids = std.ArrayListUnmanaged(u64).empty;
+        defer scheduled_table_ids.deinit(self.alloc);
+
+        var scheduled: usize = 0;
+        for (snapshot.schema_rewrite_jobs) |job| {
+            if (!schemaRewriteJobNeedsCatalogCatchup(job)) continue;
+            if (schemaRewriteGenerationHasInvalidJob(&snapshot, job)) continue;
+            if (schemaRewriteCatchupAlreadyScheduled(scheduled_table_ids.items, job.table_id)) continue;
+            const table = schemaRewriteSnapshotTableById(&snapshot, job.table_id) orelse continue;
+            try SchemaRewriteWakeJob.submitWithPromotion(
+                runtime,
+                self.schemaRewriteWakeOwnerId(runtime),
+                write_source,
+                table.name,
+                self.source,
+                table,
+            );
+            try scheduled_table_ids.append(self.alloc, job.table_id);
+            scheduled += 1;
+        }
+        return scheduled;
     }
 
     fn localTableRuntimeStatuses(

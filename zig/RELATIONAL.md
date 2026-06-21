@@ -6886,10 +6886,15 @@ schema-rewrite worker pass plus group-local internal route: catalog scans
 select range-scoped jobs, hosted routing forwards remote owner work through the
 internal group route, local owners open the current range DB, and completed or
 invalid metadata state is observed through the same catalog lifecycle. The
-remaining production step is a catalog controller that schedules periodic
-catch-up passes for work that was not request-triggered and retries CAS
+API maintenance hook now also runs a catalog catch-up controller: it snapshots
+durable `schema_rewrite_jobs`, schedules one bounded wake per affected table
+for `declared`, `running`, or `ready` work, skips generations that already have
+an `invalid` terminal job so broken catalog work does not spin, ignores orphaned
+jobs whose table projection is gone, and retries the same table schema CAS
 reconciliation for completed work that was discovered outside the original API
-wake.
+wake. Long schema rewrites preserve the promoted-table/CAS context when they
+hand remaining work back to the runtime, so request-triggered and
+maintenance-triggered wakes converge through the same durable publication path.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from

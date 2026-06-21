@@ -3941,6 +3941,7 @@ pub fn build(b: *std.Build) void {
             "api http server wakes durable schema worker after SQL ALTER validation DDL",
             "api schema rewrite wake continues after unclaimed terminal progress",
             "api schema rewrite wake stops on busy-only pass",
+            "api session maintenance runs schema rewrite catalog catch-up",
             "derive initial ranges",
             "table catalog identity",
             // api/indexes.zig: index status/config encoders and aggregation.

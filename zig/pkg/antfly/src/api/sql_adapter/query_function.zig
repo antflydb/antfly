@@ -527,6 +527,30 @@ fn graphPatternDigitsOnly(value: []const u8) bool {
     return true;
 }
 
+fn graphPatternIdentifierValid(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (!std.ascii.isAlphabetic(value[0]) and value[0] != '_') return false;
+    for (value[1..]) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return true;
+}
+
+fn graphPatternEdgeTypeValid(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_' and ch != '-' and ch != '.') return false;
+    }
+    return true;
+}
+
+fn graphPatternHopCount(value: []const u8) !u32 {
+    if (!graphPatternDigitsOnly(value)) return error.UnsupportedSqlShape;
+    const parsed = try std.fmt.parseUnsigned(u32, value, 10);
+    if (parsed == 0) return error.UnsupportedSqlShape;
+    return parsed;
+}
+
 fn appendGraphPatternEdgeSpec(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -545,7 +569,7 @@ fn appendGraphPatternEdgeSpec(
         var item_index: usize = 0;
         while (split.next()) |raw_item| {
             const item = std.mem.trim(u8, raw_item, " \t\r\n");
-            if (item.len == 0) return error.UnsupportedSqlShape;
+            if (!graphPatternEdgeTypeValid(item)) return error.UnsupportedSqlShape;
             if (item_index > 0) try out.append(alloc, ',');
             try appendAntflySqlJsonString(alloc, out, item);
             item_index += 1;
@@ -560,11 +584,13 @@ fn appendGraphPatternEdgeSpec(
         if (std.mem.indexOf(u8, quantifier, "..")) |range_index| {
             const min = std.mem.trim(u8, quantifier[0..range_index], " \t\r\n");
             const max = std.mem.trim(u8, quantifier[range_index + 2 ..], " \t\r\n");
-            if (!graphPatternDigitsOnly(min) or !graphPatternDigitsOnly(max)) return error.UnsupportedSqlShape;
+            const min_hops = try graphPatternHopCount(min);
+            const max_hops = try graphPatternHopCount(max);
+            if (max_hops < min_hops) return error.UnsupportedSqlShape;
             try appendAntflySqlJsonNumberField(alloc, out, first, "min_hops", min);
             try appendAntflySqlJsonNumberField(alloc, out, first, "max_hops", max);
         } else {
-            if (!graphPatternDigitsOnly(quantifier)) return error.UnsupportedSqlShape;
+            _ = try graphPatternHopCount(quantifier);
             try appendAntflySqlJsonNumberField(alloc, out, first, "min_hops", quantifier);
             try appendAntflySqlJsonNumberField(alloc, out, first, "max_hops", quantifier);
         }
@@ -577,9 +603,10 @@ fn appendGraphPatternStep(
     alias: []const u8,
     edge: ?GraphPatternEdge,
 ) !void {
+    if (!graphPatternIdentifierValid(alias)) return error.UnsupportedSqlShape;
     try out.append(alloc, '{');
     var first = true;
-    if (alias.len > 0) try appendAntflySqlJsonStringField(alloc, out, &first, "alias", alias);
+    try appendAntflySqlJsonStringField(alloc, out, &first, "alias", alias);
     if (edge) |edge_spec| {
         try appendAntflySqlJsonFieldName(alloc, out, &first, "edge");
         try out.append(alloc, '{');
@@ -610,6 +637,45 @@ fn appendGraphPatternSteps(
     }
     if (step_count < 2) return error.UnsupportedSqlShape;
     try out.append(alloc, ']');
+}
+
+fn appendGraphMetricOrderFilterArgs(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    args: []const SqlQueryFunctionArg,
+) !void {
+    const order_metric = antflyQueryFunctionStringArg(args, "order_metric") orelse antflyQueryFunctionStringArg(args, "order_by_metric");
+    if (order_metric) |metric| {
+        try appendAntflySqlJsonFieldName(alloc, out, first, "order_by");
+        try out.appendSlice(alloc, "[{");
+        var order_first = true;
+        try appendAntflySqlJsonStringField(alloc, out, &order_first, "metric", metric);
+        if (antflyQueryFunctionStringArg(args, "order_direction")) |direction| try appendAntflySqlJsonStringField(alloc, out, &order_first, "direction", direction);
+        if (antflyQueryFunctionStringArg(args, "order_nulls")) |nulls| try appendAntflySqlJsonStringField(alloc, out, &order_first, "nulls", nulls);
+        try out.appendSlice(alloc, "}]");
+    } else if (antflyQueryFunctionStringArg(args, "order_direction") != null or antflyQueryFunctionStringArg(args, "order_nulls") != null) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const filter_metric = antflyQueryFunctionStringArg(args, "where_metric") orelse antflyQueryFunctionStringArg(args, "filter_metric");
+    if (filter_metric) |metric| {
+        const op = antflyQueryFunctionStringArg(args, "where_op") orelse antflyQueryFunctionStringArg(args, "filter_op") orelse return error.UnsupportedSqlShape;
+        const value = antflyQueryFunctionNumberArg(args, "where_value") orelse antflyQueryFunctionNumberArg(args, "filter_value") orelse return error.UnsupportedSqlShape;
+        try appendAntflySqlJsonFieldName(alloc, out, first, "where_metric");
+        try out.appendSlice(alloc, "[{");
+        var filter_first = true;
+        try appendAntflySqlJsonStringField(alloc, out, &filter_first, "metric", metric);
+        try appendAntflySqlJsonStringField(alloc, out, &filter_first, "op", op);
+        try appendAntflySqlJsonNumberField(alloc, out, &filter_first, "value", value);
+        try out.appendSlice(alloc, "}]");
+    } else if (antflyQueryFunctionStringArg(args, "where_op") != null or
+        antflyQueryFunctionStringArg(args, "filter_op") != null or
+        antflyQueryFunctionNumberArg(args, "where_value") != null or
+        antflyQueryFunctionNumberArg(args, "filter_value") != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn appendGraphMatchFunctionBody(
@@ -650,6 +716,7 @@ fn appendGraphMatchFunctionBody(
         try out.append(alloc, '}');
     }
     if (antflyQueryFunctionStringArg(args, "metrics")) |metrics| try appendAntflySqlJsonCommaStringArrayField(alloc, out, &query_first, "metrics", metrics);
+    try appendGraphMetricOrderFilterArgs(alloc, out, &query_first, args);
     if (antflyQueryFunctionStringArg(args, "freshness")) |freshness| {
         try appendAntflySqlJsonStringField(alloc, out, &query_first, "metric_freshness", freshness);
     } else if (antflyQueryFunctionStringArg(args, "metric_freshness")) |freshness| {

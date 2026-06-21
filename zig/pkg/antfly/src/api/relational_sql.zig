@@ -3267,7 +3267,7 @@ test "postgres sql adapter lowers antfly query functions into native search requ
     var graph_match = try lowerAntflyQueryFunctionSqlAlloc(
         alloc,
         null,
-        "SELECT * FROM antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites|references*1..3]->(b)<-[:mentions]-(c)', return => 'b,c', metrics => 'pagerank', freshness => 'published', include_metric_status => true, fields => 'title,url', max_results => 17);",
+        "SELECT * FROM antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites|references*1..3]->(b)<-[:mentions]-(c)', return => 'b,c', metrics => 'pagerank', order_metric => 'pagerank', order_direction => 'desc', order_nulls => 'last', where_metric => 'pagerank', where_op => '>=', where_value => 0.25, freshness => 'published', include_metric_status => true, fields => 'title,url', max_results => 17);",
     );
     defer graph_match.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), graph_match.req.graph_queries.len);
@@ -3294,6 +3294,14 @@ test "postgres sql adapter lowers antfly query functions into native search requ
     try std.testing.expectEqual(@as(u32, 17), graph_match_query.params.max_results);
     try std.testing.expectEqual(@as(usize, 1), graph_match_query.metrics.len);
     try std.testing.expectEqualStrings("pagerank", graph_match_query.metrics[0].name);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_query.order_by.len);
+    try std.testing.expectEqualStrings("pagerank", graph_match_query.order_by[0].name);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.order_by[0].direction), .desc), graph_match_query.order_by[0].direction);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.order_by[0].nulls), .last), graph_match_query.order_by[0].nulls);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_query.where_metric.len);
+    try std.testing.expectEqualStrings("pagerank", graph_match_query.where_metric[0].name);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.where_metric[0].op), .gte), graph_match_query.where_metric[0].op);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), graph_match_query.where_metric[0].value, 0.0001);
     try std.testing.expectEqual(@as(usize, 2), graph_match_query.fields.len);
     try std.testing.expectEqualStrings("title", graph_match_query.fields[0]);
     try std.testing.expectEqualStrings("url", graph_match_query.fields[1]);
@@ -3317,6 +3325,63 @@ test "postgres sql adapter lowers antfly query functions into native search requ
     try std.testing.expectEqual(@as(usize, 2), graph_match_ref_query.pattern.len);
     try std.testing.expectEqual(@as(@TypeOf(graph_match_ref_query.pattern[1].edge.direction), .both), graph_match_ref_query.pattern[1].edge.direction);
     try std.testing.expectEqualStrings("neighbor", graph_match_ref_query.return_aliases[0]);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a:Document)-[:cites]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites|]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*0]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*3..1]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', where_metric => 'pagerank', where_op => '>=');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', order_direction => 'desc');",
+        ),
+    );
 
     var graph_metric = try lowerAntflyQueryFunctionSqlAlloc(
         alloc,
