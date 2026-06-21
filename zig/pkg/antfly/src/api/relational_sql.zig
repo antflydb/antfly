@@ -2215,13 +2215,18 @@ const Parser = struct {
     fn insertSourceParserHooks(self: *@This()) sql_adapter.InsertSourceParserHooks {
         return .{
             .ptr = self,
+            .params = self.params,
             .schema = self.schema,
             .joined_source_schema = self.joined_source_schema,
             .insert_source_allows_different_table = self.insert_source_allows_different_table,
             .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
+            .conflict_context_hooks = self.conflictClauseParserContextHooks(),
+            .conflict_target_options = self.conflictTargetParserOptions(),
+            .conflict_assignment_hooks = self.conflictUpdateSetAssignmentParserOptions(&.{}, &.{}),
+            .conflict_condition_options = self.conflictAssignmentExpressionParserOptions(),
+            .conflict_dispatch_hooks = self.conflictExpressionDispatchHooks(),
             .returning_hooks = self.returningProjectionParserOptions(),
             .parse_select = parseInsertSourceSelectHook,
-            .parse_conflict_clause = parseInsertSourceConflictClauseHook,
         };
     }
 
@@ -2434,37 +2439,6 @@ const Parser = struct {
             .unique_resolver = self.unique_resolver,
         };
         return try sub.parseSelect();
-    }
-
-    fn parseInsertSourceConflictClauseHook(
-        ptr: *anyopaque,
-        table_name: []const u8,
-        existing_qualifiers: []const []const u8,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-        source_schema: runtime_schema.TableSchema,
-    ) anyerror!ConflictClause {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseConflictClauseWithContextAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            .{
-                .params = self.params,
-                .schema = self.schema,
-                .joined_source_schema = source_schema,
-                .table_name = table_name,
-                .existing_qualifiers = existing_qualifiers,
-                .insert_columns = insert_columns,
-                .insert_values = insert_values,
-                .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-                .context_hooks = self.conflictClauseParserContextHooks(),
-                .target_options = self.conflictTargetParserOptions(),
-                .assignment_hooks = self.conflictUpdateSetAssignmentParserOptions(insert_columns, insert_values),
-                .condition_options = self.conflictAssignmentExpressionParserOptions(),
-                .dispatch_hooks = self.conflictExpressionDispatchHooks(),
-            },
-        );
     }
 
     fn parseUpdateJoinedMutationSourceWithCtesHook(
@@ -20717,6 +20691,41 @@ fn createTablePlanUpdatePolicyColumnCount(plan: CreateTablePlan) usize {
     return count;
 }
 
+const NamedConstraintFingerprintCounts = struct {
+    primary_key: usize = 0,
+    unique: usize = 0,
+    foreign_key: usize = 0,
+    check: usize = 0,
+};
+
+fn countNamedCreateTableConstraints(plan: CreateTablePlan) NamedConstraintFingerprintCounts {
+    var counts: NamedConstraintFingerprintCounts = .{};
+    if (plan.primary_key) |primary_key| {
+        if (primary_key.name != null) counts.primary_key += 1;
+    }
+    for (plan.unique_constraints) |constraint| {
+        if (constraint.name.len > 0) counts.unique += 1;
+    }
+    for (plan.foreign_keys) |foreign_key| {
+        if (foreign_key.name.len > 0) counts.foreign_key += 1;
+    }
+    for (plan.checks) |check| {
+        if (check.name.len > 0) counts.check += 1;
+    }
+    return counts;
+}
+
+fn appendNamedConstraintFingerprintsAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    counts: NamedConstraintFingerprintCounts,
+) ![]u8 {
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, "pk_named", counts.primary_key);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "unique_named", counts.unique);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_named", counts.foreign_key);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "check_named", counts.check);
+}
+
 const ForeignKeyOptionFingerprintCounts = struct {
     deferrable: usize = 0,
     deferred: usize = 0,
@@ -21284,6 +21293,7 @@ fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "system_versioned", plan.system_versioned);
             fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, countCreateTableConstraintTimingFingerprints(plan));
+            fingerprint = try appendNamedConstraintFingerprintsAlloc(alloc, fingerprint, countNamedCreateTableConstraints(plan));
             fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, countForeignKeyOptionFingerprints(plan.foreign_keys));
             break :blk fingerprint;
         },

@@ -7291,6 +7291,70 @@ non-SQL callers: ranked source specs, `rrf`/`rsf`, optional failover, pruning,
 and reranking. The table-valued function result can then be joined back to base
 rows for filtering, authorization, and projection.
 
+#### Graph DSL influence
+
+SurrealDB and Cypher should influence the relational graph API, but they should
+not become the first relational query language surface. The first API should
+stay PostgreSQL-shaped because relational rows remain the authoritative data
+model and graph indexes remain derived artifacts.
+
+From SurrealDB, Antfly should borrow the idea that edges are explicit,
+property-bearing records. The SQL form is an edge table plus `CREATE GRAPH
+INDEX`, not embedded SurrealQL:
+
+```sql
+CREATE TABLE doc_edges (
+  source_doc text NOT NULL,
+  target_doc text NOT NULL,
+  edge_type text NOT NULL,
+  confidence float8,
+  created_at timestamptz,
+  PRIMARY KEY (source_doc, target_doc, edge_type)
+);
+
+CREATE GRAPH INDEX docs_graph ON doc_edges
+  EDGE (source_doc -> target_doc)
+  TYPE edge_type
+  WEIGHT confidence;
+```
+
+From Cypher, Antfly should borrow graph vocabulary and pattern concepts:
+nodes, relationships, direction, path length, edge-type filters, path bindings,
+and metric-aware traversal. The first SQL API should expose those concepts as
+typed function arguments:
+
+```sql
+SELECT *
+FROM antfly.graph_traverse(
+  index => 'docs_graph',
+  start => 'doc:root',
+  direction => 'out',
+  edge_types => ARRAY['cites'],
+  max_depth => 2,
+  require_metric => 'pagerank_v1'
+);
+```
+
+Long-term, a small pattern DSL can be added as a convenience layer over the same
+native graph planner:
+
+```sql
+SELECT *
+FROM antfly.graph_match(
+  index => 'docs_graph',
+  pattern => '(a)-[:cites*1..2]->(b)',
+  start => 'doc:root'
+);
+```
+
+That DSL should be intentionally smaller than full Cypher at first: no separate
+transaction model, no separate graph-owned storage model, and no planner path
+that bypasses relational authorization or committed base-row visibility. It is
+adapter sugar for graph traversal and path binding over a named graph index. If
+Antfly later adds broader GQL/Cypher compatibility, it should be an additional
+adapter on top of the same graph index and relational row contracts, not the
+primary contract for relational graph data.
+
 #### Operational contract
 
 - Catalog application validates SQL names, column references, model references,

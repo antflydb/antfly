@@ -30,24 +30,22 @@ const Token = lower_expr.Token;
 
 pub const InsertSourceParserHooks = struct {
     ptr: *anyopaque,
+    params: []const sql_value.SqlValue = &.{},
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema = null,
     insert_source_allows_different_table: bool = false,
     defer_row_expression_field_validation: bool = false,
+    conflict_context_hooks: ConflictClauseParserContextHooks,
+    conflict_target_options: ConflictTargetParserOptions,
+    conflict_assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
+    conflict_condition_options: ConflictAssignmentExpressionParserOptions,
+    conflict_dispatch_hooks: ConflictExpressionDispatchHooks,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     parse_select: *const fn (
         *anyopaque,
         []const Token,
         runtime_schema.TableSchema,
     ) anyerror!plan_mod.LoweredSelect,
-    parse_conflict_clause: *const fn (
-        *anyopaque,
-        []const u8,
-        []const []const u8,
-        []const []const u8,
-        []const []const u8,
-        runtime_schema.TableSchema,
-    ) anyerror!ConflictClause,
 };
 
 pub const InsertSourceParserOptions = struct {
@@ -854,7 +852,21 @@ pub fn parseInsertSourceWithCtesAlloc(
     var conflict_where = false;
     if (parser.matchKeyword(tokens, pos, "on")) {
         const conflict_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-        const parsed_conflict = try hooks.parse_conflict_clause(hooks.ptr, target_table.name, &conflict_qualifiers, columns.items, &.{}, effective_source_schema);
+        const parsed_conflict = try parseConflictClauseWithContextAlloc(alloc, tokens, pos, .{
+            .params = hooks.params,
+            .schema = hooks.schema,
+            .joined_source_schema = effective_source_schema,
+            .table_name = target_table.name,
+            .existing_qualifiers = &conflict_qualifiers,
+            .insert_columns = columns.items,
+            .insert_values = &.{},
+            .defer_row_expression_field_validation = hooks.defer_row_expression_field_validation,
+            .context_hooks = hooks.conflict_context_hooks,
+            .target_options = hooks.conflict_target_options,
+            .assignment_hooks = hooks.conflict_assignment_hooks,
+            .condition_options = hooks.conflict_condition_options,
+            .dispatch_hooks = hooks.conflict_dispatch_hooks,
+        });
         defer freeConflictClause(alloc, parsed_conflict);
         if (parsed_conflict.where_expression != null or parsed_conflict.where_expressions.len != 0 or parsed_conflict.where_any.len != 0 or parsed_conflict.where_not.len != 0) conflict_where = true;
         conflict = try insertSourceOnConflictFromClauseAlloc(alloc, hooks.schema, parsed_conflict);
