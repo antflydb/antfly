@@ -67,6 +67,7 @@ fn tempTestAflitePath(alloc: Allocator, label: []const u8) ![:0]u8 {
 const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
+    open_mode: db_mod.OpenOptions.OpenMode = .writer,
     readable_lease_hook: ?ReadableLeaseHook = null,
     owned_lite_backend: ?lite_backend.Handle = null,
     lite_profile: ?lite_backend.Profile = null,
@@ -114,7 +115,7 @@ const Handle = struct {
 };
 
 fn closeHandle(handle: *Handle) void {
-    if (handle.owned_lite_backend != null) {
+    if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
         handle.db.sync(true) catch {};
         handle.db.syncIndexes(true) catch {};
     }
@@ -123,6 +124,13 @@ fn closeHandle(handle: *Handle) void {
         backend.deinit();
     }
     handle.alloc.destroy(handle);
+}
+
+fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return switch (open_mode) {
+        .writer, .writer_no_replay => true,
+        else => false,
+    };
 }
 
 fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64 {
@@ -1740,6 +1748,7 @@ fn openLiteHandle(
     handle.* = .{
         .alloc = alloc,
         .db = db,
+        .open_mode = resolved.open_mode,
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
@@ -6816,6 +6825,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var concurrent_readonly_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(src_path, &concurrent_readonly_handle));
     defer antfly_db_close(concurrent_readonly_handle);
+    try std.testing.expectEqual(db_mod.OpenOptions.OpenMode.query_readonly, asHandle(concurrent_readonly_handle).?.open_mode);
     var second_writer_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_open(src_path, &second_writer_handle));
     defer antfly_db_close(second_writer_handle);
@@ -6875,6 +6885,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     var concurrent_status_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_status_only(src_path, &concurrent_status_handle));
     defer antfly_db_close(concurrent_status_handle);
+    try std.testing.expectEqual(db_mod.OpenOptions.OpenMode.status_only, asHandle(concurrent_status_handle).?.open_mode);
     var concurrent_status: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_stats_json(concurrent_status_handle, &concurrent_status));
     defer antfly_db_buffer_free(concurrent_status.ptr, concurrent_status.len);
