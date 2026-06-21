@@ -5779,10 +5779,12 @@ pub export fn antfly_db_add_index_json(
 pub export fn antfly_db_delete_index(
     handle_ptr: ?*anyopaque,
     name: capi.Slice,
-    out_deleted: *bool,
+    out_deleted: ?*bool,
 ) capi.ErrorCode {
+    const out = out_deleted orelse return .invalid_argument;
+    out.* = false;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    out_deleted.* = handle.db.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
+    out.* = handle.db.deleteIndex(name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -5803,11 +5805,13 @@ pub export fn antfly_db_delete_enrichment(
     handle_ptr: ?*anyopaque,
     kind_slice: capi.Slice,
     name: capi.Slice,
-    out_deleted: *bool,
+    out_deleted: ?*bool,
 ) capi.ErrorCode {
+    const out = out_deleted orelse return .invalid_argument;
+    out.* = false;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     const kind = parseEnrichmentKind(kind_slice.bytes()) orelse return .invalid_argument;
-    out_deleted.* = handle.db.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
+    out.* = handle.db.deleteEnrichment(kind, name.bytes()) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -6486,6 +6490,17 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, idle_json, "\"derived_target_sequence\":") != null);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_run_until_idle(src_handle));
 
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_index(src_handle, .{
+        .ptr = "missing-index",
+        .len = "missing-index".len,
+    }, null));
+    var missing_index_deleted = true;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_delete_index(src_handle, .{
+        .ptr = "missing-index",
+        .len = "missing-index".len,
+    }, &missing_index_deleted));
+    try std.testing.expect(!missing_index_deleted);
+
     const schema_json =
         \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
     ;
@@ -6520,6 +6535,23 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_buffer_free(enrichments.ptr, enrichments.len);
     try std.testing.expect(std.mem.indexOf(u8, enrichments.ptr.?[0..enrichments.len], "\"body_chunks_v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, enrichments.ptr.?[0..enrichments.len], "\"chunk_size\":8") != null);
+
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_enrichment(src_handle, .{
+        .ptr = "chunk",
+        .len = "chunk".len,
+    }, .{
+        .ptr = "scratch_chunks_v1",
+        .len = "scratch_chunks_v1".len,
+    }, null));
+    var invalid_enrichment_deleted = true;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_delete_enrichment(src_handle, .{
+        .ptr = "unknown",
+        .len = "unknown".len,
+    }, .{
+        .ptr = "scratch_chunks_v1",
+        .len = "scratch_chunks_v1".len,
+    }, &invalid_enrichment_deleted));
+    try std.testing.expect(!invalid_enrichment_deleted);
 
     var deleted_enrichment = false;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_delete_enrichment(src_handle, .{
