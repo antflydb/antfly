@@ -3592,7 +3592,7 @@ const Parser = struct {
         insert_columns: []const []const u8,
     ) anyerror!JsonSetParsedValue {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseJsonSetSqlValueAlloc(column, insert_columns);
+        return try sql_adapter.parseJsonSetSqlValueAlloc(self.alloc, self.tokens, &self.pos, column, self.jsonSetSqlValueParserHooks(insert_columns));
     }
 
     fn parseConflictUpdateArrayElementValueJsonHook(
@@ -10998,14 +10998,6 @@ const Parser = struct {
         }
     }
 
-    fn parseJsonSetSqlValueAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!JsonSetParsedValue {
-        return try sql_adapter.parseJsonSetSqlValueAlloc(self.alloc, self.tokens, &self.pos, column, self.jsonSetSqlValueParserHooks(insert_columns));
-    }
-
     fn parseConflictUpdateSetAssignment(
         self: *@This(),
         insert_columns: []const []const u8,
@@ -11059,7 +11051,24 @@ const Parser = struct {
             const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
             try self.notePrimaryKeyAssignment(field);
             var field_transferred = false;
-            try self.parseConflictUpdateAssignmentValue(field, column, insert_columns, insert_values, patch, patch_expr, increment, increment_expr, json_set, array_update, &field_transferred);
+            try sql_adapter.parseConflictUpdateAssignmentValueAlloc(
+                self.alloc,
+                self.tokens,
+                &self.pos,
+                self.schema,
+                self.params,
+                self.conflict_existing_qualifiers,
+                field,
+                column,
+                patch,
+                patch_expr,
+                increment,
+                increment_expr,
+                json_set,
+                array_update,
+                &field_transferred,
+                self.conflictUpdateAssignmentValueParserHooks(insert_columns, insert_values),
+            );
             if (field_transferred) fields.items[i] = "";
             if (i + 1 < fields.items.len) {
                 try self.expect(.comma);
@@ -11090,30 +11099,7 @@ const Parser = struct {
         const column = relationalColumnForField(self.schema, field, null) orelse return error.InvalidSqlCatalog;
         try self.notePrimaryKeyAssignment(field);
         try self.expect(.eq);
-        try self.parseConflictUpdateAssignmentValue(field, column, insert_columns, insert_values, patch, patch_expr, increment, increment_expr, json_set, array_update, &field_transferred);
-    }
-
-    fn notePrimaryKeyAssignment(self: *@This(), field: []const u8) !void {
-        if (!primaryKeyContains(self.schema.primary_key.?, field)) return;
-        if (!self.allow_primary_key_assignment) return error.UnsupportedSqlShape;
-        self.saw_primary_key_assignment = true;
-    }
-
-    fn parseConflictUpdateAssignmentValue(
-        self: *@This(),
-        field: []const u8,
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-        patch: *std.ArrayListUnmanaged(FieldJsonValue),
-        patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        increment: *std.ArrayListUnmanaged(FieldJsonValue),
-        increment_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
-        json_set: *std.ArrayListUnmanaged(JsonSetValue),
-        array_update: *std.ArrayListUnmanaged(ArrayTransformValue),
-        field_transferred: *bool,
-    ) !void {
-        return try sql_adapter.parseConflictUpdateAssignmentValueAlloc(
+        try sql_adapter.parseConflictUpdateAssignmentValueAlloc(
             self.alloc,
             self.tokens,
             &self.pos,
@@ -11128,9 +11114,15 @@ const Parser = struct {
             increment_expr,
             json_set,
             array_update,
-            field_transferred,
+            &field_transferred,
             self.conflictUpdateAssignmentValueParserHooks(insert_columns, insert_values),
         );
+    }
+
+    fn notePrimaryKeyAssignment(self: *@This(), field: []const u8) !void {
+        if (!primaryKeyContains(self.schema.primary_key.?, field)) return;
+        if (!self.allow_primary_key_assignment) return error.UnsupportedSqlShape;
+        self.saw_primary_key_assignment = true;
     }
 
     fn parseUpdateAssignment(
@@ -11158,7 +11150,7 @@ const Parser = struct {
             var path_transferred = false;
             errdefer if (!path_transferred) freeStringSlice(self.alloc, path);
             try self.expect(.comma);
-            const value = try self.parseJsonSetSqlValueAlloc(column, &.{});
+            const value = try sql_adapter.parseJsonSetSqlValueAlloc(self.alloc, self.tokens, &self.pos, column, self.jsonSetSqlValueParserHooks(&.{}));
             var value_transferred = false;
             errdefer if (!value_transferred) freeJsonSetParsedValue(self.alloc, value);
             if (self.match(.comma) != null) {
