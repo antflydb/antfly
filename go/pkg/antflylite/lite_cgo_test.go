@@ -136,6 +136,107 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	}
 }
 
+func TestLiteHostedPauseResumeGeneratedEnrichment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "go-hosted-resume.aflite")
+
+	hosted, err := OpenHosted(path)
+	if err != nil {
+		t.Fatalf("open hosted Lite database: %v", err)
+	}
+	hostedCaps, err := hosted.Capabilities()
+	if err != nil {
+		hosted.Close()
+		t.Fatalf("hosted capabilities: %v", err)
+	}
+	if !hostedCaps.ManualMaintenance || hostedCaps.BackgroundEnrichmentRuntime {
+		hosted.Close()
+		t.Fatalf("hosted capabilities should expose manual maintenance without background enrichment: %#v", hostedCaps)
+	}
+	if err := hosted.AddEnrichmentJSON([]byte(`{"name":"resume_chunks_v1","kind":"chunk","field":"body","chunk_size":24,"chunk_overlap":0}`)); err != nil {
+		hosted.Close()
+		t.Fatalf("hosted add chunk enrichment: %v", err)
+	}
+	if err := hosted.AddIndexJSON([]byte(`{"name":"resume_ft_body","kind":"full_text","config_json":"{\"chunk_name\":\"resume_chunks_v1\"}"}`)); err != nil {
+		hosted.Close()
+		t.Fatalf("hosted add full-text index: %v", err)
+	}
+	batchOut, err := hosted.BatchJSON([]byte(`{"inserts":{"doc:go-resume":{"title":"paused","body":"go manual maintenance pause resume phrase"}},"sync_level":"write"}`))
+	if err != nil {
+		hosted.Close()
+		t.Fatalf("hosted batch source document: %v", err)
+	}
+	if !bytes.Contains(batchOut, []byte(`"inserted":1`)) {
+		hosted.Close()
+		t.Fatalf("hosted batch source document response = %s, want inserted count", batchOut)
+	}
+	hostedLookup, err := hosted.LookupJSON("doc:go-resume")
+	if err != nil {
+		hosted.Close()
+		t.Fatalf("hosted lookup source document after batch: %v", err)
+	}
+	if !bytes.Contains(hostedLookup, []byte("pause resume phrase")) {
+		hosted.Close()
+		t.Fatalf("hosted lookup source document = %s, want body text", hostedLookup)
+	}
+	pendingBefore, err := hosted.PendingWorkStats()
+	if err != nil {
+		hosted.Close()
+		t.Fatalf("hosted pending work: %v", err)
+	}
+	if !pendingBefore.HasAsyncIndexes {
+		hosted.Close()
+		t.Fatalf("hosted pending work should expose async index debt: %#v", pendingBefore)
+	}
+	if err := hosted.Close(); err != nil {
+		t.Fatalf("close hosted Lite database: %v", err)
+	}
+
+	resumed, err := OpenWithOptions(path, OpenOptions{
+		Mode:                      OpenModeWriter,
+		Profile:                   ProfileNative,
+		GeneratedEnrichmentReplay: true,
+	})
+	if err != nil {
+		t.Fatalf("open native Lite database after hosted pause: %v", err)
+	}
+	defer resumed.Close()
+
+	resumedLookup, err := resumed.LookupJSON("doc:go-resume")
+	if err != nil {
+		enrichments, _ := resumed.EnrichmentsJSON()
+		indexes, _ := resumed.IndexesJSON()
+		t.Fatalf("resumed lookup source document after hosted close: %v; enrichments=%s indexes=%s", err, enrichments, indexes)
+	}
+	if !bytes.Contains(resumedLookup, []byte("pause resume phrase")) {
+		t.Fatalf("resumed lookup source document = %s, want body text", resumedLookup)
+	}
+
+	replayed, err := resumed.ReplayGeneratedEnrichments()
+	if err != nil {
+		t.Fatalf("replay generated enrichments: %v", err)
+	}
+	if replayed.Replayed == 0 {
+		enrichments, _ := resumed.EnrichmentsJSON()
+		indexes, _ := resumed.IndexesJSON()
+		t.Fatalf("replay generated enrichments = %#v, want nonzero replay after hosted pause; enrichments=%s indexes=%s", replayed, enrichments, indexes)
+	}
+	idle, err := resumed.RunUntilIdleStatus()
+	if err != nil {
+		t.Fatalf("run until idle after replay: %v", err)
+	}
+	if !idle.HasAsyncIndexes || idle.DerivedTargetSequence == 0 {
+		t.Fatalf("post-replay idle status missing index readiness fields: %#v", idle)
+	}
+	result, err := resumed.SearchJSON([]byte(`{"full_text_search":{"match":{"field":"body","text":"resume phrase"}},"limit":1}`))
+	if err != nil {
+		t.Fatalf("search resumed full-text index: %v", err)
+	}
+	if !bytes.Contains(result, []byte("doc:go-resume")) {
+		stats, _ := resumed.StatsJSON()
+		t.Fatalf("resumed full-text search JSON %q did not contain restored document; stats=%s", result, stats)
+	}
+}
+
 func TestLiteCAPI(t *testing.T) {
 	if got := ABIVersion(); got != SupportedABIVersion {
 		t.Fatalf("ABI version = %d, want %d", got, SupportedABIVersion)

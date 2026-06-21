@@ -7918,6 +7918,7 @@ pub const DB = struct {
     fn drainReplayStagesUntilStable(self: *DB) !void {
         var rounds: usize = 0;
         while (rounds < run_until_idle_max_replay_rounds) : (rounds += 1) {
+            const starting_sequence = self.core.nextDerivedSequence();
             try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             const drained_sequence = self.core.nextDerivedSequence();
 
@@ -7934,7 +7935,7 @@ pub const DB = struct {
                 }
             }
 
-            if (self.core.nextDerivedSequence() <= drained_sequence) return;
+            if (self.core.nextDerivedSequence() <= starting_sequence) return;
         }
         return error.RunUntilIdleDidNotConverge;
     }

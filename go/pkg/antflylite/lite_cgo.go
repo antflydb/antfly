@@ -58,13 +58,14 @@ const (
 
 // OpenOptions configures OpenWithOptions.
 type OpenOptions struct {
-	Mode                     OpenMode
-	Profile                  Profile
-	NoSync                   bool
-	RemoteProviderConfigured bool
-	LocalRuntimeConfigured   bool
-	MapSize                  uint64
-	TTLCleanup               *TTLCleanupOptions
+	Mode                      OpenMode
+	Profile                   Profile
+	NoSync                    bool
+	RemoteProviderConfigured  bool
+	LocalRuntimeConfigured    bool
+	GeneratedEnrichmentReplay bool
+	MapSize                   uint64
+	TTLCleanup                *TTLCleanupOptions
 }
 
 // TTLCleanupOptions configures the optional Lite TTL cleanup runtime.
@@ -190,6 +191,9 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	}
 	if opts.LocalRuntimeConfigured {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED
+	}
+	if opts.GeneratedEnrichmentReplay {
+		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY
 	}
 	if opts.TTLCleanup != nil {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP
@@ -413,6 +417,13 @@ func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
 		C.uint64_t(timestampNS),
 		0,
 	))
+}
+
+// BatchJSON applies a public Antfly batch request and returns the JSON result.
+func (db *DB) BatchJSON(request []byte) ([]byte, error) {
+	return db.withInputOutput(request, func(handle unsafe.Pointer, input C.antfly_slice, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_db_batch_json(handle, input, out)
+	})
 }
 
 // LookupJSON returns the JSON lookup result for key.

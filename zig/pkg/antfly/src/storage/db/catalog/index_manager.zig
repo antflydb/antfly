@@ -3422,6 +3422,26 @@ pub const IndexManager = struct {
             });
         }
 
+        for (self.text_indexes.items) |entry| {
+            const chunk_name = entry.chunk_name orelse continue;
+            const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse return error.InvalidIndexConfig;
+            if (chunk_cfg.source_artifact_name.len > 0) continue;
+            if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
+                try requests.append(alloc, .{
+                    .kind = .chunk_text,
+                    .index_name = try alloc.dupe(u8, entry.config.name),
+                    .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
+                    .doc_key = try alloc.dupe(u8, doc_key),
+                    .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
+                    .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                    .chunk_size = chunk_cfg.chunk_size,
+                    .chunk_overlap = chunk_cfg.chunk_overlap,
+                    .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                    .full_text_index = true,
+                });
+            }
+        }
+
         for (self.dense_indexes.items) |entry| {
             if (hasExplicitDenseEmbedding(explicit_dense, entry.config.name)) continue;
             if (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) |vector| {

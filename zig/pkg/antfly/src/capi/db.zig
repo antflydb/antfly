@@ -33,6 +33,7 @@ const lite_backend = antfly.lite.backend;
 const lite_restore_staging = antfly.lite.restore_staging;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
+const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const Allocator = std.mem.Allocator;
 
@@ -113,6 +114,10 @@ const Handle = struct {
 };
 
 fn closeHandle(handle: *Handle) void {
+    if (handle.owned_lite_backend != null) {
+        handle.db.sync(true) catch {};
+        handle.db.syncIndexes(true) catch {};
+    }
     handle.db.close();
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
@@ -1620,7 +1625,8 @@ pub export fn antfly_lite_open_options_init(options: ?*capi.LiteOpenOptions) cap
 const lite_open_known_flags = capi.lite_open_flag_no_sync |
     capi.lite_open_flag_ttl_cleanup |
     capi.lite_open_flag_remote_provider_configured |
-    capi.lite_open_flag_local_runtime_configured;
+    capi.lite_open_flag_local_runtime_configured |
+    capi.lite_open_flag_generated_enrichment_replay;
 
 const LiteResolvedOpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -1629,6 +1635,7 @@ const LiteResolvedOpenOptions = struct {
     no_sync: bool = false,
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
     inference: lite_backend.InferenceOpenOptions = .{},
+    generated_enrichment_replay: bool = false,
 };
 
 fn validateLiteOpenOptionsReserved(options: *const capi.LiteOpenOptions) !void {
@@ -1657,6 +1664,9 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
     if (profile == .hosted and (options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
         return error.InvalidArgument;
     }
+    if (profile == .hosted and (options.flags & capi.lite_open_flag_generated_enrichment_replay) != 0) {
+        return error.InvalidArgument;
+    }
     if (options.map_size > std.math.maxInt(usize)) return error.InvalidArgument;
 
     var resolved = LiteResolvedOpenOptions{
@@ -1668,6 +1678,7 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
             .remote_provider_configured = (options.flags & capi.lite_open_flag_remote_provider_configured) != 0,
             .local_runtime_configured = (options.flags & capi.lite_open_flag_local_runtime_configured) != 0,
         },
+        .generated_enrichment_replay = (options.flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
     };
     if ((options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
         if (options.ttl_cleanup_owner_id.ptr == null and options.ttl_cleanup_owner_id.len != 0) {
@@ -1713,6 +1724,9 @@ fn openLiteHandle(
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
     if (resolved.ttl_cleanup) |ttl_cleanup| opts.ttl_cleanup = ttl_cleanup;
+    if (resolved.generated_enrichment_replay) {
+        opts.enrichment = .{ .enable_without_producers = true };
+    }
     if (resolved.profile == .hosted) {
         opts.executor = .{ .backend = .manual };
         opts.ttl_cleanup = .{ .enabled = false };
@@ -2924,6 +2938,24 @@ pub export fn antfly_db_batch(
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
     batchInternal(handle, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
+    return .ok;
+}
+
+pub export fn antfly_db_batch_json(
+    handle_ptr: ?*anyopaque,
+    request_json: capi.Slice,
+    out_buf: *capi.Buffer,
+) capi.ErrorCode {
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
+    defer owned.deinit(handle.alloc);
+
+    handle.db.batch(owned.req) catch |err| return capi.mapError(err);
+    const response = batch_api.encodeBatchResponse(std.heap.c_allocator, owned.result()) catch |err| return capi.mapError(err);
+    out_buf.* = .{
+        .ptr = response.ptr,
+        .len = response.len,
+    };
     return .ok;
 }
 
@@ -6312,6 +6344,29 @@ test "capi batch and lookup json" {
     }, &out));
     defer antfly_db_buffer_free(out.ptr, out.len);
     try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"title\":\"ok\"") != null);
+
+    const batch_json = "{\"inserts\":{\"doc:capi-batch-json\":{\"title\":\"json path\"}},\"sync_level\":\"write\"}";
+    var batch_json_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle_ptr, .{
+        .ptr = batch_json.ptr,
+        .len = batch_json.len,
+    }, &batch_json_out));
+    defer antfly_db_buffer_free(batch_json_out.ptr, batch_json_out.len);
+    try std.testing.expect(std.mem.indexOf(u8, batch_json_out.ptr.?[0..batch_json_out.len], "\"inserted\":1") != null);
+
+    var json_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(handle_ptr, .{
+        .ptr = "doc:capi-batch-json",
+        .len = "doc:capi-batch-json".len,
+    }, &json_out));
+    defer antfly_db_buffer_free(json_out.ptr, json_out.len);
+    try std.testing.expect(std.mem.indexOf(u8, json_out.ptr.?[0..json_out.len], "\"title\":\"json path\"") != null);
+
+    var invalid_json_out: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch_json(handle_ptr, .{
+        .ptr = "{".ptr,
+        .len = 1,
+    }, &invalid_json_out));
 }
 
 test "capi lite opens exports imports checks and vacuums aflite" {
@@ -7241,6 +7296,15 @@ test "capi lite open options validate and configure ttl cleanup" {
     };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &hosted_ttl_options, &hosted_ttl_handle));
     try std.testing.expect(hosted_ttl_handle == null);
+
+    var hosted_generated_replay_handle: ?*anyopaque = &sentinel;
+    var hosted_generated_replay_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .profile = capi.lite_profile_hosted,
+        .flags = capi.lite_open_flag_generated_enrichment_replay,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_with_options(path, &hosted_generated_replay_options, &hosted_generated_replay_handle));
+    try std.testing.expect(hosted_generated_replay_handle == null);
 
     const owner_id = "capi-ttl-owner";
     var open_options = capi.LiteOpenOptions{

@@ -83,6 +83,7 @@ typedef struct antfly_buffer {
 #define ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP (1u << 1)
 #define ANTFLY_LITE_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED (1u << 2)
 #define ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED (1u << 3)
+#define ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY (1u << 4)
 
 typedef struct antfly_lite_open_options {
     uint32_t abi_size;
@@ -284,6 +285,11 @@ antfly_error_code antfly_db_batch(
     size_t predicate_count,
     uint64_t timestamp_ns,
     uint8_t sync_level
+);
+antfly_error_code antfly_db_batch_json(
+    void *handle,
+    antfly_slice request_json,
+    antfly_buffer *out
 );
 antfly_error_code antfly_db_begin_transaction_with_id(
     void *handle,

@@ -51,6 +51,7 @@ pub const lite_open_flag_no_sync: u32 = 1 << 0;
 pub const lite_open_flag_ttl_cleanup: u32 = 1 << 1;
 pub const lite_open_flag_remote_provider_configured: u32 = 1 << 2;
 pub const lite_open_flag_local_runtime_configured: u32 = 1 << 3;
+pub const lite_open_flag_generated_enrichment_replay: u32 = 1 << 4;
 
 pub const LiteOpenOptions = extern struct {
     abi_size: u32 = @sizeOf(LiteOpenOptions),
@@ -206,6 +207,9 @@ pub fn mapError(err: anyerror) ErrorCode {
         error.TxnNotFound => .txn_not_found,
         error.NotFound => .not_found,
         error.InvalidArgument,
+        error.InvalidBatchRequest,
+        error.UnsupportedBatchRequestEncoding,
+        error.ValueTooLong,
         error.InvalidQueryRequest,
         error.UnsupportedQueryRequest,
         error.InvalidAggregation,
