@@ -6436,6 +6436,8 @@ pub fn build(b: *std.Build) void {
     lite_core_test_step.dependOn(&run_lite_native_tests.step);
     lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
     lite_core_test_step.dependOn(&run_lite_go_tests.step);
+    lite_core_test_step.dependOn(&run_lite_go_example.step);
+    lite_core_test_step.dependOn(&run_lite_go_retrieval_template.step);
     lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
