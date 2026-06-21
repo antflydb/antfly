@@ -185,7 +185,7 @@ pub const ConflictClauseParserOptions = struct {
     context_hooks: ConflictClauseParserContextHooks,
     target_options: ConflictTargetParserOptions,
     assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
-    condition_hooks: ConflictExpressionConditionParserHooks,
+    condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_hooks: ConflictExpressionDispatchHooks,
 };
 
@@ -200,8 +200,7 @@ pub const ConflictAssignmentExpressionParserOptions = struct {
 
 pub const ConflictExpressionDispatchHooks = struct {
     array_length: ConflictArrayLengthExpressionParserOptions,
-    case_expression: ConflictCaseExpressionParserHooks,
-    case_fold: ConflictCaseFoldExpressionParserHooks,
+    case_fold: ConflictCaseFoldExpressionParserOptions,
 };
 
 pub const ConflictExpressionStart = enum {
@@ -356,41 +355,6 @@ const ConflictBooleanExpressionParserHooks = struct {
     ) anyerror!db_mod.types.RelationalRowsExpression,
 };
 
-pub const ConflictExpressionConditionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_untyped_expression: *const fn (
-        *anyopaque,
-        runtime_schema.RelationalColumn,
-        []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression,
-    parse_boolean_operand: *const fn (
-        *anyopaque,
-        runtime_schema.RelationalColumn,
-        []const []const u8,
-        ?runtime_schema.AntflyType,
-    ) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
-pub const ConflictCaseExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_expression: *const fn (
-        *anyopaque,
-        runtime_schema.RelationalColumn,
-        []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression,
-    parse_untyped_expression: *const fn (
-        *anyopaque,
-        runtime_schema.RelationalColumn,
-        []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression,
-    parse_boolean_operand: *const fn (
-        *anyopaque,
-        runtime_schema.RelationalColumn,
-        []const []const u8,
-        ?runtime_schema.AntflyType,
-    ) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
 pub const ConflictPeriodBoundExpressionParserOptions = struct {
     schema: runtime_schema.TableSchema,
     field_expression_qualifiers: []const []const u8,
@@ -399,14 +363,7 @@ pub const ConflictPeriodBoundExpressionParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
 };
 
-pub const ConflictCaseFoldExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_operand: *const fn (
-        *anyopaque,
-        runtime_schema.RelationalColumn,
-        []const []const u8,
-        ?runtime_schema.AntflyType,
-    ) anyerror!db_mod.types.RelationalRowsExpression,
+pub const ConflictCaseFoldExpressionParserOptions = struct {
     period_bound: ConflictPeriodBoundExpressionParserOptions,
 };
 
@@ -694,7 +651,7 @@ pub const InsertParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     target_options: ConflictTargetParserOptions,
     assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
-    condition_hooks: ConflictExpressionConditionParserHooks,
+    condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_hooks: ConflictExpressionDispatchHooks,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     realtime_ns: u64,
@@ -2120,7 +2077,7 @@ pub fn parseConflictClauseAlloc(
     defer_row_expression_field_validation: bool,
     target_options: ConflictTargetParserOptions,
     assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
-    condition_hooks: ConflictExpressionConditionParserHooks,
+    condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_hooks: ConflictExpressionDispatchHooks,
 ) !ConflictClause {
     try parser.expectKeyword(tokens, pos, "conflict");
@@ -2221,7 +2178,7 @@ pub fn parseConflictClauseAlloc(
             &where_expressions,
             &where_any,
             &where_not,
-            condition_hooks,
+            condition_options,
             dispatch_hooks,
         );
     }
@@ -2257,6 +2214,7 @@ pub fn parseConflictClauseWithContextAlloc(
 
     const type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr);
     const assignment_hooks = conflictUpdateSetAssignmentOptionsWithExistingQualifiers(options.assignment_hooks, options.existing_qualifiers);
+    const condition_options = conflictAssignmentExpressionOptionsWithExistingQualifiers(options.condition_options, options.existing_qualifiers);
     const dispatch_hooks = conflictDispatchHooksWithExistingQualifiers(options.dispatch_hooks, options.existing_qualifiers);
     return try parseConflictClauseAlloc(
         alloc,
@@ -2272,9 +2230,19 @@ pub fn parseConflictClauseWithContextAlloc(
         options.defer_row_expression_field_validation,
         options.target_options,
         assignment_hooks,
-        options.condition_hooks,
+        condition_options,
         dispatch_hooks,
     );
+}
+
+fn conflictAssignmentExpressionOptionsWithExistingQualifiers(
+    options: ConflictAssignmentExpressionParserOptions,
+    conflict_existing_qualifiers: []const []const u8,
+) ConflictAssignmentExpressionParserOptions {
+    var out = options;
+    out.conflict_existing_qualifiers = conflict_existing_qualifiers;
+    out.dispatch_hooks = conflictDispatchHooksWithExistingQualifiers(out.dispatch_hooks, conflict_existing_qualifiers);
+    return out;
 }
 
 fn conflictUpdateSetAssignmentOptionsWithExistingQualifiers(
@@ -2287,9 +2255,8 @@ fn conflictUpdateSetAssignmentOptionsWithExistingQualifiers(
         out.value.json_set.conflict_dispatch_hooks,
         conflict_existing_qualifiers,
     );
-    out.value.expression_options.assignment_options.conflict_existing_qualifiers = conflict_existing_qualifiers;
-    out.value.expression_options.assignment_options.dispatch_hooks = conflictDispatchHooksWithExistingQualifiers(
-        out.value.expression_options.assignment_options.dispatch_hooks,
+    out.value.expression_options.assignment_options = conflictAssignmentExpressionOptionsWithExistingQualifiers(
+        out.value.expression_options.assignment_options,
         conflict_existing_qualifiers,
     );
     return out;
@@ -3372,8 +3339,8 @@ pub fn parseConflictExpressionWithExpectedAlloc(
     if (conflictExpressionStartAt(tokens, pos.*)) |start| {
         switch (start) {
             .cast => return try parseConflictCastExpressionAlloc(alloc, tokens, pos, column, insert_columns, options),
-            .case => return try parseConflictCaseExpressionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, hooks.case_expression),
-            .case_fold => return try parseConflictCaseFoldExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.case_fold),
+            .case => return try parseConflictCaseExpressionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, options),
+            .case_fold => return try parseConflictCaseFoldExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, options, hooks.case_fold),
             .replace => return try parseConflictTextTernaryExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .replace, type_context, options),
             .regexp_replace => return try parseConflictRegexpListExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_replace, type_context, options),
             .regexp_match => return try parseConflictRegexpListExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, .regexp_match, type_context, options),
@@ -3869,21 +3836,6 @@ pub fn parseConflictCastExpressionAlloc(
     return expression;
 }
 
-fn conflictBooleanHooksFromConditionHooks(hooks: ConflictExpressionConditionParserHooks) ConflictBooleanExpressionParserHooks {
-    return .{
-        .ptr = hooks.ptr,
-        .parse_operand = hooks.parse_boolean_operand,
-    };
-}
-
-fn conflictConditionHooksFromCaseHooks(hooks: ConflictCaseExpressionParserHooks) ConflictExpressionConditionParserHooks {
-    return .{
-        .ptr = hooks.ptr,
-        .parse_untyped_expression = hooks.parse_untyped_expression,
-        .parse_boolean_operand = hooks.parse_boolean_operand,
-    };
-}
-
 pub fn parseConflictCaseExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -3895,7 +3847,7 @@ pub fn parseConflictCaseExpressionAlloc(
     insert_columns: []const []const u8,
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    hooks: ConflictCaseExpressionParserHooks,
+    options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     try lower_expr.parseCaseExpressionStart(tokens, pos);
 
@@ -3905,13 +3857,12 @@ pub fn parseConflictCaseExpressionAlloc(
         branches.deinit(alloc);
     }
 
-    const condition_hooks = conflictConditionHooksFromCaseHooks(hooks);
     while (lower_expr.matchCaseExpressionWhen(tokens, pos)) {
-        const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks);
+        const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, options);
         var condition_transferred = false;
         errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
         try lower_expr.parseCaseExpressionThen(tokens, pos);
-        const then_expression = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+        const then_expression = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, column.field_type, options);
         var then_transferred = false;
         errdefer if (!then_transferred) freeExpression(alloc, then_expression);
         try branches.append(alloc, .{ .when = condition, .then = then_expression });
@@ -3921,7 +3872,7 @@ pub fn parseConflictCaseExpressionAlloc(
     if (branches.items.len == 0) return error.UnsupportedSqlShape;
 
     try lower_expr.parseCaseExpressionElse(tokens, pos);
-    const else_expression = try hooks.parse_expression(hooks.ptr, column, insert_columns);
+    const else_expression = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, column.field_type, options);
     var else_transferred = false;
     errdefer if (!else_transferred) freeExpression(alloc, else_expression);
     try lower_expr.parseCaseExpressionEnd(tokens, pos);
@@ -3958,13 +3909,13 @@ pub fn parseConflictExpressionConditionAlloc(
     insert_columns: []const []const u8,
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    hooks: ConflictExpressionConditionParserHooks,
+    options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
     if (canParseBareBooleanConflictExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, insert_columns)) {
-        return try parseBareBooleanConflictExpressionConditionAlloc(alloc, tokens, pos, column, insert_columns, type_context, conflictBooleanHooksFromConditionHooks(hooks));
+        return try parseBareBooleanConflictExpressionConditionAlloc(alloc, tokens, pos, column, insert_columns, type_context, options);
     }
 
-    const lhs = try hooks.parse_untyped_expression(hooks.ptr, column, insert_columns);
+    const lhs = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
@@ -4006,7 +3957,7 @@ pub fn parseConflictExpressionConditionAlloc(
             const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
             var out_transferred = false;
             errdefer if (!out_transferred) alloc.free(out);
-            out[0] = try hooks.parse_untyped_expression(hooks.ptr, column, insert_columns);
+            out[0] = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             out_transferred = true;
             break :blk out;
         },
@@ -4039,12 +3990,12 @@ pub fn parseConflictActionWhereConditionAlternatives(
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    condition_hooks: ConflictExpressionConditionParserHooks,
+    condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_hooks: ConflictExpressionDispatchHooks,
 ) !void {
     const parenthesized = parser.matchToken(tokens, pos, .lparen) != null;
     if (canParseBareBooleanConflictExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, insert_columns)) {
-        const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks);
+        const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options);
         try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
         if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
         return;
@@ -4168,7 +4119,7 @@ pub fn parseConflictActionWhereClause(
     where_expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
     where_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     where_not: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    condition_hooks: ConflictExpressionConditionParserHooks,
+    condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_hooks: ConflictExpressionDispatchHooks,
 ) !void {
     if (schema.relational_columns.len == 0) return error.InvalidSqlCatalog;
@@ -4176,7 +4127,7 @@ pub fn parseConflictActionWhereClause(
     if (parser.matchKeyword(tokens, pos, "not")) {
         try parser.expectToken(tokens, pos, .lparen);
         while (true) {
-            const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks, dispatch_hooks);
+            const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_hooks);
             var branch_groups_transferred = false;
             errdefer if (!branch_groups_transferred) {
                 freeExpressionPredicateGroups(alloc, branch_groups);
@@ -4199,7 +4150,7 @@ pub fn parseConflictActionWhereClause(
     defer groups.deinit(alloc);
     errdefer if (!groups_transferred) freeExpressionPredicateGroups(alloc, groups.items);
     while (true) {
-        const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks, dispatch_hooks);
+        const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_hooks);
         var branch_groups_transferred = false;
         errdefer if (!branch_groups_transferred) {
             freeExpressionPredicateGroups(alloc, branch_groups);
@@ -4241,7 +4192,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
     insert_columns: []const []const u8,
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    condition_hooks: ConflictExpressionConditionParserHooks,
+    condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_hooks: ConflictExpressionDispatchHooks,
 ) ![]const db_mod.types.RelationalRowsExpressionPredicateGroup {
     const parenthesized = conflictParenthesizedConjunctionCanStart(tokens, pos.*);
@@ -4270,7 +4221,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
             type_context,
             defer_row_expression_field_validation,
             &alternatives,
-            condition_hooks,
+            condition_options,
             dispatch_hooks,
         );
         try lower_expr.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
@@ -4290,9 +4241,9 @@ fn parseBareBooleanConflictExpressionConditionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     type_context: lower_expr.RowExpressionTypeContext,
-    hooks: ConflictBooleanExpressionParserHooks,
+    options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
-    const expression = try parseConflictBooleanExpressionWithHooksAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    const expression = try parseConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, options);
     var expression_transferred = false;
     errdefer if (!expression_transferred) freeExpression(alloc, expression);
     try type_context.validateBooleanRowExpression(expression);
@@ -4484,7 +4435,8 @@ pub fn parseConflictCaseFoldExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     type_context: lower_expr.RowExpressionTypeContext,
-    hooks: ConflictCaseFoldExpressionParserHooks,
+    assignment_options: ConflictAssignmentExpressionParserOptions,
+    options: ConflictCaseFoldExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     const kind = try lower_expr.parseCaseFoldFunctionCallStart(tokens, pos);
@@ -4493,11 +4445,11 @@ pub fn parseConflictCaseFoldExpressionAlloc(
         tokens,
         pos,
         kind,
-        hooks.period_bound.schema,
-        hooks.period_bound.field_expression_qualifiers,
-        hooks.period_bound.returning_expression_qualifiers,
-        hooks.period_bound.defer_row_expression_field_validation,
-        hooks.period_bound.field_source,
+        options.period_bound.schema,
+        options.period_bound.field_expression_qualifiers,
+        options.period_bound.returning_expression_qualifiers,
+        options.period_bound.defer_row_expression_field_validation,
+        options.period_bound.field_source,
     )) |expression| return expression;
 
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
@@ -4506,7 +4458,7 @@ pub fn parseConflictCaseFoldExpressionAlloc(
         operands.deinit(alloc);
     }
 
-    const operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+    const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, assignment_options);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     try type_context.validateTextRowExpression(operand);
@@ -4515,7 +4467,7 @@ pub fn parseConflictCaseFoldExpressionAlloc(
 
     if (kind == .trim or kind == .ltrim or kind == .rtrim) {
         if (parser.matchToken(tokens, pos, .comma) != null) {
-            const trim_operand = try hooks.parse_operand(hooks.ptr, column, insert_columns, null);
+            const trim_operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, assignment_options);
             var trim_transferred = false;
             errdefer if (!trim_transferred) freeExpression(alloc, trim_operand);
             try type_context.validateTextRowExpression(trim_operand);
@@ -9037,8 +8989,8 @@ fn parseInsertConflictClauseAlloc(
             insertConflictUpdateSetAssignmentOptions(options.assignment_value_hooks),
             existing_qualifiers,
         ),
-        options.condition_hooks,
-        options.dispatch_hooks,
+        conflictAssignmentExpressionOptionsWithExistingQualifiers(options.condition_options, existing_qualifiers),
+        conflictDispatchHooksWithExistingQualifiers(options.dispatch_hooks, existing_qualifiers),
     );
 }
 

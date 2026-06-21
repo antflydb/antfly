@@ -2461,7 +2461,7 @@ const Parser = struct {
                 .context_hooks = self.conflictClauseParserContextHooks(),
                 .target_options = self.conflictTargetParserOptions(),
                 .assignment_hooks = self.conflictUpdateSetAssignmentParserOptions(insert_columns, insert_values),
-                .condition_hooks = self.conflictExpressionConditionParserHooks(),
+                .condition_options = self.conflictAssignmentExpressionParserOptions(),
                 .dispatch_hooks = self.conflictExpressionDispatchHooks(),
             },
         );
@@ -2862,7 +2862,6 @@ const Parser = struct {
     fn conflictExpressionDispatchHooks(self: *@This()) sql_adapter.ConflictExpressionDispatchHooks {
         return .{
             .array_length = self.conflictArrayLengthExpressionParserOptions(),
-            .case_expression = self.conflictCaseExpressionParserHooks(),
             .case_fold = self.conflictCaseFoldExpressionParserHooks(),
         };
     }
@@ -3063,27 +3062,8 @@ const Parser = struct {
         };
     }
 
-    fn conflictExpressionConditionParserHooks(self: *@This()) sql_adapter.ConflictExpressionConditionParserHooks {
+    fn conflictCaseFoldExpressionParserHooks(self: *@This()) sql_adapter.ConflictCaseFoldExpressionParserOptions {
         return .{
-            .ptr = self,
-            .parse_untyped_expression = parseConflictUntypedExpressionHook,
-            .parse_boolean_operand = parseConflictUnaryExpressionOperandHook,
-        };
-    }
-
-    fn conflictCaseExpressionParserHooks(self: *@This()) sql_adapter.ConflictCaseExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_expression = parseConflictNullifExpressionHook,
-            .parse_untyped_expression = parseConflictUntypedExpressionHook,
-            .parse_boolean_operand = parseConflictUnaryExpressionOperandHook,
-        };
-    }
-
-    fn conflictCaseFoldExpressionParserHooks(self: *@This()) sql_adapter.ConflictCaseFoldExpressionParserHooks {
-        return .{
-            .ptr = self,
-            .parse_operand = parseConflictUnaryExpressionOperandHook,
             .period_bound = .{
                 .schema = self.schema,
                 .field_expression_qualifiers = self.field_expression_qualifiers,
@@ -3124,60 +3104,6 @@ const Parser = struct {
     fn parseFixedUnaryRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try sql_adapter.parseRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.rowExpressionParserHooks(), self.arithmeticExpressionParserHooks(), self.variadicRowExpressionParserHooks());
-    }
-
-    fn parseConflictNullifExpressionHook(
-        ptr: *anyopaque,
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseConflictExpressionWithExpectedAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.params,
-            self.schema,
-            self.conflict_existing_qualifiers,
-            column,
-            insert_columns,
-            column.field_type,
-            self.rowExpressionTypeContext(),
-            self.defer_row_expression_field_validation,
-            self.conflictExpressionDispatchHooks(),
-        );
-    }
-
-    fn parseConflictUntypedExpressionHook(
-        ptr: *anyopaque,
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseConflictExpressionWithExpectedAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.params,
-            self.schema,
-            self.conflict_existing_qualifiers,
-            column,
-            insert_columns,
-            null,
-            self.rowExpressionTypeContext(),
-            self.defer_row_expression_field_validation,
-            self.conflictExpressionDispatchHooks(),
-        );
-    }
-
-    fn parseConflictUnaryExpressionOperandHook(
-        ptr: *anyopaque,
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseConflictRowExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.conflictAssignmentExpressionParserOptions());
     }
 
     fn joinedMutationJsonSetSqlValueParserOptions(self: *@This()) sql_adapter.JoinedMutationJsonSetSqlValueParserOptions {
@@ -3448,7 +3374,7 @@ const Parser = struct {
             .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
             .target_options = self.conflictTargetParserOptions(),
             .assignment_value_hooks = self.conflictUpdateAssignmentValueParserOptions(&.{}, &.{}),
-            .condition_hooks = self.conflictExpressionConditionParserHooks(),
+            .condition_options = self.conflictAssignmentExpressionParserOptions(),
             .dispatch_hooks = self.conflictExpressionDispatchHooks(),
             .returning_hooks = self.returningProjectionParserOptions(),
             .realtime_ns = try checkedPlatformRealtimeNsU64(),
