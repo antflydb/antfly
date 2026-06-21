@@ -17,6 +17,25 @@ import (
 	"testing"
 )
 
+func TestBundledCABIHeaderMatchesSourceTree(t *testing.T) {
+	bundled, err := os.ReadFile(filepath.Join("include", "antflylite.h"))
+	if err != nil {
+		t.Fatalf("read bundled C ABI header: %v", err)
+	}
+
+	sourcePath := filepath.Join("..", "..", "..", "zig", "pkg", "antfly", "include", "antflylite.h")
+	source, err := os.ReadFile(sourcePath)
+	if os.IsNotExist(err) {
+		t.Skip("source-tree C ABI header is not present in this module checkout")
+	}
+	if err != nil {
+		t.Fatalf("read source-tree C ABI header: %v", err)
+	}
+	if !bytes.Equal(bundled, source) {
+		t.Fatalf("bundled C ABI header is out of sync with %s", sourcePath)
+	}
+}
+
 func TestErrorCodeMetadataMatchesCABI(t *testing.T) {
 	cases := []ErrorCode{
 		OK,

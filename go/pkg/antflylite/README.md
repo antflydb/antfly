@@ -4,7 +4,9 @@
 Antfly Lite APIs. It wraps the C ABI, so applications embed a live `.aflite`
 database directly instead of talking to the network SDK.
 
-Build the C library before running cgo-backed tests from the source tree:
+The Go module includes the matching `antflylite.h` C ABI header. Applications
+still need `libantflylite` at build and runtime. From the source tree, build the
+C library before running cgo-backed tests:
 
 ```sh
 cd zig
@@ -12,6 +14,19 @@ zig build lite-capi
 cd ../go/pkg/antflylite
 go test -tags antflylite_capi ./...
 ```
+
+Outside the source tree, install an Antfly CLI release package or archive that
+contains `include/antflylite.h` and `lib/libantflylite.*`, then point cgo and
+the dynamic loader at that installation when building your app. For example:
+
+```sh
+CGO_LDFLAGS="-L/path/to/antfly/lib" \
+LD_LIBRARY_PATH="/path/to/antfly/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+go build ./...
+```
+
+On macOS use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH` when the library
+is not already on the loader search path.
 
 Normal `go test ./...` does not run the C ABI smoke test. The
 `antflylite_capi` tag is intentional so package consumers do not need a freshly
