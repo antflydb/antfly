@@ -710,6 +710,39 @@ test "lite backend native stable snapshot uses open handle checkpoint" {
     try std.testing.expectEqualStrings("value", value);
 }
 
+test "lite backend native stable snapshot is consistent with active writer" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-backend-snapshot-writer.aflite");
+    defer allocator.free(path);
+    const snapshot_path = try testPath(allocator, tmp, "native-backend-snapshot-writer-copy.aflite");
+    defer allocator.free(snapshot_path);
+
+    var handle = try Handle.open(allocator, path, .{ .engine = .native_single_file });
+    defer handle.deinit();
+
+    try handle.native_docstore.?.file.putDocument("doc:committed", "committed");
+
+    var writer = try handle.native_docstore.?.beginWrite();
+    defer writer.abort();
+    try writer.put("doc:pending", "pending");
+    try std.testing.expectError(error.FileBusy, handle.native_docstore.?.beginWrite());
+
+    const copied = try handle.copyStableSnapshot(snapshot_path, false);
+    try std.testing.expect(copied.checkpoint_sequence > 0);
+
+    var snapshot = try native.NativeFile.open(allocator, snapshot_path, true);
+    defer snapshot.close();
+
+    const committed = (try snapshot.getDocumentAlloc(allocator, "doc:committed")).?;
+    defer allocator.free(committed);
+    try std.testing.expectEqualStrings("committed", committed);
+    try std.testing.expectEqual(@as(?[]u8, null), try snapshot.getDocumentAlloc(allocator, "doc:pending"));
+}
+
 test "lite backend auto creates new aflite files with native engine" {
     const allocator = std.testing.allocator;
 

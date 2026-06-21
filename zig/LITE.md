@@ -555,6 +555,7 @@ Minimum test matrix:
 - crash during commit/checkpoint publish
 - reader/writer concurrency
 - read-only open while writer exists
+- online backup or snapshot while a write transaction is open
 - backup from Lite, restore into normal Antfly
 - backup from normal Antfly, restore into Lite
 - direct restore from `.aflite` into normal Antfly through a portable restore
