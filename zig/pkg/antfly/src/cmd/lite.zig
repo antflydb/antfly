@@ -2560,6 +2560,63 @@ test "lite http handlers expose narrow embedded api" {
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"raft_replication\":false") != null);
     }
     {
+        var resp = try testLiteHttpCall(
+            allocator,
+            &state,
+            liteHttpIndexCreate,
+            .POST,
+            "http://lite.test/lite/v1/indexes",
+            "{\"name\":\"ft_title\",\"kind\":\"full_text\",\"config_json\":\"{}\"}",
+            &.{},
+        );
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"created\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"name\":\"ft_title\"") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(allocator, &state, liteHttpRunUntilIdle, .POST, "http://lite.test/lite/v1/run-until-idle", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"derived_target_sequence\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"text_merge\"") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(
+            allocator,
+            &state,
+            liteHttpQuery,
+            .POST,
+            "http://lite.test/lite/v1/query",
+            "{\"full_text_search\":{\"match\":{\"field\":\"title\",\"text\":\"served lite\"}},\"limit\":1}",
+            &.{},
+        );
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"doc:http\"") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(allocator, &state, liteHttpCheck, .GET, "http://lite.test/lite/v1/check", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"valid\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"record_count\":") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(allocator, &state, liteHttpCompact, .POST, "http://lite.test/lite/v1/compact", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"reclaimed_bytes\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"live_bytes\":") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(allocator, &state, liteHttpVacuum, .POST, "http://lite.test/lite/v1/vacuum", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"before_size\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"reclaimed_bytes\":") != null);
+    }
+    {
         var req = try httpx.Request.init(allocator, .GET, "http://lite.test/lite/v1/status");
         defer req.deinit();
 
