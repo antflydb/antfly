@@ -27786,13 +27786,15 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
         if (command_buffer == nil) return -15;
 
         const bool split_gate_up_linear = (rows >= 9u && runtime->q8_0_pair_activation_mm_pipeline == nil && runtime->q8_0_mm_pipeline != nil);
-        const bool fused_gate_up = !split_gate_up_linear && termite_metal_encode_q8_0_pair_activation_multiply(
+        const bool fused_gate_up = !split_gate_up_linear && termite_metal_encode_q8_0_pair_activation_multiply_with_offsets(
             runtime,
             command_buffer,
             input_buffer,
             0,
             gate_view.weight_buffer,
+            gate_view.weight_offset,
             up_view.weight_buffer,
+            up_view.weight_offset,
             gated_buffer,
             0,
             rows,

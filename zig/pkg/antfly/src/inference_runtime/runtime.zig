@@ -119,7 +119,7 @@ pub fn runFromIterator(
         inference.native_generate.main(alloc, io, try collectArgs(alloc, args)) catch |err| switch (err) {
             error.WarmInferenceServerUnavailable => {
                 std.debug.print(
-                    "warm inference server unavailable; start one with `antfly inference run --warm-generator <model> --warm-generator-backend metal` or pass --server\n",
+                    "warm inference server unavailable; start one with `antfly inference run --warm-generator <model> --warm-generator-backend metal` and pass --server\n",
                     .{},
                 );
                 std.process.exit(1);

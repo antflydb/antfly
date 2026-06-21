@@ -49,8 +49,6 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
-const default_server_url = "http://127.0.0.1:8090";
-const default_server_port: u16 = 8090;
 
 const ExecutionMode = enum {
     eager,
@@ -107,24 +105,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
         var server_opts = opts;
         server_opts.server_url = server_url;
-        return try runServerGenerate(allocator, io, server_opts);
-    }
-    if (shouldTryDefaultServer(opts, require_server) and loopbackTcpConnects(default_server_port)) {
-        var server_opts = opts;
-        server_opts.server_url = default_server_url;
         if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
-        var used_server = true;
-        runServerGenerate(allocator, io, server_opts) catch |err| switch (err) {
-            error.ConnectionRefused,
-            error.ConnectionResetByPeer,
-            error.HostUnreachable,
-            error.NetworkUnreachable,
-            error.Timeout,
-            error.AccessDenied,
-            => used_server = false,
-            else => return err,
-        };
-        if (used_server) return;
+        return try runServerGenerate(allocator, io, server_opts, false);
     }
     if (require_server) {
         if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
@@ -1863,7 +1845,7 @@ fn emitArtifactResultAndExit(
     std.process.exit(0);
 }
 
-fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
     if (!serverGenerateSupportsOptions(opts)) {
         return error.UnsupportedServerGenerateOption;
     }
@@ -1902,10 +1884,12 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options) !v
     defer resp.deinit();
     const finished_at = std.Io.Timestamp.now(io, .awake);
     if (!resp.ok()) {
-        if (resp.body) |payload| {
-            print("server_error status={d} body={s}\n", .{ resp.status.code, payload });
-        } else {
-            print("server_error status={d}\n", .{resp.status.code});
+        if (!quiet_errors) {
+            if (resp.body) |payload| {
+                print("server_error status={d} body={s}\n", .{ resp.status.code, payload });
+            } else {
+                print("server_error status={d}\n", .{resp.status.code});
+            }
         }
         return error.GenerateRequestFailed;
     }
@@ -1934,10 +1918,6 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options) !v
     }
 }
 
-fn shouldTryDefaultServer(opts: Options, require_server: bool) bool {
-    return (require_server or opts.backend == .metal) and serverGenerateSupportsOptions(opts);
-}
-
 fn requireWarmServer(opts: Options) bool {
     return opts.require_server or platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
 }
@@ -1960,23 +1940,6 @@ fn stripDefaultModelsDir(home: []const u8, model_dir: []const u8) ?[]const u8 {
 fn serverGenerateSupportsOptions(opts: Options) bool {
     return opts.image_count == 0 and opts.audio_count == 0 and !opts.raw_prompt and !opts.no_bos and !opts.no_chat_template and opts.draft_model == null and
         !opts.print_token_ids and !opts.print_prompt_token_ids and !opts.print_prompt and !opts.print_chat_template_status;
-}
-
-fn loopbackTcpConnects(port: u16) bool {
-    const fd_rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (std.posix.errno(fd_rc) != .SUCCESS) return false;
-    const fd: std.posix.fd_t = @intCast(fd_rc);
-    defer _ = std.posix.system.close(fd);
-
-    var addr = std.c.sockaddr.in{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001),
-    };
-    return std.posix.errno(std.posix.system.connect(
-        fd,
-        @ptrCast(&addr),
-        @sizeOf(@TypeOf(addr)),
-    )) == .SUCCESS;
 }
 
 fn compiledTargetName(target: CompiledTarget) []const u8 {
@@ -2312,7 +2275,7 @@ fn printUsage() void {
         \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
-        \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails instead of taking the slow direct path.
+        \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
         \\  artifact-dir overrides that lookup root.
@@ -2410,33 +2373,21 @@ test "server generate routes metal requests to whole model" {
     try std.testing.expectEqualStrings("whole-model", serverGenerateCompiledTargetName(opts).?);
 }
 
-test "default server auto route is metal only" {
-    try std.testing.expectEqual(@as(u16, 8090), default_server_port);
-    try std.testing.expectEqualStrings("http://127.0.0.1:8090", default_server_url);
-    try std.testing.expect(shouldTryDefaultServer(.{
+test "server generate rejects unsupported server options" {
+    try std.testing.expect(serverGenerateSupportsOptions(.{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .metal,
-    }, false));
-    try std.testing.expect(!shouldTryDefaultServer(.{
-        .model_dir = "gemma-e2b",
-        .prompt = "hello",
-        .backend = .native,
-    }, false));
-    try std.testing.expect(shouldTryDefaultServer(.{
-        .model_dir = "gemma-e2b",
-        .prompt = "hello",
-        .backend = .native,
-    }, true));
-    try std.testing.expect(!shouldTryDefaultServer(.{
+    }));
+    try std.testing.expect(!serverGenerateSupportsOptions(.{
         .model_dir = "gemma-e2b",
         .prompt = "hello",
         .backend = .metal,
         .print_token_ids = true,
-    }, true));
+    }));
 }
 
-test "default server strips local models dir prefix" {
+test "server model name strips local models dir prefix" {
     try std.testing.expectEqualStrings(
         "ggml-org/gemma-4-e2b-it-gguf",
         stripDefaultModelsDir(
