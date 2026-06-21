@@ -835,6 +835,70 @@ test "lite restore staging accepts aflite input for normal restore" {
     }
 }
 
+test "lite restore staging exports stable aflite data while writer has open transaction" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/normal-restore-active-writer.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/normal-restore-active-writer-restored.aflite", .{tmp.sub_path});
+    defer allocator.free(restored_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/normal-restore-active-writer-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+
+    var source = try LiteDb.open(allocator, src_path, .writer);
+    defer source.close();
+
+    try source.db.batch(.{
+        .writes = &.{.{
+            .key = "doc:restore-committed",
+            .value = "{\"title\":\"normal restore committed\"}",
+        }},
+        .sync_level = .write,
+    });
+
+    const txn_id: db_types.TxnId = .{ 0x6c, 0x69, 0x74, 0x65, 0x2d, 0x72, 0x65, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x2d, 0, 0, 1 };
+    _ = try source.db.beginTransactionWithId(txn_id, 7_000);
+    try source.db.writeTransaction(txn_id, .{
+        .writes = &.{.{
+            .key = "doc:restore-pending",
+            .value = "{\"title\":\"normal restore pending\"}",
+        }},
+    });
+
+    var staged = try stageInputRestoreBackup(allocator, src_path, "docs", "active-writer", location);
+    defer staged.deinit(allocator);
+    try source.db.abortTransaction(txn_id, 7_001);
+
+    try std.testing.expectEqualStrings("active-writer.afb", staged.snapshot_path);
+
+    const afb_path = try std.fmt.allocPrint(allocator, "{s}/active-writer.afb", .{backup_root});
+    defer allocator.free(afb_path);
+    const portable = try readFileAlloc(allocator, afb_path, max_afb_file_bytes);
+    defer allocator.free(portable);
+    try portable_backup.validatePortable(allocator, portable);
+
+    var restored = try LiteDb.open(allocator, restored_path, .writer);
+    defer restored.close();
+    try importPortableIntoLiteDb(allocator, &restored.db, portable);
+
+    var committed = (try restored.db.lookup(allocator, "doc:restore-committed", .{})) orelse return error.MissingRestoredCommittedDoc;
+    defer committed.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, committed.json, "\"normal restore committed\"") != null);
+
+    try std.testing.expectEqual(@as(?db_types.LookupResult, null), try restored.db.lookup(allocator, "doc:restore-pending", .{}));
+}
+
 test "lite portable backup roundtrips through normal table backup APIs" {
     const allocator = std.testing.allocator;
 
