@@ -274,6 +274,10 @@ pub const Api = struct {
     }
 };
 
+pub fn checkLiteFileJson(alloc: Allocator, path: []const u8) ![]u8 {
+    return try Api.checkLiteFileJson(alloc, path);
+}
+
 const ParsedLookupRequest = struct {
     fields: ?[]const []const u8 = null,
 };

@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const std = @import("std");
 const embedded = @import("embedded_surface");
 pub const db = embedded.db;
 pub const api = embedded.api;
@@ -29,4 +30,40 @@ test "pkg antfly embedded root compiles" {
     _ = lsm_backend;
     _ = storage_backend;
     _ = db_types;
+    _ = db.Capabilities;
+    _ = db.InferenceOpenOptions;
+    _ = db.InferenceStatus;
+    _ = db.LiteCheckReport;
+    _ = db.LiteStableSnapshotReport;
+    _ = db.LiteStatus;
+    _ = db.LiteStorageStatus;
+    _ = db.LiteVacuumReport;
+    _ = db.capabilitiesForProfile;
+    _ = db.checkLiteFile;
+    _ = api.checkLiteFileJson;
+}
+
+test "pkg antfly embedded exposes Lite path-level check helpers" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pkg-lite-malformed.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    {
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, "short embedded package header", 0);
+    }
+
+    const report: db.LiteCheckReport = try db.checkLiteFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("truncated_header", report.issue.?);
+
+    const json = try api.checkLiteFileJson(allocator, path);
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"valid\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"issue\":\"truncated_header\"") != null);
 }
