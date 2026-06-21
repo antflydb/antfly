@@ -55,18 +55,20 @@ func main() {
 		removeIfExists(*backupPath)
 	}
 
-	db, err := antflylite.Open(*dbPath)
+	db, created, err := openOrCreateLite(*dbPath)
 	if err != nil {
-		log.Fatalf("open Lite database: %v", err)
+		log.Fatalf("open or create Lite database: %v", err)
 	}
 	defer db.Close()
 
-	if err := db.SetSchemaJSON([]byte(schemaJSON)); err != nil {
-		log.Fatalf("set schema: %v", err)
-	}
-	for _, index := range indexes {
-		if err := db.AddIndexJSON(index); err != nil {
-			log.Fatalf("add index: %v", err)
+	if created {
+		if err := db.SetSchemaJSON([]byte(schemaJSON)); err != nil {
+			log.Fatalf("set schema: %v", err)
+		}
+		for _, index := range indexes {
+			if err := db.AddIndexJSON(index); err != nil {
+				log.Fatalf("add index: %v", err)
+			}
 		}
 	}
 	if err := db.Batch(documents, 1); err != nil {
@@ -104,6 +106,17 @@ func removeIfExists(path string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		log.Fatalf("remove %s: %v", path, err)
 	}
+}
+
+func openOrCreateLite(path string) (*antflylite.DB, bool, error) {
+	if _, err := os.Stat(path); err == nil {
+		db, openErr := antflylite.Open(path)
+		return db, false, openErr
+	} else if !os.IsNotExist(err) {
+		return nil, false, err
+	}
+	db, err := antflylite.Create(path)
+	return db, true, err
 }
 
 func mustSearch(db *antflylite.DB, request []byte) []byte {

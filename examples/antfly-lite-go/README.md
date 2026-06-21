@@ -1,8 +1,9 @@
 # Antfly Lite Go Example
 
-This example embeds Antfly Lite in a Go application. It opens a live `.aflite`
-database, writes a JSON document, reads it back, prints Lite status, and exports
-a portable `.afb` backup. It also checks the `.aflite` file directly without
+This example embeds Antfly Lite in a Go application. It creates a live
+`.aflite` database on first run, opens that existing database on later runs,
+writes a JSON document, reads it back, prints Lite status, and exports a
+portable `.afb` backup. It also checks the `.aflite` file directly without
 opening another database handle.
 
 ## Run
@@ -20,6 +21,10 @@ Run the example:
 ```bash
 GOWORK=off go run . --reset --db demo.aflite --backup demo.afb
 ```
+
+`--reset` removes the demo files before running so the example exercises
+`antflylite.Create`. Without `--reset`, the example reopens `demo.aflite` with
+`antflylite.Open`.
 
 The generated files have different meanings:
 

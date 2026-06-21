@@ -38,9 +38,9 @@ func main() {
 		}
 	}
 
-	db, err := antflylite.Open(*dbPath)
+	db, err := openOrCreateLite(*dbPath)
 	if err != nil {
-		log.Fatalf("open Lite database: %v", err)
+		log.Fatalf("open or create Lite database: %v", err)
 	}
 	defer db.Close()
 
@@ -91,4 +91,13 @@ func main() {
 		log.Fatalf("check Lite file: %v", err)
 	}
 	fmt.Printf("check: valid=%t size=%d compact_size=%d\n", check.Valid, check.FileSize, check.CompactSize)
+}
+
+func openOrCreateLite(path string) (*antflylite.DB, error) {
+	if _, err := os.Stat(path); err == nil {
+		return antflylite.Open(path)
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return antflylite.Create(path)
 }
