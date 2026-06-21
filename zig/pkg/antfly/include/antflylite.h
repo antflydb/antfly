@@ -28,6 +28,26 @@ typedef enum antfly_error_code {
     ANTFLY_INTERNAL = 255,
 } antfly_error_code;
 
+/*
+ * C ABI conventions:
+ *
+ * - Functions return ANTFLY_OK on success. Any other antfly_error_code is an
+ *   error and should be handled with the stable strings returned by
+ *   antfly_error_code_name and antfly_error_code_description.
+ * - antfly_slice is borrowed input. The caller owns the memory and must keep it
+ *   valid for the duration of the call.
+ * - antfly_buffer is owned output. On success, the caller owns the returned
+ *   memory and must release it with antfly_buffer_free, or
+ *   antfly_buffer_free_zero when the bytes may contain sensitive data.
+ * - Functions with an antfly_buffer *out reset the output to {NULL, 0} before
+ *   validating arguments. Unless the function returns ANTFLY_OK, callers must
+ *   treat the output as empty.
+ * - void * database handles are owned by the caller after a successful open and
+ *   must be closed with antfly_db_close. Closing NULL is allowed.
+ * - Search result structs own nested allocations only after ANTFLY_OK and must
+ *   be released with their matching *_free function.
+ */
+
 typedef enum antfly_txn_status {
     ANTFLY_TXN_PENDING = 0,
     ANTFLY_TXN_COMMITTED = 1,
@@ -78,6 +98,13 @@ typedef struct antfly_lite_open_options {
     uint64_t ttl_cleanup_grace_period_ns;
     uint64_t reserved[8];
 } antfly_lite_open_options;
+
+/*
+ * Call antfly_lite_open_options_init before setting fields manually. The
+ * abi_size field must remain the value returned by
+ * antfly_lite_open_options_size so future library versions can detect the
+ * caller's struct layout.
+ */
 
 typedef struct antfly_write_intent {
     antfly_slice key;
@@ -240,7 +267,9 @@ antfly_error_code antfly_lite_pending_work_stats_json(void *handle, antfly_buffe
 void antfly_db_close(void *handle);
 void antfly_buffer_free(antfly_buffer *buffer);
 void antfly_buffer_free_zero(antfly_buffer *buffer);
+/* Raw pointer/length free helper for bindings that cannot pass antfly_buffer. */
 void antfly_db_buffer_free(uint8_t *ptr, size_t len);
+/* Alias retained for existing buffer-shaped callers; prefer antfly_buffer_free_zero. */
 void antfly_db_buffer_free_zero(antfly_buffer *buffer);
 void antfly_db_dense_search_result_free(antfly_dense_search_result *result);
 void antfly_db_packed_dense_search_result_free(antfly_packed_dense_search_result *result);
