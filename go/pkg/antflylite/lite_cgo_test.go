@@ -340,6 +340,10 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("local inference status: %v", err)
 	}
+	localCaps, err := localDB.Capabilities()
+	if err != nil {
+		t.Fatalf("local inference capabilities: %v", err)
+	}
 	if err := localDB.Close(); err != nil {
 		t.Fatalf("close local inference Lite database: %v", err)
 	}
@@ -349,6 +353,16 @@ func TestLiteCAPI(t *testing.T) {
 		!localStatus.Inference.LocalRuntimeConfigured ||
 		!localStatus.Inference.LocalRuntimeAvailable {
 		t.Fatalf("local inference status = %#v", localStatus.Inference)
+	}
+	if localStatus.Capabilities.InferenceMode != InferenceModeLocalEmbedded ||
+		!localStatus.Capabilities.LocalInferenceRuntime ||
+		!containsString(localStatus.Capabilities.AvailableInferenceModes, InferenceModeLocalEmbedded) {
+		t.Fatalf("local inference status capabilities = %#v", localStatus.Capabilities)
+	}
+	if localCaps.InferenceMode != InferenceModeLocalEmbedded ||
+		!localCaps.LocalInferenceRuntime ||
+		!containsString(localCaps.AvailableInferenceModes, InferenceModeLocalEmbedded) {
+		t.Fatalf("local inference capabilities = %#v", localCaps)
 	}
 
 	caps, err := db.CapabilitiesJSON()

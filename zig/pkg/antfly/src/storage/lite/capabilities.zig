@@ -165,6 +165,14 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
     };
 }
 
+pub fn capabilitiesForProfileWithInferenceStatus(profile: Profile, status: InferenceStatus) Capabilities {
+    var caps = capabilitiesForProfile(profile);
+    caps.inference_mode = status.mode;
+    caps.available_inference_modes = status.available_modes;
+    caps.local_inference_runtime = status.local_runtime_available;
+    return caps;
+}
+
 pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
     return inferenceStatusForProfileWithOptions(profile, .{});
 }

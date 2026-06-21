@@ -38,6 +38,7 @@ pub const Capabilities = capabilities.Capabilities;
 pub const InferenceStatus = capabilities.InferenceStatus;
 pub const InferenceOpenOptions = capabilities.InferenceOpenOptions;
 pub const capabilitiesForProfile = capabilities.capabilitiesForProfile;
+pub const capabilitiesForProfileWithInferenceStatus = capabilities.capabilitiesForProfileWithInferenceStatus;
 pub const inferenceStatusForProfile = capabilities.inferenceStatusForProfile;
 pub const inferenceStatusForProfileWithOptions = capabilities.inferenceStatusForProfileWithOptions;
 
@@ -388,6 +389,12 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(!hosted_caps.background_enrichment_runtime);
     try std.testing.expect(!hosted_caps.ttl_cleanup_runtime);
     try std.testing.expect(!hosted_caps.transaction_recovery_runtime);
+
+    const local_status = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
+    const local_caps = capabilitiesForProfileWithInferenceStatus(.native, local_status);
+    try std.testing.expectEqualStrings("local_embedded", local_caps.inference_mode);
+    try std.testing.expect(local_caps.local_inference_runtime);
+    try std.testing.expect(std.mem.eql(u8, local_caps.available_inference_modes[2], "local_embedded"));
 }
 
 test "lite backend capabilities contract is stable" {
