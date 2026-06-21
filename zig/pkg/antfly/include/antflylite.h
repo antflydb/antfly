@@ -210,6 +210,12 @@ antfly_error_code antfly_lite_restore_backup_json(
     bool replace,
     antfly_buffer *out
 );
+antfly_error_code antfly_lite_restore_json(
+    const char *dest_path,
+    antfly_slice backup,
+    bool replace,
+    antfly_buffer *out
+);
 antfly_error_code antfly_lite_check_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_check_file_json(const char *path, antfly_buffer *out);
 antfly_error_code antfly_lite_copy_stable_snapshot_json(

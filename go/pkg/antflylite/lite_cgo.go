@@ -306,6 +306,20 @@ func restoreBackupToFile(path string, backup []byte, replace bool) error {
 	return nil
 }
 
+func restoreToFile(path string, backup []byte, replace bool) error {
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+	input, cleanup := makeCStringSlice(backup)
+	defer cleanup()
+
+	var out C.antfly_buffer
+	if err := check(C.antfly_lite_restore_json(cPath, input, C.bool(replace), &out)); err != nil {
+		return err
+	}
+	C.antfly_buffer_free(&out)
+	return nil
+}
+
 // CheckJSON runs Lite integrity checks and returns the JSON result.
 func (db *DB) CheckJSON() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {

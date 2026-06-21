@@ -1873,6 +1873,15 @@ pub export fn antfly_lite_restore_backup_json(
     return .ok;
 }
 
+pub export fn antfly_lite_restore_json(
+    dest_path: ?[*:0]const u8,
+    backup: capi.Slice,
+    replace: bool,
+    out_buf: ?*capi.Buffer,
+) capi.ErrorCode {
+    return antfly_lite_restore_backup_json(dest_path, backup, replace, out_buf);
+}
+
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
@@ -6282,6 +6291,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(pinned_snapshot_path);
     const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
     defer alloc.free(restore_path);
+    const restore_alias_path = try tempTestAflitePath(alloc, "capi-lite-restore-alias");
+    defer alloc.free(restore_alias_path);
     const locked_restore_path = try tempTestAflitePath(alloc, "capi-lite-restore-locked");
     defer alloc.free(locked_restore_path);
     const restore_malformed_path = try tempTestAflitePath(alloc, "capi-lite-restore-malformed");
@@ -6300,6 +6311,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(snapshot_path);
     cleanupTestFile(pinned_snapshot_path);
     cleanupTestFile(restore_path);
+    cleanupTestFile(restore_alias_path);
     cleanupTestFile(locked_restore_path);
     cleanupTestFile(restore_malformed_path);
     cleanupTestFile(invalid_snapshot_path);
@@ -6315,6 +6327,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(snapshot_path);
     defer cleanupTestFile(pinned_snapshot_path);
     defer cleanupTestFile(restore_path);
+    defer cleanupTestFile(restore_alias_path);
     defer cleanupTestFile(locked_restore_path);
     defer cleanupTestFile(restore_malformed_path);
     defer cleanupTestFile(invalid_snapshot_path);
@@ -6901,6 +6914,25 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &restored_file_lookup));
     defer antfly_db_buffer_free(restored_file_lookup.ptr, restored_file_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, restored_file_lookup.ptr.?[0..restored_file_lookup.len], "\"second\"") != null);
+
+    var restore_alias_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_restore_json(restore_alias_path, .{
+        .ptr = exported_backup.ptr,
+        .len = exported_backup.len,
+    }, false, &restore_alias_report));
+    defer antfly_db_buffer_free(restore_alias_report.ptr, restore_alias_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, restore_alias_report.ptr.?[0..restore_alias_report.len], "\"format\":\"aflite\"") != null);
+
+    var restored_alias_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(restore_alias_path, &restored_alias_handle));
+    defer antfly_db_close(restored_alias_handle);
+    var restored_alias_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(restored_alias_handle, .{
+        .ptr = "doc:capi-lite",
+        .len = "doc:capi-lite".len,
+    }, &restored_alias_lookup));
+    defer antfly_db_buffer_free(restored_alias_lookup.ptr, restored_alias_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, restored_alias_lookup.ptr.?[0..restored_alias_lookup.len], "\"second\"") != null);
 
     const locked_restore_tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{locked_restore_path});
     defer alloc.free(locked_restore_tmp_path);

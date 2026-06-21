@@ -668,6 +668,19 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("restore without replace unexpectedly overwrote target")
 	}
 
+	restoredAliasPath := filepath.Join(t.TempDir(), "go-restored-alias.aflite")
+	if err := Restore(restoredAliasPath, backupBytes, false); err != nil {
+		t.Fatalf("restore alias bytes: %v", err)
+	}
+	if err := Restore(restoredAliasPath, backupBytes, false); err == nil {
+		t.Fatalf("restore alias without replace unexpectedly overwrote target")
+	}
+
+	restoredAliasFilePath := filepath.Join(t.TempDir(), "go-restored-alias-file.aflite")
+	if err := RestoreFile(restoredAliasFilePath, exportPath, false); err != nil {
+		t.Fatalf("restore alias file: %v", err)
+	}
+
 	lockedRestorePath := filepath.Join(t.TempDir(), "go-locked-restore.aflite")
 	lockedRestore, err := Open(lockedRestorePath)
 	if err != nil {

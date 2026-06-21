@@ -63,6 +63,28 @@ func RestoreBackup(path string, backup []byte, replace bool) error {
 	return restoreBackupToFile(path, backup, replace)
 }
 
+// RestoreFile creates or replaces a Lite database from a portable Antfly
+// backup archive.
+func RestoreFile(path, backupPath string, replace bool) error {
+	if !strings.HasSuffix(backupPath, ".afb") {
+		return InvalidArgument
+	}
+	backup, err := os.ReadFile(backupPath)
+	if err != nil {
+		return err
+	}
+	return Restore(path, backup, replace)
+}
+
+// Restore creates or replaces a Lite database from a portable Antfly backup
+// archive.
+func Restore(path string, backup []byte, replace bool) error {
+	if !strings.HasSuffix(path, ".aflite") || len(backup) == 0 {
+		return InvalidArgument
+	}
+	return restoreToFile(path, backup, replace)
+}
+
 func writeFileAtomically(path string, data []byte, perm fs.FileMode) error {
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)

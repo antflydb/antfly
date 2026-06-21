@@ -60,8 +60,10 @@ static int fail_with_buffer(const char *message, antfly_buffer *buffer) {
 
 int main(void) {
     const char *path = "/tmp/antfly-lite-c-smoke.aflite";
+    const char *restored_path = "/tmp/antfly-lite-c-smoke-restored.aflite";
     const char *bad_path = "/tmp/antfly-lite-c-smoke-bad.aflite";
     (void)remove(path);
+    (void)remove(restored_path);
     (void)remove(bad_path);
 
     if (antfly_lite_abi_version() != 1) {
@@ -95,6 +97,7 @@ int main(void) {
     if (bad_file == NULL) {
         fprintf(stderr, "failed to create truncated lite file\n");
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -102,12 +105,14 @@ int main(void) {
         fprintf(stderr, "failed to write truncated lite file\n");
         fclose(bad_file);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
     if (fclose(bad_file) != 0) {
         fprintf(stderr, "failed to close truncated lite file\n");
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -115,12 +120,14 @@ int main(void) {
     antfly_buffer check_file = {0};
     if (expect_ok(antfly_lite_check_file_json(bad_path, &check_file), "check invalid lite file") != 0) {
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
     if (!buffer_contains(check_file, "\"valid\":false") ||
         !buffer_contains(check_file, "\"issue\":\"truncated_header\"")) {
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return fail_with_buffer("file-level check did not report truncated lite file", &check_file);
     }
@@ -130,6 +137,7 @@ int main(void) {
     void *handle = NULL;
     if (expect_ok(antfly_lite_open_with_options(path, &options, &handle), "open lite database") != 0) {
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -142,6 +150,7 @@ int main(void) {
     if (expect_ok(antfly_db_batch(handle, &write, 1, NULL, 0, 1, 0), "write batch") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -150,27 +159,53 @@ int main(void) {
     if (expect_ok(antfly_lite_export(handle, &exported_backup), "export lite database") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
     if (exported_backup.len == 0) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return fail_with_buffer("export alias returned an empty portable backup", &exported_backup);
     }
+
+    antfly_slice exported_slice;
+    exported_slice.ptr = exported_backup.ptr;
+    exported_slice.len = exported_backup.len;
+    antfly_buffer restore_report = {0};
+    if (expect_ok(antfly_lite_restore_json(restored_path, exported_slice, false, &restore_report), "restore lite database") != 0) {
+        antfly_buffer_free(&exported_backup);
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    if (!buffer_contains(restore_report, "aflite")) {
+        antfly_buffer_free(&exported_backup);
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(bad_path);
+        return fail_with_buffer("restore alias did not return an aflite report", &restore_report);
+    }
+    antfly_buffer_free(&restore_report);
     antfly_buffer_free(&exported_backup);
 
     antfly_buffer lookup = {0};
     if (expect_ok(antfly_db_lookup_json(handle, write.key, &lookup), "lookup json") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
     if (!buffer_contains(lookup, "c api lite")) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return fail_with_buffer("lookup json did not contain expected value", &lookup);
     }
@@ -180,12 +215,14 @@ int main(void) {
     if (expect_ok(antfly_lite_status_json(handle, &status), "status json") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return 1;
     }
     if (!buffer_contains(status, "aflite") || !buffer_contains(status, "native_single_file")) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return fail_with_buffer("status json did not describe native aflite storage", &status);
     }
@@ -194,6 +231,7 @@ int main(void) {
         !buffer_contains(status, ANTFLY_LITE_INFERENCE_MODE_DISABLED_DEFERRED)) {
         antfly_db_close(handle);
         (void)remove(path);
+        (void)remove(restored_path);
         (void)remove(bad_path);
         return fail_with_buffer("status json did not expose expected Lite inference modes", &status);
     }
@@ -201,6 +239,7 @@ int main(void) {
 
     antfly_db_close(handle);
     (void)remove(path);
+    (void)remove(restored_path);
     (void)remove(bad_path);
     return 0;
 }
