@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly = @import("antfly-zig");
+const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
@@ -747,6 +748,8 @@ const PromoteOptions = struct {
     }
 };
 
+const PromoteRestoreFn = *const fn (ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) anyerror!void;
+
 fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
     const path = args.next() orelse cli.fatal("database path is required", .{});
     try requireAflitePath(path);
@@ -757,20 +760,15 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
         owned_opts.deinit(allocator);
     }
 
-    var staged = try lite_restore_staging.stageAfliteRestoreBackup(allocator, path, opts.table, opts.backup_id, opts.location);
-    defer staged.deinit(allocator);
-
     const global_config = cli.parseGlobalFlags();
     var http = httpx.Client.initWithConfig(allocator, io, .{});
     defer http.deinit();
     var client = try cli.initClient(allocator, &http, global_config);
     defer client.deinit();
     try client.setBaseUrl(opts.target);
-    try client.restoreTable(opts.table, .{
-        .backup_id = staged.backup_id,
-        .location = staged.location,
-        .format = "portable",
-    });
+
+    var staged = try promoteWithRestore(allocator, path, opts, &client, promoteRestoreWithClient);
+    defer staged.deinit(allocator);
 
     cli.writeStdout(io, "{\"promoted\":true,\"table\":");
     try writeJsonString(allocator, io, opts.table);
@@ -781,6 +779,30 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     cli.writeStdout(io, ",\"location\":");
     try writeJsonString(allocator, io, staged.location);
     cli.writeStdout(io, "}\n");
+}
+
+fn promoteWithRestore(
+    allocator: Allocator,
+    path: []const u8,
+    opts: PromoteOptions,
+    restore_ctx: *anyopaque,
+    restore_fn: PromoteRestoreFn,
+) !lite_restore_staging.StagedRestore {
+    var staged = try lite_restore_staging.stageAfliteRestoreBackup(allocator, path, opts.table, opts.backup_id, opts.location);
+    errdefer staged.deinit(allocator);
+
+    try restore_fn(restore_ctx, opts.table, .{
+        .backup_id = staged.backup_id,
+        .location = staged.location,
+        .format = "portable",
+    });
+
+    return staged;
+}
+
+fn promoteRestoreWithClient(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
+    const client: *antfly_client.AntflyClient = @ptrCast(@alignCast(ctx));
+    try client.restoreTable(table, request);
 }
 
 fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.process.Args.Iterator) !PromoteOptions {
@@ -3119,4 +3141,75 @@ test "lite promote stages portable afb and table manifest" {
     const portable = try std.Io.Dir.cwd().readFileAlloc(io, afb_path, allocator, .limited(max_afb_file_bytes));
     defer allocator.free(portable);
     try std.testing.expect(portable.len > 0);
+}
+
+test "lite promote helper stages backup then submits normal restore request" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/promote-command-src.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
+    defer allocator.free(cwd_tmp);
+    const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/promote-command-backups", .{ cwd_tmp, tmp.sub_path });
+    defer allocator.free(backup_root);
+    const location = try std.fmt.allocPrint(allocator, "file://{s}", .{backup_root});
+    defer allocator.free(location);
+
+    {
+        var source = try LiteDb.open(allocator, src_path, .writer);
+        defer source.close();
+
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:promote-command\":{\"title\":\"restore request\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    const location_z = try allocator.dupeZ(u8, location);
+    defer allocator.free(location_z);
+    const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var opts = try parsePromoteOptions(allocator, src_path, &args);
+    defer opts.deinit(allocator);
+
+    const Capture = struct {
+        called: bool = false,
+        table: []const u8 = "",
+        backup_id: []const u8 = "",
+        location: []const u8 = "",
+        format: []const u8 = "",
+
+        fn restore(ctx: *anyopaque, table: []const u8, request: antfly_client.types.RestoreRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            self.table = table;
+            self.backup_id = request.backup_id;
+            self.location = request.location;
+            self.format = request.format orelse "";
+        }
+    };
+
+    var capture = Capture{};
+    var staged = try promoteWithRestore(allocator, src_path, opts, &capture, Capture.restore);
+    defer staged.deinit(allocator);
+
+    try std.testing.expect(capture.called);
+    try std.testing.expectEqualStrings("docs", capture.table);
+    try std.testing.expectEqualStrings(staged.backup_id, capture.backup_id);
+    try std.testing.expectEqualStrings(staged.location, capture.location);
+    try std.testing.expectEqualStrings("portable", capture.format);
+    try std.testing.expectEqualStrings("lite-promote-command.afb", staged.snapshot_path);
+
+    var backup_location = try antfly.public_api.backups.openBackupLocation(allocator, location);
+    defer backup_location.deinit(allocator);
+    var manifest = try antfly.public_api.backups.readManifestFromLocation(allocator, &backup_location, capture.backup_id);
+    defer manifest.deinit(allocator);
+    try std.testing.expectEqualStrings("docs", manifest.table_name);
+    try std.testing.expectEqualStrings(staged.snapshot_path, manifest.shards[0].snapshot_path);
 }
