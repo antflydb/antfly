@@ -518,6 +518,34 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("restore without replace unexpectedly overwrote target")
 	}
 
+	lockedRestorePath := filepath.Join(t.TempDir(), "go-locked-restore.aflite")
+	lockedRestore, err := Open(lockedRestorePath)
+	if err != nil {
+		t.Fatalf("open locked restore target: %v", err)
+	}
+	if err := lockedRestore.Batch([]WriteIntent{{
+		Key:   "doc:locked-restore-target",
+		Value: []byte(`{"title":"locked restore target survives"}`),
+	}}, 7); err != nil {
+		t.Fatalf("write locked restore target: %v", err)
+	}
+	if err := RestoreBackup(lockedRestorePath, backupBytes, true); err != Busy {
+		t.Fatalf("restore into active writer = %v, want %v", err, Busy)
+	}
+	lockedLookup, err := lockedRestore.LookupJSON("doc:locked-restore-target")
+	if err != nil {
+		t.Fatalf("lookup locked restore target: %v", err)
+	}
+	if !bytes.Contains(lockedLookup, []byte("locked restore target survives")) {
+		t.Fatalf("locked restore target lookup JSON %q did not contain original document", lockedLookup)
+	}
+	if _, err := os.Stat(lockedRestorePath + ".restore-tmp.aflite"); !os.IsNotExist(err) {
+		t.Fatalf("locked restore left temp file behind: %v", err)
+	}
+	if err := lockedRestore.Close(); err != nil {
+		t.Fatalf("close locked restore target: %v", err)
+	}
+
 	importedPath := filepath.Join(t.TempDir(), "go-imported.aflite")
 	imported, err := Open(importedPath)
 	if err != nil {
