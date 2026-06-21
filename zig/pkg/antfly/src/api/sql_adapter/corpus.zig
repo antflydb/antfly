@@ -457,6 +457,7 @@ pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
 pub const app_parity_coverage_regression_requirement_fixture_format: u64 = 1;
 pub const app_parity_native_requirement_fixture_format: u64 = 1;
+pub const app_parity_resolved_requirement_fixture_format: u64 = 1;
 pub const app_parity_summary_assertion_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
@@ -493,12 +494,32 @@ pub const AppParityNativeRequirementRoot = struct {
     required: []const []const u8,
 };
 
+pub const AppParityResolvedRequirement = struct {
+    reason: []const u8,
+    coverage: []const []const u8,
+};
+
+pub const AppParityResolvedRequirementRoot = struct {
+    resolution_format: u64,
+    resolved: []const AppParityResolvedRequirement,
+};
+
 pub const AppParityNativeRequirements = struct {
     parsed: std.json.Parsed(std.json.Value),
     root: AppParityNativeRequirementRoot,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeNativeRequirementRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const AppParityResolvedRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParityResolvedRequirementRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeResolvedRequirementRoot(alloc, self.root);
         self.parsed.deinit();
     }
 };
@@ -624,6 +645,86 @@ pub fn parseAppParityNativeRequirementsAlloc(alloc: std.mem.Allocator) !AppParit
 
     const root = try parseNativeRequirementRootAlloc(alloc, parsed.value);
     errdefer freeNativeRequirementRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+pub fn parseResolvedRequirementRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !AppParityResolvedRequirementRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "resolution_format", "resolved" });
+    const resolution_format = try fixtureJsonOptionalU64(root, "resolution_format", 0);
+    if (resolution_format != app_parity_resolved_requirement_fixture_format) return error.TestUnexpectedResult;
+    const resolved_values = switch (root.get("resolved") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (resolved_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var resolved = std.ArrayListUnmanaged(AppParityResolvedRequirement).empty;
+    errdefer {
+        for (resolved.items) |item| if (item.coverage.len > 0) alloc.free(item.coverage);
+        resolved.deinit(alloc);
+    }
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (resolved_values.items, 0..) |item_value, i| {
+        const item_object = try fixtureJsonObject(item_value);
+        try fixtureRequireOnlyKeys(item_object, &.{ "reason", "coverage" });
+        const reason = try fixtureJsonOptionalString(item_object, "reason", "");
+        const parsed_reason = diagnostics.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
+        if (reason.len == 0 or seen.contains(reason) or !diagnostics.classificationReasonIsUnsupportedRequirement(parsed_reason)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, resolved.items[i - 1].reason, reason)) return error.TestUnexpectedResult;
+
+        const coverage = try parseFixtureStringListAlloc(alloc, item_object, "coverage");
+        errdefer if (coverage.len > 0) alloc.free(coverage);
+        if (coverage.len == 0) return error.TestUnexpectedResult;
+        var coverage_seen = std.StringHashMapUnmanaged(void){};
+        defer coverage_seen.deinit(alloc);
+        for (coverage, 0..) |name, coverage_index| {
+            if (name.len == 0 or coverage_seen.contains(name) or !appParityCoverageRequirementKnown(name)) return error.TestUnexpectedResult;
+            if (coverage_index > 0 and !std.mem.lessThan(u8, coverage[coverage_index - 1], name)) return error.TestUnexpectedResult;
+            try coverage_seen.put(alloc, name, {});
+        }
+
+        try seen.put(alloc, reason, {});
+        try resolved.append(alloc, .{
+            .reason = reason,
+            .coverage = coverage,
+        });
+    }
+
+    return .{
+        .resolution_format = resolution_format,
+        .resolved = try resolved.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeResolvedRequirementRoot(
+    alloc: std.mem.Allocator,
+    root: AppParityResolvedRequirementRoot,
+) void {
+    for (root.resolved) |item| {
+        if (item.coverage.len > 0) alloc.free(item.coverage);
+    }
+    if (root.resolved.len > 0) alloc.free(root.resolved);
+}
+
+pub fn parseAppParityResolvedRequirementsAlloc(alloc: std.mem.Allocator) !AppParityResolvedRequirements {
+    const requirement_json = @embedFile("../fixtures/sql_api_resolved_native_requirements.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, requirement_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseResolvedRequirementRootAlloc(alloc, parsed.value);
+    errdefer freeResolvedRequirementRoot(alloc, root);
 
     return .{
         .parsed = parsed,
@@ -4482,6 +4583,107 @@ test "sql adapter corpus validates native requirement manifest" {
         error.TestUnexpectedResult,
         expectSourceCorpusNativeRequirements(alloc, &entries, &.{"aggregate_duplicate_output_name"}),
     );
+}
+
+fn expectSourceCorpusResolvedRequirements(
+    coverage: AppParityCorpusCoverage,
+    resolved: []const AppParityResolvedRequirement,
+) !void {
+    if (resolved.len == 0) return error.TestUnexpectedResult;
+    for (resolved) |item| {
+        if (item.coverage.len == 0) return error.TestUnexpectedResult;
+        for (item.coverage) |name| {
+            if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
+                std.debug.print("missing resolved native requirement coverage: {s} -> {s}\n", .{ item.reason, name });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "sql adapter source corpus covers resolved native requirements with positive typed plans" {
+    const alloc = std.testing.allocator;
+    var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer source.deinit(alloc);
+    var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved.deinit(alloc);
+
+    var coverage = AppParityCorpusCoverage{};
+    for (source.root.entries) |entry| {
+        try coverage.observe(alloc, entry);
+    }
+    try expectSourceCorpusResolvedRequirements(coverage, resolved.root.resolved);
+}
+
+test "sql adapter corpus validates resolved native requirement manifest" {
+    const alloc = std.testing.allocator;
+    var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved.deinit(alloc);
+    try std.testing.expectEqual(app_parity_resolved_requirement_fixture_format, resolved.root.resolution_format);
+    try std.testing.expect(resolved.root.resolved.len > 0);
+
+    const unknown_reason_json =
+        \\{
+        \\  "resolution_format": 1,
+        \\  "resolved": [
+        \\    {"reason": "not_a_reason", "coverage": ["read_recursive_cte_stream_plan"]}
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_reason = try std.json.parseFromSlice(std.json.Value, alloc, unknown_reason_json, .{});
+    defer parsed_unknown_reason.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_unknown_reason.value));
+
+    const noop_reason_json =
+        \\{
+        \\  "resolution_format": 1,
+        \\  "resolved": [
+        \\    {"reason": "session_setting", "coverage": ["read_recursive_cte_stream_plan"]}
+        \\  ]
+        \\}
+    ;
+    var parsed_noop_reason = try std.json.parseFromSlice(std.json.Value, alloc, noop_reason_json, .{});
+    defer parsed_noop_reason.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_noop_reason.value));
+
+    const unknown_coverage_json =
+        \\{
+        \\  "resolution_format": 1,
+        \\  "resolved": [
+        \\    {"reason": "recursive_cte_stream_plan", "coverage": ["not_a_coverage_bucket"]}
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_coverage = try std.json.parseFromSlice(std.json.Value, alloc, unknown_coverage_json, .{});
+    defer parsed_unknown_coverage.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_unknown_coverage.value));
+
+    const unsorted_reason_json =
+        \\{
+        \\  "resolution_format": 1,
+        \\  "resolved": [
+        \\    {"reason": "set_operation_plan", "coverage": ["read_set_operation_order_limit"]},
+        \\    {"reason": "recursive_cte_stream_plan", "coverage": ["read_recursive_cte_stream_plan"]}
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted_reason = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_reason_json, .{});
+    defer parsed_unsorted_reason.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_unsorted_reason.value));
+
+    const unsorted_coverage_json =
+        \\{
+        \\  "resolution_format": 1,
+        \\  "resolved": [
+        \\    {"reason": "set_operation_plan", "coverage": ["read_set_operation_order_limit", "read_set_operation_cross_table_source_schema_classifier"]}
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted_coverage = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_coverage_json, .{});
+    defer parsed_unsorted_coverage.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_unsorted_coverage.value));
+
+    try std.testing.expectError(error.TestUnexpectedResult, expectSourceCorpusResolvedRequirements(.{}, resolved.root.resolved));
 }
 
 test "sql adapter source corpus rejects duplicate entry names" {

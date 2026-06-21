@@ -1,0 +1,19 @@
+{
+  "resolution_format": 1,
+  "resolved": [
+    {
+      "reason": "recursive_cte_stream_plan",
+      "coverage": [
+        "read_recursive_cte_stream_plan"
+      ]
+    },
+    {
+      "reason": "set_operation_plan",
+      "coverage": [
+        "read_set_operation_cross_table_source_schema_classifier",
+        "read_set_operation_order_limit",
+        "set_operation_fetch_tail"
+      ]
+    }
+  ]
+}
