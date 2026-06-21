@@ -601,15 +601,18 @@ fn importPortableIntoExistingLite(
         return error.InvalidArguments;
     }
 
+    var target_lock = try antfly.lite.native.lockWriterPath(allocator, target_path);
+    defer target_lock.close();
+
     {
-        var lite = try LiteDb.open(allocator, target_path, .writer);
+        var lite = try LiteDb.open(allocator, target_path, .status_only);
         defer lite.close();
         if (!(try lite_restore_staging.isImportTargetEmpty(allocator, &lite.db))) {
             return error.LiteImportTargetNotEmpty;
         }
     }
 
-    try restoreFromSourceFile(allocator, io, source_path, target_path, true);
+    try publishRestoreFromSourceFileLocked(allocator, io, source_path, target_path);
 }
 
 fn restoreFromSourceFile(
@@ -636,6 +639,15 @@ fn restoreFromSourceFile(
         cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
     }
 
+    try publishRestoreFromSourceFileLocked(allocator, io, source_path, out_path);
+}
+
+fn publishRestoreFromSourceFileLocked(
+    allocator: Allocator,
+    io: std.Io,
+    source_path: []const u8,
+    out_path: []const u8,
+) !void {
     if (std.mem.endsWith(u8, source_path, ".aflite")) {
         const tmp_path = try restoreTempPathAlloc(allocator, out_path);
         defer allocator.free(tmp_path);
@@ -1916,6 +1928,8 @@ test "lite backup output restores schema indexes enrichments and documents" {
     defer allocator.free(dst_path);
     const import_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-import-empty.aflite", .{tmp.sub_path});
     defer allocator.free(import_path);
+    const locked_import_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-import-locked.aflite", .{tmp.sub_path});
+    defer allocator.free(locked_import_path);
     const nonempty_import_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-import-nonempty.aflite", .{tmp.sub_path});
     defer allocator.free(nonempty_import_path);
 
@@ -2090,6 +2104,25 @@ test "lite backup output restores schema indexes enrichments and documents" {
         defer db_types.freeEnrichmentConfigs(allocator, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("body_chunks_v1", enrichments[0].name);
+    }
+
+    {
+        var locked_empty_target = try LiteDb.create(allocator, locked_import_path, true);
+        locked_empty_target.close();
+    }
+    const locked_tmp_path = try restoreTempPathAlloc(allocator, locked_import_path);
+    defer allocator.free(locked_tmp_path);
+    {
+        var target_lock = try antfly.lite.native.lockWriterPath(allocator, locked_import_path);
+        defer target_lock.close();
+
+        try std.testing.expectError(error.WouldBlock, importPortableIntoExistingLite(allocator, io, backup_path, locked_import_path));
+    }
+    try std.testing.expect(!pathExists(io, locked_tmp_path));
+    {
+        var locked_empty_target = try LiteDb.open(allocator, locked_import_path, .status_only);
+        defer locked_empty_target.close();
+        try std.testing.expect(try lite_restore_staging.isImportTargetEmpty(allocator, &locked_empty_target.db));
     }
 
     {
