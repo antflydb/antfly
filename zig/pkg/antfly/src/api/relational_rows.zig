@@ -23955,7 +23955,7 @@ test "relational rows cte plan contract executes derived outputs across read sta
         schema,
     );
     defer spill_required_query_plan.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedRowsQuery, executeRowsQueryPlanOnJsonRowsAlloc(alloc, schema, spill_required_query_plan, rows[0..]));
+    try std.testing.expectError(error.RelationalRowsCteSpillRequired, executeRowsQueryPlanOnJsonRowsAlloc(alloc, schema, spill_required_query_plan, rows[0..]));
 
     var ranged_query_plan = try parseRowsQueryPlanRequest(
         alloc,

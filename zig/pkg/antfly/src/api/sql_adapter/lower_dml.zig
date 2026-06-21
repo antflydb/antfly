@@ -455,6 +455,11 @@ pub const ConflictExpressionConditionParserHooks = struct {
     parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
 };
 
+pub const ConflictActionWhereConditionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
+};
+
 pub const ConflictCaseExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_expression: *const fn (
@@ -2320,6 +2325,34 @@ pub fn parseParenthesizedConflictExpressionAlloc(
     return expression;
 }
 
+pub fn parseConflictExpressionOperandAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    expected_type: ?runtime_schema.AntflyType,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    hooks: ConflictExpressionDispatchHooks,
+    value_ptr: *anyopaque,
+    parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
+) !db_mod.types.RelationalRowsExpression {
+    switch (conflictExpressionOperandStartAt(tokens, pos.*)) {
+        .unary_negative => return try parseConflictUnaryNegativeExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, hooks.operand),
+        .parenthesized => return try parseParenthesizedConflictExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, type_context, hooks.row, hooks.arithmetic, hooks.pipe_concat),
+        .expression => return try parseConflictExpressionWithExpectedAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, column.field_type, type_context, defer_row_expression_field_validation, hooks),
+        .field_or_json_extract => return try parseConflictFieldOrJsonExtractExpressionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, insert_columns, expected_type, type_context),
+        .value => {},
+    }
+    const value_json = try parse_value_json(value_ptr);
+    errdefer alloc.free(value_json);
+    return .{ .kind = .value, .value_json = value_json };
+}
+
 pub fn parseConflictUnaryNegativeExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -2724,6 +2757,134 @@ pub fn parseConflictExpressionConditionAlloc(
         .op = op,
         .rhs = rhs,
     };
+}
+
+pub fn parseConflictActionWhereConditionAlternatives(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+    schema: runtime_schema.TableSchema,
+    conflict_existing_qualifiers: []const []const u8,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    type_context: lower_expr.RowExpressionTypeContext,
+    defer_row_expression_field_validation: bool,
+    alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    condition_hooks: ConflictExpressionConditionParserHooks,
+    dispatch_hooks: ConflictExpressionDispatchHooks,
+    hooks: ConflictActionWhereConditionParserHooks,
+) !void {
+    const parenthesized = parser.matchToken(tokens, pos, .lparen) != null;
+    if (canParseBareBooleanConflictExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, insert_columns)) {
+        const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_hooks);
+        try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+        if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
+        return;
+    }
+
+    const lhs = try parseConflictExpressionWithExpectedAlloc(
+        alloc,
+        tokens,
+        pos,
+        params,
+        schema,
+        conflict_existing_qualifiers,
+        column,
+        insert_columns,
+        null,
+        type_context,
+        defer_row_expression_field_validation,
+        dispatch_hooks,
+    );
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+
+    const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+        .allow_boolean_unknown = true,
+        .allow_boolean_literal = true,
+        .allow_boolean_literal_negation = true,
+    })) |is_tail| blk: {
+        switch (is_tail.kind) {
+            .distinct_comparison, .null_test => {},
+            .boolean_unknown => {
+                try type_context.validateBooleanRowExpression(lhs);
+                const condition = lower_expr.expressionNullTestCondition(lhs, is_tail.op);
+                lhs_transferred = true;
+                try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+                if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
+                return;
+            },
+            .boolean_literal => {
+                try type_context.validateBooleanRowExpression(lhs);
+                if (is_tail.boolean_negated) {
+                    try lower_expr.appendExpressionBooleanIsNotGroups(alloc, alternatives, lhs, is_tail.boolean_value);
+                    freeExpression(alloc, lhs);
+                    lhs_transferred = true;
+                    if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
+                    return;
+                }
+                const condition = try lower_expr.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
+                lhs_transferred = true;
+                try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+                if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
+                return;
+            },
+        }
+        break :blk is_tail.op;
+    } else if (lower_expr.matchPostfixNullTest(tokens, pos)) |postfix_null_test|
+        postfix_null_test
+    else
+        try lower_expr.parseComparisonOp(tokens, pos);
+
+    if (op == .eq and lower_expr.matchAnyOrSomeKeyword(tokens, pos)) {
+        try parser.expectToken(tokens, pos, .lparen);
+        const values_json = try hooks.parse_json_array_value(hooks.ptr);
+        defer alloc.free(values_json);
+        try parser.expectToken(tokens, pos, .rparen);
+        return error.UnsupportedSqlShape;
+    }
+
+    const rhs = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            out[0] = try parseConflictExpressionWithExpectedAlloc(
+                alloc,
+                tokens,
+                pos,
+                params,
+                schema,
+                conflict_existing_qualifiers,
+                column,
+                insert_columns,
+                null,
+                type_context,
+                defer_row_expression_field_validation,
+                dispatch_hooks,
+            );
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |expression| freeExpression(alloc, expression);
+        alloc.free(rhs);
+    };
+    try lower_expr.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
+
+    const condition: db_mod.types.RelationalRowsExpressionCondition = .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+    lhs_transferred = true;
+    rhs_transferred = true;
+    try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+    if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
 }
 
 fn parseBareBooleanConflictExpressionConditionAlloc(
