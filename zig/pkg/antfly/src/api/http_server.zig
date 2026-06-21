@@ -1429,6 +1429,7 @@ fn applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
         };
     }
 
+    try tables_api.validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table.schema_json);
     const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, index_json, table.schema_json);
     defer alloc.free(expanded_index_json);
 
@@ -1720,7 +1721,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
                 .table = try metadata_table_manager.cloneTable(allocator, .{
                     .table_id = 99,
                     .name = "docs",
-                    .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"body\":{\"type\":\"text\"},\"embedding\":{\"type\":\"array\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+                    .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"body\":{\"type\":\"text\"},\"embedding\":{\"type\":\"array\"},\"edge_type\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
                     .indexes_json = "{}",
                     .placement_role = "data",
                 }),
@@ -2883,6 +2884,7 @@ fn createCatalogIndexOnService(svc: anytype, alloc: std.mem.Allocator, target: c
     defer svc.freeAdminSnapshot(&snapshot);
     const table = tables_api.findTableByQualifiedName(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.TableNotFound;
     if (extensionOwnsIndex(&snapshot, target.table_name, index_name)) return error.ExtensionOwnedObject;
+    try tables_api.validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table.schema_json);
     const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, target.table_name, index_json, table.schema_json);
     defer alloc.free(expanded_index_json);
 
@@ -7698,6 +7700,9 @@ pub const ApiHttpServer = struct {
         tables_api.validatePublicAlgebraicIndexJson(self.alloc, index_json) catch {
             return try textResponse(self.alloc, 400, "unsupported index configuration");
         };
+        tables_api.validateDerivedIndexFieldRefsForSchemaAlloc(self.alloc, index_json, table_before.schema_json) catch {
+            return try textResponse(self.alloc, 400, "unsupported index configuration");
+        };
         const expanded_index_json = tables_api.expandSchemaDerivedAlgebraicIndexAlloc(self.alloc, target.table_name, index_json, table_before.schema_json) catch |err| switch (err) {
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported index configuration"),
             else => return try textResponse(self.alloc, 500, "index create failed"),
@@ -10938,6 +10943,9 @@ pub const ApiHttpServer = struct {
         };
         defer alloc.free(index_json);
         tables_api.validatePublicAlgebraicIndexJson(alloc, index_json) catch {
+            return error.InvalidIndexRequest;
+        };
+        tables_api.validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table_before.schema_json) catch {
             return error.InvalidIndexRequest;
         };
         const expanded_index_json = tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table_name, index_json, table_before.schema_json) catch |err| switch (err) {
@@ -16251,6 +16259,7 @@ fn planExtensionStorageMemberDeltaAlloc(
         for (new_members) |member| {
             const table_name = extensionIndexMemberTableName(member) orelse continue;
             if (!std.mem.eql(u8, table_name, table.name)) continue;
+            try tables_api.validateDerivedIndexFieldRefsForSchemaAlloc(alloc, member.owner_metadata_json, table.schema_json);
             const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, member.owner_metadata_json, table.schema_json);
             defer alloc.free(expanded_index_json);
             const current = owned_indexes_json orelse table.indexes_json;

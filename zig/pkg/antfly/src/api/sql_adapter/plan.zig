@@ -3967,3 +3967,42 @@ test "sql adapter lowered merge and explain plans own nested memory" {
     };
     explain.deinit(alloc);
 }
+
+test "sql adapter plan clones query check without catalog name" {
+    const alloc = std.testing.allocator;
+    const rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "\"deleted\"",
+    }};
+    const source: runtime_schema.RelationalCheck = .{
+        .name = "catalog_status_check",
+        .field = "status",
+        .op = .ne,
+        .value_json = "\"ready\"",
+        .expression = .{
+            .lhs = .{
+                .kind = .field,
+                .field = "status",
+            },
+            .op = .ne,
+            .rhs = rhs[0..],
+        },
+    };
+
+    const cloned = try cloneQueryRelationalCheckAlloc(alloc, source);
+    defer freeRelationalCheck(alloc, cloned);
+
+    try std.testing.expectEqual(@as(usize, 0), cloned.name.len);
+    try std.testing.expectEqualStrings("status", cloned.field);
+    try std.testing.expect(cloned.field.ptr != source.field.ptr);
+    try std.testing.expectEqualStrings("\"ready\"", cloned.value_json.?);
+    try std.testing.expect(cloned.value_json.?.ptr != source.value_json.?.ptr);
+    try std.testing.expect(cloned.expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, cloned.expression.?.lhs.kind);
+    try std.testing.expectEqualStrings("status", cloned.expression.?.lhs.field);
+    try std.testing.expect(cloned.expression.?.lhs.field.ptr != source.expression.?.lhs.field.ptr);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, cloned.expression.?.op);
+    try std.testing.expectEqual(@as(usize, 1), cloned.expression.?.rhs.len);
+    try std.testing.expectEqualStrings("\"deleted\"", cloned.expression.?.rhs[0].value_json);
+    try std.testing.expect(cloned.expression.?.rhs[0].value_json.ptr != source.expression.?.rhs[0].value_json.ptr);
+}

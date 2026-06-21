@@ -790,6 +790,132 @@ pub fn expandSchemaDerivedAlgebraicIndexAlloc(
     return try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
 }
 
+pub fn validateDerivedIndexFieldRefsForSchemaAlloc(
+    alloc: std.mem.Allocator,
+    index_json: []const u8,
+    schema_json: []const u8,
+) !void {
+    if (schema_json.len == 0) return error.InvalidTableIndexMetadata;
+    var parsed_index = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed_index.deinit();
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer runtime_schema_mod.freeSchema(alloc, runtime);
+    try validateDerivedIndexFieldRefsValue(runtime, parsed_index.value);
+}
+
+fn validateDerivedIndexFieldRefsValue(schema: runtime_schema_mod.TableSchema, value: std.json.Value) !void {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    const type_value = value.object.get("type") orelse return;
+    if (type_value != .string) return error.InvalidTableIndexMetadata;
+    if (std.mem.eql(u8, type_value.string, "full_text")) {
+        if (value.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+    } else if (std.mem.eql(u8, type_value.string, "embeddings")) {
+        if (value.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+    } else if (std.mem.eql(u8, type_value.string, "graph")) {
+        if (value.object.get("edge_table")) |edge_table| {
+            if (edge_table != .object) return error.InvalidTableIndexMetadata;
+            try validateRequiredDerivedIndexFieldRef(schema, edge_table.object, "source_field");
+            try validateRequiredDerivedIndexFieldRef(schema, edge_table.object, "target_field");
+            if (edge_table.object.get("type_field")) |type_field| try validateOptionalDerivedIndexFieldRefJson(schema, type_field);
+            if (edge_table.object.get("weight_field")) |weight_field| try validateOptionalDerivedIndexFieldRefJson(schema, weight_field);
+        }
+    }
+
+    if (value.object.get("enrichments")) |enrichments| {
+        if (enrichments != .array) return error.InvalidTableIndexMetadata;
+        for (enrichments.array.items) |enrichment| {
+            if (enrichment != .object) return error.InvalidTableIndexMetadata;
+            if (enrichment.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+        }
+    }
+}
+
+fn validateRequiredDerivedIndexFieldRef(
+    schema: runtime_schema_mod.TableSchema,
+    object: std.json.ObjectMap,
+    field_name: []const u8,
+) !void {
+    const value = object.get(field_name) orelse return error.InvalidTableIndexMetadata;
+    try validateDerivedIndexFieldRefJson(schema, value);
+}
+
+fn validateDerivedIndexFieldRefJson(schema: runtime_schema_mod.TableSchema, value: std.json.Value) !void {
+    if (value != .string) return error.InvalidTableIndexMetadata;
+    try validateDerivedIndexFieldRef(schema, value.string);
+}
+
+fn validateOptionalDerivedIndexFieldRefJson(schema: runtime_schema_mod.TableSchema, value: std.json.Value) !void {
+    if (value != .string) return error.InvalidTableIndexMetadata;
+    if (std.mem.indexOfScalar(u8, value.string, '.') == null) return;
+    try validateDerivedIndexFieldRef(schema, value.string);
+}
+
+fn validateDerivedIndexFieldRef(schema: runtime_schema_mod.TableSchema, field: []const u8) !void {
+    if (!validRenderedFieldRef(field)) return error.InvalidTableIndexMetadata;
+    const dot = std.mem.indexOfScalar(u8, field, '.');
+    if (dot) |dot_index| {
+        const root = field[0..dot_index];
+        const suffix = field[dot_index + 1 ..];
+        if (suffix.len == 0) return error.InvalidTableIndexMetadata;
+        const column = findRuntimeRelationalColumn(schema, root) orelse {
+            if (documentFieldRefAllowed(schema, field)) return;
+            return error.InvalidTableIndexMetadata;
+        };
+        if (column.field_type != .json) return error.InvalidTableIndexMetadata;
+        if (!documentFieldRefAllowed(schema, field)) return error.InvalidTableIndexMetadata;
+        return;
+    }
+    if (findRuntimeRelationalColumn(schema, field) != null) return;
+    if (documentFieldRefAllowed(schema, field)) return;
+    return error.InvalidTableIndexMetadata;
+}
+
+fn findRuntimeRelationalColumn(schema: runtime_schema_mod.TableSchema, name: []const u8) ?runtime_schema_mod.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+fn documentFieldRefAllowed(schema: runtime_schema_mod.TableSchema, field: []const u8) bool {
+    for (schema.full_text_documents) |document| {
+        for (document.fields) |document_field| {
+            if (std.mem.eql(u8, document_field.path, field)) return true;
+        }
+        for (document.open_dynamic_paths) |open_path| {
+            if (pathFallsUnderOpenDynamicPath(field, open_path)) return true;
+        }
+        for (document.infer_type_dynamic_paths) |open_path| {
+            if (pathFallsUnderOpenDynamicPath(field, open_path)) return true;
+        }
+    }
+    return false;
+}
+
+fn pathFallsUnderOpenDynamicPath(field: []const u8, open_path: []const u8) bool {
+    if (open_path.len == 0) return true;
+    return std.mem.eql(u8, field, open_path) or
+        (field.len > open_path.len and
+            std.mem.eql(u8, field[0..open_path.len], open_path) and
+            field[open_path.len] == '.');
+}
+
+fn validRenderedFieldRef(field: []const u8) bool {
+    if (field.len == 0 or field[0] == '.' or field[field.len - 1] == '.') return false;
+    var prev_dot = false;
+    for (field) |ch| {
+        if (ch == '.') {
+            if (prev_dot) return false;
+            prev_dot = true;
+        } else {
+            prev_dot = false;
+        }
+    }
+    return true;
+}
+
 pub fn validatePublicAlgebraicIndexesJson(alloc: std.mem.Allocator, indexes_json: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
     defer parsed.deinit();
@@ -4328,6 +4454,75 @@ test "public algebraic index definitions cannot declare internal materialization
     try std.testing.expectError(
         error.InvalidCreateTableRequest,
         validatePublicAlgebraicIndexJson(alloc, "{\"type\":\"algebraic\",\"derive_from_schema\":true,\"group_fields\":[]}"),
+    );
+}
+
+test "derived index field refs validate against relational and embedded json schema" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"embedding":{"type":"embedding"},"source_doc":{"type":"keyword"},"target_doc":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"},"source":{"type":"keyword"},"target":{"type":"keyword"},"edge_type":{"type":"keyword"},"confidence":{"type":"numeric"}},"additionalProperties":true}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    try validateDerivedIndexFieldRefsForSchemaAlloc(
+        alloc,
+        "{\"type\":\"full_text\",\"field\":\"body\"}",
+        schema_json,
+    );
+    try validateDerivedIndexFieldRefsForSchemaAlloc(
+        alloc,
+        "{\"type\":\"full_text\",\"field\":\"attrs.title\"}",
+        schema_json,
+    );
+    try validateDerivedIndexFieldRefsForSchemaAlloc(
+        alloc,
+        "{\"type\":\"embeddings\",\"field\":\"attrs.plan\",\"enrichments\":[{\"name\":\"plan_embedding\",\"kind\":\"embedding\",\"field\":\"attrs.plan\"}]}",
+        schema_json,
+    );
+    try validateDerivedIndexFieldRefsForSchemaAlloc(
+        alloc,
+        "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"attrs.source\",\"target_field\":\"attrs.target\",\"type_field\":\"attrs.edge_type\",\"weight_field\":\"attrs.confidence\"}}",
+        schema_json,
+    );
+
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"full_text\",\"field\":\"missing\"}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"body.source\",\"target_field\":\"target_doc\"}}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"source_doc\"}}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"source_doc\",\"target_field\":\"target_doc\",\"type_field\":\"missing_kind\"}}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"embeddings\",\"field\":\"attrs..title\"}",
+            schema_json,
+        ),
     );
 }
 

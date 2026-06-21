@@ -4627,8 +4627,17 @@ pub fn parseCreateIndexPlanAlloc(
         .antfly_algebraic, .antfly_graph_metric, .antfly_hybrid => cursor.matchToken(.rparen) != null,
         else => false,
     };
+    const derived_index = ddlIndexMethodIsDerived(method);
     while (!empty_derived_index) {
-        if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
+        if (derived_index) {
+            const column = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+            var column_transferred = false;
+            errdefer if (!column_transferred) alloc.free(column);
+            const suffix = try grammar.parseCreateIndexElementSuffix(tokens, pos, method, true);
+            if (suffix.opclass != .default) opclass = suffix.opclass;
+            try columns.append(alloc, column);
+            column_transferred = true;
+        } else if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
             const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
             if (unique) {
                 const expression = try grammar.parseDdlUniqueExpressionAlloc(alloc, tokens, pos);
@@ -4780,6 +4789,100 @@ const DerivedIndexOptionValue = union(enum) {
     number: []const u8,
     boolean: bool,
 };
+
+fn parseDerivedIndexFieldPathAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
+    const field = if (cursor.peekFunctionCallIf(grammar.sqlKeywordIsJsonExtractPathFunction))
+        try parseDerivedIndexJsonExtractPathFunctionAlloc(alloc, tokens, pos)
+    else
+        try parseDerivedIndexIdentifierOrJsonOperatorPathAlloc(alloc, tokens, pos);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try grammar.closeDdlIndexExpressionWrappers(tokens, pos, wrapper_count);
+    try validateDerivedIndexRenderedFieldPath(field);
+    field_transferred = true;
+    return field;
+}
+
+fn parseDerivedIndexIdentifierOrJsonOperatorPathAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    const root = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var root_transferred = false;
+    errdefer if (!root_transferred) alloc.free(root);
+
+    const operator: ?parser.TokenKind = if (cursor.matchToken(.arrow_json) != null)
+        .arrow_json
+    else if (cursor.matchToken(.arrow_text) != null)
+        .arrow_text
+    else if (cursor.matchToken(.path_arrow_json) != null)
+        .path_arrow_json
+    else if (cursor.matchToken(.path_arrow_text) != null)
+        .path_arrow_text
+    else
+        null;
+
+    if (operator) |kind| {
+        const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, &.{}, kind);
+        defer alloc.free(path);
+        const field = try joinDerivedIndexJsonFieldPathAlloc(alloc, root, path);
+        root_transferred = true;
+        alloc.free(root);
+        return field;
+    }
+
+    root_transferred = true;
+    return root;
+}
+
+fn parseDerivedIndexJsonExtractPathFunctionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    _ = cursor.matchIdentifierIf(grammar.sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    try cursor.expectToken(.lparen);
+    const root = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(root);
+    const path = try value_mod.parseJsonExtractPathSegmentsAlloc(alloc, tokens, pos, &.{});
+    defer alloc.free(path);
+    try cursor.expectToken(.rparen);
+    return try joinDerivedIndexJsonFieldPathAlloc(alloc, root, path);
+}
+
+fn joinDerivedIndexJsonFieldPathAlloc(
+    alloc: std.mem.Allocator,
+    root: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    if (root.len == 0 or path.len == 0) return error.UnsupportedSqlShape;
+    try validateDerivedIndexRenderedFieldPath(root);
+    try validateDerivedIndexRenderedFieldPath(path);
+    return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ root, path });
+}
+
+fn validateDerivedIndexRenderedFieldPath(path: []const u8) !void {
+    if (path.len == 0) return error.UnsupportedSqlShape;
+    if (path[0] == '.' or path[path.len - 1] == '.') return error.UnsupportedSqlShape;
+    var prev_dot = false;
+    for (path) |ch| {
+        if (ch == '.') {
+            if (prev_dot) return error.UnsupportedSqlShape;
+            prev_dot = true;
+        } else {
+            prev_dot = false;
+        }
+    }
+}
 
 const DerivedIndexOption = struct {
     name: []const u8,
@@ -7368,6 +7471,84 @@ test "sql adapter ddl plan lowers create index ddl" {
         else => return error.TestUnexpectedResult,
     }
 
+    var derived_json_arrow_full_text = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_title_fts ON docs USING antfly_full_text ((attrs->>'title')) WITH (analyzer = 'standard');",
+    );
+    defer derived_json_arrow_full_text.deinit(alloc);
+    switch (derived_json_arrow_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("attrs.title", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"attrs.title\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var derived_json_function_full_text = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_plan_fts ON docs USING antfly_full_text ((jsonb_extract_path_text(attrs, 'billing', 'plan')));",
+    );
+    defer derived_json_function_full_text.deinit(alloc);
+    switch (derived_json_function_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("attrs.billing.plan", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"attrs.billing.plan\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var embedded_json_dotted_full_text = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_title_fts ON docs USING antfly_full_text (attrs.title) WITH (analyzer = 'standard');",
+    );
+    defer embedded_json_dotted_full_text.deinit(alloc);
+    switch (embedded_json_dotted_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("attrs.title", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"attrs.title\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var embedded_json_operator_full_text = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_title_fts ON docs USING antfly_full_text ((attrs->>'title'));",
+    );
+    defer embedded_json_operator_full_text.deinit(alloc);
+    switch (embedded_json_operator_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqualStrings("attrs.title", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"attrs.title\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var embedded_json_path_function_full_text = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_plan_fts ON docs USING antfly_full_text ((jsonb_extract_path_text(attrs, 'billing', 'plan')));",
+    );
+    defer embedded_json_path_function_full_text.deinit(alloc);
+    switch (embedded_json_path_function_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqualStrings("attrs.billing.plan", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"attrs.billing.plan\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var external_vector = try lowerDdlPlanForTestAlloc(
         alloc,
         "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_cosine_ops) WITH (dimension = 1536, m = 16, ef_construction = 64);",
@@ -7383,6 +7564,22 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":true") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"cosine\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"dimension\":1536") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var embedded_json_external_vector = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_embedding_hnsw ON docs USING hnsw (attrs.embedding vector_cosine_ops) WITH (dimension = 1536);",
+    );
+    defer embedded_json_external_vector.deinit(alloc);
+    switch (embedded_json_external_vector) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.hnsw, plan.method);
+            try std.testing.expectEqual(DdlIndexOpClass.vector_cosine_ops, plan.opclass);
+            try std.testing.expectEqualStrings("attrs.embedding", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"attrs.embedding\"") != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -7442,6 +7639,26 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"type_field\":\"edge_type\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"weight_field\":\"confidence\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var embedded_json_graph = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_attrs_edge_graph ON doc_edges USING antfly_graph (attrs.source_doc, attrs.target_doc) WITH (type_field = 'attrs.edge_type', weight_field = 'attrs.confidence', edge_policy = 'all');",
+    );
+    defer embedded_json_graph.deinit(alloc);
+    switch (embedded_json_graph) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("attrs.source_doc", plan.columns[0]);
+            try std.testing.expectEqualStrings("attrs.target_doc", plan.columns[1]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"source_field\":\"attrs.source_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target_field\":\"attrs.target_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type_field\":\"attrs.edge_type\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"weight_field\":\"attrs.confidence\"") != null);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -8882,6 +9099,160 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
     ));
+}
+
+test "sql adapter ddl plan rejects mistyped expression checks during catalog validation" {
+    const alloc = std.testing.allocator;
+    var text_mismatch = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE bad_expression_checks (
+        \\  id text PRIMARY KEY,
+        \\  amount numeric,
+        \\  CONSTRAINT amount_text_check CHECK (amount = 'open')
+        \\);
+        ,
+    );
+    defer text_mismatch.deinit(alloc);
+    switch (text_mismatch) {
+        .create_table => |plan| try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var function_mismatch = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE bad_function_checks (
+        \\  id text PRIMARY KEY,
+        \\  amount numeric,
+        \\  CONSTRAINT lower_amount_check CHECK (lower(amount) <> '0')
+        \\);
+        ,
+    );
+    defer function_mismatch.deinit(alloc);
+    switch (function_mismatch) {
+        .create_table => |plan| try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var range_mismatch = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE bad_range_checks (
+        \\  id text PRIMARY KEY,
+        \\  metadata jsonb,
+        \\  CONSTRAINT metadata_range_check CHECK (metadata > '{"source":"api"}'::jsonb)
+        \\);
+        ,
+    );
+    defer range_mismatch.deinit(alloc);
+    switch (range_mismatch) {
+        .create_table => |plan| try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, plan)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const nested_interval_value_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "3600000000000",
+    }};
+    const nested_interval_operands = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .interval_ns,
+        .operands = nested_interval_value_operands[0..],
+    }};
+    const date_bin_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{
+            .kind = .interval_ns,
+            .operands = nested_interval_operands[0..],
+        },
+        .{
+            .kind = .field,
+            .field = "created_at_ns",
+        },
+        .{
+            .kind = .value,
+            .value_json = "0",
+        },
+    };
+    const date_bin_rhs = [_]db_mod.types.RelationalRowsExpression{.{
+        .kind = .value,
+        .value_json = "0",
+    }};
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .text, .nullable = false },
+        .{ .name = "created_at_ns", .path = "created_at_ns", .field_type = .datetime, .nullable = false },
+    };
+    const primary_columns = [_][]const u8{"id"};
+    const checks = [_]runtime_schema.RelationalCheck{.{
+        .name = "bad_nested_interval_stride",
+        .expression = .{
+            .lhs = .{
+                .kind = .date_bin,
+                .operands = date_bin_operands[0..],
+            },
+            .op = .gte,
+            .rhs = date_bin_rhs[0..],
+        },
+    }};
+    try std.testing.expectError(error.InvalidSqlCatalog, runtimeSchemaFromCreateTablePlanAlloc(alloc, .{
+        .table_name = "bad_nested_interval_stride",
+        .columns = columns[0..],
+        .primary_key = .{ .columns = primary_columns[0..] },
+        .checks = checks[0..],
+    }));
+}
+
+test "sql adapter ddl plan lowers application inline foreign key ddl" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE cloud_groups (
+        \\  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        \\  organization_id UUID NOT NULL REFERENCES organizations(id) MATCH FULL ON DELETE CASCADE,
+        \\  name VARCHAR(100) NOT NULL,
+        \\  slug VARCHAR(100) NOT NULL,
+        \\  description TEXT,
+        \\  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        \\  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        \\  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        \\  CONSTRAINT cloud_groups_slug_not_empty CHECK (slug <> ''),
+        \\  CONSTRAINT cloud_groups_org_slug_unique UNIQUE (organization_id, slug)
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("cloud_groups", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 8), plan.columns.len);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("cloud_groups_org_slug_unique", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("organization_id", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqualStrings("slug", plan.unique_constraints[0].columns[1]);
+            try std.testing.expectEqual(@as(usize, 2), plan.foreign_keys.len);
+            try std.testing.expectEqualStrings("organizations_organization_id_fkey", plan.foreign_keys[0].name);
+            try std.testing.expectEqualStrings("organization_id", plan.foreign_keys[0].child_columns[0]);
+            try std.testing.expectEqualStrings("organizations", plan.foreign_keys[0].parent_table);
+            try std.testing.expectEqualStrings("id", plan.foreign_keys[0].parent_columns[0]);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, plan.foreign_keys[0].match);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, plan.foreign_keys[0].on_delete);
+            try std.testing.expectEqualStrings("users_created_by_fkey", plan.foreign_keys[1].name);
+            try std.testing.expectEqualStrings("created_by", plan.foreign_keys[1].child_columns[0]);
+            try std.testing.expectEqualStrings("users", plan.foreign_keys[1].parent_table);
+            try std.testing.expectEqualStrings("id", plan.foreign_keys[1].parent_columns[0]);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.simple, plan.foreign_keys[1].match);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, plan.foreign_keys[1].on_delete);
+            try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
+            try std.testing.expectEqualStrings("cloud_groups_slug_not_empty", plan.checks[0].name);
+            try std.testing.expect(plan.columns[7].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.columns[7].default_value.?.kind);
+        },
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter ddl plan preserves named inline create table constraints" {
