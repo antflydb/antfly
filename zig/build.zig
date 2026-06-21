@@ -3634,6 +3634,7 @@ pub fn build(b: *std.Build) void {
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{
             "public table batch handler maps doc identity unavailable errors",
+            "public table batch handler maps HA write gate errors",
             "public table query handler maps doc identity unavailable errors",
             "public table query handler maps HA read gate errors",
             "public table query view handler maps doc identity unavailable errors",
