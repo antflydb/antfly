@@ -1175,7 +1175,10 @@ not require extending a second Zig-side name map. Summary-shape regressions
 that need named predicate checks live in
 `api/fixtures/sql_api_summary_regressions.json`; `corpus.zig` owns the small
 assertion-name map and parser, while the entry data and positive/negative
-expectations stay reviewable as JSON. That keeps regression examples
+expectations stay reviewable as JSON. Required summary assertion names live in
+`api/fixtures/sql_api_summary_required_assertions.json`, must stay sorted, and
+must enumerate every summary assertion helper; the summary-regression fixture
+must reference each required assertion at least once. That keeps regression examples
 data-driven without hand-editing the generated parity corpus. SQL/API
 parity entries that are pure workload examples move into
 `api/fixtures/sql_api_parity_source_corpus.json`, a hand-maintained source

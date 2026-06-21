@@ -455,6 +455,7 @@ pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityC
 
 pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
+pub const app_parity_summary_assertion_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
 pub const sql_adapter_edge_case_fixture_format: u64 = 1;
@@ -478,6 +479,21 @@ pub const AppParitySourceCorpusRoot = struct {
 pub const AppParityCoverageRequirementsRoot = struct {
     coverage_format: u64,
     required: []const []const u8,
+};
+
+pub const AppParitySummaryAssertionRequirementsRoot = struct {
+    assertion_format: u64,
+    required: []const []const u8,
+};
+
+pub const AppParitySummaryAssertionRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParitySummaryAssertionRequirementsRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeSummaryAssertionRequirementsRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
 };
 
 pub const AppParityExternalSourceCorpus = struct {
@@ -526,6 +542,112 @@ pub fn parseAppParityCoverageRequirementsAlloc(alloc: std.mem.Allocator) !AppPar
 
     const root = try parseCoverageRequirementsRootAlloc(alloc, parsed.value);
     errdefer freeCoverageRequirementsRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const app_parity_summary_regression_assertions = [_][]const u8{
+    "access_matches",
+    "aggregate_matches_plan",
+    "allows_access",
+    "allows_aggregate",
+    "allows_conflict_where",
+    "allows_full_query_output",
+    "allows_join_on",
+    "allows_join_select",
+    "allows_lateral",
+    "allows_merge_arm",
+    "allows_mutation_transform",
+    "allows_pagination",
+    "allows_predicate",
+    "allows_returning",
+    "allows_row_claim",
+    "allows_source_assignments",
+    "allows_window",
+    "conflict_where_matches_false",
+    "ddl_predicate_matches",
+    "ddl_select_matches",
+    "explain_plan_has_read_kind",
+    "explain_plan_has_write_kind",
+    "explain_write_inner_insert",
+    "full_query_output_matches",
+    "join_on_matches_1",
+    "join_select_matches_1",
+    "lateral_matches",
+    "merge_arm_matches_plan",
+    "operations_matches_2",
+    "operations_matches_3",
+    "pagination_matches",
+    "plan_analyze_true_token",
+    "plan_costs_present",
+    "plan_format_present",
+    "plan_verbose_present",
+    "predicate_matches",
+    "read_plan_has_query_prefix",
+    "returning_all_matches_true",
+    "returning_matches_1",
+    "row_claim_matches",
+    "select_matches",
+    "source_assignments_match_2",
+    "transform_matches_plan",
+    "window_matches_1",
+};
+
+fn appParitySummaryRegressionAssertionKnown(name: []const u8) bool {
+    for (app_parity_summary_regression_assertions) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+pub fn parseSummaryAssertionRequirementsRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !AppParitySummaryAssertionRequirementsRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "assertion_format", "required" });
+    const assertion_format = try fixtureJsonOptionalU64(root, "assertion_format", 0);
+    if (assertion_format != app_parity_summary_assertion_fixture_format) return error.TestUnexpectedResult;
+    const required = try parseFixtureStringListAlloc(alloc, root, "required");
+    errdefer if (required.len > 0) alloc.free(required);
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    for (required, 0..) |name, i| {
+        if (name.len == 0 or seen.contains(name) or !appParitySummaryRegressionAssertionKnown(name)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
+        try seen.put(alloc, name, {});
+    }
+    for (app_parity_summary_regression_assertions) |known| {
+        if (!seen.contains(known)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .assertion_format = assertion_format,
+        .required = required,
+    };
+}
+
+pub fn freeSummaryAssertionRequirementsRoot(
+    alloc: std.mem.Allocator,
+    root: AppParitySummaryAssertionRequirementsRoot,
+) void {
+    if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn parseAppParitySummaryAssertionRequirementsAlloc(alloc: std.mem.Allocator) !AppParitySummaryAssertionRequirements {
+    const assertion_json = @embedFile("../fixtures/sql_api_summary_required_assertions.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, assertion_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSummaryAssertionRequirementsRootAlloc(alloc, parsed.value);
+    errdefer freeSummaryAssertionRequirementsRoot(alloc, root);
 
     return .{
         .parsed = parsed,
@@ -1456,7 +1578,22 @@ fn checkCoverageRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) 
     }
 }
 
-fn checkSummaryRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) !void {
+fn recordSummaryRegressionAssertions(
+    alloc: std.mem.Allocator,
+    seen_assertions: *std.StringHashMapUnmanaged(void),
+    assertions: []const []const u8,
+) !void {
+    for (assertions) |name| {
+        if (!appParitySummaryRegressionAssertionKnown(name)) return error.TestUnexpectedResult;
+        try seen_assertions.put(alloc, name, {});
+    }
+}
+
+fn checkSummaryRegressionCase(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    seen_assertions: *std.StringHashMapUnmanaged(void),
+) !void {
     const object = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(object, &.{ "name", "entry", "expect_true", "expect_false" });
 
@@ -1473,6 +1610,8 @@ fn checkSummaryRegressionCase(alloc: std.mem.Allocator, value: std.json.Value) !
         if (expect_false.len > 0) alloc.free(expect_false);
     }
     if (expect_true.len == 0 and expect_false.len == 0) return error.TestUnexpectedResult;
+    try recordSummaryRegressionAssertions(alloc, seen_assertions, expect_true);
+    try recordSummaryRegressionAssertions(alloc, seen_assertions, expect_false);
 
     for (expect_true) |name| {
         try std.testing.expect(try appParitySummaryRegressionAssertion(entry, name));
@@ -4659,6 +4798,8 @@ test "sql adapter corpus data-driven summary regressions" {
     const fixture_json = @embedFile("../fixtures/sql_api_summary_regressions.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed.deinit();
+    var required_assertions = try parseAppParitySummaryAssertionRequirementsAlloc(alloc);
+    defer required_assertions.deinit(alloc);
 
     const root = try fixtureJsonObject(parsed.value);
     try fixtureRequireOnlyKeys(root, &.{ "summary_format", "cases" });
@@ -4669,9 +4810,48 @@ test "sql adapter corpus data-driven summary regressions" {
         else => return error.TestUnexpectedResult,
     };
     if (cases.len == 0) return error.TestUnexpectedResult;
+    var seen_assertions = std.StringHashMapUnmanaged(void){};
+    defer seen_assertions.deinit(alloc);
     for (cases) |regression_case| {
-        try checkSummaryRegressionCase(alloc, regression_case);
+        try checkSummaryRegressionCase(alloc, regression_case, &seen_assertions);
     }
+    for (required_assertions.root.required) |name| {
+        if (!seen_assertions.contains(name)) {
+            std.debug.print("missing summary regression assertion coverage: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "sql adapter corpus validates summary assertion requirements" {
+    const alloc = std.testing.allocator;
+    var required_assertions = try parseAppParitySummaryAssertionRequirementsAlloc(alloc);
+    defer required_assertions.deinit(alloc);
+    try std.testing.expectEqual(app_parity_summary_assertion_fixture_format, required_assertions.root.assertion_format);
+    try std.testing.expect(required_assertions.root.required.len > 0);
+
+    const incomplete_json =
+        \\{
+        \\  "assertion_format": 1,
+        \\  "required": ["access_matches"]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSummaryAssertionRequirementsRootAlloc(alloc, parsed_incomplete.value));
+
+    const unknown_json =
+        \\{
+        \\  "assertion_format": 1,
+        \\  "required": [
+        \\    "access_matches",
+        \\    "not_a_summary_assertion"
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown = try std.json.parseFromSlice(std.json.Value, alloc, unknown_json, .{});
+    defer parsed_unknown.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSummaryAssertionRequirementsRootAlloc(alloc, parsed_unknown.value));
 }
 
 test "sql adapter corpus data-driven coverage regressions" {
