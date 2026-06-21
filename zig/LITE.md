@@ -103,6 +103,13 @@ v1 format version, page size, and active checkpoint sequence. That makes the
 public native `.aflite` path observable and keeps internal bridge profiles from
 being mistaken for the v1 contract.
 
+For native `.aflite`, the public status contract should report
+`primary_layout: native_document_pages`,
+`replay_layout: native_replay_lanes_in_document_catalog`, and
+`index_layout: native_index_catalog_pages`. Any LSM adapter used while the
+native index engine is being completed is an implementation detail and must not
+appear as the public index layout for native Lite files.
+
 `antfly lite serve` is optional convenience mode. It should expose a narrow
 local single-node HTTP API under `/lite/v1` for development, SDK smoke tests,
 and migration testing, but the primary contract is embedded use. It should not

@@ -26,6 +26,7 @@ const index_storage = @import("index_storage.zig");
 
 const Allocator = std.mem.Allocator;
 const native_index_base_path = "__antfly_lite";
+const native_index_layout = "native_index_catalog_pages";
 
 pub const native = @import("native.zig");
 pub const CheckReport = native.CheckReport;
@@ -207,7 +208,7 @@ pub const Handle = struct {
                     .engine = @tagName(self.engine),
                     .primary_layout = "native_document_pages",
                     .replay_layout = "native_replay_lanes_in_document_catalog",
-                    .index_layout = "lsm_logical_files_in_native_index_catalog",
+                    .index_layout = native_index_layout,
                     .index_namespace = native_index_base_path,
                     .format_version = native.format_version,
                     .page_size = file.header.page_size,
@@ -660,7 +661,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_single_file", status.engine);
     try std.testing.expectEqualStrings("native_document_pages", status.primary_layout);
     try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
-    try std.testing.expectEqualStrings("lsm_logical_files_in_native_index_catalog", status.index_layout);
+    try std.testing.expectEqualStrings(native_index_layout, status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
     try std.testing.expectEqual(native.format_version, status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);

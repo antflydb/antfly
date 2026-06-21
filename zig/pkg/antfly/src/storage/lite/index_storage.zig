@@ -12,12 +12,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! LSM `Storage` adapter backed by native `.aflite` index catalog records.
+//! Internal index `Storage` adapter backed by native `.aflite` catalog pages.
 //!
 //! This is an incremental Lite-native index backend: existing Antfly index
 //! implementations can still use their LSM storage contract, but their logical
 //! files are stored under the dedicated native `.aflite` index checkpoint root
-//! rather than in the internal bridge container.
+//! rather than in the internal bridge container. Public Lite status reports the
+//! native catalog-page layout; this adapter is not a user-visible file format.
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
