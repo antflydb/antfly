@@ -552,6 +552,52 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("unexpected vacuum report: %#v", vacuumReport)
 	}
 
+	openTxnID := TxnID{0x67, 0x6f, 0x2d, 0x6c, 0x69, 0x74, 0x65, 0x2d, 0x6f, 0x70, 0x65, 0x6e, 0, 0, 0, 2}
+	if err := db.BeginTransaction(openTxnID, 9_400, nil); err != nil {
+		t.Fatalf("begin open transaction before backup: %v", err)
+	}
+	if err := db.WriteTransaction(openTxnID, []WriteIntent{{
+		Key:   "doc:go-pending-backup",
+		Value: []byte(`{"title":"pending backup write"}`),
+	}}); err != nil {
+		t.Fatalf("write open transaction before backup: %v", err)
+	}
+	openTxnBackupPath := filepath.Join(t.TempDir(), "go-open-txn-backup.afb")
+	if err := db.BackupToFile(openTxnBackupPath); err != nil {
+		t.Fatalf("backup with open transaction: %v", err)
+	}
+	openTxnRestoredPath := filepath.Join(t.TempDir(), "go-open-txn-restored.aflite")
+	if err := RestoreBackupFile(openTxnRestoredPath, openTxnBackupPath, false); err != nil {
+		t.Fatalf("restore backup with open transaction: %v", err)
+	}
+	openTxnRestored, err := OpenReadonly(openTxnRestoredPath)
+	if err != nil {
+		t.Fatalf("open restored backup with open transaction: %v", err)
+	}
+	openTxnCommittedLookup, err := openTxnRestored.LookupJSON("doc:go-smoke")
+	if err != nil {
+		openTxnRestored.Close()
+		t.Fatalf("lookup committed doc from open-transaction backup: %v", err)
+	}
+	if !bytes.Contains(openTxnCommittedLookup, []byte("go api lite")) {
+		openTxnRestored.Close()
+		t.Fatalf("open-transaction backup lookup JSON %q did not contain committed document", openTxnCommittedLookup)
+	}
+	openTxnPendingLookup, pendingErr := openTxnRestored.LookupJSON("doc:go-pending-backup")
+	if pendingErr != nil && pendingErr != NotFound {
+		openTxnRestored.Close()
+		t.Fatalf("lookup pending doc from open-transaction backup: %v", pendingErr)
+	}
+	if closeErr := openTxnRestored.Close(); closeErr != nil {
+		t.Fatalf("close open-transaction backup restore: %v", closeErr)
+	}
+	if pendingErr == nil && bytes.Contains(openTxnPendingLookup, []byte("pending backup write")) {
+		t.Fatalf("open-transaction backup restored unresolved write: %q", openTxnPendingLookup)
+	}
+	if err := db.ResolveTransaction(openTxnID, TxnAborted, 0); err != nil {
+		t.Fatalf("abort open transaction after backup: %v", err)
+	}
+
 	backupPath := filepath.Join(t.TempDir(), "go-backup.afb")
 	if err := db.BackupToFile(backupPath); err != nil {
 		t.Fatalf("backup to file: %v", err)
