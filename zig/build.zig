@@ -2089,6 +2089,24 @@ pub fn build(b: *std.Build) void {
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantflylite");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
 
+    const run_lite_go_example = b.addSystemCommand(&.{
+        "env",
+        "GOWORK=off",
+        "go",
+        "run",
+        ".",
+        "--reset",
+        "--db",
+        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
+        "--backup",
+        "../../zig/.zig-cache/antfly-lite-go-example.afb",
+    });
+    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
+    run_lite_go_example.step.dependOn(&install_lite_capi_lib.step);
+    run_lite_go_example.step.dependOn(&install_lite_capi_header.step);
+    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
+    lite_go_example_step.dependOn(&run_lite_go_example.step);
+
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
@@ -6378,6 +6396,7 @@ pub fn build(b: *std.Build) void {
     lite_core_step.dependOn(&run_lite_core_main_tests.step);
     lite_core_step.dependOn(&run_lite_capi_smoke.step);
     lite_core_step.dependOn(&run_lite_go_tests.step);
+    lite_core_step.dependOn(&run_lite_go_example.step);
     lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
@@ -6390,6 +6409,7 @@ pub fn build(b: *std.Build) void {
     lite_full_step.dependOn(&run_lite_native_tests.step);
     lite_full_step.dependOn(&run_lite_capi_smoke.step);
     lite_full_step.dependOn(&run_lite_go_tests.step);
+    lite_full_step.dependOn(&run_lite_go_example.step);
     lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
@@ -6430,6 +6450,7 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_lite_native_tests.step);
     lite_dev_step.dependOn(&run_lite_capi_smoke.step);
     lite_dev_step.dependOn(&run_lite_go_tests.step);
+    lite_dev_step.dependOn(&run_lite_go_example.step);
     lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_dev_step.dependOn(&install_lite_wasm_profile.step);
