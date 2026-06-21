@@ -16967,7 +16967,10 @@ fn prepareGeneratedEnrichments(
         sparse_embeddings = .empty;
     }
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
-    errdefer enrichment_types.deinitGeneratedRefs(self.alloc, planned.items);
+    errdefer {
+        for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
+        planned.deinit(self.alloc);
+    }
 
     for (req.writes, 0..) |write, i| {
         const cleaned = extracted[i].cleaned_value orelse continue;
@@ -18427,7 +18430,10 @@ fn appendGeneratedEnrichments(
     extracted: []const mapper.ExtractedWrite,
 ) !void {
     var planned = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef).empty;
-    errdefer enrichment_types.deinitGeneratedRefs(self.alloc, planned.items);
+    errdefer {
+        for (planned.items) |request| enrichment_types.freeGeneratedRef(self.alloc, request);
+        planned.deinit(self.alloc);
+    }
 
     for (req.writes, 0..) |write, i| {
         const cleaned = extracted[i].cleaned_value orelse continue;

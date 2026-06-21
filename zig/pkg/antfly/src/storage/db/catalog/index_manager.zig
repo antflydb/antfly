@@ -3414,7 +3414,10 @@ pub const IndexManager = struct {
         explicit_sparse: []const mapper.SparseEmbeddingWrite,
     ) ![]enrichment_types.GeneratedEnrichmentRequest {
         var requests = std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest).empty;
-        errdefer enrichment_types.deinitGeneratedRequests(alloc, requests.items);
+        errdefer {
+            for (requests.items) |request| enrichment_types.freeGeneratedRequest(alloc, request);
+            requests.deinit(alloc);
+        }
 
         for (self.enrichments.items) |entry| {
             if (entry.kind != .asset) continue;
@@ -3432,7 +3435,7 @@ pub const IndexManager = struct {
 
         for (self.text_indexes.items) |entry| {
             const chunk_name = entry.chunk_name orelse continue;
-            const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse return error.InvalidIndexConfig;
+            const chunk_cfg = self.getEnrichment(.chunk, chunk_name) orelse continue;
             if (chunk_cfg.source_artifact_name.len > 0) continue;
             if (!hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.name)) {
                 try requests.append(alloc, .{
