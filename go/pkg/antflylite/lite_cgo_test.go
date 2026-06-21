@@ -622,6 +622,34 @@ func TestLiteCAPI(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("write open transaction before backup: %v", err)
 	}
+	openTxnSnapshotPath := filepath.Join(t.TempDir(), "go-open-txn-snapshot.aflite")
+	if _, err := CopyStableSnapshotFile(path, openTxnSnapshotPath, false); err != nil {
+		t.Fatalf("snapshot with open transaction: %v", err)
+	}
+	openTxnSnapshot, err := OpenReadonly(openTxnSnapshotPath)
+	if err != nil {
+		t.Fatalf("open snapshot with open transaction: %v", err)
+	}
+	openTxnSnapshotCommittedLookup, err := openTxnSnapshot.LookupJSON("doc:go-smoke")
+	if err != nil {
+		openTxnSnapshot.Close()
+		t.Fatalf("lookup committed doc from open-transaction snapshot: %v", err)
+	}
+	if !bytes.Contains(openTxnSnapshotCommittedLookup, []byte("go api lite")) {
+		openTxnSnapshot.Close()
+		t.Fatalf("open-transaction snapshot lookup JSON %q did not contain committed document", openTxnSnapshotCommittedLookup)
+	}
+	openTxnSnapshotPendingLookup, snapshotPendingErr := openTxnSnapshot.LookupJSON("doc:go-pending-backup")
+	if snapshotPendingErr != nil && snapshotPendingErr != NotFound {
+		openTxnSnapshot.Close()
+		t.Fatalf("lookup pending doc from open-transaction snapshot: %v", snapshotPendingErr)
+	}
+	if closeErr := openTxnSnapshot.Close(); closeErr != nil {
+		t.Fatalf("close open-transaction snapshot: %v", closeErr)
+	}
+	if snapshotPendingErr == nil && bytes.Contains(openTxnSnapshotPendingLookup, []byte("pending backup write")) {
+		t.Fatalf("open-transaction snapshot included unresolved write: %q", openTxnSnapshotPendingLookup)
+	}
 	openTxnBackupPath := filepath.Join(t.TempDir(), "go-open-txn-backup.afb")
 	if err := db.BackupToFile(openTxnBackupPath); err != nil {
 		t.Fatalf("backup with open transaction: %v", err)
