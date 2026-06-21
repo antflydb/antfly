@@ -1061,7 +1061,15 @@ lowering belong to `api/sql_adapter/lower_expr.zig` or adjacent adapter
 modules until the remaining parser code physically moves. Ready extension
 bindings passed into the adapter are typed
 `RelationalRowsExpressionKind` values, not parser-local string mappings. The
-second migration slice keeps parser syntax methods in `relational_sql.zig` but
+test split follows the same boundary. `api/relational_sql.zig` should keep
+public API, storage execution, schema-application, app-parity, catalog-backed
+plan, and end-to-end typed-plan coverage. Pure adapter regressions such as
+PostgreSQL syntax lowering, DDL plan shapes, expression lowering, DML plan
+construction, parser grammar tails, and fail-closed adapter diagnostics should
+live beside the owning `api/sql_adapter/` module, using local test helpers that
+exercise the adapter contract directly instead of reaching back through the
+public facade. The second migration slice keeps parser syntax methods in
+`relational_sql.zig` but
 moves `SqlFunctionBindings`, routine expression binding metadata, `argN`
 substitution, duplicate/arity lookup, and null-input short-circuit helpers to
 the adapter expression layer. A follow-on cleanup routes DDL predicate literal
@@ -6865,6 +6873,12 @@ busy lease. API-triggered durable wake jobs treat claimed work and observed
 terminal state as progress, continue bounded passes while that progress is
 being made, stop immediately on busy-only passes, and hand long batches back to
 the runtime for a later maintenance job rather than monopolizing the worker.
+When a wake pass reports completion, it submits the table schema
+compare-and-swap through the same metadata catalog boundary. The CAS is
+generation-gated by durable rewrite job state, consumes completed rewrite job
+records atomically, and emits the table projection signal; if the request path
+already published the target schema for storage-generation correctness, the CAS
+still acts as the durable reconciliation point for completed jobs.
 Storage still does not store or interpret SQL text; only
 `SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross the
 boundary. The provisioned/hosted table-write source boundary now exposes a
@@ -6873,9 +6887,9 @@ select range-scoped jobs, hosted routing forwards remote owner work through the
 internal group route, local owners open the current range DB, and completed or
 invalid metadata state is observed through the same catalog lifecycle. The
 remaining production step is a catalog controller that schedules periodic
-catch-up passes for work that was not request-triggered and triggers schema
-compare-and-swap promotion once every required rewrite, rebuild, and validation
-record is complete.
+catch-up passes for work that was not request-triggered and retries CAS
+reconciliation for completed work that was discovered outside the original API
+wake.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from

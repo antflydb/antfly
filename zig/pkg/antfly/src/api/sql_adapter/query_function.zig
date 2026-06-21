@@ -29,6 +29,7 @@ pub const AntflyQueryFunction = enum {
     graph_neighbors,
     graph_shortest_path,
     graph_k_shortest_paths,
+    graph_match,
     graph_metric,
     graph_metric_rerank,
     hybrid_search,
@@ -99,6 +100,7 @@ pub fn antflyQueryFunctionFromSqlName(name: []const u8) ?AntflyQueryFunction {
     if (std.ascii.eqlIgnoreCase(local, "graph_neighbors")) return .graph_neighbors;
     if (std.ascii.eqlIgnoreCase(local, "graph_shortest_path")) return .graph_shortest_path;
     if (std.ascii.eqlIgnoreCase(local, "graph_k_shortest_paths")) return .graph_k_shortest_paths;
+    if (std.ascii.eqlIgnoreCase(local, "graph_match")) return .graph_match;
     if (std.ascii.eqlIgnoreCase(local, "graph_metric")) return .graph_metric;
     if (std.ascii.eqlIgnoreCase(local, "graph_metric_rerank")) return .graph_metric_rerank;
     if (std.ascii.eqlIgnoreCase(local, "hybrid_search")) return .hybrid_search;
@@ -187,6 +189,7 @@ pub fn lowerAntflyQueryFunctionSqlAlloc(
         .semantic_search => try appendSemanticFunctionBody(alloc, &body, &first, args.items),
         .vector_search => try appendVectorFunctionBody(alloc, &body, &first, args.items),
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths => try appendGraphSearchFunctionBody(alloc, &body, &first, function, args.items),
+        .graph_match => try appendGraphMatchFunctionBody(alloc, &body, &first, args.items),
         .graph_metric => try appendGraphMetricFunctionBody(alloc, &body, &first, args.items),
         .graph_metric_rerank => try appendGraphMetricRerankFunctionBody(alloc, &body, &first, args.items),
         .hybrid_search => try appendHybridFunctionBody(alloc, &body, &first, args.items),
@@ -430,6 +433,222 @@ fn appendGraphSearchFunctionBody(
     if (antflyQueryFunctionNumberArg(args, "k")) |k| try appendAntflySqlJsonNumberField(alloc, out, &params_first, "k", k);
     try out.append(alloc, '}');
 
+    if (antflyQueryFunctionStringArg(args, "metrics")) |metrics| try appendAntflySqlJsonCommaStringArrayField(alloc, out, &query_first, "metrics", metrics);
+    if (antflyQueryFunctionStringArg(args, "freshness")) |freshness| {
+        try appendAntflySqlJsonStringField(alloc, out, &query_first, "metric_freshness", freshness);
+    } else if (antflyQueryFunctionStringArg(args, "metric_freshness")) |freshness| {
+        try appendAntflySqlJsonStringField(alloc, out, &query_first, "metric_freshness", freshness);
+    }
+    if (antflyQueryFunctionBoolArg(args, "include_metric_status")) |include_metric_status| try appendAntflySqlJsonBoolField(alloc, out, &query_first, "include_metric_status", include_metric_status);
+    if (antflyQueryFunctionBoolArg(args, "include_documents")) |include_documents| try appendAntflySqlJsonBoolField(alloc, out, &query_first, "include_documents", include_documents);
+    if (antflyQueryFunctionStringArg(args, "fields")) |fields| try appendAntflySqlJsonCommaStringArrayField(alloc, out, &query_first, "fields", fields);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+}
+
+const GraphPatternEdge = struct {
+    direction: []const u8,
+    spec: []const u8 = "",
+};
+
+const GraphPatternCursor = struct {
+    text: []const u8,
+    pos: usize = 0,
+
+    fn skipSpace(self: *@This()) void {
+        while (self.pos < self.text.len and std.ascii.isWhitespace(self.text[self.pos])) self.pos += 1;
+    }
+
+    fn done(self: *@This()) bool {
+        self.skipSpace();
+        return self.pos >= self.text.len;
+    }
+
+    fn startsWith(self: *@This(), value: []const u8) bool {
+        return std.mem.startsWith(u8, self.text[self.pos..], value);
+    }
+
+    fn consume(self: *@This(), value: []const u8) !void {
+        self.skipSpace();
+        if (!self.startsWith(value)) return error.UnsupportedSqlShape;
+        self.pos += value.len;
+    }
+
+    fn consumeOptionalEdgeSpec(self: *@This()) ![]const u8 {
+        self.skipSpace();
+        if (self.pos >= self.text.len or self.text[self.pos] != '[') return "";
+        const start = self.pos + 1;
+        self.pos += 1;
+        while (self.pos < self.text.len and self.text[self.pos] != ']') self.pos += 1;
+        if (self.pos >= self.text.len) return error.UnsupportedSqlShape;
+        const spec = std.mem.trim(u8, self.text[start..self.pos], " \t\r\n");
+        self.pos += 1;
+        return spec;
+    }
+
+    fn parseNodeAlias(self: *@This()) ![]const u8 {
+        try self.consume("(");
+        const start = self.pos;
+        while (self.pos < self.text.len and self.text[self.pos] != ')') self.pos += 1;
+        if (self.pos >= self.text.len) return error.UnsupportedSqlShape;
+        const alias = std.mem.trim(u8, self.text[start..self.pos], " \t\r\n");
+        self.pos += 1;
+        return alias;
+    }
+
+    fn parseEdge(self: *@This()) !GraphPatternEdge {
+        self.skipSpace();
+        if (self.startsWith("<-")) {
+            self.pos += 2;
+            const spec = try self.consumeOptionalEdgeSpec();
+            try self.consume("-");
+            return .{ .direction = "in", .spec = spec };
+        }
+        try self.consume("-");
+        const spec = try self.consumeOptionalEdgeSpec();
+        self.skipSpace();
+        if (self.startsWith("->")) {
+            self.pos += 2;
+            return .{ .direction = "out", .spec = spec };
+        }
+        if (self.startsWith("-")) {
+            self.pos += 1;
+            return .{ .direction = "both", .spec = spec };
+        }
+        return error.UnsupportedSqlShape;
+    }
+};
+
+fn graphPatternDigitsOnly(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
+fn appendGraphPatternEdgeSpec(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    spec: []const u8,
+) !void {
+    const trimmed = std.mem.trim(u8, spec, " \t\r\n");
+    const star_index = std.mem.indexOfScalar(u8, trimmed, '*');
+    const raw_types = if (star_index) |index| trimmed[0..index] else trimmed;
+    const types_text = std.mem.trim(u8, if (std.mem.startsWith(u8, raw_types, ":")) raw_types[1..] else raw_types, " \t\r\n");
+
+    if (types_text.len > 0) {
+        try appendAntflySqlJsonFieldName(alloc, out, first, "types");
+        try out.append(alloc, '[');
+        var split = std.mem.splitScalar(u8, types_text, '|');
+        var item_index: usize = 0;
+        while (split.next()) |raw_item| {
+            const item = std.mem.trim(u8, raw_item, " \t\r\n");
+            if (item.len == 0) return error.UnsupportedSqlShape;
+            if (item_index > 0) try out.append(alloc, ',');
+            try appendAntflySqlJsonString(alloc, out, item);
+            item_index += 1;
+        }
+        if (item_index == 0) return error.UnsupportedSqlShape;
+        try out.append(alloc, ']');
+    }
+
+    if (star_index) |index| {
+        const quantifier = std.mem.trim(u8, trimmed[index + 1 ..], " \t\r\n");
+        if (quantifier.len == 0) return error.UnsupportedSqlShape;
+        if (std.mem.indexOf(u8, quantifier, "..")) |range_index| {
+            const min = std.mem.trim(u8, quantifier[0..range_index], " \t\r\n");
+            const max = std.mem.trim(u8, quantifier[range_index + 2 ..], " \t\r\n");
+            if (!graphPatternDigitsOnly(min) or !graphPatternDigitsOnly(max)) return error.UnsupportedSqlShape;
+            try appendAntflySqlJsonNumberField(alloc, out, first, "min_hops", min);
+            try appendAntflySqlJsonNumberField(alloc, out, first, "max_hops", max);
+        } else {
+            if (!graphPatternDigitsOnly(quantifier)) return error.UnsupportedSqlShape;
+            try appendAntflySqlJsonNumberField(alloc, out, first, "min_hops", quantifier);
+            try appendAntflySqlJsonNumberField(alloc, out, first, "max_hops", quantifier);
+        }
+    }
+}
+
+fn appendGraphPatternStep(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    alias: []const u8,
+    edge: ?GraphPatternEdge,
+) !void {
+    try out.append(alloc, '{');
+    var first = true;
+    if (alias.len > 0) try appendAntflySqlJsonStringField(alloc, out, &first, "alias", alias);
+    if (edge) |edge_spec| {
+        try appendAntflySqlJsonFieldName(alloc, out, &first, "edge");
+        try out.append(alloc, '{');
+        var edge_first = true;
+        try appendAntflySqlJsonStringField(alloc, out, &edge_first, "direction", edge_spec.direction);
+        if (edge_spec.spec.len > 0) try appendGraphPatternEdgeSpec(alloc, out, &edge_first, edge_spec.spec);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendGraphPatternSteps(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    pattern: []const u8,
+) !void {
+    var cursor = GraphPatternCursor{ .text = pattern };
+    try out.append(alloc, '[');
+    const first_alias = try cursor.parseNodeAlias();
+    try appendGraphPatternStep(alloc, out, first_alias, null);
+    var step_count: usize = 1;
+    while (!cursor.done()) {
+        const edge = try cursor.parseEdge();
+        const alias = try cursor.parseNodeAlias();
+        try out.append(alloc, ',');
+        try appendGraphPatternStep(alloc, out, alias, edge);
+        step_count += 1;
+    }
+    if (step_count < 2) return error.UnsupportedSqlShape;
+    try out.append(alloc, ']');
+}
+
+fn appendGraphMatchFunctionBody(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    args: []const SqlQueryFunctionArg,
+) !void {
+    const index_name = antflyQueryFunctionStringArg(args, "graph_index") orelse try requireAntflyQueryFunctionStringArg(args, "index");
+    const query_name = antflyQueryFunctionStringArg(args, "name") orelse "graph_match";
+    const pattern = try requireAntflyQueryFunctionStringArg(args, "pattern");
+    const start_key = antflyQueryFunctionStringArg(args, "start") orelse antflyQueryFunctionStringArg(args, "start_node");
+    const start_result_ref = antflyQueryFunctionStringArg(args, "start_result_ref") orelse antflyQueryFunctionStringArg(args, "result_ref");
+
+    try appendAntflySqlJsonFieldName(alloc, out, first, "graph_searches");
+    try out.append(alloc, '{');
+    var searches_first = true;
+    try appendAntflySqlJsonFieldName(alloc, out, &searches_first, query_name);
+    try out.append(alloc, '{');
+    var query_first = true;
+    try appendAntflySqlJsonStringField(alloc, out, &query_first, "type", "pattern");
+    try appendAntflySqlJsonStringField(alloc, out, &query_first, "index_name", index_name);
+    try appendAntflySqlJsonFieldName(alloc, out, &query_first, "start_nodes");
+    try appendGraphNodeSelectorObject(alloc, out, start_key, start_result_ref, antflyQueryFunctionNumberArg(args, "start_limit"));
+    try appendAntflySqlJsonFieldName(alloc, out, &query_first, "pattern");
+    try appendGraphPatternSteps(alloc, out, pattern);
+
+    if (antflyQueryFunctionStringArg(args, "return")) |return_aliases| {
+        try appendAntflySqlJsonCommaStringArrayField(alloc, out, &query_first, "return_aliases", return_aliases);
+    } else if (antflyQueryFunctionStringArg(args, "return_aliases")) |return_aliases| {
+        try appendAntflySqlJsonCommaStringArrayField(alloc, out, &query_first, "return_aliases", return_aliases);
+    }
+    if (antflyQueryFunctionNumberArg(args, "max_results")) |max_results| {
+        try appendAntflySqlJsonFieldName(alloc, out, &query_first, "params");
+        try out.append(alloc, '{');
+        var params_first = true;
+        try appendAntflySqlJsonNumberField(alloc, out, &params_first, "max_results", max_results);
+        try out.append(alloc, '}');
+    }
     if (antflyQueryFunctionStringArg(args, "metrics")) |metrics| try appendAntflySqlJsonCommaStringArrayField(alloc, out, &query_first, "metrics", metrics);
     if (antflyQueryFunctionStringArg(args, "freshness")) |freshness| {
         try appendAntflySqlJsonStringField(alloc, out, &query_first, "metric_freshness", freshness);

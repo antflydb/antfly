@@ -17,9 +17,11 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
+const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
+const parser_context = @import("parser_context.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const value_mod = @import("value.zig");
 
@@ -7268,6 +7270,969 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
         .invalid => "invalid",
         .dropping => "dropping",
     };
+}
+
+fn lowerDdlPlanForTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !LoweredDdlPlan {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+    };
+    return try parseDdlPlanAlloc(alloc, tokens.items, &state.pos, .{
+        .schema = state.schema,
+        .field_expression_qualifiers = state.field_expression_qualifiers,
+        .returning_expression_qualifiers = state.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
+        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
+        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
+        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
+    });
+}
+
+test "sql adapter ddl plan lowers create index ddl" {
+    const alloc = std.testing.allocator;
+
+    var ordinary = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_idx ON usage_records (tenant_id, status);",
+    );
+    defer ordinary.deinit(alloc);
+    switch (ordinary) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expect(!plan.if_not_exists);
+            try std.testing.expectEqualStrings("usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
+            try std.testing.expectEqualStrings("status", plan.columns[1]);
+            try std.testing.expectEqual(@as(usize, 0), plan.include_columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var covering = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_cover_idx ON usage_records (status) INCLUDE (tenant_id, amount);",
+    );
+    defer covering.deinit(alloc);
+    switch (covering) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_cover_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+            try std.testing.expectEqualStrings("amount", plan.include_columns[1]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var derived_full_text = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');",
+    );
+    defer derived_full_text.deinit(alloc);
+    switch (derived_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqualStrings("docs_body_fts", plan.index_name);
+            try std.testing.expectEqualStrings("docs", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("body", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"full_text\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"analyzer\":\"standard\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var external_vector = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_cosine_ops) WITH (dimension = 1536, m = 16, ef_construction = 64);",
+    );
+    defer external_vector.deinit(alloc);
+    switch (external_vector) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.hnsw, plan.method);
+            try std.testing.expectEqual(DdlIndexOpClass.vector_cosine_ops, plan.opclass);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"embeddings\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"embedding\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"cosine\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"dimension\":1536") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var managed_aknn = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', metric = 'cosine', dimension = 384, chunk_size = 512);",
+    );
+    defer managed_aknn.deinit(alloc);
+    switch (managed_aknn) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_aknn, plan.method);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"embeddings\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":false") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"enrichments\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"name\":\"body_embedding_v1\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"kind\":\"embedding\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"expected_dims\":384") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"chunk_size\":512") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var algebraic = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_algebraic ON docs USING antfly_algebraic () WITH (derive_from_schema = true);",
+    );
+    defer algebraic.deinit(alloc);
+    switch (algebraic) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_algebraic, plan.method);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"algebraic\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"derive_from_schema\":true") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_edge_graph ON doc_edges USING antfly_graph (source_doc, target_doc) WITH (type_field = 'edge_type', weight_field = 'confidence', edge_policy = 'all');",
+    );
+    defer graph.deinit(alloc);
+    switch (graph) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("source_doc", plan.columns[0]);
+            try std.testing.expectEqualStrings("target_doc", plan.columns[1]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_table\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"source_field\":\"source_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target_field\":\"target_doc\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type_field\":\"edge_type\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"weight_field\":\"confidence\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_metric = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_edge_graph_pagerank ON doc_edges USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', damping = 0.85, max_iterations = 40);",
+    );
+    defer graph_metric.deinit(alloc);
+    switch (graph_metric) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph_metric, plan.method);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph_metric\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"pagerank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"publish\":\"on_convergence\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var hybrid = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX docs_hybrid_search ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_body_semantic,docs_edge_graph_pagerank', fusion = 'rrf', reranker = 'cross_encoder');",
+    );
+    defer hybrid.deinit(alloc);
+    switch (hybrid) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_hybrid, plan.method);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"hybrid\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"sources\":[\"docs_body_fts\",\"docs_body_semantic\",\"docs_edge_graph_pagerank\"]") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"fusion\":\"rrf\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"reranker\":\"cross_encoder\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var public_qualified = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX public.usage_records_status_idx ON public.usage_records (status);",
+    );
+    defer public_qualified.deinit(alloc);
+    switch (public_qualified) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var only_qualified = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX public.usage_records_status_idx ON ONLY public.usage_records (status);",
+    );
+    defer only_qualified.deinit(alloc);
+    switch (only_qualified) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var archive_qualified = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX archive.usage_records_status_idx ON archive.usage_records (status);",
+    );
+    defer archive_qualified.deinit(alloc);
+    switch (archive_qualified) {
+        .create_index => |plan| {
+            try std.testing.expectEqualStrings("archive.usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqualStrings("archive.usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var idempotent = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX IF NOT EXISTS usage_records_status_idx ON usage_records (status);",
+    );
+    defer idempotent.deinit(alloc);
+    switch (idempotent) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.if_not_exists);
+            try std.testing.expectEqualStrings("usage_records_status_idx", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var concurrent = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX CONCURRENTLY usage_records_created_at_idx ON usage_records (created_at DESC NULLS LAST);",
+    );
+    defer concurrent.deinit(alloc);
+    switch (concurrent) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expect(!plan.if_not_exists);
+            try std.testing.expectEqualStrings("usage_records_created_at_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("created_at", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unique_concurrent = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS usage_records_email_key ON usage_records (lower(email));",
+    );
+    defer unique_concurrent.deinit(alloc);
+    switch (unique_concurrent) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expect(plan.if_not_exists);
+            try std.testing.expectEqualStrings("usage_records_email_key", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, plan.expressions[0].op);
+            try std.testing.expectEqualStrings("email", plan.expressions[0].field);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var md5_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_digest_key ON usage_records (md5(email));",
+    );
+    defer md5_unique.deinit(alloc);
+    switch (md5_unique) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_email_digest_key", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.md5, plan.expressions[0].op);
+            try std.testing.expectEqualStrings("email", plan.expressions[0].field);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_external_id_key ON usage_records (external_id) NULLS NOT DISTINCT;",
+    );
+    defer nulls_not_distinct_unique.deinit(alloc);
+    switch (nulls_not_distinct_unique) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expect(plan.nulls_not_distinct);
+            try std.testing.expectEqualStrings("usage_records_external_id_key", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("external_id", plan.columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_external_id_idx ON usage_records (external_id) NULLS DISTINCT;",
+    ));
+
+    var temporal_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
+    );
+    defer temporal_unique.deinit(alloc);
+    switch (temporal_unique) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("prices_sku_valid_time_key", plan.index_name);
+            try std.testing.expectEqualStrings("prices", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("sku", plan.columns[0]);
+            try std.testing.expectEqualStrings("valid_time", plan.without_overlaps_period.?);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX prices_sku_valid_time_idx ON prices (sku, valid_time WITHOUT OVERLAPS);",
+    ));
+
+    var wrapped_expression = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_lower_email_idx ON usage_records ((lower(email)));",
+    );
+    defer wrapped_expression.deinit(alloc);
+    switch (wrapped_expression) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_lower_email_idx", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expect(plan.generated_expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.generated_expression.?.op);
+            try std.testing.expectEqualStrings("email", plan.generated_expression.?.field.?);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var concat_ws_expression = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_label_idx ON usage_records (concat_ws(':', status, id));",
+    );
+    defer concat_ws_expression.deinit(alloc);
+    switch (concat_ws_expression) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_label_idx", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expect(plan.generated_expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat_ws, plan.generated_expression.?.op);
+            try std.testing.expectEqual(@as(usize, 2), plan.generated_expression.?.fields.len);
+            try std.testing.expectEqualStrings("status", plan.generated_expression.?.fields[0]);
+            try std.testing.expectEqualStrings("id", plan.generated_expression.?.fields[1]);
+            try std.testing.expectEqualStrings(":", plan.generated_expression.?.separator);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rich_expression_index = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_status_replace_idx ON usage_records (replace(status, 'old', 'new'));",
+    );
+    defer rich_expression_index.deinit(alloc);
+    switch (rich_expression_index) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_status_replace_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expect(plan.generated_expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, plan.generated_expression.?.op);
+            const expression = plan.generated_expression.?.expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, expression.kind);
+            try std.testing.expectEqual(@as(usize, 3), expression.operands.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var wrapped_unique_expression = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (tenant_id, (lower(email)));",
+    );
+    defer wrapped_unique_expression.deinit(alloc);
+    switch (wrapped_unique_expression) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_lower_email_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, plan.expressions[0].op);
+            try std.testing.expectEqualStrings("email", plan.expressions[0].field);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var ordered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX idx_import_jobs_instance ON import_jobs USING btree (organization_id, cloud_instance_id, created_at DESC NULLS LAST);",
+    );
+    defer ordered.deinit(alloc);
+    switch (ordered) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("idx_import_jobs_instance", plan.index_name);
+            try std.testing.expectEqualStrings("import_jobs", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 3), plan.columns.len);
+            try std.testing.expectEqualStrings("organization_id", plan.columns[0]);
+            try std.testing.expectEqualStrings("cloud_instance_id", plan.columns[1]);
+            try std.testing.expectEqualStrings("created_at", plan.columns[2]);
+            try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var partial_expression = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_lower_email_active_key ON users (tenant_id, lower(email)) WHERE (deleted_at IS NULL) AND ((status)::text = 'active'::text);",
+    );
+    defer partial_expression.deinit(alloc);
+    switch (partial_expression) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("users_lower_email_active_key", plan.index_name);
+            try std.testing.expectEqualStrings("users", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, plan.expressions[0].op);
+            try std.testing.expectEqualStrings("email", plan.expressions[0].field);
+            try std.testing.expectEqual(@as(usize, 2), plan.where.len);
+            try std.testing.expectEqualStrings("deleted_at", plan.where[0].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.is_null, plan.where[0].op);
+            try std.testing.expectEqualStrings("status", plan.where[1].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.eq, plan.where[1].op);
+            try std.testing.expectEqualStrings("\"active\"", plan.where[1].value_json.?);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var expression_where_partial = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';",
+    );
+    defer expression_where_partial.deinit(alloc);
+    switch (expression_where_partial) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("users_lower_email_active_expr_key", plan.index_name);
+            try std.testing.expectEqualStrings("users", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.expressions.len);
+            try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, plan.expressions[0].op);
+            try std.testing.expectEqualStrings("email", plan.expressions[0].field);
+            try std.testing.expectEqual(@as(usize, 0), plan.where.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, plan.where_expressions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions[0].lhs.operands.len);
+            try std.testing.expectEqualStrings("status", plan.where_expressions[0].lhs.operands[0].field);
+            try std.testing.expectEqualStrings("\"active\"", plan.where_expressions[0].rhs[0].value_json);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var boolean_partial = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX idx_project_tables_default ON project_tables(project_id, is_default) WHERE (is_default = TRUE);",
+    );
+    defer boolean_partial.deinit(alloc);
+    switch (boolean_partial) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("idx_project_tables_default", plan.index_name);
+            try std.testing.expectEqualStrings("project_tables", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("project_id", plan.columns[0]);
+            try std.testing.expectEqualStrings("is_default", plan.columns[1]);
+            try std.testing.expectEqual(@as(usize, 1), plan.where.len);
+            try std.testing.expectEqualStrings("is_default", plan.where[0].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.eq, plan.where[0].op);
+            try std.testing.expectEqualStrings("true", plan.where[0].value_json.?);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var signed_partial = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_negative_amount_idx ON usage_records (status) WHERE amount = -1;",
+    );
+    defer signed_partial.deinit(alloc);
+    switch (signed_partial) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_negative_amount_idx", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("status", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.where.len);
+            try std.testing.expectEqualStrings("amount", plan.where[0].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.eq, plan.where[0].op);
+            try std.testing.expectEqualStrings("-1", plan.where[0].value_json.?);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_duplicate_idx ON usage_records (status, status);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_duplicate_expr_key ON usage_records (lower(email), lower(email));",
+    ));
+    var unique_covering = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (tenant_id);",
+    );
+    defer unique_covering.deinit(alloc);
+    switch (unique_covering) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_email_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("email", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+    var explicit_nulls_distinct = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_nulls_distinct_key ON usage_records (email) NULLS DISTINCT INCLUDE (tenant_id);",
+    );
+    defer explicit_nulls_distinct.deinit(alloc);
+    switch (explicit_nulls_distinct) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("usage_records_email_nulls_distinct_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("email", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_email_nulls_distinct_idx ON usage_records (email) NULLS DISTINCT;",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX usage_records_email_key ON usage_records (email) INCLUDE (email);",
+    ));
+    var covering_gin = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_metadata_gin_cover ON usage_records USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
+    );
+    defer covering_gin.deinit(alloc);
+    switch (covering_gin) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqual(.gin, plan.method);
+            try std.testing.expectEqual(.jsonb_path_ops, plan.opclass);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("metadata", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var covering_lower = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_lower_email_cover ON usage_records (lower(email)) INCLUDE (tenant_id);",
+    );
+    defer covering_lower.deinit(alloc);
+    switch (covering_lower) {
+        .create_index => |plan| {
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_lower_email_cover", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expect(plan.generated_expression != null);
+            try std.testing.expectEqualStrings("email", plan.generated_expression.?.field.?);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.generated_expression.?.op);
+            try std.testing.expectEqual(@as(usize, 1), plan.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.include_columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var casted_not_null = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX cloud_groups_external_key ON cloud_groups (organization_id, external_id) WHERE ((external_id)::text IS NOT NULL);",
+    );
+    defer casted_not_null.deinit(alloc);
+    switch (casted_not_null) {
+        .create_index => |plan| {
+            try std.testing.expect(plan.unique);
+            try std.testing.expectEqualStrings("cloud_groups_external_key", plan.index_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.where.len);
+            try std.testing.expectEqualStrings("external_id", plan.where[0].field);
+            try std.testing.expectEqual(runtime_schema.UniquePredicateOp.is_not_null, plan.where[0].op);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var json_gin = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_metadata_gin ON usage_records USING gin (metadata jsonb_path_ops)",
+    );
+    defer json_gin.deinit(alloc);
+    switch (json_gin) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.gin, plan.method);
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_metadata_gin", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("metadata", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
+            try std.testing.expectEqual(DdlIndexOpClass.jsonb_path_ops, plan.opclass);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var array_gin = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE INDEX usage_records_tags_gin ON usage_records USING gin (tags array_ops)",
+    );
+    defer array_gin.deinit(alloc);
+    switch (array_gin) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.gin, plan.method);
+            try std.testing.expect(!plan.unique);
+            try std.testing.expectEqualStrings("usage_records_tags_gin", plan.index_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("tags", plan.columns[0]);
+            try std.testing.expectEqual(@as(usize, 0), plan.expressions.len);
+            try std.testing.expectEqual(DdlIndexOpClass.array_ops, plan.opclass);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_index = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "DROP INDEX IF EXISTS usage_records_status_idx;",
+    );
+    defer drop_index.deinit(alloc);
+    switch (drop_index) {
+        .drop_index => |plan| {
+            try std.testing.expectEqualStrings("usage_records_status_idx", plan.index_name);
+            try std.testing.expect(plan.if_exists);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan preserves named inline create table constraints" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE inline_named_constraints (
+        \\  id uuid CONSTRAINT inline_named_constraints_pkey PRIMARY KEY,
+        \\  tenant_id text CONSTRAINT inline_named_constraints_tenant_fkey REFERENCES tenants (id) ON DELETE CASCADE,
+        \\  email text CONSTRAINT inline_named_constraints_email_key UNIQUE,
+        \\  status text CONSTRAINT inline_named_constraints_status_check CHECK (lower(status) != 'deleted')
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("inline_named_constraints", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 4), plan.columns.len);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("inline_named_constraints_pkey", plan.primary_key.?.name.?);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("inline_named_constraints_email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.foreign_keys.len);
+            try std.testing.expectEqualStrings("inline_named_constraints_tenant_fkey", plan.foreign_keys[0].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.foreign_keys[0].child_columns[0]);
+            try std.testing.expectEqualStrings("tenants", plan.foreign_keys[0].parent_table);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, plan.foreign_keys[0].on_delete);
+            try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
+            try std.testing.expectEqualStrings("inline_named_constraints_status_check", plan.checks[0].name);
+            try std.testing.expect(plan.checks[0].expression != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, plan.checks[0].expression.?.lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, plan.checks[0].expression.?.op);
+            try std.testing.expectEqualStrings("\"deleted\"", plan.checks[0].expression.?.rhs[0].value_json);
+        },
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers computed check constraints into native expression checks" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE expression_checks (
+        \\  id text PRIMARY KEY,
+        \\  status text,
+        \\  amount numeric,
+        \\  fee numeric,
+        \\  enabled boolean,
+        \\  CONSTRAINT expression_checks_status_check CHECK (lower(status) != 'deleted'),
+        \\  CONSTRAINT expression_checks_amount_check CHECK (amount + fee >= 0),
+        \\  CONSTRAINT expression_checks_grouped_check CHECK (amount + fee >= 0 AND lower(status) != 'deleted' OR enabled IS TRUE),
+        \\  CONSTRAINT expression_checks_nested_check CHECK ((amount + fee >= 0 OR enabled IS TRUE) AND lower(status) != 'archived'),
+        \\  CONSTRAINT expression_checks_not_check CHECK (NOT (lower(status) = 'blocked' OR amount + fee < 0))
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 5), plan.checks.len);
+            try std.testing.expectEqualStrings("expression_checks_status_check", plan.checks[0].name);
+            try std.testing.expect(plan.checks[0].expression != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, plan.checks[0].expression.?.lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, plan.checks[0].expression.?.op);
+            try std.testing.expectEqualStrings("\"deleted\"", plan.checks[0].expression.?.rhs[0].value_json);
+            try std.testing.expectEqualStrings("expression_checks_amount_check", plan.checks[1].name);
+            try std.testing.expect(plan.checks[1].expression != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, plan.checks[1].expression.?.lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, plan.checks[1].expression.?.op);
+            try std.testing.expectEqualStrings("0", plan.checks[1].expression.?.rhs[0].value_json);
+            try std.testing.expectEqualStrings("expression_checks_grouped_check", plan.checks[2].name);
+            try std.testing.expect(plan.checks[2].expression != null);
+            const grouped = plan.checks[2].expression.?;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, grouped.lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, grouped.op);
+            try std.testing.expectEqual(@as(usize, 1), grouped.rhs.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, grouped.rhs[0].kind);
+            try std.testing.expectEqualStrings("true", grouped.rhs[0].value_json);
+            try std.testing.expectEqual(@as(usize, 2), grouped.lhs.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, grouped.lhs.operands[0].kind);
+            try std.testing.expectEqual(@as(usize, 2), grouped.lhs.operands[0].operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, grouped.lhs.operands[0].operands[0].kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, grouped.lhs.operands[0].operands[1].kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, grouped.lhs.operands[1].kind);
+            try std.testing.expectEqualStrings("expression_checks_nested_check", plan.checks[3].name);
+            try std.testing.expect(plan.checks[3].expression != null);
+            const nested = plan.checks[3].expression.?;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, nested.lhs.kind);
+            try std.testing.expectEqual(@as(usize, 2), nested.lhs.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, nested.lhs.operands[0].kind);
+            try std.testing.expectEqual(@as(usize, 2), nested.lhs.operands[0].operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, nested.lhs.operands[1].kind);
+            try std.testing.expectEqual(@as(usize, 2), nested.lhs.operands[1].operands.len);
+            try std.testing.expectEqualStrings("expression_checks_not_check", plan.checks[4].name);
+            try std.testing.expect(plan.checks[4].expression != null);
+            const negated = plan.checks[4].expression.?;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_not, negated.lhs.kind);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, negated.op);
+            try std.testing.expectEqual(@as(usize, 1), negated.rhs.len);
+            try std.testing.expectEqualStrings("true", negated.rhs[0].value_json);
+            try std.testing.expectEqual(@as(usize, 1), negated.lhs.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, negated.lhs.operands[0].kind);
+
+            const runtime = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, runtime);
+            try std.testing.expectEqual(@as(usize, 5), runtime.checks.len);
+            try std.testing.expect(runtime.checks[0].expression != null);
+            try std.testing.expect(runtime.checks[1].expression != null);
+            try std.testing.expect(runtime.checks[2].expression != null);
+            try std.testing.expect(runtime.checks[3].expression != null);
+            try std.testing.expect(runtime.checks[4].expression != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, runtime.checks[0].expression.?.lhs.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, runtime.checks[1].expression.?.lhs.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, runtime.checks[2].expression.?.lhs.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, runtime.checks[3].expression.?.lhs.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_not, runtime.checks[4].expression.?.lhs.kind);
+        },
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "SQL adapter DDL syntax conversions map grammar enums to plan enums" {
