@@ -350,6 +350,14 @@ func (db *DB) VacuumJSON() ([]byte, error) {
 	})
 }
 
+// CompactJSON drains maintenance, compacts indexes, vacuums free space, and
+// returns the JSON result.
+func (db *DB) CompactJSON() ([]byte, error) {
+	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {
+		return C.antfly_lite_compact_json(handle, out)
+	})
+}
+
 // CopyStableSnapshotJSON copies a stable Lite snapshot to destPath.
 func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, error) {
 	handle, err := db.requireHandle()

@@ -35,6 +35,12 @@ type VacuumReport struct {
 	LiveBytes      uint64 `json:"live_bytes"`
 }
 
+// CompactReport is the typed form of CompactJSON.
+type CompactReport struct {
+	Compacted bool         `json:"compacted"`
+	Vacuum    VacuumReport `json:"vacuum"`
+}
+
 // StableSnapshotReport is the typed form of CopyStableSnapshotJSON.
 type StableSnapshotReport struct {
 	SourceSize         uint64 `json:"source_size"`
@@ -78,6 +84,20 @@ func (db *DB) Vacuum() (*VacuumReport, error) {
 		return nil, err
 	}
 	var report VacuumReport
+	if err := json.Unmarshal(body, &report); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
+// Compact drains maintenance, compacts indexes, vacuums free space, and returns
+// the typed result.
+func (db *DB) Compact() (*CompactReport, error) {
+	body, err := db.CompactJSON()
+	if err != nil {
+		return nil, err
+	}
+	var report CompactReport
 	if err := json.Unmarshal(body, &report); err != nil {
 		return nil, err
 	}

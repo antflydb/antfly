@@ -211,6 +211,23 @@ int main(void) {
     }
     antfly_buffer_free(&lookup);
 
+    antfly_buffer compact = {0};
+    if (expect_ok(antfly_lite_compact_json(handle, &compact), "compact lite database") != 0) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    if (!buffer_contains(compact, "compacted") || !buffer_contains(compact, "vacuum")) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(bad_path);
+        return fail_with_buffer("compact json did not include compact/vacuum fields", &compact);
+    }
+    antfly_buffer_free(&compact);
+
     antfly_buffer status = {0};
     if (expect_ok(antfly_lite_status_json(handle, &status), "status json") != 0) {
         antfly_db_close(handle);

@@ -558,6 +558,14 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("snapshot file: %v", err)
 	}
 
+	compactReport, err := db.Compact()
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if !compactReport.Compacted || compactReport.Vacuum.BeforeSize == 0 || compactReport.Vacuum.AfterSize == 0 {
+		t.Fatalf("unexpected compact report: %#v", compactReport)
+	}
+
 	vacuumReport, err := db.Vacuum()
 	if err != nil {
 		t.Fatalf("vacuum: %v", err)

@@ -224,6 +224,7 @@ antfly_error_code antfly_lite_copy_stable_snapshot_json(
     bool replace,
     antfly_buffer *out
 );
+antfly_error_code antfly_lite_compact_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_vacuum_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_run_until_idle(void *handle);
 antfly_error_code antfly_lite_run_until_idle_json(void *handle, antfly_buffer *out);

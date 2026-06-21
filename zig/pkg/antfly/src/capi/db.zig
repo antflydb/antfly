@@ -1917,6 +1917,34 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
     return .invalid_argument;
 }
 
+const LiteCompactReport = struct {
+    compacted: bool,
+    vacuum: lite_backend.VacuumReport,
+};
+
+fn prepareLiteCompact(handle: *Handle) !void {
+    try handle.db.runUntilIdle();
+    try handle.db.forceCompactTextIndexes();
+    try handle.db.drainScheduledTextMerges();
+    try handle.db.sync(true);
+    try handle.db.syncIndexes(true);
+}
+
+pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    if (handle.owned_lite_backend) |*backend| {
+        prepareLiteCompact(handle) catch |err| return capi.mapError(err);
+        const report = LiteCompactReport{
+            .compacted = true,
+            .vacuum = backend.vacuum() catch |err| return capi.mapError(err),
+        };
+        out.* = stringifyJson(report) catch return .internal;
+        return .ok;
+    }
+    return .invalid_argument;
+}
+
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
@@ -6422,6 +6450,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, null, false, &null_snapshot_dest));
     try std.testing.expect(null_snapshot_dest.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), null_snapshot_dest.len);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_compact_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_vacuum_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_run_until_idle_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_replay_generated_enrichments_json(src_handle, null));
@@ -6784,6 +6813,12 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &snapshot_lookup));
     defer antfly_db_buffer_free(snapshot_lookup.ptr, snapshot_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, snapshot_lookup.ptr.?[0..snapshot_lookup.len], "\"second\"") != null);
+
+    var compacted: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_compact_json(src_handle, &compacted));
+    defer antfly_db_buffer_free(compacted.ptr, compacted.len);
+    try std.testing.expect(std.mem.indexOf(u8, compacted.ptr.?[0..compacted.len], "\"compacted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, compacted.ptr.?[0..compacted.len], "\"vacuum\":") != null);
 
     var vacuumed: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_vacuum_json(src_handle, &vacuumed));

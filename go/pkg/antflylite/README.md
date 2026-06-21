@@ -30,11 +30,11 @@ mode, caller-supplied artifact support, and distributed-only capability flags.
 Use constants such as `InferenceModeCallerSuppliedArtifacts`,
 `InferenceModeManualMaintenance`, and `InferenceModeDisabledDeferred` when
 branching on inference status or capabilities.
-Typed `PendingWorkStats`, `RunUntilIdleStatus`, `Check`, `Vacuum`, and
-`CopyStableSnapshot` helpers cover the stable Lite maintenance reports while
-keeping the raw JSON methods available. `ReplayGeneratedEnrichments` recreates
-generated enrichment work from stored documents after a manual-maintenance or
-restore pause.
+Typed `PendingWorkStats`, `RunUntilIdleStatus`, `Check`, `Compact`, `Vacuum`,
+and `CopyStableSnapshot` helpers cover the stable Lite maintenance reports
+while keeping the raw JSON methods available. `ReplayGeneratedEnrichments`
+recreates generated enrichment work from stored documents after a
+manual-maintenance or restore pause.
 Use `CheckFile` or `CheckFileJSON` to inspect an invalid, truncated, or
 corrupted `.aflite` file without opening a database handle.
 
