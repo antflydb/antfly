@@ -24,6 +24,7 @@ const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../../platform/time.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const strings = @import("strings.zig");
 const token_mod = @import("token.zig");
 const value_mod = @import("value.zig");
 
@@ -58,6 +59,25 @@ pub const AggregateOutputFieldExpressionConditionParserHooks = struct {
         []const db_mod.types.RelationalRowsAggregateSpec,
     ) anyerror![]const u8,
     parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
+};
+
+pub const ReturningProjectionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_field_expression_owned: *const fn (*anyopaque) anyerror![]const u8,
+    parse_select_item: *const fn (
+        *anyopaque,
+        []const []const u8,
+    ) anyerror!plan_mod.SelectItem,
+};
+
+pub const JoinedMutationReturningProjectionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_field_expression_owned: *const fn (*anyopaque) anyerror![]const u8,
+    parse_select_item: *const fn (
+        *anyopaque,
+        []const u8,
+        []const []const u8,
+    ) anyerror!plan_mod.SelectItem,
 };
 
 pub const AggregateOutputExpressionConditionParserHooks = struct {
@@ -104,6 +124,8 @@ pub const JoinOutputOrderExpressionParserHooks = struct {
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
 const cloneExpressionConditionsConcatAlloc = plan_mod.cloneExpressionConditionsConcatAlloc;
+const freeExpressionProjection = plan_mod.freeExpressionProjection;
+const freeExpressionProjections = plan_mod.freeExpressionProjections;
 const cloneExpressionPredicateGroupsAlloc = plan_mod.cloneExpressionPredicateGroupsAlloc;
 const cloneInPredicatesAlloc = plan_mod.cloneInPredicatesAlloc;
 const cloneInPredicatesConcatAlloc = plan_mod.cloneInPredicatesConcatAlloc;
@@ -5527,6 +5549,326 @@ pub fn validateReturningProjectionOutputs(
         if (returningExpressionOutputCount(expressions, projection.output) > 1) return error.UnsupportedSqlShape;
         if (returningFieldOutputCount(fields, projection.output) > 0) return error.UnsupportedSqlShape;
     }
+}
+
+pub fn parseReturningProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    returning_qualifiers: []const []const u8,
+    hooks: ReturningProjectionParserHooks,
+) !plan_mod.ReturningProjection {
+    var saw_all = false;
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+    var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+    errdefer {
+        for (expressions.items) |projection| freeExpressionProjection(alloc, projection);
+        expressions.deinit(alloc);
+    }
+
+    while (true) {
+        const returning_all_item = parser.matchToken(tokens, pos, .star) != null or try binder.matchQualifiedReturningAll(alloc, tokens, pos, returning_qualifiers);
+        if (returning_all_item) {
+            if (saw_all or fields.items.len != 0 or expressions.items.len != 0) return error.UnsupportedSqlShape;
+            const all_field = try alloc.dupe(u8, "*");
+            var all_field_transferred = false;
+            errdefer if (!all_field_transferred) alloc.free(all_field);
+            try fields.append(alloc, all_field);
+            all_field_transferred = true;
+            saw_all = true;
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+            continue;
+        }
+        if (peekSimpleReturningField(tokens, pos.*)) {
+            const parsed_field = try hooks.parse_field_expression_owned(hooks.ptr);
+            defer alloc.free(parsed_field);
+            const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
+            var field_owned = true;
+            errdefer if (field_owned) alloc.free(field);
+            const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+            var alias_owned = true;
+            errdefer if (alias_owned) if (alias) |owned| alloc.free(owned);
+            if (alias) |output| {
+                if (std.mem.eql(u8, output, field)) {
+                    alloc.free(output);
+                    alias_owned = false;
+                    try fields.append(alloc, field);
+                    field_owned = false;
+                } else {
+                    if (saw_all and binder.relationalColumnForReturningField(schema, output) != null) return error.UnsupportedSqlShape;
+                    try expressions.append(alloc, .{
+                        .output = output,
+                        .expression = .{
+                            .kind = .field,
+                            .field = field,
+                        },
+                    });
+                    alias_owned = false;
+                    field_owned = false;
+                }
+            } else {
+                if (saw_all) return error.UnsupportedSqlShape;
+                try fields.append(alloc, field);
+                field_owned = false;
+            }
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+            continue;
+        }
+        const item = try hooks.parse_select_item(hooks.ptr, returning_qualifiers);
+        var item_owned = true;
+        errdefer if (item_owned) plan_mod.freeSelectItem(alloc, item);
+        switch (item) {
+            .field => |parsed_field| {
+                if (saw_all) return error.UnsupportedSqlShape;
+                const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
+                var field_owned = true;
+                errdefer if (field_owned) alloc.free(field);
+                alloc.free(parsed_field);
+                try fields.append(alloc, field);
+                field_owned = false;
+                item_owned = false;
+            },
+            .field_alias => |projection| {
+                const field = try binder.normalizeReturningFieldAlloc(alloc, schema, projection.field, returning_qualifiers);
+                var field_owned = true;
+                errdefer if (field_owned) alloc.free(field);
+                if (saw_all and binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
+                try expressions.append(alloc, .{
+                    .output = projection.output,
+                    .expression = .{
+                        .kind = .field,
+                        .field = field,
+                    },
+                });
+                alloc.free(projection.field);
+                field_owned = false;
+                item_owned = false;
+            },
+            .expression => |projection| {
+                if (saw_all and binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
+                try expressions.append(alloc, projection);
+                item_owned = false;
+            },
+            .coalesce => |projection| {
+                if (saw_all and binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
+                const expression_projection = try plan_mod.expressionProjectionFromCoalesceAlloc(alloc, projection);
+                var expression_projection_owned = true;
+                errdefer if (expression_projection_owned) freeExpressionProjection(alloc, expression_projection);
+                try expressions.append(alloc, expression_projection);
+                expression_projection_owned = false;
+                plan_mod.freeCoalesceProjection(alloc, projection);
+                item_owned = false;
+            },
+            else => return error.UnsupportedSqlShape,
+        }
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    var fields_owned = true;
+    errdefer if (fields_owned) strings.freeStringSlice(alloc, owned_fields);
+    const owned_expressions = try expressions.toOwnedSlice(alloc);
+    errdefer freeExpressionProjections(alloc, owned_expressions);
+    try validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
+    fields_owned = false;
+    return .{
+        .fields = owned_fields,
+        .expressions = owned_expressions,
+    };
+}
+
+pub fn parseJoinedMutationReturningProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    source_alias: []const u8,
+    returning_qualifiers: []const []const u8,
+    hooks: JoinedMutationReturningProjectionParserHooks,
+) !plan_mod.ReturningProjection {
+    var saw_all = false;
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+    var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
+    errdefer {
+        for (expressions.items) |projection| freeExpressionProjection(alloc, projection);
+        expressions.deinit(alloc);
+    }
+
+    while (true) {
+        const returning_all_item = parser.matchToken(tokens, pos, .star) != null or try binder.matchQualifiedReturningAll(alloc, tokens, pos, returning_qualifiers);
+        if (returning_all_item) {
+            if (saw_all or fields.items.len != 0 or expressions.items.len != 0) return error.UnsupportedSqlShape;
+            const all_field = try alloc.dupe(u8, "*");
+            var all_field_transferred = false;
+            errdefer if (!all_field_transferred) alloc.free(all_field);
+            try fields.append(alloc, all_field);
+            all_field_transferred = true;
+            saw_all = true;
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+            continue;
+        }
+        if (peekSimpleReturningField(tokens, pos.*)) {
+            const parsed_field = try hooks.parse_field_expression_owned(hooks.ptr);
+            defer alloc.free(parsed_field);
+            if (try binder.normalizeJoinedMutationReturningSourceFieldAlloc(alloc, schema, joined_source_schema, parsed_field, source_alias)) |source_field| {
+                var source_field_owned = true;
+                errdefer if (source_field_owned) alloc.free(source_field);
+                const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+                var alias_owned = true;
+                errdefer if (alias_owned) if (alias) |owned| alloc.free(owned);
+                const output = alias orelse try alloc.dupe(u8, source_field);
+                alias_owned = false;
+                var output_owned = true;
+                errdefer if (output_owned) alloc.free(output);
+                try expressions.append(alloc, .{
+                    .output = output,
+                    .expression = .{
+                        .kind = .field,
+                        .field = source_field,
+                        .field_source = .source,
+                    },
+                });
+                source_field_owned = false;
+                output_owned = false;
+            } else {
+                const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
+                var field_owned = true;
+                errdefer if (field_owned) alloc.free(field);
+                const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+                var alias_owned = true;
+                errdefer if (alias_owned) if (alias) |owned| alloc.free(owned);
+                if (alias) |output| {
+                    if (std.mem.eql(u8, output, field)) {
+                        alloc.free(output);
+                        alias_owned = false;
+                        try fields.append(alloc, field);
+                        field_owned = false;
+                    } else {
+                        if (saw_all and binder.relationalColumnForReturningField(schema, output) != null) return error.UnsupportedSqlShape;
+                        try expressions.append(alloc, .{
+                            .output = output,
+                            .expression = .{
+                                .kind = .field,
+                                .field = field,
+                            },
+                        });
+                        alias_owned = false;
+                        field_owned = false;
+                    }
+                } else {
+                    if (saw_all) return error.UnsupportedSqlShape;
+                    try fields.append(alloc, field);
+                    field_owned = false;
+                }
+            }
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+            continue;
+        }
+        const item = try hooks.parse_select_item(hooks.ptr, source_alias, returning_qualifiers);
+        var item_owned = true;
+        errdefer if (item_owned) plan_mod.freeSelectItem(alloc, item);
+        switch (item) {
+            .field => |parsed_field| {
+                if (saw_all) return error.UnsupportedSqlShape;
+                if (try binder.normalizeJoinedMutationReturningSourceFieldAlloc(alloc, schema, joined_source_schema, parsed_field, source_alias)) |source_field| {
+                    var source_field_owned = true;
+                    errdefer if (source_field_owned) alloc.free(source_field);
+                    const output = try alloc.dupe(u8, source_field);
+                    var output_owned = true;
+                    errdefer if (output_owned) alloc.free(output);
+                    try expressions.append(alloc, .{
+                        .output = output,
+                        .expression = .{
+                            .kind = .field,
+                            .field = source_field,
+                            .field_source = .source,
+                        },
+                    });
+                    source_field_owned = false;
+                    output_owned = false;
+                } else {
+                    const field = try binder.normalizeReturningFieldAlloc(alloc, schema, parsed_field, returning_qualifiers);
+                    var field_owned = true;
+                    errdefer if (field_owned) alloc.free(field);
+                    try fields.append(alloc, field);
+                    field_owned = false;
+                }
+                alloc.free(parsed_field);
+                item_owned = false;
+            },
+            .field_alias => |projection| {
+                if (try binder.normalizeJoinedMutationReturningSourceFieldAlloc(alloc, schema, joined_source_schema, projection.field, source_alias)) |source_field| {
+                    var source_field_owned = true;
+                    errdefer if (source_field_owned) alloc.free(source_field);
+                    try expressions.append(alloc, .{
+                        .output = projection.output,
+                        .expression = .{
+                            .kind = .field,
+                            .field = source_field,
+                            .field_source = .source,
+                        },
+                    });
+                    alloc.free(projection.field);
+                    source_field_owned = false;
+                    item_owned = false;
+                } else {
+                    const field = try binder.normalizeReturningFieldAlloc(alloc, schema, projection.field, returning_qualifiers);
+                    var field_owned = true;
+                    errdefer if (field_owned) alloc.free(field);
+                    if (saw_all and binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
+                    try expressions.append(alloc, .{
+                        .output = projection.output,
+                        .expression = .{
+                            .kind = .field,
+                            .field = field,
+                        },
+                    });
+                    alloc.free(projection.field);
+                    field_owned = false;
+                    item_owned = false;
+                }
+            },
+            .expression => |projection| {
+                if (saw_all and binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
+                try expressions.append(alloc, projection);
+                item_owned = false;
+            },
+            .coalesce => |projection| {
+                if (saw_all and binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
+                const expression_projection = try plan_mod.expressionProjectionFromCoalesceAlloc(alloc, projection);
+                var expression_projection_owned = true;
+                errdefer if (expression_projection_owned) freeExpressionProjection(alloc, expression_projection);
+                try expressions.append(alloc, expression_projection);
+                expression_projection_owned = false;
+                plan_mod.freeCoalesceProjection(alloc, projection);
+                item_owned = false;
+            },
+            else => return error.UnsupportedSqlShape,
+        }
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+
+    const owned_fields = try fields.toOwnedSlice(alloc);
+    var fields_owned = true;
+    errdefer if (fields_owned) strings.freeStringSlice(alloc, owned_fields);
+    const owned_expressions = try expressions.toOwnedSlice(alloc);
+    errdefer freeExpressionProjections(alloc, owned_expressions);
+    try validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
+    fields_owned = false;
+    return .{
+        .fields = owned_fields,
+        .expressions = owned_expressions,
+    };
 }
 
 pub fn returningFieldOutputCount(fields: []const []const u8, output: []const u8) usize {

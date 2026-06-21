@@ -263,7 +263,6 @@ const sourceQueryUsesExtendedPredicates = sql_adapter.sourceQueryUsesExtendedPre
 const relationalCheckNameExists = sql_adapter.relationalCheckNameExists;
 const relationalColumnForDdl = sql_adapter.relationalColumnForDdl;
 const relationalColumnForField = sql_adapter.relationalColumnForField;
-const relationalColumnForReturningField = sql_adapter.relationalColumnForReturningField;
 const relationalColumnHasIndexName = sql_adapter.relationalColumnHasIndexName;
 const relationalColumnIndex = sql_adapter.relationalColumnIndex;
 const relationalColumnIndexForIndexName = sql_adapter.relationalColumnIndexForIndexName;
@@ -321,7 +320,6 @@ const uniqueConstraintValidationStateString = sql_adapter.uniqueConstraintValida
 const uniqueExpressionsEqual = sql_adapter.uniqueExpressionsEqual;
 const updateWillLookupExistingRow = sql_adapter.updateWillLookupExistingRow;
 const validateCheckForColumns = sql_adapter.validateCheckForColumns;
-const validateReturningProjectionOutputs = sql_adapter.validateReturningProjectionOutputs;
 const validateCommentMetadataPlanForRuntimeSchemaAlloc = sql_adapter.validateCommentMetadataPlanForRuntimeSchemaAlloc;
 const validateCreateIndexIncludeColumns = sql_adapter.validateCreateIndexIncludeColumns;
 const validateMergeAssignmentsUnique = sql_adapter.validateMergeAssignmentsUnique;
@@ -3195,6 +3193,22 @@ const Parser = struct {
         };
     }
 
+    fn returningProjectionParserHooks(self: *@This()) sql_adapter.ReturningProjectionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_field_expression_owned = parseFieldExpressionOwnedHook,
+            .parse_select_item = parseReturningSelectItemHook,
+        };
+    }
+
+    fn joinedMutationReturningProjectionParserHooks(self: *@This()) sql_adapter.JoinedMutationReturningProjectionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_field_expression_owned = parseFieldExpressionOwnedHook,
+            .parse_select_item = parseJoinedMutationReturningSelectItemHook,
+        };
+    }
+
     fn parseAggregateOutputExpressionConditionHook(
         ptr: *anyopaque,
         aggregate_schema: runtime_schema.TableSchema,
@@ -3227,6 +3241,54 @@ const Parser = struct {
         self.schema = output_schema;
         defer self.schema = prior_schema;
         return try self.parseOrderExpressionAlloc();
+    }
+
+    fn parseFieldExpressionOwnedHook(ptr: *anyopaque) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseFieldExpressionOwned();
+    }
+
+    fn parseReturningSelectItemHook(
+        ptr: *anyopaque,
+        returning_qualifiers: []const []const u8,
+    ) anyerror!SelectItem {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_returning_expression_qualifiers = self.returning_expression_qualifiers;
+        const previous_field_expression_qualifiers = self.field_expression_qualifiers;
+        self.returning_expression_qualifiers = returning_qualifiers;
+        self.field_expression_qualifiers = returning_qualifiers;
+        defer {
+            self.returning_expression_qualifiers = previous_returning_expression_qualifiers;
+            self.field_expression_qualifiers = previous_field_expression_qualifiers;
+        }
+        return try self.parseSelectItem();
+    }
+
+    fn parseJoinedMutationReturningSelectItemHook(
+        ptr: *anyopaque,
+        source_alias: []const u8,
+        returning_qualifiers: []const []const u8,
+    ) anyerror!SelectItem {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const previous_returning_expression_qualifiers = self.returning_expression_qualifiers;
+        const previous_field_expression_qualifiers = self.field_expression_qualifiers;
+        const previous_joined_target_expression_qualifiers = self.joined_target_expression_qualifiers;
+        const previous_joined_source_expression_qualifiers = self.joined_source_expression_qualifiers;
+        const previous_defer_row_expression_field_validation = self.defer_row_expression_field_validation;
+        const source_qualifiers = [_][]const u8{source_alias};
+        self.returning_expression_qualifiers = returning_qualifiers;
+        self.field_expression_qualifiers = returning_qualifiers;
+        self.joined_target_expression_qualifiers = returning_qualifiers;
+        self.joined_source_expression_qualifiers = source_qualifiers[0..];
+        self.defer_row_expression_field_validation = true;
+        defer {
+            self.returning_expression_qualifiers = previous_returning_expression_qualifiers;
+            self.field_expression_qualifiers = previous_field_expression_qualifiers;
+            self.joined_target_expression_qualifiers = previous_joined_target_expression_qualifiers;
+            self.joined_source_expression_qualifiers = previous_joined_source_expression_qualifiers;
+            self.defer_row_expression_field_validation = previous_defer_row_expression_field_validation;
+        }
+        return try self.parseSelectItem();
     }
 
     fn parseUniquePredicateWhereExpressionConditionHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpressionCondition {
@@ -6056,7 +6118,7 @@ const Parser = struct {
         errdefer returning.deinit(self.alloc);
         if (self.matchKeyword("returning")) {
             const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-            returning = try self.parseReturningProjectionAlloc(&returning_qualifiers);
+            returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &returning_qualifiers, self.returningProjectionParserHooks());
         }
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
@@ -6246,7 +6308,7 @@ const Parser = struct {
         errdefer returning.deinit(self.alloc);
         if (self.matchKeyword("returning")) {
             const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-            returning = try self.parseReturningProjectionAlloc(&returning_qualifiers);
+            returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &returning_qualifiers, self.returningProjectionParserHooks());
         }
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
@@ -6424,7 +6486,7 @@ const Parser = struct {
         errdefer returning.deinit(self.alloc);
         if (self.matchKeyword("returning")) {
             const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-            returning = try self.parseReturningProjectionAlloc(&returning_qualifiers);
+            returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &returning_qualifiers, self.returningProjectionParserHooks());
         }
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
@@ -6480,7 +6542,7 @@ const Parser = struct {
         errdefer returning.deinit(self.alloc);
         if (self.matchKeyword("returning")) {
             const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-            returning = try self.parseReturningProjectionAlloc(&returning_qualifiers);
+            returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &returning_qualifiers, self.returningProjectionParserHooks());
         }
 
         if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
@@ -6889,7 +6951,7 @@ const Parser = struct {
         if (matched_arms.items.len == 0 and not_matched_arms.items.len == 0) return error.UnsupportedSqlShape;
         if (self.matchKeyword("returning")) {
             const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-            returning = try self.parseReturningProjectionAlloc(&returning_qualifiers);
+            returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &returning_qualifiers, self.returningProjectionParserHooks());
         }
         if (ctes.len == 0) {
             if (self.match(.semicolon) != null and !self.atEnd()) return error.UnsupportedSqlShape;
@@ -7136,7 +7198,7 @@ const Parser = struct {
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
-                returning = try self.parseReturningProjectionAlloc(&target_qualifiers);
+                returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &target_qualifiers, self.returningProjectionParserHooks());
             } else if (self.match(.semicolon) != null) {
                 if (!self.atEnd()) return error.UnsupportedSqlShape;
             } else {
@@ -7321,7 +7383,7 @@ const Parser = struct {
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
-                returning = try self.parseReturningProjectionAlloc(&target_qualifiers);
+                returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &target_qualifiers, self.returningProjectionParserHooks());
             } else if (self.match(.semicolon) != null) {
                 if (!self.atEnd()) return error.UnsupportedSqlShape;
             } else {
@@ -7453,7 +7515,7 @@ const Parser = struct {
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
-                returning = try self.parseReturningProjectionAlloc(&target_qualifiers);
+                returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, &target_qualifiers, self.returningProjectionParserHooks());
             } else if (self.match(.semicolon) != null) {
                 if (!self.atEnd()) return error.UnsupportedSqlShape;
             } else {
@@ -8134,7 +8196,7 @@ const Parser = struct {
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
-                returning = try self.parseJoinedMutationReturningProjectionAlloc(source_alias, returning_qualifiers);
+                returning = try sql_adapter.parseJoinedMutationReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.joined_source_schema, source_alias, returning_qualifiers, self.joinedMutationReturningProjectionParserHooks());
             } else if (self.match(.semicolon) != null) {
                 if (!self.atEnd()) return error.UnsupportedSqlShape;
             } else if (sql_adapter.nextIsUnsupportedQueryKeyword(self.tokens, self.pos)) {
@@ -8378,7 +8440,7 @@ const Parser = struct {
             } else if (self.matchKeyword("returning")) {
                 if (saw_returning) return error.UnsupportedSqlShape;
                 saw_returning = true;
-                returning = try self.parseReturningProjectionAlloc(returning_qualifiers);
+                returning = try sql_adapter.parseReturningProjectionAlloc(self.alloc, self.tokens, &self.pos, self.schema, returning_qualifiers, self.returningProjectionParserHooks());
             } else if (self.match(.semicolon) != null) {
                 if (!self.atEnd()) return error.UnsupportedSqlShape;
             } else if (sql_adapter.nextIsUnsupportedQueryKeyword(self.tokens, self.pos)) {
@@ -13767,351 +13829,6 @@ const Parser = struct {
         try self.expect(.rparen);
         try writer.writeByte('}');
         return try out.toOwnedSlice();
-    }
-
-    fn parseReturningProjectionAlloc(
-        self: *@This(),
-        returning_qualifiers: []const []const u8,
-    ) !ReturningProjection {
-        const previous_returning_expression_qualifiers = self.returning_expression_qualifiers;
-        self.returning_expression_qualifiers = returning_qualifiers;
-        defer self.returning_expression_qualifiers = previous_returning_expression_qualifiers;
-        const previous_field_expression_qualifiers = self.field_expression_qualifiers;
-        self.field_expression_qualifiers = returning_qualifiers;
-        defer self.field_expression_qualifiers = previous_field_expression_qualifiers;
-
-        var saw_all = false;
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| self.alloc.free(field);
-            fields.deinit(self.alloc);
-        }
-        var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
-        errdefer {
-            for (expressions.items) |projection| freeExpressionProjection(self.alloc, projection);
-            expressions.deinit(self.alloc);
-        }
-
-        while (true) {
-            const returning_all_item = self.match(.star) != null or try sql_adapter.matchQualifiedReturningAll(self.alloc, self.tokens, &self.pos, returning_qualifiers);
-            if (returning_all_item) {
-                if (saw_all or fields.items.len != 0 or expressions.items.len != 0) return error.UnsupportedSqlShape;
-                const all_field = try self.alloc.dupe(u8, "*");
-                var all_field_transferred = false;
-                errdefer if (!all_field_transferred) self.alloc.free(all_field);
-                try fields.append(self.alloc, all_field);
-                all_field_transferred = true;
-                saw_all = true;
-                if (self.match(.comma) == null) break;
-                continue;
-            }
-            if (sql_adapter.peekSimpleReturningField(self.tokens, self.pos)) {
-                const parsed_field = try self.parseFieldExpressionOwned();
-                defer self.alloc.free(parsed_field);
-                const field = try sql_adapter.normalizeReturningFieldAlloc(self.alloc, self.schema, parsed_field, returning_qualifiers);
-                var field_owned = true;
-                errdefer if (field_owned) self.alloc.free(field);
-                const alias = try sql_adapter.parseOptionalProjectionAliasAlloc(self.alloc, self.tokens, &self.pos);
-                var alias_owned = true;
-                errdefer if (alias_owned) if (alias) |owned| self.alloc.free(owned);
-                if (alias) |output| {
-                    if (std.mem.eql(u8, output, field)) {
-                        self.alloc.free(output);
-                        alias_owned = false;
-                        try fields.append(self.alloc, field);
-                        field_owned = false;
-                    } else {
-                        if (saw_all and relationalColumnForReturningField(self.schema, output) != null) return error.UnsupportedSqlShape;
-                        try expressions.append(self.alloc, .{
-                            .output = output,
-                            .expression = .{
-                                .kind = .field,
-                                .field = field,
-                            },
-                        });
-                        alias_owned = false;
-                        field_owned = false;
-                    }
-                } else {
-                    if (saw_all) return error.UnsupportedSqlShape;
-                    try fields.append(self.alloc, field);
-                    field_owned = false;
-                }
-                if (self.match(.comma) == null) break;
-                continue;
-            }
-            const item = try self.parseSelectItem();
-            var item_owned = true;
-            errdefer if (item_owned) freeSelectItem(self.alloc, item);
-            switch (item) {
-                .field => |parsed_field| {
-                    if (saw_all) return error.UnsupportedSqlShape;
-                    const field = try sql_adapter.normalizeReturningFieldAlloc(self.alloc, self.schema, parsed_field, returning_qualifiers);
-                    var field_owned = true;
-                    errdefer if (field_owned) self.alloc.free(field);
-                    self.alloc.free(parsed_field);
-                    try fields.append(self.alloc, field);
-                    field_owned = false;
-                    item_owned = false;
-                },
-                .field_alias => |projection| {
-                    const field = try sql_adapter.normalizeReturningFieldAlloc(self.alloc, self.schema, projection.field, returning_qualifiers);
-                    var field_owned = true;
-                    errdefer if (field_owned) self.alloc.free(field);
-                    if (saw_all and relationalColumnForReturningField(self.schema, projection.output) != null) return error.UnsupportedSqlShape;
-                    try expressions.append(self.alloc, .{
-                        .output = projection.output,
-                        .expression = .{
-                            .kind = .field,
-                            .field = field,
-                        },
-                    });
-                    self.alloc.free(projection.field);
-                    field_owned = false;
-                    item_owned = false;
-                },
-                .expression => |projection| {
-                    if (saw_all and relationalColumnForReturningField(self.schema, projection.output) != null) return error.UnsupportedSqlShape;
-                    try expressions.append(self.alloc, projection);
-                    item_owned = false;
-                },
-                .coalesce => |projection| {
-                    if (saw_all and relationalColumnForReturningField(self.schema, projection.output) != null) return error.UnsupportedSqlShape;
-                    const expression_projection = try expressionProjectionFromCoalesceAlloc(self.alloc, projection);
-                    var expression_projection_owned = true;
-                    errdefer if (expression_projection_owned) freeExpressionProjection(self.alloc, expression_projection);
-                    try expressions.append(self.alloc, expression_projection);
-                    expression_projection_owned = false;
-                    freeCoalesceProjection(self.alloc, projection);
-                    item_owned = false;
-                },
-                else => return error.UnsupportedSqlShape,
-            }
-            if (self.match(.comma) == null) break;
-        }
-
-        const owned_fields = try fields.toOwnedSlice(self.alloc);
-        var fields_owned = true;
-        errdefer if (fields_owned) freeStringSlice(self.alloc, owned_fields);
-        const owned_expressions = try expressions.toOwnedSlice(self.alloc);
-        errdefer freeExpressionProjections(self.alloc, owned_expressions);
-        try validateReturningProjectionOutputs(self.schema, owned_fields, owned_expressions);
-        fields_owned = false;
-        return .{
-            .fields = owned_fields,
-            .expressions = owned_expressions,
-        };
-    }
-
-    fn parseJoinedMutationReturningProjectionAlloc(
-        self: *@This(),
-        source_alias: []const u8,
-        returning_qualifiers: []const []const u8,
-    ) !ReturningProjection {
-        const previous_returning_expression_qualifiers = self.returning_expression_qualifiers;
-        self.returning_expression_qualifiers = returning_qualifiers;
-        defer self.returning_expression_qualifiers = previous_returning_expression_qualifiers;
-        const previous_field_expression_qualifiers = self.field_expression_qualifiers;
-        self.field_expression_qualifiers = returning_qualifiers;
-        defer self.field_expression_qualifiers = previous_field_expression_qualifiers;
-
-        var saw_all = false;
-        var fields = std.ArrayListUnmanaged([]const u8).empty;
-        errdefer {
-            for (fields.items) |field| self.alloc.free(field);
-            fields.deinit(self.alloc);
-        }
-        var expressions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionProjection).empty;
-        errdefer {
-            for (expressions.items) |projection| freeExpressionProjection(self.alloc, projection);
-            expressions.deinit(self.alloc);
-        }
-
-        while (true) {
-            const returning_all_item = self.match(.star) != null or try sql_adapter.matchQualifiedReturningAll(self.alloc, self.tokens, &self.pos, returning_qualifiers);
-            if (returning_all_item) {
-                if (saw_all or fields.items.len != 0 or expressions.items.len != 0) return error.UnsupportedSqlShape;
-                const all_field = try self.alloc.dupe(u8, "*");
-                var all_field_transferred = false;
-                errdefer if (!all_field_transferred) self.alloc.free(all_field);
-                try fields.append(self.alloc, all_field);
-                all_field_transferred = true;
-                saw_all = true;
-                if (self.match(.comma) == null) break;
-                continue;
-            }
-            if (sql_adapter.peekSimpleReturningField(self.tokens, self.pos)) {
-                const parsed_field = try self.parseFieldExpressionOwned();
-                defer self.alloc.free(parsed_field);
-                if (try sql_adapter.normalizeJoinedMutationReturningSourceFieldAlloc(self.alloc, self.schema, self.joined_source_schema, parsed_field, source_alias)) |source_field| {
-                    var source_field_owned = true;
-                    errdefer if (source_field_owned) self.alloc.free(source_field);
-                    const alias = try sql_adapter.parseOptionalProjectionAliasAlloc(self.alloc, self.tokens, &self.pos);
-                    var alias_owned = true;
-                    errdefer if (alias_owned) if (alias) |owned| self.alloc.free(owned);
-                    const output = alias orelse try self.alloc.dupe(u8, source_field);
-                    alias_owned = false;
-                    var output_owned = true;
-                    errdefer if (output_owned) self.alloc.free(output);
-                    try expressions.append(self.alloc, .{
-                        .output = output,
-                        .expression = .{
-                            .kind = .field,
-                            .field = source_field,
-                            .field_source = .source,
-                        },
-                    });
-                    source_field_owned = false;
-                    output_owned = false;
-                } else {
-                    const field = try sql_adapter.normalizeReturningFieldAlloc(self.alloc, self.schema, parsed_field, returning_qualifiers);
-                    var field_owned = true;
-                    errdefer if (field_owned) self.alloc.free(field);
-                    const alias = try sql_adapter.parseOptionalProjectionAliasAlloc(self.alloc, self.tokens, &self.pos);
-                    var alias_owned = true;
-                    errdefer if (alias_owned) if (alias) |owned| self.alloc.free(owned);
-                    if (alias) |output| {
-                        if (std.mem.eql(u8, output, field)) {
-                            self.alloc.free(output);
-                            alias_owned = false;
-                            try fields.append(self.alloc, field);
-                            field_owned = false;
-                        } else {
-                            if (saw_all and relationalColumnForReturningField(self.schema, output) != null) return error.UnsupportedSqlShape;
-                            try expressions.append(self.alloc, .{
-                                .output = output,
-                                .expression = .{
-                                    .kind = .field,
-                                    .field = field,
-                                },
-                            });
-                            alias_owned = false;
-                            field_owned = false;
-                        }
-                    } else {
-                        if (saw_all) return error.UnsupportedSqlShape;
-                        try fields.append(self.alloc, field);
-                        field_owned = false;
-                    }
-                }
-                if (self.match(.comma) == null) break;
-                continue;
-            }
-            const item = try self.parseJoinedMutationReturningSelectItem(source_alias, returning_qualifiers);
-            var item_owned = true;
-            errdefer if (item_owned) freeSelectItem(self.alloc, item);
-            switch (item) {
-                .field => |parsed_field| {
-                    if (saw_all) return error.UnsupportedSqlShape;
-                    if (try sql_adapter.normalizeJoinedMutationReturningSourceFieldAlloc(self.alloc, self.schema, self.joined_source_schema, parsed_field, source_alias)) |source_field| {
-                        var source_field_owned = true;
-                        errdefer if (source_field_owned) self.alloc.free(source_field);
-                        const output = try self.alloc.dupe(u8, source_field);
-                        var output_owned = true;
-                        errdefer if (output_owned) self.alloc.free(output);
-                        try expressions.append(self.alloc, .{
-                            .output = output,
-                            .expression = .{
-                                .kind = .field,
-                                .field = source_field,
-                                .field_source = .source,
-                            },
-                        });
-                        source_field_owned = false;
-                        output_owned = false;
-                    } else {
-                        const field = try sql_adapter.normalizeReturningFieldAlloc(self.alloc, self.schema, parsed_field, returning_qualifiers);
-                        var field_owned = true;
-                        errdefer if (field_owned) self.alloc.free(field);
-                        try fields.append(self.alloc, field);
-                        field_owned = false;
-                    }
-                    self.alloc.free(parsed_field);
-                    item_owned = false;
-                },
-                .field_alias => |projection| {
-                    if (try sql_adapter.normalizeJoinedMutationReturningSourceFieldAlloc(self.alloc, self.schema, self.joined_source_schema, projection.field, source_alias)) |source_field| {
-                        var source_field_owned = true;
-                        errdefer if (source_field_owned) self.alloc.free(source_field);
-                        try expressions.append(self.alloc, .{
-                            .output = projection.output,
-                            .expression = .{
-                                .kind = .field,
-                                .field = source_field,
-                                .field_source = .source,
-                            },
-                        });
-                        self.alloc.free(projection.field);
-                        source_field_owned = false;
-                        item_owned = false;
-                    } else {
-                        const field = try sql_adapter.normalizeReturningFieldAlloc(self.alloc, self.schema, projection.field, returning_qualifiers);
-                        var field_owned = true;
-                        errdefer if (field_owned) self.alloc.free(field);
-                        if (saw_all and relationalColumnForReturningField(self.schema, projection.output) != null) return error.UnsupportedSqlShape;
-                        try expressions.append(self.alloc, .{
-                            .output = projection.output,
-                            .expression = .{
-                                .kind = .field,
-                                .field = field,
-                            },
-                        });
-                        self.alloc.free(projection.field);
-                        field_owned = false;
-                        item_owned = false;
-                    }
-                },
-                .expression => |projection| {
-                    if (saw_all and relationalColumnForReturningField(self.schema, projection.output) != null) return error.UnsupportedSqlShape;
-                    try expressions.append(self.alloc, projection);
-                    item_owned = false;
-                },
-                .coalesce => |projection| {
-                    if (saw_all and relationalColumnForReturningField(self.schema, projection.output) != null) return error.UnsupportedSqlShape;
-                    const expression_projection = try expressionProjectionFromCoalesceAlloc(self.alloc, projection);
-                    var expression_projection_owned = true;
-                    errdefer if (expression_projection_owned) freeExpressionProjection(self.alloc, expression_projection);
-                    try expressions.append(self.alloc, expression_projection);
-                    expression_projection_owned = false;
-                    freeCoalesceProjection(self.alloc, projection);
-                    item_owned = false;
-                },
-                else => return error.UnsupportedSqlShape,
-            }
-            if (self.match(.comma) == null) break;
-        }
-
-        const owned_fields = try fields.toOwnedSlice(self.alloc);
-        var fields_owned = true;
-        errdefer if (fields_owned) freeStringSlice(self.alloc, owned_fields);
-        const owned_expressions = try expressions.toOwnedSlice(self.alloc);
-        errdefer freeExpressionProjections(self.alloc, owned_expressions);
-        try validateReturningProjectionOutputs(self.schema, owned_fields, owned_expressions);
-        fields_owned = false;
-        return .{
-            .fields = owned_fields,
-            .expressions = owned_expressions,
-        };
-    }
-
-    fn parseJoinedMutationReturningSelectItem(
-        self: *@This(),
-        source_alias: []const u8,
-        returning_qualifiers: []const []const u8,
-    ) !SelectItem {
-        const previous_joined_target_expression_qualifiers = self.joined_target_expression_qualifiers;
-        const previous_joined_source_expression_qualifiers = self.joined_source_expression_qualifiers;
-        const previous_defer_row_expression_field_validation = self.defer_row_expression_field_validation;
-        const source_qualifiers = [_][]const u8{source_alias};
-        self.joined_target_expression_qualifiers = returning_qualifiers;
-        self.joined_source_expression_qualifiers = source_qualifiers[0..];
-        self.defer_row_expression_field_validation = true;
-        defer {
-            self.joined_target_expression_qualifiers = previous_joined_target_expression_qualifiers;
-            self.joined_source_expression_qualifiers = previous_joined_source_expression_qualifiers;
-            self.defer_row_expression_field_validation = previous_defer_row_expression_field_validation;
-        }
-        return try self.parseSelectItem();
     }
 
     fn parseSelectItem(self: *@This()) !SelectItem {
