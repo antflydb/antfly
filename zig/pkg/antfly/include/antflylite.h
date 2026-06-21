@@ -217,6 +217,11 @@ const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
 antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *options);
 
+/*
+ * antfly_lite_create* creates a new v1 .aflite database. antfly_lite_open*
+ * opens an existing v1 .aflite database. Open calls do not create missing files
+ * or migrate pre-release Lite layouts.
+ */
 antfly_error_code antfly_lite_open(const char *path, void **out_handle);
 antfly_error_code antfly_lite_create(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_with_options(

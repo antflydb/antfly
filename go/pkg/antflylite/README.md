@@ -38,13 +38,16 @@ documents after a manual-maintenance or restore pause.
 Use `CheckFile` or `CheckFileJSON` to inspect an invalid, truncated, or
 corrupted `.aflite` file without opening a database handle.
 
-Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
-handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
-wants hosted/manual maintenance and will call `RunUntilIdle` itself. Use
-`RunUntilIdleStatus` when the application also wants the typed post-drain
-pending-work readiness document.
-Use `OpenWithOptions` for advanced settings such as map size, native-profile
-TTL cleanup, and explicit inference status reporting. Set
+Use `Create` for a new native `.aflite` writer database and `Open` for an
+existing native `.aflite` writer database. `Open` does not create missing files
+or upgrade pre-release Lite layouts; unknown or invalid files fail explicitly.
+Use `OpenReadonly` for read-only query handles and `OpenStatusOnly` for
+inspection. Use `CreateHosted` for a new hosted/manual-maintenance database and
+`OpenHosted` for an existing hosted/manual-maintenance database when the
+application will call `RunUntilIdle` itself. Use `RunUntilIdleStatus` when the
+application also wants the typed post-drain pending-work readiness document.
+Use `CreateWithOptions` and `OpenWithOptions` for advanced settings such as map
+size, native-profile TTL cleanup, and explicit inference status reporting. Set
 `RemoteProviderConfigured` when the embedding producer is backed by a configured
 remote provider so `Status().Inference` reports `remote_provider` instead of the
 default caller-supplied/deferred mode. Set `LocalRuntimeConfigured` when the
