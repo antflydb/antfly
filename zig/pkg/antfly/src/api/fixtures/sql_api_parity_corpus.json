@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "34849ad50432acfe1db3868b70ab537b800e613e326d3fee4d6433826f061a35",
-  "source_entry_count": 1013,
-  "entry_count": 1013,
+  "source_sha256": "0c007ba01dc2e3c1df4754f1cc01a7e00002f56b0abb630c217e4a9ecc66d430",
+  "source_entry_count": 1012,
+  "entry_count": 1012,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -6538,23 +6538,16 @@
       "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
-      "name": "unsupported multi-output subquery delete selector",
-      "family": "unsupported_delete",
-      "plan": "unsupported:delete:requires=multi_output_subquery_delete_selector",
-      "classification_reason": "multi_output_subquery_delete_selector",
-      "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
-    },
-    {
-      "name": "unsupported multi-output subquery joined update selector",
-      "family": "unsupported_update_joined_source",
-      "plan": "unsupported:update_joined_source:requires=multi_output_subquery_update_selector",
+      "name": "invalid multi-output scalar subquery update selector",
+      "family": "invalid_update",
+      "plan": "invalid:update:reason=multi_output_subquery_update_selector",
       "classification_reason": "multi_output_subquery_update_selector",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id, status FROM archived_records)"
     },
     {
-      "name": "unsupported multi-output subquery joined delete selector",
-      "family": "unsupported_delete_joined_source",
-      "plan": "unsupported:delete_joined_source:requires=multi_output_subquery_delete_selector",
+      "name": "invalid multi-output scalar subquery delete selector",
+      "family": "invalid_delete",
+      "plan": "invalid:delete:reason=multi_output_subquery_delete_selector",
       "classification_reason": "multi_output_subquery_delete_selector",
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
     },
