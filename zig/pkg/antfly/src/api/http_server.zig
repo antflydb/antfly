@@ -22323,6 +22323,79 @@ test "api http server applies safe before insert SQL triggers to rows batch" {
     try std.testing.expectEqualStrings("open", row.get("status").?.string);
 }
 
+test "api http server maps relational CTE spill admission to rows backpressure" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"text"},"status":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .rows_query_plan = rowsQueryPlan },
+            };
+        }
+
+        fn rowsQueryPlan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: runtime_schema_mod.TableSchema, _: db_mod.types.RelationalRowsQueryPlan, _: raft_mod.ReadConsistency) !?db_mod.types.RelationalRowsQueryResult {
+            return error.RelationalRowsCteSpillRequired;
+        }
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var reads = FakeReads{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var response = try server.handlePublicTableRowsQuery(
+        "events",
+        "{\"ctes\":[{\"name\":\"open_events\",\"spill_after_bytes\":8,\"query\":{\"select\":[\"id\",\"status\"]}}],\"query\":{\"source_cte\":\"open_events\",\"select\":[\"id\"]}}",
+        null,
+    );
+    defer response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 429), response.status);
+    try std.testing.expectEqualStrings("rows query backpressured", response.body);
+}
+
 test "api http server exposes SQL routine bindings to catalog read planning" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {

@@ -11182,15 +11182,6 @@ const Parser = struct {
         );
     }
 
-    fn parseConflictJsonBuildObjectExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictJsonBuildObjectExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictJsonBuildObjectExpressionParserHooks());
-    }
-
     fn parseConflictExpressionOperandAlloc(
         self: *@This(),
         column: runtime_schema.RelationalColumn,
@@ -11243,22 +11234,6 @@ const Parser = struct {
         return try sql_adapter.parseConflictFieldExpressionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.conflict_existing_qualifiers, insert_columns, expected_type);
     }
 
-    fn parseConflictCastExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictCastExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictCaseExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictCaseExpressionAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.conflict_existing_qualifiers, column, insert_columns, self.rowExpressionTypeContext(), self.defer_row_expression_field_validation, self.conflictCaseExpressionParserHooks());
-    }
-
     fn parseConflictExpressionConditionAlloc(
         self: *@This(),
         column: runtime_schema.RelationalColumn,
@@ -11273,158 +11248,6 @@ const Parser = struct {
         insert_columns: []const []const u8,
     ) anyerror!db_mod.types.RelationalRowsExpression {
         return try sql_adapter.parseConflictBooleanExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, self.rowExpressionTypeContext(), self.conflictBooleanExpressionParserHooks());
-    }
-
-    fn parseConflictCaseFoldExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictCaseFoldExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictCaseFoldExpressionParserHooks());
-    }
-
-    fn parseConflictConcatExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictConcatExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictNullifExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-    ) anyerror!db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictNullifExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, self.conflictNullifExpressionParserHooks());
-    }
-
-    fn parseConflictLengthExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictLengthExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictAsciiExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictAsciiExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictChrExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictChrExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictReplaceExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictTextTernaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .replace, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictRegexpReplaceExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictRegexpListExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .regexp_replace, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictRegexpCountExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictTextBinaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .regexp_count, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictRegexpMatchExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictRegexpListExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .regexp_match, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictRegexpSubstrExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictTextBinaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .regexp_substr, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictRegexpInstrExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictTextBinaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .regexp_instr, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictTranslateExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictTextTernaryExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .translate, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
-    }
-
-    fn parseConflictSubstringExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .substring, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
-    }
-
-    fn parseConflictOverlayExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .overlay, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
-    }
-
-    fn parseConflictSplitPartExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictMixedTextFunctionExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, .split_part, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks(), self.conflictCoalesceExpressionParserHooks());
-    }
-
-    fn parseConflictStrposExpressionAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        expected_type: ?runtime_schema.AntflyType,
-    ) !db_mod.types.RelationalRowsExpression {
-        return try sql_adapter.parseConflictStrposExpressionAlloc(self.alloc, self.tokens, &self.pos, column, insert_columns, expected_type, self.rowExpressionTypeContext(), self.conflictUnaryExpressionParserHooks());
     }
 
     fn parseConflictArithmeticExpressionRestAlloc(
