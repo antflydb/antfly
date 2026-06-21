@@ -16,7 +16,6 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 const cli = @import("cli/mod.zig");
 const httpx = @import("httpx");
-const lite_restore_staging = @import("lite_restore_staging.zig");
 const platform_sync = @import("antfly_platform").sync;
 const fs_paths = antfly.common.fs_paths;
 
@@ -29,6 +28,7 @@ const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
+const lite_restore_staging = antfly.lite.restore_staging;
 
 var active_lite_http_state: ?*LiteHttpState = null;
 const lite_http_state_key = "antfly.lite.state";

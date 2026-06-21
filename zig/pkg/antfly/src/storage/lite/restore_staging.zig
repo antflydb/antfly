@@ -13,38 +13,39 @@
 // limitations.
 
 const std = @import("std");
-const antfly = @import("antfly-zig");
 
 const Allocator = std.mem.Allocator;
-const db_mod = antfly.db;
-const db_types = db_mod.types;
-const backups_api = antfly.public_api.backups;
-const backup_codec = antfly.backup_codec;
-const portable_backup = antfly.portable_backup;
-const query_api = antfly.public_api.query;
-const group_ids = antfly.common.group_ids;
-const tables_api = antfly.public_api.tables;
+const backend = @import("backend.zig");
+const backup_codec = @import("../backup_codec.zig");
+const backups_api = @import("../../api/backups.zig");
+const db_mod = @import("../db/db.zig");
+const db_types = @import("../db/types.zig");
+const group_ids = @import("../../common/group_ids.zig");
+const portable_backup = @import("../portable_backup.zig");
+const query_api = @import("../../api/query.zig");
+const tables_api = @import("../../api/tables.zig");
+const table_writes = @import("../../api/table_writes.zig");
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
 const LiteDb = struct {
-    backend: antfly.lite.backend.Handle,
+    backend: backend.Handle,
     db: db_mod.DB,
 
     fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
-        var backend = try antfly.lite.backend.Handle.open(allocator, path, .{
+        var lite_backend = try backend.Handle.open(allocator, path, .{
             .read_only = open_mode == .query_readonly or open_mode == .status_only,
         });
-        errdefer backend.deinit();
+        errdefer lite_backend.deinit();
 
         var opts = db_mod.OpenOptions{
             .open_mode = open_mode,
             .external_derived_checkpoints = false,
         };
-        try backend.configureDbOpenOptions(&opts);
+        try lite_backend.configureDbOpenOptions(&opts);
 
         return .{
-            .backend = backend,
+            .backend = lite_backend,
             .db = try db_mod.DB.open(allocator, path, opts),
         };
     }
@@ -887,7 +888,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
 
     var normal_db = try db_mod.DB.open(allocator, normal_path, .{});
     defer normal_db.close();
-    var normal_source = antfly.public_api.BoundTableWriteSource.init("docs", &normal_db);
+    var normal_source = table_writes.BoundTableWriteSource.init("docs", &normal_db);
     _ = try normal_source.source().restoreTable(allocator, "docs", .{
         .backup_root = backup_root,
         .manifest = &lite_manifest,

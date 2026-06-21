@@ -16,9 +16,9 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
-const lite_restore_staging = @import("../lite_restore_staging.zig");
 
 const backup_codec = antfly.backup_codec;
+const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
 
 const BackupArgs = struct {
