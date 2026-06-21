@@ -27,10 +27,13 @@ LICENSE
 bindings that embed Lite, including the Go `antflylite` binding, link against
 that library and include `include/antflylite.h`.
 
-The Python and npm CLI installer packages intentionally expose only the `antfly`
-binary and support files needed by the CLI. They are not the C ABI distribution
-surface. Consumers that need embedded Lite should install the native runtime
-archive or a future language-specific package that bundles `libantflylite`.
+The Python, npm, and Homebrew CLI installer packages preserve the same Lite C
+ABI files from the native archive. Consumers that need embedded Lite can install
+one of those packages or unpack the native runtime archive, then point their
+language binding at the packaged `libantflylite` library. The Go `antflylite`
+module carries a matching header copy for standalone builds, but the release
+packages and archives also keep `include/antflylite.h` available for direct C
+consumers.
 
 ## Release Flow
 
