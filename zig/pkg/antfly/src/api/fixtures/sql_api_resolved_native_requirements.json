@@ -2,9 +2,31 @@
   "resolution_format": 1,
   "resolved": [
     {
+      "reason": "prepared_transaction_plan",
+      "coverage": [
+        "ddl_prepared_transaction_commit",
+        "ddl_prepared_transaction_prepare",
+        "ddl_prepared_transaction_recovery_contract",
+        "ddl_prepared_transaction_rollback"
+      ]
+    },
+    {
       "reason": "recursive_cte_stream_plan",
       "coverage": [
         "read_recursive_cte_stream_plan"
+      ]
+    },
+    {
+      "reason": "role_setting_plan",
+      "coverage": [
+        "ddl_role_alter_runtime_reset",
+        "ddl_role_alter_runtime_setting"
+      ]
+    },
+    {
+      "reason": "row_rewrite_expression_plan",
+      "coverage": [
+        "ddl_alter_column_rewrite_expression"
       ]
     },
     {
@@ -13,6 +35,29 @@
         "read_set_operation_cross_table_source_schema_classifier",
         "read_set_operation_order_limit",
         "set_operation_fetch_tail"
+      ]
+    },
+    {
+      "reason": "set_operation_source_schema",
+      "coverage": [
+        "read_set_operation_cross_table_source_schema",
+        "read_set_operation_cross_table_source_schema_classifier"
+      ]
+    },
+    {
+      "reason": "system_time_temporal_table",
+      "coverage": [
+        "ddl_system_versioned_table",
+        "schema_system_versioned_table"
+      ]
+    },
+    {
+      "reason": "temporal_fk_action",
+      "coverage": [
+        "ddl_temporal_fk_delete_cascade_action",
+        "ddl_temporal_fk_delete_set_null_action",
+        "ddl_temporal_fk_update_cascade_action",
+        "schema_temporal_fk_ddl"
       ]
     }
   ]

@@ -4601,6 +4601,31 @@ fn expectSourceCorpusResolvedRequirements(
     }
 }
 
+fn resolvedRequirementContains(resolved: []const AppParityResolvedRequirement, reason: []const u8) bool {
+    for (resolved) |item| {
+        if (std.mem.eql(u8, item.reason, reason)) return true;
+    }
+    return false;
+}
+
+fn expectNativeRequirementPolicyComplete(
+    unresolved: []const []const u8,
+    resolved: []const AppParityResolvedRequirement,
+) !void {
+    if (unresolved.len == 0 or resolved.len == 0) return error.TestUnexpectedResult;
+    inline for (std.meta.fields(diagnostics.SqlAdapterClassificationReason)) |field| {
+        const reason: diagnostics.SqlAdapterClassificationReason = @enumFromInt(field.value);
+        if (!diagnostics.classificationReasonIsUnsupportedRequirement(reason)) continue;
+        const name = diagnostics.classificationReasonToken(reason);
+        const is_unresolved = stringListContains(unresolved, name);
+        const is_resolved = resolvedRequirementContains(resolved, name);
+        if (is_unresolved == is_resolved) {
+            std.debug.print("native requirement policy must classify exactly once: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "sql adapter source corpus covers resolved native requirements with positive typed plans" {
     const alloc = std.testing.allocator;
     var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
@@ -4613,6 +4638,35 @@ test "sql adapter source corpus covers resolved native requirements with positiv
         try coverage.observe(alloc, entry);
     }
     try expectSourceCorpusResolvedRequirements(coverage, resolved.root.resolved);
+}
+
+test "sql adapter native requirement manifests classify every stable requirement" {
+    const alloc = std.testing.allocator;
+    var unresolved = try parseAppParityNativeRequirementsAlloc(alloc);
+    defer unresolved.deinit(alloc);
+    var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved.deinit(alloc);
+
+    try expectNativeRequirementPolicyComplete(unresolved.root.required, resolved.root.resolved);
+
+    const overlapping = [_]AppParityResolvedRequirement{.{
+        .reason = "bulk_io_plan",
+        .coverage = &.{"ddl_copy_from_execution_contract"},
+    }};
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectNativeRequirementPolicyComplete(unresolved.root.required, &overlapping),
+    );
+
+    const missing_unresolved = [_][]const u8{"bulk_io_plan"};
+    const missing_resolved = [_]AppParityResolvedRequirement{.{
+        .reason = "set_operation_plan",
+        .coverage = &.{"read_set_operation_order_limit"},
+    }};
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectNativeRequirementPolicyComplete(&missing_unresolved, &missing_resolved),
+    );
 }
 
 test "sql adapter corpus validates resolved native requirement manifest" {

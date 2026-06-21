@@ -1219,7 +1219,10 @@ disappear silently. Resolved native-requirement labels live in
 `api/fixtures/sql_api_resolved_native_requirements.json` and tie former
 model-gap diagnostics to positive typed-plan coverage buckets; when a
 fail-closed shape becomes implemented, the source corpus must prove the native
-plan coverage instead of leaving a stale unsupported reason behind. SQL adapter
+plan coverage instead of leaving a stale unsupported reason behind. The two
+native-requirement manifests partition every stable non-noop diagnostic reason:
+new reason tokens fail the corpus tests until review policy classifies them as
+unresolved work or resolved typed-plan evidence. SQL adapter
 edge cases that are not golden typed-plan entries, such as comment preservation,
 malformed placeholder suffixes, statement-kind classification, and fail-closed
 point-lowerer boundaries, live in
