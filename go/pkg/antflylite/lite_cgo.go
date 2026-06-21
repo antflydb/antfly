@@ -23,6 +23,7 @@ import "C"
 import (
 	"fmt"
 	"runtime"
+	"strings"
 	"unsafe"
 )
 
@@ -404,6 +405,9 @@ func (db *DB) CompactJSON() ([]byte, error) {
 
 // CopyStableSnapshotJSON copies a stable Lite snapshot to destPath.
 func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, error) {
+	if !strings.HasSuffix(destPath, ".aflite") {
+		return nil, InvalidArgument
+	}
 	handle, err := db.requireHandle()
 	if err != nil {
 		return nil, err

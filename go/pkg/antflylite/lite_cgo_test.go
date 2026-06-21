@@ -693,6 +693,9 @@ func TestLiteCAPI(t *testing.T) {
 	if _, err := os.Stat(snapshotPath); err != nil {
 		t.Fatalf("snapshot file: %v", err)
 	}
+	if _, err := db.CopyStableSnapshot(filepath.Join(t.TempDir(), "go-snapshot.afb"), false); err != InvalidArgument {
+		t.Fatalf("handle snapshot to .afb error = %v, want %v", err, InvalidArgument)
+	}
 
 	snapshotFilePath := filepath.Join(t.TempDir(), "go-snapshot-file.aflite")
 	snapshotFileReport, err := CopyStableSnapshotFile(path, snapshotFilePath, false)
