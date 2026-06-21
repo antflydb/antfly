@@ -15,6 +15,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
+const platform_sync = @import("antfly_platform").sync;
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -1447,7 +1448,9 @@ const SchemaRewriteWakeJob = struct {
     owner_id: u64,
     source: table_writes.TableWriteSource,
     catalog: ?StatusSource = null,
+    registry: ?*SchemaRewriteWakeRegistry = null,
     table_name: []u8,
+    table_id: u64 = 0,
     promoted_table: ?metadata_table_manager.TableRecord = null,
     worker_id: []const u8 = "api-schema-rewrite",
     lease_ms: u64 = 60_000,
@@ -1471,24 +1474,47 @@ const SchemaRewriteWakeJob = struct {
         catalog: ?StatusSource,
         promoted_table: ?metadata_table_manager.TableRecord,
     ) !void {
+        return try SchemaRewriteWakeJob.submitWithPromotionAndRegistry(runtime, owner_id, source, table_name, catalog, promoted_table, null, 0);
+    }
+
+    fn submitWithPromotionAndRegistry(
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        owner_id: u64,
+        source: table_writes.TableWriteSource,
+        table_name: []const u8,
+        catalog: ?StatusSource,
+        promoted_table: ?metadata_table_manager.TableRecord,
+        registry: ?*SchemaRewriteWakeRegistry,
+        table_id: u64,
+    ) !void {
         const alloc = std.heap.page_allocator;
         const work = try alloc.create(SchemaRewriteWakeJob);
-        errdefer alloc.destroy(work);
+        var work_transferred = false;
+        errdefer if (!work_transferred) alloc.destroy(work);
         const owned_table_name = try alloc.dupe(u8, table_name);
-        errdefer alloc.free(owned_table_name);
+        var table_name_transferred = false;
+        errdefer if (!table_name_transferred) alloc.free(owned_table_name);
         const owned_promoted_table = if (promoted_table) |table|
             try metadata_table_manager.cloneTable(alloc, table)
         else
             null;
-        errdefer if (owned_promoted_table) |table| metadata_table_manager.freeTable(alloc, table);
+        var promoted_table_transferred = false;
+        errdefer if (!promoted_table_transferred) if (owned_promoted_table) |table| metadata_table_manager.freeTable(alloc, table);
         work.* = .{
             .runtime = runtime,
             .owner_id = owner_id,
             .source = source,
             .catalog = catalog,
+            .registry = registry,
             .table_name = owned_table_name,
+            .table_id = table_id,
             .promoted_table = owned_promoted_table,
         };
+        table_name_transferred = true;
+        promoted_table_transferred = true;
+        work_transferred = true;
+        var submitted = false;
+        errdefer if (!submitted) SchemaRewriteWakeJob.deinit(work);
         try runtime.durable_jobs.submit(.{
             .owner_id = owner_id,
             .class = .maintenance,
@@ -1496,6 +1522,7 @@ const SchemaRewriteWakeJob = struct {
             .run = SchemaRewriteWakeJob.run,
             .deinit = SchemaRewriteWakeJob.deinit,
         });
+        submitted = true;
     }
 
     fn run(ptr: *anyopaque) !void {
@@ -1524,10 +1551,20 @@ const SchemaRewriteWakeJob = struct {
             made_progress = true;
         }
         if (!made_progress or self.runtime.backend == .manual) return;
-        SchemaRewriteWakeJob.submitWithPromotion(self.runtime, self.owner_id, self.source, self.table_name, self.catalog, self.promoted_table) catch |err| switch (err) {
+        SchemaRewriteWakeJob.submitWithPromotionAndRegistry(
+            self.runtime,
+            self.owner_id,
+            self.source,
+            self.table_name,
+            self.catalog,
+            self.promoted_table,
+            self.registry,
+            self.table_id,
+        ) catch |err| switch (err) {
             error.BackgroundOwnerClosing => return,
             else => return err,
         };
+        self.registry = null;
     }
 
     fn promoteCompletedSchemaRewrite(self: *SchemaRewriteWakeJob) !void {
@@ -1546,9 +1583,35 @@ const SchemaRewriteWakeJob = struct {
     fn deinit(ptr: *anyopaque) void {
         const self: *SchemaRewriteWakeJob = @ptrCast(@alignCast(ptr));
         const alloc = std.heap.page_allocator;
+        if (self.registry) |registry| registry.release(self.table_id);
         if (self.promoted_table) |table| metadata_table_manager.freeTable(alloc, table);
         alloc.free(self.table_name);
         alloc.destroy(self);
+    }
+};
+
+const SchemaRewriteWakeRegistry = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    table_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
+
+    fn deinit(self: *SchemaRewriteWakeRegistry, alloc: std.mem.Allocator) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.table_ids.deinit(alloc);
+        self.table_ids = .empty;
+    }
+
+    fn tryAcquire(self: *SchemaRewriteWakeRegistry, alloc: std.mem.Allocator, table_id: u64) !bool {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const gop = try self.table_ids.getOrPut(alloc, table_id);
+        return !gop.found_existing;
+    }
+
+    fn release(self: *SchemaRewriteWakeRegistry, table_id: u64) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        _ = self.table_ids.remove(table_id);
     }
 };
 
@@ -2474,6 +2537,149 @@ test "api session maintenance runs schema rewrite catalog catch-up" {
     try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
 }
 
+test "api schema rewrite catalog catch-up dedupes in-flight table wakes" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+
+    const FakeSource = struct {
+        snapshot_count: std.atomic.Value(u32) = .init(0),
+        compare_count: std.atomic.Value(u32) = .init(0),
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 88,
+            .name = "audit_log",
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+            .indexes_json = "{}",
+            .replication_sources_json = "[]",
+            .placement_role = "data",
+        },
+        job: metadata_table_manager.SchemaRewriteJobRecord = .{
+            .job_id = 1,
+            .table_id = 88,
+            .group_id = 100,
+            .schema_generation = 2,
+            .action = "rewrite",
+            .reason = "row_images",
+            .start_row_key = "",
+            .state = metadata_table_manager.schema_rewrite_ready,
+        },
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .compare_and_swap_table_schema = compareAndSwapTableSchema,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.snapshot_count.fetchAdd(1, .monotonic);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = @as([*]metadata_table_manager.SchemaRewriteJobRecord, @ptrCast(&self.job))[0..1],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn compareAndSwapTableSchema(
+            ptr: *anyopaque,
+            request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
+        ) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.compare_count.fetchAdd(1, .monotonic);
+            try std.testing.expectEqual(@as(u64, 88), request.table_id);
+            try std.testing.expectEqualStrings("audit_log", request.promoted_table.name);
+        }
+    };
+
+    const FakeWrites = struct {
+        allow_finish: std.atomic.Value(bool) = .init(false),
+        pass_count: std.atomic.Value(u32) = .init(0),
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            if (!std.mem.eql(u8, table_name, "audit_log")) return error.TestUnexpectedResult;
+            if (!std.mem.eql(u8, worker_id, "api-schema-rewrite")) return error.TestUnexpectedResult;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.pass_count.fetchAdd(1, .monotonic);
+            while (!self.allow_finish.load(.acquire)) {
+                std.atomic.spinLoopHint();
+            }
+            return .{
+                .complete = true,
+                .jobs_scanned = 1,
+                .jobs_completed = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(
+        alloc,
+        .{ .backend_runtime = runtime.ptr() },
+        source.iface(),
+        null,
+        writes.iface(),
+    );
+    defer server.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), try server.runSchemaRewriteCatalogCatchupOnce());
+    try std.testing.expectEqual(@as(usize, 0), try server.runSchemaRewriteCatalogCatchupOnce());
+
+    writes.allow_finish.store(true, .release);
+    runtime.ptr().durable_jobs.drainOwner(server.schema_rewrite_wake_owner_id);
+
+    try std.testing.expectEqual(@as(u32, 2), source.snapshot_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), writes.pass_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), source.compare_count.load(.monotonic));
+}
+
 test "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs" {
     const alloc = std.testing.allocator;
     const initial_schema_json =
@@ -2953,6 +3159,7 @@ pub const ApiHttpServer = struct {
     sql_prepared_statement_runtime: SqlPreparedStatementRuntime = .{ .alloc = undefined },
     sql_routine_runtime: sql_routines.Runtime = .{ .alloc = undefined },
     schema_rewrite_wake_owner_id: u64 = 0,
+    schema_rewrite_wake_registry: SchemaRewriteWakeRegistry = .{},
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
@@ -3243,6 +3450,7 @@ pub const ApiHttpServer = struct {
                 runtime.durable_jobs.closeOwner(self.schema_rewrite_wake_owner_id);
             }
         }
+        self.schema_rewrite_wake_registry.deinit(self.alloc);
         self.mcp_sessions.deinit(self.alloc);
         self.a2a_tasks.deinit(self.alloc);
         self.txn_sessions.deinit(self.alloc);
@@ -3400,14 +3608,7 @@ pub const ApiHttpServer = struct {
             if (schemaRewriteGenerationHasInvalidJob(&snapshot, job)) continue;
             if (schemaRewriteCatchupAlreadyScheduled(scheduled_table_ids.items, job.table_id)) continue;
             const table = schemaRewriteSnapshotTableById(&snapshot, job.table_id) orelse continue;
-            try SchemaRewriteWakeJob.submitWithPromotion(
-                runtime,
-                self.schemaRewriteWakeOwnerId(runtime),
-                write_source,
-                table.name,
-                self.source,
-                table,
-            );
+            if (!try self.submitSchemaRewriteWakeForTable(runtime, write_source, table)) continue;
             try scheduled_table_ids.append(self.alloc, job.table_id);
             scheduled += 1;
         }
@@ -4215,6 +4416,29 @@ pub const ApiHttpServer = struct {
         return self.schema_rewrite_wake_owner_id;
     }
 
+    fn submitSchemaRewriteWakeForTable(
+        self: *ApiHttpServer,
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        write_source: table_writes.TableWriteSource,
+        table: metadata_table_manager.TableRecord,
+    ) !bool {
+        if (!try self.schema_rewrite_wake_registry.tryAcquire(self.alloc, table.table_id)) return false;
+        var acquired = true;
+        errdefer if (acquired) self.schema_rewrite_wake_registry.release(table.table_id);
+        try SchemaRewriteWakeJob.submitWithPromotionAndRegistry(
+            runtime,
+            self.schemaRewriteWakeOwnerId(runtime),
+            write_source,
+            table.name,
+            self.source,
+            table,
+            &self.schema_rewrite_wake_registry,
+            table.table_id,
+        );
+        acquired = false;
+        return true;
+    }
+
     fn scheduleSchemaRewriteWakeForAppliedDdl(
         self: *ApiHttpServer,
         applied: tables_api.AppliedRelationalSqlDdlRecord,
@@ -4222,14 +4446,7 @@ pub const ApiHttpServer = struct {
         if (!catalog_jobs.appliedDdlHasSchemaRewriteWork(applied)) return;
         const runtime = self.cfg.backend_runtime orelse return;
         const write_source = self.table_writes orelse return;
-        try SchemaRewriteWakeJob.submitWithPromotion(
-            runtime,
-            self.schemaRewriteWakeOwnerId(runtime),
-            write_source,
-            applied.table.name,
-            self.source,
-            applied.table,
-        );
+        _ = try self.submitSchemaRewriteWakeForTable(runtime, write_source, applied.table);
     }
 
     fn refreshSqlExtensionQueryFunctions(self: *ApiHttpServer) !void {

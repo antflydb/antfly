@@ -134,6 +134,43 @@ top-level fields outside `attrs` are still rejected by the closed relational
 schema. Top-level dynamic templates in relational schemas stay invalid; flexible
 fields belong behind an explicit `json` column.
 
+All derived-index references to relational fields use one logical path model:
+
+```text
+FieldRef{ column = "attrs", path = "billing.plan", rendered = "attrs.billing.plan" }
+```
+
+An empty `path` addresses a declared relational column. A non-empty `path`
+addresses a field below a declared `json` column. The catalog validates every
+derived-index `field`, graph `source_field` / `target_field` / `type_field` /
+`weight_field`, embedding source, JSON predicate, and JSON projection through
+that resolver. `status` resolves only to a top-level declared relational
+column; `attrs.title` resolves only when `attrs` is a declared `json` column and
+the embedded schema or scoped dynamic template permits `title`.
+
+This lets JSON/JSONB fields participate in the same document-derived artifacts
+as document-mode tables without creating a second storage model:
+
+```sql
+CREATE INDEX docs_attrs_title_fts
+  ON docs USING antfly_full_text (attrs.title);
+
+CREATE INDEX docs_attrs_body_semantic
+  ON docs USING antfly_aknn (attrs.body)
+  WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384);
+
+CREATE INDEX doc_edges_attrs_graph
+  ON doc_edges USING antfly_graph (attrs.source_doc, attrs.target_doc)
+  WITH (type_field = 'attrs.edge_type', weight_field = 'attrs.confidence');
+```
+
+PostgreSQL-style JSON expression forms such as `(attrs->>'title')`,
+`(attrs->'billing')`, `jsonb_extract_path_text(attrs, 'billing', 'plan')`, and
+`attrs #>> '{billing,plan}'` are adapter sugar only. They lower to the same
+typed `FieldRef` and typed JSON predicate/projection nodes; raw SQL expression
+text is not stored as index metadata. Unsupported, dynamic, or ambiguous JSON
+path expressions fail closed at catalog-application time.
+
 Constraints in scope: primary identity is either the existing document key or a
 declared `primary_key.columns` tuple with optional durable `primary_key.name`
 constraint metadata, including optional non-key covering payload columns;
@@ -6895,6 +6932,13 @@ reconciliation for completed work that was discovered outside the original API
 wake. Long schema rewrites preserve the promoted-table/CAS context when they
 hand remaining work back to the runtime, so request-triggered and
 maintenance-triggered wakes converge through the same durable publication path.
+The API server keeps an in-flight table-id registry for schema-rewrite wakes,
+so periodic maintenance and request-triggered DDL cannot flood the durable
+runtime with duplicate table wakes while an earlier wake is still queued or
+running. The registry entry is released by the wake job deinit path, including
+owner-close and submit-error cleanup, and long-batch resubmission transfers the
+same entry to the follow-up job instead of briefly reopening the scheduling
+window.
 Service-level SQL table-drop records carry the same three typed table work
 items as applied drop-table fingerprints, so callers do not have to infer
 derived-artifact rebuild, constraint validation, and row-image rewrite work from
@@ -7040,6 +7084,38 @@ projects them into the same derived full-text/path-fact/algebraic artifacts used
 for document tables. The JSON cell itself remains stored only in the relational
 base row and is reprojected from that row during replay/backfill.
 
+The same prefixed path model applies to all multimodal derived indexes. A
+full-text config with `field = "attrs.title"` tokenizes that embedded JSON
+field. A managed embedding config with `field = "attrs.description"` reads text
+from the committed JSON cell, runs the configured enrichment, and publishes an
+embedding artifact under the index generation. An external vector config with
+`field = "attrs.embedding"` validates that the JSON value is a numeric array
+with the configured dimension before writing vector index state. A graph config
+may reference `attrs.source`, `attrs.target`, `attrs.edge_type`, and
+`attrs.weight` as scalar JSON paths. Algebraic/path-fact projection uses the
+same embedded schema and dynamic-template rules to decide which JSON paths are
+fact-bearing. In every case, the base row remains authoritative and the derived
+artifact is disposable.
+
+Write execution follows the ordinary relational write boundary:
+
+1. Validate the closed top-level relational row.
+2. Store the packed relational row and relational column entries.
+3. For each declared `json` column, project permitted embedded paths using the
+   compiled `FieldRef` resolver.
+4. Feed those projected values to existing full-text, embedding, graph,
+   algebraic, JSON path, and JSON value index builders.
+5. Publish only after the derived generation has caught up to the committed
+   base-row generation.
+
+Read execution intersects derived JSON candidates with relational predicates
+and then rechecks/materializes from the authoritative row. For example,
+`WHERE attrs->>'plan' = 'pro' AND status = 'active'` lowers to a
+`json_path_eq(field = "attrs", path = "plan", value = "pro")` predicate plus a
+relational scalar predicate on `status`. Search over `attrs.title` uses the
+full-text index field `attrs.title`, intersects any top-level relational
+filters by document id, and hydrates `include_stored` from the packed row.
+
 Changing a JSON column's embedded `schema` or `dynamic_templates` is therefore
 a derived-index schema update, not a row migration. This follows the same
 user-facing model as document-store `jsonschema` updates: commit the new schema
@@ -7077,6 +7153,15 @@ The production invariants are:
 - embedded JSON indexes are disposable and never accept writes that bypass the
   relational row;
 - new derived index generations are built from committed relational rows;
+- derived-index field references must resolve to either a declared relational
+  column or a permitted path below a declared `json` column;
+- full-text and managed-embedding JSON paths must resolve to text-compatible
+  values;
+- external vector JSON paths must resolve to numeric arrays with the configured
+  dimension;
+- graph JSON paths must resolve to keyword/text-compatible source and target
+  values, with optional type and weight paths validated against string/numeric
+  domains;
 - query planners only advertise index-served JSON paths after the matching
   generation is complete, or otherwise fall back/report pending capability;
 - stale JSON-subdocument artifacts are safe to drop because they contain no
@@ -7172,6 +7257,59 @@ user-supplied typed vector column. These paths are compatible with pgvector and
 ParadeDB-style SQL because they operate on already-materialized table columns.
 They do not create hidden enrichment jobs.
 
+#### Embedded JSON field indexes
+
+`json` / `jsonb` columns can be indexed as embedded document fields through the
+same derived-index methods. The durable catalog does not distinguish a
+document-mode field from a relational embedded JSON field after resolution; both
+become a typed field path plus index-specific config. The difference is that a
+relational embedded field is always re-read from the packed relational row and
+is scoped below one declared JSON column.
+
+Simple path syntax is preferred for Antfly-owned SQL:
+
+```sql
+CREATE INDEX docs_attrs_title_fts
+  ON docs USING antfly_full_text (attrs.title)
+  WITH (analyzer = 'standard');
+
+CREATE INDEX docs_attrs_embedding_hnsw
+  ON docs USING hnsw (attrs.embedding vector_cosine_ops)
+  WITH (dimension = 1536);
+
+CREATE INDEX docs_attrs_summary_semantic
+  ON docs USING antfly_aknn (attrs.summary)
+  WITH (embedding_name = 'attrs_summary_v1', model = 'text-embedding-3-small', dimension = 384);
+
+CREATE INDEX doc_edges_attrs_graph
+  ON doc_edges USING antfly_graph (attrs.source_doc, attrs.target_doc)
+  WITH (type_field = 'attrs.edge_type', weight_field = 'attrs.confidence', edge_policy = 'all');
+```
+
+PostgreSQL JSONB expression syntax is accepted only when the adapter can reduce
+it to the same static field path:
+
+```sql
+CREATE INDEX docs_attrs_title_fts
+  ON docs USING antfly_full_text ((attrs->>'title'));
+
+CREATE INDEX docs_attrs_plan_fts
+  ON docs USING antfly_full_text ((jsonb_extract_path_text(attrs, 'billing', 'plan')));
+```
+
+The lowerer stores neither `attrs->>'title'` nor
+`jsonb_extract_path_text(...)` as SQL text. It stores `field =
+"attrs.title"` or `field = "attrs.billing.plan"` after catalog validation. Path
+segments must be string literals or identifier path elements known at DDL time;
+runtime-computed JSON paths, wildcard JSONPath expressions, and expressions that
+return non-scalar objects for scalar-only index types fail closed.
+
+This also gives REST/SDK callers the same surface. Index configs may reference
+`attrs.title`, query filters may use native `json_path_eq` /
+`json_path_exists` / `json_contains`, and projections may use typed JSON
+extract nodes. SQL operators such as `->`, `->>`, `#>`, `#>>`, `@>`, and
+`jsonb_extract_path[_text]` remain adapter sugar over those typed requests.
+
 #### Managed AKNN indexes and automatic embeddings
 
 For automatic embeddings, the SQL surface should not pretend that an embedding
@@ -7260,7 +7398,7 @@ ALTER GRAPH INDEX docs_rel_graph
     max_iterations = 40,
     tolerance = 0.000001,
     edge_types = ARRAY['cites', 'references'],
-    publish = 'on_convergence'
+    publish = 'after_max_iterations'
   );
 ```
 
@@ -7268,9 +7406,11 @@ The metric config belongs to the graph index because metric values are only
 meaningful for a specific graph projection, edge filter, weighting policy, and
 generation. Reads that require a metric before the first qualifying generation
 is published return `MetricNotReady`, not an empty result. Fixed-iteration
-non-converged PageRank should not publish by default; it can be surfaced as a
-diagnostic or explicitly enabled later with a policy such as
-`publish = 'after_max_iterations'`.
+non-converged PageRank publishes by default with `converged: false`,
+`iterations_completed`, and `delta` metadata, matching the graph metric
+roadmap's PageRank-first policy. If a future metric family needs strict
+convergence-only behavior, it should opt out explicitly with documented
+behavior rather than changing the default for PageRank-compatible metrics.
 
 For the first version, old metric generations should be cleaned up immediately
 after the replacement generation is published and no reader holds it. Long-term,

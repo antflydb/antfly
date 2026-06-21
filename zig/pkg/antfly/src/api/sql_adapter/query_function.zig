@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const db_mod = @import("../../storage/db/mod.zig");
 const query_contract = @import("../query_contract.zig");
 const lexer_mod = @import("lexer.zig");
 const token_mod = @import("token.zig");
@@ -832,4 +833,301 @@ fn appendCommonAntflyQueryFunctionOptions(
     if (antflyQueryFunctionNumberArg(args, "offset")) |offset| try appendAntflySqlJsonNumberField(alloc, out, first, "offset", offset);
     if (antflyQueryFunctionBoolArg(args, "profile")) |profile| try appendAntflySqlJsonBoolField(alloc, out, first, "profile", profile);
     if (antflyQueryFunctionBoolArg(args, "include_stored")) |include_stored| try appendAntflySqlJsonBoolField(alloc, out, first, "include_stored", include_stored);
+}
+
+test "sql adapter query function lowers antfly query functions into native search requests" {
+    const alloc = std.testing.allocator;
+
+    const Resolver = struct {
+        fn resolve(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            semantic_search: []const u8,
+            embedding_template: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expect(index_name.len > 0);
+            try std.testing.expect(semantic_search.len > 0);
+            try std.testing.expect(embedding_template == null or embedding_template.?.len > 0);
+            return .{
+                .vector = try allocator.dupe(f32, &[_]f32{ 0.25, 0.5, 0.75 }),
+                .k = limit,
+            };
+        }
+    };
+    var resolver_state: u8 = 0;
+    const resolver = query_contract.SemanticResolver{
+        .ptr = &resolver_state,
+        .vtable = &.{ .resolve_dense_query = Resolver.resolve },
+    };
+
+    var full_text = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5);",
+    );
+    defer full_text.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), full_text.req.limit);
+    try std.testing.expectEqualStrings("docs_body_fts", full_text.req.primary_text_index_name.?);
+    try std.testing.expect(full_text.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", full_text.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("refund policy", full_text.req.full_text.?.match.text);
+
+    var semantic = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        resolver,
+        "SELECT * FROM antfly.semantic_search(table => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7);",
+    );
+    defer semantic.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), semantic.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_body_semantic", semantic.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(u32, 7), semantic.req.dense_queries[0].query.k);
+    try std.testing.expectEqual(@as(usize, 3), semantic.req.dense_queries[0].query.vector.len);
+
+    var vector = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.vector_search(table_name = 'docs', index = 'docs_embedding_hnsw', vector = '[1.0,0.0,0.5]', limit = 3);",
+    );
+    defer vector.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), vector.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_embedding_hnsw", vector.req.dense_queries[0].index_name);
+    try std.testing.expectEqual(@as(u32, 3), vector.req.dense_queries[0].query.k);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), vector.req.dense_queries[0].query.vector[2], 0.0001);
+
+    var traverse = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', edge_types => 'cites, references', max_depth => 2, max_results => 11, metrics => 'pagerank', freshness => 'fresh', include_metric_status => true, include_paths => true);",
+    );
+    defer traverse.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), traverse.req.graph_queries.len);
+    try std.testing.expectEqualStrings("citation_walk", traverse.req.graph_queries[0].name);
+    const traverse_query = traverse.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(traverse_query.query_type), .traverse), traverse_query.query_type);
+    try std.testing.expectEqualStrings("docs_edge_graph", traverse_query.index_name);
+    switch (traverse_query.start_nodes) {
+        .keys => |keys| {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings("doc:root", keys[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(@TypeOf(traverse_query.params.direction), .out), traverse_query.params.direction);
+    try std.testing.expectEqual(@as(u32, 2), traverse_query.params.max_depth);
+    try std.testing.expectEqual(@as(u32, 11), traverse_query.params.max_results);
+    try std.testing.expectEqual(@as(usize, 2), traverse_query.params.edge_types.len);
+    try std.testing.expectEqualStrings("cites", traverse_query.params.edge_types[0]);
+    try std.testing.expectEqualStrings("references", traverse_query.params.edge_types[1]);
+    try std.testing.expect(traverse_query.params.include_paths);
+    try std.testing.expect(traverse_query.include_metric_status);
+    try std.testing.expectEqual(@as(usize, 1), traverse_query.metrics.len);
+    try std.testing.expectEqualStrings("pagerank", traverse_query.metrics[0].name);
+    try std.testing.expect(traverse_query.metrics[0].freshness == .fresh);
+
+    var shortest_path = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', direction => 'both', max_depth => 4, weight_mode => 'min_weight');",
+    );
+    defer shortest_path.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), shortest_path.req.graph_queries.len);
+    const shortest_path_query = shortest_path.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(shortest_path_query.query_type), .shortest_path), shortest_path_query.query_type);
+    try std.testing.expectEqual(@as(@TypeOf(shortest_path_query.params.direction), .both), shortest_path_query.params.direction);
+    try std.testing.expectEqual(@as(u32, 4), shortest_path_query.params.max_depth);
+    try std.testing.expectEqual(@as(@TypeOf(shortest_path_query.params.weight_mode), .min_weight), shortest_path_query.params.weight_mode);
+    const shortest_path_target = shortest_path_query.target_nodes orelse return error.TestUnexpectedResult;
+    switch (shortest_path_target) {
+        .keys => |keys| {
+            try std.testing.expectEqual(@as(usize, 1), keys.len);
+            try std.testing.expectEqualStrings("doc:z", keys[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var k_shortest_paths = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', result_ref => '$full_text_results', target_result_ref => '$graph_results.targets', start_limit => 5, target_limit => 2, k => 3, max_depth => 6);",
+    );
+    defer k_shortest_paths.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), k_shortest_paths.req.graph_queries.len);
+    const k_shortest_paths_query = k_shortest_paths.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(k_shortest_paths_query.query_type), .k_shortest_paths), k_shortest_paths_query.query_type);
+    try std.testing.expectEqual(@as(u32, 3), k_shortest_paths_query.k);
+    try std.testing.expectEqual(@as(u32, 6), k_shortest_paths_query.params.max_depth);
+    switch (k_shortest_paths_query.start_nodes) {
+        .result_ref => |ref| {
+            try std.testing.expectEqualStrings("$full_text_results", ref.ref);
+            try std.testing.expectEqual(@as(u32, 5), ref.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (k_shortest_paths_query.target_nodes orelse return error.TestUnexpectedResult) {
+        .result_ref => |ref| {
+            try std.testing.expectEqualStrings("$graph_results.targets", ref.ref);
+            try std.testing.expectEqual(@as(u32, 2), ref.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_match = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites|references*1..3]->(b)<-[:mentions]-(c)', return => 'b,c', metrics => 'pagerank', order_metric => 'pagerank', order_direction => 'desc', order_nulls => 'last', where_metric => 'pagerank', where_op => '>=', where_value => 0.25, freshness => 'published', include_metric_status => true, fields => 'title,url', max_results => 17);",
+    );
+    defer graph_match.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), graph_match.req.graph_queries.len);
+    try std.testing.expectEqualStrings("citation_pattern", graph_match.req.graph_queries[0].name);
+    const graph_match_query = graph_match.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.query_type), .pattern), graph_match_query.query_type);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_match_query.index_name);
+    try std.testing.expectEqual(@as(usize, 3), graph_match_query.pattern.len);
+    try std.testing.expectEqualStrings("a", graph_match_query.pattern[0].alias);
+    try std.testing.expectEqualStrings("b", graph_match_query.pattern[1].alias);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.pattern[1].edge.direction), .out), graph_match_query.pattern[1].edge.direction);
+    try std.testing.expectEqual(@as(u32, 1), graph_match_query.pattern[1].edge.min_hops);
+    try std.testing.expectEqual(@as(u32, 3), graph_match_query.pattern[1].edge.max_hops);
+    try std.testing.expectEqual(@as(usize, 2), graph_match_query.pattern[1].edge.types.len);
+    try std.testing.expectEqualStrings("cites", graph_match_query.pattern[1].edge.types[0]);
+    try std.testing.expectEqualStrings("references", graph_match_query.pattern[1].edge.types[1]);
+    try std.testing.expectEqualStrings("c", graph_match_query.pattern[2].alias);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.pattern[2].edge.direction), .in), graph_match_query.pattern[2].edge.direction);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_query.pattern[2].edge.types.len);
+    try std.testing.expectEqualStrings("mentions", graph_match_query.pattern[2].edge.types[0]);
+    try std.testing.expectEqual(@as(usize, 2), graph_match_query.return_aliases.len);
+    try std.testing.expectEqualStrings("b", graph_match_query.return_aliases[0]);
+    try std.testing.expectEqualStrings("c", graph_match_query.return_aliases[1]);
+    try std.testing.expectEqual(@as(u32, 17), graph_match_query.params.max_results);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_query.metrics.len);
+    try std.testing.expectEqualStrings("pagerank", graph_match_query.metrics[0].name);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_query.order_by.len);
+    try std.testing.expectEqualStrings("pagerank", graph_match_query.order_by[0].name);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.order_by[0].direction), .desc), graph_match_query.order_by[0].direction);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.order_by[0].nulls), .last), graph_match_query.order_by[0].nulls);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_query.where_metric.len);
+    try std.testing.expectEqualStrings("pagerank", graph_match_query.where_metric[0].name);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_query.where_metric[0].op), .gte), graph_match_query.where_metric[0].op);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), graph_match_query.where_metric[0].value, 0.0001);
+    try std.testing.expectEqual(@as(usize, 2), graph_match_query.fields.len);
+    try std.testing.expectEqualStrings("title", graph_match_query.fields[0]);
+    try std.testing.expectEqualStrings("url", graph_match_query.fields[1]);
+    try std.testing.expect(graph_match_query.include_metric_status);
+
+    var graph_match_ref = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_match(table_name => 'docs', graph_index => 'docs_edge_graph', result_ref => '$full_text_results', start_limit => 4, pattern => '(seed)--(neighbor)', return_aliases => 'neighbor');",
+    );
+    defer graph_match_ref.deinit(alloc);
+    const graph_match_ref_query = graph_match_ref.req.graph_queries[0].query;
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_ref_query.query_type), .pattern), graph_match_ref_query.query_type);
+    switch (graph_match_ref_query.start_nodes) {
+        .result_ref => |ref| {
+            try std.testing.expectEqualStrings("$full_text_results", ref.ref);
+            try std.testing.expectEqual(@as(u32, 4), ref.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 2), graph_match_ref_query.pattern.len);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_ref_query.pattern[1].edge.direction), .both), graph_match_ref_query.pattern[1].edge.direction);
+    try std.testing.expectEqualStrings("neighbor", graph_match_ref_query.return_aliases[0]);
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a:Document)-[:cites]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites|]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*0]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*3..1]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', where_metric => 'pagerank', where_op => '>=');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', order_direction => 'desc');",
+        ),
+    );
+
+    var graph_metric = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh');",
+    );
+    defer graph_metric.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), graph_metric.req.graph_metric_queries.len);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_metric.req.graph_metric_queries[0].query.index_name);
+    try std.testing.expectEqualStrings("pagerank", graph_metric.req.graph_metric_queries[0].query.metric_name);
+    try std.testing.expectEqual(@as(u32, 2), graph_metric.req.graph_metric_queries[0].query.top_k);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, graph_metric.req.graph_metric_queries[0].query.freshness);
+
+    var rerank = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        null,
+        "SELECT * FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25);",
+    );
+    defer rerank.deinit(alloc);
+    try std.testing.expectEqualStrings("docs_body_fts", rerank.req.primary_text_index_name.?);
+    try std.testing.expect(rerank.req.graph_metric_rerank != null);
+    try std.testing.expectEqualStrings("docs_edge_graph", rerank.req.graph_metric_rerank.?.index_name);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), rerank.req.graph_metric_rerank.?.weight, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), rerank.req.graph_metric_rerank.?.base_weight, 0.0001);
+
+    var hybrid = try lowerAntflyQueryFunctionSqlAlloc(
+        alloc,
+        resolver,
+        "SELECT * FROM antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9);",
+    );
+    defer hybrid.deinit(alloc);
+    try std.testing.expectEqualStrings("docs_body_fts", hybrid.req.primary_text_index_name.?);
+    try std.testing.expect(hybrid.req.full_text != null);
+    try std.testing.expectEqual(@as(usize, 1), hybrid.req.dense_queries.len);
+    try std.testing.expect(hybrid.req.graph_metric_rerank != null);
+    try std.testing.expect(hybrid.req.merge_config != null);
+    try std.testing.expectEqual(@as(u32, 9), hybrid.req.limit);
 }

@@ -5038,7 +5038,7 @@ fn derivedIndexConfigJsonAlloc(
             try appendJsonStringField(alloc, &out, &first, "graph_index", derivedIndexOptionString(options, "graph_index") orelse return error.UnsupportedSqlShape);
             try appendJsonStringField(alloc, &out, &first, "metric", derivedIndexOptionString(options, "metric") orelse return error.UnsupportedSqlShape);
             try appendJsonStringField(alloc, &out, &first, "metric_freshness", derivedIndexOptionString(options, "metric_freshness") orelse "published");
-            try appendJsonStringField(alloc, &out, &first, "publish", derivedIndexOptionString(options, "publish") orelse "on_convergence");
+            try appendJsonStringField(alloc, &out, &first, "publish", derivedIndexOptionString(options, "publish") orelse "after_max_iterations");
         },
         .antfly_hybrid => {
             try appendJsonStringField(alloc, &out, &first, "type", "hybrid");
@@ -7459,7 +7459,7 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph_metric\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"pagerank\"") != null);
-            try std.testing.expect(std.mem.indexOf(u8, config, "\"publish\":\"on_convergence\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"publish\":\"after_max_iterations\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);
         },
@@ -8099,6 +8099,789 @@ test "sql adapter ddl plan lowers create index ddl" {
         .create_update_policy => return error.TestUnexpectedResult,
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "sql adapter ddl plan lowers alter table ddl" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\ALTER TABLE usage_records
+        \\  ADD COLUMN metadata jsonb DEFAULT '{"source":"migration"}',
+        \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
+        \\  ADD CONSTRAINT usage_records_tenant_status_key UNIQUE (tenant_id, status),
+        \\  ADD CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) MATCH FULL ON DELETE SET NULL,
+        \\  ADD CONSTRAINT usage_records_amount_check CHECK (amount >= 0);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expect(!plan.if_exists);
+            try std.testing.expectEqual(@as(usize, 5), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_column => |add_column| {
+                    try std.testing.expectEqualStrings("metadata", add_column.column.name);
+                    try std.testing.expectEqual(runtime_schema.AntflyType.json, add_column.column.field_type);
+                    try std.testing.expect(add_column.column.default_value != null);
+                    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, add_column.column.default_value.?.kind);
+                    try std.testing.expectEqualStrings("{\"source\":\"migration\"}", add_column.column.default_value.?.value_json);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[1]) {
+                .add_column => |add_column| {
+                    try std.testing.expectEqualStrings("tenant_status_key", add_column.column.name);
+                    try std.testing.expect(add_column.column.generated != null);
+                    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, add_column.column.generated.?.op);
+                    try std.testing.expectEqual(@as(usize, 2), add_column.column.generated.?.fields.len);
+                    try std.testing.expectEqualStrings("tenant_id", add_column.column.generated.?.fields[0]);
+                    try std.testing.expectEqualStrings("status", add_column.column.generated.?.fields[1]);
+                    try std.testing.expectEqualStrings(":", add_column.column.generated.?.separator);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[2]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_tenant_status_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", constraint.columns[0]);
+                    try std.testing.expectEqualStrings("status", constraint.columns[1]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[3]) {
+                .add_foreign_key => |foreign_key| {
+                    try std.testing.expectEqualStrings("usage_records_tenant_fkey", foreign_key.name);
+                    try std.testing.expectEqualStrings("tenant_id", foreign_key.child_columns[0]);
+                    try std.testing.expectEqualStrings("tenants", foreign_key.parent_table);
+                    try std.testing.expectEqualStrings("id", foreign_key.parent_columns[0]);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyMatch.full, foreign_key.match);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, foreign_key.on_delete);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyValidationState.unvalidated, foreign_key.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+            switch (plan.operations[4]) {
+                .add_check => |check| {
+                    try std.testing.expectEqualStrings("usage_records_amount_check", check.name);
+                    try std.testing.expectEqualStrings("amount", check.field);
+                    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, check.op);
+                    try std.testing.expectEqualStrings("0", check.value_json.?);
+                    try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, check.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var if_exists = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE IF EXISTS usage_records ADD COLUMN optional_status text;",
+    );
+    defer if_exists.deinit(alloc);
+    switch (if_exists) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expect(plan.if_exists);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var explicit_nulls_distinct_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+    );
+    defer explicit_nulls_distinct_unique.deinit(alloc);
+    switch (explicit_nulls_distinct_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 1), constraint.columns.len);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE NULLS NOT DISTINCT (email);",
+    );
+    defer nulls_not_distinct_unique.deinit(alloc);
+    switch (nulls_not_distinct_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expect(constraint.nulls_not_distinct);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var deferrable_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE INITIALLY DEFERRED;",
+    );
+    defer deferrable_unique.deinit(alloc);
+    switch (deferrable_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expect(constraint.deferrable);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, constraint.timing);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var explicit_covering_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (tenant_id, status) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+    );
+    defer explicit_covering_unique.deinit(alloc);
+    switch (explicit_covering_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_cover_key", constraint.name);
+                    try std.testing.expectEqual(@as(usize, 1), constraint.columns.len);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expectEqual(@as(usize, 2), constraint.include_columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", constraint.include_columns[0]);
+                    try std.testing.expectEqualStrings("status", constraint.include_columns[1]);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (email);",
+    ));
+
+    var explicit_primary_key_timing = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+    );
+    defer explicit_primary_key_timing.deinit(alloc);
+    switch (explicit_primary_key_timing) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_stage", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_primary_key => |primary_key| {
+                    try std.testing.expectEqualStrings("usage_stage_pk", primary_key.name.?);
+                    try std.testing.expectEqual(@as(usize, 2), primary_key.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", primary_key.columns[0]);
+                    try std.testing.expectEqualStrings("id", primary_key.columns[1]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var deferrable_primary_key = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE INITIALLY DEFERRED;",
+    );
+    defer deferrable_primary_key.deinit(alloc);
+    switch (deferrable_primary_key) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_stage", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_primary_key => |primary_key| {
+                    try std.testing.expectEqualStrings("usage_stage_pk", primary_key.name.?);
+                    try std.testing.expectEqual(@as(usize, 2), primary_key.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", primary_key.columns[0]);
+                    try std.testing.expectEqualStrings("id", primary_key.columns[1]);
+                    try std.testing.expect(primary_key.deferrable);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.deferred, primary_key.timing);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var explicit_covering_primary_key = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (status) NOT DEFERRABLE INITIALLY IMMEDIATE;",
+    );
+    defer explicit_covering_primary_key.deinit(alloc);
+    switch (explicit_covering_primary_key) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_stage", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_primary_key => |primary_key| {
+                    try std.testing.expectEqualStrings("usage_stage_pk", primary_key.name.?);
+                    try std.testing.expectEqual(@as(usize, 2), primary_key.columns.len);
+                    try std.testing.expectEqualStrings("tenant_id", primary_key.columns[0]);
+                    try std.testing.expectEqualStrings("id", primary_key.columns[1]);
+                    try std.testing.expectEqual(@as(usize, 1), primary_key.include_columns.len);
+                    try std.testing.expectEqualStrings("status", primary_key.include_columns[0]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) INCLUDE (id);",
+    ));
+
+    var drop_column = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records DROP COLUMN IF EXISTS metadata RESTRICT",
+    );
+    defer drop_column.deinit(alloc);
+    switch (drop_column) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .drop_column => |drop| {
+                    try std.testing.expectEqualStrings("metadata", drop.name);
+                    try std.testing.expect(drop.if_exists);
+                    try std.testing.expectEqual(DropDependencyMode.restrict, drop.dependency_mode);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_constraint = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records DROP CONSTRAINT IF EXISTS usage_records_amount_check CASCADE",
+    );
+    defer drop_constraint.deinit(alloc);
+    switch (drop_constraint) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .drop_constraint => |drop| {
+                    try std.testing.expectEqualStrings("usage_records_amount_check", drop.name);
+                    try std.testing.expect(drop.if_exists);
+                    try std.testing.expectEqual(DropDependencyMode.cascade, drop.dependency_mode);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_default = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'pending'",
+    );
+    defer set_default.deinit(alloc);
+    switch (set_default) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .alter_column_default => |operation| {
+                    try std.testing.expectEqualStrings("status", operation.column_name);
+                    try std.testing.expect(operation.default_value != null);
+                    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, operation.default_value.?.kind);
+                    try std.testing.expectEqualStrings("\"pending\"", operation.default_value.?.value_json);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_default = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER status DROP DEFAULT",
+    );
+    defer drop_default.deinit(alloc);
+    switch (drop_default) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_default => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expect(operation.default_value == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_not_null = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL",
+    );
+    defer set_not_null.deinit(alloc);
+    switch (set_not_null) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_nullability => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expect(!operation.nullable);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_not_null = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER status DROP NOT NULL",
+    );
+    defer drop_not_null.deinit(alloc);
+    switch (drop_not_null) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_nullability => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expect(operation.nullable);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_type = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER COLUMN status TYPE varchar(64)",
+    );
+    defer alter_type.deinit(alloc);
+    switch (alter_type) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_type => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expectEqual(runtime_schema.AntflyType.keyword, operation.field_type);
+                try std.testing.expect(operation.array_item_type == null);
+                try std.testing.expect(operation.collation == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_type_collated = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER COLUMN status TYPE text COLLATE \"C\"",
+    );
+    defer alter_type_collated.deinit(alloc);
+    switch (alter_type_collated) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_type => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expectEqual(runtime_schema.AntflyType.keyword, operation.field_type);
+                try std.testing.expect(operation.array_item_type == null);
+                try std.testing.expectEqualStrings("C", operation.collation.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_set_data_type = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER status SET DATA TYPE text[]",
+    );
+    defer alter_set_data_type.deinit(alloc);
+    switch (alter_set_data_type) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_type => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expectEqual(runtime_schema.AntflyType.array, operation.field_type);
+                try std.testing.expectEqual(runtime_schema.AntflyType.keyword, operation.array_item_type.?);
+                try std.testing.expect(operation.collation == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_set_data_type_collated = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER status SET DATA TYPE text COLLATE \"C\"",
+    );
+    defer alter_set_data_type_collated.deinit(alloc);
+    switch (alter_set_data_type_collated) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .alter_column_type => |operation| {
+                try std.testing.expectEqualStrings("status", operation.column_name);
+                try std.testing.expectEqual(runtime_schema.AntflyType.keyword, operation.field_type);
+                try std.testing.expect(operation.array_item_type == null);
+                try std.testing.expectEqualStrings("C", operation.collation.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rename_column = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records RENAME COLUMN status TO state",
+    );
+    defer rename_column.deinit(alloc);
+    switch (rename_column) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .rename_column => |operation| {
+                try std.testing.expectEqualStrings("status", operation.old_name);
+                try std.testing.expectEqualStrings("state", operation.new_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rename_constraint = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_amount_check TO usage_records_quantity_check",
+    );
+    defer rename_constraint.deinit(alloc);
+    switch (rename_constraint) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .rename_constraint => |operation| {
+                try std.testing.expectEqualStrings("usage_records_amount_check", operation.old_name);
+                try std.testing.expectEqualStrings("usage_records_quantity_check", operation.new_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+    var upper_generated = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN email_upper_key text GENERATED ALWAYS AS (upper(tenant_id)) STORED",
+    );
+    defer upper_generated.deinit(alloc);
+    switch (upper_generated) {
+        .alter_table => |plan| switch (plan.operations[0]) {
+            .add_column => |operation| {
+                try std.testing.expectEqualStrings("email_upper_key", operation.column.name);
+                try std.testing.expect(operation.column.generated != null);
+                try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, operation.column.generated.?.op);
+                try std.testing.expectEqualStrings("tenant_id", operation.column.generated.?.field.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers alter table constraint validation ddl" {
+    const alloc = std.testing.allocator;
+
+    var add_check = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_amount_check CHECK (amount >= 0) NOT VALID;",
+    );
+    defer add_check.deinit(alloc);
+    switch (add_check) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_check => |check| {
+                    try std.testing.expectEqualStrings("usage_records_amount_check", check.name);
+                    try std.testing.expectEqualStrings("amount", check.field);
+                    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, check.op);
+                    try std.testing.expectEqualStrings("0", check.value_json.?);
+                    try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, check.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var validate = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_amount_check;",
+    );
+    defer validate.deinit(alloc);
+    switch (validate) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .validate_constraint => |constraint_name| try std.testing.expectEqualStrings("usage_records_amount_check", constraint_name),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers additive inline foreign key column ddl" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD COLUMN IF NOT EXISTS cloud_instance_id UUID REFERENCES cloud_instances(id) ON DELETE CASCADE;",
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_column => |add_column| {
+                    try std.testing.expect(add_column.if_not_exists);
+                    try std.testing.expectEqualStrings("cloud_instance_id", add_column.column.name);
+                    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, add_column.column.field_type);
+                    try std.testing.expectEqual(@as(usize, 1), add_column.foreign_keys.len);
+                    const foreign_key = add_column.foreign_keys[0];
+                    try std.testing.expectEqualStrings("cloud_instances_cloud_instance_id_fkey", foreign_key.name);
+                    try std.testing.expectEqualStrings("cloud_instance_id", foreign_key.child_columns[0]);
+                    try std.testing.expectEqualStrings("cloud_instances", foreign_key.parent_table);
+                    try std.testing.expectEqualStrings("id", foreign_key.parent_columns[0]);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, foreign_key.on_delete);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyValidationState.unvalidated, foreign_key.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var named = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE import_jobs ADD COLUMN cloud_instance_table_id uuid CONSTRAINT import_jobs_instance_table_fkey REFERENCES cloud_instance_tables(id) ON DELETE CASCADE;",
+    );
+    defer named.deinit(alloc);
+    switch (named) {
+        .alter_table => |plan| {
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_column => |add_column| {
+                    try std.testing.expect(!add_column.if_not_exists);
+                    try std.testing.expectEqualStrings("cloud_instance_table_id", add_column.column.name);
+                    try std.testing.expectEqual(@as(usize, 1), add_column.foreign_keys.len);
+                    const foreign_key = add_column.foreign_keys[0];
+                    try std.testing.expectEqualStrings("import_jobs_instance_table_fkey", foreign_key.name);
+                    try std.testing.expectEqualStrings("cloud_instance_table_id", foreign_key.child_columns[0]);
+                    try std.testing.expectEqualStrings("cloud_instance_tables", foreign_key.parent_table);
+                    try std.testing.expectEqual(runtime_schema.ForeignKeyValidationState.unvalidated, foreign_key.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers updated-at trigger ddl into typed update policy" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records FOR EACH ROW EXECUTE FUNCTION public.touch_updated_at('updated_at_ns');",
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_update_policy => |plan| {
+            try std.testing.expectEqualStrings("update_timestamp", plan.trigger_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqualStrings("updated_at_ns", plan.column_name);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.on_update_value.kind);
+            try std.testing.expectEqualStrings("", plan.on_update_value.value_json);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var default_column = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE PROCEDURE set_updated_at();",
+    );
+    defer default_column.deinit(alloc);
+    switch (default_column) {
+        .create_update_policy => |plan| {
+            try std.testing.expectEqualStrings("updated_at", plan.column_name);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var replace_trigger = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE OR REPLACE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns')",
+    );
+    defer replace_trigger.deinit(alloc);
+    switch (replace_trigger) {
+        .create_update_policy => |plan| {
+            try std.testing.expectEqualStrings("update_timestamp", plan.trigger_name);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqualStrings("updated_at_ns", plan.column_name);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.on_update_value.kind);
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_trigger = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "DROP TRIGGER IF EXISTS update_timestamp ON ONLY public.usage_records RESTRICT;",
+    );
+    defer drop_trigger.deinit(alloc);
+    switch (drop_trigger) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .drop_update_policy => |drop_update_policy| {
+                    try std.testing.expectEqualStrings("update_timestamp", drop_update_policy.trigger_name);
+                    try std.testing.expect(drop_update_policy.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        .create_table => return error.TestUnexpectedResult,
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE INSERT ON usage_records EXECUTE FUNCTION touch_updated_at()",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
+    ));
 }
 
 test "sql adapter ddl plan preserves named inline create table constraints" {

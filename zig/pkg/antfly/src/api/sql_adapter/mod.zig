@@ -2535,5 +2535,6 @@ test {
     _ = ddl_plan;
     _ = lower_dml;
     _ = plan;
+    _ = query_function;
     _ = strings;
 }
