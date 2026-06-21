@@ -350,6 +350,18 @@ The Go package exposes constants such as
 `antflylite.InferenceModeDisabledDeferred` for branching on status or
 capability responses without hard-coding JSON strings.
 
+## Embedded App Templates
+
+The repository includes runnable Lite templates:
+
+- `examples/antfly-lite-go`: minimal open, write, lookup, status, and backup.
+- `examples/antfly-lite-retrieval-go`: schema, full-text index, dense vector
+  index with caller-supplied embeddings, full-text search, dense search, hybrid
+  search, status, and portable backup.
+
+Both examples are gated by `zig build lite-core` against the built
+`libantflylite` C ABI.
+
 ## Build Profiles
 
 The repository exposes focused Lite build profiles:
