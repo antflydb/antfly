@@ -48,6 +48,31 @@ func containsString(values []string, value string) bool {
 	return false
 }
 
+func TestLiteOpenReadOnlyMissingDoesNotCreate(t *testing.T) {
+	for name, open := range map[string]func(string) (*DB, error){
+		"readonly":    OpenReadonly,
+		"status-only": OpenStatusOnly,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), name+".aflite")
+			db, err := open(path)
+			if err != NotFound {
+				if db != nil {
+					db.Close()
+				}
+				t.Fatalf("open missing %s database error = %v, want %v", name, err, NotFound)
+			}
+			if db != nil {
+				db.Close()
+				t.Fatalf("open missing %s database returned a handle", name)
+			}
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("missing %s open created or exposed file: stat err = %v", name, statErr)
+			}
+		})
+	}
+}
+
 func TestLiteOpenModeConcurrency(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "go-open-modes.aflite")
 

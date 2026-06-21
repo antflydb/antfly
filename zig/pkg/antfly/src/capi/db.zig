@@ -191,6 +191,13 @@ fn cleanupTestFile(path: []const u8) void {
     std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch {};
 }
 
+fn testPathExists(path: []const u8) bool {
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch return false;
+    return true;
+}
+
 fn beginWithIdAndParticipants(
     handle: *Handle,
     txn_id: transactions_mod.TxnId,
@@ -6313,6 +6320,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(plain_path);
     const invalid_lite_path = try tempTestPath(alloc, "capi-lite-invalid");
     defer alloc.free(invalid_lite_path);
+    const missing_readonly_path = try tempTestAflitePath(alloc, "capi-lite-missing-readonly");
+    defer alloc.free(missing_readonly_path);
+    const missing_status_path = try tempTestAflitePath(alloc, "capi-lite-missing-status");
+    defer alloc.free(missing_status_path);
     const short_lite_path = try tempTestAflitePath(alloc, "capi-lite-short");
     defer alloc.free(short_lite_path);
     const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
@@ -6347,6 +6358,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(invalid_snapshot_file_path);
     cleanupTestDir(plain_path);
     cleanupTestFile(invalid_lite_path);
+    cleanupTestFile(missing_readonly_path);
+    cleanupTestFile(missing_status_path);
     cleanupTestFile(short_lite_path);
     cleanupTestFile(src_path);
     cleanupTestFile(remote_inference_path);
@@ -6365,6 +6378,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(invalid_snapshot_file_path);
     defer cleanupTestDir(plain_path);
     defer cleanupTestFile(invalid_lite_path);
+    defer cleanupTestFile(missing_readonly_path);
+    defer cleanupTestFile(missing_status_path);
     defer cleanupTestFile(short_lite_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(remote_inference_path);
@@ -6431,6 +6446,22 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open(invalid_lite_path, &invalid_lite_handle));
     try std.testing.expect(invalid_lite_handle == null);
     defer antfly_db_close(invalid_lite_handle);
+
+    try std.testing.expect(!testPathExists(missing_readonly_path));
+    var missing_readonly_sentinel: u8 = 0;
+    var missing_readonly_handle: ?*anyopaque = &missing_readonly_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_lite_open_readonly(missing_readonly_path, &missing_readonly_handle));
+    try std.testing.expect(missing_readonly_handle == null);
+    try std.testing.expect(!testPathExists(missing_readonly_path));
+    defer antfly_db_close(missing_readonly_handle);
+
+    try std.testing.expect(!testPathExists(missing_status_path));
+    var missing_status_sentinel: u8 = 0;
+    var missing_status_handle: ?*anyopaque = &missing_status_sentinel;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_lite_open_status_only(missing_status_path, &missing_status_handle));
+    try std.testing.expect(missing_status_handle == null);
+    try std.testing.expect(!testPathExists(missing_status_path));
+    defer antfly_db_close(missing_status_handle);
 
     {
         var short_file = try std.Io.Dir.cwd().createFile(std.testing.io, short_lite_path, .{});
