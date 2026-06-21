@@ -595,7 +595,7 @@ fn importBackup(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterat
     }
     const resolved_from = from_path orelse cli.fatal("--from is required", .{});
     importFromSourceFile(allocator, io, resolved_from, path, replace) catch |err| switch (err) {
-        error.AfliteImportRequiresReplace => cli.fatal("import into an existing Lite database requires a portable .afb source; use restore --replace for .aflite snapshots", .{}),
+        error.AfliteImportRequiresReplace => cli.fatal("importing a .aflite snapshot over an existing target requires --replace", .{}),
         error.LiteImportTargetNotEmpty => cli.fatal("target database is not empty; pass --replace to replace it: {s}", .{path}),
         else => return err,
     };
