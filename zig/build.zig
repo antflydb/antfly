@@ -2141,6 +2141,16 @@ pub fn build(b: *std.Build) void {
     const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
     lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
 
+    const run_lite_cabi_packaging_tests = b.addSystemCommand(&.{
+        "env",
+        "PYTHONPYCACHEPREFIX=/tmp/antfly-pycache",
+        "python3",
+        "scripts/packaging/test_lite_cabi_packaging.py",
+    });
+    run_lite_cabi_packaging_tests.setCwd(b.path(".."));
+    const lite_package_test_step = b.step("lite-package-test", "Run Antfly Lite C ABI release packaging regression tests");
+    lite_package_test_step.dependOn(&run_lite_cabi_packaging_tests.step);
+
     const capi_default_filters = [_][]const u8{
         "capi lite opens exports imports checks and vacuums aflite",
         "capi zero buffer helper wipes bytes before free",
@@ -6517,6 +6527,7 @@ pub fn build(b: *std.Build) void {
     lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
     lite_dev_step.dependOn(&install_lite_wasm_profile.step);
     lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
+    lite_dev_step.dependOn(&run_lite_cabi_packaging_tests.step);
     lite_dev_step.dependOn(&run_capi_tests.step);
     lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
