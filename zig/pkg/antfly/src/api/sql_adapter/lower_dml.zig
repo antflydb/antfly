@@ -11705,6 +11705,43 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
+test "sql adapter lower dml lowers on conflict boolean expression update" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"enabled\":false}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, enabled) VALUES ('u2', 'a@example.test', true) ON CONFLICT (email) DO UPDATE SET enabled = enabled OR excluded.enabled RETURNING enabled",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, lowered.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("enabled", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("true", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"enabled\":true}", lowered.batch.returning_rows[0]);
+
+    var parenthesized = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, enabled) VALUES ('u2', 'a@example.test', false) ON CONFLICT (email) DO UPDATE SET enabled = (enabled OR excluded.enabled) AND NOT false RETURNING enabled",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer parenthesized.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), parenthesized.batch.transformed);
+    try std.testing.expectEqualStrings("false", parenthesized.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"enabled\":false}", parenthesized.batch.returning_rows[0]);
+}
+
 test "sql adapter lower dml lowers on conflict arithmetic update" {
     const alloc = std.testing.allocator;
     const schema_json =
