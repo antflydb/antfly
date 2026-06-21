@@ -696,6 +696,51 @@ fn unaryGeneratedRowExpressionAlloc(
     };
 }
 
+fn concatGeneratedRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    generated: runtime_schema.RelationalGeneratedValue,
+) !db_mod.types.RelationalRowsExpression {
+    if (generated.fields.len == 0) return error.UnsupportedSqlShape;
+    const operand_count = switch (generated.op) {
+        .concat => generated.fields.len + if (generated.separator.len != 0 and generated.fields.len > 1) generated.fields.len - 1 else 0,
+        .concat_ws => generated.fields.len + 1,
+        else => return error.UnsupportedSqlShape,
+    };
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, operand_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
+        alloc.free(operands);
+    }
+
+    if (generated.op == .concat_ws) {
+        const separator_json = try std.json.Stringify.valueAlloc(alloc, generated.separator, .{});
+        defer alloc.free(separator_json);
+        operands[initialized] = try valueRowExpressionAlloc(alloc, separator_json);
+        initialized += 1;
+    }
+
+    for (generated.fields, 0..) |field, i| {
+        if (generated.op == .concat and i != 0 and generated.separator.len != 0) {
+            const separator_json = try std.json.Stringify.valueAlloc(alloc, generated.separator, .{});
+            defer alloc.free(separator_json);
+            operands[initialized] = try valueRowExpressionAlloc(alloc, separator_json);
+            initialized += 1;
+        }
+        operands[initialized] = try fieldRowExpressionAlloc(alloc, field);
+        initialized += 1;
+    }
+
+    return .{
+        .kind = switch (generated.op) {
+            .concat => .concat,
+            .concat_ws => .concat_ws,
+            else => return error.UnsupportedSqlShape,
+        },
+        .operands = operands,
+    };
+}
+
 fn generatedBackfillRowExpressionAlloc(
     alloc: std.mem.Allocator,
     generated: runtime_schema.RelationalGeneratedValue,
@@ -704,8 +749,8 @@ fn generatedBackfillRowExpressionAlloc(
         .lower => try unaryGeneratedRowExpressionAlloc(alloc, .lower, generated.field orelse return error.UnsupportedSqlShape),
         .upper => try unaryGeneratedRowExpressionAlloc(alloc, .upper, generated.field orelse return error.UnsupportedSqlShape),
         .md5 => try unaryGeneratedRowExpressionAlloc(alloc, .md5, generated.field orelse return error.UnsupportedSqlShape),
+        .concat, .concat_ws => try concatGeneratedRowExpressionAlloc(alloc, generated),
         .expression => try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, generated.expression orelse return error.UnsupportedSqlShape),
-        .concat, .concat_ws => error.UnsupportedSqlShape,
     };
 }
 

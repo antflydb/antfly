@@ -2356,6 +2356,148 @@ pub fn parseCoalesceRowExpressionAlloc(
     return expression;
 }
 
+pub fn parseCoalesceProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    hooks: CoalesceProjectionParserHooks,
+) !db_mod.types.RelationalRowsCoalesceProjection {
+    try parseCoalesceFunctionCallStart(tokens, pos);
+    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCoalesceOperand).empty;
+    errdefer {
+        for (operands.items) |operand| plan_mod.freeCoalesceOperand(alloc, operand);
+        operands.deinit(alloc);
+    }
+    while (true) {
+        const operand = try parseCoalesceOperandAlloc(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            field_expression_qualifiers,
+            returning_expression_qualifiers,
+            defer_row_expression_field_validation,
+            hooks,
+        );
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) plan_mod.freeCoalesceOperand(alloc, operand);
+        try operands.append(alloc, operand);
+        operand_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (operands.items.len == 0) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, "coalesce");
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+    const projection = try plan_mod.buildCoalesceProjectionFromOperandListAlloc(alloc, output, &operands);
+    output_transferred = true;
+    return projection;
+}
+
+pub fn parseCoalesceOperandAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    hooks: CoalesceProjectionParserHooks,
+) !db_mod.types.RelationalRowsCoalesceOperand {
+    if (try parseCoalesceFieldOperandOrNullOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    )) |operand| return operand;
+
+    const value_json = try hooks.parse_value_json(hooks.ptr);
+    errdefer alloc.free(value_json);
+    return .{ .kind = .value, .value_json = value_json };
+}
+
+pub fn parseParenthesizedNullTestExpressionProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    try parser.expectToken(tokens, pos, .lparen);
+    const field = try parseRowExpressionFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    if (binder.relationalColumnForField(schema, field, null) == null) return error.InvalidSqlCatalog;
+    try parser.expectKeyword(tokens, pos, "is");
+    const op: runtime_schema.RelationalCheckOp = if (parser.matchKeyword(tokens, pos, "not")) blk: {
+        try parser.expectKeyword(tokens, pos, "null");
+        break :blk .is_not_null;
+    } else blk: {
+        try parser.expectKeyword(tokens, pos, "null");
+        break :blk .is_null;
+    };
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, if (op == .is_not_null) "is_not_null" else "is_null");
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(output);
+
+    const true_json = try alloc.dupe(u8, "true");
+    var true_transferred = false;
+    errdefer if (!true_transferred) alloc.free(true_json);
+    const false_json = try alloc.dupe(u8, "false");
+    var false_transferred = false;
+    errdefer if (!false_transferred) alloc.free(false_json);
+    const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, 1);
+    var branches_transferred = false;
+    errdefer if (!branches_transferred) alloc.free(branches);
+    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var fallback_transferred = false;
+    errdefer if (!fallback_transferred) alloc.free(fallback);
+
+    branches[0] = .{
+        .when = .{
+            .lhs = .{ .kind = .field, .field = field, .field_source = field_source },
+            .op = op,
+        },
+        .then = .{ .kind = .value, .value_json = true_json },
+    };
+    fallback[0] = .{ .kind = .value, .value_json = false_json };
+    field_transferred = true;
+    true_transferred = true;
+    false_transferred = true;
+    branches_transferred = true;
+    fallback_transferred = true;
+
+    const expression: db_mod.types.RelationalRowsExpression = .{
+        .kind = .case,
+        .case_branches = branches,
+        .case_else = fallback,
+    };
+    errdefer freeExpression(alloc, expression);
+    output_transferred = true;
+    return buildExpressionProjection(output, expression);
+}
+
 pub fn parseNullifRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,

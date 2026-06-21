@@ -129,7 +129,6 @@ const freeArrayLengthProjections = sql_adapter.freeArrayLengthProjections;
 const freeArrayAny = sql_adapter.freeArrayAny;
 const freeArrayContains = sql_adapter.freeArrayContains;
 const freeArrayEq = sql_adapter.freeArrayEq;
-const freeCoalesceOperand = sql_adapter.freeCoalesceOperand;
 const freeCoalesceProjection = sql_adapter.freeCoalesceProjection;
 const freeCoalesceProjections = sql_adapter.freeCoalesceProjections;
 const freeExpression = sql_adapter.freeExpression;
@@ -3349,6 +3348,13 @@ const Parser = struct {
         };
     }
 
+    fn coalesceProjectionParserHooks(self: *@This()) sql_adapter.CoalesceProjectionParserHooks {
+        return .{
+            .ptr = self,
+            .parse_value_json = parseJsonValueHook,
+        };
+    }
+
     fn nullifRowExpressionParserHooks(self: *@This()) sql_adapter.NullifRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -3658,6 +3664,11 @@ const Parser = struct {
     fn parseCoalesceRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return try self.parseRowExpressionAlloc();
+    }
+
+    fn parseJsonValueHook(ptr: *anyopaque) anyerror![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parseJsonValueAlloc();
     }
 
     fn parseNullifRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
@@ -15154,60 +15165,16 @@ const Parser = struct {
     }
 
     fn parseParenthesizedNullTestExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        try self.expect(.lparen);
-        const field = try self.parseFieldExpressionOwned();
-        var field_transferred = false;
-        errdefer if (!field_transferred) self.alloc.free(field);
-        if (relationalColumnForField(self.schema, field, null) == null) return error.InvalidSqlCatalog;
-        try self.expectKeyword("is");
-        const op: runtime_schema.RelationalCheckOp = if (self.matchKeyword("not")) blk: {
-            try self.expectKeyword("null");
-            break :blk .is_not_null;
-        } else blk: {
-            try self.expectKeyword("null");
-            break :blk .is_null;
-        };
-        try self.expect(.rparen);
-
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, if (op == .is_not_null) "is_not_null" else "is_null");
-        var output_transferred = false;
-        errdefer if (!output_transferred) self.alloc.free(output);
-
-        const true_json = try self.alloc.dupe(u8, "true");
-        var true_transferred = false;
-        errdefer if (!true_transferred) self.alloc.free(true_json);
-        const false_json = try self.alloc.dupe(u8, "false");
-        var false_transferred = false;
-        errdefer if (!false_transferred) self.alloc.free(false_json);
-        const branches = try self.alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, 1);
-        var branches_transferred = false;
-        errdefer if (!branches_transferred) self.alloc.free(branches);
-        const fallback = try self.alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-        var fallback_transferred = false;
-        errdefer if (!fallback_transferred) self.alloc.free(fallback);
-
-        branches[0] = .{
-            .when = .{
-                .lhs = .{ .kind = .field, .field = field, .field_source = self.rowExpressionFieldSource() },
-                .op = op,
-            },
-            .then = .{ .kind = .value, .value_json = true_json },
-        };
-        fallback[0] = .{ .kind = .value, .value_json = false_json };
-        field_transferred = true;
-        true_transferred = true;
-        false_transferred = true;
-        branches_transferred = true;
-        fallback_transferred = true;
-
-        const expression: db_mod.types.RelationalRowsExpression = .{
-            .kind = .case,
-            .case_branches = branches,
-            .case_else = fallback,
-        };
-        errdefer freeExpression(self.alloc, expression);
-        output_transferred = true;
-        return sql_adapter.buildExpressionProjection(output, expression);
+        return try sql_adapter.parseParenthesizedNullTestExpressionProjectionAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+            self.rowExpressionFieldSource(),
+        );
     }
 
     fn parseParenthesizedExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -16129,33 +16096,16 @@ const Parser = struct {
     }
 
     fn parseCoalesceProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsCoalesceProjection {
-        try sql_adapter.parseCoalesceFunctionCallStart(self.tokens, &self.pos);
-        var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCoalesceOperand).empty;
-        errdefer {
-            for (operands.items) |operand| {
-                switch (operand.kind) {
-                    .field => if (operand.field.len > 0) self.alloc.free(operand.field),
-                    .value => if (operand.value_json.len > 0) self.alloc.free(operand.value_json),
-                }
-            }
-            operands.deinit(self.alloc);
-        }
-        while (true) {
-            const operand = try self.parseCoalesceOperandAlloc();
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeCoalesceOperand(self.alloc, operand);
-            try operands.append(self.alloc, operand);
-            operand_transferred = true;
-            if (self.match(.comma) == null) break;
-        }
-        if (operands.items.len == 0) return error.UnsupportedSqlShape;
-        try self.expect(.rparen);
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, "coalesce");
-        var output_transferred = false;
-        errdefer if (!output_transferred) self.alloc.free(output);
-        const projection = try sql_adapter.buildCoalesceProjectionFromOperandListAlloc(self.alloc, output, &operands);
-        output_transferred = true;
-        return projection;
+        return try sql_adapter.parseCoalesceProjectionAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.schema,
+            self.field_expression_qualifiers,
+            self.returning_expression_qualifiers,
+            self.defer_row_expression_field_validation,
+            self.coalesceProjectionParserHooks(),
+        );
     }
 
     fn parseCoalesceExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -16164,22 +16114,6 @@ const Parser = struct {
         const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, "coalesce");
         errdefer self.alloc.free(output);
         return sql_adapter.buildExpressionProjection(output, expression);
-    }
-
-    fn parseCoalesceOperandAlloc(self: *@This()) !db_mod.types.RelationalRowsCoalesceOperand {
-        if (try sql_adapter.parseCoalesceFieldOperandOrNullOwnedAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            self.schema,
-            self.field_expression_qualifiers,
-            self.returning_expression_qualifiers,
-            self.defer_row_expression_field_validation,
-        )) |operand| return operand;
-
-        const value_json = try self.parseJsonValueAlloc();
-        errdefer self.alloc.free(value_json);
-        return .{ .kind = .value, .value_json = value_json };
     }
 
     fn parseFieldExpressionOwned(self: *@This()) ![]const u8 {

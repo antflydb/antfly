@@ -5060,7 +5060,13 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expectEqual(@as(usize, 2), generated.work_items.len);
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, generated.work_items[0].action);
     try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rewrite, generated.work_items[1].action);
-    try std.testing.expect(generated.work_items[1].rewrite_expression == null);
+    const concat_rewrite = generated.work_items[1].rewrite_expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("tenant_status_key", concat_rewrite.target_column);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.concat, concat_rewrite.expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), concat_rewrite.expression.operands.len);
+    try std.testing.expectEqualStrings("tenant_id", concat_rewrite.expression.operands[0].field);
+    try std.testing.expectEqualStrings("\":\"", concat_rewrite.expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("status", concat_rewrite.expression.operands[2].field);
 
     var default_backfill = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
@@ -5088,6 +5094,22 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.lower, generated_rewrite.expression.kind);
     try std.testing.expectEqual(@as(usize, 1), generated_rewrite.expression.operands.len);
     try std.testing.expectEqualStrings("status", generated_rewrite.expression.operands[0].field);
+
+    var generated_concat_ws_backfill = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &altered.table,
+        "ALTER TABLE users ADD COLUMN tenant_status_joined text GENERATED ALWAYS AS (concat_ws(':', tenant_id, status)) STORED;",
+    );
+    defer generated_concat_ws_backfill.deinit(std.testing.allocator);
+    try std.testing.expect(generated_concat_ws_backfill.rewrite_required);
+    try std.testing.expectEqual(@as(usize, 2), generated_concat_ws_backfill.work_items.len);
+    const concat_ws_rewrite = generated_concat_ws_backfill.work_items[1].rewrite_expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("tenant_status_joined", concat_ws_rewrite.target_column);
+    try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.concat_ws, concat_ws_rewrite.expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), concat_ws_rewrite.expression.operands.len);
+    try std.testing.expectEqualStrings("\":\"", concat_ws_rewrite.expression.operands[0].value_json);
+    try std.testing.expectEqualStrings("tenant_id", concat_ws_rewrite.expression.operands[1].field);
+    try std.testing.expectEqualStrings("status", concat_ws_rewrite.expression.operands[2].field);
 
     var indexed = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
