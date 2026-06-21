@@ -19311,10 +19311,7 @@ pub const DB = struct {
                 }
             }
             const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedQueryRequest;
-            switch (types.relationalRowsCteMaterializationDecision(cte, result.rows.len, materialized_bytes)) {
-                .memory => {},
-                .spill, .reject => return error.UnsupportedQueryRequest,
-            }
+            try admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
             const output_fields = try relationalRowsQueryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
             var output_fields_transferred = false;
             errdefer if (!output_fields_transferred) freeOwnedConstStringSlice(alloc, output_fields);
@@ -19369,9 +19366,18 @@ pub const DB = struct {
             .max_bytes = plan.max_bytes,
             .spill_after_bytes = plan.spill_after_bytes,
         };
-        switch (types.relationalRowsCteMaterializationDecision(admission, rows.len, materialized_bytes)) {
+        try admitRelationalRowsCteMaterialization(admission, rows.len, materialized_bytes);
+    }
+
+    pub fn admitRelationalRowsCteMaterialization(
+        cte: types.RelationalRowsCte,
+        observed_rows: usize,
+        observed_bytes: u64,
+    ) !void {
+        switch (types.relationalRowsCteMaterializationDecision(cte, observed_rows, observed_bytes)) {
             .memory => {},
-            .spill, .reject => return error.UnsupportedQueryRequest,
+            .spill => return error.RelationalRowsCteSpillRequired,
+            .reject => return error.RelationalRowsCteMaterializationRejected,
         }
     }
 

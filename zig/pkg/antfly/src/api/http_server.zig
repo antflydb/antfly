@@ -12358,7 +12358,8 @@ pub const ApiHttpServer = struct {
         } else self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
 
         var result = (source.rowsQueryPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows query request"),
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows query request"),
+            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows query backpressured"),
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows query plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
@@ -12419,7 +12420,8 @@ pub const ApiHttpServer = struct {
         } else self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
 
         var result = (source.rowsAggregatePlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.ResourceBudgetExceeded, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows aggregate request"),
+            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows aggregate backpressured"),
             error.UnsupportedOperation, error.UnsupportedRowsQuery, error.EmptyExternalSourceSnapshot => return try textResponse(self.alloc, 501, "rows aggregate plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
@@ -12459,7 +12461,8 @@ pub const ApiHttpServer = struct {
         defer relational_rows_api.freeRowsOutputColumns(self.alloc, result_schema);
 
         var result = (source.rowsWindowPlan(self.alloc, table_name, schema, plan, .read_index) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows window request"),
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows window request"),
+            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows window backpressured"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows window plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
@@ -12520,7 +12523,8 @@ pub const ApiHttpServer = struct {
             source.rowsJoinPlan(self.alloc, table_name, cte_schema, plan, .read_index)
         else
             table_reads.rowsJoinPlanFromRoutedScansWithSchemasAlloc(self.alloc, source, table_name, left_table_name, right_table_name, cte_schema, left_schema, right_schema, plan, .read_index)) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows join request"),
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows join request"),
+            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows join backpressured"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows join plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
@@ -12581,7 +12585,8 @@ pub const ApiHttpServer = struct {
             source.rowsLateralPlan(self.alloc, table_name, cte_schema, plan, .read_index)
         else
             table_reads.rowsLateralPlanFromRoutedScansWithSchemasAlloc(self.alloc, source, table_name, left_table_name, right_table_name, cte_schema, left_schema, right_schema, plan, .read_index)) catch |err| switch (err) {
-            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid rows lateral request"),
+            error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "rows lateral backpressured"),
             error.UnsupportedOperation => return try textResponse(self.alloc, 501, "rows lateral plan unavailable"),
             error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),

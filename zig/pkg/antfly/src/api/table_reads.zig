@@ -4959,10 +4959,7 @@ fn admitRecursiveCteRows(
         .max_bytes = lowered.max_bytes,
         .spill_after_bytes = lowered.spill_after_bytes,
     };
-    switch (db_mod.types.relationalRowsCteMaterializationDecision(cte, rows.len, materialized_bytes)) {
-        .memory => {},
-        .spill, .reject => return error.UnsupportedRowsQuery,
-    }
+    try db_mod.DB.admitRelationalRowsCteMaterialization(cte, rows.len, materialized_bytes);
 }
 
 fn recursiveCteJoinRowsMatchAlloc(
@@ -5100,9 +5097,7 @@ fn executeRelationalRowsSetOperationOnQueryResultsAlloc(
 ) !db_mod.types.RelationalRowsQueryResult {
     const combined = try db_mod.DB.relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left_rows, right_rows);
     defer freeSetOperationOwnedRows(alloc, combined);
-    db_mod.DB.admitRelationalRowsSetOperationRows(plan, combined) catch |err| switch (err) {
-        error.UnsupportedQueryRequest => return error.UnsupportedRowsQuery,
-    };
+    try db_mod.DB.admitRelationalRowsSetOperationRows(plan, combined);
     return try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "set_operation", combined, .{
         .select_all = true,
         .order_by = plan.order_by,
@@ -5116,7 +5111,7 @@ fn freeSetOperationOwnedRows(alloc: std.mem.Allocator, rows: []const []const u8)
     if (rows.len > 0) alloc.free(rows);
 }
 
-test "lowered sql set operation materialization admission fails closed on caps and spill" {
+test "lowered sql set operation materialization admission distinguishes spill from hard caps" {
     const rows = [_][]const u8{
         "{\"id\":\"a\"}",
         "{\"id\":\"b\"}",
@@ -5131,7 +5126,7 @@ test "lowered sql set operation materialization admission fails closed on caps a
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes,
     }, &rows);
-    try std.testing.expectError(error.UnsupportedQueryRequest, db_mod.DB.admitRelationalRowsSetOperationRows(.{
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, db_mod.DB.admitRelationalRowsSetOperationRows(.{
         .operation = .union_distinct,
         .left = .{},
         .right = .{},
@@ -5139,7 +5134,7 @@ test "lowered sql set operation materialization admission fails closed on caps a
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes,
     }, &rows));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db_mod.DB.admitRelationalRowsSetOperationRows(.{
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, db_mod.DB.admitRelationalRowsSetOperationRows(.{
         .operation = .union_distinct,
         .left = .{},
         .right = .{},
@@ -5147,7 +5142,7 @@ test "lowered sql set operation materialization admission fails closed on caps a
         .max_bytes = observed_bytes - 1,
         .spill_after_bytes = observed_bytes - 1,
     }, &rows));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db_mod.DB.admitRelationalRowsSetOperationRows(.{
+    try std.testing.expectError(error.RelationalRowsCteSpillRequired, db_mod.DB.admitRelationalRowsSetOperationRows(.{
         .operation = .union_distinct,
         .left = .{},
         .right = .{},

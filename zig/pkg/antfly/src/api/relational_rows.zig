@@ -1028,10 +1028,7 @@ fn materializeRowsJsonCtesAlloc(
         var result_transferred = false;
         errdefer if (!result_transferred) result.deinit(alloc);
         const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedRowsQuery;
-        switch (db_mod.types.relationalRowsCteMaterializationDecision(cte, result.rows.len, materialized_bytes)) {
-            .memory => {},
-            .spill, .reject => return error.UnsupportedRowsQuery,
-        }
+        try db_mod.DB.admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
         try materialized_ctes.append(alloc, .{
             .name = cte.name,
             .schema = rowsSchemaFromPlannedCte(planned_ctes[cte_index]),
