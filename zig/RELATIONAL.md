@@ -7663,6 +7663,30 @@ primary contract for relational graph data.
    graph query support as an additional adapter, not as the primary relational
    contract.
 
+Current implementation status:
+
+- SQL DDL parsing covers `antfly_full_text`, external `hnsw`, managed
+  `antfly_aknn`, `antfly_algebraic`, explicit edge-table `antfly_graph`, the
+  first-class `CREATE GRAPH INDEX ... EDGE (...)` form, lower-level
+  `antfly_graph_metric`, and `antfly_hybrid` configs.
+- Table-record catalog application now stores Antfly-derived index DDL in
+  `indexes_json` instead of schema JSON, preserving the invariant that SQL
+  records native Antfly derived-index configs rather than backend SQL strings.
+- Catalog application validates derived field references against the current
+  relational schema before writing metadata. Full-text, AKNN/enrichment fields,
+  graph source/target/type/weight fields, and embedded JSON paths fail closed
+  before async build work can start.
+- Catalog application also validates derived-index dependencies before publish:
+  graph metric configs must reference an existing graph index, hybrid source
+  configs must reference existing index configs, and drops are rejected when
+  another derived index would be left with a dangling `graph_index` or
+  `sources` reference.
+- Remaining production work is to replace the lower-level
+  `antfly_graph_metric` DDL with `ALTER GRAPH INDEX ... ADD METRIC` as the
+  primary catalog surface, add extraction-based graph indexes from enrichment
+  output, and connect managed AKNN/graph builds all the way through durable job
+  scheduling, readiness, generation publish, and distributed recovery.
+
 ### Query and movement invariants
 
 Structured relational filters for supported keyword/range/bool/geo clauses
