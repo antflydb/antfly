@@ -22,6 +22,8 @@ const runtime_schema_mod = @import("../storage/schema.zig");
 const sql_adapter = @import("sql_adapter/mod.zig");
 const tables_api = @import("tables.zig");
 
+// Catalog job planning owns deterministic durable job records. Execution stays
+// with the table/range write path that can claim and drain range-local work.
 pub fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
     svc: anytype,
     alloc: std.mem.Allocator,

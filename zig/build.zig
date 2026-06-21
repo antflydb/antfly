@@ -3891,7 +3891,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter plan resolves CTE and base table sources",
             "sql adapter plan resolves join CTE sides to physical base table",
             "postgres sql adapter lowers recursive cte stream contract",
-            "postgres sql adapter lowers create index ddl into typed schema plan",
+            "sql adapter ddl plan lowers create index ddl",
             "postgres sql adapter lowers antfly query functions into native search requests",
             "sql adapter ddl plan preserves named inline create table constraints",
             "sql adapter ddl plan lowers computed check constraints into native expression checks",
