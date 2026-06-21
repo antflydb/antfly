@@ -764,14 +764,41 @@ pub const AppliedDdlRewriteExpression = struct {
     }
 };
 
+pub const AppliedDdlRowRewriteRename = struct {
+    old_path: []const u8,
+    new_path: []const u8,
+};
+
+pub const AppliedDdlRowRewritePlan = struct {
+    renames: []const AppliedDdlRowRewriteRename = &.{},
+    drops: []const []const u8 = &.{},
+
+    pub fn empty(self: @This()) bool {
+        return self.renames.len == 0 and self.drops.len == 0;
+    }
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.renames) |rename| {
+            alloc.free(rename.old_path);
+            alloc.free(rename.new_path);
+        }
+        alloc.free(self.renames);
+        for (self.drops) |drop| alloc.free(drop);
+        alloc.free(self.drops);
+        self.* = undefined;
+    }
+};
+
 pub const AppliedDdlWorkItem = struct {
     action: AppliedDdlWorkAction,
     subject: AppliedDdlWorkSubject,
     reason: AppliedDdlWorkReason,
     rewrite_expression: ?AppliedDdlRewriteExpression = null,
+    row_rewrite_plan: AppliedDdlRowRewritePlan = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.rewrite_expression) |*rewrite| rewrite.deinit(alloc);
+        self.row_rewrite_plan.deinit(alloc);
         self.* = undefined;
     }
 };

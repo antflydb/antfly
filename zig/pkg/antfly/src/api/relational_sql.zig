@@ -15142,18 +15142,15 @@ const Parser = struct {
     }
 
     fn parseTextExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try self.parseRowExpressionAlloc();
-        return try sql_adapter.buildTextExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), expression);
+        return try sql_adapter.parseTextExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.expressionProjectionParserHooks());
     }
 
     fn parseGenericExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try self.parseRowExpressionAlloc();
-        return try sql_adapter.buildNumericExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), expression);
+        return try sql_adapter.parseGenericExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.expressionProjectionParserHooks());
     }
 
     fn parseBooleanExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try self.parseBooleanRowExpressionAlloc();
-        return try sql_adapter.buildBooleanExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), expression);
+        return try sql_adapter.parseBooleanExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.expressionProjectionParserHooks());
     }
 
     fn parseParenthesizedNullTestExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
@@ -15170,97 +15167,37 @@ const Parser = struct {
     }
 
     fn parseParenthesizedExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        try self.expect(.lparen);
-        const expression = try self.parseBooleanRowExpressionAlloc();
-        var expression_transferred = false;
-        errdefer if (!expression_transferred) freeExpression(self.alloc, expression);
-        try self.expect(.rparen);
-        expression_transferred = true;
-        return try sql_adapter.buildDefaultExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, expression);
+        return try sql_adapter.parseParenthesizedExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos, self.expressionProjectionParserHooks());
     }
 
     fn parseNowExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try sql_adapter.parseSqlNowRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        return try sql_adapter.buildExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, expression, "now");
+        return try sql_adapter.parseNowExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseCurrentDateExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try sql_adapter.parseSqlCurrentDateRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        return try sql_adapter.buildExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, expression, "current_date");
+        return try sql_adapter.parseCurrentDateExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseTypedDatetimeLiteralExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try sql_adapter.parseSqlTypedDatetimeLiteralRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-        return try sql_adapter.buildExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, expression, "datetime_literal");
+        return try sql_adapter.parseTypedDatetimeLiteralExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseUuidV4ExpressionProjectionAlloc(self: *@This()) !db_mod.types.RelationalRowsExpressionProjection {
-        const expression = try sql_adapter.parseSqlUuidV4RowExpression(self.tokens, &self.pos);
-        return try sql_adapter.buildExpressionProjectionFromOwnedExpressionAlloc(self.alloc, self.tokens, &self.pos, expression, "gen_random_uuid");
+        return try sql_adapter.parseUuidV4ExpressionProjectionAlloc(self.alloc, self.tokens, &self.pos);
     }
 
     fn parseArithmeticExpressionProjectionFromFieldAlloc(
         self: *@This(),
         lhs_field: []const u8,
     ) !db_mod.types.RelationalRowsExpressionProjection {
-        var current: db_mod.types.RelationalRowsExpression = .{
-            .kind = .field,
-            .field = lhs_field,
-            .field_source = self.rowExpressionFieldSource(),
-        };
-        var current_owned = true;
-        errdefer if (current_owned) freeExpression(self.alloc, current);
-
-        current_owned = false;
-        current = try self.parseArithmeticExpressionRestAlloc(current, 0);
-        current_owned = true;
-        try self.rowExpressionTypeContext().validateNumericRowExpression(current);
-
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, switch (current.kind) {
-            .add => "add",
-            .sub => "sub",
-            .mul => "mul",
-            .div => "div",
-            else => "expr",
-        });
-        var output_owned = true;
-        errdefer if (output_owned) self.alloc.free(output);
-
-        current_owned = false;
-        output_owned = false;
-        return .{
-            .output = output,
-            .expression = current,
-        };
+        return try sql_adapter.parseArithmeticExpressionProjectionFromFieldAlloc(self.alloc, self.tokens, &self.pos, lhs_field, self.rowExpressionFieldSource(), self.rowExpressionTypeContext(), self.arithmeticExpressionParserHooks());
     }
 
     fn parseBooleanExpressionProjectionFromFieldAlloc(
         self: *@This(),
         lhs_field: []const u8,
     ) !db_mod.types.RelationalRowsExpressionProjection {
-        var current: db_mod.types.RelationalRowsExpression = .{
-            .kind = .field,
-            .field = lhs_field,
-            .field_source = self.rowExpressionFieldSource(),
-        };
-        var current_owned = true;
-        errdefer if (current_owned) freeExpression(self.alloc, current);
-
-        current_owned = false;
-        current = try self.parseBooleanExpressionRestAlloc(current, 0);
-        current_owned = true;
-        try self.rowExpressionTypeContext().validateBooleanRowExpression(current);
-
-        const output = try sql_adapter.parseProjectionOutputOwnedAlloc(self.alloc, self.tokens, &self.pos, rowExpressionDefaultOutputName(current.kind));
-        var output_owned = true;
-        errdefer if (output_owned) self.alloc.free(output);
-
-        current_owned = false;
-        output_owned = false;
-        return .{
-            .output = output,
-            .expression = current,
-        };
+        return try sql_adapter.parseBooleanExpressionProjectionFromFieldAlloc(self.alloc, self.tokens, &self.pos, lhs_field, self.rowExpressionFieldSource(), self.rowExpressionTypeContext(), self.booleanExpressionParserHooks());
     }
 
     fn parseArithmeticExpressionRestAlloc(

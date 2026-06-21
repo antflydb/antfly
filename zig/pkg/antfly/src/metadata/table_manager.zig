@@ -194,6 +194,11 @@ pub const SchemaRewriteExpression = struct {
     expression: runtime_schema.RelationalRowsExpression,
 };
 
+pub const SchemaRewriteRename = struct {
+    old_path: []const u8,
+    new_path: []const u8,
+};
+
 pub const SchemaRewriteJobRecord = struct {
     job_id: u64,
     table_id: u64,
@@ -206,6 +211,8 @@ pub const SchemaRewriteJobRecord = struct {
     state: []const u8 = schema_rewrite_declared,
     target_column: []const u8 = "",
     expression: ?runtime_schema.RelationalRowsExpression = null,
+    rewrite_renames: []const SchemaRewriteRename = &.{},
+    rewrite_drops: []const []const u8 = &.{},
     lease_owner: []const u8 = "",
     lease_expires_at_ms: u64 = 0,
     attempts: u32 = 0,
@@ -835,7 +842,21 @@ pub const TableManager = struct {
         if (record.schema_generation == 0) return error.InvalidSchemaRewriteGeneration;
         if (record.action.len == 0 or record.reason.len == 0) return error.InvalidSchemaRewriteJob;
         if (!schemaRewriteJobStateValid(record.state)) return error.InvalidSchemaRewriteJobState;
-        if (record.expression != null and record.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
+        const has_expression_rewrite = record.expression != null or record.target_column.len != 0;
+        const has_row_rewrite = record.rewrite_renames.len != 0 or record.rewrite_drops.len != 0;
+        if (has_expression_rewrite) {
+            if (record.expression == null or record.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
+            if (has_row_rewrite) return error.InvalidSchemaRewriteExpression;
+        } else if (std.mem.eql(u8, record.action, "rewrite") and std.mem.eql(u8, record.reason, "row_images") and !has_row_rewrite) {
+            return error.InvalidSchemaRewriteExpression;
+        }
+        for (record.rewrite_renames) |rename| {
+            if (rename.old_path.len == 0 or rename.new_path.len == 0) return error.InvalidSchemaRewriteExpression;
+            if (std.mem.eql(u8, rename.old_path, rename.new_path)) return error.InvalidSchemaRewriteExpression;
+        }
+        for (record.rewrite_drops) |drop| {
+            if (drop.len == 0) return error.InvalidSchemaRewriteExpression;
+        }
         if (record.end_row_key) |end_row_key| {
             if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidSchemaRewriteJobRange;
         }
@@ -2338,6 +2359,32 @@ pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobR
     errdefer alloc.free(target_column);
     const expression = if (record.expression) |expr| try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, expr) else null;
     errdefer if (expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
+    const rewrite_renames = try alloc.alloc(SchemaRewriteRename, record.rewrite_renames.len);
+    var rewrite_renames_initialized: usize = 0;
+    errdefer {
+        for (rewrite_renames[0..rewrite_renames_initialized]) |rename| {
+            alloc.free(rename.old_path);
+            alloc.free(rename.new_path);
+        }
+        alloc.free(rewrite_renames);
+    }
+    for (record.rewrite_renames, 0..) |rename, i| {
+        const old_path = try alloc.dupe(u8, rename.old_path);
+        errdefer alloc.free(old_path);
+        const new_path = try alloc.dupe(u8, rename.new_path);
+        rewrite_renames[i] = .{ .old_path = old_path, .new_path = new_path };
+        rewrite_renames_initialized += 1;
+    }
+    const rewrite_drops = try alloc.alloc([]const u8, record.rewrite_drops.len);
+    var rewrite_drops_initialized: usize = 0;
+    errdefer {
+        for (rewrite_drops[0..rewrite_drops_initialized]) |drop| alloc.free(drop);
+        alloc.free(rewrite_drops);
+    }
+    for (record.rewrite_drops, 0..) |drop, i| {
+        rewrite_drops[i] = try alloc.dupe(u8, drop);
+        rewrite_drops_initialized += 1;
+    }
     const lease_owner = try alloc.dupe(u8, record.lease_owner);
     errdefer alloc.free(lease_owner);
     const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
@@ -2356,6 +2403,8 @@ pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobR
         .state = state,
         .target_column = target_column,
         .expression = expression,
+        .rewrite_renames = rewrite_renames,
+        .rewrite_drops = rewrite_drops,
         .lease_owner = lease_owner,
         .lease_expires_at_ms = record.lease_expires_at_ms,
         .attempts = record.attempts,
@@ -2373,6 +2422,13 @@ pub fn freeSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRe
     alloc.free(record.state);
     alloc.free(record.target_column);
     if (record.expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
+    for (record.rewrite_renames) |rename| {
+        alloc.free(rename.old_path);
+        alloc.free(rename.new_path);
+    }
+    alloc.free(record.rewrite_renames);
+    for (record.rewrite_drops) |drop| alloc.free(drop);
+    alloc.free(record.rewrite_drops);
     alloc.free(record.lease_owner);
     alloc.free(record.progress_row_key);
     alloc.free(record.last_error);

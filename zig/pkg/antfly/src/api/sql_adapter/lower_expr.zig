@@ -3677,6 +3677,64 @@ pub fn parseBooleanExpressionRestAlloc(
     return current;
 }
 
+pub fn parseArithmeticExpressionProjectionFromFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    lhs_field: []const u8,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    type_context: RowExpressionTypeContext,
+    hooks: ArithmeticExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    var current: db_mod.types.RelationalRowsExpression = .{
+        .kind = .field,
+        .field = lhs_field,
+        .field_source = field_source,
+    };
+    var current_owned = true;
+    errdefer if (current_owned) freeExpression(alloc, current);
+
+    current_owned = false;
+    current = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, current, 0, type_context, hooks);
+    current_owned = true;
+    try type_context.validateNumericRowExpression(current);
+
+    const default_output = switch (current.kind) {
+        .add => "add",
+        .sub => "sub",
+        .mul => "mul",
+        .div => "div",
+        else => "expr",
+    };
+    current_owned = false;
+    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, current, default_output);
+}
+
+pub fn parseBooleanExpressionProjectionFromFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    lhs_field: []const u8,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    type_context: RowExpressionTypeContext,
+    hooks: BooleanExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpressionProjection {
+    var current: db_mod.types.RelationalRowsExpression = .{
+        .kind = .field,
+        .field = lhs_field,
+        .field_source = field_source,
+    };
+    var current_owned = true;
+    errdefer if (current_owned) freeExpression(alloc, current);
+
+    current_owned = false;
+    current = try parseBooleanExpressionRestAlloc(alloc, tokens, pos, current, 0, type_context, hooks);
+    current_owned = true;
+
+    current_owned = false;
+    return try buildBooleanExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, current);
+}
+
 pub fn parseBooleanRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
