@@ -29,6 +29,7 @@ const batch_api = antfly.public_api.batch;
 const query_api = antfly.public_api.query;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
+const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 
 var active_lite_http_state: ?*LiteHttpState = null;
@@ -851,17 +852,7 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
 }
 
 fn defaultLitePromoteLocationAlloc(allocator: Allocator) ![]u8 {
-    const root = try defaultLiteWorkspaceRootAlloc(allocator);
-    defer allocator.free(root);
-    const backups = try std.fs.path.join(allocator, &.{ root, "backups" });
-    defer allocator.free(backups);
-    return try std.fmt.allocPrint(allocator, "file://{s}", .{backups});
-}
-
-fn defaultLiteWorkspaceRootAlloc(allocator: Allocator) ![]u8 {
-    const home_z = std.c.getenv("HOME") orelse return error.HomeNotSet;
-    const home = std.mem.span(home_z);
-    return try std.fs.path.join(allocator, &.{ home, ".antfly", "lite" });
+    return try lite_paths.defaultBackupsLocationAlloc(allocator);
 }
 
 fn nextRequiredArg(args: *std.process.Args.Iterator) ![]const u8 {

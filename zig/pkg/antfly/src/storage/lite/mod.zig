@@ -17,6 +17,7 @@ pub const capabilities = @import("capabilities.zig");
 pub const docstore = @import("docstore.zig");
 pub const index_storage = @import("index_storage.zig");
 pub const native = @import("native.zig");
+pub const paths = @import("paths.zig");
 pub const restore_staging = @import("restore_staging.zig");
 
 test {
@@ -26,5 +27,6 @@ test {
     _ = docstore;
     _ = index_storage;
     _ = native;
+    _ = paths;
     _ = restore_staging;
 }

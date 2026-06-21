@@ -18,6 +18,7 @@ const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 
 const backup_codec = antfly.backup_codec;
+const lite_paths = antfly.lite.paths;
 const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
 
@@ -310,11 +311,7 @@ fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u
 }
 
 fn defaultLiteInputRestoreLocationAlloc(allocator: std.mem.Allocator) ![]u8 {
-    const home_z = std.c.getenv("HOME") orelse return error.HomeNotSet;
-    const home = std.mem.span(home_z);
-    const backups = try std.fs.path.join(allocator, &.{ home, ".antfly", "lite", "backups" });
-    defer allocator.free(backups);
-    return try std.fmt.allocPrint(allocator, "file://{s}", .{backups});
+    return try lite_paths.defaultBackupsLocationAlloc(allocator);
 }
 
 fn printBackupUsage() void {
