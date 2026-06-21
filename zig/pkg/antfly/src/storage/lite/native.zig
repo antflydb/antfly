@@ -106,8 +106,12 @@ const PageAllocator = struct {
     free_pages: []u64,
     next_free_index: usize = 0,
     next_page_id: u64,
+    data_lock_file: ?std.Io.File = null,
 
     fn deinit(self: *PageAllocator) void {
+        if (self.data_lock_file) |lock_file| {
+            lock_file.close(self.file.io_impl.io());
+        }
         self.file.allocator.free(self.free_pages);
     }
 
@@ -1478,13 +1482,25 @@ pub const NativeFile = struct {
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
-        const free_pages = try self.readFreePagesAlloc(checkpoint);
+        var free_pages = try self.readFreePagesAlloc(checkpoint);
         errdefer self.allocator.free(free_pages);
         try self.validateFreePagesSafeForCheckpointSlots(free_pages);
+        var data_lock_file: ?std.Io.File = null;
+        if (free_pages.len > 0) {
+            data_lock_file = acquireDataRewriteLock(self.io_impl.io(), self.path) catch |err| switch (err) {
+                error.WouldBlock => blk: {
+                    self.allocator.free(free_pages);
+                    free_pages = try self.allocator.alloc(u64, 0);
+                    break :blk null;
+                },
+                else => return err,
+            };
+        }
         return .{
             .file = self,
             .free_pages = free_pages,
             .next_page_id = checkpoint.page_count,
+            .data_lock_file = data_lock_file,
         };
     }
 
@@ -3215,6 +3231,49 @@ test "lite native free map reuses pages released by checkpoint rotation" {
     const value = (try file.getDocumentAlloc(allocator, "doc:1")).?;
     defer allocator.free(value);
     try std.testing.expectEqualStrings("v4", value);
+}
+
+test "lite native free map does not reuse pages while reader pins older checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-reader-protected.aflite");
+    defer allocator.free(path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    try writer.putDocument("doc:1", "v1");
+    try writer.putDocument("doc:1", "v2");
+    const before_size = (try writer.file.stat(writer.io_impl.io())).size;
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    const reader_checkpoint = reader.activeCheckpoint();
+    const reader_value_before = (try reader.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(reader_value_before);
+    try std.testing.expectEqualStrings("v2", reader_value_before);
+
+    try writer.putDocument("doc:1", "v3");
+    try writer.putDocument("doc:1", "v4");
+    const after_size = (try writer.file.stat(writer.io_impl.io())).size;
+    try std.testing.expect(after_size > before_size + default_page_size);
+
+    try std.testing.expectEqual(reader_checkpoint.commit_sequence, reader.activeCheckpoint().commit_sequence);
+    const reader_value_after = (try reader.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(reader_value_after);
+    try std.testing.expectEqualStrings("v2", reader_value_after);
+    const reader_free_pages = try reader.readFreePagesAlloc(reader.activeCheckpoint());
+    defer allocator.free(reader_free_pages);
+
+    const writer_value = (try writer.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(writer_value);
+    try std.testing.expectEqualStrings("v4", writer_value);
+
+    const report = try writer.check();
+    try std.testing.expect(report.valid);
 }
 
 test "lite native document store spills large values into value pages" {
