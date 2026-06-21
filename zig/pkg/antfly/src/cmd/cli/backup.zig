@@ -21,12 +21,14 @@ const backup_codec = antfly.backup_codec;
 const lite_restore_staging = antfly.lite.restore_staging;
 const portable_backup = antfly.portable_backup;
 
+const default_backup_location = "file:///tmp/antfly_backups";
+
 const BackupArgs = struct {
     help: bool = false,
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
-    location: []const u8 = "file:///tmp/antfly_backups",
+    location: []const u8 = default_backup_location,
     format: ?[]const u8 = null,
     url: ?[]const u8 = null,
     output: ?[]const u8 = null,
@@ -39,7 +41,8 @@ const RestoreArgs = struct {
     table_name: ?[]const u8 = null,
     tables_str: ?[]const u8 = null,
     backup_id: ?[]const u8 = null,
-    location: []const u8 = "file:///tmp/antfly_backups",
+    location: []const u8 = default_backup_location,
+    location_explicit: bool = false,
     format: ?[]const u8 = null,
     restore_mode: ?[]const u8 = null,
     url: ?[]const u8 = null,
@@ -160,7 +163,9 @@ pub fn runRestore(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
             }
         }
 
-        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, opts.location);
+        const location = try restoreInputLocationAlloc(allocator, input, opts);
+        defer allocator.free(location);
+        var plan = try prepareInputRestorePlan(allocator, input, tbl, opts.backup_id, location);
         defer plan.deinit(allocator);
         try client.restoreTable(plan.tableName(), plan.request);
         std.debug.print("Restore command successfully initiated.\n", .{});
@@ -271,6 +276,7 @@ fn parseRestoreArgs(args: *std.process.Args.Iterator) !RestoreArgs {
             out.backup_id = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--location")) {
             out.location = try nextRequired(args);
+            out.location_explicit = true;
         } else if (std.mem.eql(u8, arg, "--format")) {
             out.format = try nextRequired(args);
         } else if (std.mem.eql(u8, arg, "--mode")) {
@@ -294,6 +300,21 @@ fn validateRestoreArgs(opts: RestoreArgs) !void {
 
 fn isPortableRestoreInputPath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".aflite") or std.mem.endsWith(u8, path, ".afb");
+}
+
+fn restoreInputLocationAlloc(allocator: std.mem.Allocator, input_path: []const u8, opts: RestoreArgs) ![]u8 {
+    if (opts.location_explicit or !std.mem.endsWith(u8, input_path, ".aflite")) {
+        return try allocator.dupe(u8, opts.location);
+    }
+    return try defaultLiteInputRestoreLocationAlloc(allocator);
+}
+
+fn defaultLiteInputRestoreLocationAlloc(allocator: std.mem.Allocator) ![]u8 {
+    const home_z = std.c.getenv("HOME") orelse return error.HomeNotSet;
+    const home = std.mem.span(home_z);
+    const backups = try std.fs.path.join(allocator, &.{ home, ".antfly", "lite", "backups" });
+    defer allocator.free(backups);
+    return try std.fmt.allocPrint(allocator, "file://{s}", .{backups});
 }
 
 fn printBackupUsage() void {
@@ -320,6 +341,7 @@ fn printRestoreUsage() void {
         \\notes:
         \\  `--input db.aflite` stages an Antfly Lite database as a portable backup,
         \\  then restores it through the normal Antfly table restore path.
+        \\  Without --location, .aflite input stages under ~/.antfly/lite/backups.
         \\
     , .{});
 }
@@ -483,7 +505,45 @@ test "restore cli parser accepts aflite input shape" {
     try std.testing.expectEqualStrings("docs", opts.table_name.?);
     try std.testing.expectEqualStrings("portable", opts.format.?);
     try std.testing.expectEqualStrings("file:///tmp/backups", opts.location);
+    try std.testing.expect(opts.location_explicit);
     try std.testing.expectEqualStrings("lite-app", opts.backup_id.?);
+}
+
+test "restore input location defaults aflite staging under lite workspace" {
+    const allocator = std.testing.allocator;
+
+    var argv = [_][*:0]const u8{
+        "--input",
+        "app.aflite",
+        "--table",
+        "docs",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expect(!opts.location_explicit);
+
+    const location = try restoreInputLocationAlloc(allocator, opts.input_path.?, opts);
+    defer allocator.free(location);
+    try std.testing.expect(std.mem.startsWith(u8, location, "file://"));
+    try std.testing.expect(std.mem.endsWith(u8, location, "/.antfly/lite/backups"));
+}
+
+test "restore input location keeps generic default for afb input" {
+    const allocator = std.testing.allocator;
+
+    var argv = [_][*:0]const u8{
+        "--input",
+        "app.afb",
+        "--table",
+        "docs",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const opts = try parseRestoreArgs(&iter);
+    try std.testing.expect(!opts.location_explicit);
+
+    const location = try restoreInputLocationAlloc(allocator, opts.input_path.?, opts);
+    defer allocator.free(location);
+    try std.testing.expectEqualStrings(default_backup_location, location);
 }
 
 test "restore input plan stages aflite as portable table restore" {

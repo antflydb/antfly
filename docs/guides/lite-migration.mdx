@@ -50,11 +50,12 @@ You can run the same flow through normal restore:
 antfly restore \
   --input app.aflite \
   --table docs \
-  --location file:///tmp/antfly_backups \
   --url http://localhost:8080
 ```
 
 Use this direct path for one-shot promotion from an application-local database.
+If `--location` is omitted, `.aflite` input restore stages the portable backup
+under `~/.antfly/lite/backups`.
 For repeatable release or disaster-recovery workflows, create an explicit
 portable backup first:
 

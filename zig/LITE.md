@@ -347,6 +347,8 @@ When `antfly lite promote` needs a local staging location and the user does not
 pass `--location`, it should use `~/.antfly/lite/backups`, not a process-global
 `/tmp` directory. Explicit `--location` values continue to support normal
 Antfly backup targets such as `file://`, `s3://`, or `gs://`.
+The direct normal restore shortcut for `.aflite` input should use the same
+Lite-local default staging location when `--location` is omitted.
 
 Normal Antfly should also be able to restore directly from a `.aflite` live
 database file:
@@ -637,7 +639,7 @@ query-visible results should match within documented index rebuild semantics.
   CLI shape should be:
 
   ```sh
-  antfly restore --input app.aflite --table docs --location file:///tmp/antfly_backups
+  antfly restore --input app.aflite --table docs
   ```
 
 - Extend portable backup coverage for schema, index definitions, enrichment

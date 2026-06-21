@@ -301,13 +301,14 @@ Or use the normal restore command directly with a Lite input:
 antfly restore \
   --input app.aflite \
   --table docs \
-  --location file:///tmp/antfly_backups \
   --url http://localhost:8080
 ```
 
 Both paths open the `.aflite` database read-only, stage a portable restore
 backup, and restore that backup into the target Antfly table. They do not make
 `.aflite` the backup format.
+If you omit `--location`, direct `.aflite` restore input also stages under
+`~/.antfly/lite/backups`.
 
 For full upgrade, downgrade, restore, snapshot, and enrichment behavior, see the
 [Antfly Lite migration guide](/docs/guides/lite-migration).
