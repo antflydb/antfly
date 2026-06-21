@@ -142,6 +142,11 @@ The C ABI should expose a single Lite status JSON call that mirrors
 flags. Bindings should not have to reconstruct Lite status by combining several
 lower-level calls differently in each language.
 
+The C ABI should also expose a path-level Lite check call, not only a
+handle-level check. Bindings need to inspect invalid, truncated, or corrupted
+`.aflite` files and receive the same JSON integrity report as `antfly lite
+check` without first opening the database successfully.
+
 The embedded Zig API should expose the same status shape for Lite handles, with
 the storage identity available as a typed value on the lower-level DB wrapper.
 

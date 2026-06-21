@@ -1875,6 +1875,15 @@ pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Bu
     return .invalid_argument;
 }
 
+pub export fn antfly_lite_check_file_json(path: ?[*:0]const u8, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    const report = lite_backend.checkFile(alloc, path_slice) catch |err| return capi.mapError(err);
+    out.* = stringifyJson(report) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_lite_copy_stable_snapshot_json(
     handle_ptr: ?*anyopaque,
     dest_path: ?[*:0]const u8,
@@ -6359,6 +6368,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(short_lite_handle == null);
     defer antfly_db_close(short_lite_handle);
 
+    var short_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_file_json(short_lite_path, &short_check));
+    defer antfly_db_buffer_free(short_check.ptr, short_check.len);
+    const short_check_json = short_check.ptr.?[0..short_check.len];
+    try std.testing.expect(std.mem.indexOf(u8, short_check_json, "\"valid\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, short_check_json, "\"issue\":\"truncated_header\"") != null);
+
     var src_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &src_handle));
     defer antfly_db_close(src_handle);
@@ -6367,6 +6383,15 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_capabilities_json(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_backup(src_handle, null));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_json(src_handle, null));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_file_json(src_path, null));
+    var null_check_file_path: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_file_json(null, &null_check_file_path));
+    try std.testing.expect(null_check_file_path.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), null_check_file_path.len);
+    var invalid_check_file_path: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_check_file_json(plain_path, &invalid_check_file_path));
+    try std.testing.expect(invalid_check_file_path.ptr == null);
+    try std.testing.expectEqual(@as(usize, 0), invalid_check_file_path.len);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, snapshot_path, false, null));
     var null_snapshot_dest: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_copy_stable_snapshot_json(src_handle, null, false, &null_snapshot_dest));
