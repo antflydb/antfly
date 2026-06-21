@@ -96,7 +96,9 @@ pub const KvDType = enum {
             .f16, .bf16 => values_per_token * 2,
             .fp8 => values_per_token,
             .int4 => int4BytesForRow(values_per_token),
-            .int8, .polar4, .turbo3 => 0,
+            .int8 => flatInt8BytesForRow(values_per_token, num_kv_heads),
+            .polar4 => flatPolar4KeyBytes(values_per_token, num_kv_heads),
+            .turbo3 => flatTurbo3KeyBytes(values_per_token, num_kv_heads),
         };
     }
 
@@ -108,7 +110,7 @@ pub const KvDType = enum {
             .f16, .bf16 => values_per_token * 2,
             .fp8 => values_per_token,
             .int4 => int4BytesForRow(values_per_token),
-            .int8, .polar4, .turbo3 => 0,
+            .int8, .polar4, .turbo3 => flatInt8BytesForRow(values_per_token, num_kv_heads),
         };
     }
 };
@@ -118,6 +120,30 @@ const int4_bytes_per_group: usize = 2 + int4_group_size / 2; // f16 scale (2 byt
 
 fn int8BytesForRow(num_kv_heads: u32, head_dim: u32) usize {
     return @as(usize, num_kv_heads) * (@as(usize, head_dim) + @sizeOf(f32));
+}
+
+fn flatHeadDim(values_per_token: usize, num_kv_heads: u32) ?u32 {
+    if (num_kv_heads == 0) return null;
+    const heads: usize = num_kv_heads;
+    if (values_per_token % heads != 0) return null;
+    const head_dim = values_per_token / heads;
+    if (head_dim > std.math.maxInt(u32)) return null;
+    return @intCast(head_dim);
+}
+
+fn flatInt8BytesForRow(values_per_token: usize, num_kv_heads: u32) usize {
+    const head_dim = flatHeadDim(values_per_token, num_kv_heads) orelse return 0;
+    return int8BytesForRow(num_kv_heads, head_dim);
+}
+
+fn flatPolar4KeyBytes(values_per_token: usize, num_kv_heads: u32) usize {
+    const head_dim = flatHeadDim(values_per_token, num_kv_heads) orelse return 0;
+    return turboquant.polar4KeyBytes(num_kv_heads, head_dim);
+}
+
+fn flatTurbo3KeyBytes(values_per_token: usize, num_kv_heads: u32) usize {
+    const head_dim = flatHeadDim(values_per_token, num_kv_heads) orelse return 0;
+    return turboquant.turbo3KeyBytes(num_kv_heads, head_dim) + turboquant.turbo3ResidualBytes(num_kv_heads, head_dim);
 }
 
 fn int4BytesForRow(token_values: usize) usize {
@@ -702,7 +728,7 @@ fn dequantizeFp8ToF32(src: []const u8, dst: []f32) void {
 
 // --- int8 per-head symmetric quantization ---
 
-fn quantizeF32ToInt8PerHead(src: []const f32, dst: []u8, num_kv_heads: u32, head_dim: u32) void {
+pub fn quantizeF32ToInt8PerHead(src: []const f32, dst: []u8, num_kv_heads: u32, head_dim: u32) void {
     const hd: usize = head_dim;
     var dst_off: usize = 0;
     for (0..num_kv_heads) |h| {
@@ -1074,6 +1100,25 @@ test "pool turbo3 uses asymmetric key and value row sizes" {
     try std.testing.expectEqual(@as(usize, 1024 + 8 * 4), KvDType.turbo3.bytesForValueRow(8, 128));
     try std.testing.expectEqual(@as(usize, 384 + 32 + 1024 + 8 * 4), KvDType.turbo3.bytesForTokenRow(8, 128));
     try std.testing.expectEqual(@as(usize, 384 + 32 + 1024 + 8 * 4), KvDType.turbo3.bytesForTokenPair(8, 128));
+}
+
+test "pool turboquant flat rows support Gemma4 wide KV rows" {
+    const config = KvPoolConfig{
+        .backend = .cuda,
+        .dtype = .polar4,
+        .page_size_tokens = 4,
+        .num_kv_heads = 1,
+        .head_dim = 256,
+        .key_values_per_token = 512,
+        .value_values_per_token = 512,
+    };
+    try std.testing.expectEqual(@as(usize, 256), config.bytesPerKeyTokenRow());
+    try std.testing.expectEqual(@as(usize, 512 + 4), config.bytesPerValueTokenRow());
+
+    var turbo3_config = config;
+    turbo3_config.dtype = .turbo3;
+    try std.testing.expectEqual(@as(usize, 192 + 4), turbo3_config.bytesPerKeyTokenRow());
+    try std.testing.expectEqual(@as(usize, 512 + 4), turbo3_config.bytesPerValueTokenRow());
 }
 
 test "pool polar4 round-trip uses polar keys and int8 values" {

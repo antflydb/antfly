@@ -544,12 +544,7 @@ fn prepareGemmaQueryForAttention(
 ) !ops.CT {
     if (gpt_config.global_head_dim == 0) return q_input;
     const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
-    if (cb.vtable.reshape2d != null) {
-        const scale_shape = [_]i32{1};
-        const scale_ct = try cb.fromFloat32Shape(&[_]f32{scale}, &scale_shape);
-        defer cb.free(scale_ct);
-        return cb.multiply(q_input, scale_ct);
-    }
+    if (try cb.multiplyScalar(q_input, scale)) |scaled| return scaled;
     const q_data = try cb.toFloat32(q_input, allocator);
     defer allocator.free(q_data);
     const scaled = try allocator.alloc(f32, q_data.len);
@@ -583,7 +578,7 @@ fn prepareGemmaValueForAttention(
         defer cb.free(reshaped);
         const normed_flat = try cb.rmsNorm(reshaped, ones_ct, head_dim, gpt_config.norm_eps);
         defer cb.free(normed_flat);
-        return (try cb.reshape2d(normed_flat, rows, kv_dim)) orelse error.ReshapeFailed;
+        return try gpt_arch.reshape2dOwned(cb, allocator, normed_flat, rows, kv_dim);
     }
     return cb.rmsNorm(v_input, ones_ct, head_dim, gpt_config.norm_eps);
 }
@@ -646,6 +641,42 @@ fn prepareRopeForDirectAttention(
     const position_offset = seq_len - query_sequence_len;
     return cb.rope(
         input,
+        query_sequence_len,
+        head_dim,
+        rope_dim,
+        rope_theta,
+        gpt_config.rope_freq_scale,
+        position_offset,
+        rope_consecutive_pairs,
+    );
+}
+
+fn prepareScaledRopeForDirectAttention(
+    cb: *const ops.ComputeBackend,
+    gpt_config: gpt_mod.Config,
+    input: ops.CT,
+    scale: f32,
+    seq_len: usize,
+    query_sequence_len: usize,
+    head_dim: usize,
+    layer: usize,
+) !?ops.CT {
+    if (gpt_config.position_encoding != .rope) return null;
+    const rope_dim: usize = gpt_config.layerRopeActiveDim(layer);
+    const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
+    const rope_theta = blk: {
+        const base_theta = gpt_config.layerRopeTheta(layer);
+        const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
+        const active_dim: f32 = @floatFromInt(rope_dim);
+        if (active_dim < freq_dim) {
+            break :blk std.math.pow(f32, base_theta, active_dim / freq_dim);
+        }
+        break :blk base_theta;
+    };
+    const position_offset = seq_len - query_sequence_len;
+    return try cb.ropeScaled(
+        input,
+        scale,
         query_sequence_len,
         head_dim,
         rope_dim,
@@ -1016,6 +1047,7 @@ fn applyPleDirect(
     ple_vectors: ops.CT,
     layer: usize,
     rows: usize,
+    output_scale: ?ops.CT,
     allow_host_fallback: bool,
 ) !?ops.CT {
     const ple_dim: usize = gpt_config.ple_hidden_size;
@@ -1040,7 +1072,7 @@ fn applyPleDirect(
         ple_dim,
     );
 
-    if (try metal_compute_mod.MetalCompute.applyPleResidual(
+    if (output_scale == null) if (try metal_compute_mod.MetalCompute.applyPleResidual(
         cb,
         hidden,
         ple_input,
@@ -1051,7 +1083,9 @@ fn applyPleDirect(
         ple_dim,
         gpt_config.norm_eps,
         activation,
-    )) |direct| return direct;
+    )) |direct| {
+        return direct;
+    };
 
     const gate_proj = (try cb.decoderRuntimeApplyLinear(&.{
         .slot = pleGateSlot(configured_layer_count, layer),
@@ -1129,6 +1163,16 @@ fn applyPleDirect(
         normed,
         hidden_size,
     );
+
+    if (output_scale) |scale| {
+        const residual = (try cb.decoderRuntimeApplyAdd(&.{
+            .lhs = hidden,
+            .rhs = normed,
+            .dim = hidden_size,
+        })) orelse try cb.add(hidden, normed);
+        defer cb.free(residual);
+        return try cb.multiply(residual, scale);
+    }
 
     return (try cb.decoderRuntimeApplyAdd(&.{
         .lhs = hidden,
@@ -1756,15 +1800,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var block_output_scale: ?ops.CT = null;
             defer if (block_output_scale) |scale| cb.free(scale);
             if (block_ple_input != null or ple_vectors == null) {
-                var output_scale_name_buf: [256]u8 = undefined;
-                const output_scale_name = std.fmt.bufPrint(
-                    &output_scale_name_buf,
-                    "model.layers.{d}.per_layer_input.layer_output_scale.weight",
-                    .{layer},
-                ) catch "";
-                if (output_scale_name.len != 0) {
-                    block_output_scale = gpt_arch.getModelWeight(cb, gpt_config, output_scale_name) catch null;
-                }
+                block_output_scale = getLayerOutputScaleWeight(cb, gpt_config, layer);
             }
 
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
@@ -2007,7 +2043,71 @@ fn forwardFinalHiddenTensorGemmaDirect(
 
         const attention_head_norm_started_at = monotonicNowNs();
         var name_buf: [256]u8 = undefined;
-        const q_attn = if (try gpt_arch.maybeApplyQKHeadNorm(
+        var qk_already_roped = false;
+        var fused_q_rope: ?ops.CT = null;
+        var fused_k_rope: ?ops.CT = null;
+        if (!shares_kv and gpt_config.family == .gemma and gpt_config.position_encoding == .rope and decode_context.query_sequence_len == 1) fused_blk: {
+            const rope_dim = gpt_config.layerRopeActiveDim(layer);
+            const rope_theta = theta_blk: {
+                const base_theta = gpt_config.layerRopeTheta(layer);
+                const freq_dim: f32 = @floatFromInt(gpt_config.layerRopeFrequencyDim(layer));
+                const active_dim: f32 = @floatFromInt(rope_dim);
+                if (active_dim < freq_dim) break :theta_blk std.math.pow(f32, base_theta, active_dim / freq_dim);
+                break :theta_blk base_theta;
+            };
+            const position_offset = gpt_arch.positionOffset(seq_len, decode_context.query_sequence_len, decode_context);
+            const rope_consecutive_pairs = gpt_config.rope_layout == .consecutive_pairs;
+            const q_scale = if (gpt_config.global_head_dim != 0) @sqrt(@as(f32, @floatFromInt(head_dim))) else 1.0;
+            fused_q_rope = try gpt_arch.maybeApplyQKHeadNormRope(
+                cb,
+                allocator,
+                gpt_config,
+                q,
+                decode_context.query_sequence_len,
+                @intCast(gpt_config.num_attention_heads * head_dim),
+                layer,
+                "q",
+                @intCast(head_dim),
+                rope_dim,
+                rope_theta,
+                gpt_config.rope_freq_scale,
+                position_offset,
+                decode_context.query_sequence_len,
+                rope_consecutive_pairs,
+                q_scale,
+                &name_buf,
+            );
+            if (fused_q_rope == null) break :fused_blk;
+            errdefer if (fused_q_rope) |tensor| cb.free(tensor);
+            fused_k_rope = try gpt_arch.maybeApplyQKHeadNormRope(
+                cb,
+                allocator,
+                gpt_config,
+                k_value,
+                decode_context.query_sequence_len,
+                @intCast(num_kv_heads * head_dim),
+                layer,
+                "k",
+                @intCast(head_dim),
+                rope_dim,
+                rope_theta,
+                gpt_config.rope_freq_scale,
+                position_offset,
+                decode_context.query_sequence_len,
+                rope_consecutive_pairs,
+                1.0,
+                &name_buf,
+            );
+            if (fused_k_rope == null) {
+                if (fused_q_rope) |tensor| cb.free(tensor);
+                fused_q_rope = null;
+                break :fused_blk;
+            }
+            qk_already_roped = true;
+        }
+        const q_attn = if (fused_q_rope) |roped_q|
+            roped_q
+        else if (try gpt_arch.maybeApplyQKHeadNorm(
             cb,
             allocator,
             gpt_config,
@@ -2026,7 +2126,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
         defer if (q_attn != q) cb.free(q_attn);
         traceGatedFamilyDevice(cb, layer, "q_attn", q_attn);
 
-        const k_attn = if (!shares_kv) blk: {
+        const k_attn = if (fused_k_rope) |roped_k| roped_k else if (!shares_kv) blk: {
             if (try gpt_arch.maybeApplyQKHeadNorm(
                 cb,
                 allocator,
@@ -2046,15 +2146,20 @@ fn forwardFinalHiddenTensorGemmaDirect(
         } else k_value;
         defer if (k_attn != k_value) cb.free(k_attn);
         traceGatedFamilyDevice(cb, layer, "k_attn", k_attn);
-        const q_for_attn = try prepareGemmaQueryForAttention(
-            cb,
-            allocator,
-            gpt_config,
-            q_attn,
-            decode_context.query_sequence_len,
-            head_dim,
-            gpt_config.num_attention_heads * head_dim,
-        );
+        const q_for_attn = if (gpt_config.global_head_dim == 0)
+            q_attn
+        else if (gpt_config.position_encoding == .rope)
+            q_attn
+        else
+            try prepareGemmaQueryForAttention(
+                cb,
+                allocator,
+                gpt_config,
+                q_attn,
+                decode_context.query_sequence_len,
+                head_dim,
+                gpt_config.num_attention_heads * head_dim,
+            );
         defer if (q_for_attn != q_attn) cb.free(q_for_attn);
         traceGatedFamilyDevice(cb, layer, "q_for_attn", q_for_attn);
         const v_for_attn = try prepareGemmaValueForAttention(
@@ -2322,15 +2427,30 @@ fn forwardFinalHiddenTensorGemmaDirect(
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = true;
 
-            const q_block = try prepareRopeForDirectAttention(
-                cb,
-                gpt_config,
-                q_for_attn,
-                seq_len,
-                decode_context.query_sequence_len,
-                head_dim,
-                layer,
-            );
+            const q_block = blk: {
+                if (gpt_config.global_head_dim != 0 and gpt_config.position_encoding == .rope) {
+                    const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+                    if (try prepareScaledRopeForDirectAttention(
+                        cb,
+                        gpt_config,
+                        q_attn,
+                        scale,
+                        seq_len,
+                        decode_context.query_sequence_len,
+                        head_dim,
+                        layer,
+                    )) |scaled_rope| break :blk scaled_rope;
+                }
+                break :blk try prepareRopeForDirectAttention(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    seq_len,
+                    decode_context.query_sequence_len,
+                    head_dim,
+                    layer,
+                );
+            };
             defer if (q_block != q_for_attn) cb.free(q_block);
 
             var block_ple_input: ?ops.CT = null;
@@ -2345,15 +2465,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var block_output_scale: ?ops.CT = null;
             defer if (block_output_scale) |scale| cb.free(scale);
             if (block_ple_input != null or ple_vectors == null) {
-                var output_scale_name_buf: [256]u8 = undefined;
-                const output_scale_name = std.fmt.bufPrint(
-                    &output_scale_name_buf,
-                    "model.layers.{d}.per_layer_input.layer_output_scale.weight",
-                    .{layer},
-                ) catch "";
-                if (output_scale_name.len != 0) {
-                    block_output_scale = gpt_arch.getModelWeight(cb, gpt_config, output_scale_name) catch null;
-                }
+                block_output_scale = getLayerOutputScaleWeight(cb, gpt_config, layer);
             }
 
             const block_started_at = monotonicNowNs();
@@ -2400,6 +2512,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 }
                 try maybeFlushDecoderRuntimePrefillFrame(cb, phase, &decoder_frame_active);
                 var layer_result = block_hidden;
+                var layer_result_output_scaled = block_output_scale != null;
                 if (block_ple_input != null) {
                     if (phase == .prefill) {
                         timing_stats.prefill_ple_ops += 1;
@@ -2407,6 +2520,11 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     }
                 } else if (ple_vectors) |ple| {
                     const ple_started_at = monotonicNowNs();
+                    const ple_output_scale = if (!disableDirectPleRequested())
+                        try gpt_arch.getLayerOutputScaleWeight(cb, gpt_config, layer)
+                    else
+                        null;
+                    defer if (ple_output_scale) |scale| cb.free(scale);
                     const ple_result = if (!disableDirectPleRequested()) if (try applyPleDirect(
                         cb,
                         gpt_config,
@@ -2415,10 +2533,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
                         ple,
                         layer,
                         decode_context.query_sequence_len,
+                        ple_output_scale,
                         !decoder_frame_active,
-                    )) |direct_ple|
-                        direct_ple
-                    else if (!decoder_frame_active)
+                    )) |direct_ple| blk: {
+                        if (ple_output_scale != null) {
+                            layer_result_output_scaled = true;
+                            if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                        }
+                        break :blk direct_ple;
+                    } else if (!decoder_frame_active)
                         try gpt_arch.applyPle(
                             cb,
                             allocator,
@@ -2427,6 +2550,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                             ple,
                             decode_context.query_sequence_len,
                             layer,
+                            ple_output_scale,
                             &name_buf,
                         )
                     else {
@@ -2442,8 +2566,13 @@ fn forwardFinalHiddenTensorGemmaDirect(
                         ple,
                         decode_context.query_sequence_len,
                         layer,
+                        ple_output_scale,
                         &name_buf,
                     );
+                    if (ple_output_scale != null) {
+                        layer_result_output_scaled = true;
+                        if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                    }
                     const ple_finished_at = monotonicNowNs();
                     if (ple_finished_at > ple_started_at) {
                         addBlockPleTiming(phase, ple_finished_at - ple_started_at);
@@ -2452,8 +2581,8 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     layer_result = ple_result;
                 }
                 const prev_hidden = hidden;
-                const next_hidden = if (block_output_scale != null) blk: {
-                    if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                const next_hidden = if (layer_result_output_scaled) blk: {
+                    if (phase == .prefill and block_output_scale != null) timing_stats.prefill_output_scale_ops += 1;
                     break :blk layer_result;
                 } else blk: {
                     const output_scale_started_at = monotonicNowNs();
@@ -2529,8 +2658,14 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     addBlockAttentionTiming(phase, attention_finished_at - attention_started_at);
                 }
                 var layer_result = block_hidden;
+                var layer_result_output_scaled = false;
                 if (ple_vectors) |ple| {
                     const ple_started_at = monotonicNowNs();
+                    const ple_output_scale = if (!disableDirectPleRequested())
+                        try gpt_arch.getLayerOutputScaleWeight(cb, gpt_config, layer)
+                    else
+                        null;
+                    defer if (ple_output_scale) |scale| cb.free(scale);
                     const ple_result = if (!disableDirectPleRequested()) if (try applyPleDirect(
                         cb,
                         gpt_config,
@@ -2539,10 +2674,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
                         ple,
                         layer,
                         decode_context.query_sequence_len,
+                        ple_output_scale,
                         !decoder_frame_active,
-                    )) |direct_ple|
-                        direct_ple
-                    else if (!decoder_frame_active)
+                    )) |direct_ple| blk: {
+                        if (ple_output_scale != null) {
+                            layer_result_output_scaled = true;
+                            if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                        }
+                        break :blk direct_ple;
+                    } else if (!decoder_frame_active)
                         try gpt_arch.applyPle(
                             cb,
                             allocator,
@@ -2551,6 +2691,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                             ple,
                             decode_context.query_sequence_len,
                             layer,
+                            ple_output_scale,
                             &name_buf,
                         )
                     else {
@@ -2566,8 +2707,13 @@ fn forwardFinalHiddenTensorGemmaDirect(
                         ple,
                         decode_context.query_sequence_len,
                         layer,
+                        ple_output_scale,
                         &name_buf,
                     );
+                    if (ple_output_scale != null) {
+                        layer_result_output_scaled = true;
+                        if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                    }
                     const ple_finished_at = monotonicNowNs();
                     if (ple_finished_at > ple_started_at) {
                         addBlockPleTiming(phase, ple_finished_at - ple_started_at);
@@ -2576,12 +2722,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     layer_result = ple_result;
                 }
                 const prev_hidden = hidden;
-                const output_scale_started_at = monotonicNowNs();
-                const next_hidden = try gpt_arch.applyLayerOutputScale(cb, allocator, gpt_config, layer_result, decode_context.query_sequence_len, gpt_config.hidden_size, layer);
-                const output_scale_finished_at = monotonicNowNs();
-                if (output_scale_finished_at > output_scale_started_at) {
-                    addBlockOutputScaleTiming(phase, output_scale_finished_at - output_scale_started_at);
-                }
+                const next_hidden = if (layer_result_output_scaled) layer_result else blk: {
+                    const output_scale_started_at = monotonicNowNs();
+                    const scaled = try gpt_arch.applyLayerOutputScale(cb, allocator, gpt_config, layer_result, decode_context.query_sequence_len, gpt_config.hidden_size, layer);
+                    const output_scale_finished_at = monotonicNowNs();
+                    if (output_scale_finished_at > output_scale_started_at) {
+                        addBlockOutputScaleTiming(phase, output_scale_finished_at - output_scale_started_at);
+                    }
+                    break :blk scaled;
+                };
                 _ = try compareGatedFamilyLayer(
                     cb,
                     allocator,
@@ -2610,15 +2759,30 @@ fn forwardFinalHiddenTensorGemmaDirect(
             var attention = gpt_arch.attentionContextFromDecode(decode_context);
             attention.layer_index = kv_layer_index;
             attention.skip_kv_write = shares_kv;
-            const q_block = try prepareRopeForDirectAttention(
-                cb,
-                gpt_config,
-                q_for_attn,
-                seq_len,
-                decode_context.query_sequence_len,
-                head_dim,
-                layer,
-            );
+            const q_block = blk: {
+                if (gpt_config.global_head_dim != 0 and gpt_config.position_encoding == .rope) {
+                    const scale = @sqrt(@as(f32, @floatFromInt(head_dim)));
+                    if (try prepareScaledRopeForDirectAttention(
+                        cb,
+                        gpt_config,
+                        q_attn,
+                        scale,
+                        seq_len,
+                        decode_context.query_sequence_len,
+                        head_dim,
+                        layer,
+                    )) |scaled_rope| break :blk scaled_rope;
+                }
+                break :blk try prepareRopeForDirectAttention(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    seq_len,
+                    decode_context.query_sequence_len,
+                    head_dim,
+                    layer,
+                );
+            };
             defer if (q_block != q_for_attn) cb.free(q_block);
             const k_block = if (!shares_kv)
                 try prepareRopeForDirectAttention(
@@ -2671,8 +2835,11 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 if (owns_hidden) cb.free(hidden);
 
                 var layer_result = block_hidden;
+                var layer_result_output_scaled = false;
                 if (ple_vectors) |ple| {
                     const ple_started_at = monotonicNowNs();
+                    const ple_output_scale = try gpt_arch.getLayerOutputScaleWeight(cb, gpt_config, layer);
+                    defer if (ple_output_scale) |scale| cb.free(scale);
                     const ple_result = if (try applyPleDirect(
                         cb,
                         gpt_config,
@@ -2681,10 +2848,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
                         ple,
                         layer,
                         decode_context.query_sequence_len,
+                        ple_output_scale,
                         !decoder_frame_active,
-                    )) |direct_ple|
-                        direct_ple
-                    else if (!decoder_frame_active)
+                    )) |direct_ple| blk: {
+                        if (ple_output_scale != null) {
+                            layer_result_output_scaled = true;
+                            if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                        }
+                        break :blk direct_ple;
+                    } else if (!decoder_frame_active)
                         try gpt_arch.applyPle(
                             cb,
                             allocator,
@@ -2693,6 +2865,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                             ple,
                             decode_context.query_sequence_len,
                             layer,
+                            ple_output_scale,
                             &name_buf,
                         )
                     else {
@@ -2700,6 +2873,10 @@ fn forwardFinalHiddenTensorGemmaDirect(
                         cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
                         return null;
                     };
+                    if (ple_output_scale != null) {
+                        layer_result_output_scaled = true;
+                        if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                    }
                     const ple_finished_at = monotonicNowNs();
                     if (ple_finished_at > ple_started_at) {
                         addBlockPleTiming(phase, ple_finished_at - ple_started_at);
@@ -2707,11 +2884,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     cb.free(block_hidden);
                     layer_result = ple_result;
                 }
-                const output_scale_started_at = monotonicNowNs();
-                hidden = try gpt_arch.applyLayerOutputScale(cb, allocator, gpt_config, layer_result, decode_context.query_sequence_len, gpt_config.hidden_size, layer);
-                const output_scale_finished_at = monotonicNowNs();
-                if (output_scale_finished_at > output_scale_started_at) {
-                    addBlockOutputScaleTiming(phase, output_scale_finished_at - output_scale_started_at);
+                if (layer_result_output_scaled) {
+                    hidden = layer_result;
+                } else {
+                    const output_scale_started_at = monotonicNowNs();
+                    hidden = try gpt_arch.applyLayerOutputScale(cb, allocator, gpt_config, layer_result, decode_context.query_sequence_len, gpt_config.hidden_size, layer);
+                    const output_scale_finished_at = monotonicNowNs();
+                    if (output_scale_finished_at > output_scale_started_at) {
+                        addBlockOutputScaleTiming(phase, output_scale_finished_at - output_scale_started_at);
+                    }
                 }
                 owns_hidden = true;
                 continue;
@@ -2721,51 +2902,71 @@ fn forwardFinalHiddenTensorGemmaDirect(
         const attention_apply_started_at = monotonicNowNs();
         const attn_residual = if (decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1) blk: {
             const fused_residual_started_at = monotonicNowNs();
-            if (try gpt_arch.applyAttentionResidual(
-                cb,
-                gpt_config,
-                q_for_attn,
-                k_attn,
-                v_for_attn,
-                hidden,
-                1,
-                seq_len,
-                gpt_config.num_attention_heads,
-                num_kv_heads,
-                head_dim,
-                gpt_config.hidden_size,
-                layer,
-                kv_layer_index,
-                shares_kv,
-                linearSlot(layer, .attn_out_proj),
-                null,
-                normSlot(layer, .attn_post),
-                decode_context,
-            )) |fused_attn_residual| {
-                recordGemmaDirectAttentionResidual(true, true);
-                const fused_residual_finished_at = monotonicNowNs();
-                if (fused_residual_finished_at > fused_residual_started_at) {
-                    addBlockAttentionFusedResidualTiming(phase, fused_residual_finished_at - fused_residual_started_at);
+            if (!qk_already_roped) {
+                if (try gpt_arch.applyAttentionResidual(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    k_attn,
+                    v_for_attn,
+                    hidden,
+                    1,
+                    seq_len,
+                    gpt_config.num_attention_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gpt_config.hidden_size,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    linearSlot(layer, .attn_out_proj),
+                    null,
+                    normSlot(layer, .attn_post),
+                    decode_context,
+                )) |fused_attn_residual| {
+                    recordGemmaDirectAttentionResidual(true, true);
+                    const fused_residual_finished_at = monotonicNowNs();
+                    if (fused_residual_finished_at > fused_residual_started_at) {
+                        addBlockAttentionFusedResidualTiming(phase, fused_residual_finished_at - fused_residual_started_at);
+                    }
+                    break :blk fused_attn_residual;
                 }
-                break :blk fused_attn_residual;
             }
 
-            const attn_out = try gpt_arch.applyAttention(
-                cb,
-                gpt_config,
-                q_for_attn,
-                k_attn,
-                v_for_attn,
-                1,
-                seq_len,
-                gpt_config.num_attention_heads,
-                num_kv_heads,
-                head_dim,
-                layer,
-                kv_layer_index,
-                shares_kv,
-                decode_context,
-            );
+            const attn_out = if (qk_already_roped)
+                try gpt_arch.applyPreparedAttention(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    k_attn,
+                    v_for_attn,
+                    1,
+                    seq_len,
+                    gpt_config.num_attention_heads,
+                    num_kv_heads,
+                    head_dim,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    decode_context,
+                )
+            else
+                try gpt_arch.applyAttention(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    k_attn,
+                    v_for_attn,
+                    1,
+                    seq_len,
+                    gpt_config.num_attention_heads,
+                    num_kv_heads,
+                    head_dim,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    decode_context,
+                );
             if (phase == .prefill) timing_stats.prefill_attention_apply_ops += 1;
             defer cb.free(attn_out);
             try gpt_arch.maybeDumpGatedLayerStageStats(
@@ -3483,6 +3684,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
 
         var compare_layer_hidden_pre_ple: ?ops.CT = null;
         defer if (compare_layer_hidden_pre_ple) |ct| cb.free(ct);
+        var layer_hidden_output_scaled = false;
         const layer_hidden = blk: {
             const ffn_fused_started_at = monotonicNowNs();
             if (try cb.runGatedFfnResidual(&.{
@@ -3572,28 +3774,49 @@ fn forwardFinalHiddenTensorGemmaDirect(
             defer cb.free(gate_up.first);
             defer cb.free(gate_up.second);
 
-            const activated = (try cb.decoderRuntimeApplyActivation(&.{
-                .input = gate_up.first,
-                .kind = switch (gpt_config.activation) {
-                    .gelu => .gelu,
-                    .gelu_new => .gelu_new,
-                    .silu => .silu,
-                    .relu => .relu,
-                    .relu_squared => .relu_squared,
-                },
-                .dim = gpt_config.intermediateSize(layer),
-            })) orelse activated_blk: {
-                if (decoder_frame_active) {
-                    cb.free(attn_residual);
-                    cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
-                    return null;
-                }
-                break :activated_blk try gpt_arch.applyActivation(cb, gpt_config, gate_up.first);
+            const activation_kind = decoderActivationKind(gpt_config);
+            const gated = if (try cb.activationMultiply(gate_up.first, gate_up.second, activation_kind)) |fused|
+                fused
+            else if (gpt_config.activation == .silu) fused_blk: {
+                if (try cb.siluMultiply(gate_up.first, gate_up.second)) |fused| break :fused_blk fused;
+                const activated = (try cb.decoderRuntimeApplyActivation(&.{
+                    .input = gate_up.first,
+                    .kind = .silu,
+                    .dim = gpt_config.intermediateSize(layer),
+                })) orelse activated_blk: {
+                    if (decoder_frame_active) {
+                        cb.free(attn_residual);
+                        cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
+                        return null;
+                    }
+                    break :activated_blk try gpt_arch.applyActivation(cb, gpt_config, gate_up.first);
+                };
+                if (phase == .prefill) timing_stats.prefill_ffn_activation_ops += 1;
+                defer cb.free(activated);
+                break :fused_blk try cb.multiply(activated, gate_up.second);
+            } else fused_blk: {
+                const activated = (try cb.decoderRuntimeApplyActivation(&.{
+                    .input = gate_up.first,
+                    .kind = switch (gpt_config.activation) {
+                        .gelu => .gelu,
+                        .gelu_new => .gelu_new,
+                        .silu => .silu,
+                        .relu => .relu,
+                        .relu_squared => .relu_squared,
+                    },
+                    .dim = gpt_config.intermediateSize(layer),
+                })) orelse activated_blk: {
+                    if (decoder_frame_active) {
+                        cb.free(attn_residual);
+                        cancelDecoderRuntimeFrame(cb, &decoder_frame_active);
+                        return null;
+                    }
+                    break :activated_blk try gpt_arch.applyActivation(cb, gpt_config, gate_up.first);
+                };
+                if (phase == .prefill) timing_stats.prefill_ffn_activation_ops += 1;
+                defer cb.free(activated);
+                break :fused_blk try cb.multiply(activated, gate_up.second);
             };
-            if (phase == .prefill) timing_stats.prefill_ffn_activation_ops += 1;
-            defer cb.free(activated);
-
-            const gated = try cb.multiply(activated, gate_up.second);
             if (phase == .prefill) timing_stats.prefill_ffn_multiply_ops += 1;
             defer cb.free(gated);
 
@@ -3699,6 +3922,28 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 compare_layer_hidden_pre_ple = try cb.add(compare_down_post, compare_attn_residual.?);
             }
 
+            const fused_scaled = if (ple_vectors == null) fused_blk: {
+                const scale_w = (try gpt_arch.getLayerOutputScaleWeight(cb, gpt_config, layer)) orelse break :fused_blk null;
+                defer cb.free(scale_w);
+                break :fused_blk try cb.addMultiplyScalarTensor(down_post, attn_residual, scale_w);
+            } else null;
+            if (fused_scaled) |scaled| {
+                layer_hidden_output_scaled = true;
+                if (phase == .prefill) {
+                    timing_stats.prefill_ffn_residual_add_ops += 1;
+                    timing_stats.prefill_output_scale_ops += 1;
+                }
+                try gpt_arch.maybeDumpGatedLayerStageStats(
+                    cb,
+                    allocator,
+                    layer,
+                    "ffn-residual",
+                    scaled,
+                    gpt_config.hidden_size,
+                );
+                break :blk scaled;
+            }
+
             const residual = try cb.add(down_post, attn_residual);
             if (phase == .prefill) timing_stats.prefill_ffn_residual_add_ops += 1;
             try gpt_arch.maybeDumpGatedLayerStageStats(
@@ -3733,6 +3978,11 @@ fn forwardFinalHiddenTensorGemmaDirect(
             const ple_started_at = monotonicNowNs();
             if (phase == .prefill) timing_stats.prefill_ple_ops += 1;
             var used_direct_ple = false;
+            const ple_output_scale = if (!disableDirectPleRequested())
+                try gpt_arch.getLayerOutputScaleWeight(cb, gpt_config, layer)
+            else
+                null;
+            defer if (ple_output_scale) |scale| cb.free(scale);
             const ple_result = if (!disableDirectPleRequested()) if (try applyPleDirect(
                 cb,
                 gpt_config,
@@ -3741,9 +3991,14 @@ fn forwardFinalHiddenTensorGemmaDirect(
                 ple,
                 layer,
                 decode_context.query_sequence_len,
+                ple_output_scale,
                 !decoder_frame_active,
             )) |direct_ple| blk: {
                 used_direct_ple = true;
+                if (ple_output_scale != null) {
+                    layer_hidden_output_scaled = true;
+                    if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+                }
                 break :blk direct_ple;
             } else if (!decoder_frame_active) blk: {
                 if (phase == .prefill) timing_stats.prefill_ple_fallbacks += 1;
@@ -3755,6 +4010,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     ple,
                     decode_context.query_sequence_len,
                     layer,
+                    ple_output_scale,
                     &name_buf,
                 );
             } else {
@@ -3772,9 +4028,14 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     ple,
                     decode_context.query_sequence_len,
                     layer,
+                    ple_output_scale,
                     &name_buf,
                 );
             };
+            if (!used_direct_ple and ple_output_scale != null) {
+                layer_hidden_output_scaled = true;
+                if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+            }
             if (phase == .prefill and used_direct_ple) timing_stats.prefill_ple_direct_hits += 1;
             const ple_finished_at = monotonicNowNs();
             if (ple_finished_at > ple_started_at) {
@@ -3789,6 +4050,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     ple,
                     decode_context.query_sequence_len,
                     layer,
+                    null,
                     &name_buf,
                 );
                 defer cb.free(compare_ple_result);
@@ -3819,12 +4081,15 @@ fn forwardFinalHiddenTensorGemmaDirect(
         try maybeSyncTensor(cb, allocator, layer_result);
         try maybeFlushDecoderRuntimePrefillFrame(cb, phase, &decoder_frame_active);
         const prev_hidden = hidden;
-        const output_scale_started_at = monotonicNowNs();
-        var next_hidden = try gpt_arch.applyLayerOutputScale(cb, allocator, gpt_config, layer_result, decode_context.query_sequence_len, gpt_config.hidden_size, layer);
-        if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
-        const output_scale_finished_at = monotonicNowNs();
-        if (output_scale_finished_at > output_scale_started_at) {
-            addBlockOutputScaleTiming(phase, output_scale_finished_at - output_scale_started_at);
+        var next_hidden = layer_result;
+        if (!layer_hidden_output_scaled) {
+            const output_scale_started_at = monotonicNowNs();
+            next_hidden = try gpt_arch.applyLayerOutputScale(cb, allocator, gpt_config, layer_result, decode_context.query_sequence_len, gpt_config.hidden_size, layer);
+            if (phase == .prefill) timing_stats.prefill_output_scale_ops += 1;
+            const output_scale_finished_at = monotonicNowNs();
+            if (output_scale_finished_at > output_scale_started_at) {
+                addBlockOutputScaleTiming(phase, output_scale_finished_at - output_scale_started_at);
+            }
         }
         try gpt_arch.maybeDumpGatedLayerStageStats(
             cb,
@@ -3865,6 +4130,7 @@ fn forwardFinalHiddenTensorGemmaDirect(
                     ple,
                     decode_context.query_sequence_len,
                     layer,
+                    null,
                     &name_buf,
                 )
             else

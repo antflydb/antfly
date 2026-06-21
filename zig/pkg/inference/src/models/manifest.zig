@@ -67,7 +67,7 @@ const gemma4_chat_template =
     "{{ '<turn|>\\n' }}" ++
     "{%- endfor -%}" ++
     "{%- if add_generation_prompt -%}" ++
-    "{{ '<|turn>model\\n' }}" ++
+    "{{ '<|turn>model\\n<|channel>thought\\n<channel|>' }}" ++
     "{%- endif -%}";
 
 pub const ModelType = enum {
@@ -772,10 +772,10 @@ fn applyGgufTokenizerMetadata(
             manifest.tokenizer_type = .sentencepiece;
         } else if (c_file.fileExistsInDir(allocator, model_dir_path, "tokenizer.json")) {
             manifest.tokenizer_type = .huggingface;
-        } else if (supportsGgufSentencePieceFallback(model_name) and hasGgufSentencePieceMetadata(&parsed)) {
-            manifest.tokenizer_type = .sentencepiece;
         } else if (supportsGgufHuggingFaceFallback(model_name) and hasGgufHuggingFaceMetadata(&parsed)) {
             manifest.tokenizer_type = .huggingface;
+        } else if (supportsGgufSentencePieceFallback(model_name) and hasGgufSentencePieceMetadata(&parsed)) {
+            manifest.tokenizer_type = .sentencepiece;
         } else {
             manifest.tokenizer_type = null;
         }
@@ -806,13 +806,15 @@ fn applyGgufTokenizerMetadata(
     applyGgufSpecialTokenString(allocator, &parsed, "tokenizer.ggml.padding_token_id", &manifest.pad_token);
 }
 
-fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
-    if (!std.mem.eql(u8, model_name, "gemma4")) return false;
-
+fn gemma4ChatTemplateRequiresBuiltInFallback(chat_template: []const u8) bool {
     return std.mem.indexOf(u8, chat_template, "macro format_parameters") != null or
         std.mem.indexOf(u8, chat_template, "namespace(") != null or
         std.mem.indexOf(u8, chat_template, "{% set captured_content") != null or
         std.mem.indexOf(u8, chat_template, "{%- set captured_content") != null;
+}
+
+fn shouldUseBuiltInGemma4GgufChatTemplate(model_name: []const u8, chat_template: []const u8) bool {
+    return std.mem.eql(u8, model_name, "gemma4") and gemma4ChatTemplateRequiresBuiltInFallback(chat_template);
 }
 
 fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
@@ -820,7 +822,7 @@ fn supportsGgufSentencePieceFallback(model_name: []const u8) bool {
 }
 
 fn supportsGgufHuggingFaceFallback(model_name: []const u8) bool {
-    return std.mem.eql(u8, model_name, "gpt2");
+    return std.mem.eql(u8, model_name, "gpt2") or std.mem.eql(u8, model_name, "gemma4");
 }
 
 fn hasGgufSentencePieceMetadata(parsed: *const gguf_format.File) bool {
@@ -1820,10 +1822,16 @@ fn parseTokenizerConfig(manifest: *ModelManifest, allocator: std.mem.Allocator, 
         }
     }
 
-    // Gemma 4 models may lack a chat_template field — detect by sot_token and apply built-in.
-    if (manifest.chat_template == null) {
-        if (obj.get("sot_token")) |v| {
-            if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
+    // Gemma 4 models use <|turn> and may ship a tool-capable upstream
+    // template that requires Jinja features outside our rendering subset.
+    if (obj.get("sot_token")) |v| {
+        if (v == .string and std.mem.eql(u8, v.string, "<|turn>")) {
+            if (manifest.chat_template) |existing| {
+                if (gemma4ChatTemplateRequiresBuiltInFallback(existing)) {
+                    allocator.free(existing);
+                    manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
+                }
+            } else {
                 manifest.chat_template = try allocator.dupe(u8, gemma4_chat_template);
             }
         }
@@ -2646,6 +2654,21 @@ test "manifest treats gemma4 unified config as generator" {
     try std.testing.expect(manifest.gguf_projector_path != null);
 }
 
+test "gemma4 tokenizer config replaces unsupported upstream chat template" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    manifest.chat_template = try allocator.dupe(u8, "{%- macro format_parameters(properties, required) -%}{%- endmacro -%}");
+    defer manifest.deinit();
+
+    try parseTokenizerConfig(&manifest, allocator,
+        \\{"sot_token":"<|turn>","bos_token":"<bos>","eos_token":"<eos>","pad_token":"<pad>","unk_token":"<unk>"}
+    );
+
+    try std.testing.expect(manifest.chat_template != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "<|turn>model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.chat_template.?, "format_parameters") == null);
+}
+
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     const allocator = std.testing.allocator;
 
@@ -2668,6 +2691,28 @@ test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     try std.testing.expectEqualStrings("<|end_of_text|>", manifest.eos_token);
 }
 
+test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const gguf_bytes = try buildTestGgufWithGemma4Tokenizer(allocator);
+    defer allocator.free(gguf_bytes);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
+
+    const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(model_dir);
+
+    var manifest = try loadFromDir(allocator, model_dir);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expectEqual(TokenizerType.huggingface, manifest.tokenizer_type.?);
+    try std.testing.expectEqualStrings("<bos>", manifest.bos_token);
+    try std.testing.expectEqualStrings("<eos>", manifest.eos_token);
+}
+
 fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(allocator);
@@ -2688,6 +2733,38 @@ fn buildTestGgufWithGpt2Tokenizer(allocator: std.mem.Allocator) ![]u8 {
     try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 1, 3 });
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 0);
     try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 2);
+    try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
+
+    return data.toOwnedSlice(allocator);
+}
+
+fn buildTestGgufWithGemma4Tokenizer(allocator: std.mem.Allocator) ![]u8 {
+    var data = std.ArrayListUnmanaged(u8).empty;
+    defer data.deinit(allocator);
+
+    try data.appendSlice(allocator, gguf_format.magic);
+    try appendTestLe(u32, allocator, &data, 3);
+    try appendTestLe(u64, allocator, &data, 0);
+    try appendTestLe(u64, allocator, &data, 11);
+
+    try appendTestMetadataString(allocator, &data, "general.architecture", "gemma4");
+    try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gemma4");
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.tokens", &.{
+        "<pad>",
+        "<eos>",
+        "<bos>",
+        "<unk>",
+        "hello",
+        "▁world",
+        "<|turn>",
+    });
+    try appendTestMetadataStringArray(allocator, &data, "tokenizer.ggml.merges", &.{});
+    try appendTestMetadataF32Array(allocator, &data, "tokenizer.ggml.scores", &.{ 0, 0, 0, 0, 0, 0, 0 });
+    try appendTestMetadataI32Array(allocator, &data, "tokenizer.ggml.token_type", &.{ 3, 3, 3, 2, 1, 1, 3 });
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.bos_token_id", 2);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.eos_token_id", 1);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.padding_token_id", 0);
+    try appendTestMetadataU32(allocator, &data, "tokenizer.ggml.unknown_token_id", 3);
     try appendTestMetadataBool(allocator, &data, "tokenizer.ggml.add_bos_token", true);
 
     return data.toOwnedSlice(allocator);
@@ -2735,4 +2812,12 @@ fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayList
     try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
+}
+
+fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
+    try appendTestString(allocator, data, key);
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u64, allocator, data, values.len);
+    for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }

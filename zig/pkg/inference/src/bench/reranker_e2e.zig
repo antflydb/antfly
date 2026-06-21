@@ -23,7 +23,6 @@ const std = @import("std");
 
 const inference = @import("inference_internal");
 const platform = inference.platform;
-const session_factory = inference.architectures.session_factory;
 const backends = inference.backends;
 const native_backend_choice = inference.native_backend_choice;
 
@@ -108,7 +107,18 @@ const BenchResult = struct {
     p95_ms: f64,
     docs_per_s: f64,
     checksum: f64,
-    graph_stats: session_factory.CudaDebertaGraphRuntimeStats = .{},
+    graph_stats: GraphStats = .{},
+};
+
+const GraphStats = struct {
+    captures: u64 = 0,
+    replays: u64 = 0,
+    fallbacks: u64 = 0,
+    capture_failures: u64 = 0,
+    buckets: u64 = 0,
+    graph_owned_bytes: u64 = 0,
+    dynamic_copy_bytes: u64 = 0,
+    last_fallback_reason: []const u8 = "none",
 };
 
 fn runTimed(
@@ -118,6 +128,7 @@ fn runTimed(
     opts: Options,
     docs: []const []const u8,
 ) !BenchResult {
+    _ = session;
     var checksum: f64 = 0;
     for (0..opts.warmup_iters) |_| {
         const scores = try pipeline.rerank(opts.query, docs);
@@ -160,7 +171,7 @@ fn runTimed(
         .p95_ms = p95_ms,
         .docs_per_s = docs_per_s,
         .checksum = checksum,
-        .graph_stats = session_factory.getCudaDebertaGraphRuntimeStats(session) orelse .{},
+        .graph_stats = .{},
     };
 }
 

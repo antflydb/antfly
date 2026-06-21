@@ -81,6 +81,7 @@ pub fn supportsMetalEagerGraph(op: OpCode) bool {
         .fused_tanh_act,
         .fused_elem_add,
         .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .fused_embedding_lookup,
         .fused_from_float32,
         .fused_to_float32,

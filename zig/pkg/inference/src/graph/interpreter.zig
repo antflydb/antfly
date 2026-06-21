@@ -802,6 +802,7 @@ pub fn canKeepAliasedOutput(op: anytype) bool {
         .fused_log_softmax,
         .fused_elem_add,
         .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .neg,
         .sqrt,
         .rsqrt,
@@ -1684,6 +1685,15 @@ pub fn executeNode(
                 if (try cb.multiplyConsumeLeft(V.get(ins[0]), V.get(ins[1]))) |consumed| return consumed;
             }
             return cb.multiply(V.get(ins[0]), V.get(ins[1]));
+        },
+
+        .fused_add_mul_scalar => {
+            if (try cb.addMultiplyScalarTensor(V.get(ins[0]), V.get(ins[1]), V.get(ins[2]))) |fused| return fused;
+            const sum = try cb.add(V.get(ins[0]), V.get(ins[1]));
+            errdefer cb.free(sum);
+            const scaled = try cb.multiply(sum, V.get(ins[2]));
+            cb.free(sum);
+            return scaled;
         },
 
         .fused_concat => |attrs| {

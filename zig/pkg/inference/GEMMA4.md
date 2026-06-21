@@ -200,7 +200,7 @@ MTP heads instead of independent decoders:
    for `gemma4_assistant` draft configs.
 5. Keep the existing verification path unchanged: done. Target-side verification is
    what preserves output quality and sampling semantics.
-6. Extend telemetry: partially done. `ANTFLY_INFERENCE_DEBUG_GEMMA4_MTP=1` prints drafted
+6. Extend telemetry: partially done. `ANTFLY_GEMMA4_MTP_DEBUG=1` prints drafted
    token ids and verifier choices for acceptance debugging.
 7. Move Gemma 4 runtime-specific construction into
    `src/architectures/gemma4_runtime.zig`: done.
@@ -239,6 +239,100 @@ productive, but acceptance is still far below the published best-case numbers.
 The remaining likely causes are source/model pairing differences between the
 official safetensors assistant and the local GGUF target, quantization effects in
 the target, or a still-missing detail in the clustered output head.
+
+### CUDA Branch Status
+
+Status checked on 2026-06-21 on branch `gemma4_gpu_stuff`:
+
+- `zig build -Dcuda=true` succeeds.
+- `antfly-inference cuda-info --smoke` succeeds on an NVIDIA L4 (`sm_89`).
+- The CUDA smoke now covers the Gemma4-specific WIP primitives:
+  add-multiply-scalar, RMSNorm-add-multiply-scalar, head-norm+RoPE, GQA, RoPE,
+  and MTP masked argmax.
+- Local validation artifacts used in this pass:
+  `.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf`
+  for E2B CUDA smoke, `.models/google/gemma-4-12B-it-q4_k` for 12B Q4 CUDA
+  validation, and `.models/unsloth/gemma-4-E2B-it-qat-GGUF/MTP/` for E2B MTP
+  assistant GGUFs.
+- CUDA uses the current device-side Gemma4 fast paths for Q4_K Q/K/V
+  projection, Q4_K embedding lookup, fused head-norm+RoPE, device KV
+  read/write, dense GQA attention, MTP masked argmax, and optional paged
+  TurboQuant KV.
+- CUDA TurboQuant KV status, measurements, and validation steps live in
+  `CUDA.md` under "Gemma4 And TurboQuant KV Status". Gemma4 CUDA defaults remain
+  `f32` KV for exactness. `--cache-dtype polar4` is the current
+  production-candidate opt-in compressed-K/compressed-V path; `--cache-dtype
+  turbo3` is resident and functional but still experimental.
+
+The most direct user-facing E2B smoke is:
+
+```sh
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  .models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
+  "Give a one sentence summary of Korean history." \
+  --backend cuda \
+  --max-tokens 128 \
+  --print-timing \
+  --print-token-count
+```
+
+If running from `zig/pkg/inference/zig-out/bin`, use the absolute model path
+instead of `.models/...`; CUDA.md includes that copy-paste form.
+
+Once the model artifacts are available, run the CUDA validation ladder in this
+order:
+
+```sh
+zig build -Dcuda=true
+
+zig/pkg/inference/zig-out/bin/antfly-inference cuda-info --smoke
+
+zig/pkg/inference/zig-out/bin/antfly-inference cuda-info \
+  --gemma4-parity /path/to/gemma4-12b-target.gguf
+
+zig/pkg/inference/zig-out/bin/antfly-inference compare \
+  /path/to/gemma4-12b-target /path/to/gemma4-12b-target \
+  "Write one sentence about ants." \
+  --runtime-parity \
+  --backend cuda \
+  --top-k 8 \
+  --no-chat-template
+
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  /path/to/gemma4-12b-target \
+  "Write one sentence about ants." \
+  --backend cuda \
+  --max-tokens 16 \
+  --temperature 0 \
+  --print-token-ids \
+  --print-timing
+
+zig/pkg/inference/zig-out/bin/antfly-inference generate \
+  /path/to/gemma4-12b-target \
+  "Write one sentence about ants." \
+  --backend cuda \
+  --draft-model /path/to/gemma4-assistant \
+  --speculative-k 2 \
+  --max-tokens 16 \
+  --temperature 0 \
+  --debug-mtp \
+  --print-token-ids \
+  --print-timing
+```
+
+Useful CUDA/MTP isolation flags:
+
+- `ANTFLY_CUDA_DISABLE_GEMMA4_MTP_DEVICE=1`: use the host clustered-output
+  fallback instead of the CUDA MTP masked-argmax kernel.
+- `ANTFLY_CUDA_ENABLE_Q4K_DECODE_FAST=1`: enable the experimental Q4_K tile8
+  decode path.
+- `ANTFLY_CUDA_DISABLE_HEAD_NORM_ROPE_FUSION=1`: disable fused
+  head-norm+RoPE.
+- `ANTFLY_CUDA_ENABLE_ADD_MUL_SCALAR_FUSION=1` and
+  `ANTFLY_CUDA_ENABLE_RMSNORM_ADD_MUL_SCALAR_FUSION=1`: enable experimental
+  output-scale fusions.
+- `ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET=1`: force experimental MTP against
+  targets missing shared-KV metadata.
 
 Follow-up smoke after adding the earlier pre-final-RMSNorm target activation
 path:

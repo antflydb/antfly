@@ -5475,6 +5475,9 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
+            error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
+            error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
+            error.HAFencedPrimary => return error.HAFencedPrimary,
             else => {
                 std.log.err("public table batch failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
