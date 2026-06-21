@@ -73,7 +73,6 @@ pub const StorageStatus = struct {
     engine: []const u8,
     primary_layout: []const u8,
     index_layout: []const u8,
-    compatibility_fallback: bool = false,
     format_version: ?u32 = null,
     page_size: ?u32 = null,
     active_checkpoint: ?u8 = null,
@@ -206,7 +205,6 @@ pub const Handle = struct {
                     .engine = @tagName(self.engine),
                     .primary_layout = "native_document_pages",
                     .index_layout = "lsm_logical_files_in_native_index_catalog",
-                    .compatibility_fallback = false,
                     .format_version = native.format_version,
                     .page_size = file.header.page_size,
                     .active_checkpoint = file.header.active_checkpoint,
@@ -219,7 +217,6 @@ pub const Handle = struct {
                 .engine = @tagName(self.engine),
                 .primary_layout = "lsm_container",
                 .index_layout = "lsm_container",
-                .compatibility_fallback = false,
             },
         };
     }
@@ -657,7 +654,6 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("native_single_file", status.engine);
     try std.testing.expectEqualStrings("native_document_pages", status.primary_layout);
     try std.testing.expectEqualStrings("lsm_logical_files_in_native_index_catalog", status.index_layout);
-    try std.testing.expect(!status.compatibility_fallback);
     try std.testing.expectEqual(native.format_version, status.format_version.?);
     try std.testing.expectEqual(native.default_page_size, status.page_size.?);
     try std.testing.expectEqual(handle.native_docstore.?.file.header.active_checkpoint, status.active_checkpoint.?);

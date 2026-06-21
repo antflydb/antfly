@@ -438,6 +438,10 @@ pub const NativeFile = struct {
         try self.putIndexCatalogBatch(&.{.{ .key = key, .value = value }});
     }
 
+    pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
+        try self.appendCatalogRecordForRoot(.index, key, suffix);
+    }
+
     pub fn deleteIndexCatalogRecord(self: *NativeFile, key: []const u8) !void {
         try self.putIndexCatalogBatch(&.{.{ .key = key, .is_delete = true }});
     }
@@ -479,6 +483,90 @@ pub const NativeFile = struct {
             try self.writePage(page_id, .catalog, payload.items);
             next_root_page = page_id;
         }
+
+        var next = previous;
+        next.commit_sequence += 1;
+        setCatalogRootPage(&next, root, next_root_page);
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+    }
+
+    fn appendCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, key: []const u8, suffix: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+
+        const previous = self.activeCheckpoint();
+        var found_entry: ?CatalogEntry = null;
+        var found_payload: ?[]u8 = null;
+
+        var page_id = catalogRootPage(previous, root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            const entry = decodeCatalogEntry(payload) catch |err| {
+                self.allocator.free(payload);
+                return err;
+            };
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) {
+                    self.allocator.free(payload);
+                    return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }});
+                }
+                found_entry = entry;
+                found_payload = payload;
+                break;
+            }
+            page_id = entry.previous_page;
+            self.allocator.free(payload);
+        }
+
+        const entry = found_entry orelse return try self.putCatalogBatchForRoot(root, &.{.{ .key = key, .value = suffix }});
+        defer if (found_payload) |payload| self.allocator.free(payload);
+
+        const old_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        const total_len = try std.math.add(usize, old_len, suffix.len);
+
+        var next_root_page = catalogRootPage(previous, root);
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        var external_value_root_page: u64 = 0;
+        var inline_value: []u8 = &.{};
+        defer if (inline_value.len > 0) self.allocator.free(inline_value);
+
+        const fixed_len = 16 + key.len;
+        const fits_inline = fixed_len <= self.maxPagePayloadBytes() and total_len <= self.maxPagePayloadBytes() - fixed_len;
+        if (fits_inline) {
+            inline_value = try self.allocator.alloc(u8, total_len);
+            if (entry.external_value_root_page != 0) {
+                const old_value = try self.readValuePagesAlloc(self.allocator, entry.external_value_root_page, entry.external_value_len);
+                defer self.allocator.free(old_value);
+                @memcpy(inline_value[0..old_value.len], old_value);
+            } else {
+                @memcpy(inline_value[0..entry.value.len], entry.value);
+            }
+            @memcpy(inline_value[old_len..], suffix);
+        } else {
+            external_value_root_page = try self.writeAppendedCatalogValuePagesAllocated(&page_allocator, entry, suffix, total_len);
+        }
+
+        const catalog_page_id = try page_allocator.allocate();
+        var payload = std.ArrayListUnmanaged(u8).empty;
+        defer payload.deinit(self.allocator);
+        try encodeCatalogEntryRaw(self.allocator, &payload, .{
+            .previous_page = next_root_page,
+            .key = key,
+            .value = inline_value,
+            .external_value_root_page = external_value_root_page,
+            .external_value_len = if (external_value_root_page != 0) total_len else 0,
+        });
+        try self.writePage(catalog_page_id, .catalog, payload.items);
+        next_root_page = catalog_page_id;
 
         var next = previous;
         next.commit_sequence += 1;
@@ -1234,10 +1322,9 @@ pub const NativeFile = struct {
 
     fn copyValuePagesAllocated(self: *NativeFile, page_allocator: *PageAllocator, root_page_id: u64, value_len: usize) !u64 {
         if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
-        const page_count = self.valuePageCount(value_len);
-        if (page_count > std.math.maxInt(usize)) return error.RecordTooLarge;
+        const page_count = try self.countValuePages(root_page_id, value_len);
 
-        const page_ids = try self.allocator.alloc(u64, @intCast(page_count));
+        const page_ids = try self.allocator.alloc(u64, page_count);
         defer self.allocator.free(page_ids);
         for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
 
@@ -1267,6 +1354,96 @@ pub const NativeFile = struct {
 
         if (remaining != 0 or page_index != page_ids.len) return error.InvalidNativeValueChain;
         return page_ids[0];
+    }
+
+    fn writeAppendedCatalogValuePagesAllocated(
+        self: *NativeFile,
+        page_allocator: *PageAllocator,
+        entry: CatalogEntry,
+        suffix: []const u8,
+        total_len: usize,
+    ) !u64 {
+        if (total_len == 0) return error.InvalidNativeValueChain;
+        const old_page_count: usize = if (entry.external_value_root_page != 0)
+            try self.countValuePages(entry.external_value_root_page, entry.external_value_len)
+        else if (entry.value.len > 0)
+            1
+        else
+            0;
+        const suffix_page_count: usize = if (suffix.len == 0)
+            0
+        else
+            std.math.divCeil(usize, suffix.len, self.maxValuePagePayloadBytes()) catch unreachable;
+        const page_count = try std.math.add(usize, old_page_count, suffix_page_count);
+        if (page_count == 0) return error.InvalidNativeValueChain;
+
+        const page_ids = try self.allocator.alloc(u64, page_count);
+        defer self.allocator.free(page_ids);
+        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
+
+        var page_index: usize = 0;
+        if (entry.external_value_root_page != 0) {
+            var remaining = entry.external_value_len;
+            var source_page_id = entry.external_value_root_page;
+            while (source_page_id != 0) : (page_index += 1) {
+                if (page_index >= old_page_count) return error.InvalidNativeValueChain;
+                const payload = try self.readPagePayloadByKindAlloc(self.allocator, source_page_id, .value);
+                defer self.allocator.free(payload);
+                const page = try decodeValuePage(payload);
+                if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+                if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+                try self.writeValuePageChunk(page_ids, page_index, page.chunk);
+                remaining -= page.chunk.len;
+                source_page_id = page.next_page;
+                if (remaining == 0 and source_page_id != 0) return error.InvalidNativeValueChain;
+            }
+            if (remaining != 0 or page_index != old_page_count) return error.InvalidNativeValueChain;
+        } else if (entry.value.len > 0) {
+            try self.writeValuePageChunk(page_ids, page_index, entry.value);
+            page_index += 1;
+        }
+
+        var suffix_offset: usize = 0;
+        while (suffix_offset < suffix.len) : (page_index += 1) {
+            if (page_index >= page_ids.len) return error.InvalidNativeValueChain;
+            const len = @min(self.maxValuePagePayloadBytes(), suffix.len - suffix_offset);
+            try self.writeValuePageChunk(page_ids, page_index, suffix[suffix_offset..][0..len]);
+            suffix_offset += len;
+        }
+
+        if (page_index != page_ids.len) return error.InvalidNativeValueChain;
+        return page_ids[0];
+    }
+
+    fn countValuePages(self: *NativeFile, root_page_id: u64, value_len: usize) !usize {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+        var remaining = value_len;
+        var page_id = root_page_id;
+        var count: usize = 0;
+        while (page_id != 0) {
+            count += 1;
+            if (count > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .value);
+            defer self.allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+            remaining -= page.chunk.len;
+            page_id = page.next_page;
+            if (remaining == 0 and page_id != 0) return error.InvalidNativeValueChain;
+        }
+        if (remaining != 0) return error.InvalidNativeValueChain;
+        return count;
+    }
+
+    fn writeValuePageChunk(self: *NativeFile, page_ids: []const u64, page_index: usize, chunk: []const u8) !void {
+        if (chunk.len == 0 or chunk.len > self.maxValuePagePayloadBytes()) return error.InvalidNativeValueChain;
+        const next_page_id = if (page_index + 1 < page_ids.len) page_ids[page_index + 1] else 0;
+        const payload = try self.allocator.alloc(u8, value_page_header_size + chunk.len);
+        defer self.allocator.free(payload);
+        std.mem.writeInt(u64, payload[0..8], next_page_id, .little);
+        @memcpy(payload[value_page_header_size..], chunk);
+        try self.writePage(page_ids[page_index], .value, payload);
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {

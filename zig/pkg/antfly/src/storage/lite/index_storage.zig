@@ -130,17 +130,7 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const existing = try self.docs.file.getIndexCatalogRecordAlloc(self.allocator, path);
-    defer if (existing) |bytes| self.allocator.free(bytes);
-    if (existing) |old| {
-        const joined = try self.allocator.alloc(u8, old.len + contents.len);
-        defer self.allocator.free(joined);
-        @memcpy(joined[0..old.len], old);
-        @memcpy(joined[old.len..], contents);
-        try self.docs.file.putIndexCatalogRecord(path, joined);
-        return;
-    }
-    try self.docs.file.putIndexCatalogRecord(path, contents);
+    try self.docs.file.appendIndexCatalogRecord(path, contents);
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
@@ -334,9 +324,16 @@ test "lite native index storage handles large files rename and delete tree" {
 
     try storage.writeFileAbsolute("/dense/a/blob", large);
     try std.testing.expectEqual(@as(u64, @intCast(large.len)), try storage.fileSize("/dense/a/blob"));
+
+    const append_suffix = " native append keeps old pages streaming";
+    const before_append_page_count = docs.file.activeCheckpoint().page_count;
+    try storage.appendFileAbsolute(allocator, "/dense/a/blob", append_suffix, true);
+    try std.testing.expectEqual(before_append_page_count + 7, docs.file.activeCheckpoint().page_count);
+    try std.testing.expectEqual(@as(u64, @intCast(large.len + append_suffix.len)), try storage.fileSize("/dense/a/blob"));
+
     const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
-    try std.testing.expectEqual(before_rename_page_count + 7, docs.file.activeCheckpoint().page_count);
+    try std.testing.expectEqual(before_rename_page_count + 8, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
 
     const range_offset = native.default_page_size + 19;
@@ -346,8 +343,8 @@ test "lite native index storage handles large files rename and delete tree" {
 
     const trailer = try storage.readFileTrailerAlloc(allocator, "/dense/a/blob2", 17);
     defer allocator.free(trailer);
-    try std.testing.expectEqualSlices(u8, large[large.len - 17 ..], trailer);
-    try std.testing.expectError(error.EndOfStream, storage.readFileRangeAlloc(allocator, "/dense/a/blob2", large.len - 4, 8));
+    try std.testing.expectEqualSlices(u8, append_suffix[append_suffix.len - 17 ..], trailer);
+    try std.testing.expectError(error.EndOfStream, storage.readFileRangeAlloc(allocator, "/dense/a/blob2", large.len + append_suffix.len - 4, 8));
 
     try storage.writeFileAbsolute("/dense/a/sub/file", "child");
     try storage.deleteTree("/dense/a");
