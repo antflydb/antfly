@@ -31,10 +31,10 @@ Use constants such as `InferenceModeCallerSuppliedArtifacts`,
 `InferenceModeManualMaintenance`, and `InferenceModeDisabledDeferred` when
 branching on inference status or capabilities.
 Typed `PendingWorkStats`, `RunUntilIdleStatus`, `Check`, `Compact`, `Vacuum`,
-and `CopyStableSnapshot` helpers cover the stable Lite maintenance reports
-while keeping the raw JSON methods available. `ReplayGeneratedEnrichments`
-recreates generated enrichment work from stored documents after a
-manual-maintenance or restore pause.
+`CopyStableSnapshot`, and `CopyStableSnapshotFile` helpers cover the stable
+Lite maintenance reports while keeping the raw JSON methods available.
+`ReplayGeneratedEnrichments` recreates generated enrichment work from stored
+documents after a manual-maintenance or restore pause.
 Use `CheckFile` or `CheckFileJSON` to inspect an invalid, truncated, or
 corrupted `.aflite` file without opening a database handle.
 
@@ -59,6 +59,8 @@ Use `ExportToFile` or `BackupToFile` to write a portable `.afb` archive from an
 open Lite handle. Use `RestoreFile`, `Restore`, `RestoreBackupFile`,
 `RestoreBackup`, or handle-level `Import` to stage a portable backup into a new
 `.aflite` database without publishing a partial target on import failure.
+Use `CopyStableSnapshot` or `CopyStableSnapshotFile` when you want a physical
+`.aflite` database snapshot rather than a portable `.afb` backup archive.
 
 The repository-level `zig build lite-core` gate builds `libantflylite` and runs
 the Go binding tests against it.

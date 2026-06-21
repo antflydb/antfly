@@ -41,6 +41,26 @@ func (db *DB) ExportToFile(path string) error {
 	return writeFileAtomically(path, backup, 0o600)
 }
 
+// CopyStableSnapshotFile opens srcPath read-only, copies a stable physical
+// .aflite snapshot to destPath, and returns the typed snapshot report.
+func CopyStableSnapshotFile(srcPath, destPath string, replace bool) (*StableSnapshotReport, error) {
+	if !strings.HasSuffix(srcPath, ".aflite") || !strings.HasSuffix(destPath, ".aflite") {
+		return nil, InvalidArgument
+	}
+	db, err := OpenReadonly(srcPath)
+	if err != nil {
+		return nil, err
+	}
+	report, copyErr := db.CopyStableSnapshot(destPath, replace)
+	if closeErr := db.Close(); closeErr != nil && copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		return nil, copyErr
+	}
+	return report, nil
+}
+
 // RestoreBackupFile creates or replaces a Lite database from a portable Antfly
 // backup archive.
 func RestoreBackupFile(path, backupPath string, replace bool) error {

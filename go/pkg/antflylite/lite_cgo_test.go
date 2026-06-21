@@ -558,6 +558,35 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("snapshot file: %v", err)
 	}
 
+	snapshotFilePath := filepath.Join(t.TempDir(), "go-snapshot-file.aflite")
+	snapshotFileReport, err := CopyStableSnapshotFile(path, snapshotFilePath, false)
+	if err != nil {
+		t.Fatalf("copy stable snapshot file: %v", err)
+	}
+	if snapshotFileReport.SnapshotSize == 0 || snapshotFileReport.PageCount == 0 {
+		t.Fatalf("unexpected snapshot file report: %#v", snapshotFileReport)
+	}
+	snapshotFile, err := OpenReadonly(snapshotFilePath)
+	if err != nil {
+		t.Fatalf("open copied stable snapshot file: %v", err)
+	}
+	snapshotFileLookup, err := snapshotFile.LookupJSON("doc:go-smoke")
+	if closeErr := snapshotFile.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("lookup copied stable snapshot file: %v", err)
+	}
+	if !bytes.Contains(snapshotFileLookup, []byte("go api lite")) {
+		t.Fatalf("snapshot file lookup JSON %q did not contain written document", snapshotFileLookup)
+	}
+	if _, err := CopyStableSnapshotFile(path, snapshotFilePath, false); err == nil {
+		t.Fatalf("snapshot file without replace unexpectedly overwrote target")
+	}
+	if _, err := CopyStableSnapshotFile(path, filepath.Join(t.TempDir(), "go-snapshot-file.afb"), false); err != InvalidArgument {
+		t.Fatalf("snapshot file to .afb error = %v, want %v", err, InvalidArgument)
+	}
+
 	compactReport, err := db.Compact()
 	if err != nil {
 		t.Fatalf("compact: %v", err)
