@@ -77,6 +77,12 @@ def archive_name(version: str, platform: Platform) -> str:
     return f"antfly_{version}_{platform.release_os}_{platform.release_arch}.tar.gz"
 
 
+def lite_library_name(platform: Platform) -> str:
+    if platform.release_os == "Darwin":
+        return "libantflylite.dylib"
+    return "libantflylite.so"
+
+
 def is_packaging_noise(path: Path) -> bool:
     return any(part == "__MACOSX" or part.startswith("._") for part in path.parts)
 
@@ -103,6 +109,12 @@ def extract_archive(archive_dir: Path, version: str, platform: Platform, dest: P
     binary = dest / "antfly"
     if not binary.exists():
         raise SystemExit(f"release archive does not contain antfly binary: {archive}")
+    header = dest / "include" / "antflylite.h"
+    if not header.exists():
+        raise SystemExit(f"release archive does not contain antflylite.h: {archive}")
+    lite_lib = dest / "lib" / lite_library_name(platform)
+    if not lite_lib.exists():
+        raise SystemExit(f"release archive does not contain {lite_lib.name}: {archive}")
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 

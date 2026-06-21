@@ -102,6 +102,25 @@ if [ -d /mnt/cache ] && [ -w /mnt/cache ]; then
   cache_root=/mnt/cache/zig
 fi
 
+lite_library_name() {
+  case "$1" in
+    *macos*) echo "libantflylite.dylib" ;;
+    *windows*) echo "antflylite.dll" ;;
+    *) echo "libantflylite.so" ;;
+  esac
+}
+
+lite_library_archive_path() {
+  case "$1" in
+    *windows*) echo "./bin/$(lite_library_name "$1")" ;;
+    *) echo "./lib/$(lite_library_name "$1")" ;;
+  esac
+}
+
+lite_lib_name="$(lite_library_name "$target")"
+lite_lib_archive_path="$(lite_library_archive_path "$target")"
+lite_lib_prefix_path="$prefix/${lite_lib_archive_path#./}"
+
 rm -rf "$work_root"
 mkdir -p "$prefix" "$stage" "$local_cache" "$cache_root/global" "$out_dir"
 
@@ -136,6 +155,11 @@ zig_install_args=(
 
 test -x "$prefix/bin/antfly"
 test -f "$prefix/include/antflylite.h"
+if [ ! -f "$lite_lib_prefix_path" ]; then
+  echo "missing Lite C ABI library: $lite_lib_prefix_path" >&2
+  find "$prefix" -maxdepth 3 -type f | sort >&2
+  exit 1
+fi
 cp "$prefix/bin/antfly" "$stage/antfly"
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
@@ -150,4 +174,7 @@ cp "$repo_root/README.md" "$stage/README.md"
 cp "$repo_root/LICENSE" "$stage/LICENSE"
 
 tar -C "$stage" -czf "$out_dir/$archive_name" .
+tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
+grep -Fx "./include/antflylite.h" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"
