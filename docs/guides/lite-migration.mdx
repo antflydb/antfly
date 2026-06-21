@@ -85,11 +85,21 @@ Restore it into a new Lite database:
 antfly lite restore docs.afb --out docs.aflite
 ```
 
+Import it into an existing empty Lite database:
+
+```bash
+antfly lite init empty-docs.aflite
+antfly lite import empty-docs.aflite --from docs.afb
+```
+
 Use replacement only when the destination database can be overwritten:
 
 ```bash
 antfly lite import docs.aflite --from docs.afb --replace
 ```
+
+Importing from another `.aflite` file is a physical snapshot replacement, not a
+logical merge. Pass `--replace` when the target `.aflite` file already exists.
 
 This workflow is useful for local development, debugging a production slice,
 building fixture databases, or shipping a seeded embedded application.

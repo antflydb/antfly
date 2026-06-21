@@ -251,7 +251,14 @@ Restore a backup into a new Lite database:
 antfly lite restore app.afb --out restored.aflite
 ```
 
-Import into an existing Lite database only when replacement is explicit:
+Import a portable `.afb` into an existing empty Lite database:
+
+```bash
+antfly lite init empty.aflite
+antfly lite import empty.aflite --from app.afb
+```
+
+If the target database already contains data, replacement must be explicit:
 
 ```bash
 antfly lite import restored.aflite --from app.afb --replace
@@ -262,6 +269,10 @@ You can also copy a stable live `.aflite` snapshot:
 ```bash
 antfly lite snapshot app.aflite --out copy.aflite
 ```
+
+`antfly lite import <target.aflite> --from <source.aflite>` is a physical
+snapshot replacement, not a logical merge. It requires `--replace` when the
+target already exists.
 
 Use snapshots for local file copies. Use `.afb` for portable backups and
 migrations.
