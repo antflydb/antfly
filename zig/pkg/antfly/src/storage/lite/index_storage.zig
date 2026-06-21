@@ -153,12 +153,7 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(self.allocator, old_path)) orelse return;
-    defer self.allocator.free(stored);
-    try self.docs.file.putIndexCatalogBatch(&.{
-        .{ .key = new_path, .value = stored },
-        .{ .key = old_path, .is_delete = true },
-    });
+    try self.docs.file.renameIndexCatalogRecord(old_path, new_path);
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -339,7 +334,9 @@ test "lite native index storage handles large files rename and delete tree" {
 
     try storage.writeFileAbsolute("/dense/a/blob", large);
     try std.testing.expectEqual(@as(u64, @intCast(large.len)), try storage.fileSize("/dense/a/blob"));
+    const before_rename_page_count = docs.file.activeCheckpoint().page_count;
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
+    try std.testing.expectEqual(before_rename_page_count + 7, docs.file.activeCheckpoint().page_count);
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
 
     const range_offset = native.default_page_size + 19;

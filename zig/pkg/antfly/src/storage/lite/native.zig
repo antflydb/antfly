@@ -87,6 +87,15 @@ const ValuePage = struct {
     chunk: []const u8,
 };
 
+const EncodedCatalogEntry = struct {
+    previous_page: u64,
+    key: []const u8,
+    value: []const u8 = "",
+    is_delete: bool = false,
+    external_value_root_page: u64 = 0,
+    external_value_len: usize = 0,
+};
+
 const FreeMap = struct {
     covered_page_count: u64,
     free_pages: []u64,
@@ -433,6 +442,10 @@ pub const NativeFile = struct {
         try self.putIndexCatalogBatch(&.{.{ .key = key, .is_delete = true }});
     }
 
+    pub fn renameIndexCatalogRecord(self: *NativeFile, old_key: []const u8, new_key: []const u8) !void {
+        try self.renameCatalogRecordForRoot(.index, old_key, new_key);
+    }
+
     pub fn putIndexCatalogBatch(self: *NativeFile, mutations: []const CatalogMutation) !void {
         return try self.putCatalogBatchForRoot(.index, mutations);
     }
@@ -465,6 +478,87 @@ pub const NativeFile = struct {
             });
             try self.writePage(page_id, .catalog, payload.items);
             next_root_page = page_id;
+        }
+
+        var next = previous;
+        next.commit_sequence += 1;
+        setCatalogRootPage(&next, root, next_root_page);
+        next.free_map_root_page = try page_allocator.allocate();
+        next.page_count = page_allocator.next_page_id;
+
+        const free_pages = try self.computeFreePagesForPublishedCheckpoint(next, previous);
+        defer self.allocator.free(free_pages);
+        try self.writeFreeMapPage(next.free_map_root_page, next.page_count, free_pages);
+        try self.syncIfRequired();
+
+        try self.publishCheckpoint(next);
+    }
+
+    fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
+
+        const previous = self.activeCheckpoint();
+        var found_entry: ?CatalogEntry = null;
+        var found_payload: ?[]u8 = null;
+
+        var page_id = catalogRootPage(previous, root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            const entry = decodeCatalogEntry(payload) catch |err| {
+                self.allocator.free(payload);
+                return err;
+            };
+            if (std.mem.eql(u8, entry.key, old_key)) {
+                if (entry.is_delete) {
+                    self.allocator.free(payload);
+                    return;
+                }
+                found_entry = entry;
+                found_payload = payload;
+                break;
+            }
+            page_id = entry.previous_page;
+            self.allocator.free(payload);
+        }
+
+        const entry = found_entry orelse return;
+        defer if (found_payload) |payload| self.allocator.free(payload);
+
+        var next_root_page = catalogRootPage(previous, root);
+        var page_allocator = try self.pageAllocatorFromFreeMap(previous);
+        defer page_allocator.deinit();
+
+        var external_value_root_page: u64 = 0;
+        if (entry.external_value_root_page != 0) {
+            external_value_root_page = try self.copyValuePagesAllocated(&page_allocator, entry.external_value_root_page, entry.external_value_len);
+        }
+
+        {
+            const new_page_id = try page_allocator.allocate();
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntryRaw(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = new_key,
+                .value = entry.value,
+                .external_value_root_page = external_value_root_page,
+                .external_value_len = entry.external_value_len,
+            });
+            try self.writePage(new_page_id, .catalog, payload.items);
+            next_root_page = new_page_id;
+        }
+
+        {
+            const tombstone_page_id = try page_allocator.allocate();
+            var payload = std.ArrayListUnmanaged(u8).empty;
+            defer payload.deinit(self.allocator);
+            try encodeCatalogEntryRaw(self.allocator, &payload, .{
+                .previous_page = next_root_page,
+                .key = old_key,
+                .is_delete = true,
+            });
+            try self.writePage(tombstone_page_id, .catalog, payload.items);
+            next_root_page = tombstone_page_id;
         }
 
         var next = previous;
@@ -1135,6 +1229,43 @@ pub const NativeFile = struct {
             offset += len;
         }
 
+        return page_ids[0];
+    }
+
+    fn copyValuePagesAllocated(self: *NativeFile, page_allocator: *PageAllocator, root_page_id: u64, value_len: usize) !u64 {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+        const page_count = self.valuePageCount(value_len);
+        if (page_count > std.math.maxInt(usize)) return error.RecordTooLarge;
+
+        const page_ids = try self.allocator.alloc(u64, @intCast(page_count));
+        defer self.allocator.free(page_ids);
+        for (page_ids) |*page_id| page_id.* = try page_allocator.allocate();
+
+        var remaining = value_len;
+        var source_page_id = root_page_id;
+        var page_index: usize = 0;
+        while (source_page_id != 0) : (page_index += 1) {
+            if (page_index >= page_ids.len) return error.InvalidNativeValueChain;
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, source_page_id, .value);
+            defer self.allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > remaining) return error.InvalidNativeValueChain;
+
+            const dest_page_id = page_ids[page_index];
+            const next_dest_page_id = if (page_index + 1 < page_ids.len) page_ids[page_index + 1] else 0;
+            const copied_payload = try self.allocator.alloc(u8, value_page_header_size + page.chunk.len);
+            defer self.allocator.free(copied_payload);
+            std.mem.writeInt(u64, copied_payload[0..8], next_dest_page_id, .little);
+            @memcpy(copied_payload[value_page_header_size..], page.chunk);
+            try self.writePage(dest_page_id, .value, copied_payload);
+
+            remaining -= page.chunk.len;
+            source_page_id = page.next_page;
+            if (remaining == 0 and source_page_id != 0) return error.InvalidNativeValueChain;
+        }
+
+        if (remaining != 0 or page_index != page_ids.len) return error.InvalidNativeValueChain;
         return page_ids[0];
     }
 
@@ -1927,13 +2058,25 @@ fn decodePagePayloadAlloc(allocator: Allocator, raw: []const u8, expected_kind: 
 }
 
 fn encodeCatalogEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: CatalogEntry) !void {
-    if (entry.key.len > catalog_key_len_mask or entry.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+    try encodeCatalogEntryRaw(allocator, out, .{
+        .previous_page = entry.previous_page,
+        .key = entry.key,
+        .value = entry.value,
+        .is_delete = entry.is_delete,
+        .external_value_root_page = entry.external_value_root_page,
+        .external_value_len = if (entry.external_value_root_page != 0 and entry.external_value_len == 0) entry.value.len else entry.external_value_len,
+    });
+}
+
+fn encodeCatalogEntryRaw(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: EncodedCatalogEntry) !void {
+    const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+    if (entry.key.len > catalog_key_len_mask or value_len > std.math.maxInt(u32)) return error.RecordTooLarge;
     if (entry.is_delete and entry.external_value_root_page != 0) return error.InvalidNativeCatalogEntryFlags;
     const external_value = entry.external_value_root_page != 0;
-    if (external_value and entry.value.len == 0) return error.InvalidNativeValueChain;
+    if (external_value and entry.external_value_len == 0) return error.InvalidNativeValueChain;
 
     const start = out.items.len;
-    const stored_value_len: usize = if (external_value) 8 else entry.value.len;
+    const stored_value_len: usize = if (external_value) 8 else value_len;
     try out.resize(allocator, start + 16 + entry.key.len + stored_value_len);
     const encoded = out.items[start..];
     std.mem.writeInt(u64, encoded[0..8], entry.previous_page, .little);
@@ -1942,7 +2085,7 @@ fn encodeCatalogEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), en
         (if (entry.is_delete) catalog_delete_flag else 0) |
         (if (external_value) catalog_external_value_flag else 0);
     std.mem.writeInt(u32, encoded[8..12], key_len_flags, .little);
-    std.mem.writeInt(u32, encoded[12..16], @intCast(entry.value.len), .little);
+    std.mem.writeInt(u32, encoded[12..16], @intCast(value_len), .little);
     @memcpy(encoded[16..][0..entry.key.len], entry.key);
     if (external_value) {
         std.mem.writeInt(u64, encoded[16 + entry.key.len ..][0..8], entry.external_value_root_page, .little);
