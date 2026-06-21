@@ -3875,6 +3875,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml lowers on conflict primary do nothing",
             "sql adapter lower dml lowers on conflict primary do update with excluded values",
             "sql adapter lower dml lowers on conflict unique do update",
+            "sql adapter lower dml lowers on conflict arithmetic update",
             "sql adapter lower dml lowers excluded explicit default values",
             "sql adapter lower dml lowers conflict update explicit default values",
             "sql adapter lower dml lowers cross-column excluded conflict values",

@@ -11705,6 +11705,169 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
+test "sql adapter lower dml lowers on conflict arithmetic update" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"amount\":5}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 1) ON CONFLICT (email) DO UPDATE SET amount = amount + 3 RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, lowered.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("3", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 8), lowered.batch.predicates[0].expected_version);
+    var returned = try std.json.parseFromSlice(std.json.Value, alloc, lowered.batch.returning_rows[0], .{});
+    defer returned.deinit();
+    switch (returned.value.object.get("amount").?) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, 8), value),
+        .float => |value| try std.testing.expectEqual(@as(f64, 8), value),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var excluded_delta = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 4) ON CONFLICT (email) DO UPDATE SET amount = amount + excluded.amount RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer excluded_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), excluded_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, excluded_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", excluded_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", excluded_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":9}", excluded_delta.batch.returning_rows[0]);
+
+    var row_assignment = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 4) ON CONFLICT (email) DO UPDATE SET (email, amount) = (excluded.email, amount + excluded.amount) RETURNING email, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer row_assignment.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), row_assignment.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 2), row_assignment.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, row_assignment.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("email", row_assignment.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"a@example.test\"", row_assignment.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, row_assignment.batch.transforms[0].operations[1].op);
+    try std.testing.expectEqualStrings("amount", row_assignment.batch.transforms[0].operations[1].path);
+    try std.testing.expectEqualStrings("4", row_assignment.batch.transforms[0].operations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"email\":\"a@example.test\",\"amount\":9}", row_assignment.batch.returning_rows[0]);
+
+    var table_qualified_delta = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO public.usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 4) ON CONFLICT (email) DO UPDATE SET amount = public.usage_records.amount + excluded.amount RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer table_qualified_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), table_qualified_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, table_qualified_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", table_qualified_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("9", table_qualified_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":9}", table_qualified_delta.batch.returning_rows[0]);
+
+    var proposed_arithmetic = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 4) ON CONFLICT (email) DO UPDATE SET amount = excluded.amount + 3 RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer proposed_arithmetic.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), proposed_arithmetic.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, proposed_arithmetic.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", proposed_arithmetic.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("7", proposed_arithmetic.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":7}", proposed_arithmetic.batch.returning_rows[0]);
+
+    var parenthesized_proposed_arithmetic = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 4) ON CONFLICT (email) DO UPDATE SET amount = (excluded.amount + 3) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer parenthesized_proposed_arithmetic.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), parenthesized_proposed_arithmetic.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, parenthesized_proposed_arithmetic.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", parenthesized_proposed_arithmetic.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("7", parenthesized_proposed_arithmetic.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":7}", parenthesized_proposed_arithmetic.batch.returning_rows[0]);
+
+    var excluded_negative_delta = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 2) ON CONFLICT (email) DO UPDATE SET amount = amount - excluded.amount RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer excluded_negative_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), excluded_negative_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, excluded_negative_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", excluded_negative_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("-2", excluded_negative_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":3}", excluded_negative_delta.batch.returning_rows[0]);
+
+    var unary_negative_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 2) ON CONFLICT (email) DO UPDATE SET amount = -amount RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer unary_negative_patch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), unary_negative_patch.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), unary_negative_patch.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, unary_negative_patch.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", unary_negative_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("-5", unary_negative_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":-5}", unary_negative_patch.batch.returning_rows[0]);
+
+    var coalesced_excluded_delta = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 6) ON CONFLICT (email) DO UPDATE SET amount = amount + coalesce(excluded.amount, 4) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced_excluded_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), coalesced_excluded_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, coalesced_excluded_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", coalesced_excluded_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("6", coalesced_excluded_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":11}", coalesced_excluded_delta.batch.returning_rows[0]);
+
+    var coalesced_fallback_delta = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', null) ON CONFLICT (email) DO UPDATE SET amount = amount + coalesce(excluded.amount, 4) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced_fallback_delta.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), coalesced_fallback_delta.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.inc, coalesced_fallback_delta.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", coalesced_fallback_delta.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", coalesced_fallback_delta.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":9}", coalesced_fallback_delta.batch.returning_rows[0]);
+}
+
 test "sql adapter lower dml lowers on conflict unique do update" {
     const alloc = std.testing.allocator;
     const schema_json =
