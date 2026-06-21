@@ -6855,7 +6855,10 @@ declared or expired jobs with a bounded lease, checks the job `group_id` and
 row-key bounds before touching local storage, executes the typed local rewrite,
 finishes successful jobs with row-count/progress metadata, and marks failed
 jobs invalid with the stable execution error token so bad catalog work does
-not spin indefinitely. Storage still does not store or interpret SQL text; only
+not spin indefinitely. Stale snapshot claim races, including jobs already
+claimed, completed, removed, or otherwise no longer declared by metadata, are
+skipped so one concurrent worker does not block later claimable jobs in the same
+drain pass. Storage still does not store or interpret SQL text; only
 `SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross the
 boundary. The provisioned/hosted table-write source boundary now exposes a
 schema-rewrite worker pass plus group-local internal route: catalog scans
