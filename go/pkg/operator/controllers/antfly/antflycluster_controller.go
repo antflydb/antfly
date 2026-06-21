@@ -1903,8 +1903,10 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 	}
 
 	targetPort := cluster.Spec.MetadataNodes.MetadataAPI.Port
+	component := "metadata"
 	if swarmMode && cluster.Spec.Swarm != nil {
 		targetPort = cluster.Spec.Swarm.MetadataAPI.Port
+		component = "swarm"
 	}
 
 	servicePort := corev1.ServicePort{
@@ -1926,14 +1928,9 @@ func (r *AntflyClusterReconciler) createPublicAPIService(cluster *antflyv1.Antfl
 			Namespace: cluster.Namespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Type: serviceType,
-			Selector: serviceSelectorLabels(cluster.Name, func() string {
-				if swarmMode {
-					return "swarm"
-				}
-				return "metadata"
-			}()),
-			Ports: []corev1.ServicePort{servicePort},
+			Type:     serviceType,
+			Selector: serviceSelectorLabels(cluster.Name, component),
+			Ports:    []corev1.ServicePort{servicePort},
 		},
 	}
 }

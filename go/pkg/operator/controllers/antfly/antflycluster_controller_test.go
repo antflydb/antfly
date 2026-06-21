@@ -2327,6 +2327,38 @@ func TestReconcileServices_SwarmCreatesSwarmAndPublicAPI(t *testing.T) {
 	g.Expect(errors.IsNotFound(err)).To(BeTrue())
 }
 
+func TestCreatePublicAPIService_ClusteredTargetsMetadataAPI(t *testing.T) {
+	g := NewWithT(t)
+
+	enabled := true
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: antflyv1.AntflyClusterSpec{
+			MetadataNodes: antflyv1.MetadataNodesSpec{
+				MetadataAPI: antflyv1.APISpec{Port: 12377},
+			},
+			DataNodes: antflyv1.DataNodesSpec{
+				API: antflyv1.APISpec{Port: 12380},
+			},
+			PublicAPI: &antflyv1.PublicAPIConfig{
+				Enabled: &enabled,
+				Port:    80,
+			},
+		},
+	}
+
+	reconciler := &AntflyClusterReconciler{}
+	svc := reconciler.createPublicAPIService(cluster, false)
+
+	g.Expect(svc).ToNot(BeNil())
+	g.Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/component", "metadata"))
+	g.Expect(svc.Spec.Ports).To(HaveLen(1))
+	g.Expect(svc.Spec.Ports[0].TargetPort.IntValue()).To(Equal(12377))
+}
+
 func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	g := NewWithT(t)
 
