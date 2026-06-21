@@ -628,9 +628,12 @@ fn restoreFromSourceFile(
 
     const target_exists = pathExists(io, out_path);
     if (target_exists and !replace) cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
-    if (target_exists) {
-        var target_probe = try LiteDb.open(allocator, out_path, .writer);
-        target_probe.close();
+
+    var target_lock = try antfly.lite.native.lockWriterPath(allocator, out_path);
+    defer target_lock.close();
+
+    if (!target_exists and !replace and pathExists(io, out_path)) {
+        cli.fatal("output database already exists; pass --replace to overwrite: {s}", .{out_path});
     }
 
     if (std.mem.endsWith(u8, source_path, ".aflite")) {
@@ -1803,6 +1806,40 @@ test "lite restore source can be an aflite database" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.indexOf(u8, json, "\"from aflite source\"") != null);
     }
+}
+
+test "lite restore target writer lock is held before staging" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-lock-source.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const dst_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-lock-dst.aflite", .{tmp.sub_path});
+    defer allocator.free(dst_path);
+    const tmp_path = try restoreTempPathAlloc(allocator, dst_path);
+    defer allocator.free(tmp_path);
+
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:locked-restore\":{\"title\":\"restore waits for target writer\"}}}");
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    var target_lock = try antfly.lite.native.lockWriterPath(allocator, dst_path);
+    defer target_lock.close();
+
+    try std.testing.expectError(error.WouldBlock, restoreFromSourceFile(allocator, io, src_path, dst_path, false));
+    try std.testing.expect(!pathExists(io, dst_path));
+    try std.testing.expect(!pathExists(io, tmp_path));
 }
 
 test "lite restore result json distinguishes portable restore and snapshot copy" {

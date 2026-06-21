@@ -160,6 +160,17 @@ pub const OpenOptions = struct {
     no_sync: bool = false,
 };
 
+pub const PathWriterLock = struct {
+    io_impl: std.Io.Threaded,
+    file: std.Io.File,
+
+    pub fn close(self: *PathWriterLock) void {
+        self.file.close(self.io_impl.io());
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const CreateOptions = struct {
     exclusive: bool = false,
     no_sync: bool = false,
@@ -1863,6 +1874,19 @@ pub fn create(io: std.Io, path: []const u8) !void {
 
     try file.writePositionalAll(io, &encoded, 0);
     try file.sync(io);
+}
+
+pub fn lockWriterPath(allocator: Allocator, path: []const u8) !PathWriterLock {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    errdefer io_impl.deinit();
+
+    const file = try acquireWriterLock(allocator, io_impl.io(), path);
+    errdefer file.close(io_impl.io());
+
+    return .{
+        .io_impl = io_impl,
+        .file = file,
+    };
 }
 
 fn openDataFile(io: std.Io, path: []const u8, lock_mode: LockMode) !std.Io.File {
