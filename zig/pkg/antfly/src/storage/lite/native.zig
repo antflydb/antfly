@@ -1168,6 +1168,9 @@ pub const NativeFile = struct {
                 try out_file.writePositionalAll(self.io_impl.io(), buffer[0..len], offset);
                 offset += len;
             }
+            var snapshot_header: [header_size]u8 = undefined;
+            encodeHeader(&snapshot_header, self.header);
+            try out_file.writePositionalAll(self.io_impl.io(), &snapshot_header, 0);
             try out_file.setLength(self.io_impl.io(), snapshot_size);
             try out_file.sync(self.io_impl.io());
         }
@@ -3274,6 +3277,53 @@ test "lite native free map does not reuse pages while reader pins older checkpoi
 
     const report = try writer.check();
     try std.testing.expect(report.valid);
+}
+
+test "lite native stable snapshot preserves pinned reader checkpoint while writer advances" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-pinned-reader-snapshot.aflite");
+    defer allocator.free(path);
+    const snapshot_path = try testPath(allocator, tmp, "native-pinned-reader-snapshot-copy.aflite");
+    defer allocator.free(snapshot_path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    try writer.putDocument("doc:1", "v1");
+    try writer.putDocument("doc:1", "v2");
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    const reader_checkpoint = reader.activeCheckpoint();
+    const reader_value_before = (try reader.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(reader_value_before);
+    try std.testing.expectEqualStrings("v2", reader_value_before);
+
+    try writer.putDocument("doc:1", "v3");
+    try writer.putDocument("doc:1", "v4");
+
+    const snapshot_report = try reader.copyStableSnapshotToPath(snapshot_path, false);
+    try std.testing.expectEqual(reader_checkpoint.commit_sequence, snapshot_report.checkpoint_sequence);
+    try std.testing.expect(snapshot_report.tail_bytes > 0);
+
+    const snapshot_check = try checkFile(allocator, snapshot_path);
+    try std.testing.expect(snapshot_check.valid);
+    try std.testing.expectEqual(@as(u64, 0), snapshot_check.tail_bytes);
+
+    var snapshot = try NativeFile.open(allocator, snapshot_path, true);
+    defer snapshot.close();
+    try std.testing.expectEqual(reader_checkpoint.commit_sequence, snapshot.activeCheckpoint().commit_sequence);
+    const snapshot_value = (try snapshot.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(snapshot_value);
+    try std.testing.expectEqualStrings("v2", snapshot_value);
+
+    const writer_value = (try writer.getDocumentAlloc(allocator, "doc:1")).?;
+    defer allocator.free(writer_value);
+    try std.testing.expectEqualStrings("v4", writer_value);
 }
 
 test "lite native document store spills large values into value pages" {
