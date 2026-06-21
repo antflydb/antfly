@@ -1292,6 +1292,52 @@ fn parseConflictJsonbBuildObjectAlloc(
     return try out.toOwnedSlice();
 }
 
+pub fn parseConflictJsonbBuildObjectValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    hooks: ConflictValueParserHooks,
+) ![]const u8 {
+    if (sql_value.peekToJsonbFunctionCall(tokens, pos.*)) {
+        try sql_value.parseToJsonbFunctionCallStart(tokens, pos);
+        const value_json = try parseConflictJsonbBuildObjectValueAlloc(alloc, tokens, pos, schema, insert_columns, insert_values, hooks);
+        errdefer alloc.free(value_json);
+        try parser.expectToken(tokens, pos, .rparen);
+        return value_json;
+    }
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier) {
+        const token = tokens[pos.*];
+        if (std.mem.startsWith(u8, token.text, "excluded.")) {
+            pos.* += 1;
+            return try conflictExcludedJsonObjectValueAlloc(alloc, schema, token.text["excluded.".len..], insert_columns, insert_values);
+        }
+    }
+    return try hooks.parse_json_value_json(hooks.ptr);
+}
+
+pub fn parseConflictCoalesceOperandJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    column: runtime_schema.RelationalColumn,
+    insert_columns: []const []const u8,
+    insert_values: []const []const u8,
+    hooks: ConflictValueParserHooks,
+) ![]const u8 {
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier) {
+        const token = tokens[pos.*];
+        if (std.mem.startsWith(u8, token.text, "excluded.")) {
+            pos.* += 1;
+            return try conflictExcludedValueJsonAlloc(alloc, schema, column, token.text["excluded.".len..], insert_columns, insert_values);
+        }
+    }
+    return try hooks.parse_column_value_json(hooks.ptr, column);
+}
+
 pub fn parseConflictValueJsonAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,

@@ -3182,7 +3182,7 @@ const Parser = struct {
         insert_values: []const []const u8,
     ) anyerror![]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseConflictCoalesceOperandJsonAlloc(column, insert_columns, insert_values);
+        return try sql_adapter.parseConflictCoalesceOperandJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, column, insert_columns, insert_values, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
     fn parseConflictJsonbBuildObjectValueHook(
@@ -3191,7 +3191,7 @@ const Parser = struct {
         insert_values: []const []const u8,
     ) anyerror![]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseConflictJsonbBuildObjectValueAlloc(insert_columns, insert_values);
+        return try sql_adapter.parseConflictJsonbBuildObjectValueAlloc(self.alloc, self.tokens, &self.pos, self.schema, insert_columns, insert_values, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
     fn conflictValueParserHooks(
@@ -3602,7 +3602,7 @@ const Parser = struct {
         insert_values: []const []const u8,
     ) anyerror![]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseConflictArrayElementValueJsonAlloc(column, insert_columns, insert_values);
+        return try sql_adapter.parseConflictArrayElementValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, column, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
     fn parseConflictUpdateJsonDocumentValueHook(ptr: *anyopaque) anyerror![]const u8 {
@@ -3964,7 +3964,7 @@ const Parser = struct {
         insert_values: []const []const u8,
     ) anyerror![]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.parseConflictValueJsonAlloc(column, insert_columns, insert_values);
+        return try sql_adapter.parseConflictValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, self.params, column, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
     fn incrementParserHooks(self: *@This()) sql_adapter.IncrementParserHooks {
@@ -11151,44 +11151,6 @@ const Parser = struct {
         return try sql_adapter.parseConflictArrayElementValueJsonAlloc(self.alloc, self.tokens, &self.pos, self.schema, column, self.conflictValueParserHooks(insert_columns, insert_values));
     }
 
-    fn parseConflictJsonbBuildObjectValueAlloc(
-        self: *@This(),
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        if (sql_adapter.peekToJsonbFunctionCall(self.tokens, self.pos)) {
-            try sql_adapter.parseToJsonbFunctionCallStart(self.tokens, &self.pos);
-            const value_json = try self.parseConflictJsonbBuildObjectValueAlloc(insert_columns, insert_values);
-            errdefer self.alloc.free(value_json);
-            try self.expect(.rparen);
-            return value_json;
-        }
-        if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
-            const token = self.tokens[self.pos];
-            if (std.mem.startsWith(u8, token.text, "excluded.")) {
-                self.pos += 1;
-                return try sql_adapter.conflictExcludedJsonObjectValueAlloc(self.alloc, self.schema, token.text["excluded.".len..], insert_columns, insert_values);
-            }
-        }
-        return try self.parseJsonValueAlloc();
-    }
-
-    fn parseConflictCoalesceOperandJsonAlloc(
-        self: *@This(),
-        column: runtime_schema.RelationalColumn,
-        insert_columns: []const []const u8,
-        insert_values: []const []const u8,
-    ) ![]const u8 {
-        if (self.peekKind(.identifier) and self.pos < self.tokens.len) {
-            const token = self.tokens[self.pos];
-            if (std.mem.startsWith(u8, token.text, "excluded.")) {
-                self.pos += 1;
-                return try sql_adapter.conflictExcludedValueJsonAlloc(self.alloc, self.schema, column, token.text["excluded.".len..], insert_columns, insert_values);
-            }
-        }
-        return try self.parseSqlColumnValueAlloc(column);
-    }
-
     fn parseConflictIncrementAssignment(
         self: *@This(),
         field: []const u8,
@@ -11284,7 +11246,7 @@ const Parser = struct {
             return;
         }
         if (self.peekKind(.identifier) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].kind == .plus or self.tokens[self.pos + 1].kind == .minus)) {
-            try self.parseIncrementAssignment(field, column, increment);
+            try sql_adapter.parseIncrementAssignmentAlloc(self.alloc, self.tokens, &self.pos, field, column, increment, self.incrementParserHooks());
             return;
         }
 
