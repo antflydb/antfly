@@ -971,13 +971,13 @@ fn resolveLocalBaseDir(
 fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.common.config.Config) !ResolvedPaths {
     const local_base = try resolveLocalBaseDir(alloc, cli, cfg);
     defer alloc.free(local_base);
-    const base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
-    defer alloc.free(base);
+    const metadata_base = try std.fmt.allocPrint(alloc, "{s}/metadata", .{local_base});
+    defer alloc.free(metadata_base);
 
     const replica_root_dir = if (cli.replica_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/replicas", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/replicas", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -985,7 +985,7 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
     const replica_catalog_path = if (cli.replica_catalog_path) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/catalog.txt", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/catalog.txt", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -993,13 +993,13 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
     const snapshot_root_dir = if (cli.snapshot_root_dir) |path|
         try normalizeResolvedPathAlloc(alloc, path)
     else blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
     const auth_store_root_dir = blk: {
-        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{local_base});
+        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{metadata_base});
         defer alloc.free(raw);
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
@@ -1702,7 +1702,7 @@ test "metadata runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/snapshots", resolved.snapshot_root_dir);
-    try std.testing.expectEqualStrings("/tmp/antflydb/auth", resolved.auth_store_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/metadata/auth", resolved.auth_store_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
 }
 
