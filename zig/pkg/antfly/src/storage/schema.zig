@@ -929,10 +929,6 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
         try buf.append(alloc, 0);
     }
 
-    // SQL system-versioned table marker (format version 43+). This is durable
-    // catalog metadata only; temporal history execution remains separately gated.
-    try buf.append(alloc, if (schema.system_versioned) 1 else 0);
-
     // Relational check catalog (format version 20+).
     try appendU32(&buf, alloc, @intCast(schema.checks.len));
     for (schema.checks) |check| {
@@ -992,6 +988,11 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
     } else {
         try buf.append(alloc, 0);
     }
+
+    // SQL system-versioned table marker (format version 43+). This durable
+    // catalog flag enables transaction-time history capture and native AS-OF
+    // read helpers in the relational storage layer.
+    try buf.append(alloc, if (schema.system_versioned) 1 else 0);
 
     const result = try alloc.dupe(u8, buf.items);
     buf.deinit(alloc);

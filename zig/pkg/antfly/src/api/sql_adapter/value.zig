@@ -16,6 +16,7 @@ const std = @import("std");
 
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
+const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
 
@@ -81,6 +82,30 @@ pub fn parseJsonScalarValueAlloc(
     return null;
 }
 
+pub fn parseJsonValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) anyerror![]const u8 {
+    if (peekConvertFromFunctionCall(tokens, pos.*)) return try parseConvertFromJsonAlloc(alloc, tokens, pos, params);
+    if (peekToJsonbFunctionCall(tokens, pos.*)) return try parseToJsonbValueJsonAlloc(alloc, tokens, pos, params);
+    return (try parseJsonScalarValueAlloc(alloc, tokens, pos, params)) orelse error.UnsupportedSqlShape;
+}
+
+pub fn parseToJsonbValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) anyerror![]const u8 {
+    try parseToJsonbFunctionCallStart(tokens, pos);
+    const value_json = try parseJsonValueAlloc(alloc, tokens, pos, params);
+    errdefer alloc.free(value_json);
+    try parser.expectToken(tokens, pos, .rparen);
+    return value_json;
+}
+
 pub fn parseJsonDocumentValueAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -102,6 +127,262 @@ pub fn parseJsonDocumentValueAlloc(
         return try alloc.dupe(u8, token.text);
     }
     return null;
+}
+
+pub fn parseRequiredJsonDocumentValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    return (try parseJsonDocumentValueAlloc(alloc, tokens, pos, params)) orelse error.UnsupportedSqlShape;
+}
+
+pub fn parseJsonArrayValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    const value_json = if (parser.peekKeyword(tokens, pos.*, "array"))
+        try parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params)
+    else
+        try parseRequiredJsonDocumentValueAlloc(alloc, tokens, pos, params);
+    errdefer alloc.free(value_json);
+    try validateJsonArray(alloc, value_json);
+    return value_json;
+}
+
+pub fn parseStructuredPredicateValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+    column: runtime_schema.RelationalColumn,
+) ![]const u8 {
+    return switch (column.field_type) {
+        .array => try parseArrayPredicateValueAlloc(alloc, tokens, pos, params),
+        .json => try parseRequiredJsonDocumentValueAlloc(alloc, tokens, pos, params),
+        else => error.InvalidSqlCatalog,
+    };
+}
+
+pub fn parseArrayPredicateValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    return if (parser.peekKeyword(tokens, pos.*, "array"))
+        try parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params)
+    else
+        try parseRequiredJsonDocumentValueAlloc(alloc, tokens, pos, params);
+}
+
+pub fn parseSqlArrayConstructorJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    try parser.expectKeyword(tokens, pos, "array");
+    try parser.expectToken(tokens, pos, .lbracket);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    if (parser.matchToken(tokens, pos, .rbracket) == null) {
+        var first = true;
+        while (true) {
+            const value_json = try parseJsonValueAlloc(alloc, tokens, pos, params);
+            defer alloc.free(value_json);
+            if (!first) try writer.writeByte(',');
+            try writer.writeAll(value_json);
+            first = false;
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        try parser.expectToken(tokens, pos, .rbracket);
+    }
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+pub fn parseSqlInValuesJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    try parser.expectToken(tokens, pos, .lparen);
+    if (parser.peekKind(tokens, pos.*, .rparen)) return error.UnsupportedSqlShape;
+
+    if (parser.matchToken(tokens, pos, .placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        if (parser.matchToken(tokens, pos, .rparen) != null) {
+            return switch (value) {
+                .json => |json| blk: {
+                    try validateJsonArray(alloc, json);
+                    break :blk try alloc.dupe(u8, json);
+                },
+                else => try singleValueJsonArrayAlloc(alloc, value),
+            };
+        }
+        const first_json = try value.jsonAlloc(alloc);
+        defer alloc.free(first_json);
+        return try parseSqlInRemainingValuesJsonAlloc(alloc, tokens, pos, params, first_json);
+    }
+
+    const first_json = try parseJsonValueAlloc(alloc, tokens, pos, params);
+    defer alloc.free(first_json);
+    return try parseSqlInRemainingValuesJsonAlloc(alloc, tokens, pos, params, first_json);
+}
+
+fn parseSqlInRemainingValuesJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+    first_json: []const u8,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    try writer.writeAll(first_json);
+    while (parser.matchToken(tokens, pos, .comma) != null) {
+        const value_json = try parseJsonValueAlloc(alloc, tokens, pos, params);
+        defer alloc.free(value_json);
+        try writer.writeByte(',');
+        try writer.writeAll(value_json);
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+pub fn parseSqlColumnValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+    column: runtime_schema.RelationalColumn,
+    realtime_ns: u64,
+) ![]const u8 {
+    if (parser.matchKeyword(tokens, pos, "default")) {
+        const default_value = column.default_value orelse return error.UnsupportedSqlShape;
+        return try relational_rows.relationalDefaultValueJsonAlloc(alloc, default_value);
+    }
+    if (lower_expr.peekSqlNowExpressionSyntax(tokens, pos.*)) {
+        if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
+        const now_ns = try checkedRealtimeNsU64(realtime_ns);
+        return try parseSqlNowValueJsonAlloc(alloc, tokens, pos, now_ns);
+    }
+    if (lower_expr.peekSqlCurrentDateExpressionSyntax(tokens, pos.*)) {
+        if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
+        const now_ns = try checkedRealtimeNsU64(realtime_ns);
+        return try parseSqlCurrentDateValueJsonAlloc(alloc, tokens, pos, sqlCurrentUtcDateStartNs(now_ns));
+    }
+    if (column.field_type == .datetime and lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos.*)) {
+        return try parseSqlTypedDatetimeLiteralValueJsonAlloc(alloc, tokens, pos);
+    }
+    if (lower_expr.peekFunctionCallIf(tokens, pos.*, lower_expr.sqlKeywordIsUuidV4Function)) {
+        if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog;
+        return try parseUuidV4ValueJsonAlloc(alloc, tokens, pos);
+    }
+    if (peekConvertFromFunctionCall(tokens, pos.*)) {
+        if (column.field_type != .json) return error.InvalidSqlCatalog;
+        return try parseConvertFromJsonAlloc(alloc, tokens, pos, params);
+    }
+    if (peekJsonbBuildObjectFunctionCall(tokens, pos.*)) {
+        if (column.field_type != .json) return error.InvalidSqlCatalog;
+        return try parseJsonbBuildObjectAlloc(alloc, tokens, pos, params);
+    }
+    if (peekToJsonbFunctionCall(tokens, pos.*)) {
+        if (column.field_type != .json) return error.InvalidSqlCatalog;
+        return try parseToJsonbValueJsonAlloc(alloc, tokens, pos, params);
+    }
+    if (parser.matchToken(tokens, pos, .placeholder)) |token| {
+        const value = try boundSqlValue(token, params);
+        if (column.field_type == .json) {
+            return switch (value) {
+                .json => |json| try alloc.dupe(u8, json),
+                else => try value.jsonAlloc(alloc),
+            };
+        }
+        return try value.jsonAlloc(alloc);
+    }
+    if (parser.matchToken(tokens, pos, .string)) |token| {
+        if (column.field_type == .json) {
+            if (jsonValueIsValid(alloc, token.text)) return try alloc.dupe(u8, token.text);
+        }
+        return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
+    }
+    if (parser.matchKeyword(tokens, pos, "null")) return try alloc.dupe(u8, "null");
+    if (parser.matchKeyword(tokens, pos, "true")) return try alloc.dupe(u8, "true");
+    if (parser.matchKeyword(tokens, pos, "false")) return try alloc.dupe(u8, "false");
+    if (parser.matchToken(tokens, pos, .number)) |token| return try alloc.dupe(u8, token.text);
+    if (parser.matchToken(tokens, pos, .minus) != null) return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseUuidV4ValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    try parseSqlUuidV4Call(tokens, pos);
+    return try relational_rows.relationalDefaultValueJsonAlloc(alloc, .{ .kind = .uuid_v4, .value_json = "" });
+}
+
+pub fn parseConvertFromJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    try parseConvertFromFunctionCallStart(tokens, pos);
+    const decoded = (try parseConvertFromInputAlloc(alloc, tokens, pos, params)) orelse return error.UnsupportedSqlShape;
+    defer alloc.free(decoded);
+    try parser.expectToken(tokens, pos, .comma);
+    const encoding = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(encoding.text, "UTF8") and !std.ascii.eqlIgnoreCase(encoding.text, "UTF-8")) return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .rparen);
+    if (!jsonValueIsValid(alloc, decoded)) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, decoded);
+}
+
+pub fn parseJsonbBuildObjectAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const SqlValue,
+) ![]const u8 {
+    try parseJsonbBuildObjectFunctionCallStart(tokens, pos);
+    if (parser.matchToken(tokens, pos, .rparen) != null) return try alloc.dupe(u8, "{}");
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    var first = true;
+    while (true) {
+        const key = try parseJsonbBuildObjectKey(tokens, pos, params);
+        const entry = try seen.getOrPut(alloc, key);
+        if (entry.found_existing) return error.UnsupportedSqlShape;
+        try parser.expectToken(tokens, pos, .comma);
+        const value_json = try parseJsonValueAlloc(alloc, tokens, pos, params);
+        defer alloc.free(value_json);
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try writer.print("{f}:", .{std.json.fmt(key, .{})});
+        try writer.writeAll(value_json);
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
 }
 
 pub fn parseConvertFromInputAlloc(
@@ -470,6 +751,11 @@ pub fn parseSqlTypedDatetimeLiteralValueJsonAlloc(
 
 pub fn sqlCurrentUtcDateStartNs(now_ns: u64) u64 {
     return now_ns - (now_ns % ns_per_day);
+}
+
+fn checkedRealtimeNsU64(value: i128) !u64 {
+    if (value < 0 or value > std.math.maxInt(u64)) return error.UnsupportedSqlShape;
+    return @intCast(value);
 }
 
 pub fn parseSqlNowValueJsonAlloc(

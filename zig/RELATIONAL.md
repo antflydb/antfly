@@ -1332,9 +1332,15 @@ current routine runtime bindings into catalog-aware SQL read planning so
 ordinary row-expression lowerer. Narrow safe PL/pgSQL trigger bodies that
 return `NEW` or `OLD` are stored as typed routine hooks rather than opaque
 procedure text, and cataloged trigger DDL records bind those hooks to table
-events through the routine runtime. Unsupported procedural bodies, cascaded
-routine drops, and unsupported expression forms fail closed until they have
-native typed execution contracts.
+events through the routine runtime. Narrow safe PL/pgSQL procedure bodies that
+only perform no side effects (`BEGIN NULL; END` and notice-only equivalents)
+are stored as `procedure_noop` hooks and the routine runtime can execute those
+procedure records directly after durable catalog recovery; SQL `CALL
+procedure_name()` lowers to a typed `procedure_call` plan and `ApiHttpServer`
+executes only that recovered no-argument noop hook, while argument-bearing
+calls and side-effecting bodies remain fail-closed. Unsupported
+procedural bodies, cascaded routine drops, and unsupported expression forms
+fail closed until they have native typed execution contracts.
 sequence catalog grammar for `CREATE SEQUENCE`, `ALTER SEQUENCE`, and
 `DROP SEQUENCE`, including idempotent create, `IF EXISTS` alter, owned-by/type
 metadata, and drop dependency metadata,
@@ -1544,11 +1550,12 @@ recursive anchor's base source schema for cross-table inserts, and execution
 materializes the bounded recursive rows under the same row/byte caps before the
 final source projection feeds deterministic target-row planning. Bound table
 write sources can also stage claimed joined mutations from pre-materialized
-source rows through the ordinary target-row claim/OCC path, which is the native
-building block needed before recursive CTE-backed joined updates/deletes can
-graduate. Recursive CTE-backed SQL claimed update/delete and MERGE remain
-fail-closed under `recursive_cte_stream_plan` until the adapter lowers them
-into an explicit recursive-source envelope over those native primitives.
+source rows through the ordinary target-row claim/OCC path. Recursive
+CTE-backed SQL claimed update/delete and MERGE now lower into explicit
+recursive-source envelopes over those native primitives: the wrapper owns the
+bounded recursive producer, the inner mutation consumes the materialized CTE by
+typed `source_cte`, and execution feeds the deterministic target-row claim/OCC
+or MERGE batch builders without passing SQL text through storage.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.
@@ -1828,12 +1835,27 @@ movement, repair, and catalog promotion in one generated workload.
 System-time / transaction-time history is intentionally separate from the
 application-time interval model. `CREATE TABLE ... WITH SYSTEM VERSIONING`
 lowers to durable relational schema metadata (`system_versioned: true`) so the
-catalog records user intent and schema round trips preserve it. That marker
-does not by itself create hidden history rows or bitemporal visibility rules.
-History retention, visibility, replay, repair, and query syntax must remain a
-separate storage/runtime contract before system-time execution is enabled. The
-SQL/API parity corpus pins this distinction with a supported DDL fingerprint
-that includes the system-versioned metadata token.
+catalog records user intent and schema round trips preserve it. Storage now
+keeps the current-row table behavior enabled for system-versioned relational
+tables and appends hidden `relational-system-history:v1` metadata records
+atomically with direct batch writes, deletes, identity rewrites, and committed
+transaction/mutation-source changes. Each record is ordered by the same durable
+batch or commit sequence, stores the transaction-time timestamp, operation
+(`insert`, `update`, `delete`, or `identity_rewrite`), row key, optional new row
+key, and before/after row JSON. Storage exposes typed history scans and a native
+commit-sequence `querySystemVersionedRelationalRowsAsOfSequence` helper that
+reconstructs the visible row set from hidden history records, then runs the
+normal relational query executor over that reconstructed source. The SQL read
+adapter accepts the conservative `FOR SYSTEM_TIME AS OF <commit-sequence>` form
+for plain table queries and routes it through the typed table-read vtable;
+bound/local storage executes it directly, while provisioned/hosted sources only
+execute the path for single local groups and fail closed for distributed or
+remote AS-OF until there is a global visibility contract. Timestamp-to-sequence
+resolution, retention policy, CTE/set-operation AS-OF composition, and
+bitemporal planner visibility remain separate query/runtime work on top of the
+durable history records. The SQL/API parity corpus pins the DDL metadata token
+while storage and table-read tests pin native hidden history capture and
+commit-sequence AS-OF reads.
 
 For SQL DML, row locking remains a typed backend contract rather than required
 surface syntax. The adapter receives the mutation-source row-claim owner,
@@ -1861,14 +1883,15 @@ of carrying SQL COPY syntax through storage.
 
 SQL `UNION ALL`, `UNION`, `INTERSECT`, and `EXCEPT` result streams use the
 same row/byte materialization admission model as typed CTEs before returning
-rows or applying result-tail ordering and pagination. Outputs classified as
-spill-required fail closed until Antfly has a durable spill store and
-backpressure contract for result-stream materialization. The SQL adapter's
-stable unsupported classifications now carry native execution-requirement
-metadata: `recursive_cte_stream_plan` and `set_operation_plan` both require a
-stream-materialization runtime with explicit materialization, spill, and
-backpressure support before the parser can admit broader recursive or general
-set-operation execution.
+rows or applying result-tail ordering and pagination. Cross-source
+set-operation streams and bounded recursive CTE fixpoint streams now use the
+same native admission policy as DB-owned CTE materialization: spill-classified
+streams are admitted by the stream executor while hard row/byte cap violations
+still reject. The SQL adapter's stable unsupported classifications carry native
+execution-requirement metadata: `recursive_cte_stream_plan` and
+`set_operation_plan` require a stream-materialization runtime with explicit
+materialization, spill, and backpressure support before the parser can admit
+broader recursive or general set-operation execution.
 
 `PRIMARY KEY ... [NOT] DEFERRABLE [INITIALLY IMMEDIATE|DEFERRED]`,
 `CREATE UNIQUE INDEX ... NULLS DISTINCT`, and `UNIQUE NULLS DISTINCT (...)`
@@ -2146,8 +2169,12 @@ remain catalog workflow concerns.
 Plain nullable `ADD COLUMN` is rebuild-only for derived artifacts. Constraint
 additions, `SET NOT NULL`, and `VALIDATE CONSTRAINT` carry validation work, and
 generated/default/non-null additions plus drop/rename/type replacement carry
-base-row rewrite/backfill work. Migration-equivalent data changes use ordinary
-typed source mutation plans (`insert_source`, `update_source`,
+base-row rewrite/backfill work. SQL DDL application now schedules validation
+work as durable per-range claimed jobs with `validate/table/constraints`
+metadata; DB workers execute those jobs by validating enforced unique owners,
+foreign-key references, and check predicates over the claimed range before
+marking the job ready. Migration-equivalent data changes use ordinary typed
+source mutation plans (`insert_source`, `update_source`,
 `delete_source`, and joined update/delete sources); the parity gate requires
 those families independently from point DML so data backfill support cannot be
 mistaken for single-row write coverage.
@@ -4709,10 +4736,15 @@ transaction coordinator store, resolves `COMMIT PREPARED` / `ROLLBACK PREPARED`
 through the same durable intent-resolution path used by native transactions,
 keeps repeat same-decision recovery idempotent for crash/retry safety, and fails
 closed for duplicate prepared GIDs, missing GIDs, and conflicting terminal
-decisions. Applying those plans to schema JSON or runtime table storage still
-fails closed because prepared transactions are coordinator actions rather than
-schema mutations, but the adapter boundary no longer treats the syntax as an
-opaque unsupported string.
+decisions. HTTP SQL DDL execution first routes prepared-transaction plans to a
+source-provided coordinator hook; if that hook is absent, a server configured
+with `session_store_path` reuses the durable opened-session `DocStore` and
+transaction coordinator as the recovery store. A server without either
+coordinator path still fails closed rather than treating `PREPARE TRANSACTION`
+as schema/table mutation. Applying those plans to schema JSON or runtime table
+storage still fails closed because prepared transactions are coordinator
+actions, but the adapter boundary no longer treats the syntax as an opaque
+unsupported string.
 
 Adapter-only session cleanup covers a narrow allowlist of PostgreSQL
 client/dump boilerplate as explicit `session_setting` classifications:
@@ -5235,7 +5267,10 @@ and `PROGRAM` endpoints use an optional embedding-provided program adapter;
 both remain fail-closed when the adapter is absent. Antfly never executes shell
 commands directly for `PROGRAM`; the adapter owns command allowlisting,
 sandboxing, and byte production/consumption while Antfly still owns SQL target
-resolution, auth, row-filter enforcement, and audit. The bridge also marks
+resolution, auth, row-filter enforcement, and audit. File and program COPY
+endpoints are authorized before external bytes are read or written, and the
+audit stream distinguishes applied, denied, and post-authorization failed
+attempts. The bridge also marks
 STDIN/STDOUT as requiring an external SQL protocol stream so the SQL text cannot
 masquerade as payload. `COPY FROM STDIN` has an initial native CSV executor that
 converts the supplied stream into the row-batch API, and
@@ -5335,9 +5370,20 @@ result is statically known from a literal null argument; dynamic strict calls
 fail closed until the row-expression AST has a native null-guard node that can
 preserve PostgreSQL null-input semantics for nullable row fields.
 The routine body model also admits narrow safe PL/pgSQL trigger bodies:
-`BEGIN RETURN NEW; END` as a `plpgsql_trigger` / `trigger_return_new` hook and
+`BEGIN RETURN NEW; END` as a `plpgsql_trigger` / `trigger_return_new` hook,
 `BEGIN RETURN OLD; END` as a `plpgsql_trigger` / `trigger_return_old` hook, and
 `BEGIN RETURN NULL; END` as a `plpgsql_trigger` / `trigger_return_null` hook.
+Benign `RAISE NOTICE 'literal';` statements may appear before the return and
+are treated as deterministic adapter-level diagnostics with no storage side
+effects. A trigger body may also contain `PERFORM function_name();` statements
+before the return, but only when each referenced routine is an existing
+zero-argument safe SQL expression function. The routine runtime records those
+dependencies as `perform` entries in the typed body plan, validates them when
+creating or recovering the trigger routine, executes them through the expression
+routine evaluator while discarding their result, and rejects drops of referenced
+functions while any cataloged routine depends on them. Qualified calls,
+arguments, dynamic SQL, table writes, and unknown side effects still fail
+closed rather than being persisted as opaque PL/pgSQL.
 `ApiHttpServer` routes cataloged `CREATE TRIGGER` / `DROP TRIGGER` DDL that is
 not a table-owned update-policy shortcut into the routine runtime, where
 trigger records persist table name, trigger name, function name, and event.
@@ -5352,14 +5398,17 @@ operation before storage sees it; `RETURN OLD` on update is a typed no-op for
 the requested row change; and `RETURN NEW` preserves the planned row-batch
 mutation. `COPY FROM STDIN` routes through the same insert hook path after
 payload parsing and before permission checks and catalog batch writes, so bulk
-import cannot bypass supported before-insert hooks. The model also admits the side-effect-free PL/pgSQL procedure body
-`BEGIN NULL; END` as a `plpgsql_procedure` / `procedure_noop` hook. Both hooks
-are stored as durable routine metadata and are intentionally not executable
-through the expression-function path. Other PL/pgSQL bodies, such as
-`RAISE`, dynamic SQL, or procedural statements with side effects, still fail
-closed under `routine_body_plan` until their row inputs, side effects,
-dependency tracking, replay behavior, and repair semantics have native
-contracts.
+import cannot bypass supported before-insert hooks. The model also admits the
+side-effect-free PL/pgSQL procedure body `BEGIN NULL; END` as a
+`plpgsql_procedure` / `procedure_noop` hook, plus the same benign `RAISE NOTICE
+'literal';` and safe zero-argument `PERFORM function_name();` prefix statements
+allowed for trigger bodies. `CALL procedure_name()` executes that hook through
+the routine runtime after catalog recovery; the hook is still intentionally not
+executable through the expression-function path. Other PL/pgSQL bodies,
+including argument-bearing `PERFORM`, dynamic SQL, procedural branches, loops,
+table writes, or external side effects, still fail closed under
+`routine_body_plan` until their row inputs, side effects, dependency tracking,
+replay behavior, and repair semantics have native contracts.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.
 Routine bodies and routine options that do not yet have typed metadata remain
@@ -5467,7 +5516,7 @@ The detailed plan for the remaining model-level bucket is:
 | `ON CONFLICT ... DO UPDATE` expressions | Conflict actions over a typed expression tree with `excluded`, committed-row, default, parameter, literal, and server-owned value inputs. | The supported conflict-action set now binds fields from the proposed row and committed row through typed expression nodes, enforces type compatibility during binding, evaluates generated columns and table-owned update policies after conflict transforms, and projects `RETURNING` from the committed image. Keep expanding by adding new deterministic expression nodes to the shared expression tree rather than creating conflict-only cases. |
 | `RETURNING` expressions | Typed projection expressions over the committed row image, including generated/default/server-updated values. | The row-batch, mutation-source, and joined mutation-source contracts share the common expression tree with query projections, bind result labels in the adapter, and evaluate after OCC success and server-maintained fields are applied. Bound, provisioned, and hosted execution return projected rows from the staged final image or deleted preimage across owner ranges; the remaining work is adding new deterministic expression nodes through the shared AST rather than creating returning-only cases. |
 | Routed joins | Distributed row-stream execution over durable table/range ownership metadata with lookup, hash, or merge strategies. | Route each side through table/range owners; push predicates and limits only when semantics preserve output; merge ordered streams once at the coordinator; keep row-version visibility stable across both sides; add chaos coverage with owner movement and live writes. |
-| CTE materialization | Named typed subplans with fail-closed default row/byte caps, optional explicit caps, and routed coordinator materialization for provisioned row, aggregate, window, join, and lateral plans. | Inline single-use CTEs when safe; preserve column aliases and types for downstream joins/aggregates/windows; reject recursive CTEs until a separate fixpoint/graph plan exists; add spill/backpressure for intentionally larger materializations. |
+| CTE materialization | Named typed subplans with fail-closed default row/byte caps, optional explicit caps, routed coordinator materialization for provisioned row, aggregate, window, join, and lateral plans, and bounded recursive CTE fixpoint streams for the admitted join-member shape. | Inline single-use CTEs when safe; preserve column aliases and types for downstream joins/aggregates/windows; keep unsupported recursive CTE shapes rejected until they have typed fixpoint/graph plans; add durable spill/backpressure for intentionally larger materializations. |
 | Aggregate filters and `DISTINCT` | Aggregate specs whose filters and distinct keys are expression nodes or typed access predicates, including boolean filter groups, boolean `IS TRUE` / `IS FALSE`, null-inclusive `IS NOT TRUE` / `IS NOT FALSE`, and boolean-null `IS UNKNOWN` / `IS NOT UNKNOWN` filters, JSON-extraction filter expressions, declared JSON containment/path-equality/path-existence filters, declared array element/containment/equality filters, scalar membership filters, text-pattern filters, and computed array-containment filters, with bounded in-memory state and optional spill. | Unify aggregate structured access filters with the broader expression tree where that improves sharing; add broader `DISTINCT` keys, per-group/per-metric memory accounting, and predictable spill/fail behavior when a declared bound is exceeded; keep ordered collection aggregates explicitly capped. |
 | `LEFT JOIN LATERAL` | A correlated, bounded per-left-row subquery stage, not a special case inside ordinary joins; local, CTE-backed, and declared multi-range execution support declared correlations, right filters, right order/limit/offset, and null-preserving left output. | Extend the same stage to catalog-owned cross-table execution with durable ownership routing, hosted coordinator behavior, and explicit resource bounds. |
 | Window functions | Typed stream stages with partition keys, optional order keys, and `ROWS`/`RANGE` frame metadata; local `row_number()`, `rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile()`, `lag()`, `lead()`, `first_value()`, `last_value()`, and frame-aware `nth_value()`, `count()`, `sum()`, `avg()`, `min()`, and `max()` over base-row or materialized CTE sources are modeled, including unordered whole-partition aggregate windows, bounded `ROWS` offsets, bounded single-key numeric/datetime field or expression `RANGE` offsets, and empty-frame handling at partition edges. | Add ordered-set/percentile window stages, routed partition execution, and spill/backpressure before allowing unbounded partitions. |
@@ -6993,6 +7042,291 @@ the same schema-aware index preparation: if no algebraic index exists,
 `algebraic_index_v0` is added with `derive_from_schema: true` and stored as a
 concrete derived config. Storage-mode switches are not schema updates; they need
 an explicit row migration path.
+
+### SQL surface for multimodal derived indexes
+
+The relational SQL surface should expose full-text indexes, dense and sparse
+AKNN indexes, managed enrichments, automatic graph construction, graph metrics,
+and algebraic indexes through PostgreSQL-shaped DDL and query composition. The
+durable model remains Antfly-native: SQL records catalog intent, validates
+syntax, and lowers into the same derived index, enrichment, graph, metric,
+algebraic, job, and artifact manifests used by REST and SDK callers.
+
+This is intentionally not a direct clone of any one reference system:
+
+- [pgvector](https://github.com/pgvector/pgvector) is the closest reference for
+  external vector-column ergonomics. It keeps vectors as ordinary PostgreSQL
+  columns, supports exact and approximate nearest-neighbor search, exposes
+  distance operators such as L2, inner product, cosine, L1, Hamming, and Jaccard,
+  and adds HNSW/IVFFlat indexes with tunables such as `m`, `ef_construction`,
+  and `hnsw.ef_search`.
+- [ParadeDB full-text search](https://docs.paradedb.com/documentation/full-text/overview)
+  is the closest reference for Postgres-native full-text ergonomics: table data
+  stays relational, text is tokenized by analyzers, ranked token/phrase/term
+  queries are exposed through SQL, and vector similarity is treated as a
+  separate ranked source that can be composed with full-text results.
+- [Neo4j vector indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/)
+  and [Neo4j full-text indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/)
+  are useful references for making graph, vector, and full-text indexes
+  first-class semantic indexes with scores. Neo4j also demonstrates hybrid
+  retrieval by combining vector, full-text, and graph-ranked result sets, but
+  Cypher should not be the first Antfly relational API target.
+- [SurrealDB `RELATE`](https://surrealdb.com/docs/surrealql/statements/relate)
+  is a useful reference for explicit edge records: edges have `in` and `out`
+  endpoints, can hold properties, can be indexed, and support bidirectional
+  traversal. [SurrealDB `DEFINE INDEX`](https://surrealdb.com/docs/surrealql/statements/define/indexes)
+  is a useful multimodel indexing reference because it includes full-text,
+  HNSW, and DISKANN-style vector indexes, but SurrealQL should not be embedded
+  inside the PostgreSQL adapter.
+
+The Antfly shape is therefore: borrow the SQL affordances that users already
+expect from Postgres extensions, but lower them to Antfly's derived artifact
+system instead of making PostgreSQL syntax the storage contract.
+
+#### Ordinary full-text and external vector indexes
+
+When the application owns a physical text or vector column, SQL should look
+close to Postgres extension DDL:
+
+```sql
+CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body)
+  WITH (
+    analyzer = 'standard',
+    language = 'english'
+  );
+
+CREATE INDEX docs_embedding_hnsw ON docs
+  USING hnsw (embedding vector_cosine_ops)
+  WITH (
+    m = 16,
+    ef_construction = 64
+  );
+```
+
+`antfly_full_text` lowers to a native full-text derived index over the `body`
+column. A physical vector-column index lowers to an AKNN index whose source is a
+user-supplied typed vector column. These paths are compatible with pgvector and
+ParadeDB-style SQL because they operate on already-materialized table columns.
+They do not create hidden enrichment jobs.
+
+#### Managed AKNN indexes and automatic embeddings
+
+For automatic embeddings, the SQL surface should not pretend that an embedding
+column is authoritative row storage. It should create a managed derived index
+with an attached enrichment:
+
+```sql
+CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body)
+  WITH (
+    embedding_name = 'body_embedding_v1',
+    model = 'text-embedding-3-small',
+    metric = 'cosine',
+    chunk_size = 512,
+    refresh = 'async'
+  );
+```
+
+This lowers to:
+
+- an `EmbeddingsIndexConfig` or equivalent dense/sparse AKNN config;
+- an `EnrichmentConfig` that reads committed relational rows, chunks `body`,
+  invokes the configured embedding model, and writes embedding artifacts;
+- a build/catch-up job that publishes an index generation only after the
+  enrichment artifacts needed by that generation are complete;
+- readiness metadata that can distinguish `MetricNotReady` or
+  `IndexNotReady` from an empty result set.
+
+The physical table remains `docs`. The generated embedding is a derived artifact
+addressed by index/enrichment metadata, not an implicit relational column unless
+the user explicitly declares a generated column in a future API.
+
+#### Graph indexes and automatic graph construction
+
+Graph construction should live with the graph index. A relational table can
+declare explicit edge columns, edge tables, or extraction-based edges, but each
+path should lower to one native graph index manifest:
+
+```sql
+CREATE GRAPH INDEX docs_rel_graph ON docs
+  SOURCE ENRICHMENT relations_v1
+    FROM body
+    USING extractor MODEL 'relations'
+  EDGES JSON_PATH '$.relations[*]'
+    SOURCE _id
+    TARGET target.document_id
+    TYPE type
+    WEIGHT confidence;
+```
+
+For explicit edge tables, the SQL can use a Postgres-shaped table plus graph
+index declaration:
+
+```sql
+CREATE TABLE doc_edges (
+  source_doc text NOT NULL,
+  target_doc text NOT NULL,
+  edge_type text NOT NULL,
+  confidence float8,
+  PRIMARY KEY (source_doc, target_doc, edge_type)
+);
+
+CREATE GRAPH INDEX docs_edge_graph ON doc_edges
+  EDGE (source_doc -> target_doc)
+  TYPE edge_type
+  WEIGHT confidence;
+```
+
+The extraction form lowers to an enrichment plus edge materializer. The explicit
+edge-table form lowers directly from committed relational rows. In both cases,
+the graph index owns the graph artifact generation, edge schema, traversal
+metadata, and metric namespace. This follows the SurrealDB lesson that edge
+records are first-class data, while keeping Antfly's graph storage as a derived
+artifact rather than adding a second query language.
+
+#### Graph metrics
+
+Metrics such as PageRank, eigenvector centrality, degree, connected components,
+or community labels should be attached to a graph index:
+
+```sql
+ALTER GRAPH INDEX docs_rel_graph
+  ADD METRIC pagerank_v1
+  USING pagerank
+  WITH (
+    damping = 0.85,
+    max_iterations = 40,
+    tolerance = 0.000001,
+    edge_types = ARRAY['cites', 'references'],
+    publish = 'on_convergence'
+  );
+```
+
+The metric config belongs to the graph index because metric values are only
+meaningful for a specific graph projection, edge filter, weighting policy, and
+generation. Reads that require a metric before the first qualifying generation
+is published return `MetricNotReady`, not an empty result. Fixed-iteration
+non-converged PageRank should not publish by default; it can be surfaced as a
+diagnostic or explicitly enabled later with a policy such as
+`publish = 'after_max_iterations'`.
+
+For the first version, old metric generations should be cleaned up immediately
+after the replacement generation is published and no reader holds it. Long-term,
+retention can become a graph-index option for debugging, audits, or rollback:
+
+```sql
+ALTER GRAPH INDEX docs_rel_graph
+  SET (metric_generation_retention = 2);
+```
+
+#### Algebraic indexes
+
+Algebraic indexes should stay schema-derived by default and should not become a
+separate SQL aggregate store:
+
+```sql
+CREATE INDEX docs_algebraic ON docs USING antfly_algebraic
+  WITH (
+    derive_from_schema = true
+  );
+```
+
+When users request explicit algebraic materializations, the catalog should lower
+them to native grouped folds or expression folds over the committed `RowSource`.
+That keeps SQL aggregates, migration backfills, embedded-JSON projections, REST
+queries, and SDK queries on the same artifact path.
+
+#### Query composition
+
+The main SQL integration point should be table-valued functions and normal SQL
+joins, not a new SQL planner that tries to inline every Antfly retrieval mode on
+day one:
+
+```sql
+WITH semantic AS (
+  SELECT id, score
+  FROM antfly.semantic_search(
+    index => 'docs_body_semantic',
+    query => 'refund policy for enterprise plan',
+    limit => 50
+  )
+),
+graph AS (
+  SELECT key AS id, metrics->>'pagerank_v1' AS pagerank
+  FROM antfly.graph_traverse(
+    index => 'docs_rel_graph',
+    start => 'doc:root',
+    max_depth => 2,
+    require_metric => 'pagerank_v1'
+  )
+)
+SELECT d.id, d.title, semantic.score, graph.pagerank
+FROM docs AS d
+JOIN semantic USING (id)
+LEFT JOIN graph USING (id)
+WHERE d.tenant_id = 't1'
+ORDER BY semantic.score * 0.8 + graph.pagerank::float8 * 0.2 DESC
+LIMIT 10;
+```
+
+Higher-level hybrid search can be a convenience function over the same native
+fusion machinery:
+
+```sql
+SELECT *
+FROM antfly.hybrid_search(
+  table_name => 'docs',
+  query => 'enterprise refund policy',
+  sources => ARRAY[
+    antfly.source('docs_body_fts', weight => 0.25),
+    antfly.source('docs_body_semantic', weight => 0.60),
+    antfly.source('docs_rel_graph', metric => 'pagerank_v1', weight => 0.15)
+  ],
+  fusion => 'rrf',
+  limit => 20
+);
+```
+
+That function should lower to the same REST/SDK fusion configuration used by
+non-SQL callers: ranked source specs, `rrf`/`rsf`, optional failover, pruning,
+and reranking. The table-valued function result can then be joined back to base
+rows for filtering, authorization, and projection.
+
+#### Operational contract
+
+- Catalog application validates SQL names, column references, model references,
+  edge extraction paths, graph metric names, and index-specific options before
+  any asynchronous build starts.
+- SQL DDL stores native configs in the Antfly catalog. It must not generate a
+  backend SQL string as the source of truth.
+- Backfill, catch-up, refresh, split, merge, replay, restore, and replication
+  rebuild derived artifacts from committed relational base rows and schema
+  metadata.
+- Read APIs expose readiness explicitly. Required graph metrics return
+  `MetricNotReady`; required derived indexes return the matching index readiness
+  error; optional sources can be omitted according to the caller's fusion policy.
+- Edge extraction and managed embedding jobs must be idempotent across crash and
+  retry. Publishing a graph or AKNN generation is the visibility boundary.
+- Freshness names should use operation-oriented options such as
+  `require_fresh => true` or `freshness => 'published'`; `published` describes
+  the artifact state, while `require_fresh` describes the read requirement.
+- Graph indexes should require an explicit default edge policy in config. The
+  long-term default can be `edge_types = 'all'`, but the catalog should store
+  that decision explicitly so adding new edge types cannot silently change old
+  metrics without a new generation.
+
+#### Implementation order
+
+1. Parse and catalog ordinary `antfly_full_text`, external-vector, and
+   `antfly_algebraic` DDL as direct derived index configs.
+2. Add `antfly_aknn` DDL that creates an enrichment plus AKNN config and exposes
+   readiness through SQL table-valued functions.
+3. Add explicit edge-table graph indexes, then extraction-based graph indexes.
+4. Attach graph metrics to graph indexes with `MetricNotReady`, immediate old
+   generation cleanup, and explicit edge policy recording.
+5. Add hybrid table-valued functions that lower to the native fusion planner.
+6. Only after those APIs prove insufficient, evaluate optional GQL/Cypher-like
+   graph query support as an additional adapter, not as the primary relational
+   contract.
 
 ### Query and movement invariants
 

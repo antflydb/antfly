@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "b509e6f78d2f6ad8b9a866cfb55f3ef0ea660cedb5284558f204407d0948c46b",
-  "source_entry_count": 1008,
-  "entry_count": 1008,
+  "source_sha256": "01429bbc33f1f35b9c3510eadea86b32ceca45e190f8058409ef7c8fec74db04",
+  "source_entry_count": 1013,
+  "entry_count": 1013,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -150,18 +150,22 @@
       "sql": "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)"
     },
     {
-      "name": "unsupported recursive cte merge write plan",
-      "family": "unsupported_write",
-      "plan": "unsupported:write:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
+      "name": "recursive cte merge write plan",
+      "family": "merge_mutation",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "recursive_merge_mutation:cte=source_rows:op=union_all:anchor_table=usage_records:outputs=2:member=recursive_member_join:type=inner:left=usage_records:right=source_rows:on=1:projections=2:merge=merge_mutation:target=usage_records:source=source_rows:ctes=0:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
       "sql": "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {
-      "name": "unsupported recursive cte merge mutation plan",
+      "name": "unsupported merge mutation-producing cte source",
       "family": "unsupported_merge_mutation",
-      "plan": "unsupported:merge_mutation:requires=recursive_cte_stream_plan",
-      "classification_reason": "recursive_cte_stream_plan",
-      "sql": "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
+      "plan": "unsupported:merge_mutation:requires=cte_mutation_source_plan",
+      "classification_reason": "cte_mutation_source_plan",
+      "sql": "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status"
     },
     {
       "name": "schema add deferrable unique validation work",
@@ -3488,6 +3492,17 @@
       "sql": "CREATE POLICY usage_records_literal_policy ON usage_records USING (tenant_id = 'tenant-a')"
     },
     {
+      "name": "row security expression policy catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_row_policy",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:create_row_policy:policy=usage_records_lower_policy:table=usage_records:kind=expression:json_hex=7b226c6873223a7b226f70223a226c6f776572222c2261726773223a5b7b226669656c64223a22737461747573227d5d7d2c226f70223a226571222c22726873223a7b2276616c7565223a22616374697665227d7d",
+      "sql": "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active')"
+    },
+    {
       "name": "row security write check policy catalog ddl",
       "family": "ddl",
       "summary": {
@@ -3993,6 +4008,18 @@
       "sql": "COPY usage_records (id, status) TO STDIN"
     },
     {
+      "name": "copy from binary format bulk import ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "copy_from",
+        "table_name": "usage_records",
+        "operations": 2
+      },
+      "plan": "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=binary:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+      "execution_plan": "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=postgres_binary:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=true",
+      "sql": "COPY usage_records (id, status) FROM STDIN WITH (FORMAT binary)"
+    },
+    {
       "name": "copy from where filter bulk import ddl",
       "family": "ddl",
       "summary": {
@@ -4024,14 +4051,14 @@
       "sql": "COPY usage_records (id, status) FROM STDIN WITH (OIDS true)"
     },
     {
-      "name": "copy binary format parses but execution bridge rejects",
+      "name": "copy binary format bulk export ddl",
       "family": "ddl",
       "summary": {
         "ddl_tag": "copy_to",
         "table_name": "usage_records"
       },
       "plan": "ddl:copy_to:table=usage_records:columns=0:endpoint=STDOUT:format=binary:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
-      "execution_plan": "unsupported:ddl:requires=bulk_io_plan",
+      "execution_plan": "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=postgres_binary:auth=table/read:audit=copy_to:table=usage_records:columns=0:where_expr=0:requires_stream=true",
       "sql": "COPY usage_records TO STDOUT WITH (FORMAT binary)"
     },
     {
@@ -4310,11 +4337,22 @@
       "sql": "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$"
     },
     {
-      "name": "unsupported create function executable side-effect body",
+      "name": "create trigger perform function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_perform_body",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_perform_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log",
+      "sql": "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$"
+    },
+    {
+      "name": "unsupported create function executable argument side-effect body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$"
+      "sql": "CREATE FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(1); RETURN NEW; END$$"
     },
     {
       "name": "unsupported create function routine option",
@@ -4379,11 +4417,33 @@
       "sql": "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$"
     },
     {
-      "name": "unsupported create procedure executable statement body",
+      "name": "create perform procedure body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_procedure",
+        "table_name": "rotate_usage_perform",
+        "operations": 0
+      },
+      "plan": "ddl:create_procedure:name=rotate_usage_perform:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now",
+      "sql": "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$"
+    },
+    {
+      "name": "call noop procedure catalog runtime ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "call_procedure",
+        "table_name": "rotate_usage",
+        "operations": 0
+      },
+      "plan": "ddl:call_procedure:name=rotate_usage:args=0",
+      "sql": "CALL rotate_usage()"
+    },
+    {
+      "name": "unsupported create procedure executable argument statement body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$"
+      "sql": "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$"
     },
     {
       "name": "drop procedure catalog ddl",
@@ -6265,6 +6325,7 @@
         "join_on": 1
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records)"
     },
     {
@@ -6276,6 +6337,7 @@
         "join_on": 2
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.status = usage_records.status)"
     },
     {
@@ -6288,6 +6350,7 @@
         "join_on": 2
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status)"
     },
     {
@@ -6299,6 +6362,7 @@
         "join_on": 2
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=1:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE (id, status) IN (SELECT organization_id, status FROM archived_records)"
     },
     {
@@ -6312,6 +6376,7 @@
         "row_claim_skip_locked": true
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
@@ -6326,6 +6391,7 @@
         "row_claim_skip_locked": true
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
@@ -6339,6 +6405,7 @@
         "row_claim_skip_locked": true
       },
       "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=1:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
@@ -6373,6 +6440,7 @@
         "join_on": 1
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)"
     },
     {
@@ -6383,6 +6451,7 @@
         "join_on": 1
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records)"
     },
     {
@@ -6393,6 +6462,7 @@
         "join_on": 2
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.status = usage_records.status)"
     },
     {
@@ -6404,6 +6474,7 @@
         "join_on": 2
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status)"
     },
     {
@@ -6414,6 +6485,7 @@
         "join_on": 2
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=2:order=0:limit=-1:claim=locked:source_assignments=0:ops=0:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE (id, status) IN (SELECT organization_id, status FROM archived_records)"
     },
     {
@@ -6426,6 +6498,7 @@
         "row_claim_skip_locked": true
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
@@ -6439,6 +6512,7 @@
         "row_claim_skip_locked": true
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=1:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
@@ -6451,6 +6525,7 @@
         "row_claim_skip_locked": true
       },
       "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:order=0:limit=-1:claim=skip_locked:source_assignments=0:ops=0:returning=1:returning_expr=0:returning_all=0:match_expr_pred=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "DELETE FROM usage_records WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id"
     },
     {
@@ -6544,7 +6619,7 @@
         "operations": 1,
         "join_on": 1
       },
-      "plan": "merge_mutation:target=usage_records:source=archived_records:ctes=1:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+      "plan": "merge_mutation:target=usage_records:source=ready_sources:ctes=1:source_cte=1:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
       "sql": "WITH ready_sources AS (SELECT id, status FROM archived_records WHERE status = 'ready') MERGE INTO usage_records AS target USING ready_sources AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status"
     },
     {

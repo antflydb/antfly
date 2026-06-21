@@ -240,6 +240,7 @@ test "public API request body limit matches Go linear merge contract" {
 pub const SqlBulkIoAuditOutcome = enum {
     applied,
     denied,
+    failed,
 };
 
 pub const SqlBulkIoAuditRecord = struct {
@@ -1398,8 +1399,11 @@ fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
     defer svc.freeAdminSnapshot(&snapshot);
     var ordinal: u32 = 0;
     for (applied.work_items) |item| {
-        if (item.action != .rewrite) continue;
-        if (item.rewrite_expression == null and item.row_rewrite_plan.empty() and !item.full_row_rewrite) return error.UnsupportedSqlShape;
+        switch (item.action) {
+            .validate => if (item.subject != .table or item.reason != .constraints) return error.UnsupportedSqlShape,
+            .rewrite => if (item.rewrite_expression == null and item.row_rewrite_plan.empty() and !item.full_row_rewrite) return error.UnsupportedSqlShape,
+            else => continue,
+        }
         ordinal += 1;
         for (snapshot.ranges) |range| {
             if (range.table_id != applied.table.table_id) continue;
@@ -1490,9 +1494,13 @@ fn nonZeroId(value: u64) u64 {
 }
 
 fn appliedDdlHasSchemaRewriteWork(applied: tables_api.AppliedRelationalSqlDdlRecord) bool {
-    if (applied.dropped_table or !applied.rewrite_required) return false;
+    if (applied.dropped_table) return false;
     for (applied.work_items) |item| {
-        if (item.action == .rewrite) return true;
+        switch (item.action) {
+            .rewrite => if (item.subject == .table and item.reason == .row_images) return true,
+            .validate => if (item.subject == .table and item.reason == .constraints) return true,
+            else => {},
+        }
     }
     return false;
 }
@@ -1735,6 +1743,78 @@ test "api http server schedules typed schema rewrite jobs from applied SQL DDL w
     try std.testing.expectEqual(@as(u64, 9002), service.jobs.items[1].group_id);
     try std.testing.expectEqualStrings("m", service.jobs.items[1].start_row_key);
     try std.testing.expect(service.jobs.items[1].end_row_key == null);
+}
+
+test "api http server schedules durable schema validation jobs from applied SQL DDL work" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        ranges: [2]metadata_table_manager.RangeRecord = .{
+            .{ .group_id = 9101, .range_id = 9201, .table_id = 88, .start_key = "", .end_key = "n" },
+            .{ .group_id = 9102, .range_id = 9202, .table_id = 88, .start_key = "n", .end_key = null },
+        },
+        jobs: std.ArrayListUnmanaged(metadata_table_manager.SchemaRewriteJobRecord) = .empty,
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.jobs.items) |record| metadata_table_manager.freeSchemaRewriteJob(allocator, record);
+            self.jobs.deinit(allocator);
+            self.* = undefined;
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = self.ranges[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        fn upsertSchemaRewriteJob(self: *@This(), record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+            const owned = try metadata_table_manager.cloneSchemaRewriteJob(std.testing.allocator, record);
+            errdefer metadata_table_manager.freeSchemaRewriteJob(std.testing.allocator, owned);
+            try self.jobs.append(std.testing.allocator, owned);
+        }
+    };
+
+    const table = try metadata_table_manager.cloneTable(alloc, .{
+        .table_id = 88,
+        .name = "events",
+        .schema_json = "{\"version\":3,\"storage_mode\":\"relational\"}",
+    });
+    errdefer metadata_table_manager.freeTable(alloc, table);
+    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    work_items[0] = .{
+        .action = .validate,
+        .subject = .table,
+        .reason = .constraints,
+    };
+    var applied: tables_api.AppliedRelationalSqlDdlRecord = .{
+        .table = table,
+        .validation_required = true,
+        .work_items = work_items,
+    };
+    defer applied.deinit(alloc);
+
+    var service = FakeService{};
+    defer service.deinit(alloc);
+    try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
+
+    try std.testing.expectEqual(@as(usize, 2), service.jobs.items.len);
+    try std.testing.expectEqual(@as(u64, 88), service.jobs.items[0].table_id);
+    try std.testing.expectEqual(@as(u64, 9101), service.jobs.items[0].group_id);
+    try std.testing.expectEqualStrings("validate", service.jobs.items[0].action);
+    try std.testing.expectEqualStrings("constraints", service.jobs.items[0].reason);
+    try std.testing.expectEqualStrings("", service.jobs.items[0].target_column);
+    try std.testing.expect(service.jobs.items[0].expression == null);
+    try std.testing.expect(!service.jobs.items[0].full_row_rewrite);
+    try std.testing.expectEqual(@as(usize, 0), service.jobs.items[0].rewrite_renames.len);
+    try std.testing.expectEqual(@as(usize, 0), service.jobs.items[0].rewrite_drops.len);
+    try std.testing.expectEqual(@as(u64, 9102), service.jobs.items[1].group_id);
 }
 
 test "api http server schedules row-plan schema rewrite jobs from applied SQL DDL work" {
@@ -2096,6 +2176,140 @@ test "api http server wakes durable schema rewrite worker after SQL ALTER rewrit
     try std.testing.expectEqualStrings("api-schema-rewrite", writes.last_worker_id_buf[0..writes.last_worker_id_len]);
 }
 
+test "api http server wakes durable schema worker after SQL ALTER validation DDL" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    defer runtime.deinit();
+
+    const FakeSource = struct {
+        apply_count: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .apply_relational_sql_ddl_with_session_and_function_bindings = applyRelationalSqlDdlWithSessionAndFunctionBindings,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn applyRelationalSqlDdlWithSessionAndFunctionBindings(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            sql: []const u8,
+            session: catalog_resources.SqlCatalogSession,
+            function_bindings: relational_sql.SqlFunctionBindings,
+        ) !tables_api.AppliedRelationalSqlDdlRecord {
+            _ = sql;
+            _ = session;
+            _ = function_bindings;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.apply_count += 1;
+
+            const table = try metadata_table_manager.cloneTable(allocator, .{
+                .table_id = 89,
+                .name = "audit_log",
+                .database_name = catalog_resources.default_database_name,
+                .namespace_name = catalog_resources.default_namespace_name,
+                .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
+                .indexes_json = "{}",
+                .replication_sources_json = "[]",
+                .placement_role = "data",
+            });
+            errdefer metadata_table_manager.freeTable(allocator, table);
+            const work_items = try allocator.alloc(relational_sql.AppliedDdlWorkItem, 1);
+            errdefer allocator.free(work_items);
+            work_items[0] = .{
+                .action = .validate,
+                .subject = .table,
+                .reason = .constraints,
+            };
+            return .{
+                .table = table,
+                .validation_required = true,
+                .work_items = work_items,
+            };
+        }
+    };
+
+    const FakeWrites = struct {
+        pass_count: usize = 0,
+        last_table_name_buf: [128]u8 = undefined,
+        last_table_name_len: usize = 0,
+        last_worker_id_buf: [128]u8 = undefined,
+        last_worker_id_len: usize = 0,
+
+        fn iface(self: *@This()) table_writes.TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                    .schema_rewrite_worker_pass = schemaRewriteWorkerPass,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) !?void {
+            return error.TestUnexpectedResult;
+        }
+
+        fn schemaRewriteWorkerPass(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            worker_id: []const u8,
+            lease_ms: u64,
+            max_work_units: usize,
+        ) !?table_writes.SchemaRewriteWorkerPassResult {
+            _ = allocator;
+            if (lease_ms == 0 or max_work_units == 0) return error.TestUnexpectedResult;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.pass_count += 1;
+            if (table_name.len > self.last_table_name_buf.len or worker_id.len > self.last_worker_id_buf.len) return error.TestUnexpectedResult;
+            @memcpy(self.last_table_name_buf[0..table_name.len], table_name);
+            self.last_table_name_len = table_name.len;
+            @memcpy(self.last_worker_id_buf[0..worker_id.len], worker_id);
+            self.last_worker_id_len = worker_id.len;
+            return .{
+                .complete = true,
+                .jobs_scanned = 1,
+                .jobs_claimed = 1,
+                .jobs_completed = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var writes = FakeWrites{};
+    var server = try ApiHttpServer.initWithConfig(
+        alloc,
+        .{ .backend_runtime = runtime.ptr() },
+        source.iface(),
+        null,
+        writes.iface(),
+    );
+    defer server.deinit();
+
+    var applied = try server.applyRelationalSqlDdl("ALTER TABLE audit_log VALIDATE CONSTRAINT audit_log_amount_check;");
+    defer applied.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), source.apply_count);
+    try std.testing.expectEqual(@as(usize, 1), writes.pass_count);
+    try std.testing.expectEqualStrings("audit_log", writes.last_table_name_buf[0..writes.last_table_name_len]);
+    try std.testing.expectEqualStrings("api-schema-rewrite", writes.last_worker_id_buf[0..writes.last_worker_id_len]);
+}
+
 test "api http server applies SQL ALTER COLUMN USING through durable schema rewrite jobs" {
     const alloc = std.testing.allocator;
     const initial_schema_json =
@@ -2197,9 +2411,29 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
     try std.testing.expect(applied.rewrite_required);
     try std.testing.expectEqual(@as(usize, 1), service.upsert_table_count);
     try std.testing.expectEqual(@as(usize, 1), service.run_round_count);
-    try std.testing.expectEqual(@as(usize, 2), service.jobs.items.len);
+    try std.testing.expectEqual(@as(usize, 4), service.jobs.items.len);
 
-    const first = service.jobs.items[0];
+    var rewrite_count: usize = 0;
+    var validate_count: usize = 0;
+    var first_rewrite: ?*const metadata_table_manager.SchemaRewriteJobRecord = null;
+    var second_rewrite: ?*const metadata_table_manager.SchemaRewriteJobRecord = null;
+    for (service.jobs.items) |*job| {
+        if (std.mem.eql(u8, job.action, "rewrite") and std.mem.eql(u8, job.reason, "row_images")) {
+            rewrite_count += 1;
+            if (job.group_id == 9901) first_rewrite = job;
+            if (job.group_id == 9902) second_rewrite = job;
+        } else if (std.mem.eql(u8, job.action, "validate") and std.mem.eql(u8, job.reason, "constraints")) {
+            validate_count += 1;
+            try std.testing.expect(job.expression == null);
+            try std.testing.expectEqualStrings("", job.target_column);
+        } else {
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), rewrite_count);
+    try std.testing.expectEqual(@as(usize, 2), validate_count);
+
+    const first = first_rewrite orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u64, 88), first.table_id);
     try std.testing.expectEqual(@as(u64, 9901), first.group_id);
     try std.testing.expectEqualStrings("", first.start_row_key);
@@ -2213,9 +2447,10 @@ test "api http server applies SQL ALTER COLUMN USING through durable schema rewr
     try std.testing.expectEqualStrings("amount", expression.operands[0].field);
     try std.testing.expectEqualStrings("1", expression.operands[1].value_json);
 
-    try std.testing.expectEqual(@as(u64, 9902), service.jobs.items[1].group_id);
-    try std.testing.expectEqualStrings("n", service.jobs.items[1].start_row_key);
-    try std.testing.expect(service.jobs.items[1].end_row_key == null);
+    const second = second_rewrite orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 9902), second.group_id);
+    try std.testing.expectEqualStrings("n", second.start_row_key);
+    try std.testing.expect(second.end_row_key == null);
 }
 
 fn applyDatabaseCatalogPlanOnService(
@@ -3443,6 +3678,26 @@ pub const ApiHttpServer = struct {
         return try self.applyRelationalSqlDdlWithSession(sql, &session);
     }
 
+    pub fn applyRelationalSqlDdlInTransactionSession(
+        self: *ApiHttpServer,
+        txn_id: db_mod.types.TxnId,
+        sql: []const u8,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        var state = (try self.txn_sessions.getSqlCatalogSessionState(self.alloc, txn_id)) orelse return error.TxnNotFound;
+        defer state.deinit(self.alloc);
+
+        var session = try state.toOwnedSqlCatalogSessionAlloc(self.alloc);
+        defer session.deinit(self.alloc);
+
+        var applied = try self.applyRelationalSqlDdlWithSession(sql, &session);
+        errdefer applied.deinit(self.alloc);
+
+        var updated = try transactions_api.SqlCatalogSessionState.fromOwnedSqlCatalogSessionAlloc(self.alloc, session);
+        defer updated.deinit(self.alloc);
+        _ = (try self.txn_sessions.updateSqlCatalogSessionState(self.alloc, txn_id, updated)) orelse return error.TxnNotFound;
+        return applied;
+    }
+
     pub fn sqlCatalogSessionForAuthenticatedIdentityDatabaseAlloc(
         self: *ApiHttpServer,
         identity: ?*const AuthenticatedIdentity,
@@ -3568,7 +3823,7 @@ pub const ApiHttpServer = struct {
                 return applied;
             },
             .prepared_transaction => |prepared_plan| {
-                _ = try self.source.applyPreparedTransactionPlan(self.alloc, prepared_plan, sqlDdlTimestampNs());
+                _ = try self.applyPreparedTransactionPlan(prepared_plan, sqlDdlTimestampNs());
                 if (prepared_plan.action == .prepare) {
                     try session.clearTransactionLocalState(self.alloc);
                 }
@@ -3596,6 +3851,13 @@ pub const ApiHttpServer = struct {
             .function_catalog => |*function_plan| {
                 try self.resolveRoutineSettingsFromCurrentInPlace(function_plan, session.session());
                 try self.sql_routine_runtime.apply(function_plan.*);
+                var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
+                errdefer applied.deinit(self.alloc);
+                try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+                return applied;
+            },
+            .procedure_call => |procedure_call| {
+                try self.sql_routine_runtime.executeProcedureRoutineArgs(procedure_call.routine_name, procedure_call.argument_count);
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                 errdefer applied.deinit(self.alloc);
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -3630,6 +3892,20 @@ pub const ApiHttpServer = struct {
         try self.scheduleSchemaRewriteWakeForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         return applied;
+    }
+
+    fn applyPreparedTransactionPlan(
+        self: *ApiHttpServer,
+        plan: relational_sql.PreparedTransactionPlan,
+        timestamp_ns: u64,
+    ) !relational_sql.PreparedTransactionCoordinatorResult {
+        return self.source.applyPreparedTransactionPlan(self.alloc, plan, timestamp_ns) catch |err| switch (err) {
+            error.UnsupportedOperation => {
+                const opened = self.opened_session_store orelse return err;
+                return try relational_sql.executePreparedTransactionRecoveryPlan(self.alloc, opened.docstore, plan, timestamp_ns);
+            },
+            else => return err,
+        };
     }
 
     fn applySqlRoutineTriggerDdlAlloc(
@@ -3924,12 +4200,22 @@ pub const ApiHttpServer = struct {
     ) !relational_rows_api.OwnedRowsBatchRequest {
         const target = try session.tableTargetFromObjectName(execution_plan.table_name);
         try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+        return try self.executeBulkSqlImportPlanFromPayloadAuthorized(execution_plan, target, stdin_payload, authenticated_identity);
+    }
 
+    fn executeBulkSqlImportPlanFromPayloadAuthorized(
+        self: *ApiHttpServer,
+        execution_plan: relational_sql.BulkSqlIoExecutionPlan,
+        target: catalog_resources.TableTarget,
+        payload: []const u8,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+    ) !relational_rows_api.OwnedRowsBatchRequest {
+        errdefer |err| if (err != error.PermissionDenied) self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
         const source = self.table_writes orelse return error.UnsupportedOperation;
         const schema = try self.runtimeSchemaForCatalogRows(target);
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
-        var rows_req = try relational_sql.bulkSqlIoImportRowsBatchFromStdinAlloc(self.alloc, schema, execution_plan, stdin_payload);
+        var rows_req = try relational_sql.bulkSqlIoImportRowsBatchFromStdinAlloc(self.alloc, schema, execution_plan, payload);
         errdefer rows_req.deinit(self.alloc);
         try self.applyRowsBatchBeforeInsertTriggersForBulkImport(target.table_name, schema, &rows_req);
         try self.requireSqlBulkIoRowsSatisfyEffectiveFilter(execution_plan, target, schema, rows_req.req, authenticated_identity);
@@ -4028,10 +4314,19 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) !relational_rows_api.OwnedRowsBatchRequest {
         if (execution_plan.stream != .file or execution_plan.endpoint_kind != .file) return error.UnsupportedSqlShape;
-        const file_io = self.cfg.sql_bulk_io_file_io orelse return error.UnsupportedOperation;
-        const payload = try file_io.readImport(self.alloc, execution_plan.endpoint);
+        const target = try session.tableTargetFromObjectName(execution_plan.table_name);
+        try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+        const file_io = self.cfg.sql_bulk_io_file_io orelse {
+            const err = error.UnsupportedOperation;
+            self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
+            return err;
+        };
+        const payload = file_io.readImport(self.alloc, execution_plan.endpoint) catch |err| {
+            self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
+            return err;
+        };
         defer self.alloc.free(payload);
-        return try self.executeBulkSqlImportPlanFromStdin(execution_plan, payload, session, authenticated_identity);
+        return try self.executeBulkSqlImportPlanFromPayloadAuthorized(execution_plan, target, payload, authenticated_identity);
     }
 
     fn executeBulkSqlImportPlanFromProgram(
@@ -4041,10 +4336,19 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) !relational_rows_api.OwnedRowsBatchRequest {
         if (execution_plan.stream != .program or execution_plan.endpoint_kind != .program) return error.UnsupportedSqlShape;
-        const program_io = self.cfg.sql_bulk_io_program_io orelse return error.UnsupportedOperation;
-        const payload = try program_io.readImport(self.alloc, execution_plan.endpoint);
+        const target = try session.tableTargetFromObjectName(execution_plan.table_name);
+        try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+        const program_io = self.cfg.sql_bulk_io_program_io orelse {
+            const err = error.UnsupportedOperation;
+            self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
+            return err;
+        };
+        const payload = program_io.readImport(self.alloc, execution_plan.endpoint) catch |err| {
+            self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
+            return err;
+        };
         defer self.alloc.free(payload);
-        return try self.executeBulkSqlImportPlanFromStdin(execution_plan, payload, session, authenticated_identity);
+        return try self.executeBulkSqlImportPlanFromPayloadAuthorized(execution_plan, target, payload, authenticated_identity);
     }
 
     fn executeBulkSqlExportPlanToStdout(
@@ -4072,10 +4376,19 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) !void {
         if (execution_plan.stream != .file or execution_plan.endpoint_kind != .file) return error.UnsupportedSqlShape;
-        const file_io = self.cfg.sql_bulk_io_file_io orelse return error.UnsupportedOperation;
+        const target = try session.tableTargetFromObjectName(execution_plan.table_name);
+        try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+        const file_io = self.cfg.sql_bulk_io_file_io orelse {
+            const err = error.UnsupportedOperation;
+            self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
+            return err;
+        };
         const exported = try self.executeBulkSqlExportPlanBytes(execution_plan, session, authenticated_identity);
         defer self.alloc.free(exported.payload);
-        try file_io.writeExport(execution_plan.endpoint, exported.payload);
+        file_io.writeExport(execution_plan.endpoint, exported.payload) catch |err| {
+            self.recordSqlBulkIoFailedAudit(execution_plan, exported.target, exported.row_count, authenticated_identity, err);
+            return err;
+        };
         try self.recordSqlBulkIoAudit(execution_plan, exported.target, exported.row_count, authenticated_identity);
     }
 
@@ -4086,10 +4399,19 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?*const AuthenticatedIdentity,
     ) !void {
         if (execution_plan.stream != .program or execution_plan.endpoint_kind != .program) return error.UnsupportedSqlShape;
-        const program_io = self.cfg.sql_bulk_io_program_io orelse return error.UnsupportedOperation;
+        const target = try session.tableTargetFromObjectName(execution_plan.table_name);
+        try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+        const program_io = self.cfg.sql_bulk_io_program_io orelse {
+            const err = error.UnsupportedOperation;
+            self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
+            return err;
+        };
         const exported = try self.executeBulkSqlExportPlanBytes(execution_plan, session, authenticated_identity);
         defer self.alloc.free(exported.payload);
-        try program_io.writeExport(execution_plan.endpoint, exported.payload);
+        program_io.writeExport(execution_plan.endpoint, exported.payload) catch |err| {
+            self.recordSqlBulkIoFailedAudit(execution_plan, exported.target, exported.row_count, authenticated_identity, err);
+            return err;
+        };
         try self.recordSqlBulkIoAudit(execution_plan, exported.target, exported.row_count, authenticated_identity);
     }
 
@@ -4101,6 +4423,7 @@ pub const ApiHttpServer = struct {
     ) !BulkSqlExportBytes {
         const target = try session.tableTargetFromObjectName(execution_plan.table_name);
         try self.requireSqlBulkIoPermission(target, execution_plan, authenticated_identity);
+        errdefer |err| self.recordSqlBulkIoFailedAudit(execution_plan, target, 0, authenticated_identity, err);
 
         const source = self.effectivePublicTableReads() orelse return error.UnsupportedOperation;
         const schema = try self.runtimeSchemaForCatalogRows(target);
@@ -4194,6 +4517,19 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn recordSqlBulkIoFailedAudit(
+        self: *ApiHttpServer,
+        execution_plan: relational_sql.BulkSqlIoExecutionPlan,
+        target: catalog_resources.TableTarget,
+        row_count: usize,
+        authenticated_identity: ?*const AuthenticatedIdentity,
+        err: anyerror,
+    ) void {
+        self.recordSqlBulkIoAuditOutcome(execution_plan, target, row_count, authenticated_identity, .failed, @errorName(err)) catch |audit_err| {
+            std.log.warn("failed to record failed SQL bulk IO audit err={s} original_err={s}", .{ @errorName(audit_err), @errorName(err) });
+        };
+    }
+
     fn requireSqlBulkIoPermission(
         self: *ApiHttpServer,
         target: catalog_resources.TableTarget,
@@ -4249,7 +4585,9 @@ pub const ApiHttpServer = struct {
             query.array_any.len != 0 or
             query.in_predicates.len != 0 or
             query.json_contains.len != 0 or
-            query.access_or_predicates.len != 0;
+            query.expression_predicates.len != 0 or
+            query.access_or_predicates.len != 0 or
+            query.expression_or_predicates.len != 0;
     }
 
     const OwnedSqlAuthCatalog = struct {
@@ -21793,6 +22131,66 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
     try std.testing.expect(source.last_aborted);
 }
 
+test "api http server persists prepared transaction SQL DDL through durable session store fallback" {
+    const alloc = std.testing.allocator;
+    const session_path = "/tmp/antfly-api-http-prepared-transaction-fallback";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
+
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    {
+        var server = try ApiHttpServer.initWithConfig(alloc, .{ .session_store_path = session_path }, source.iface(), null, null);
+        defer server.deinit();
+        var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+        defer session.deinit(alloc);
+
+        var set_local = try server.applyRelationalSqlDdlWithSession("SET LOCAL search_path TO analytics;", &session);
+        defer set_local.deinit(alloc);
+        try std.testing.expect(session.transaction_local_search_path);
+
+        var prepared = try server.applyRelationalSqlDdlWithSession("PREPARE TRANSACTION 'durable_usage_batch';", &session);
+        defer prepared.deinit(alloc);
+        try std.testing.expect(!session.transaction_local_search_path);
+    }
+
+    {
+        var server = try ApiHttpServer.initWithConfig(alloc, .{ .session_store_path = session_path }, source.iface(), null, null);
+        defer server.deinit();
+        var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+        defer session.deinit(alloc);
+
+        var committed = try server.applyRelationalSqlDdlWithSession("COMMIT PREPARED 'durable_usage_batch';", &session);
+        defer committed.deinit(alloc);
+
+        var committed_retry = try server.applyRelationalSqlDdlWithSession("COMMIT PREPARED 'durable_usage_batch';", &session);
+        defer committed_retry.deinit(alloc);
+
+        try std.testing.expectError(
+            error.PreparedTransactionDecisionConflict,
+            server.applyRelationalSqlDdlWithSession("ROLLBACK PREPARED 'durable_usage_batch';", &session),
+        );
+    }
+}
+
 test "api http server applies prepared statement SQL plans to session runtime" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -22102,22 +22500,33 @@ test "api http server recovers durable SQL routine catalog" {
             &session,
         );
         defer created.deinit(alloc);
-        try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+        var created_procedure = try server.applyRelationalSqlDdlWithSession(
+            "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
+            &session,
+        );
+        defer created_procedure.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), server.sql_routine_runtime.routineCountForTest());
     }
 
     {
         var source = FakeSource{};
         var server = try ApiHttpServer.initWithConfig(alloc, .{ .sql_routine_store_path = path }, source.iface(), null, null);
         defer server.deinit();
-        try std.testing.expectEqual(@as(usize, 1), server.sql_routine_runtime.routineCountForTest());
+        try std.testing.expectEqual(@as(usize, 2), server.sql_routine_runtime.routineCountForTest());
         const normalized = try server.sql_routine_runtime.executeExpressionRoutineAlloc(alloc, "normalize_status", "\"ACTIVE\"");
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings("\"active\"", normalized);
 
         var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
         defer session.deinit(alloc);
+        var called = try server.applyRelationalSqlDdlWithSession("CALL rotate_usage();", &session);
+        defer called.deinit(alloc);
+        try std.testing.expectError(error.UnsupportedSqlShape, server.applyRelationalSqlDdlWithSession("CALL rotate_usage(1);", &session));
+        try std.testing.expectError(error.RoutineNotFound, server.applyRelationalSqlDdlWithSession("CALL missing_usage();", &session));
         var dropped = try server.applyRelationalSqlDdlWithSession("DROP FUNCTION normalize_status(text);", &session);
         defer dropped.deinit(alloc);
+        var dropped_procedure = try server.applyRelationalSqlDdlWithSession("DROP PROCEDURE rotate_usage();", &session);
+        defer dropped_procedure.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 0), server.sql_routine_runtime.routineCountForTest());
     }
 
@@ -22932,10 +23341,12 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             try std.testing.expectEqual(@as(usize, 2), plan.query.select.len);
             try std.testing.expectEqualStrings("id", plan.query.select[0]);
             try std.testing.expectEqualStrings("status", plan.query.select[1]);
-            try std.testing.expectEqual(@as(usize, 1), plan.query.predicates.len);
-            try std.testing.expectEqualStrings("status", plan.query.predicates[0].field);
-            try std.testing.expectEqual(runtime_schema_mod.RelationalCheckOp.eq, plan.query.predicates[0].op);
-            try std.testing.expectEqualStrings("\"Ready\"", plan.query.predicates[0].value_json orelse return error.TestUnexpectedResult);
+            try std.testing.expectEqual(@as(usize, 0), plan.query.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.query.expression_predicates.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, plan.query.expression_predicates[0].lhs.kind);
+            try std.testing.expectEqualStrings("status", plan.query.expression_predicates[0].lhs.operands[0].field);
+            try std.testing.expectEqual(runtime_schema_mod.RelationalCheckOp.eq, plan.query.expression_predicates[0].op);
+            try std.testing.expectEqualStrings("\"ready\"", plan.query.expression_predicates[0].rhs[0].value_json);
             self.calls += 1;
 
             const rows = try allocator.alloc([]const u8, 1);
@@ -22971,7 +23382,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         };
 
         alloc: std.mem.Allocator,
-        events: [11]Captured = undefined,
+        events: [13]Captured = undefined,
         count: usize = 0,
 
         fn deinit(self: *@This()) void {
@@ -23215,7 +23626,12 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     );
     server.cfg.sql_bulk_io_file_io = configured_file_io;
     try std.testing.expectEqual(@as(usize, 2), writes.calls);
-    try std.testing.expectEqual(@as(usize, 3), audit.count);
+    try std.testing.expectEqual(@as(usize, 4), audit.count);
+    try std.testing.expectEqual(SqlBulkIoAuditOutcome.failed, audit.events[3].outcome);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[3].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[3].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.file, audit.events[3].stream);
+    try std.testing.expectEqualStrings("UnsupportedOperation", audit.events[3].error_name orelse return error.TestUnexpectedResult);
 
     var copied_file_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) FROM '/tmp/events.csv' WITH (FORMAT csv, HEADER true);",
@@ -23233,13 +23649,13 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     defer first_file_row.deinit();
     try std.testing.expectEqualStrings("u_file", first_file_row.value.object.get("id").?.string);
     try std.testing.expectEqualStrings("Ready", first_file_row.value.object.get("status").?.string);
-    try std.testing.expectEqual(@as(usize, 4), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[3].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[3].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[3].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.file, audit.events[3].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[3].required_permission);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[3].row_count);
+    try std.testing.expectEqual(@as(usize, 5), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[4].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[4].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[4].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.file, audit.events[4].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[4].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[4].row_count);
 
     const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
     var row_filters_transferred = false;
@@ -23248,7 +23664,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         if (row_filter_initialized) row_filters[0].deinit(alloc);
         alloc.free(row_filters);
     };
-    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.analytics.events", "{\"term\":{\"status\":\"Ready\"}}");
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "tenant_ops.analytics.events", "{\"expression_where\":[{\"op\":\"eq\",\"lhs\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},\"rhs\":{\"value\":\"ready\"}}]}");
     row_filter_initialized = true;
     identity.row_filter = row_filters;
     row_filters_transferred = true;
@@ -23263,16 +23679,16 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         ),
     );
     try std.testing.expectEqual(@as(usize, 3), writes.calls);
-    try std.testing.expectEqual(@as(usize, 5), audit.count);
-    try std.testing.expectEqual(SqlBulkIoAuditOutcome.denied, audit.events[4].outcome);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[4].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[4].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[4].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdin, audit.events[4].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[4].required_permission);
-    try std.testing.expectEqualStrings("alice", audit.events[4].authenticated_subject orelse return error.TestUnexpectedResult);
-    try std.testing.expectEqualStrings("PermissionDenied", audit.events[4].error_name orelse return error.TestUnexpectedResult);
-    try std.testing.expectEqual(@as(usize, 0), audit.events[4].row_count);
+    try std.testing.expectEqual(@as(usize, 6), audit.count);
+    try std.testing.expectEqual(SqlBulkIoAuditOutcome.denied, audit.events[5].outcome);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[5].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[5].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[5].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdin, audit.events[5].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[5].required_permission);
+    try std.testing.expectEqualStrings("alice", audit.events[5].authenticated_subject orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("PermissionDenied", audit.events[5].error_name orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 0), audit.events[5].row_count);
 
     var exported_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) TO STDOUT WITH (FORMAT csv, HEADER true, FORCE_QUOTE *);",
@@ -23286,18 +23702,18 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         .import_rows, .export_file => return error.TestUnexpectedResult,
         .export_stdout => |exported| try std.testing.expectEqualStrings("id,status\n\"u1\",\"Ready\"\n", exported),
     }
-    try std.testing.expectEqual(@as(usize, 6), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[5].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[5].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[5].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[5].stream);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.csv, audit.events[5].codec);
-    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[5].required_permission);
-    try std.testing.expectEqualStrings("alice", audit.events[5].authenticated_subject orelse return error.TestUnexpectedResult);
-    try std.testing.expectEqualStrings("tenant_ops", audit.events[5].database_name);
-    try std.testing.expectEqualStrings("analytics", audit.events[5].namespace_name);
-    try std.testing.expectEqualStrings("events", audit.events[5].table_name);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[5].row_count);
+    try std.testing.expectEqual(@as(usize, 7), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[6].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[6].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[6].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[6].stream);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.csv, audit.events[6].codec);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[6].required_permission);
+    try std.testing.expectEqualStrings("alice", audit.events[6].authenticated_subject orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("tenant_ops", audit.events[6].database_name);
+    try std.testing.expectEqualStrings("analytics", audit.events[6].namespace_name);
+    try std.testing.expectEqualStrings("events", audit.events[6].table_name);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[6].row_count);
 
     var exported_text_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) TO STDOUT WITH (FORMAT text);",
@@ -23311,14 +23727,14 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         .import_rows, .export_file => return error.TestUnexpectedResult,
         .export_stdout => |exported| try std.testing.expectEqualStrings("u1\tReady\n", exported),
     }
-    try std.testing.expectEqual(@as(usize, 7), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[6].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[6].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[6].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[6].stream);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.postgres_text, audit.events[6].codec);
-    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[6].required_permission);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[6].row_count);
+    try std.testing.expectEqual(@as(usize, 8), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[7].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[7].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[7].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdout, audit.events[7].stream);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoCodec.postgres_text, audit.events[7].codec);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[7].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[7].row_count);
 
     var exported_file_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) TO '/tmp/events.csv' WITH (FORMAT csv, HEADER true);",
@@ -23333,13 +23749,13 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     }
     try std.testing.expectEqualStrings("/tmp/events.csv", file_io.last_export_path);
     try std.testing.expectEqualStrings("id,status\nu1,Ready\n", file_io.last_export_payload);
-    try std.testing.expectEqual(@as(usize, 8), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[7].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[7].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[7].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.file, audit.events[7].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[7].required_permission);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[7].row_count);
+    try std.testing.expectEqual(@as(usize, 9), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[8].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[8].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[8].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.file, audit.events[8].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[8].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[8].row_count);
 
     const configured_program_io = server.cfg.sql_bulk_io_program_io;
     server.cfg.sql_bulk_io_program_io = null;
@@ -23354,7 +23770,12 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     );
     server.cfg.sql_bulk_io_program_io = configured_program_io;
     try std.testing.expectEqual(@as(usize, 3), writes.calls);
-    try std.testing.expectEqual(@as(usize, 8), audit.count);
+    try std.testing.expectEqual(@as(usize, 10), audit.count);
+    try std.testing.expectEqual(SqlBulkIoAuditOutcome.failed, audit.events[9].outcome);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[9].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[9].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[9].stream);
+    try std.testing.expectEqualStrings("UnsupportedOperation", audit.events[9].error_name orelse return error.TestUnexpectedResult);
 
     var copied_program_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) FROM PROGRAM 'cat /tmp/events.csv' WITH (FORMAT csv, HEADER true);",
@@ -23369,13 +23790,13 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         .import_rows => |copied| try std.testing.expectEqual(@as(usize, 1), copied.writes.len),
         .export_stdout, .export_file => return error.TestUnexpectedResult,
     }
-    try std.testing.expectEqual(@as(usize, 9), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[8].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[8].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[8].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[8].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[8].required_permission);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[8].row_count);
+    try std.testing.expectEqual(@as(usize, 11), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[10].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[10].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[10].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[10].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[10].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[10].row_count);
 
     var exported_program_result = try server.executeBulkSqlWithSession(
         "COPY events (id, status) TO PROGRAM 'cat > /tmp/events.csv' WITH (FORMAT csv, HEADER true);",
@@ -23390,13 +23811,13 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     }
     try std.testing.expectEqualStrings("cat > /tmp/events.csv", program_io.last_export_command);
     try std.testing.expectEqualStrings("id,status\nu1,Ready\n", program_io.last_export_payload);
-    try std.testing.expectEqual(@as(usize, 10), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[9].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[9].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[9].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[9].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[9].required_permission);
-    try std.testing.expectEqual(@as(usize, 1), audit.events[9].row_count);
+    try std.testing.expectEqual(@as(usize, 12), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_to, audit.events[11].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.export_rows, audit.events[11].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_query, audit.events[11].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.program, audit.events[11].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.read, audit.events[11].required_permission);
+    try std.testing.expectEqual(@as(usize, 1), audit.events[11].row_count);
 
     var routine_session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, session);
     defer routine_session.deinit(alloc);
@@ -23424,13 +23845,13 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
         .export_stdout, .export_file => return error.TestUnexpectedResult,
     }
     try std.testing.expectEqual(writes_before_skip, writes.calls);
-    try std.testing.expectEqual(@as(usize, 11), audit.count);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[10].action);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[10].operation);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[10].native_route);
-    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdin, audit.events[10].stream);
-    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[10].required_permission);
-    try std.testing.expectEqual(@as(usize, 0), audit.events[10].row_count);
+    try std.testing.expectEqual(@as(usize, 13), audit.count);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoAuditAction.copy_from, audit.events[12].action);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoOperation.import_rows, audit.events[12].operation);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoNativeRoute.rows_batch, audit.events[12].native_route);
+    try std.testing.expectEqual(relational_sql.BulkSqlIoStream.stdin, audit.events[12].stream);
+    try std.testing.expectEqual(usermgr.PermissionType.write, audit.events[12].required_permission);
+    try std.testing.expectEqual(@as(usize, 0), audit.events[12].row_count);
 
     try std.testing.expectError(
         error.InvalidRowsRequest,
@@ -23468,7 +23889,7 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
             &identity,
         ),
     );
-    try std.testing.expectEqual(@as(usize, 11), audit.count);
+    try std.testing.expectEqual(@as(usize, 13), audit.count);
 }
 
 test "api http server serves api key and row filter routes" {
@@ -29017,6 +29438,134 @@ test "api http server serves long-lived public transaction session routes" {
     var parsed_abort = try std.json.parseFromSlice(transactions_api.TransactionStatusResponse, std.testing.allocator, abort_resp.body, .{});
     defer parsed_abort.deinit();
     try std.testing.expectEqualStrings("aborted", parsed_abort.value.status);
+}
+
+test "api http server persists SQL catalog session state through transaction session routes" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var begin_resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.transactions_begin,
+        .content_type = "application/json",
+        .body = "{}",
+    });
+    defer begin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), begin_resp.status);
+    var parsed_begin = try std.json.parseFromSlice(transactions_api.BeginResponse, alloc, begin_resp.body, .{});
+    defer parsed_begin.deinit();
+    const txn_id_hex = parsed_begin.value.transaction_id;
+    const txn_id = try distributed_txn.parseTxnIdHex(txn_id_hex);
+
+    var set_path = try server.applyRelationalSqlDdlInTransactionSession(txn_id, "SET search_path TO analytics, public;");
+    defer set_path.deinit(alloc);
+    try std.testing.expect(set_path.noop);
+
+    const info_uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ routes.Routes.transactions_prefix, txn_id_hex });
+    defer alloc.free(info_uri);
+    var info_after_set = try server.handle(.{
+        .method = .GET,
+        .uri = info_uri,
+    });
+    defer info_after_set.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), info_after_set.status);
+    var parsed_info_after_set = try std.json.parseFromSlice(transactions_api.SessionDetailsResponse, alloc, info_after_set.body, .{});
+    defer parsed_info_after_set.deinit();
+    const base_sql_session = parsed_info_after_set.value.sql_session orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("default", base_sql_session.current_database_name);
+    try std.testing.expectEqual(@as(usize, 2), base_sql_session.search_path.len);
+    try std.testing.expectEqualStrings("analytics", base_sql_session.search_path[0]);
+    try std.testing.expectEqualStrings("public", base_sql_session.search_path[1]);
+    try std.testing.expect(!base_sql_session.transaction_local_search_path);
+
+    const savepoint_uri = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{
+        routes.Routes.transactions_prefix,
+        txn_id_hex,
+        routes.Routes.transactions_savepoints_suffix,
+    });
+    defer alloc.free(savepoint_uri);
+    var savepoint_resp = try server.handle(.{
+        .method = .POST,
+        .uri = savepoint_uri,
+        .body = "",
+    });
+    defer savepoint_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), savepoint_resp.status);
+    var parsed_savepoint = try std.json.parseFromSlice(transactions_api.SavepointStatusResponse, alloc, savepoint_resp.body, .{});
+    defer parsed_savepoint.deinit();
+
+    var set_local_path = try server.applyRelationalSqlDdlInTransactionSession(txn_id, "SET LOCAL search_path TO tenant_schema, public;");
+    defer set_local_path.deinit(alloc);
+    try std.testing.expect(set_local_path.noop);
+    var set_local_setting = try server.applyRelationalSqlDdlInTransactionSession(txn_id, "SET LOCAL app.tenant_id = 'tenant-b';");
+    defer set_local_setting.deinit(alloc);
+    try std.testing.expect(set_local_setting.noop);
+
+    var info_after_local = try server.handle(.{
+        .method = .GET,
+        .uri = info_uri,
+    });
+    defer info_after_local.deinit(alloc);
+    var parsed_info_after_local = try std.json.parseFromSlice(transactions_api.SessionDetailsResponse, alloc, info_after_local.body, .{});
+    defer parsed_info_after_local.deinit();
+    const local_sql_session = parsed_info_after_local.value.sql_session orelse return error.TestUnexpectedResult;
+    try std.testing.expect(local_sql_session.transaction_local_search_path);
+    try std.testing.expect(local_sql_session.transaction_local_settings);
+    try std.testing.expectEqualStrings("tenant_schema", local_sql_session.search_path[0]);
+    try std.testing.expect(local_sql_session.transaction_local_search_path_base != null);
+    try std.testing.expectEqualStrings("analytics", local_sql_session.transaction_local_search_path_base.?[0]);
+    try std.testing.expect(local_sql_session.transaction_local_settings_base != null);
+    try std.testing.expectEqual(@as(usize, 0), local_sql_session.transaction_local_settings_base.?.len);
+    try std.testing.expectEqual(@as(usize, 1), local_sql_session.settings.len);
+    try std.testing.expectEqualStrings("app.tenant_id", local_sql_session.settings[0].name);
+    try std.testing.expectEqualStrings("tenant-b", local_sql_session.settings[0].value);
+
+    const rollback_uri = try std.fmt.allocPrint(alloc, "{s}{s}{s}/{d}{s}", .{
+        routes.Routes.transactions_prefix,
+        txn_id_hex,
+        routes.Routes.transactions_savepoints_suffix,
+        parsed_savepoint.value.savepoint_id,
+        routes.Routes.transactions_rollback_suffix,
+    });
+    defer alloc.free(rollback_uri);
+    var rollback_resp = try server.handle(.{
+        .method = .POST,
+        .uri = rollback_uri,
+        .body = "",
+    });
+    defer rollback_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), rollback_resp.status);
+
+    var info_after_rollback = try server.handle(.{
+        .method = .GET,
+        .uri = info_uri,
+    });
+    defer info_after_rollback.deinit(alloc);
+    var parsed_info_after_rollback = try std.json.parseFromSlice(transactions_api.SessionDetailsResponse, alloc, info_after_rollback.body, .{});
+    defer parsed_info_after_rollback.deinit();
+    const restored_sql_session = parsed_info_after_rollback.value.sql_session orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!restored_sql_session.transaction_local_search_path);
+    try std.testing.expect(!restored_sql_session.transaction_local_settings);
+    try std.testing.expectEqualStrings("analytics", restored_sql_session.search_path[0]);
+    try std.testing.expectEqualStrings("public", restored_sql_session.search_path[1]);
+    try std.testing.expectEqual(@as(usize, 0), restored_sql_session.settings.len);
 }
 
 test "api http server serves transaction session cleanup route" {

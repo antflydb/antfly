@@ -55,15 +55,16 @@ pub const CreateRowSecurityPolicySyntax = struct {
 pub const AlterRowSecurityPolicySyntax = struct {
     policy_name: []const u8,
     table_name: []const u8,
+    role_targets_present: bool = false,
     role_targets: []const []const u8 = &.{},
-    predicate: ddl_plan.RowSecurityPolicyPredicate,
+    predicate: ?ddl_plan.RowSecurityPolicyPredicate = null,
     check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.policy_name));
         alloc.free(@constCast(self.table_name));
         freeStringSlice(alloc, self.role_targets);
-        self.predicate.deinit(alloc);
+        if (self.predicate) |*predicate| predicate.deinit(alloc);
         if (self.check_predicate) |*predicate| predicate.deinit(alloc);
         self.* = undefined;
     }
@@ -1547,13 +1548,21 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
     const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
-    const role_targets = try parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
+    var role_targets_present = false;
+    var role_targets: []const []const u8 = &.{};
+    if (cursor.matchKeyword("to")) {
+        role_targets_present = true;
+        role_targets = try parseRowSecurityPolicyRoleTargetsAfterToAlloc(alloc, tokens, pos);
+    }
     var role_targets_transferred = false;
     errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
-    try cursor.expectKeyword("using");
-    var predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
-    var predicate_transferred = false;
-    errdefer if (!predicate_transferred) predicate.deinit(alloc);
+    var predicate: ?ddl_plan.RowSecurityPolicyPredicate = null;
+    var predicate_transferred = true;
+    if (cursor.matchKeyword("using")) {
+        predicate = try parseRowSecurityPolicyPredicateAlloc(alloc, cursor, tokens, pos);
+        predicate_transferred = false;
+        errdefer if (!predicate_transferred) if (predicate) |*value| value.deinit(alloc);
+    }
     var check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null;
     var check_predicate_transferred = true;
     if (cursor.matchKeyword("with")) {
@@ -1562,6 +1571,7 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
         check_predicate_transferred = false;
         errdefer if (!check_predicate_transferred) if (check_predicate) |*value| value.deinit(alloc);
     }
+    if (!role_targets_present and predicate == null and check_predicate == null) return error.UnsupportedSqlShape;
     try adapterNoopStatementEnd(cursor);
 
     policy_transferred = true;
@@ -1572,6 +1582,7 @@ pub fn parseAlterRowSecurityPolicyCatalogTailAlloc(
     return .{
         .policy_name = policy_name,
         .table_name = table_name,
+        .role_targets_present = role_targets_present,
         .role_targets = role_targets,
         .predicate = predicate,
         .check_predicate = check_predicate,
@@ -1585,6 +1596,16 @@ pub fn parseOptionalRowSecurityPolicyRoleTargetsAlloc(
 ) ![]const []const u8 {
     const cursor = parser.Cursor.init(tokens, pos);
     if (!cursor.matchKeyword("to")) return &.{};
+    return try parseRowSecurityPolicyRoleTargetsAfterToAlloc(alloc, tokens, pos);
+}
+
+pub fn parseRowSecurityPolicyRoleTargetsAfterToAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const []const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchKeyword("public")) return &.{};
     return try parseIdentifierListAlloc(alloc, tokens, pos);
 }
 
@@ -3070,8 +3091,10 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
     defer lexer.freeTokens(alloc, &body_tokens);
     var pos: usize = 0;
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
+    var perform_routines = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringSlice(alloc, perform_routines.items);
     try cursor.expectKeyword("begin");
-    _ = try consumeBenignPlpgsqlStatements(cursor);
+    _ = try consumeBenignPlpgsqlStatements(alloc, cursor, &perform_routines);
     try cursor.expectKeyword("return");
     const hook: ddl_plan.RoutineExecutionHook = if (cursor.matchKeyword("new"))
         .trigger_return_new
@@ -3088,6 +3111,7 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
     return .{
         .kind = .plpgsql_trigger,
         .hook = hook,
+        .perform_routines = try perform_routines.toOwnedSlice(alloc),
     };
 }
 
@@ -3103,8 +3127,10 @@ fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
     defer lexer.freeTokens(alloc, &body_tokens);
     var pos: usize = 0;
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
+    var perform_routines = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer freeStringSlice(alloc, perform_routines.items);
     try cursor.expectKeyword("begin");
-    _ = try consumeBenignPlpgsqlStatements(cursor);
+    _ = try consumeBenignPlpgsqlStatements(alloc, cursor, &perform_routines);
     if (cursor.matchKeyword("null")) {
         try cursor.expectToken(.semicolon);
     } else if (!cursor.peekKeyword("end")) {
@@ -3116,21 +3142,40 @@ fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
     return .{
         .kind = .plpgsql_procedure,
         .hook = .procedure_noop,
+        .perform_routines = try perform_routines.toOwnedSlice(alloc),
     };
 }
 
-fn consumeBenignPlpgsqlStatements(cursor: parser.Cursor) !bool {
+fn consumeBenignPlpgsqlStatements(
+    alloc: std.mem.Allocator,
+    cursor: parser.Cursor,
+    perform_routines: *std.ArrayListUnmanaged([]const u8),
+) !bool {
     var consumed = false;
     while (true) {
         const checkpoint = cursor.checkpoint();
-        if (!cursor.matchKeyword("raise")) return consumed;
-        if (!cursor.matchKeyword("notice")) {
-            cursor.restore(checkpoint);
-            return error.UnsupportedSqlShape;
+        if (cursor.matchKeyword("raise")) {
+            if (!cursor.matchKeyword("notice")) {
+                cursor.restore(checkpoint);
+                return error.UnsupportedSqlShape;
+            }
+            _ = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+            try cursor.expectToken(.semicolon);
+            consumed = true;
+            continue;
         }
-        _ = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
-        try cursor.expectToken(.semicolon);
-        consumed = true;
+        if (cursor.matchKeyword("perform")) {
+            const routine = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+            try cursor.expectToken(.lparen);
+            try cursor.expectToken(.rparen);
+            try cursor.expectToken(.semicolon);
+            const owned_routine = try alloc.dupe(u8, routine.text);
+            errdefer alloc.free(owned_routine);
+            try perform_routines.append(alloc, owned_routine);
+            consumed = true;
+            continue;
+        }
+        return consumed;
     }
 }
 
@@ -7913,7 +7958,7 @@ test "sql adapter grammar parses row security catalog tails" {
     defer literal.deinit(alloc);
     try std.testing.expectEqual(literal_tokens.items.len, literal_pos);
     const literal_predicate = switch (literal.predicate) {
-        .literal_equals => |literal_predicate| literal_predicate,
+        .literal_equals => |predicate_value| predicate_value,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("tenant_id", literal_predicate.field);
@@ -7926,7 +7971,7 @@ test "sql adapter grammar parses row security catalog tails" {
     defer check.deinit(alloc);
     try std.testing.expectEqual(check_tokens.items.len, check_pos);
     const check_predicate = switch (check.check_predicate orelse return error.TestUnexpectedResult) {
-        .literal_equals => |check_predicate| check_predicate,
+        .literal_equals => |predicate_value| predicate_value,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("status", check_predicate.field);
@@ -7940,12 +7985,39 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqual(alter_tokens.items.len, alter_pos);
     try std.testing.expectEqualStrings("tenant_policy", alter.policy_name);
     try std.testing.expectEqualStrings("usage_records", alter.table_name);
-    const alter_predicate = switch (alter.predicate) {
+    const alter_predicate = switch (alter.predicate orelse return error.TestUnexpectedResult) {
         .literal_equals => |alter_predicate| alter_predicate,
         else => return error.TestUnexpectedResult,
     };
     try std.testing.expectEqualStrings("status", alter_predicate.field);
     try std.testing.expectEqualStrings("\"active\"", alter_predicate.value_json);
+
+    var alter_targets_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records TO app_writer;");
+    defer lexer.freeTokens(alloc, &alter_targets_tokens);
+    var alter_targets_pos: usize = 0;
+    var alter_targets = try parseAlterRowSecurityPolicyCatalogTailAlloc(alloc, alter_targets_tokens.items, &alter_targets_pos);
+    defer alter_targets.deinit(alloc);
+    try std.testing.expectEqual(alter_targets_tokens.items.len, alter_targets_pos);
+    try std.testing.expect(alter_targets.role_targets_present);
+    try std.testing.expectEqual(@as(usize, 1), alter_targets.role_targets.len);
+    try std.testing.expectEqualStrings("app_writer", alter_targets.role_targets[0]);
+    try std.testing.expect(alter_targets.predicate == null);
+    try std.testing.expect(alter_targets.check_predicate == null);
+
+    var alter_check_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records WITH CHECK (status = 'ready');");
+    defer lexer.freeTokens(alloc, &alter_check_tokens);
+    var alter_check_pos: usize = 0;
+    var alter_check = try parseAlterRowSecurityPolicyCatalogTailAlloc(alloc, alter_check_tokens.items, &alter_check_pos);
+    defer alter_check.deinit(alloc);
+    try std.testing.expectEqual(alter_check_tokens.items.len, alter_check_pos);
+    try std.testing.expect(!alter_check.role_targets_present);
+    try std.testing.expect(alter_check.predicate == null);
+    const alter_check_predicate = switch (alter_check.check_predicate orelse return error.TestUnexpectedResult) {
+        .literal_equals => |predicate_value| predicate_value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("status", alter_check_predicate.field);
+    try std.testing.expectEqualStrings("\"ready\"", alter_check_predicate.value_json);
 
     var compound_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');");
     defer lexer.freeTokens(alloc, &compound_tokens);
@@ -8877,10 +8949,32 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, notice_trigger_body.body.?.hook);
     try std.testing.expect(notice_trigger_body.body.?.expression == null);
 
-    var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(); RETURN NEW; END';");
-    defer lexer.freeTokens(alloc, &unsupported_trigger_body_tokens);
-    var unsupported_trigger_body_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_trigger_body_tokens.items, &unsupported_trigger_body_pos));
+    var perform_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(); RETURN NEW; END';");
+    defer lexer.freeTokens(alloc, &perform_trigger_body_tokens);
+    var perform_trigger_body_pos: usize = 0;
+    var perform_trigger_body = try parseCreateRoutineCatalogTailAlloc(alloc, perform_trigger_body_tokens.items, &perform_trigger_body_pos);
+    defer perform_trigger_body.deinit(alloc);
+    try std.testing.expectEqual(perform_trigger_body_tokens.items.len, perform_trigger_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, perform_trigger_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, perform_trigger_body.body.?.hook);
+    try std.testing.expectEqual(@as(usize, 1), perform_trigger_body.body.?.perform_routines.len);
+    try std.testing.expectEqualStrings("audit_log", perform_trigger_body.body.?.perform_routines[0]);
+
+    var perform_procedure_body_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(); END';");
+    defer lexer.freeTokens(alloc, &perform_procedure_body_tokens);
+    var perform_procedure_body_pos: usize = 0;
+    var perform_procedure_body = try parseCreateRoutineCatalogTailAlloc(alloc, perform_procedure_body_tokens.items, &perform_procedure_body_pos);
+    defer perform_procedure_body.deinit(alloc);
+    try std.testing.expectEqual(perform_procedure_body_tokens.items.len, perform_procedure_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_procedure, perform_procedure_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.procedure_noop, perform_procedure_body.body.?.hook);
+    try std.testing.expectEqual(@as(usize, 1), perform_procedure_body.body.?.perform_routines.len);
+    try std.testing.expectEqualStrings("rotate_usage_now", perform_procedure_body.body.?.perform_routines[0]);
+
+    var perform_arg_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(1); RETURN NEW; END';");
+    defer lexer.freeTokens(alloc, &perform_arg_body_tokens);
+    var perform_arg_body_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, perform_arg_body_tokens.items, &perform_arg_body_pos));
 
     var security_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SECURITY DEFINER;");
     defer lexer.freeTokens(alloc, &security_tokens);

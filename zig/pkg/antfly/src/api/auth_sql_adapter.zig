@@ -254,18 +254,32 @@ fn executeAlterRowSecurityPolicy(
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
     defer alloc.free(table_resource);
-    try validateRowSecurityPredicateForCatalogTableSchema(alloc, plan.table_name, catalog, plan.predicate);
+    const existing_filter_json = try manager.getSqlRowSecurityPolicy(plan.policy_name, table_resource);
+    defer alloc.free(existing_filter_json);
+    const existing_check_filter_json = try manager.getSqlRowSecurityPolicyCheck(plan.policy_name, table_resource);
+    defer alloc.free(existing_check_filter_json);
+    const existing_role_targets = try manager.getSqlRowSecurityPolicyTargets(plan.policy_name, table_resource);
+    defer freeStringSlice(alloc, existing_role_targets);
+    if (plan.predicate) |predicate| {
+        try validateRowSecurityPredicateForCatalogTableSchema(alloc, plan.table_name, catalog, predicate);
+    }
     if (plan.check_predicate) |check_predicate| {
         try validateRowSecurityPredicateForCatalogTableSchema(alloc, plan.table_name, catalog, check_predicate);
     }
-    const filter_json = try rowSecurityFilterJsonAlloc(alloc, plan.predicate);
+    const filter_json = if (plan.predicate) |predicate|
+        try rowSecurityFilterJsonAlloc(alloc, predicate)
+    else
+        try alloc.dupe(u8, existing_filter_json);
     defer alloc.free(filter_json);
     const check_filter_json = if (plan.check_predicate) |check_predicate|
         try rowSecurityFilterJsonAlloc(alloc, check_predicate)
     else
-        try alloc.dupe(u8, filter_json);
+        try alloc.dupe(u8, existing_check_filter_json);
     defer alloc.free(check_filter_json);
-    const role_targets = try rowSecurityPolicyTargetSubjectsAlloc(manager, alloc, plan.role_targets);
+    const role_targets = if (plan.role_targets_present)
+        try rowSecurityPolicyTargetSubjectsAlloc(manager, alloc, plan.role_targets)
+    else
+        try cloneStringSliceAlloc(alloc, existing_role_targets);
     defer freeStringSlice(alloc, role_targets);
     try manager.replaceSqlRowSecurityPolicyWithTargetsAndCheck(plan.policy_name, table_resource, filter_json, check_filter_json, role_targets);
     return try changedRecordAlloc(alloc);
@@ -713,6 +727,20 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
+fn cloneStringSliceAlloc(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
 fn changedRecordAlloc(alloc: std.mem.Allocator) !tables_api.AppliedRelationalSqlDdlRecord {
     return .{ .table = try emptyTableRecordAlloc(alloc) };
 }
@@ -1145,6 +1173,18 @@ test "sql auth adapter applies row security policies through user manager" {
     const altered_literal = try manager.getSqlRowSecurityPolicy("usage_records_literal_policy", usage_records_resource);
     defer alloc.free(altered_literal);
     try std.testing.expectEqualStrings("{\"term\":{\"status\":\"archived\"}}", altered_literal);
+    const altered_literal_check = try manager.getSqlRowSecurityPolicyCheck("usage_records_literal_policy", usage_records_resource);
+    defer alloc.free(altered_literal_check);
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", altered_literal_check);
+
+    var altered_check_only_policy = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY usage_records_check_policy ON usage_records WITH CHECK (status = 'ready');")).?;
+    defer altered_check_only_policy.deinit(alloc);
+    const preserved_check_read = try manager.getSqlRowSecurityPolicy("usage_records_check_policy", usage_records_resource);
+    defer alloc.free(preserved_check_read);
+    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"tenant-a\"}}", preserved_check_read);
+    const altered_check_only = try manager.getSqlRowSecurityPolicyCheck("usage_records_check_policy", usage_records_resource);
+    defer alloc.free(altered_check_only);
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"ready\"}}", altered_check_only);
     try std.testing.expectError(error.RowFilterNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY missing_policy ON usage_records USING (status = 'active');"));
 
     const filters = try manager.getRowFilters("alice");
@@ -1168,6 +1208,7 @@ test "sql auth adapter applies row security policies through user manager" {
     try std.testing.expectEqual(@as(usize, 1), write_filters.len);
     try std.testing.expectEqualStrings(usage_records_resource, write_filters[0].table);
     try std.testing.expect(std.mem.indexOf(u8, write_filters[0].filter, "\"status\":\"active\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, write_filters[0].filter, "\"status\":\"ready\"") != null);
 
     try std.testing.expectError(error.PolicyExists, executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));"));
     var disabled = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;")).?;
@@ -1255,6 +1296,23 @@ test "sql auth adapter maps row security policy targets to Antfly role subjects"
     try std.testing.expect(std.mem.indexOf(u8, bob_public_filters[0].filter, "\"tenant_id\":\"reader\"") == null);
 
     try manager.addRoleToUser("bob", "role:app_writer");
+    var altered_target_only = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer;")).?;
+    defer altered_target_only.deinit(alloc);
+    const docs_resource = try sqlAuthTableResourceNameAlloc(alloc, "docs", .{});
+    defer alloc.free(docs_resource);
+    const altered_targets = try manager.getSqlRowSecurityPolicyTargets("docs_reader_policy", docs_resource);
+    defer freeStringSlice(alloc, altered_targets);
+    try std.testing.expectEqual(@as(usize, 1), altered_targets.len);
+    try std.testing.expectEqualStrings("role:app_writer", altered_targets[0]);
+    const bob_writer_reader_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_writer_reader_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_writer_reader_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bob_writer_reader_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, bob_writer_reader_filters[0].filter, "\"tenant_id\":\"reader\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob_writer_reader_filters[0].filter, "\"visibility\":\"public\"") != null);
+
     var altered = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "ALTER POLICY docs_reader_policy ON docs TO app_writer USING (tenant_id = 'writer');")).?;
     defer altered.deinit(alloc);
 

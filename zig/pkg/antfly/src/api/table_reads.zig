@@ -1349,6 +1349,24 @@ pub const TableReadSource = struct {
             plan: db_mod.types.RelationalRowsQueryPlan,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_query_plan_system_time_as_of_sequence: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            runtime_schema: storage_schema.TableSchema,
+            commit_sequence: u64,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
+        rows_query_plan_catalog_system_time_as_of_sequence: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            commit_sequence: u64,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!?db_mod.types.RelationalRowsQueryResult = null,
         rows_set_operation_plan: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1697,6 +1715,32 @@ pub const TableReadSource = struct {
     ) !?db_mod.types.RelationalRowsQueryResult {
         const fn_ptr = self.vtable.rows_query_plan_catalog orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, target, runtime_schema, plan, consistency);
+    }
+
+    pub fn rowsQueryPlanSystemTimeAsOfSequence(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_query_plan_system_time_as_of_sequence orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, runtime_schema, commit_sequence, plan, consistency);
+    }
+
+    pub fn rowsQueryPlanCatalogSystemTimeAsOfSequence(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const fn_ptr = self.vtable.rows_query_plan_catalog_system_time_as_of_sequence orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, target, runtime_schema, commit_sequence, plan, consistency);
     }
 
     pub fn rowsSetOperationPlan(
@@ -2360,6 +2404,9 @@ pub const BoundTableReadSource = struct {
                 .relational_temporal_unique_owner_lookup_group_local = BoundTableReadSource.relationalTemporalUniqueOwnerLookupGroupLocal,
                 .relational_temporal_unique_overlap_owner_lookup_group_local = BoundTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
+                .rows_query_plan_catalog = rowsQueryPlanCatalogNative,
+                .rows_query_plan_system_time_as_of_sequence = rowsQueryPlanSystemTimeAsOfSequence,
+                .rows_query_plan_catalog_system_time_as_of_sequence = rowsQueryPlanCatalogSystemTimeAsOfSequenceNative,
                 .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_aggregate_plan = rowsAggregatePlan,
                 .rows_window_plan = rowsWindowPlan,
@@ -2660,6 +2707,45 @@ pub const BoundTableReadSource = struct {
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try self.prepareRelationalRowsFullTableRead(consistency);
         return try self.db.queryRelationalRowsPlan(alloc, runtime_schema, plan);
+    }
+
+    fn rowsQueryPlanCatalogNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        return try rowsQueryPlan(ptr, alloc, target.table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsQueryPlanSystemTimeAsOfSequence(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+        try self.prepareRelationalRowsFullTableRead(consistency);
+        return try self.db.querySystemVersionedRelationalRowsAsOfSequence(alloc, runtime_schema, commit_sequence, plan.query);
+    }
+
+    fn rowsQueryPlanCatalogSystemTimeAsOfSequenceNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        return try rowsQueryPlanSystemTimeAsOfSequence(ptr, alloc, target.table_name, runtime_schema, commit_sequence, plan, consistency);
     }
 
     fn rowsSetOperationPlan(
@@ -2967,6 +3053,8 @@ pub const ProvisionedTableReadSource = struct {
                 .relational_temporal_unique_overlap_owner_lookup_group_local = ProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = rowsQueryPlanCatalogNative,
+                .rows_query_plan_system_time_as_of_sequence = rowsQueryPlanSystemTimeAsOfSequence,
+                .rows_query_plan_catalog_system_time_as_of_sequence = rowsQueryPlanCatalogSystemTimeAsOfSequenceNative,
                 .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_set_operation_plan_catalog = rowsSetOperationPlanCatalogNative,
                 .rows_aggregate_plan = rowsAggregatePlan,
@@ -3376,6 +3464,47 @@ pub const ProvisionedTableReadSource = struct {
         return try rowsQueryPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
     }
 
+    fn rowsQueryPlanSystemTimeAsOfSequence(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (self.prepare_for_read) |prep| prep.prepareForRead(table_name, .general);
+        if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        if (group_ids.len != 1) return error.UnsupportedRowsQuery;
+        try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
+        try reads.reads.prepareScanWithConsistency(group_ids[0], "", "", .{}, consistency);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
+        defer alloc.free(path);
+        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
+        defer db.close();
+        return try db.querySystemVersionedRelationalRowsAsOfSequence(alloc, runtime_schema, commit_sequence, plan.query);
+    }
+
+    fn rowsQueryPlanCatalogSystemTimeAsOfSequenceNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try rowsQueryPlanSystemTimeAsOfSequence(ptr, alloc, table_name, runtime_schema, commit_sequence, plan, consistency);
+    }
+
     fn rowsSetOperationPlan(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3714,6 +3843,8 @@ pub const HostedProvisionedTableReadSource = struct {
                 .relational_temporal_unique_overlap_owner_lookup_group_local = HostedProvisionedTableReadSource.relationalTemporalUniqueOverlapOwnerLookupGroupLocal,
                 .rows_query_plan = rowsQueryPlan,
                 .rows_query_plan_catalog = HostedProvisionedTableReadSource.rowsQueryPlanCatalogNative,
+                .rows_query_plan_system_time_as_of_sequence = HostedProvisionedTableReadSource.rowsQueryPlanSystemTimeAsOfSequence,
+                .rows_query_plan_catalog_system_time_as_of_sequence = HostedProvisionedTableReadSource.rowsQueryPlanCatalogSystemTimeAsOfSequenceNative,
                 .rows_set_operation_plan = rowsSetOperationPlan,
                 .rows_set_operation_plan_catalog = HostedProvisionedTableReadSource.rowsSetOperationPlanCatalogNative,
                 .rows_aggregate_plan = rowsAggregatePlan,
@@ -4041,6 +4172,52 @@ pub const HostedProvisionedTableReadSource = struct {
         const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
         defer alloc.free(table_name);
         return try rowsQueryPlan(ptr, alloc, table_name, runtime_schema, plan, consistency);
+    }
+
+    fn rowsQueryPlanSystemTimeAsOfSequence(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        if (plan.ctes.len != 0 or plan.ranges.len != 0) return error.UnsupportedRowsQuery;
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, self.catalog, table_name, "", "");
+        defer alloc.free(group_ids);
+        if (group_ids.len == 0) return null;
+        if (group_ids.len != 1) return error.UnsupportedRowsQuery;
+        try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        switch (route) {
+            .local => {},
+            .remote => return error.UnsupportedOperation,
+        }
+        var reads = raft_mod.FeatureDBReads.init(group_ids[0], self.requester);
+        try reads.reads.prepareScanWithConsistency(group_ids[0], "", "", .{}, consistency);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_ids[0]);
+        defer alloc.free(path);
+        var db = try openProvisionedQueryDbForTableWithRuntime(alloc, path, self.catalog, table_name, group_ids[0], self.visibleRootGeneration(group_ids[0]), self.backend_runtime);
+        defer db.close();
+        return try db.querySystemVersionedRelationalRowsAsOfSequence(alloc, runtime_schema, commit_sequence, plan.query);
+    }
+
+    fn rowsQueryPlanCatalogSystemTimeAsOfSequenceNative(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        target: catalog_resources.TableTarget,
+        runtime_schema: storage_schema.TableSchema,
+        commit_sequence: u64,
+        plan: db_mod.types.RelationalRowsQueryPlan,
+        consistency: raft_mod.ReadConsistency,
+    ) !?db_mod.types.RelationalRowsQueryResult {
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const table_name = try nativeCatalogTableNameAlloc(alloc, self.catalog, target);
+        defer alloc.free(table_name);
+        return try rowsQueryPlanSystemTimeAsOfSequence(ptr, alloc, table_name, runtime_schema, commit_sequence, plan, consistency);
     }
 
     fn rowsSetOperationPlan(
@@ -4623,12 +4800,39 @@ pub fn executeLoweredSqlReadPlanAlloc(
     plan: relational_sql_api.LoweredReadPlan,
     consistency: raft_mod.ReadConsistency,
 ) !?LoweredSqlReadPlanResult {
+    return try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        source,
+        catalog,
+        catalog_resources.SqlCatalogSession.default(),
+        default_table_name,
+        default_schema,
+        plan,
+        consistency,
+    );
+}
+
+pub fn executeLoweredSqlReadPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    plan: relational_sql_api.LoweredReadPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?LoweredSqlReadPlanResult {
     return switch (plan) {
         .query => |lowered| blk: {
             const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, lowered.table_name);
             defer if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
             const runtime_schema = owned_schema orelse default_schema;
-            var result = (try source.rowsQueryPlan(alloc, lowered.table_name, runtime_schema, lowered.plan, consistency)) orelse break :blk null;
+            var result = if (lowered.system_time_as_of_sequence) |commit_sequence| result_blk: {
+                const target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.table_name);
+                break :result_blk (try source.rowsQueryPlanCatalogSystemTimeAsOfSequence(alloc, target, runtime_schema, commit_sequence, lowered.plan, consistency)) orelse break :blk null;
+            } else result_blk: {
+                break :result_blk (try source.rowsQueryPlan(alloc, lowered.table_name, runtime_schema, lowered.plan, consistency)) orelse break :blk null;
+            };
             errdefer result.deinit(alloc);
             break :blk .{ .query = result };
         },
@@ -4637,6 +4841,7 @@ pub fn executeLoweredSqlReadPlanAlloc(
                 alloc,
                 source,
                 catalog,
+                session,
                 default_table_name,
                 default_schema,
                 lowered,
@@ -4650,6 +4855,7 @@ pub fn executeLoweredSqlReadPlanAlloc(
                 alloc,
                 source,
                 catalog,
+                session,
                 default_table_name,
                 default_schema,
                 lowered,
@@ -4835,15 +5041,17 @@ fn executeLoweredSqlRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
     catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     lowered: relational_sql_api.LoweredRecursiveCtePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsQueryResult {
-    var materialized = (try materializeLoweredSqlRecursiveCteRowsAlloc(
+    var materialized = (try materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
         alloc,
         source,
         catalog,
+        session,
         default_table_name,
         default_schema,
         lowered,
@@ -4868,6 +5076,28 @@ pub fn materializeLoweredSqlRecursiveCteRowsAlloc(
     lowered: relational_sql_api.LoweredRecursiveCtePlan,
     consistency: raft_mod.ReadConsistency,
 ) !?RecursiveCteMaterializedRows {
+    return try materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+        alloc,
+        source,
+        catalog,
+        catalog_resources.SqlCatalogSession.default(),
+        default_table_name,
+        default_schema,
+        lowered,
+        consistency,
+    );
+}
+
+pub fn materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    lowered: relational_sql_api.LoweredRecursiveCtePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?RecursiveCteMaterializedRows {
     if (lowered.output_columns.len == 0) return error.UnsupportedRowsQuery;
     const join_member = switch (lowered.recursive_member) {
         .join => |join| join,
@@ -4884,11 +5114,11 @@ pub fn materializeLoweredSqlRecursiveCteRowsAlloc(
     const anchor_schema = owned_anchor_schema orelse default_schema;
     const base_schema = owned_base_schema orelse default_schema;
 
-    const anchor_target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.anchor.table_name);
+    const anchor_target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.anchor.table_name);
     var anchor = (try source.rowsQueryPlanCatalog(alloc, anchor_target, anchor_schema, lowered.anchor.plan, consistency)) orelse return null;
     defer anchor.deinit(alloc);
 
-    const base_target = try catalogTargetForLoweredSqlTable(default_table_name, base_table_name);
+    const base_target = try catalogTargetForLoweredSqlTable(session, default_table_name, base_table_name);
     var base = (try source.rowsQueryPlanCatalog(alloc, base_target, base_schema, .{ .query = .{ .select_all = true } }, consistency)) orelse return null;
     defer base.deinit(alloc);
 
@@ -4959,7 +5189,7 @@ fn admitRecursiveCteRows(
         .max_bytes = lowered.max_bytes,
         .spill_after_bytes = lowered.spill_after_bytes,
     };
-    try db_mod.DB.admitRelationalRowsCteMaterialization(cte, rows.len, materialized_bytes);
+    try db_mod.DB.admitRelationalRowsCteMaterializationAllowSpill(cte, rows.len, materialized_bytes);
 }
 
 fn recursiveCteJoinRowsMatchAlloc(
@@ -5024,6 +5254,7 @@ fn executeLoweredSqlSetOperationPlanAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
     catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
     default_table_name: []const u8,
     default_schema: storage_schema.TableSchema,
     lowered: relational_sql_api.LoweredSetOperationPlan,
@@ -5039,7 +5270,7 @@ fn executeLoweredSqlSetOperationPlanAlloc(
     const operation = loweredSqlSetOperationToRowsOperation(lowered.operation);
     const same_table = std.mem.eql(u8, lowered.left.table_name, lowered.right.table_name);
     if (same_table) {
-        const target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.left.table_name);
+        const target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.left.table_name);
         return try source.rowsSetOperationPlanCatalog(alloc, target, left_schema, .{
             .operation = operation,
             .left = lowered.left.plan,
@@ -5053,8 +5284,8 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         }, consistency);
     }
 
-    const left_target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.left.table_name);
-    const right_target = try catalogTargetForLoweredSqlTable(default_table_name, lowered.right.table_name);
+    const left_target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.left.table_name);
+    const right_target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.right.table_name);
 
     var left = (try source.rowsQueryPlanCatalog(alloc, left_target, left_schema, lowered.left.plan, consistency)) orelse return null;
     defer left.deinit(alloc);
@@ -5073,11 +5304,15 @@ fn executeLoweredSqlSetOperationPlanAlloc(
     }, left.rows, right.rows);
 }
 
-fn catalogTargetForLoweredSqlTable(default_table_name: []const u8, table_name: []const u8) !catalog_resources.TableTarget {
+fn catalogTargetForLoweredSqlTable(
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    table_name: []const u8,
+) !catalog_resources.TableTarget {
     if (std.mem.eql(u8, default_table_name, table_name)) {
-        return try catalog_resources.tableTargetFromOptional(null, null, table_name);
+        return try session.tableTargetFromObjectName(table_name);
     }
-    return try catalog_resources.SqlCatalogSession.default().tableTargetFromObjectName(table_name);
+    return try session.tableTargetFromObjectName(table_name);
 }
 
 fn loweredSqlSetOperationToRowsOperation(operation: relational_sql_api.SelectSetOperation) db_mod.types.RelationalRowsSetOperation {
@@ -5097,7 +5332,7 @@ fn executeRelationalRowsSetOperationOnQueryResultsAlloc(
 ) !db_mod.types.RelationalRowsQueryResult {
     const combined = try db_mod.DB.relationalRowsSetOperationRowsAlloc(alloc, plan.operation, left_rows, right_rows);
     defer freeSetOperationOwnedRows(alloc, combined);
-    try db_mod.DB.admitRelationalRowsSetOperationRows(plan, combined);
+    try db_mod.DB.admitRelationalRowsSetOperationRowsAllowSpill(plan, combined);
     return try db_mod.DB.queryRelationalRowsFromSourceRowsStaticAlloc(alloc, "set_operation", combined, .{
         .select_all = true,
         .order_by = plan.order_by,
@@ -5150,6 +5385,69 @@ test "lowered sql set operation materialization admission distinguishes spill fr
         .max_bytes = observed_bytes,
         .spill_after_bytes = observed_bytes - 1,
     }, &rows));
+    try db_mod.DB.admitRelationalRowsSetOperationRowsAllowSpill(.{
+        .operation = .union_distinct,
+        .left = .{},
+        .right = .{},
+        .max_rows = 2,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes - 1,
+    }, &rows);
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, db_mod.DB.admitRelationalRowsSetOperationRowsAllowSpill(.{
+        .operation = .union_distinct,
+        .left = .{},
+        .right = .{},
+        .max_rows = 1,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes - 1,
+    }, &rows));
+}
+
+test "lowered sql recursive cte materialization admission uses stream spill policy" {
+    const rows = [_][]const u8{
+        "{\"id\":\"a\"}",
+        "{\"id\":\"b\"}",
+    };
+    const observed_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(&rows) orelse return error.TestUnexpectedResult;
+    const recursive = relational_sql_api.LoweredRecursiveCtePlan{
+        .cte_name = "walk",
+        .operation = .union_all,
+        .anchor = .{
+            .table_name = "nodes",
+            .plan = .{},
+        },
+        .recursive_member = .{ .join = .{
+            .left_table_name = "nodes",
+            .right_table_name = "walk",
+            .join_type = .inner,
+            .on = &.{},
+            .projections = &.{},
+        } },
+        .max_rows = 2,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes - 1,
+    };
+    try admitRecursiveCteRows(recursive, &rows);
+
+    const too_many_rows = relational_sql_api.LoweredRecursiveCtePlan{
+        .cte_name = "walk",
+        .operation = .union_all,
+        .anchor = .{
+            .table_name = "nodes",
+            .plan = .{},
+        },
+        .recursive_member = .{ .join = .{
+            .left_table_name = "nodes",
+            .right_table_name = "walk",
+            .join_type = .inner,
+            .on = &.{},
+            .projections = &.{},
+        } },
+        .max_rows = 1,
+        .max_bytes = observed_bytes,
+        .spill_after_bytes = observed_bytes - 1,
+    };
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, admitRecursiveCteRows(too_many_rows, &rows));
 }
 
 fn catalogRuntimeSchemaUnlessDefaultAlloc(
@@ -5233,11 +5531,42 @@ pub fn rowsInsertSourceBatchFromRecursiveCtePlanAlloc(
     consistency: raft_mod.ReadConsistency,
     conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
 ) !?relational_rows_api.OwnedRowsBatchRequest {
-    if (!std.mem.eql(u8, req.source.source_cte, recursive.cte_name)) return error.InvalidRowsRequest;
-    var materialized = (try materializeLoweredSqlRecursiveCteRowsAlloc(
+    return try rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc(
         alloc,
         source,
         catalog,
+        catalog_resources.SqlCatalogSession.default(),
+        default_table_name,
+        default_schema,
+        target_table_name,
+        target_schema,
+        recursive,
+        req,
+        consistency,
+        conflict_resolver,
+    );
+}
+
+pub fn rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    target_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    recursive: relational_sql_api.LoweredRecursiveCtePlan,
+    req: db_mod.types.RelationalRowsInsertSourceRequest,
+    consistency: raft_mod.ReadConsistency,
+    conflict_resolver: ?relational_rows_api.UniqueSelectorResolver,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    if (!std.mem.eql(u8, req.source.source_cte, recursive.cte_name)) return error.InvalidRowsRequest;
+    var materialized = (try materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+        alloc,
+        source,
+        catalog,
+        session,
         default_table_name,
         default_schema,
         recursive,
@@ -5356,6 +5685,104 @@ pub fn rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
         target_schema,
         source_schema,
         plan,
+        merge_targets,
+        source_rows.rows,
+    );
+}
+
+pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    target_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    recursive_source_schema: storage_schema.TableSchema,
+    lowered: relational_sql_api.LoweredRecursiveMergeMutation,
+    target_query: db_mod.types.RelationalRowsQueryRequest,
+    target_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    return try rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
+        alloc,
+        source,
+        catalog,
+        catalog_resources.SqlCatalogSession.default(),
+        default_table_name,
+        target_table_name,
+        target_schema,
+        recursive_source_schema,
+        lowered,
+        target_query,
+        target_ranges,
+        consistency,
+    );
+}
+
+pub fn rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    target_table_name: []const u8,
+    target_schema: storage_schema.TableSchema,
+    recursive_source_schema: storage_schema.TableSchema,
+    lowered: relational_sql_api.LoweredRecursiveMergeMutation,
+    target_query: db_mod.types.RelationalRowsQueryRequest,
+    target_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    consistency: raft_mod.ReadConsistency,
+) !?relational_rows_api.OwnedRowsBatchRequest {
+    if (!std.mem.eql(u8, lowered.merge.source.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
+
+    const target_rows = (try collectMergeTargetRowsFromRoutedScansAlloc(
+        alloc,
+        source,
+        target_table_name,
+        target_schema,
+        target_query,
+        target_ranges,
+        consistency,
+    )) orelse return null;
+    defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_rows);
+
+    var materialized = (try materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+        alloc,
+        source,
+        catalog,
+        session,
+        default_table_name,
+        recursive_source_schema,
+        lowered.recursive,
+        consistency,
+    )) orelse return null;
+    defer materialized.deinit(alloc);
+
+    var cte_schema = recursive_source_schema;
+    cte_schema.relational_columns = lowered.recursive.output_columns;
+    const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
+    cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
+
+    var source_query = lowered.merge.source;
+    source_query.source_cte = "";
+    var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, source_query, materialized.rows);
+    defer source_rows.deinit(alloc);
+
+    const merge_targets = try alloc.alloc(relational_sql_api.MergeExecutionTargetRow, target_rows.len);
+    defer alloc.free(merge_targets);
+    for (target_rows, 0..) |row, i| {
+        merge_targets[i] = .{
+            .key = row.key,
+            .json = row.json,
+            .version = row.version,
+        };
+    }
+
+    return try relational_sql_api.buildMergeMutationBatchAlloc(
+        alloc,
+        target_schema,
+        cte_schema,
+        lowered.merge,
         merge_targets,
         source_rows.rows,
     );
@@ -19066,7 +19493,7 @@ test "external lake rows query and aggregate plans route through lake scan hook"
     try std.testing.expectEqualStrings("{\"amount\":30}", union_all_result.rows[0]);
     try std.testing.expectEqualStrings("{\"amount\":30}", union_all_result.rows[1]);
 
-    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsSetOperationPlan(alloc, "events", schema, .{
+    try std.testing.expectError(error.RelationalRowsCteMaterializationRejected, source.rowsSetOperationPlan(alloc, "events", schema, .{
         .operation = .union_all,
         .left = set_left,
         .right = set_right,
@@ -20564,6 +20991,8 @@ test "lowered sql recursive cte plans execute bounded materialization" {
 
     const FakeSource = struct {
         calls: usize = 0,
+        expected_database_name: []const u8 = catalog_resources.default_database_name,
+        expected_namespace_name: []const u8 = catalog_resources.default_namespace_name,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -20620,8 +21049,8 @@ test "lowered sql recursive cte plans execute bounded materialization" {
         ) !?db_mod.types.RelationalRowsQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            try std.testing.expectEqualStrings(catalog_resources.default_database_name, target.database_name);
-            try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqualStrings(self.expected_database_name, target.database_name);
+            try std.testing.expectEqualStrings(self.expected_namespace_name, target.namespace_name);
             try std.testing.expectEqualStrings("nodes", target.table_name);
             self.calls += 1;
             const rows = [_][]const u8{
@@ -20671,6 +21100,31 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     try std.testing.expectEqual(@as(usize, 2), materialized_fake.calls);
     try std.testing.expectEqual(@as(usize, 4), materialized.rows.len);
 
+    const tenant_session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{ "analytics", "public" },
+    };
+    var tenant_materialized_fake = FakeSource{
+        .expected_database_name = "tenant_ops",
+        .expected_namespace_name = "analytics",
+    };
+    var tenant_materialized = (try materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+        alloc,
+        tenant_materialized_fake.source(),
+        catalog.iface(),
+        tenant_session,
+        "nodes",
+        schema,
+        switch (lowered) {
+            .recursive_cte => |recursive| recursive,
+            else => return error.TestUnexpectedResult,
+        },
+        .read_index,
+    )) orelse return error.TestUnexpectedResult;
+    defer tenant_materialized.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tenant_materialized_fake.calls);
+    try std.testing.expectEqual(@as(usize, 4), tenant_materialized.rows.len);
+
     var fake = FakeSource{};
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
@@ -20690,6 +21144,30 @@ test "lowered sql recursive cte plans execute bounded materialization" {
             try std.testing.expectEqual(@as(usize, 2), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"c\"}", query_result.rows[0]);
             try std.testing.expectEqualStrings("{\"id\":\"d\"}", query_result.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var tenant_fake = FakeSource{
+        .expected_database_name = "tenant_ops",
+        .expected_namespace_name = "analytics",
+    };
+    var tenant_result = (try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        tenant_fake.source(),
+        catalog.iface(),
+        tenant_session,
+        "nodes",
+        schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer tenant_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tenant_fake.calls);
+    switch (tenant_result) {
+        .recursive_cte => |query_result| {
+            try std.testing.expectEqual(@as(u32, 2), query_result.total);
+            try std.testing.expectEqual(@as(usize, 2), query_result.rows.len);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -20729,6 +21207,33 @@ test "lowered sql recursive cte plans execute bounded materialization" {
     try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"c\",\"depth\":2}", batch.returning_rows[0]);
     try std.testing.expectEqualStrings("{\"id\":\"d\",\"depth\":3}", batch.returning_rows[1]);
+
+    var tenant_insert_fake = FakeSource{
+        .expected_database_name = "tenant_ops",
+        .expected_namespace_name = "analytics",
+    };
+    var tenant_batch = (try rowsInsertSourceBatchFromRecursiveCtePlanWithSessionAlloc(
+        alloc,
+        tenant_insert_fake.source(),
+        catalog.iface(),
+        tenant_session,
+        "nodes",
+        schema,
+        "walk_copies",
+        schema,
+        recursive,
+        .{
+            .source_table = "nodes",
+            .source = recursive.final_query,
+            .assignments = assignments[0..],
+            .returning = returning[0..],
+        },
+        .read_index,
+        null,
+    )) orelse return error.TestUnexpectedResult;
+    defer tenant_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), tenant_insert_fake.calls);
+    try std.testing.expectEqual(@as(u32, 2), tenant_batch.inserted);
 }
 
 test "lowered sql set operation plans preserve overlapping union all rows" {
@@ -21062,6 +21567,8 @@ test "lowered sql set operation plans route cross table branches through catalog
         archived_scans: usize = 0,
         usage_catalog_queries: usize = 0,
         archived_catalog_queries: usize = 0,
+        expected_database_name: []const u8 = tables_api.default_database_name,
+        expected_namespace_name: []const u8 = tables_api.default_namespace_name,
 
         fn source(self: *@This()) TableReadSource {
             return .{
@@ -21152,8 +21659,8 @@ test "lowered sql set operation plans route cross table branches through catalog
             consistency: raft_mod.ReadConsistency,
         ) !?db_mod.types.RelationalRowsQueryResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings(tables_api.default_database_name, target.database_name);
-            try std.testing.expectEqualStrings(tables_api.default_namespace_name, target.namespace_name);
+            try std.testing.expectEqualStrings(self.expected_database_name, target.database_name);
+            try std.testing.expectEqualStrings(self.expected_namespace_name, target.namespace_name);
             if (std.mem.eql(u8, target.table_name, "usage_records")) {
                 self.usage_catalog_queries += 1;
             } else if (std.mem.eql(u8, target.table_name, "archived_records")) {
@@ -21203,6 +21710,35 @@ test "lowered sql set operation plans route cross table branches through catalog
             try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[1]);
             try std.testing.expectEqualStrings("{\"id\":\"a1\"}", query_result.rows[2]);
             try std.testing.expectEqualStrings("{\"id\":\"a3\"}", query_result.rows[3]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var tenant_fake = FakeSource{
+        .expected_database_name = "tenant_ops",
+        .expected_namespace_name = "analytics",
+    };
+    const tenant_session: catalog_resources.SqlCatalogSession = .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{ "analytics", "public" },
+    };
+    var tenant_result = (try executeLoweredSqlReadPlanWithSessionAlloc(
+        alloc,
+        tenant_fake.source(),
+        catalog.iface(),
+        tenant_session,
+        "usage_records",
+        usage_schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer tenant_result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), tenant_fake.usage_catalog_queries);
+    try std.testing.expectEqual(@as(usize, 1), tenant_fake.archived_catalog_queries);
+    switch (tenant_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 4), query_result.total);
+            try std.testing.expectEqual(@as(usize, 4), query_result.rows.len);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -21664,6 +22200,221 @@ test "lowered sql merge mutation plans build batches from routed scans" {
     }
 }
 
+test "lowered sql recursive merge mutation plans build batches from routed scans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const path = "/tmp/antfly-api-recursive-merge-routed-scans";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "a", .value = "{\"id\":\"a\",\"organization_id\":\"root\",\"status\":\"ROOT\"}" },
+            .{ .key = "b", .value = "{\"id\":\"b\",\"organization_id\":\"a\",\"status\":\"CHILD\"}" },
+            .{ .key = "c", .value = "{\"id\":\"c\",\"organization_id\":\"other\",\"status\":\"OTHER\"}" },
+        },
+        .sync_level = .write,
+    });
+
+    const FakeCatalog = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 23, .name = "usage_records", .schema_json = schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReadSource = struct {
+        db: *db_mod.DB,
+        scan_calls: usize = 0,
+        lookup_calls: usize = 0,
+        query_plan_calls: usize = 0,
+        expected_database_name: []const u8 = catalog_resources.default_database_name,
+        expected_namespace_name: []const u8 = catalog_resources.default_namespace_name,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .rows_query_plan_catalog = rowsQueryPlanCatalog,
+                },
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "usage_records")) return null;
+            self.lookup_calls += 1;
+            var result = (try self.db.lookup(lookup_alloc, key, opts)) orelse return null;
+            defer result.deinit(lookup_alloc);
+            return .{
+                .json = try lookup_alloc.dupe(u8, result.json),
+                .version = try self.db.getTimestamp(lookup_alloc, key),
+            };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "usage_records")) return null;
+            self.scan_calls += 1;
+            var result = try self.db.scan(scan_alloc, from_key, to_key, opts);
+            defer result.deinit(scan_alloc);
+            var out = std.ArrayListUnmanaged(u8).empty;
+            errdefer out.deinit(scan_alloc);
+            for (result.hashes, 0..) |entry, i| {
+                const json = if (opts.include_documents) result.documents[i].json else null;
+                try appendScanLine(scan_alloc, &out, entry.id, json);
+            }
+            return .{ .ndjson = try out.toOwnedSlice(scan_alloc) };
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn rowsQueryPlanCatalog(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            target: catalog_resources.TableTarget,
+            runtime_schema: storage_schema.TableSchema,
+            plan: db_mod.types.RelationalRowsQueryPlan,
+            _: raft_mod.ReadConsistency,
+        ) !?db_mod.types.RelationalRowsQueryResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings(self.expected_database_name, target.database_name);
+            try std.testing.expectEqualStrings(self.expected_namespace_name, target.namespace_name);
+            try std.testing.expectEqualStrings("usage_records", target.table_name);
+            self.query_plan_calls += 1;
+            return try self.db.queryRelationalRowsPlan(query_alloc, runtime_schema, plan);
+        }
+    };
+
+    var lowered = try relational_sql_api.lowerWritePlanAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records WHERE organization_id = 'root' UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) RETURNING target.id, target.status",
+        schema,
+        &.{},
+        .{},
+    );
+    defer lowered.deinit(alloc);
+
+    var catalog = FakeCatalog{};
+    var read_source = FakeReadSource{ .db = &db };
+    switch (lowered) {
+        .recursive_merge_mutation => |recursive_merge| {
+            var batch = (try rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+                alloc,
+                read_source.source(),
+                catalog.iface(),
+                "usage_records",
+                "usage_records",
+                schema,
+                schema,
+                recursive_merge,
+                .{ .select_all = true },
+                &.{},
+                .read_index,
+            )).?;
+            defer batch.deinit(alloc);
+
+            try std.testing.expectEqual(@as(usize, 1), read_source.scan_calls);
+            try std.testing.expectEqual(@as(usize, 2), read_source.query_plan_calls);
+            try std.testing.expectEqual(@as(usize, 2), read_source.lookup_calls);
+            try std.testing.expectEqual(@as(u32, 2), batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"root\"}", batch.returning_rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"b\",\"status\":\"child\"}", batch.returning_rows[1]);
+
+            var tenant_read_source = FakeReadSource{
+                .db = &db,
+                .expected_database_name = "tenant_ops",
+                .expected_namespace_name = "analytics",
+            };
+            const tenant_session: catalog_resources.SqlCatalogSession = .{
+                .current_database_name = "tenant_ops",
+                .search_path = &.{ "analytics", "public" },
+            };
+            var tenant_batch = (try rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
+                alloc,
+                tenant_read_source.source(),
+                catalog.iface(),
+                tenant_session,
+                "usage_records",
+                "usage_records",
+                schema,
+                schema,
+                recursive_merge,
+                .{ .select_all = true },
+                &.{},
+                .read_index,
+            )).?;
+            defer tenant_batch.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), tenant_read_source.query_plan_calls);
+            try std.testing.expectEqual(@as(u32, 2), tenant_batch.transformed);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "lowered relation population plans execute routed typed read sources" {
     const alloc = std.testing.allocator;
     const orders_schema_json =
@@ -21928,6 +22679,101 @@ test "bound table read source uses feature db reads and returns version" {
     var lookup = (try source.source().lookup(alloc, "docs", "doc:a", .{}, .read_index)).?;
     defer lookup.deinit(alloc);
     try std.testing.expectEqual(@as(u64, 1234), lookup.version);
+}
+
+test "bound table read source executes SQL system-time as-of by commit sequence" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-table-system-time";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer {
+        db.close();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    }
+
+    const base_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const versioned_schema_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"system_versioned":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    try db.applyTableSchemaJson(alloc, base_schema_json, .{});
+    try db.batch(.{ .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"before\"}" }} });
+
+    var versioned_parsed = try schema_api.parseValidatedTableSchema(alloc, versioned_schema_json);
+    defer versioned_parsed.deinit(alloc);
+    const versioned_schema = try schema_api.deriveRuntimeTableSchema(alloc, versioned_parsed);
+    defer storage_schema.freeSchema(alloc, versioned_schema);
+    try db.applyTableSchemaJson(alloc, versioned_schema_json, .{});
+    try db.batch(.{ .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"first\"}" }} });
+    try db.batch(.{ .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"second\"}" }} });
+
+    const history = try db.scanSystemVersionedHistoryForDocKeyAlloc(alloc, "row:1");
+    defer db_mod.docstore.DocStore.freeResults(alloc, history);
+    try std.testing.expectEqual(@as(usize, 2), history.len);
+    var parsed_history = try std.json.parseFromSlice(std.json.Value, alloc, history[0].value, .{});
+    defer parsed_history.deinit();
+    const commit_value = parsed_history.value.object.get("commit_sequence") orelse return error.TestUnexpectedResult;
+    const commit_sequence: u64 = switch (commit_value) {
+        .integer => |value| @intCast(value),
+        .number_string => |value| try std.fmt.parseUnsigned(u64, value, 10),
+        else => return error.TestUnexpectedResult,
+    };
+
+    const sql = try std.fmt.allocPrint(alloc, "SELECT id, name FROM docs FOR SYSTEM_TIME AS OF {d} WHERE id = 'row:1'", .{commit_sequence});
+    defer alloc.free(sql);
+    var lowered = try relational_sql_api.lowerReadPlanAlloc(alloc, sql, versioned_schema, &.{});
+    defer lowered.deinit(alloc);
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = FakeCatalog{};
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        versioned_schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+    switch (result) {
+        .query => |query_result| {
+            try std.testing.expectEqual(@as(u32, 1), query_result.total);
+            try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
+            try std.testing.expect(std.mem.indexOf(u8, query_result.rows[0], "\"first\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, query_result.rows[0], "\"second\"") == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        relational_sql_api.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF '2026-01-01T00:00:00Z'", versioned_schema, &.{}),
+    );
 }
 
 test "bound table read source scans keys as ndjson" {

@@ -102,6 +102,7 @@ pub const AppParityDdlTag = enum {
     drop_function,
     create_procedure,
     drop_procedure,
+    call_procedure,
     create_role,
     alter_role,
     drop_role,
@@ -1468,7 +1469,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         .truncate_source => "truncate_source:",
         .update_joined_source => "update_joined_source:",
         .delete_joined_source => "delete_joined_source:",
-        .merge_mutation => "merge_mutation:",
+        .merge_mutation => if (std.mem.startsWith(u8, plan, "recursive_merge_mutation:")) return true else "merge_mutation:",
         .adapter_noop_ddl => "adapter_noop:ddl:",
         .invalid_insert => "invalid:insert:",
         .invalid_update => "invalid:update:",
@@ -1707,7 +1708,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .identity_allocator => false,
         .create_schema_namespace, .rename_schema_namespace, .drop_schema_namespace => false,
         .create_extension, .alter_extension_update, .drop_extension => false,
-        .create_function, .drop_function, .create_procedure, .drop_procedure => false,
+        .create_function, .drop_function, .create_procedure, .drop_procedure, .call_procedure => false,
         .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
         .copy_from, .copy_to => false,
         .prepare_transaction, .commit_prepared, .rollback_prepared => false,
@@ -2035,6 +2036,7 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .create_procedure,
         .drop_function,
         .drop_procedure,
+        .call_procedure,
         => planHasExactUsizeToken(entry.plan, ":args=", expected),
         .alter_role => (planNonNoneStringTokenUsize(entry.plan, ":setting=") orelse return false) == expected,
         .grant_privilege,
@@ -4348,6 +4350,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_sql_expression_named_arg_body: bool = false,
     ddl_function_sql_expression_nested_body: bool = false,
     ddl_function_sql_expression_minmax_body: bool = false,
+    ddl_function_trigger_perform_body: bool = false,
     ddl_function_trigger_return_new: bool = false,
     ddl_function_trigger_return_null: bool = false,
     ddl_function_trigger_return_old: bool = false,
@@ -4355,6 +4358,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_function_drop_cascade: bool = false,
     ddl_procedure_create: bool = false,
     ddl_procedure_noop_body: bool = false,
+    ddl_procedure_perform_body: bool = false,
     ddl_procedure_drop: bool = false,
     ddl_procedure_drop_cascade: bool = false,
     ddl_role_create: bool = false,
@@ -4367,7 +4371,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_role_drop: bool = false,
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
-    ddl_copy_binary_execution_unsupported: bool = false,
+    ddl_copy_binary_execution_contract: bool = false,
     ddl_copy_from: bool = false,
     ddl_copy_from_execution_contract: bool = false,
     ddl_copy_file_endpoint: bool = false,
@@ -4402,6 +4406,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_row_security_conjunction_policy: bool = false,
     ddl_row_security_disjunction_policy: bool = false,
     ddl_row_security_check_policy: bool = false,
+    ddl_row_security_expression_policy: bool = false,
     ddl_row_security_literal_policy: bool = false,
     ddl_row_security_targeted_policy: bool = false,
     ddl_row_security_alter_policy: bool = false,
@@ -4597,7 +4602,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_procedure_body: bool = false,
     ddl_system_versioned_table: bool = false,
     unsupported_write: bool = false,
-    unsupported_write_recursive_cte_merge: bool = false,
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
     invalid_duplicate_conflict_update_target: bool = false,
@@ -5716,8 +5720,12 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
             .merge_mutation => {
-                self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or std.mem.startsWith(u8, entry.plan, "merge_mutation:");
+                self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or
+                    std.mem.startsWith(u8, entry.plan, "merge_mutation:") or
+                    std.mem.startsWith(u8, entry.plan, "recursive_merge_mutation:");
+                const recursive_merge = std.mem.startsWith(u8, entry.plan, "recursive_merge_mutation:");
                 self.merge_mutation_cte = self.merge_mutation_cte or
+                    recursive_merge or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
             },
@@ -5824,10 +5832,6 @@ pub const AppParityCorpusCoverage = struct {
                     std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
                     std.mem.indexOf(u8, entry.sql, " INSERT INTO ") != null);
         } else if (entry.family == .unsupported_write) {
-            self.unsupported_write_recursive_cte_merge = self.unsupported_write_recursive_cte_merge or
-                (std.mem.eql(u8, entry.classification_reason, "recursive_cte_stream_plan") and
-                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
-                    std.mem.indexOf(u8, entry.sql, " MERGE INTO ") != null);
             self.unsupported_write_truncate_multi_table = self.unsupported_write_truncate_multi_table or
                 (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
                     std.mem.indexOf(u8, entry.sql, ", archived_records") != null);
@@ -6052,6 +6056,9 @@ pub const AppParityCorpusCoverage = struct {
                             std.mem.indexOf(u8, entry.plan, "least[") != null);
                     self.ddl_function_trigger_return_new = self.ddl_function_trigger_return_new or
                         std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_new") != null;
+                    self.ddl_function_trigger_perform_body = self.ddl_function_trigger_perform_body or
+                        (std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_new") != null and
+                            std.mem.indexOf(u8, entry.plan, ":perform=1:perform=") != null);
                     self.ddl_function_trigger_return_null = self.ddl_function_trigger_return_null or
                         std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_null") != null;
                     self.ddl_function_trigger_return_old = self.ddl_function_trigger_return_old or
@@ -6065,11 +6072,15 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_procedure_create = true;
                     self.ddl_procedure_noop_body = self.ddl_procedure_noop_body or
                         std.mem.indexOf(u8, entry.plan, ":body=plpgsql_procedure:hook=procedure_noop") != null;
+                    self.ddl_procedure_perform_body = self.ddl_procedure_perform_body or
+                        (std.mem.indexOf(u8, entry.plan, ":body=plpgsql_procedure:hook=procedure_noop") != null and
+                            std.mem.indexOf(u8, entry.plan, ":perform=1:perform=") != null);
                 },
                 .drop_procedure => {
                     self.ddl_procedure_drop = true;
                     self.ddl_procedure_drop_cascade = self.ddl_procedure_drop_cascade or sql_adapter.planHasExactBoolToken(entry.plan, ":cascade=", true);
                 },
+                .call_procedure => {},
                 .create_role => self.ddl_role_create = true,
                 .alter_role => {
                     self.ddl_role_alter = true;
@@ -6089,9 +6100,9 @@ pub const AppParityCorpusCoverage = struct {
                 .revoke_privilege => self.ddl_privilege_revoke = true,
                 .copy_from => {
                     self.ddl_copy_from = true;
-                    self.ddl_copy_binary_execution_unsupported = self.ddl_copy_binary_execution_unsupported or
+                    self.ddl_copy_binary_execution_contract = self.ddl_copy_binary_execution_contract or
                         sql_adapter.planHasExactStringToken(entry.plan, ":format=", "binary") and
-                            sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
+                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_binary:") != null;
                     self.ddl_copy_from_execution_contract = self.ddl_copy_from_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:");
                     self.ddl_copy_file_endpoint = self.ddl_copy_file_endpoint or
@@ -6124,9 +6135,9 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .copy_to => {
                     self.ddl_copy_to = true;
-                    self.ddl_copy_binary_execution_unsupported = self.ddl_copy_binary_execution_unsupported or
+                    self.ddl_copy_binary_execution_contract = self.ddl_copy_binary_execution_contract or
                         sql_adapter.planHasExactStringToken(entry.plan, ":format=", "binary") and
-                            sql_adapter.unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
+                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_binary:") != null;
                     self.ddl_copy_to_execution_contract = self.ddl_copy_to_execution_contract or
                         std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:");
                     self.ddl_copy_to_text_execution_contract = self.ddl_copy_to_text_execution_contract or
@@ -6149,6 +6160,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_row_security_conjunction_policy = self.ddl_row_security_conjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=and:") != null;
                     self.ddl_row_security_disjunction_policy = self.ddl_row_security_disjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=or:") != null;
                     self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or std.mem.indexOf(u8, entry.plan, ":check=") != null;
+                    self.ddl_row_security_expression_policy = self.ddl_row_security_expression_policy or std.mem.indexOf(u8, entry.plan, ":kind=expression:") != null;
                     self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
                     self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or std.mem.indexOf(u8, entry.plan, ":roles=") != null;
                 },

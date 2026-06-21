@@ -1600,6 +1600,30 @@ pub const UserManager = struct {
         return try self.getSubjectSqlRowSecurityCheckFilter(subject, table);
     }
 
+    pub fn getSqlRowSecurityPolicyTargets(self: *const UserManager, policy_name: []const u8, table: []const u8) ![]const []const u8 {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        const existing = try self.getSubjectRowFilter(subject, table);
+        self.alloc.free(existing);
+        const target_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p7", 0, &.{ subject, table });
+        defer {
+            for (target_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(target_rules);
+        }
+        var targets = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (targets.items) |target| self.alloc.free(@constCast(target));
+            targets.deinit(self.alloc);
+        }
+        for (target_rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            const target = try self.alloc.dupe(u8, rule.fields[2]);
+            errdefer self.alloc.free(target);
+            try targets.append(self.alloc, target);
+        }
+        return try targets.toOwnedSlice(self.alloc);
+    }
+
     fn replaceSqlRowSecurityPolicyTargets(self: *UserManager, policy_subject: []const u8, table: []const u8, role_targets: []const []const u8) !void {
         _ = try self.enforcer.removeFilteredNamedPolicy("p7", 0, &.{ policy_subject, table });
         for (role_targets) |target| {
@@ -2879,6 +2903,78 @@ test "usermgr SQL row security policy targets follow role membership durably" {
     try std.testing.expectEqual(@as(usize, 1), alice_after_cascade.len);
     try std.testing.expect(std.mem.indexOf(u8, alice_after_cascade[0].filter, "\"tenant_id\":\"acme\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, alice_after_cascade[0].filter, "\"visibility\":\"public\"") != null);
+}
+
+test "usermgr SQL row security policy target replacement updates effective filters" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var alice = try manager.createUser("alice", "secret", &.{});
+    defer alice.deinit(alloc);
+    var bob = try manager.createUser("bob", "secret", &.{});
+    defer bob.deinit(alloc);
+
+    try manager.createRoleSubject("role:app_reader");
+    try manager.createRoleSubject("role:app_writer");
+    try manager.enableSqlRowSecurity("docs");
+    try manager.addRoleToUser("alice", "role:app_reader");
+    try manager.addRoleToUser("bob", "role:app_writer");
+
+    try manager.createSqlRowSecurityPolicyWithTargets(
+        "docs_reader_policy",
+        "docs",
+        "{\"term\":{\"tenant_id\":\"reader\"}}",
+        &.{"role:app_reader"},
+    );
+    try manager.createSqlRowSecurityPolicyWithTargets(
+        "docs_public_policy",
+        "docs",
+        "{\"term\":{\"visibility\":\"public\"}}",
+        &.{},
+    );
+
+    try manager.replaceSqlRowSecurityPolicyWithTargets(
+        "docs_reader_policy",
+        "docs",
+        "{\"term\":{\"tenant_id\":\"reader\"}}",
+        &.{"role:app_writer"},
+    );
+
+    const targets = try manager.getSqlRowSecurityPolicyTargets("docs_reader_policy", "docs");
+    defer {
+        for (targets) |target| alloc.free(@constCast(target));
+        alloc.free(targets);
+    }
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    try std.testing.expectEqualStrings("role:app_writer", targets[0]);
+
+    const alice_filters = try manager.getRowFilters("alice");
+    defer {
+        for (alice_filters) |*entry| entry.deinit(alloc);
+        alloc.free(alice_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"visibility\":\"public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"tenant_id\":\"reader\"") == null);
+
+    const bob_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bob_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, bob_filters[0].filter, "\"visibility\":\"public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob_filters[0].filter, "\"tenant_id\":\"reader\"") != null);
 }
 
 test "usermgr api keys validate and persist creator-scoped permissions" {

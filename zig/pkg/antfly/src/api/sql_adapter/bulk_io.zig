@@ -40,6 +40,7 @@ pub const BulkSqlIoStream = enum {
 pub const BulkSqlIoCodec = enum {
     postgres_text,
     csv,
+    postgres_binary,
 };
 
 pub const BulkSqlIoAuditAction = enum {
@@ -164,6 +165,7 @@ fn codecFromPlan(plan: ddl_plan.BulkIoPlan) !BulkSqlIoCodec {
     const format = plan.format orelse return .postgres_text;
     if (std.ascii.eqlIgnoreCase(format, "csv")) return .csv;
     if (std.ascii.eqlIgnoreCase(format, "text")) return .postgres_text;
+    if (std.ascii.eqlIgnoreCase(format, "binary")) return .postgres_binary;
     return error.UnsupportedSqlShape;
 }
 
@@ -223,10 +225,19 @@ fn validatePostgresTextOptions(plan: BulkSqlIoExecutionPlan) !void {
     if (plan.force_not_null_columns.len != 0 or plan.force_null_columns.len != 0) return error.UnsupportedSqlShape;
 }
 
+fn validatePostgresBinaryOptions(plan: BulkSqlIoExecutionPlan) !void {
+    if (plan.header) return error.UnsupportedSqlShape;
+    if (plan.delimiter != null or plan.quote != null or plan.escape != null) return error.UnsupportedSqlShape;
+    if (plan.null_marker != null or plan.default_marker != null or plan.encoding != null) return error.UnsupportedSqlShape;
+    if (plan.force_quote_all or plan.force_quote_columns.len != 0) return error.UnsupportedSqlShape;
+    if (plan.force_not_null_columns.len != 0 or plan.force_null_columns.len != 0) return error.UnsupportedSqlShape;
+}
+
 fn validateCodecOptions(plan: BulkSqlIoExecutionPlan) !void {
     switch (plan.codec) {
         .csv => try validateCsvOptions(plan),
         .postgres_text => try validatePostgresTextOptions(plan),
+        .postgres_binary => try validatePostgresBinaryOptions(plan),
     }
 }
 
@@ -249,7 +260,30 @@ pub fn validatePlanForSchema(
             if (plan.force_not_null_columns.len != 0 or plan.force_null_columns.len != 0) return error.UnsupportedSqlShape;
         },
     }
+    if (plan.codec == .postgres_binary) try validatePostgresBinaryColumns(schema, plan);
     for (plan.where_expressions) |condition| try validateExpressionConditionForSchema(schema, condition);
+}
+
+fn validatePostgresBinaryColumns(
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+) !void {
+    if (plan.columns.len == 0) {
+        for (schema.relational_columns) |column| try validatePostgresBinaryColumn(column);
+        return;
+    }
+    for (plan.columns) |column_name| {
+        const column = findRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+        try validatePostgresBinaryColumn(column);
+    }
+}
+
+fn validatePostgresBinaryColumn(column: runtime_schema.RelationalColumn) !void {
+    if (column.generated != null) return error.InvalidRowsRequest;
+    switch (column.field_type) {
+        .keyword, .text, .link, .html, .search_as_you_type, .datetime, .boolean => return,
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 pub fn importRowsBatchFromStdinAlloc(
@@ -270,6 +304,7 @@ pub fn importRowsBatchFromStdinAlloc(
             return error.UnsupportedSqlShape;
         }
     }
+    if (plan.codec == .postgres_binary) return try importRowsBatchFromPostgresBinaryAlloc(alloc, schema, plan, stdin_payload);
 
     var body = std.ArrayList(u8).empty;
     defer body.deinit(alloc);
@@ -309,6 +344,112 @@ pub fn importRowsBatchFromStdinAlloc(
     return try relational_rows.parseRowsBatchRequest(alloc, body.items, schema);
 }
 
+const postgres_binary_copy_signature = "PGCOPY\n\xff\r\n\x00";
+
+fn importRowsBatchFromPostgresBinaryAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    payload: []const u8,
+) !relational_rows.OwnedRowsBatchRequest {
+    if (payload.len < postgres_binary_copy_signature.len + 8) return error.InvalidRowsRequest;
+    if (!std.mem.eql(u8, payload[0..postgres_binary_copy_signature.len], postgres_binary_copy_signature)) return error.InvalidRowsRequest;
+    var pos: usize = postgres_binary_copy_signature.len;
+    const flags = try readBinaryCopyU32(payload, &pos);
+    if (flags != 0) return error.UnsupportedSqlShape;
+    const extension_len = try readBinaryCopyI32(payload, &pos);
+    if (extension_len < 0) return error.InvalidRowsRequest;
+    const extension_len_usize: usize = @intCast(extension_len);
+    if (pos + extension_len_usize > payload.len) return error.InvalidRowsRequest;
+    pos += extension_len_usize;
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(alloc);
+    try body.appendSlice(alloc, "{\"operations\":[");
+    var appended: usize = 0;
+    while (true) {
+        const field_count = try readBinaryCopyI16(payload, &pos);
+        if (field_count == -1) break;
+        if (field_count < 0 or @as(usize, @intCast(field_count)) != plan.columns.len) return error.InvalidRowsRequest;
+
+        const row_json = try rowJsonFromPostgresBinaryFieldsAlloc(alloc, schema, plan, payload, &pos, @intCast(field_count));
+        defer alloc.free(row_json);
+        if (!try rowMatchesWhereAlloc(alloc, row_json, plan.where_expressions)) continue;
+
+        if (appended != 0) try body.append(alloc, ',');
+        try body.appendSlice(alloc, "{\"op\":\"insert\",\"row\":");
+        try body.appendSlice(alloc, row_json);
+        try body.append(alloc, '}');
+        appended += 1;
+    }
+    if (pos != payload.len) return error.InvalidRowsRequest;
+    try body.appendSlice(alloc, "]}");
+    return try relational_rows.parseRowsBatchRequest(alloc, body.items, schema);
+}
+
+fn rowJsonFromPostgresBinaryFieldsAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    payload: []const u8,
+    pos: *usize,
+    field_count: usize,
+) ![]u8 {
+    var row = std.ArrayList(u8).empty;
+    errdefer row.deinit(alloc);
+    try row.append(alloc, '{');
+    var emitted: usize = 0;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for (0..field_count) |i| {
+        const column_name = plan.columns[i];
+        if (seen.contains(column_name)) return error.InvalidRowsRequest;
+        try seen.put(alloc, column_name, {});
+        const column = findRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+        const len = try readBinaryCopyI32(payload, pos);
+        const value_bytes: ?[]const u8 = if (len == -1) null else blk: {
+            if (len < 0) return error.InvalidRowsRequest;
+            const len_usize: usize = @intCast(len);
+            if (pos.* + len_usize > payload.len) return error.InvalidRowsRequest;
+            const value = payload[pos.* .. pos.* + len_usize];
+            pos.* += len_usize;
+            break :blk value;
+        };
+        const value_json = try postgresBinaryValueJsonAlloc(alloc, column, value_bytes);
+        defer alloc.free(value_json);
+        if (emitted != 0) try row.append(alloc, ',');
+        const key_json = try std.json.Stringify.valueAlloc(alloc, column_name, .{});
+        defer alloc.free(key_json);
+        try row.appendSlice(alloc, key_json);
+        try row.append(alloc, ':');
+        try row.appendSlice(alloc, value_json);
+        emitted += 1;
+    }
+    try row.append(alloc, '}');
+    return try row.toOwnedSlice(alloc);
+}
+
+fn postgresBinaryValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    value_bytes: ?[]const u8,
+) ![]u8 {
+    const bytes = value_bytes orelse return try alloc.dupe(u8, "null");
+    switch (column.field_type) {
+        .keyword, .text, .link, .html, .search_as_you_type, .datetime => {
+            _ = std.unicode.utf8CountCodepoints(bytes) catch return error.InvalidRowsRequest;
+            return try std.json.Stringify.valueAlloc(alloc, bytes, .{});
+        },
+        .boolean => {
+            if (bytes.len != 1) return error.InvalidRowsRequest;
+            if (bytes[0] == 0) return try alloc.dupe(u8, "false");
+            if (bytes[0] == 1) return try alloc.dupe(u8, "true");
+            return error.InvalidRowsRequest;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 pub fn exportRowsCsvToStdoutAlloc(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
@@ -326,10 +467,14 @@ pub fn exportRowsCsvToStdoutAlloc(
 
     const columns = try exportColumnsAlloc(alloc, schema, plan);
     defer alloc.free(columns);
+    if (plan.codec == .postgres_binary) {
+        return try exportRowsPostgresBinaryToStdoutAlloc(alloc, schema, plan, result, columns);
+    }
 
     const delimiter = try singleByteOption(plan.delimiter, switch (plan.codec) {
         .csv => ',',
         .postgres_text => '\t',
+        .postgres_binary => unreachable,
     });
     const quote = try singleByteOption(plan.quote, '"');
     const escape = try singleByteOption(plan.escape, quote);
@@ -344,6 +489,7 @@ pub fn exportRowsCsvToStdoutAlloc(
             switch (plan.codec) {
                 .csv => try appendCsvField(writer, column_name, delimiter, quote, escape, false),
                 .postgres_text => try appendPostgresTextField(writer, column_name, delimiter),
+                .postgres_binary => unreachable,
             }
         }
         try writer.writeByte('\n');
@@ -356,6 +502,17 @@ pub fn exportRowsCsvToStdoutAlloc(
         for (columns, 0..) |column_name, i| {
             if (i != 0) try writer.writeByte(delimiter);
             const value = parsed.value.object.get(column_name);
+            if (value == null or value.? == .null) {
+                switch (plan.codec) {
+                    .csv => {
+                        const force_quote = plan.force_quote_all or stringSliceContains(plan.force_quote_columns, column_name);
+                        try appendCsvField(writer, nullMarker(plan), delimiter, quote, escape, force_quote);
+                    },
+                    .postgres_text => try writer.writeAll(nullMarker(plan)),
+                    .postgres_binary => unreachable,
+                }
+                continue;
+            }
             const field = try fieldFromJsonValueAlloc(alloc, value, plan);
             defer alloc.free(field);
             switch (plan.codec) {
@@ -364,12 +521,123 @@ pub fn exportRowsCsvToStdoutAlloc(
                     try appendCsvField(writer, field, delimiter, quote, escape, force_quote);
                 },
                 .postgres_text => try appendPostgresTextField(writer, field, delimiter),
+                .postgres_binary => unreachable,
             }
         }
         try writer.writeByte('\n');
     }
 
     return try out.toOwnedSlice();
+}
+
+fn exportRowsPostgresBinaryToStdoutAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    plan: BulkSqlIoExecutionPlan,
+    result: db_mod.types.RelationalRowsQueryResult,
+    columns: []const []const u8,
+) ![]u8 {
+    _ = plan;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, postgres_binary_copy_signature);
+    try appendBinaryCopyU32(alloc, &out, 0);
+    try appendBinaryCopyU32(alloc, &out, 0);
+    for (result.rows) |row_json| {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        if (columns.len > std.math.maxInt(i16)) return error.InvalidRowsRequest;
+        try appendBinaryCopyI16(alloc, &out, @intCast(columns.len));
+        for (columns) |column_name| {
+            const value = parsed.value.object.get(column_name) orelse std.json.Value.null;
+            if (value == .null) {
+                try appendBinaryCopyI32(alloc, &out, -1);
+                continue;
+            }
+            const column = findRelationalColumn(schema, column_name) orelse return error.InvalidRowsRequest;
+            const field = try postgresBinaryFieldBytesAlloc(alloc, column, value);
+            defer alloc.free(field);
+            if (field.len > std.math.maxInt(i32)) return error.InvalidRowsRequest;
+            try appendBinaryCopyI32(alloc, &out, @intCast(field.len));
+            try out.appendSlice(alloc, field);
+        }
+    }
+    try appendBinaryCopyI16(alloc, &out, -1);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn postgresBinaryFieldBytesAlloc(
+    alloc: std.mem.Allocator,
+    column: runtime_schema.RelationalColumn,
+    value: std.json.Value,
+) ![]u8 {
+    switch (column.field_type) {
+        .keyword, .text, .link, .html, .search_as_you_type, .datetime => return switch (value) {
+            .string => |raw| try alloc.dupe(u8, raw),
+            else => error.InvalidRowsRequest,
+        },
+        .boolean => return switch (value) {
+            .bool => |raw| blk: {
+                const out = try alloc.alloc(u8, 1);
+                out[0] = if (raw) 1 else 0;
+                break :blk out;
+            },
+            else => error.InvalidRowsRequest,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn readBinaryCopyI16(data: []const u8, pos: *usize) !i16 {
+    if (pos.* + 2 > data.len) return error.InvalidRowsRequest;
+    const value = std.mem.readInt(i16, data[pos.*..][0..2], .big);
+    pos.* += 2;
+    return value;
+}
+
+fn readBinaryCopyI32(data: []const u8, pos: *usize) !i32 {
+    if (pos.* + 4 > data.len) return error.InvalidRowsRequest;
+    const value = std.mem.readInt(i32, data[pos.*..][0..4], .big);
+    pos.* += 4;
+    return value;
+}
+
+fn readBinaryCopyU32(data: []const u8, pos: *usize) !u32 {
+    if (pos.* + 4 > data.len) return error.InvalidRowsRequest;
+    const value = std.mem.readInt(u32, data[pos.*..][0..4], .big);
+    pos.* += 4;
+    return value;
+}
+
+fn appendBinaryCopyI16(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    value: i16,
+) !void {
+    var buf: [2]u8 = undefined;
+    std.mem.writeInt(i16, &buf, value, .big);
+    try out.appendSlice(alloc, &buf);
+}
+
+fn appendBinaryCopyI32(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    value: i32,
+) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &buf, value, .big);
+    try out.appendSlice(alloc, &buf);
+}
+
+fn appendBinaryCopyU32(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    value: u32,
+) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, value, .big);
+    try out.appendSlice(alloc, &buf);
 }
 
 fn exportColumnsAlloc(
@@ -469,6 +737,7 @@ fn parseRecordAlloc(
     return switch (plan.codec) {
         .csv => try parseCsvRecordAlloc(alloc, line, plan),
         .postgres_text => try parsePostgresTextRecordAlloc(alloc, line, plan),
+        .postgres_binary => unreachable,
     };
 }
 
@@ -691,6 +960,7 @@ fn nullMarker(plan: BulkSqlIoExecutionPlan) []const u8 {
     return plan.null_marker orelse switch (plan.codec) {
         .csv => "",
         .postgres_text => "\\N",
+        .postgres_binary => unreachable,
     };
 }
 

@@ -714,6 +714,27 @@ pub const ReadSourceTableNames = struct {
     }
 };
 
+pub const CatalogBoundWritePlanOptions = struct {
+    options: plan_mod.LowerWritePlanOptions,
+    owned_insert_source_schema: ?runtime_schema.TableSchema = null,
+    owned_joined_source_schema: ?runtime_schema.TableSchema = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.owned_insert_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        if (self.owned_joined_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        self.* = undefined;
+    }
+};
+
+pub const CatalogBoundReadPlanSourceSchema = struct {
+    source_schema: ?runtime_schema.TableSchema = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        self.* = undefined;
+    }
+};
+
 const SelectReadTableNames = struct {
     left: []const u8,
     source: ?[]const u8 = null,
@@ -803,6 +824,73 @@ pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u
     return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens.items, 0);
 }
 
+pub fn resolveWritePlanCatalogOptionsAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !CatalogBoundWritePlanOptions {
+    var out = CatalogBoundWritePlanOptions{
+        .options = options,
+    };
+    errdefer out.deinit(alloc);
+    var resolved_recursive_insert_source = false;
+
+    if (out.options.insert_source_schema == null) {
+        if (try recursiveInsertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+            var tables = resolved_tables;
+            defer tables.deinit(alloc);
+            resolved_recursive_insert_source = true;
+            if (!std.mem.eql(u8, tables.target, tables.source)) {
+                out.owned_insert_source_schema = try runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
+                out.options.insert_source_schema = out.owned_insert_source_schema.?;
+            }
+        } else if (try insertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+            var tables = resolved_tables;
+            defer tables.deinit(alloc);
+            if (!std.mem.eql(u8, tables.target, tables.source)) {
+                out.owned_insert_source_schema = try runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
+                out.options.insert_source_schema = out.owned_insert_source_schema.?;
+            }
+        }
+    }
+
+    if (!resolved_recursive_insert_source and out.options.joined_source_schema == null) {
+        if (joinedWriteSourceTableNamesAlloc(alloc, sql)) |maybe_resolved_tables| {
+            if (maybe_resolved_tables) |resolved_tables| {
+                var tables = resolved_tables;
+                defer tables.deinit(alloc);
+                if (!std.mem.eql(u8, tables.target, tables.source)) {
+                    out.owned_joined_source_schema = try runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
+                    out.options.joined_source_schema = out.owned_joined_source_schema.?;
+                }
+            }
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
+
+    return out;
+}
+
+pub fn resolveReadPlanCatalogSourceSchemaAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    catalog: table_catalog.CatalogSource,
+) !CatalogBoundReadPlanSourceSchema {
+    var out = CatalogBoundReadPlanSourceSchema{};
+    errdefer out.deinit(alloc);
+    if (try readSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+        var tables = resolved_tables;
+        defer tables.deinit(alloc);
+        if (!std.mem.eql(u8, tables.left, tables.source)) {
+            out.source_schema = try runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
+        }
+    }
+    return out;
+}
+
 fn joinedWriteSourceTableNamesFromStatementAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -818,8 +906,18 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
         errdefer if (!target_transferred) alloc.free(target);
 
         const from_index = findTopLevelKeyword(tokens[target_index + 1 ..], "from") orelse {
-            alloc.free(target);
-            return null;
+            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], "where") orelse {
+                alloc.free(target);
+                return null;
+            };
+            const source = try joinedWriteSemiJoinSourceTableAlloc(alloc, tokens[target_index + 1 + where_index + 1 ..]) orelse {
+                alloc.free(target);
+                return null;
+            };
+            errdefer alloc.free(source);
+
+            target_transferred = true;
+            return .{ .target = target, .source = source };
         };
         var source_index = target_index + 1 + from_index + 1;
         _ = consumeKeyword(tokens, &source_index, "only");
@@ -841,8 +939,18 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
         errdefer if (!target_transferred) alloc.free(target);
 
         const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], "using") orelse {
-            alloc.free(target);
-            return null;
+            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], "where") orelse {
+                alloc.free(target);
+                return null;
+            };
+            const source = try joinedWriteSemiJoinSourceTableAlloc(alloc, tokens[target_index + 1 + where_index + 1 ..]) orelse {
+                alloc.free(target);
+                return null;
+            };
+            errdefer alloc.free(source);
+
+            target_transferred = true;
+            return .{ .target = target, .source = source };
         };
         var source_index = target_index + 1 + using_index + 1;
         _ = consumeKeyword(tokens, &source_index, "only");
@@ -877,6 +985,35 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
         return .{ .target = target, .source = source };
     }
 
+    return null;
+}
+
+fn joinedWriteSemiJoinSourceTableAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !?[]const u8 {
+    var index: usize = 0;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        if (token.kind == .semicolon) return null;
+        if (token.kind != .lparen) continue;
+
+        const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
+        const is_exists = index > 0 and tokens[index - 1].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[index - 1].text, "exists");
+        const is_in = index > 0 and tokens[index - 1].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[index - 1].text, "in");
+        if (is_exists or is_in) {
+            const body = tokens[index + 1 .. close_index];
+            if (body.len > 0 and body[0].kind == .identifier and std.ascii.eqlIgnoreCase(body[0].text, "select")) {
+                const from_index = findTopLevelKeyword(body, "from") orelse return error.UnsupportedSqlShape;
+                var source_index = from_index + 1;
+                _ = consumeKeyword(body, &source_index, "only");
+                if (source_index >= body.len or body[source_index].kind != .identifier) return error.UnsupportedSqlShape;
+                return try normalizeSqlObjectIdentifierAlloc(alloc, body[source_index].text);
+            }
+        }
+
+        index = close_index;
+    }
     return null;
 }
 

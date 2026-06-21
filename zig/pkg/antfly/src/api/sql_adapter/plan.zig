@@ -15,9 +15,11 @@
 const std = @import("std");
 
 const ast = @import("ast.zig");
+const classifier = @import("classifier.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
+const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
@@ -151,6 +153,7 @@ pub const LoweredSelect = struct {
     ctes: []const db_mod.types.RelationalRowsCte = &.{},
     query: db_mod.types.RelationalRowsQueryRequest,
     select_outputs: []const SelectOutputRef = &.{},
+    system_time_as_of_sequence: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -270,6 +273,7 @@ fn replaceOwnedStringAlloc(alloc: std.mem.Allocator, target_const: *const []cons
 pub const LoweredQueryPlan = struct {
     table_name: []const u8,
     plan: db_mod.types.RelationalRowsQueryPlan,
+    system_time_as_of_sequence: ?u64 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
@@ -558,6 +562,17 @@ pub const LoweredMergeMutationPlan = struct {
     }
 };
 
+pub const LoweredRecursiveMergeMutation = struct {
+    recursive: LoweredRecursiveCtePlan,
+    merge: LoweredMergeMutationPlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.recursive.deinit(alloc);
+        self.merge.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredWritePlan = union(enum) {
     insert: LoweredInsert,
     insert_source: LoweredInsertSource,
@@ -572,6 +587,7 @@ pub const LoweredWritePlan = union(enum) {
     recursive_update_joined_source: LoweredRecursiveJoinedMutationSource,
     recursive_delete_joined_source: LoweredRecursiveJoinedMutationSource,
     merge_mutation: LoweredMergeMutationPlan,
+    recursive_merge_mutation: LoweredRecursiveMergeMutation,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -588,10 +604,185 @@ pub const LoweredWritePlan = union(enum) {
             .recursive_update_joined_source => |*recursive_update_joined_source| recursive_update_joined_source.deinit(alloc),
             .recursive_delete_joined_source => |*recursive_delete_joined_source| recursive_delete_joined_source.deinit(alloc),
             .merge_mutation => |*merge_mutation| merge_mutation.deinit(alloc),
+            .recursive_merge_mutation => |*recursive_merge_mutation| recursive_merge_mutation.deinit(alloc),
         }
         self.* = undefined;
     }
 };
+
+pub fn sqlWritePlanFallbackAllowed(err: anyerror) bool {
+    return err == error.UnsupportedSqlShape or
+        err == error.UnsupportedRowsSelector or
+        err == error.UnsupportedRowsQuery or
+        err == error.InvalidSqlCatalog;
+}
+
+pub fn writePlanFallbackError(primary_err: ?anyerror, fallback_err: anyerror) anyerror {
+    if (primary_err) |err| {
+        if (err != error.UnsupportedSqlShape) return err;
+    }
+    return fallback_err;
+}
+
+pub const WritePlanLoweringHooks = struct {
+    ptr: *anyopaque,
+    has_recursive_insert_source: *const fn (*anyopaque, []const Token) anyerror!bool,
+    lower_recursive_insert_source: *const fn (*anyopaque, runtime_schema.TableSchema, relational_rows.UniqueSelectorResolver) anyerror!LoweredRecursiveInsertSource,
+    lower_recursive_update_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredRecursiveJoinedMutationSource,
+    lower_recursive_delete_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredRecursiveJoinedMutationSource,
+    lower_recursive_merge_mutation: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!LoweredRecursiveMergeMutation,
+    lower_insert: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredInsert,
+    lower_insert_source: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredInsertSource,
+    lower_insert_source_with_schema: *const fn (*anyopaque, runtime_schema.TableSchema, relational_rows.UniqueSelectorResolver) anyerror!LoweredInsertSource,
+    lower_update_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredJoinedMutationSource,
+    lower_update: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredMutation,
+    lower_update_source: *const fn (*anyopaque, db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource,
+    lower_delete_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredJoinedMutationSource,
+    lower_delete: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredMutation,
+    lower_delete_source: *const fn (*anyopaque, db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource,
+    lower_truncate_source: *const fn (*anyopaque, db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource,
+    lower_merge_mutation: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!LoweredMergeMutationPlan,
+};
+
+fn lowerRecursiveWritePlanWithHooksAlloc(
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    options: LowerWritePlanOptions,
+    hooks: WritePlanLoweringHooks,
+) !LoweredWritePlan {
+    if (hooks.has_recursive_insert_source(hooks.ptr, tokens)) |has_recursive_insert_source| {
+        if (has_recursive_insert_source) {
+            const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+            const source_schema = options.insert_source_schema orelse schema;
+            return .{ .recursive_insert_source = try hooks.lower_recursive_insert_source(hooks.ptr, source_schema, resolver) };
+        }
+    } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
+        return err;
+    }
+
+    if (options.row_claim) |row_claim| {
+        const source_schema = options.joined_source_schema orelse schema;
+        if (hooks.lower_recursive_update_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
+            return .{ .recursive_update_joined_source = lowered };
+        } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
+            return err;
+        }
+        if (hooks.lower_recursive_delete_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
+            return .{ .recursive_delete_joined_source = lowered };
+        } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
+            return err;
+        }
+    }
+
+    {
+        const source_schema = options.joined_source_schema orelse schema;
+        if (hooks.lower_recursive_merge_mutation(hooks.ptr, source_schema)) |lowered| {
+            return .{ .recursive_merge_mutation = lowered };
+        } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
+            return err;
+        }
+    }
+
+    return error.UnsupportedSqlShape;
+}
+
+pub fn lowerWritePlanWithHooksAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    options: LowerWritePlanOptions,
+    hooks: WritePlanLoweringHooks,
+) !LoweredWritePlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    if (tokens.items.len >= 2 and std.ascii.eqlIgnoreCase(tokens.items[0].text, "with") and std.ascii.eqlIgnoreCase(tokens.items[1].text, "recursive")) {
+        return try lowerRecursiveWritePlanWithHooksAlloc(tokens.items, schema, options, hooks);
+    }
+
+    const write_kind = classifier.classifyWriteStatement(tokens.items) orelse
+        return try lowerRecursiveWritePlanWithHooksAlloc(tokens.items, schema, options, hooks);
+
+    if (write_kind == .insert) {
+        const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+        var point_insert_err: ?anyerror = null;
+        if (hooks.lower_insert(hooks.ptr, resolver)) |lowered| {
+            return .{ .insert = lowered };
+        } else |err| {
+            if (!sqlWritePlanFallbackAllowed(err)) return err;
+            point_insert_err = err;
+        }
+        if (options.insert_source_schema) |source_schema| {
+            if (hooks.lower_insert_source_with_schema(hooks.ptr, source_schema, resolver)) |lowered| {
+                return .{ .insert_source = lowered };
+            } else |err| return writePlanFallbackError(point_insert_err, err);
+        }
+        if (hooks.lower_insert_source(hooks.ptr, resolver)) |lowered| {
+            return .{ .insert_source = lowered };
+        } else |err| {
+            return writePlanFallbackError(point_insert_err, err);
+        }
+    }
+
+    if (write_kind == .insert_source) {
+        const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+        if (options.insert_source_schema) |source_schema| {
+            return .{ .insert_source = try hooks.lower_insert_source_with_schema(hooks.ptr, source_schema, resolver) };
+        }
+        return .{ .insert_source = try hooks.lower_insert_source(hooks.ptr, resolver) };
+    }
+
+    if (write_kind == .update) {
+        if (options.row_claim) |row_claim| {
+            const source_schema = options.joined_source_schema orelse schema;
+            if (hooks.lower_update_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
+                return .{ .update_joined_source = lowered };
+            } else |err| {
+                if (!sqlWritePlanFallbackAllowed(err)) return err;
+            }
+        }
+        if (options.unique_resolver) |resolver| {
+            if (hooks.lower_update(hooks.ptr, resolver)) |lowered| {
+                return .{ .update = lowered };
+            } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
+        }
+        if (options.row_claim) |row_claim| {
+            return .{ .update_source = try hooks.lower_update_source(hooks.ptr, row_claim) };
+        }
+        return error.UnsupportedRowsSelector;
+    }
+
+    if (write_kind == .delete) {
+        if (options.row_claim) |row_claim| {
+            const source_schema = options.joined_source_schema orelse schema;
+            if (hooks.lower_delete_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
+                return .{ .delete_joined_source = lowered };
+            } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
+        }
+        if (options.unique_resolver) |resolver| {
+            if (hooks.lower_delete(hooks.ptr, resolver)) |lowered| {
+                return .{ .delete = lowered };
+            } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
+        }
+        if (options.row_claim) |row_claim| {
+            return .{ .delete_source = try hooks.lower_delete_source(hooks.ptr, row_claim) };
+        }
+        return error.UnsupportedRowsSelector;
+    }
+
+    if (write_kind == .truncate) {
+        const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+        return .{ .truncate_source = try hooks.lower_truncate_source(hooks.ptr, row_claim) };
+    }
+
+    if (write_kind == .merge) {
+        const source_schema = options.joined_source_schema orelse schema;
+        return .{ .merge_mutation = try hooks.lower_merge_mutation(hooks.ptr, source_schema) };
+    }
+
+    return error.UnsupportedSqlShape;
+}
 
 pub fn mergeMatchedPredicateCount(arms: []const MergeMatchedArm) usize {
     var total: usize = 0;
@@ -757,36 +948,41 @@ pub const CteSelectParserHooks = struct {
     ) anyerror!LoweredSelect,
 };
 
+pub const ReadPlanParserContext = struct {
+    schema: runtime_schema.TableSchema,
+    available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    allow_select_set_boundary: bool = false,
+    allow_select_set_result_tail_boundary: bool = false,
+};
+
+pub const ReadPlanParserContextHooks = struct {
+    ptr: *anyopaque,
+    get_context: *const fn (*anyopaque) ReadPlanParserContext,
+    set_context: *const fn (*anyopaque, ReadPlanParserContext) void,
+};
+
 pub const WindowPlanParserHooks = struct {
     ptr: *anyopaque,
-    parse_window: *const fn (
-        *anyopaque,
-        []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredWindowPlan,
+    context_hooks: ReadPlanParserContextHooks,
+    parse_window: *const fn (*anyopaque) anyerror!LoweredWindowPlan,
 };
 
 pub const AggregatePlanParserHooks = struct {
     ptr: *anyopaque,
-    parse_aggregate: *const fn (
-        *anyopaque,
-        []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredAggregate,
+    context_hooks: ReadPlanParserContextHooks,
+    parse_aggregate: *const fn (*anyopaque) anyerror!LoweredAggregate,
 };
 
 pub const JoinPlanParserHooks = struct {
     ptr: *anyopaque,
-    parse_join: *const fn (
-        *anyopaque,
-        []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredJoin,
+    context_hooks: ReadPlanParserContextHooks,
+    parse_join: *const fn (*anyopaque) anyerror!LoweredJoin,
 };
 
 pub const LateralPlanParserHooks = struct {
     ptr: *anyopaque,
-    parse_lateral: *const fn (
-        *anyopaque,
-        []const db_mod.types.RelationalRowsCte,
-    ) anyerror!LoweredLateralPlan,
+    context_hooks: ReadPlanParserContextHooks,
+    parse_lateral: *const fn (*anyopaque) anyerror!LoweredLateralPlan,
 };
 
 pub const RecursiveCteParserHooks = struct {
@@ -840,8 +1036,8 @@ pub const RecursiveCteMemberProjectionExpression = struct {
 
 pub const SetOperationParserHooks = struct {
     ptr: *anyopaque,
-    parse_left_select: *const fn (*anyopaque) anyerror!LoweredSelect,
-    parse_right_select: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!LoweredSelect,
+    context_hooks: ReadPlanParserContextHooks,
+    parse_select: *const fn (*anyopaque) anyerror!LoweredSelect,
     select_output_columns: *const fn (
         *anyopaque,
         LoweredSelect,
@@ -918,6 +1114,41 @@ pub fn freePlanCtes(alloc: std.mem.Allocator, ctes: []const db_mod.types.Relatio
     if (ctes.len > 0) alloc.free(ctes);
 }
 
+fn setReadPlanAvailableCtes(
+    context_hooks: ReadPlanParserContextHooks,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+) ReadPlanParserContext {
+    const previous_context = context_hooks.get_context(context_hooks.ptr);
+    var context = previous_context;
+    context.available_ctes = available_ctes;
+    context_hooks.set_context(context_hooks.ptr, context);
+    return previous_context;
+}
+
+fn parseWindowWithCtes(hooks: WindowPlanParserHooks, ctes: []const db_mod.types.RelationalRowsCte) !LoweredWindowPlan {
+    const previous_context = setReadPlanAvailableCtes(hooks.context_hooks, ctes);
+    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
+    return try hooks.parse_window(hooks.ptr);
+}
+
+fn parseAggregateWithCtes(hooks: AggregatePlanParserHooks, ctes: []const db_mod.types.RelationalRowsCte) !LoweredAggregate {
+    const previous_context = setReadPlanAvailableCtes(hooks.context_hooks, ctes);
+    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
+    return try hooks.parse_aggregate(hooks.ptr);
+}
+
+fn parseLateralWithCtes(hooks: LateralPlanParserHooks, ctes: []const db_mod.types.RelationalRowsCte) !LoweredLateralPlan {
+    const previous_context = setReadPlanAvailableCtes(hooks.context_hooks, ctes);
+    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
+    return try hooks.parse_lateral(hooks.ptr);
+}
+
+fn parseJoinWithCtes(hooks: JoinPlanParserHooks, ctes: []const db_mod.types.RelationalRowsCte) !LoweredJoin {
+    const previous_context = setReadPlanAvailableCtes(hooks.context_hooks, ctes);
+    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
+    return try hooks.parse_join(hooks.ptr);
+}
+
 pub fn parseWindowPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -925,14 +1156,14 @@ pub fn parseWindowPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: WindowPlanParserHooks,
 ) !LoweredWindowPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_window(hooks.ptr, &.{});
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseWindowWithCtes(hooks, &.{});
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
     var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
     errdefer freePlanCtes(alloc, ctes);
 
-    var final = try hooks.parse_window(hooks.ptr, ctes);
+    var final = try parseWindowWithCtes(hooks, ctes);
     errdefer final.deinit(alloc);
     try resolveWindowSourceForPlanAlloc(alloc, &final, ctes, &base_table_name);
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -955,7 +1186,7 @@ pub fn parseAggregatePlanAlloc(
     hooks: AggregatePlanParserHooks,
 ) !LoweredAggregatePlan {
     if (!parser.peekKeyword(tokens, pos.*, "with")) {
-        var lowered = try hooks.parse_aggregate(hooks.ptr, &.{});
+        var lowered = try parseAggregateWithCtes(hooks, &.{});
         errdefer lowered.deinit(alloc);
         const table_name = lowered.table_name;
         lowered.table_name = "";
@@ -970,7 +1201,7 @@ pub fn parseAggregatePlanAlloc(
     var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
     errdefer freePlanCtes(alloc, ctes);
 
-    var final = try hooks.parse_aggregate(hooks.ptr, ctes);
+    var final = try parseAggregateWithCtes(hooks, ctes);
     errdefer final.deinit(alloc);
     try resolveAggregateSourceForPlanAlloc(alloc, &final, ctes, &base_table_name);
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -998,14 +1229,14 @@ pub fn parseLateralPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: LateralPlanParserHooks,
 ) !LoweredLateralPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_lateral(hooks.ptr, &.{});
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseLateralWithCtes(hooks, &.{});
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
     var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
     errdefer freePlanCtes(alloc, ctes);
 
-    var final = try hooks.parse_lateral(hooks.ptr, ctes);
+    var final = try parseLateralWithCtes(hooks, ctes);
     errdefer final.deinit(alloc);
     try resolveLateralSourcesForPlanAlloc(alloc, &final, ctes, &base_table_name);
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -1024,14 +1255,14 @@ pub fn parseJoinPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: JoinPlanParserHooks,
 ) !LoweredJoin {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_join(hooks.ptr, &.{});
+    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseJoinWithCtes(hooks, &.{});
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
     var ctes = try parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
     errdefer freePlanCtes(alloc, ctes);
 
-    var final = try hooks.parse_join(hooks.ptr, ctes);
+    var final = try parseJoinWithCtes(hooks, ctes);
     errdefer final.deinit(alloc);
     try resolveJoinSourcesForPlanAlloc(alloc, &final, ctes, &base_table_name);
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -1160,7 +1391,7 @@ pub fn parseSetOperationPlanAlloc(
 ) !LoweredSetOperationPlan {
     if (parser.peekKeyword(tokens, pos.*, "with")) return error.UnsupportedSqlShape;
 
-    var left = try hooks.parse_left_select(hooks.ptr);
+    var left = try parseSetOperationSelectWithContext(hooks, null, true, null);
     errdefer left.deinit(alloc);
     const left_columns = try hooks.select_output_columns(hooks.ptr, left);
     var left_columns_transferred = false;
@@ -1168,7 +1399,7 @@ pub fn parseSetOperationPlanAlloc(
     if (parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
 
     const op = try grammar.parseSelectSetOperation(tokens, pos);
-    var right = try hooks.parse_right_select(hooks.ptr, right_schema);
+    var right = try parseSetOperationSelectWithContext(hooks, right_schema, null, true);
     errdefer right.deinit(alloc);
     const right_columns = try hooks.select_output_columns(hooks.ptr, right);
     defer freeSetOperationOutputColumns(alloc, right_columns);
@@ -1217,6 +1448,23 @@ pub fn parseSetOperationPlanAlloc(
         .max_bytes = db_mod.types.default_relational_rows_cte_max_bytes,
         .spill_after_bytes = db_mod.types.default_relational_rows_cte_spill_after_bytes,
     };
+}
+
+fn parseSetOperationSelectWithContext(
+    hooks: SetOperationParserHooks,
+    schema: ?runtime_schema.TableSchema,
+    allow_select_set_boundary: ?bool,
+    allow_select_set_result_tail_boundary: ?bool,
+) !LoweredSelect {
+    const previous_context = hooks.context_hooks.get_context(hooks.context_hooks.ptr);
+    var context = previous_context;
+    if (schema) |value| context.schema = value;
+    if (allow_select_set_boundary) |value| context.allow_select_set_boundary = value;
+    if (allow_select_set_result_tail_boundary) |value| context.allow_select_set_result_tail_boundary = value;
+    hooks.context_hooks.set_context(hooks.context_hooks.ptr, context);
+    defer hooks.context_hooks.set_context(hooks.context_hooks.ptr, previous_context);
+
+    return try hooks.parse_select(hooks.ptr);
 }
 
 fn setOperationColumnsCompatible(
@@ -1668,6 +1916,76 @@ pub const LoweredReadPlan = union(enum) {
     }
 };
 
+pub const ReadPlanLoweringHooks = struct {
+    ptr: *anyopaque,
+    lower_lateral: *const fn (*anyopaque) anyerror!LoweredLateralPlan,
+    lower_window: *const fn (*anyopaque) anyerror!LoweredWindowPlan,
+    lower_aggregate: *const fn (*anyopaque) anyerror!LoweredAggregatePlan,
+    lower_recursive_cte: *const fn (*anyopaque) anyerror!LoweredRecursiveCtePlan,
+    lower_join: *const fn (*anyopaque) anyerror!LoweredJoin,
+    lower_query: *const fn (*anyopaque) anyerror!LoweredQueryPlan,
+    lower_set_operation: *const fn (*anyopaque) anyerror!LoweredSetOperationPlan,
+};
+
+pub fn lowerReadPlanWithHooks(hooks: ReadPlanLoweringHooks) !LoweredReadPlan {
+    var saw_invalid_catalog = false;
+
+    if (hooks.lower_lateral(hooks.ptr)) |lowered| {
+        return .{ .lateral = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        error.InvalidSqlCatalog => saw_invalid_catalog = true,
+        else => return err,
+    }
+
+    if (hooks.lower_window(hooks.ptr)) |lowered| {
+        return .{ .window = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        error.InvalidSqlCatalog => saw_invalid_catalog = true,
+        else => return err,
+    }
+
+    if (hooks.lower_aggregate(hooks.ptr)) |lowered| {
+        return .{ .aggregate = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        error.InvalidSqlCatalog => saw_invalid_catalog = true,
+        else => return err,
+    }
+
+    if (hooks.lower_recursive_cte(hooks.ptr)) |lowered| {
+        return .{ .recursive_cte = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        error.InvalidSqlCatalog => saw_invalid_catalog = true,
+        else => return err,
+    }
+
+    if (hooks.lower_join(hooks.ptr)) |lowered| {
+        return .{ .join = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        error.InvalidSqlCatalog => saw_invalid_catalog = true,
+        else => return err,
+    }
+
+    if (hooks.lower_query(hooks.ptr)) |lowered| {
+        return .{ .query = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+
+    if (hooks.lower_set_operation(hooks.ptr)) |lowered| {
+        return .{ .set_operation = lowered };
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => if (saw_invalid_catalog) return error.InvalidSqlCatalog else return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => return error.InvalidSqlCatalog,
+        else => return err,
+    }
+}
+
 pub const LoweredRelationPopulationPlan = struct {
     mode: RelationPopulationMode,
     target_table_name: []const u8,
@@ -1682,6 +2000,28 @@ pub const LoweredRelationPopulationPlan = struct {
         self.* = undefined;
     }
 };
+
+pub fn relationPopulationPlanFromSyntaxAlloc(
+    alloc: std.mem.Allocator,
+    syntax: grammar.RelationPopulationSyntax,
+    source: *LoweredReadPlan,
+) !LoweredRelationPopulationPlan {
+    const target = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, syntax.target_identifier);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target);
+
+    target_transferred = true;
+    const out = LoweredRelationPopulationPlan{
+        .mode = syntax.mode,
+        .target_table_name = target,
+        .target_lifetime = syntax.target_lifetime,
+        .if_not_exists = syntax.if_not_exists,
+        .populate = syntax.populate,
+        .source = source.*,
+    };
+    source.* = undefined;
+    return out;
+}
 
 pub const ExplainFormat = ast.SqlExplainFormat;
 
@@ -1715,6 +2055,50 @@ pub const LoweredExplainSubject = union(enum) {
         self.* = undefined;
     }
 };
+
+pub const ExplainPlanLoweringHooks = struct {
+    ptr: *anyopaque,
+    lower_read: *const fn (*anyopaque, []const u8) anyerror!LoweredReadPlan,
+    lower_write: *const fn (*anyopaque, []const u8) anyerror!LoweredWritePlan,
+};
+
+pub fn lowerExplainPlanWithHooksAlloc(sql: []const u8, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
+    const parsed = try grammar.parseExplainPrefix(sql);
+    var read_err: ?anyerror = null;
+    if (hooks.lower_read(hooks.ptr, parsed.inner_sql)) |read| {
+        return .{
+            .analyze = parsed.analyze,
+            .format = parsed.format,
+            .verbose = parsed.verbose,
+            .costs = parsed.costs,
+            .buffers = parsed.buffers,
+            .timing = parsed.timing,
+            .summary = parsed.summary,
+            .settings = parsed.settings,
+            .wal = parsed.wal,
+            .subject = .{ .read = read },
+        };
+    } else |err| {
+        if (!sqlWritePlanFallbackAllowed(err)) return err;
+        read_err = err;
+    }
+    if (hooks.lower_write(hooks.ptr, parsed.inner_sql)) |write| {
+        return .{
+            .analyze = parsed.analyze,
+            .format = parsed.format,
+            .verbose = parsed.verbose,
+            .costs = parsed.costs,
+            .buffers = parsed.buffers,
+            .timing = parsed.timing,
+            .summary = parsed.summary,
+            .settings = parsed.settings,
+            .wal = parsed.wal,
+            .subject = .{ .write = write },
+        };
+    } else |write_err| {
+        return writePlanFallbackError(read_err, write_err);
+    }
+}
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     for (values) |value| alloc.free(value);
@@ -2736,6 +3120,7 @@ pub fn nextIsJoinClauseKeyword(tokens: []const Token, pos: usize) bool {
         std.ascii.eqlIgnoreCase(token, "limit") or
         std.ascii.eqlIgnoreCase(token, "offset") or
         std.ascii.eqlIgnoreCase(token, "returning") or
+        std.ascii.eqlIgnoreCase(token, "for") or
         std.ascii.eqlIgnoreCase(token, "group") or
         std.ascii.eqlIgnoreCase(token, "union") or
         std.ascii.eqlIgnoreCase(token, "intersect") or

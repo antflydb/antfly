@@ -4235,11 +4235,6 @@ pub const DB = struct {
             .timestamp_ns = req.timestamp_ns,
             .sync_level = req.sync_level,
         };
-        if (self.core.schema) |runtime_schema| {
-            if (runtime_schema.system_versioned) {
-                try rejectSystemVersionedTableUserRowMutations(effective_req.writes, effective_req.deletes, effective_req.relational_identity_rewrites);
-            }
-        }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
 
         var effective_predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
@@ -4804,6 +4799,19 @@ pub const DB = struct {
             &owned_child_range_outbox_keys,
             &owned_child_range_outbox_values,
         );
+        if (self.core.schema) |runtime_schema| {
+            if (runtime_schema.system_versioned) {
+                try appendSystemVersionedHistoryForBatch(
+                    self,
+                    effective_req,
+                    sequence,
+                    batch_timestamp_ns,
+                    &store_writes,
+                    &owned_store_keys,
+                    &owned_store_values,
+                );
+            }
+        }
         const build_derived_start_ns = monotonicTimeNs();
         const replay_payload = if (use_thin_replay_fast_path)
             try encodeThinReplayRecordPayload(
@@ -5483,6 +5491,48 @@ pub const DB = struct {
             error.NotFound => null,
             else => err,
         };
+    }
+
+    pub fn scanSystemVersionedHistoryForDocKeyAlloc(self: *DB, alloc: Allocator, key: []const u8) ![]docstore_mod.OwnedKVPair {
+        const prefix = try systemVersionedHistoryPrefixForDocKeyAlloc(alloc, key);
+        defer alloc.free(prefix);
+        return try self.core.scanStorePrefix(alloc, prefix);
+    }
+
+    pub fn scanSystemVersionedHistoryAlloc(self: *DB, alloc: Allocator) ![]docstore_mod.OwnedKVPair {
+        return try self.core.scanStorePrefix(alloc, system_versioned_history_prefix);
+    }
+
+    pub fn querySystemVersionedRelationalRowsAsOfSequence(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        commit_sequence: u64,
+        req: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
+        if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidArgument;
+        if (!runtime_schema.system_versioned) return error.UnsupportedQueryRequest;
+        if (req.source_cte.len != 0) return error.InvalidQueryRequest;
+        if (req.row_claim != null or req.doc_key_range != null) return error.UnsupportedQueryRequest;
+        try validateRelationalRowsBaseQueryRequestAgainstSchema(runtime_schema, req);
+
+        const history = try self.scanSystemVersionedHistoryAlloc(alloc);
+        defer docstore_mod.DocStore.freeResults(alloc, history);
+
+        var rows_by_key = std.StringHashMapUnmanaged([]u8).empty;
+        defer freeSystemVersionedRowsByKey(alloc, &rows_by_key);
+        try reconstructSystemVersionedRowsAsOfSequenceAlloc(alloc, history, commit_sequence, &rows_by_key);
+
+        var rows = try alloc.alloc([]const u8, rows_by_key.count());
+        defer alloc.free(rows);
+        var index: usize = 0;
+        var it = rows_by_key.iterator();
+        while (it.next()) |entry| {
+            rows[index] = entry.value_ptr.*;
+            index += 1;
+        }
+
+        return try self.queryRelationalRowsFromSourceRowsAlloc(alloc, "system_versioned_as_of", rows, req);
     }
 
     pub fn lookupRelationalTemporalUniqueOwner(
@@ -6537,13 +6587,17 @@ pub const DB = struct {
         job: metadata_table_manager.SchemaRewriteJobRecord,
     ) !SchemaRewriteJobExecutionResult {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        if (!std.mem.eql(u8, job.action, "rewrite") or !std.mem.eql(u8, job.reason, "row_images")) return error.InvalidSchemaRewriteJob;
+        const validate_constraints = std.mem.eql(u8, job.action, "validate") and std.mem.eql(u8, job.reason, "constraints");
+        const rewrite_rows = std.mem.eql(u8, job.action, "rewrite") and std.mem.eql(u8, job.reason, "row_images");
+        if (!validate_constraints and !rewrite_rows) return error.InvalidSchemaRewriteJob;
         if (!std.mem.eql(u8, job.state, metadata_table_manager.schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
         if (job.lease_owner.len == 0) return error.SchemaRewriteJobLeaseMismatch;
         const has_expression_rewrite = job.expression != null or job.target_column.len != 0;
         const has_row_rewrite = job.rewrite_renames.len != 0 or job.rewrite_drops.len != 0;
         const has_full_row_rewrite = job.full_row_rewrite;
-        if (has_expression_rewrite) {
+        if (validate_constraints) {
+            if (has_expression_rewrite or has_row_rewrite or has_full_row_rewrite) return error.InvalidSchemaRewriteJob;
+        } else if (has_expression_rewrite) {
             if (job.target_column.len == 0 or job.expression == null) return error.InvalidSchemaRewriteExpression;
             if (has_row_rewrite or has_full_row_rewrite) return error.InvalidSchemaRewriteExpression;
         } else if (has_row_rewrite and has_full_row_rewrite) {
@@ -6570,6 +6624,12 @@ pub const DB = struct {
         const runtime_schema = self.core.schema orelse return error.InvalidSchemaUpdateRequest;
         if (runtime_schema.storage_mode != .relational or runtime_schema.relational_columns.len == 0) return error.InvalidSchemaUpdateRequest;
         const column_index_policy = relational_store_mod.ColumnIndexPolicy.fromColumns(runtime_schema.relational_columns);
+
+        if (validate_constraints) {
+            const report = try self.validateRelationalSchemaConstraintsForJobLocked(alloc, runtime_schema, local_range.start, local_range.end);
+            const progress_row_key = try alloc.dupe(u8, local_range.end);
+            return .{ .report = report, .progress_row_key = progress_row_key };
+        }
 
         if (has_expression_rewrite) {
             const expression = job.expression.?;
@@ -6688,6 +6748,50 @@ pub const DB = struct {
         );
         const progress_row_key = try alloc.dupe(u8, local_range.end);
         return .{ .report = report, .progress_row_key = progress_row_key };
+    }
+
+    fn validateRelationalSchemaConstraintsForJobLocked(
+        self: *DB,
+        alloc: Allocator,
+        runtime_schema: schema_mod.TableSchema,
+        lower_doc_key: []const u8,
+        upper_doc_key: []const u8,
+    ) !relational_store_mod.RowRewriteReport {
+        if (runtime_schema.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+
+        const unique_report = try self.reconcileUniqueConstraintRowsInRangeLocked(
+            lower_doc_key,
+            upper_doc_key,
+            .validate,
+        );
+        if (!unique_report.valid()) return error.UniqueConstraintViolation;
+
+        const foreign_key_report = try self.reconcileForeignKeyRefsInRangeLocked(
+            null,
+            lower_doc_key,
+            upper_doc_key,
+            .validate,
+        );
+        if (!foreign_key_report.valid()) return error.ForeignKeyViolation;
+
+        var checks_to_validate = std.ArrayListUnmanaged(schema_mod.RelationalCheck).empty;
+        defer checks_to_validate.deinit(alloc);
+        for (runtime_schema.checks) |check| {
+            if (check.validation_state == .enforced) try checks_to_validate.append(alloc, check);
+        }
+        try self.validateRelationalChecksInRangeLocked(
+            alloc,
+            checks_to_validate.items,
+            lower_doc_key,
+            upper_doc_key,
+        );
+
+        const rows = try relational_store_mod.scanRowsAlloc(alloc, self.core.store, lower_doc_key, upper_doc_key);
+        defer relational_store_mod.freeRows(alloc, rows);
+        return .{
+            .scanned_rows = @intCast(rows.len),
+            .unchanged_rows = @intCast(rows.len),
+        };
     }
 
     fn schemaRewriteRowValueAlloc(
@@ -8009,10 +8113,6 @@ pub const DB = struct {
             }
             break :blk relational_intents.items;
         };
-        if (self.core.schema) |runtime_schema| {
-            if (runtime_schema.system_versioned) try rejectSystemVersionedTableWriteIntents(effective_intents);
-        }
-
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
         for (effective_intents) |intent| {
@@ -8029,14 +8129,6 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
-        if (self.core.schema) |runtime_schema| {
-            if (runtime_schema.system_versioned) {
-                try rejectSystemVersionedTableUserRowMutations(effective_ops.writes, effective_ops.deletes, req.relational_identity_rewrites);
-                if (req.foreign_key_set_null_children.len > 0 or req.foreign_key_cascade_children.len > 0) {
-                    return error.UnsupportedQueryRequest;
-                }
-            }
-        }
         try self.validateForeignKeyConstraintTimingOverrides(req.foreign_key_constraint_timing_overrides);
         if (req.foreign_key_externalized_parent_checks.len > 0) {
             try self.validateExternalizedForeignKeyParentChecks(req.foreign_key_externalized_parent_checks, req.foreign_key_constraint_timing_overrides, effective_ops.writes);
@@ -9367,11 +9459,6 @@ pub const DB = struct {
             for (raw_identity_deletes.items) |key| {
                 if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_deletes.append(self.alloc, key);
             }
-            if (self.core.schema) |runtime_schema| {
-                if (runtime_schema.system_versioned and (identity_upserts.items.len > 0 or identity_deletes.items.len > 0)) {
-                    return error.UnsupportedQueryRequest;
-                }
-            }
             const metadata_mutations = try self.core.collectTransactionIntentMutations(self.alloc, txn_id);
             defer {
                 for (metadata_mutations) |*mutation| mutation.deinit(self.alloc);
@@ -9615,6 +9702,19 @@ pub const DB = struct {
                     return err;
                 };
                 relational_participant_closed = true;
+                if (self.core.schema) |runtime_schema| {
+                    if (runtime_schema.system_versioned) {
+                        try appendSystemVersionedHistoryForTransactionMutations(
+                            self,
+                            mutations,
+                            relational_identity_rewrites,
+                            commit_version,
+                            &relational_extra_writes,
+                            &relational_extra_owned_keys,
+                            &relational_extra_owned_values,
+                        );
+                    }
+                }
                 relational_extra_owned_keys.clearRetainingCapacity();
                 relational_extra_owned_values.clearRetainingCapacity();
             }
@@ -19391,6 +19491,13 @@ pub const DB = struct {
         try admitRelationalRowsSetOperationRowsWithPolicy(plan, rows, .strict);
     }
 
+    pub fn admitRelationalRowsSetOperationRowsAllowSpill(
+        plan: types.RelationalRowsSetOperationPlan,
+        rows: []const []const u8,
+    ) !void {
+        try admitRelationalRowsSetOperationRowsWithPolicy(plan, rows, .allow_spill);
+    }
+
     fn admitRelationalRowsSetOperationRowsWithPolicy(
         plan: types.RelationalRowsSetOperationPlan,
         rows: []const []const u8,
@@ -19413,6 +19520,14 @@ pub const DB = struct {
         observed_bytes: u64,
     ) !void {
         try admitRelationalRowsCteMaterializationWithPolicy(cte, observed_rows, observed_bytes, .strict);
+    }
+
+    pub fn admitRelationalRowsCteMaterializationAllowSpill(
+        cte: types.RelationalRowsCte,
+        observed_rows: usize,
+        observed_bytes: u64,
+    ) !void {
+        try admitRelationalRowsCteMaterializationWithPolicy(cte, observed_rows, observed_bytes, .allow_spill);
     }
 
     const RelationalRowsCteMaterializationPolicy = enum {
@@ -32379,8 +32494,283 @@ fn isUserRowMutationKey(key: []const u8) bool {
     return !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
 }
 
+const system_versioned_history_prefix = "\x00\x00__metadata__:relational-system-history:v1:";
+
+fn appendFixedHexU64(out: []u8, value: u64) void {
+    const hex = "0123456789abcdef";
+    var shift: u6 = 60;
+    for (out[0..16]) |*byte| {
+        byte.* = hex[@as(usize, @intCast((value >> shift) & 0x0f))];
+        if (shift == 0) break;
+        shift -= 4;
+    }
+}
+
+fn appendFixedHexU32(out: []u8, value: u32) void {
+    const hex = "0123456789abcdef";
+    var shift: u5 = 28;
+    for (out[0..8]) |*byte| {
+        byte.* = hex[@as(usize, @intCast((value >> shift) & 0x0f))];
+        if (shift == 0) break;
+        shift -= 4;
+    }
+}
+
+fn systemVersionedHistoryPrefixForDocKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(doc_key.len);
+    const out = try alloc.alloc(u8, system_versioned_history_prefix.len + encoded_len + 1);
+    @memcpy(out[0..system_versioned_history_prefix.len], system_versioned_history_prefix);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(out[system_versioned_history_prefix.len..][0..encoded_len], doc_key);
+    out[out.len - 1] = ':';
+    return out;
+}
+
+fn systemVersionedHistoryKeyAlloc(alloc: Allocator, doc_key: []const u8, sequence: u64, ordinal: u32) ![]u8 {
+    const prefix = try systemVersionedHistoryPrefixForDocKeyAlloc(alloc, doc_key);
+    defer alloc.free(prefix);
+    const out = try alloc.alloc(u8, prefix.len + 16 + 1 + 8);
+    @memcpy(out[0..prefix.len], prefix);
+    appendFixedHexU64(out[prefix.len..][0..16], sequence);
+    out[prefix.len + 16] = ':';
+    appendFixedHexU32(out[prefix.len + 17 ..][0..8], ordinal);
+    return out;
+}
+
+fn systemVersionedHistoryJsonValueAlloc(
+    alloc: Allocator,
+    value: []const u8,
+) ![]u8 {
+    if (value.len > 0 and value[0] == '{') return try alloc.dupe(u8, value);
+    return try mapper.materializeRelationalRowValueAlloc(alloc, value);
+}
+
+fn appendSystemVersionedHistoryRecord(
+    self: *DB,
+    doc_key: []const u8,
+    new_doc_key: ?[]const u8,
+    operation: []const u8,
+    before_json: ?[]const u8,
+    after_json: ?[]const u8,
+    sequence: u64,
+    timestamp_ns: u64,
+    ordinal: *u32,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    const key = try systemVersionedHistoryKeyAlloc(self.alloc, doc_key, sequence, ordinal.*);
+    var key_owned = true;
+    errdefer if (key_owned) self.alloc.free(key);
+    ordinal.* += 1;
+
+    const value = try std.json.Stringify.valueAlloc(self.alloc, .{
+        .version = @as(u32, 1),
+        .operation = operation,
+        .doc_key = doc_key,
+        .new_doc_key = new_doc_key,
+        .commit_sequence = sequence,
+        .transaction_time_ns = timestamp_ns,
+        .before_json = before_json,
+        .after_json = after_json,
+    }, .{ .emit_null_optional_fields = false });
+    var value_owned = true;
+    errdefer if (value_owned) self.alloc.free(value);
+
+    try owned_keys.append(self.alloc, key);
+    key_owned = false;
+    try owned_values.append(self.alloc, value);
+    value_owned = false;
+    try writes.append(self.alloc, .{ .key = key, .value = value });
+}
+
+fn appendSystemVersionedHistoryForBatch(
+    self: *DB,
+    req: types.BatchRequest,
+    sequence: u64,
+    timestamp_ns: u64,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var ordinal: u32 = 0;
+    for (req.writes) |write| {
+        if (!isUserRowMutationKey(write.key)) continue;
+        const before_json = try self.get(self.alloc, write.key);
+        defer if (before_json) |value| self.alloc.free(value);
+        const operation: []const u8 = if (before_json == null) "insert" else "update";
+        const after_json = try systemVersionedHistoryJsonValueAlloc(self.alloc, write.value);
+        defer self.alloc.free(after_json);
+        try appendSystemVersionedHistoryRecord(self, write.key, null, operation, before_json, after_json, sequence, timestamp_ns, &ordinal, writes, owned_keys, owned_values);
+    }
+    for (req.relational_identity_rewrites) |rewrite| {
+        if (!isUserRowMutationKey(rewrite.old_key) or !isUserRowMutationKey(rewrite.new_key)) continue;
+        const before_json = try self.get(self.alloc, rewrite.old_key);
+        defer if (before_json) |value| self.alloc.free(value);
+        const after_json = try systemVersionedHistoryJsonValueAlloc(self.alloc, rewrite.value);
+        defer self.alloc.free(after_json);
+        try appendSystemVersionedHistoryRecord(self, rewrite.old_key, rewrite.new_key, "identity_rewrite", before_json, after_json, sequence, timestamp_ns, &ordinal, writes, owned_keys, owned_values);
+    }
+    for (req.deletes) |key| {
+        if (!isUserRowMutationKey(key)) continue;
+        const before_json = try self.get(self.alloc, key);
+        defer if (before_json) |value| self.alloc.free(value);
+        if (before_json == null) continue;
+        try appendSystemVersionedHistoryRecord(self, key, null, "delete", before_json, null, sequence, timestamp_ns, &ordinal, writes, owned_keys, owned_values);
+    }
+}
+
+fn appendSystemVersionedHistoryForTransactionMutations(
+    self: *DB,
+    mutations: []const transactions_mod.OwnedIntentMutation,
+    rewrites: []const types.RelationalIdentityRewrite,
+    commit_version: u64,
+    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
+    owned_keys: *std.ArrayListUnmanaged([]u8),
+    owned_values: *std.ArrayListUnmanaged([]u8),
+) !void {
+    var ordinal: u32 = 0;
+    for (rewrites) |rewrite| {
+        if (!isUserRowMutationKey(rewrite.old_key) or !isUserRowMutationKey(rewrite.new_key)) continue;
+        const before_json = try self.get(self.alloc, rewrite.old_key);
+        defer if (before_json) |value| self.alloc.free(value);
+        const after_json = try systemVersionedHistoryJsonValueAlloc(self.alloc, rewrite.value);
+        defer self.alloc.free(after_json);
+        try appendSystemVersionedHistoryRecord(self, rewrite.old_key, rewrite.new_key, "identity_rewrite", before_json, after_json, commit_version, commit_version, &ordinal, writes, owned_keys, owned_values);
+    }
+    for (mutations) |mutation| {
+        if (!isUserRowMutationKey(mutation.key)) continue;
+        if (isRelationalIdentityRewriteEndpoint(rewrites, mutation.key)) continue;
+        const before_json = try self.get(self.alloc, mutation.key);
+        defer if (before_json) |value| self.alloc.free(value);
+        if (mutation.value) |raw_after| {
+            const operation: []const u8 = if (before_json == null) "insert" else "update";
+            const after_json = try systemVersionedHistoryJsonValueAlloc(self.alloc, raw_after);
+            defer self.alloc.free(after_json);
+            try appendSystemVersionedHistoryRecord(self, mutation.key, null, operation, before_json, after_json, commit_version, commit_version, &ordinal, writes, owned_keys, owned_values);
+        } else {
+            if (before_json == null) continue;
+            try appendSystemVersionedHistoryRecord(self, mutation.key, null, "delete", before_json, null, commit_version, commit_version, &ordinal, writes, owned_keys, owned_values);
+        }
+    }
+}
+
+const SystemVersionedHistoryEvent = struct {
+    index: usize,
+    commit_sequence: u64,
+};
+
+fn systemVersionedHistoryEventLessThan(history: []const docstore_mod.OwnedKVPair, lhs: SystemVersionedHistoryEvent, rhs: SystemVersionedHistoryEvent) bool {
+    if (lhs.commit_sequence != rhs.commit_sequence) return lhs.commit_sequence < rhs.commit_sequence;
+    return std.mem.lessThan(u8, history[lhs.index].key, history[rhs.index].key);
+}
+
+fn systemVersionedHistoryRecordCommitSequence(value: []const u8) !u64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, value, .{}) catch return error.InvalidSystemVersionedHistoryRecord;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSystemVersionedHistoryRecord;
+    const sequence_value = parsed.value.object.get("commit_sequence") orelse return error.InvalidSystemVersionedHistoryRecord;
+    return jsonUnsignedU64(sequence_value) orelse error.InvalidSystemVersionedHistoryRecord;
+}
+
+fn reconstructSystemVersionedRowsAsOfSequenceAlloc(
+    alloc: Allocator,
+    history: []const docstore_mod.OwnedKVPair,
+    commit_sequence: u64,
+    rows_by_key: *std.StringHashMapUnmanaged([]u8),
+) !void {
+    var events = std.ArrayListUnmanaged(SystemVersionedHistoryEvent).empty;
+    defer events.deinit(alloc);
+
+    for (history, 0..) |record, i| {
+        const sequence = try systemVersionedHistoryRecordCommitSequence(record.value);
+        if (sequence > commit_sequence) continue;
+        try events.append(alloc, .{ .index = i, .commit_sequence = sequence });
+    }
+
+    std.sort.pdq(SystemVersionedHistoryEvent, events.items, history, systemVersionedHistoryEventLessThan);
+
+    for (events.items) |event| {
+        try applySystemVersionedHistoryRecordAlloc(alloc, history[event.index].value, rows_by_key);
+    }
+}
+
+fn applySystemVersionedHistoryRecordAlloc(
+    alloc: Allocator,
+    value: []const u8,
+    rows_by_key: *std.StringHashMapUnmanaged([]u8),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch return error.InvalidSystemVersionedHistoryRecord;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSystemVersionedHistoryRecord;
+    const object = parsed.value.object;
+    const operation = jsonObjectString(object, "operation") orelse return error.InvalidSystemVersionedHistoryRecord;
+    const doc_key = jsonObjectString(object, "doc_key") orelse return error.InvalidSystemVersionedHistoryRecord;
+    if (std.mem.eql(u8, operation, "delete")) {
+        removeSystemVersionedRow(alloc, rows_by_key, doc_key);
+        return;
+    }
+
+    const after_json = jsonObjectString(object, "after_json") orelse return error.InvalidSystemVersionedHistoryRecord;
+    if (std.mem.eql(u8, operation, "identity_rewrite")) {
+        removeSystemVersionedRow(alloc, rows_by_key, doc_key);
+        const new_doc_key = jsonObjectString(object, "new_doc_key") orelse doc_key;
+        try putSystemVersionedRowAlloc(alloc, rows_by_key, new_doc_key, after_json);
+        return;
+    }
+    if (std.mem.eql(u8, operation, "insert") or std.mem.eql(u8, operation, "update")) {
+        try putSystemVersionedRowAlloc(alloc, rows_by_key, doc_key, after_json);
+        return;
+    }
+    return error.InvalidSystemVersionedHistoryRecord;
+}
+
+fn jsonUnsignedU64(value: std.json.Value) ?u64 {
+    return switch (value) {
+        .integer => |raw| if (raw >= 0) @intCast(raw) else null,
+        .number_string => |raw| std.fmt.parseUnsigned(u64, raw, 10) catch null,
+        else => null,
+    };
+}
+
+fn putSystemVersionedRowAlloc(
+    alloc: Allocator,
+    rows_by_key: *std.StringHashMapUnmanaged([]u8),
+    doc_key: []const u8,
+    row_json: []const u8,
+) !void {
+    removeSystemVersionedRow(alloc, rows_by_key, doc_key);
+    const owned_key = try alloc.dupe(u8, doc_key);
+    errdefer alloc.free(owned_key);
+    const owned_value = try alloc.dupe(u8, row_json);
+    errdefer alloc.free(owned_value);
+    try rows_by_key.put(alloc, owned_key, owned_value);
+}
+
+fn removeSystemVersionedRow(
+    alloc: Allocator,
+    rows_by_key: *std.StringHashMapUnmanaged([]u8),
+    doc_key: []const u8,
+) void {
+    if (rows_by_key.fetchRemove(doc_key)) |removed| {
+        alloc.free(@constCast(removed.key));
+        alloc.free(removed.value);
+    }
+}
+
+fn freeSystemVersionedRowsByKey(
+    alloc: Allocator,
+    rows_by_key: *std.StringHashMapUnmanaged([]u8),
+) void {
+    var it = rows_by_key.iterator();
+    while (it.next()) |entry| {
+        alloc.free(@constCast(entry.key_ptr.*));
+        alloc.free(entry.value_ptr.*);
+    }
+    rows_by_key.deinit(alloc);
+}
+
 fn rejectSystemVersionedRelationalMutation(runtime_schema: schema_mod.TableSchema) !void {
-    if (runtime_schema.system_versioned) return error.UnsupportedQueryRequest;
+    _ = runtime_schema;
 }
 
 fn rejectSystemVersionedTableUserRowMutations(
@@ -45046,6 +45436,57 @@ test "db executes claimed schema rewrite job expressions over relational rows" {
     var stale = job;
     stale.schema_generation = 99;
     try std.testing.expectError(error.InvalidSchemaRewriteGeneration, db.executeClaimedSchemaRewriteJob(alloc, stale));
+}
+
+test "db executes claimed schema validation jobs over relational rows" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const schema_v1 =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","status","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id","status","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_email_key","columns":["email"],"validation_state":"enforced"}],"checks":[{"name":"users_status_known","field":"status","op":"eq","value":"active","validation_state":"enforced"}]}
+    ;
+
+    try db.applyTableSchemaJson(alloc, schema_v1, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"id\":\"a\",\"status\":\"active\",\"email\":\"a@example.test\"}" }},
+    });
+    try db.applyTableSchemaJson(alloc, schema_v2, .{});
+
+    const job = metadata_table_manager.SchemaRewriteJobRecord{
+        .job_id = 47,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_v2),
+        .action = "validate",
+        .reason = "constraints",
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = metadata_table_manager.schema_rewrite_running,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 10_000,
+    };
+
+    var result = try db.executeClaimedSchemaRewriteJob(alloc, job);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), result.report.scanned_rows);
+    try std.testing.expectEqual(@as(u64, 0), result.report.rewritten_rows);
+    try std.testing.expectEqual(@as(u64, 1), result.report.unchanged_rows);
+    try std.testing.expectEqualStrings("", result.progress_row_key);
+    const finish = result.finishRequest(job);
+    try std.testing.expectEqual(@as(u64, 1), finish.completed_row_count);
+
+    var invalid_payload = job;
+    invalid_payload.target_column = "status";
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, db.executeClaimedSchemaRewriteJob(alloc, invalid_payload));
 }
 
 test "db executes claimed full schema rewrite jobs over relational rows" {
@@ -80801,7 +81242,7 @@ test "db relational composite primary keys enforce identity and back foreign key
     try std.testing.expect(report.valid());
 }
 
-test "db system-versioned relational tables reject ordinary row mutations until native history exists" {
+test "db system-versioned relational tables capture durable row history" {
     const alloc = std.testing.allocator;
 
     var path_buf: [256]u8 = undefined;
@@ -80836,25 +81277,58 @@ test "db system-versioned relational tables reject ordinary row mutations until 
     try std.testing.expect(versioned_runtime_schema.system_versioned);
     try db.setSchema(versioned_runtime_schema);
 
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.batch(.{
-        .writes = &.{.{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"blocked\"}" }},
-    }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.batch(.{
-        .deletes = &.{"row:1"},
-    }));
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"batch\"}" },
+            .{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"inserted\"}" },
+        },
+    });
+    try db.batch(.{
+        .deletes = &.{"row:2"},
+    });
+
+    const row_1_history = try db.scanSystemVersionedHistoryForDocKeyAlloc(alloc, "row:1");
+    defer docstore_mod.DocStore.freeResults(alloc, row_1_history);
+    try std.testing.expectEqual(@as(usize, 1), row_1_history.len);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_history[0].value, "\"operation\":\"update\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_history[0].value, "before") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_history[0].value, "batch") != null);
+
+    const row_2_history = try db.scanSystemVersionedHistoryForDocKeyAlloc(alloc, "row:2");
+    defer docstore_mod.DocStore.freeResults(alloc, row_2_history);
+    try std.testing.expectEqual(@as(usize, 2), row_2_history.len);
+    try std.testing.expect(std.mem.indexOf(u8, row_2_history[0].value, "\"operation\":\"insert\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row_2_history[1].value, "\"operation\":\"delete\"") != null);
+
+    const row_2_insert_sequence = try systemVersionedHistoryRecordCommitSequence(row_2_history[0].value);
+    const row_2_delete_sequence = try systemVersionedHistoryRecordCommitSequence(row_2_history[1].value);
+    const row_2_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "id",
+        .op = .eq,
+        .value_json = "\"row:2\"",
+    }};
+    var row_2_as_of_insert = try db.querySystemVersionedRelationalRowsAsOfSequence(alloc, versioned_runtime_schema, row_2_insert_sequence, .{
+        .predicates = row_2_predicates[0..],
+        .select_all = true,
+    });
+    defer row_2_as_of_insert.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), row_2_as_of_insert.total);
+    try std.testing.expect(std.mem.indexOf(u8, row_2_as_of_insert.rows[0], "inserted") != null);
+    var row_2_as_of_delete = try db.querySystemVersionedRelationalRowsAsOfSequence(alloc, versioned_runtime_schema, row_2_delete_sequence, .{
+        .predicates = row_2_predicates[0..],
+        .select_all = true,
+    });
+    defer row_2_as_of_delete.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), row_2_as_of_delete.total);
 
     const txn_id = try db.beginTransaction(20_000);
-    defer db.abortTransaction(txn_id, 20_001) catch {};
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.writeTransaction(txn_id, .{
-        .writes = &.{.{ .key = "row:txn", .value = "{\"id\":\"row:txn\",\"name\":\"blocked\"}" }},
-    }));
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.writeIntents(txn_id, &.{.{
-        .key = "row:intent",
-        .value = "{\"id\":\"row:intent\",\"name\":\"blocked\"}",
-    }}, &.{}));
+    try db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"txn\"}" }},
+    });
+    try db.commitTransaction(txn_id, 20_001);
 
     const mutation_txn_id = try db.beginTransaction(30_000);
-    defer db.abortTransaction(mutation_txn_id, 30_001) catch {};
     const predicates = [_]schema_mod.RelationalCheck{.{
         .name = "",
         .field = "id",
@@ -80866,7 +81340,7 @@ test "db system-versioned relational tables reject ordinary row mutations until 
         .path = "name",
         .value_json = "\"after\"",
     }};
-    try std.testing.expectError(error.UnsupportedQueryRequest, db.mutateRelationalRowsFromSource(alloc, versioned_runtime_schema, .{
+    var mutation_result = try db.mutateRelationalRowsFromSource(alloc, versioned_runtime_schema, .{
         .kind = .update,
         .source = .{
             .predicates = predicates[0..],
@@ -80877,11 +81351,36 @@ test "db system-versioned relational tables reject ordinary row mutations until 
             },
         },
         .operations = operations[0..],
-    }));
+    });
+    defer mutation_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), mutation_result.staged);
+    try db.commitTransaction(mutation_txn_id, 30_001);
 
-    const preserved = (try db.get(alloc, "row:1")) orelse return error.TestExpectedEqual;
-    defer alloc.free(preserved);
-    try std.testing.expect(std.mem.indexOf(u8, preserved, "\"before\"") != null);
+    const current = (try db.get(alloc, "row:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(current);
+    try std.testing.expect(std.mem.indexOf(u8, current, "\"after\"") != null);
+
+    const row_1_final_history = try db.scanSystemVersionedHistoryForDocKeyAlloc(alloc, "row:1");
+    defer docstore_mod.DocStore.freeResults(alloc, row_1_final_history);
+    try std.testing.expectEqual(@as(usize, 3), row_1_final_history.len);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_final_history[1].value, "txn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_final_history[2].value, "after") != null);
+    const row_1_txn_sequence = try systemVersionedHistoryRecordCommitSequence(row_1_final_history[1].value);
+    const row_1_predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "id",
+        .op = .eq,
+        .value_json = "\"row:1\"",
+    }};
+    var row_1_as_of_txn = try db.querySystemVersionedRelationalRowsAsOfSequence(alloc, versioned_runtime_schema, row_1_txn_sequence, .{
+        .predicates = row_1_predicates[0..],
+        .select_all = true,
+    });
+    defer row_1_as_of_txn.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), row_1_as_of_txn.total);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_as_of_txn.rows[0], "txn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row_1_as_of_txn.rows[0], "after") == null);
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.querySystemVersionedRelationalRowsAsOfSequence(alloc, base_runtime_schema, row_1_txn_sequence, .{}));
 }
 
 test "db relational temporal primary keys enforce without-overlaps intervals" {
