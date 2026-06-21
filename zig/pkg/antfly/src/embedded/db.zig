@@ -402,7 +402,7 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expectEqualStrings("native_single_file", status.storage.engine);
     try std.testing.expectEqualStrings("__antfly_lite", status.storage.index_namespace.?);
     try std.testing.expectEqual(@as(?u32, 1), status.storage.format_version);
-    try std.testing.expect(status.storage.page_size != null);
+    try std.testing.expectEqual(@as(?u32, 4096), status.storage.page_size);
     try std.testing.expect(status.storage.active_checkpoint != null);
     try std.testing.expectEqual(@as(u64, 1), status.stats.doc_count);
     try std.testing.expect(!status.pending_work.has_async_indexes);

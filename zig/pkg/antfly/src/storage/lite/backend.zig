@@ -761,6 +761,10 @@ test "lite backend auto rejects internal bridge aflite files" {
         var handle = try Handle.open(allocator, path, .{ .engine = .bridge_lsm_container });
         defer handle.deinit();
         try std.testing.expectEqual(EngineKind.bridge_lsm_container, handle.engine);
+        const status = handle.storageStatus();
+        try std.testing.expectEqualStrings("aflite-internal", status.format);
+        try std.testing.expectEqualStrings("bridge_lsm_container", status.engine);
+        try std.testing.expect(status.index_namespace == null);
     }
 
     try std.testing.expectError(error.TruncatedNativeHeader, Handle.open(allocator, path, .{}));

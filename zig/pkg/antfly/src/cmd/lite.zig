@@ -2327,6 +2327,8 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_layout\":\"lsm_logical_files_in_native_index_catalog\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"index_namespace\":\"__antfly_lite\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"format_version\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"page_size\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"active_checkpoint\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"checkpoint_sequence\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"stats\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"pending_work\":") != null);
