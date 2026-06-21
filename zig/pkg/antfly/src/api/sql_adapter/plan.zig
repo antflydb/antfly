@@ -376,6 +376,7 @@ pub const LoweredWindowPlan = struct {
 pub const LoweredInsert = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
+    sync_level: db_mod.types.SyncLevel = .write,
     returning_expression_count: usize = 0,
     returning_all: bool = false,
     conflict_where: bool = false,
@@ -391,6 +392,7 @@ pub const LoweredInsertSource = struct {
     table_name: []const u8,
     ctes: []const db_mod.types.RelationalRowsCte = &.{},
     insert_source: relational_rows.OwnedRowsInsertSourceRequest,
+    sync_level: db_mod.types.SyncLevel = .write,
     returning_expression_count: usize = 0,
     returning_all: bool = false,
     conflict_where: bool = false,
@@ -432,6 +434,7 @@ pub const LoweredRecursiveJoinedMutationSource = struct {
 pub const LoweredMutation = struct {
     table_name: []const u8,
     batch: relational_rows.OwnedRowsBatchRequest,
+    sync_level: db_mod.types.SyncLevel = .write,
     returning_expression_count: usize = 0,
     returning_all: bool = false,
 
@@ -445,6 +448,7 @@ pub const LoweredMutation = struct {
 pub const LoweredMutationSource = struct {
     table_name: []const u8,
     mutation: relational_rows.OwnedRowsMutationSourceRequest,
+    sync_level: db_mod.types.SyncLevel = .write,
     restart_identity: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -458,6 +462,7 @@ pub const LoweredJoinedMutationSource = struct {
     target_table_name: []const u8,
     source_table_name: []const u8,
     mutation: relational_rows.OwnedRowsJoinedMutationSourceRequest,
+    sync_level: db_mod.types.SyncLevel = .write,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.target_table_name);
@@ -472,6 +477,7 @@ pub const LowerWritePlanOptions = struct {
     row_claim: ?db_mod.types.RowClaimRequest = null,
     joined_source_schema: ?runtime_schema.TableSchema = null,
     insert_source_schema: ?runtime_schema.TableSchema = null,
+    sync_level: db_mod.types.SyncLevel = .write,
 };
 
 pub const ReturningProjection = struct {
@@ -544,6 +550,7 @@ pub const LoweredMergeMutationPlan = struct {
     matched_arms: []const MergeMatchedArm = &.{},
     not_matched_arms: []const MergeNotMatchedArm = &.{},
     returning: ReturningProjection = .{},
+    sync_level: db_mod.types.SyncLevel = .write,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.target_table_name);
@@ -610,6 +617,44 @@ pub const LoweredWritePlan = union(enum) {
     }
 };
 
+fn applyRowsBatchSyncLevel(batch: *relational_rows.OwnedRowsBatchRequest, sync_level: db_mod.types.SyncLevel) void {
+    batch.req.sync_level = sync_level;
+}
+
+fn applyLoweredWritePlanSyncLevel(plan: *LoweredWritePlan, sync_level: db_mod.types.SyncLevel) void {
+    switch (plan.*) {
+        .insert => |*insert| {
+            insert.sync_level = sync_level;
+            applyRowsBatchSyncLevel(&insert.batch, sync_level);
+        },
+        .insert_source => |*insert_source| insert_source.sync_level = sync_level,
+        .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.insert_source.sync_level = sync_level,
+        .update => |*update| {
+            update.sync_level = sync_level;
+            applyRowsBatchSyncLevel(&update.batch, sync_level);
+        },
+        .delete => |*delete| {
+            delete.sync_level = sync_level;
+            applyRowsBatchSyncLevel(&delete.batch, sync_level);
+        },
+        .update_source => |*update_source| update_source.sync_level = sync_level,
+        .delete_source => |*delete_source| delete_source.sync_level = sync_level,
+        .truncate_source => |*truncate_source| truncate_source.sync_level = sync_level,
+        .update_joined_source => |*update_joined_source| update_joined_source.sync_level = sync_level,
+        .delete_joined_source => |*delete_joined_source| delete_joined_source.sync_level = sync_level,
+        .recursive_update_joined_source => |*recursive_update_joined_source| recursive_update_joined_source.mutation.sync_level = sync_level,
+        .recursive_delete_joined_source => |*recursive_delete_joined_source| recursive_delete_joined_source.mutation.sync_level = sync_level,
+        .merge_mutation => |*merge_mutation| merge_mutation.sync_level = sync_level,
+        .recursive_merge_mutation => |*recursive_merge_mutation| recursive_merge_mutation.merge.sync_level = sync_level,
+    }
+}
+
+fn loweredWritePlanWithSyncLevel(plan: LoweredWritePlan, sync_level: db_mod.types.SyncLevel) LoweredWritePlan {
+    var owned = plan;
+    applyLoweredWritePlanSyncLevel(&owned, sync_level);
+    return owned;
+}
+
 pub fn sqlWritePlanFallbackAllowed(err: anyerror) bool {
     return err == error.UnsupportedSqlShape or
         err == error.UnsupportedRowsSelector or
@@ -654,7 +699,7 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
         if (has_recursive_insert_source) {
             const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
             const source_schema = options.insert_source_schema orelse schema;
-            return .{ .recursive_insert_source = try hooks.lower_recursive_insert_source(hooks.ptr, source_schema, resolver) };
+            return loweredWritePlanWithSyncLevel(.{ .recursive_insert_source = try hooks.lower_recursive_insert_source(hooks.ptr, source_schema, resolver) }, options.sync_level);
         }
     } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
         return err;
@@ -663,12 +708,12 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
     if (options.row_claim) |row_claim| {
         const source_schema = options.joined_source_schema orelse schema;
         if (hooks.lower_recursive_update_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
-            return .{ .recursive_update_joined_source = lowered };
+            return loweredWritePlanWithSyncLevel(.{ .recursive_update_joined_source = lowered }, options.sync_level);
         } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
             return err;
         }
         if (hooks.lower_recursive_delete_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
-            return .{ .recursive_delete_joined_source = lowered };
+            return loweredWritePlanWithSyncLevel(.{ .recursive_delete_joined_source = lowered }, options.sync_level);
         } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
             return err;
         }
@@ -677,7 +722,7 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
     {
         const source_schema = options.joined_source_schema orelse schema;
         if (hooks.lower_recursive_merge_mutation(hooks.ptr, source_schema)) |lowered| {
-            return .{ .recursive_merge_mutation = lowered };
+            return loweredWritePlanWithSyncLevel(.{ .recursive_merge_mutation = lowered }, options.sync_level);
         } else |err| if (!sqlWritePlanFallbackAllowed(err)) {
             return err;
         }
@@ -708,18 +753,18 @@ pub fn lowerWritePlanWithHooksAlloc(
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
         var point_insert_err: ?anyerror = null;
         if (hooks.lower_insert(hooks.ptr, resolver)) |lowered| {
-            return .{ .insert = lowered };
+            return loweredWritePlanWithSyncLevel(.{ .insert = lowered }, options.sync_level);
         } else |err| {
             if (!sqlWritePlanFallbackAllowed(err)) return err;
             point_insert_err = err;
         }
         if (options.insert_source_schema) |source_schema| {
             if (hooks.lower_insert_source_with_schema(hooks.ptr, source_schema, resolver)) |lowered| {
-                return .{ .insert_source = lowered };
+                return loweredWritePlanWithSyncLevel(.{ .insert_source = lowered }, options.sync_level);
             } else |err| return writePlanFallbackError(point_insert_err, err);
         }
         if (hooks.lower_insert_source(hooks.ptr, resolver)) |lowered| {
-            return .{ .insert_source = lowered };
+            return loweredWritePlanWithSyncLevel(.{ .insert_source = lowered }, options.sync_level);
         } else |err| {
             return writePlanFallbackError(point_insert_err, err);
         }
@@ -728,27 +773,27 @@ pub fn lowerWritePlanWithHooksAlloc(
     if (write_kind == .insert_source) {
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
         if (options.insert_source_schema) |source_schema| {
-            return .{ .insert_source = try hooks.lower_insert_source_with_schema(hooks.ptr, source_schema, resolver) };
+            return loweredWritePlanWithSyncLevel(.{ .insert_source = try hooks.lower_insert_source_with_schema(hooks.ptr, source_schema, resolver) }, options.sync_level);
         }
-        return .{ .insert_source = try hooks.lower_insert_source(hooks.ptr, resolver) };
+        return loweredWritePlanWithSyncLevel(.{ .insert_source = try hooks.lower_insert_source(hooks.ptr, resolver) }, options.sync_level);
     }
 
     if (write_kind == .update) {
         if (options.row_claim) |row_claim| {
             const source_schema = options.joined_source_schema orelse schema;
             if (hooks.lower_update_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
-                return .{ .update_joined_source = lowered };
+                return loweredWritePlanWithSyncLevel(.{ .update_joined_source = lowered }, options.sync_level);
             } else |err| {
                 if (!sqlWritePlanFallbackAllowed(err)) return err;
             }
         }
         if (options.unique_resolver) |resolver| {
             if (hooks.lower_update(hooks.ptr, resolver)) |lowered| {
-                return .{ .update = lowered };
+                return loweredWritePlanWithSyncLevel(.{ .update = lowered }, options.sync_level);
             } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
         }
         if (options.row_claim) |row_claim| {
-            return .{ .update_source = try hooks.lower_update_source(hooks.ptr, row_claim) };
+            return loweredWritePlanWithSyncLevel(.{ .update_source = try hooks.lower_update_source(hooks.ptr, row_claim) }, options.sync_level);
         }
         return error.UnsupportedRowsSelector;
     }
@@ -757,28 +802,28 @@ pub fn lowerWritePlanWithHooksAlloc(
         if (options.row_claim) |row_claim| {
             const source_schema = options.joined_source_schema orelse schema;
             if (hooks.lower_delete_joined_source(hooks.ptr, source_schema, row_claim)) |lowered| {
-                return .{ .delete_joined_source = lowered };
+                return loweredWritePlanWithSyncLevel(.{ .delete_joined_source = lowered }, options.sync_level);
             } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
         }
         if (options.unique_resolver) |resolver| {
             if (hooks.lower_delete(hooks.ptr, resolver)) |lowered| {
-                return .{ .delete = lowered };
+                return loweredWritePlanWithSyncLevel(.{ .delete = lowered }, options.sync_level);
             } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
         }
         if (options.row_claim) |row_claim| {
-            return .{ .delete_source = try hooks.lower_delete_source(hooks.ptr, row_claim) };
+            return loweredWritePlanWithSyncLevel(.{ .delete_source = try hooks.lower_delete_source(hooks.ptr, row_claim) }, options.sync_level);
         }
         return error.UnsupportedRowsSelector;
     }
 
     if (write_kind == .truncate) {
         const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
-        return .{ .truncate_source = try hooks.lower_truncate_source(hooks.ptr, row_claim) };
+        return loweredWritePlanWithSyncLevel(.{ .truncate_source = try hooks.lower_truncate_source(hooks.ptr, row_claim) }, options.sync_level);
     }
 
     if (write_kind == .merge) {
         const source_schema = options.joined_source_schema orelse schema;
-        return .{ .merge_mutation = try hooks.lower_merge_mutation(hooks.ptr, source_schema) };
+        return loweredWritePlanWithSyncLevel(.{ .merge_mutation = try hooks.lower_merge_mutation(hooks.ptr, source_schema) }, options.sync_level);
     }
 
     return error.UnsupportedSqlShape;

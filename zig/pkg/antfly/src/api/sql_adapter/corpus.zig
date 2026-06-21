@@ -5946,8 +5946,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_delete_joined_source: bool = false,
     unsupported_merge_mutation: bool = false,
     query_calendar_interval_expression: bool = false,
-    unsupported_read_duplicate_output_name: bool = false,
-    unsupported_read_aggregate_duplicate_output_name: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
@@ -7140,9 +7138,6 @@ pub const AppParityCorpusCoverage = struct {
             },
         }
         if (entry.family == .unsupported_read) {
-            self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
-            self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
-                std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);

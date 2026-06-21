@@ -667,8 +667,6 @@
     "unsupported_insert",
     "unsupported_merge_mutation",
     "unsupported_read",
-    "unsupported_read_aggregate_duplicate_output_name",
-    "unsupported_read_duplicate_output_name",
     "unsupported_read_row_lock_target",
     "unsupported_read_set_operation_output_shape",
     "unsupported_unvalidated_unique_conflict_target",

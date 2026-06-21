@@ -21966,7 +21966,7 @@ test "lowered sql insert source plans build batches from routed scans" {
         "WITH open_orders AS (SELECT id, status, amount FROM orders WHERE status = 'OPEN') INSERT INTO order_copies (id, status_key, amount) SELECT id || '_copy' AS id, lower(status), amount FROM open_orders ORDER BY id ASC RETURNING id, status_key, amount",
         target_schema,
         &.{},
-        .{ .unique_resolver = NoConflictResolver.resolver() },
+        .{ .unique_resolver = NoConflictResolver.resolver(), .sync_level = .full_index },
         catalog.iface(),
     );
     defer lowered.deinit(alloc);
@@ -21979,6 +21979,7 @@ test "lowered sql insert source plans build batches from routed scans" {
             const plan: db_mod.types.RelationalRowsInsertSourcePlan = .{
                 .ctes = insert_source.ctes,
                 .insert_source = insert_source.insert_source.req,
+                .sync_level = insert_source.sync_level,
             };
             var batch = (try rowsInsertSourcePlanBatchFromRoutedScansWithSchemasAlloc(
                 alloc,
@@ -21994,6 +21995,8 @@ test "lowered sql insert source plans build batches from routed scans" {
             defer batch.deinit(alloc);
 
             try std.testing.expectEqual(@as(usize, 1), fake.scan_calls);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, insert_source.sync_level);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, batch.req.sync_level);
             try std.testing.expectEqual(@as(u32, 2), batch.inserted);
             try std.testing.expectEqual(@as(usize, 2), batch.returning_rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"o1_copy\",\"status_key\":\"open\",\"amount\":10}", batch.returning_rows[0]);

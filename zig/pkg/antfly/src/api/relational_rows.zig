@@ -483,7 +483,7 @@ pub fn buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
     var final_source_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, final_source_schema, final_source_query, final_source_rows, final_source_ranges);
     defer final_source_result.deinit(alloc);
 
-    return try buildRowsInsertSourceBatchWithSchemasAlloc(
+    var batch = try buildRowsInsertSourceBatchWithSchemasAlloc(
         alloc,
         table_name,
         target_schema,
@@ -492,6 +492,8 @@ pub fn buildRowsInsertSourcePlanBatchOnJsonRowsAlloc(
         final_source_result.rows,
         conflict_resolver,
     );
+    batch.req.sync_level = plan.sync_level;
+    return batch;
 }
 
 pub fn buildRowsInsertSourcePlanBatchFromDbAlloc(
@@ -2664,7 +2666,11 @@ pub fn parseRowsInsertSourcePlanRequestWithSchemas(
     }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "ctes", "ranges", "insert_source" });
+    try requireJsonObjectOnlyKeys(parsed.value.object, &.{ "ctes", "ranges", "insert_source", "sync_level" });
+    const sync_level = if (parsed.value.object.get("sync_level")) |value|
+        db_mod.types.parsePublicSyncLevelJson(value) orelse return error.InvalidRowsRequest
+    else
+        db_mod.types.SyncLevel.write;
 
     const ctes = try parseRowsCtesAlloc(alloc, base_source_schema, parsed.value.object.get("ctes"));
     errdefer freeRowsCtes(alloc, ctes);
@@ -2689,6 +2695,7 @@ pub fn parseRowsInsertSourcePlanRequestWithSchemas(
         .ctes = ctes,
         .ranges = ranges,
         .insert_source = insert_source.req,
+        .sync_level = sync_level,
     };
 }
 
@@ -26946,7 +26953,7 @@ test "relational rows insert source contract parses typed source assignments" {
 
     var insert_source_plan = try parseRowsInsertSourcePlanRequest(
         std.testing.allocator,
-        "{\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"READY\"},\"select\":[\"source_id\",\"status\",\"amount\"]}}],\"insert_source\":{\"op\":\"insert\",\"source\":{\"source_cte\":\"ready_sources\",\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"source_id\"}},{\"target_field\":\"status\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}},{\"target_field\":\"amount\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":1}]}}],\"returning\":[\"id\",\"status\"]}}",
+        "{\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"READY\"},\"select\":[\"source_id\",\"status\",\"amount\"]}}],\"insert_source\":{\"op\":\"insert\",\"source\":{\"source_cte\":\"ready_sources\",\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"source_id\"}},{\"target_field\":\"status\",\"expr\":{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]}},{\"target_field\":\"amount\",\"expr\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"value\":1}]}}],\"returning\":[\"id\",\"status\"]},\"sync_level\":\"full_text\"}",
         schema,
     );
     defer insert_source_plan.deinit(std.testing.allocator);
@@ -26954,6 +26961,7 @@ test "relational rows insert source contract parses typed source assignments" {
     try std.testing.expectEqualStrings("ready_sources", insert_source_plan.insert_source.source.source_cte);
     try std.testing.expectEqual(@as(usize, 3), insert_source_plan.insert_source.assignments.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source_plan.insert_source.assignments[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert_source_plan.sync_level);
     const base_source_rows = [_][]const u8{
         "{\"id\":\"base1\",\"source_id\":\"s1\",\"status\":\"READY\",\"amount\":7}",
         "{\"id\":\"base2\",\"source_id\":\"s2\",\"status\":\"archived\",\"amount\":99}",
@@ -26969,6 +26977,7 @@ test "relational rows insert source contract parses typed source assignments" {
     );
     defer plan_batch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), plan_batch.writes.len);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, plan_batch.req.sync_level);
     try std.testing.expectEqualStrings("{\"id\":\"s1\",\"status\":\"ready\",\"amount\":8}", plan_batch.writes[0].value);
     try std.testing.expectEqual(@as(usize, 1), plan_batch.returning_rows.len);
     try std.testing.expectEqualStrings("{\"id\":\"s1\",\"status\":\"ready\"}", plan_batch.returning_rows[0]);
@@ -26976,6 +26985,11 @@ test "relational rows insert source contract parses typed source assignments" {
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsInsertSourcePlanRequest(
         std.testing.allocator,
         "{\"ctes\":[{\"name\":\"ready_sources\",\"query\":{\"select\":[\"source_id\"]}}],\"insert_source\":{\"op\":\"insert\",\"source\":{\"source_cte\":\"ready_sources\"},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"missing_source_id\"}}]}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsInsertSourcePlanRequest(
+        std.testing.allocator,
+        "{\"insert_source\":{\"op\":\"insert\",\"source\":{\"select_all\":true},\"assignments\":[{\"target_field\":\"id\",\"expr\":{\"field\":\"source_id\"}}]},\"sync_level\":\"eventual\"}",
         schema,
     ));
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsInsertSourcePlanRequest(

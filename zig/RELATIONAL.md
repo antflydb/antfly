@@ -341,6 +341,63 @@ without changing primary-key `upsert` semantics. `rows/get` accepts an array of
 primary or unique selectors and returns the structured identity, row JSON,
 version, and optional `physical_key`.
 
+#### Write sync levels
+
+Relational row writes use the same public `sync_level` contract as the document
+batch API. `rows/batch` accepts top-level `sync_level` with the public values
+`propose`, `write`, `full_text`, `enrichments`, `aknn`, and `full_index`;
+`aknn` is accepted as a compatibility alias for `full_index` at the API/parser
+boundary. The value is a write-completion requirement, not table schema
+metadata. It controls how far the write path must advance before returning:
+Raft proposal acceptance, durable base-row write, full-text visibility,
+synchronous enrichment generation, or complete derived-index visibility.
+
+REST/SDK `rows/batch` keeps the existing batch default of `propose` when the
+field is omitted:
+
+```json
+{
+  "sync_level": "full_index",
+  "operations": [
+    {
+      "op": "insert",
+      "row": {
+        "tenant_id": "t1",
+        "order_id": "o9",
+        "status": "open"
+      }
+    }
+  ]
+}
+```
+
+PostgreSQL relational SQL exposes the same contract through an explicit session
+setting rather than non-PostgreSQL DML syntax:
+
+```sql
+SET antfly.sync_level = 'write';
+SET LOCAL antfly.sync_level = 'full_index';
+
+INSERT INTO orders (tenant_id, order_id, status)
+VALUES ('t1', 'o9', 'open');
+```
+
+The SQL adapter resolves the effective level at the write execution boundary:
+`SET LOCAL antfly.sync_level` overrides the session value for the current
+transaction, `SET antfly.sync_level` sets the session default, and an unset SQL
+session defaults to `write` so ordinary SQL statement completion means the
+base-row write has reached the normal durable write contract. Weaker latency
+semantics remain available through `SET antfly.sync_level = 'propose'`.
+
+The effective SQL sync level is applied uniformly to every native batch emitted
+by SQL lowering: point `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `INSERT ...
+SELECT`, source-backed mutation stages, `TRUNCATE`-style mutation-source
+batches, and `COPY FROM` imports. It is not stored as raw SQL text and is not
+attached to catalog DDL. Lowered write plans carry the parsed native enum, and
+batch builders set `RowsBatchRequest.sync_level` before committing through the
+same local, provisioned, hosted, and 2PC write paths used by REST/SDK row
+writes.
+
 The read-plan endpoints expose the same typed contracts used by the SQL
 adapter and storage runtime. They accept JSON envelopes rather than SQL text:
 
@@ -4831,9 +4888,14 @@ session state, including the prior base path so `COMMIT` and `ROLLBACK` can
 clear the local override without losing the session path. Typed `SET LOCAL`
 runtime/app settings preserve the same transaction-local base-state contract,
 so transaction boundaries restore the prior setting map rather than leaking
-local overrides. The source parity corpus pins public-only, multi-namespace, and
-transaction-local search paths so schema-resolution metadata cannot collapse
-back into an adapter-only no-op. Role/session
+local overrides. `SET [LOCAL|SESSION] antfly.sync_level = '<level>'` is a
+typed Antfly runtime setting over the public write sync-level enum; write
+lowering reads it once at statement execution and maps it to the native
+`RowsBatchRequest.sync_level` for every generated relational row batch, while an
+unset SQL session defaults to `write`. The source parity corpus pins
+public-only, multi-namespace, and transaction-local search paths so
+schema-resolution metadata cannot collapse back into an adapter-only no-op.
+Role/session
 authorization changes, arbitrary settings, timeout settings, default storage
 settings, unsupported values for otherwise inert settings, `SHOW ALL`, and
 partial `DISCARD` variants still fail closed. The allowlist lives in

@@ -1667,6 +1667,7 @@ pub const RelationalRowsInsertSourcePlan = struct {
     ctes: []const RelationalRowsCte = &.{},
     ranges: []const RelationalRowsDocKeyRange = &.{},
     insert_source: RelationalRowsInsertSourceRequest = .{},
+    sync_level: SyncLevel = .write,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.ctes) |cte| {

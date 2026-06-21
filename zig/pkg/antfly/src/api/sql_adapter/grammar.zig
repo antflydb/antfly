@@ -1964,6 +1964,7 @@ pub fn parseSetSessionSettingTailAlloc(alloc: std.mem.Allocator, tokens: []const
     if (cursor.matchToken(.eq) == null and !cursor.matchKeyword("to")) return error.UnsupportedSqlShape;
     const value = cursor.matchToken(.identifier) orelse cursor.matchToken(.string) orelse cursor.matchToken(.number) orelse return error.UnsupportedSqlShape;
     if (value.text.len == 0) return error.UnsupportedSqlShape;
+    try validateSetSessionSettingValue(setting.text, kind, value.text);
     const name_owned = try alloc.dupe(u8, setting.text);
     errdefer alloc.free(name_owned);
     const value_owned = try alloc.dupe(u8, value.text);
@@ -7840,8 +7841,22 @@ fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
 
 fn sessionSettingKindForName(setting: []const u8) ?ddl_plan.SessionSettingKind {
     if (std.mem.startsWith(u8, setting, "app.") and setting.len > "app.".len) return .app;
+    if (std.ascii.eqlIgnoreCase(setting, "antfly.sync_level")) return .antfly;
     if (std.mem.eql(u8, setting, "statement_timeout") or std.mem.eql(u8, setting, "timezone")) return .runtime;
     return null;
+}
+
+fn validateSetSessionSettingValue(setting: []const u8, kind: ddl_plan.SessionSettingKind, value: []const u8) !void {
+    switch (kind) {
+        .app => {
+            if (value.len == 0) return error.UnsupportedSqlShape;
+        },
+        .antfly => {
+            if (!std.ascii.eqlIgnoreCase(setting, "antfly.sync_level")) return error.UnsupportedSqlShape;
+            _ = db_mod.types.parsePublicSyncLevelText(value) orelse return error.UnsupportedSqlShape;
+        },
+        .runtime => {},
+    }
 }
 
 fn sqlSessionNamespaceNameValid(name: []const u8) bool {
@@ -8263,6 +8278,21 @@ test "sql adapter grammar rejects semantic session changes as noops" {
     try std.testing.expect(app_setting.local);
     try std.testing.expectEqualStrings("app.tenant_id", app_setting.name);
     try std.testing.expectEqualStrings("tenant-a", app_setting.value);
+
+    var sync_level_tokens = try lexer.tokenizeAlloc(alloc, "antfly.sync_level = 'full_index';");
+    defer lexer.freeTokens(alloc, &sync_level_tokens);
+    var sync_level_pos: usize = 0;
+    var sync_level_setting = try parseSetSessionSettingTailAlloc(alloc, sync_level_tokens.items, &sync_level_pos);
+    defer sync_level_setting.deinit(alloc);
+    try std.testing.expectEqual(sync_level_tokens.items.len, sync_level_pos);
+    try std.testing.expectEqual(ddl_plan.SessionSettingKind.antfly, sync_level_setting.kind);
+    try std.testing.expectEqualStrings("antfly.sync_level", sync_level_setting.name);
+    try std.testing.expectEqualStrings("full_index", sync_level_setting.value);
+
+    var invalid_sync_level_tokens = try lexer.tokenizeAlloc(alloc, "antfly.sync_level = 'eventual';");
+    defer lexer.freeTokens(alloc, &invalid_sync_level_tokens);
+    var invalid_sync_level_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSetSessionSettingTailAlloc(alloc, invalid_sync_level_tokens.items, &invalid_sync_level_pos));
 
     var reset_app_tokens = try lexer.tokenizeAlloc(alloc, "app.tenant_id;");
     defer lexer.freeTokens(alloc, &reset_app_tokens);

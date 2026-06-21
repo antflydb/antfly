@@ -6504,7 +6504,7 @@ fn extractAssetSourceValue(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_doc, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = jsonValueAtDottedPath(parsed.value, request.source_field) orelse return null;
     return switch (source) {
         .null => null,
         .string => |value| blk: {

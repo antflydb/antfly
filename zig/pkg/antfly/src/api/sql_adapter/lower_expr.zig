@@ -10753,6 +10753,75 @@ pub fn selectOutputOrderByOrdinalAlloc(
     return try selectOutputOrderByRefAlloc(alloc, select, select.outputs[index]);
 }
 
+fn aggregateSpecNameCollision(
+    name: []const u8,
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+) bool {
+    for (group_fields) |field| {
+        if (std.mem.eql(u8, field, name)) return true;
+    }
+    for (group_expressions) |projection| {
+        if (std.mem.eql(u8, projection.output, name)) return true;
+    }
+    for (aggregations) |aggregation| {
+        if (std.mem.eql(u8, aggregation.name, name)) return true;
+    }
+    return false;
+}
+
+fn allocateDisambiguatedAggregateSpecNameAlloc(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+) !?[]const u8 {
+    if (!aggregateSpecNameCollision(name, group_fields, group_expressions, aggregations)) return null;
+
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ name, suffix });
+        if (!aggregateSpecNameCollision(candidate, group_fields, group_expressions, aggregations)) return candidate;
+        alloc.free(candidate);
+    }
+}
+
+fn aggregateSpecWithName(
+    spec: db_mod.types.RelationalRowsAggregateSpec,
+    name: []const u8,
+) db_mod.types.RelationalRowsAggregateSpec {
+    return .{
+        .name = name,
+        .op = spec.op,
+        .field = spec.field,
+        .expression = spec.expression,
+        .distinct = spec.distinct,
+        .distinct_max_items = spec.distinct_max_items,
+        .percentile = spec.percentile,
+        .percentiles = spec.percentiles,
+        .percentile_max_items = spec.percentile_max_items,
+        .percentile_order = spec.percentile_order,
+        .array_max_items = spec.array_max_items,
+        .array_order_by = spec.array_order_by,
+        .string_delimiter = spec.string_delimiter,
+        .filter_predicates = spec.filter_predicates,
+        .filter_array_any = spec.filter_array_any,
+        .filter_array_contains = spec.filter_array_contains,
+        .filter_array_eq = spec.filter_array_eq,
+        .filter_in_predicates = spec.filter_in_predicates,
+        .filter_json_contains = spec.filter_json_contains,
+        .filter_json_path_eq = spec.filter_json_path_eq,
+        .filter_json_path_exists = spec.filter_json_path_exists,
+        .filter_text_patterns = spec.filter_text_patterns,
+        .filter_expressions = spec.filter_expressions,
+        .filter_expression_array_contains = spec.filter_expression_array_contains,
+        .filter_any = spec.filter_any,
+        .filter_not = spec.filter_not,
+    };
+}
+
 pub fn parseAggregateSelectListAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -10788,7 +10857,7 @@ pub fn parseAggregateSelectListAlloc(
 
     while (true) {
         if (nextIsAggregateFunction(tokens, pos.*)) {
-            const spec = try parseAggregateSpecAlloc(
+            const parsed_spec = try parseAggregateSpecAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -10800,6 +10869,25 @@ pub fn parseAggregateSelectListAlloc(
                 defer_row_expression_field_validation,
                 aggregate_spec_options,
             );
+            var parsed_spec_transferred = false;
+            errdefer if (!parsed_spec_transferred) plan_mod.freeAggregateSpec(alloc, parsed_spec);
+            const maybe_spec_name = try allocateDisambiguatedAggregateSpecNameAlloc(
+                alloc,
+                parsed_spec.name,
+                group_fields.items,
+                group_expressions.items,
+                aggregations.items,
+            );
+            var spec_name_transferred = false;
+            errdefer if (!spec_name_transferred) {
+                if (maybe_spec_name) |spec_name| alloc.free(spec_name);
+            };
+            const spec = if (maybe_spec_name) |spec_name| aggregateSpecWithName(parsed_spec, spec_name) else parsed_spec;
+            parsed_spec_transferred = true;
+            if (maybe_spec_name != null) {
+                alloc.free(parsed_spec.name);
+                spec_name_transferred = true;
+            }
             var spec_transferred = false;
             errdefer if (!spec_transferred) plan_mod.freeAggregateSpec(alloc, spec);
             try outputs.append(alloc, .{ .kind = .aggregation, .index = aggregations.items.len });
@@ -10827,9 +10915,14 @@ pub fn parseAggregateSelectListAlloc(
                     try outputs.append(alloc, .{ .kind = .group_field, .index = group_fields.items.len });
                     try group_fields.append(alloc, field);
                 },
-                .expression => |projection| {
+                .expression => |projection_value| {
+                    item_transferred = true;
+                    const projection = projection_value;
+                    var projection_transferred = false;
+                    errdefer if (!projection_transferred) freeExpressionProjection(alloc, projection);
                     try outputs.append(alloc, .{ .kind = .group_expression, .index = group_expressions.items.len });
                     try group_expressions.append(alloc, projection);
+                    projection_transferred = true;
                 },
                 else => return error.UnsupportedSqlShape,
             }
@@ -19799,18 +19892,43 @@ pub fn parseSelectListAlloc(
         switch (item) {
             .field => |field| {
                 if (select_all) return error.UnsupportedSqlShape;
+                item_transferred = true;
+                var field_transferred = false;
+                errdefer if (!field_transferred) alloc.free(field);
                 try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });
                 try fields.append(alloc, field);
+                field_transferred = true;
             },
-            .json_extract => |projection| {
+            .json_extract => |projection_value| {
+                item_transferred = true;
+                const projection = projection_value;
+                var projection_transferred = false;
+                errdefer if (!projection_transferred) {
+                    alloc.free(projection.output);
+                    alloc.free(projection.field);
+                    alloc.free(projection.path);
+                };
                 try outputs.append(alloc, .{ .kind = .json_extract, .index = json_extract.items.len });
                 try json_extract.append(alloc, projection);
+                projection_transferred = true;
             },
-            .array_length => |projection| {
+            .array_length => |projection_value| {
+                item_transferred = true;
+                const projection = projection_value;
+                var projection_transferred = false;
+                errdefer if (!projection_transferred) {
+                    alloc.free(projection.output);
+                    alloc.free(projection.field);
+                };
                 try outputs.append(alloc, .{ .kind = .array_length, .index = array_length.items.len });
                 try array_length.append(alloc, projection);
+                projection_transferred = true;
             },
-            .coalesce => |projection| {
+            .coalesce => |projection_value| {
+                item_transferred = true;
+                const projection = projection_value;
+                var projection_transferred = false;
+                errdefer if (!projection_transferred) plan_mod.freeCoalesceProjection(alloc, projection);
                 const expression_projection = try plan_mod.expressionProjectionFromCoalesceAlloc(alloc, projection);
                 var expression_projection_transferred = false;
                 errdefer if (!expression_projection_transferred) freeExpressionProjection(alloc, expression_projection);
@@ -19818,14 +19936,28 @@ pub fn parseSelectListAlloc(
                 try expressions.append(alloc, expression_projection);
                 expression_projection_transferred = true;
                 try coalesce.append(alloc, projection);
+                projection_transferred = true;
             },
-            .expression => |projection| {
+            .expression => |projection_value| {
+                item_transferred = true;
+                const projection = projection_value;
+                var projection_transferred = false;
+                errdefer if (!projection_transferred) freeExpressionProjection(alloc, projection);
                 try outputs.append(alloc, .{ .kind = .expression, .index = expressions.items.len });
                 try expressions.append(alloc, projection);
+                projection_transferred = true;
             },
-            .field_alias => |projection| {
+            .field_alias => |projection_value| {
+                item_transferred = true;
+                const projection = projection_value;
+                var projection_transferred = false;
+                errdefer if (!projection_transferred) {
+                    alloc.free(projection.output);
+                    alloc.free(projection.field);
+                };
                 try outputs.append(alloc, .{ .kind = .field_alias, .index = field_aliases.items.len });
                 try field_aliases.append(alloc, projection);
+                projection_transferred = true;
             },
         }
         item_transferred = true;
@@ -19881,6 +20013,65 @@ pub fn parseSelectListAlloc(
     };
 }
 
+fn windowSpecOutputCollision(
+    output: []const u8,
+    fields: []const []const u8,
+    windows: []const db_mod.types.RelationalRowsWindowSpec,
+) bool {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field, output)) return true;
+    }
+    for (windows) |window| {
+        if (std.mem.eql(u8, window.output, output)) return true;
+    }
+    return false;
+}
+
+fn allocateDisambiguatedWindowSpecOutputAlloc(
+    alloc: std.mem.Allocator,
+    output: []const u8,
+    fields: []const []const u8,
+    windows: []const db_mod.types.RelationalRowsWindowSpec,
+) !?[]const u8 {
+    if (!windowSpecOutputCollision(output, fields, windows)) return null;
+
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ output, suffix });
+        if (!windowSpecOutputCollision(candidate, fields, windows)) return candidate;
+        alloc.free(candidate);
+    }
+}
+
+fn windowSpecWithOutput(
+    spec: db_mod.types.RelationalRowsWindowSpec,
+    output: []const u8,
+) db_mod.types.RelationalRowsWindowSpec {
+    return .{
+        .output = output,
+        .function = spec.function,
+        .partition_by = spec.partition_by,
+        .order_by = spec.order_by,
+        .value_expression = spec.value_expression,
+        .offset = spec.offset,
+        .default_json = spec.default_json,
+        .frame = spec.frame,
+        .filter_predicates = spec.filter_predicates,
+        .filter_array_any = spec.filter_array_any,
+        .filter_array_contains = spec.filter_array_contains,
+        .filter_array_eq = spec.filter_array_eq,
+        .filter_in_predicates = spec.filter_in_predicates,
+        .filter_json_contains = spec.filter_json_contains,
+        .filter_json_path_eq = spec.filter_json_path_eq,
+        .filter_json_path_exists = spec.filter_json_path_exists,
+        .filter_text_patterns = spec.filter_text_patterns,
+        .filter_expressions = spec.filter_expressions,
+        .filter_expression_array_contains = spec.filter_expression_array_contains,
+        .filter_any = spec.filter_any,
+        .filter_not = spec.filter_not,
+    };
+}
+
 pub fn parseWindowSelectListAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -19904,7 +20095,7 @@ pub fn parseWindowSelectListAlloc(
 
     while (true) {
         if (peekWindowFunction(tokens, pos.*)) {
-            const spec = try parseWindowSpecAlloc(
+            const parsed_spec = try parseWindowSpecAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -19918,6 +20109,24 @@ pub fn parseWindowSelectListAlloc(
                 options.window_definition_options,
                 options.window_spec_options,
             );
+            var parsed_spec_transferred = false;
+            errdefer if (!parsed_spec_transferred) plan_mod.freeWindowSpec(alloc, parsed_spec);
+            const maybe_output = try allocateDisambiguatedWindowSpecOutputAlloc(
+                alloc,
+                parsed_spec.output,
+                fields.items,
+                windows.items,
+            );
+            var output_transferred = false;
+            errdefer if (!output_transferred) {
+                if (maybe_output) |output| alloc.free(output);
+            };
+            const spec = if (maybe_output) |output| windowSpecWithOutput(parsed_spec, output) else parsed_spec;
+            parsed_spec_transferred = true;
+            if (maybe_output != null) {
+                alloc.free(parsed_spec.output);
+                output_transferred = true;
+            }
             var spec_transferred = false;
             errdefer if (!spec_transferred) plan_mod.freeWindowSpec(alloc, spec);
             try outputs.append(alloc, .{ .kind = .window, .index = windows.items.len });

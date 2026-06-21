@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "f122f2869deda0400ef2d33ede38f1198947ed9d50f386cf3331ef1651217420",
+  "source_sha256": "34849ad50432acfe1db3868b70ab537b800e613e326d3fee4d6433826f061a35",
   "source_entry_count": 1013,
   "entry_count": 1013,
   "skipped_entries": [
@@ -5862,17 +5862,23 @@
       "sql": "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5"
     },
     {
-      "name": "unsupported read duplicate output name",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=duplicate_output_name",
-      "classification_reason": "duplicate_output_name",
+      "name": "read duplicate output name disambiguates computed projection",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:window:window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=1:order=0:limit=-1",
       "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
     },
     {
-      "name": "unsupported aggregate duplicate output name",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=aggregate_duplicate_output_name",
-      "classification_reason": "aggregate_duplicate_output_name",
+      "name": "aggregate duplicate output name disambiguates aggregate projection",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "group_by": 1,
+        "aggregations": 1
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=-1",
       "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
     },
     {

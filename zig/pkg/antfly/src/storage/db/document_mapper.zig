@@ -555,6 +555,10 @@ pub fn extractDenseVectorField(
     field_name: []const u8,
     dims: u32,
 ) !?[]f32 {
+    if (std.mem.indexOfScalar(u8, field_name, '.') != null) {
+        return try extractDenseVectorFieldByJsonPath(alloc, data, field_name, dims);
+    }
+
     var scanner = std.json.Scanner.initCompleteInput(alloc, data);
     defer scanner.deinit();
 
@@ -611,11 +615,31 @@ pub fn extractDenseVectorField(
     }
 }
 
+fn extractDenseVectorFieldByJsonPath(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+    dims: u32,
+) !?[]f32 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    const value = valueAtJsonPath(parsed.value, field_name) orelse return null;
+    if (value != .array and value != .string) return null;
+    const vector = try parseDenseEmbeddingValue(alloc, value);
+    errdefer alloc.free(vector);
+    if (vector.len != dims) return error.InvalidVectorDimensions;
+    return vector;
+}
+
 pub fn extractSparseVectorField(
     alloc: Allocator,
     data: []const u8,
     field_name: []const u8,
 ) !?SparseVectorData {
+    if (std.mem.indexOfScalar(u8, field_name, '.') != null) {
+        return try extractSparseVectorFieldByJsonPath(alloc, data, field_name);
+    }
+
     return extractSparseVectorFieldRawFast(alloc, data, field_name) catch |raw_err| switch (raw_err) {
         error.UnsupportedSparseFastPath => return extractSparseVectorFieldFast(alloc, data, field_name) catch |err| switch (err) {
             error.UnsupportedSparseFastPath => return extractSparseVectorFieldSlow(alloc, data, field_name),
@@ -623,6 +647,18 @@ pub fn extractSparseVectorField(
         },
         else => return raw_err,
     };
+}
+
+fn extractSparseVectorFieldByJsonPath(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    const value = valueAtJsonPath(parsed.value, field_name) orelse return null;
+    if (value != .object) return null;
+    return try parseSparseValue(alloc, value);
 }
 
 fn extractSparseVectorFieldRawFast(
@@ -3512,6 +3548,23 @@ test "document mapper dense extractor skips unrelated top-level values" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), values[2], 0.0001);
 }
 
+test "document mapper extracts dense vector from dotted json field" {
+    const alloc = std.testing.allocator;
+
+    const values = (try extractDenseVectorField(alloc,
+        \\{"title":"alpha","attrs":{"embedding":[1,2.5,3],"nested":{"other":[0]}}}
+    , "attrs.embedding", 3)).?;
+    defer alloc.free(values);
+
+    try std.testing.expectEqual(@as(usize, 3), values.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), values[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), values[1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), values[2], 0.0001);
+    try std.testing.expect((try extractDenseVectorField(alloc,
+        \\{"attrs":{"nested":{"embedding":[1,2,3]}}}
+    , "attrs.embedding", 3)) == null);
+}
+
 test "document mapper dense extractor returns null when field is absent" {
     const alloc = std.testing.allocator;
     try std.testing.expect((try extractDenseVectorField(alloc, "{\"title\":\"alpha\"}", "embedding", 3)) == null);
@@ -3521,6 +3574,21 @@ test "document mapper extracts sparse vector from configured field" {
     const alloc = std.testing.allocator;
 
     var vec = (try extractSparseVectorField(alloc, "{\"sparse\":{\"indices\":[1,5],\"values\":[0.25,0.75]}}", "sparse")).?;
+    defer vec.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), vec.indices.len);
+    try std.testing.expectEqual(@as(u32, 1), vec.indices[0]);
+    try std.testing.expectEqual(@as(u32, 5), vec.indices[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), vec.values[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), vec.values[1], 0.0001);
+}
+
+test "document mapper extracts sparse vector from dotted json field" {
+    const alloc = std.testing.allocator;
+
+    var vec = (try extractSparseVectorField(alloc,
+        \\{"attrs":{"sparse":{"indices":[1,5],"values":[0.25,0.75]}}}
+    , "attrs.sparse")).?;
     defer vec.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), vec.indices.len);

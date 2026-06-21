@@ -329,6 +329,11 @@ pub fn sqlStatementTimeoutNsFromSession(session: catalog_resources.SqlCatalogSes
     return timeout_ns;
 }
 
+pub fn sqlSyncLevelFromSession(session: catalog_resources.SqlCatalogSession) !db_mod.types.SyncLevel {
+    const raw = session.settingValue("antfly.sync_level") orelse return .write;
+    return db_mod.types.parsePublicSyncLevelText(raw) orelse error.InvalidRoleSetting;
+}
+
 pub fn sqlStatementTimeoutExpired(timeout_ns: ?u64, start_ns: u64, now_ns: u64) bool {
     const limit = timeout_ns orelse return false;
     return now_ns -| start_ns >= limit;
@@ -369,6 +374,14 @@ pub fn validateSqlRuntimeSettingValue(name: []const u8, value: []const u8) !void
                 return error.InvalidRoleSetting;
             }
         }
+        return;
+    }
+    return error.UnsupportedRoleSetting;
+}
+
+pub fn validateSqlAntflySettingValue(name: []const u8, value: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(name, "antfly.sync_level")) {
+        _ = db_mod.types.parsePublicSyncLevelText(value) orelse return error.InvalidRoleSetting;
         return;
     }
     return error.UnsupportedRoleSetting;
@@ -510,6 +523,7 @@ pub fn applyOwnedSessionCatalogPlanAlloc(
         .set_setting => |set| {
             switch (set.kind) {
                 .app => if (set.value.len == 0) return error.InvalidRoleSetting,
+                .antfly => try validateSqlAntflySettingValue(set.name, set.value),
                 .runtime => try validateSqlRuntimeSettingValue(set.name, set.value),
             }
             var updated = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, session.session());

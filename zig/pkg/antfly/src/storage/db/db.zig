@@ -168,7 +168,7 @@ fn validateDocumentExtractionInlineSources(db: *DB, doc_value: []const u8) !void
             continue;
         }
 
-        const source = parsed.value.object.get(entry.source_field) orelse continue;
+        const source = jsonValueAtPath(parsed.value, entry.source_field) orelse continue;
         if (source != .string) continue;
         try document_extraction_mod.validateInlineSourceSize(db.remote_content, source.string);
     }
@@ -10893,6 +10893,7 @@ pub const DB = struct {
         for (writes) |write| {
             var extracted = try mapper.extractWrite(alloc, write.key, write.value);
             try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
+            try self.core.index_manager.appendIndexFieldEmbeddingsToExtractedWrite(alloc, write.key, write.value, &extracted);
             defer extracted.deinit(alloc);
 
             if (extracted.cleaned_value) |cleaned| {
@@ -33317,19 +33318,32 @@ fn overwriteProbeLessThan(_: void, lhs: OverwriteProbeEntry, rhs: OverwriteProbe
 fn extractStringField(alloc: Allocator, doc_value: []const u8, field_name: []const u8) !?[]u8 {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const field = parsed.value.object.get(field_name) orelse return null;
+    const field = jsonValueAtPath(parsed.value, field_name) orelse return null;
     if (field != .string) return null;
     return try alloc.dupe(u8, field.string);
+}
+
+fn jsonValueAtPath(root: std.json.Value, field_name: []const u8) ?std.json.Value {
+    if (field_name.len == 0) return null;
+    var current = root;
+    var it = std.mem.splitScalar(u8, field_name, '.');
+    while (it.next()) |segment| {
+        if (segment.len == 0) return null;
+        switch (current) {
+            .object => |object| current = object.get(segment) orelse return null,
+            else => return null,
+        }
+    }
+    return current;
 }
 
 fn appendGraphFieldTargets(
     alloc: Allocator,
     targets: *std.ArrayListUnmanaged([]u8),
-    root: std.json.ObjectMap,
+    root: std.json.Value,
     field_name: []const u8,
 ) !void {
-    const field = root.get(field_name) orelse return;
+    const field = jsonValueAtPath(root, field_name) orelse return;
     switch (field) {
         .string => try appendUniqueOwnedKey(alloc, targets, field.string),
         .array => {
@@ -33384,7 +33398,7 @@ fn augmentExtractedWriteWithGraphFieldEdges(
                 for (targets.items) |target| alloc.free(target);
                 targets.deinit(alloc);
             }
-            try appendGraphFieldTargets(alloc, &targets, parsed.value.object, field_name);
+            try appendGraphFieldTargets(alloc, &targets, parsed.value, field_name);
 
             for (targets.items) |target| {
                 try extra_writes.append(alloc, .{
@@ -33760,7 +33774,7 @@ fn extractAssetSourceValue(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_value, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const source = parsed.value.object.get(request.source_field) orelse return null;
+    const source = jsonValueAtPath(parsed.value, request.source_field) orelse return null;
     return switch (source) {
         .null => null,
         .string => |value| blk: {
@@ -54301,6 +54315,60 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
     try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
     try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+}
+
+test "db extractEnrichments projects configured embedded json vector and graph fields" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "attrs_dense",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"attrs.embedding\",\"dims\":3,\"metric\":\"cosine\"}",
+    });
+    try db.addIndex(.{
+        .name = "attrs_sparse",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"attrs.sparse\"}",
+    });
+    try db.addIndex(.{
+        .name = "attrs_graph",
+        .kind = .graph,
+        .config_json = "{\"edge_types\":[{\"name\":\"cites\",\"field\":\"attrs.links\"}]}",
+    });
+
+    var result = try db.extractEnrichments(alloc, &.{
+        .{
+            .key = "doc:a",
+            .value =
+            \\{"title":"alpha","attrs":{"embedding":[1,0,0],"sparse":{"indices":[7,42],"values":[1.5,0.5]},"links":["doc:b","doc:c"]}}
+            ,
+        },
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cleaned_writes.len);
+    try std.testing.expectEqual(@as(usize, 1), result.dense_embeddings.len);
+    try std.testing.expectEqualStrings("attrs_dense", result.dense_embeddings[0].index_name);
+    try std.testing.expectEqual(@as(usize, 3), result.dense_embeddings[0].vector.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.dense_embeddings[0].vector[0], 0.0001);
+
+    try std.testing.expectEqual(@as(usize, 1), result.sparse_embeddings.len);
+    try std.testing.expectEqualStrings("attrs_sparse", result.sparse_embeddings[0].index_name);
+    try std.testing.expectEqual(@as(usize, 2), result.sparse_embeddings[0].indices.len);
+    try std.testing.expectEqual(@as(u32, 7), result.sparse_embeddings[0].indices[0]);
+
+    try std.testing.expectEqual(@as(usize, 2), result.graph_writes.len);
+    try std.testing.expectEqualStrings("attrs_graph", result.graph_writes[0].index_name);
+    try std.testing.expectEqualStrings("cites", result.graph_writes[0].edge_type);
+    try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+    try std.testing.expectEqualStrings("doc:c", result.graph_writes[1].target);
 }
 
 test "db extractEnrichments rejects unsupported legacy summaries field" {

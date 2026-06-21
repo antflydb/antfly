@@ -79,6 +79,7 @@ pub fn parseSetSearchPathPlanTailAlloc(
 
 pub const SessionSettingKind = enum {
     app,
+    antfly,
     runtime,
 };
 
