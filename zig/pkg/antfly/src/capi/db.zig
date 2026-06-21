@@ -1949,7 +1949,13 @@ fn restorePortableBackupToLiteFile(
     if (backup.len == 0) return error.InvalidArgument;
     try portable_backup.validatePortable(alloc, backup);
 
-    try preflightLiteRestoreTarget(alloc, io, dest_path, replace);
+    const dest_exists = liteCapiPathExists(io, dest_path);
+    if (dest_exists and !replace) return error.PathAlreadyExists;
+
+    var dest_lock = try antfly.lite.native.lockWriterPath(alloc, dest_path);
+    defer dest_lock.close();
+
+    if (!dest_exists and !replace and liteCapiPathExists(io, dest_path)) return error.PathAlreadyExists;
 
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{dest_path});
     defer alloc.free(tmp_path);
@@ -1971,18 +1977,10 @@ fn restorePortableBackupToLiteFile(
         try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
     }
 
-    try preflightLiteRestoreTarget(alloc, io, dest_path, replace);
     liteCapiRenameFilePath(io, tmp_path, dest_path) catch |err| {
         liteCapiDeleteFilePath(io, tmp_path) catch {};
         return err;
     };
-}
-
-fn preflightLiteRestoreTarget(alloc: Allocator, io: std.Io, dest_path: []const u8, replace: bool) !void {
-    if (!liteCapiPathExists(io, dest_path)) return;
-    if (!replace) return error.PathAlreadyExists;
-    var probe = try lite_backend.Handle.open(alloc, dest_path, .{});
-    probe.deinit();
 }
 
 fn liteCapiPathExists(io: std.Io, path: []const u8) bool {
@@ -6265,6 +6263,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(snapshot_path);
     const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
     defer alloc.free(restore_path);
+    const locked_restore_path = try tempTestAflitePath(alloc, "capi-lite-restore-locked");
+    defer alloc.free(locked_restore_path);
     const restore_malformed_path = try tempTestAflitePath(alloc, "capi-lite-restore-malformed");
     defer alloc.free(restore_malformed_path);
     const invalid_snapshot_path = try tempTestPath(alloc, "capi-lite-snapshot-invalid");
@@ -6280,6 +6280,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(schema_dst_path);
     cleanupTestFile(snapshot_path);
     cleanupTestFile(restore_path);
+    cleanupTestFile(locked_restore_path);
     cleanupTestFile(restore_malformed_path);
     cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestDir(plain_path);
@@ -6293,6 +6294,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(schema_dst_path);
     defer cleanupTestFile(snapshot_path);
     defer cleanupTestFile(restore_path);
+    defer cleanupTestFile(locked_restore_path);
     defer cleanupTestFile(restore_malformed_path);
     defer cleanupTestFile(invalid_snapshot_path);
 
@@ -6797,6 +6799,27 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &restored_file_lookup));
     defer antfly_db_buffer_free(restored_file_lookup.ptr, restored_file_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, restored_file_lookup.ptr.?[0..restored_file_lookup.len], "\"second\"") != null);
+
+    const locked_restore_tmp_path = try std.fmt.allocPrint(alloc, "{s}.restore-tmp.aflite", .{locked_restore_path});
+    defer alloc.free(locked_restore_tmp_path);
+    {
+        var locked_restore = try antfly.lite.native.lockWriterPath(alloc, locked_restore_path);
+        defer locked_restore.close();
+
+        var locked_restore_report: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
+        try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_restore_backup_json(locked_restore_path, .{
+            .ptr = backup.ptr,
+            .len = backup.len,
+        }, false, &locked_restore_report));
+        try std.testing.expect(locked_restore_report.ptr == null);
+        try std.testing.expectEqual(@as(usize, 0), locked_restore_report.len);
+    }
+    {
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_path));
+        try std.testing.expect(!liteCapiPathExists(io_impl.io(), locked_restore_tmp_path));
+    }
 
     var restore_existing: capi.Buffer = .{ .ptr = scratch[0..].ptr, .len = scratch.len };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_restore_backup_json(restore_path, .{
