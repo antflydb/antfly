@@ -11705,6 +11705,812 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
+test "sql adapter lower dml lowers cross-column excluded conflict values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"next_status":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"old\",\"amount\":5,\"updated_at_ns\":1,\"metadata\":{\"source\":\"old\"}}", .version = 14 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'active') ON CONFLICT (email) DO UPDATE SET status = excluded.next_status RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+
+    var coalesced_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', null) ON CONFLICT (email) DO UPDATE SET status = coalesce(excluded.next_status, status, 'fallback') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), coalesced_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), coalesced_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", coalesced_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"old\"", coalesced_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), coalesced_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"old\"}", coalesced_patch.batch.returning_rows[0]);
+
+    var computed_cast_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9) ON CONFLICT (email) DO UPDATE SET status = CAST(excluded.amount + 1 AS text) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer computed_cast_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), computed_cast_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), computed_cast_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", computed_cast_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"10\"", computed_cast_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), computed_cast_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"10\"}", computed_cast_patch.batch.returning_rows[0]);
+
+    var greatest_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9) ON CONFLICT (email) DO UPDATE SET amount = greatest(amount, excluded.amount, 0) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer greatest_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), greatest_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), greatest_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", greatest_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("9", greatest_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), greatest_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":9}", greatest_patch.batch.returning_rows[0]);
+
+    var abs_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9) ON CONFLICT (email) DO UPDATE SET amount = abs(amount - excluded.amount) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer abs_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), abs_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), abs_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", abs_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", abs_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), abs_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":4}", abs_patch.batch.returning_rows[0]);
+
+    var modulo_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9) ON CONFLICT (email) DO UPDATE SET amount = MOD(amount + excluded.amount, excluded.amount) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer modulo_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), modulo_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), modulo_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", modulo_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("5", modulo_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), modulo_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":5}", modulo_patch.batch.returning_rows[0]);
+
+    var round_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9.4) ON CONFLICT (email) DO UPDATE SET amount = round(abs(amount - excluded.amount)) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer round_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), round_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), round_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", round_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", round_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), round_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":4}", round_patch.batch.returning_rows[0]);
+
+    var floor_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9.4) ON CONFLICT (email) DO UPDATE SET amount = floor(abs(amount - excluded.amount)) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer floor_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), floor_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), floor_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", floor_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("4", floor_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), floor_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":4}", floor_patch.batch.returning_rows[0]);
+
+    var ceil_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 9.4) ON CONFLICT (email) DO UPDATE SET amount = ceil(abs(amount - excluded.amount)) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer ceil_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), ceil_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), ceil_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", ceil_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("5", ceil_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), ceil_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":5}", ceil_patch.batch.returning_rows[0]);
+
+    var length_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = char_length(excluded.next_status) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer length_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), length_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), length_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", length_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("6", length_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), length_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":6}", length_patch.batch.returning_rows[0]);
+
+    var bit_length_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = bit_length(excluded.next_status) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer bit_length_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), bit_length_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), bit_length_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", bit_length_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("48", bit_length_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), bit_length_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":48}", bit_length_patch.batch.returning_rows[0]);
+
+    var octet_length_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = octet_length(excluded.next_status) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer octet_length_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), octet_length_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), octet_length_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", octet_length_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("6", octet_length_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), octet_length_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":6}", octet_length_patch.batch.returning_rows[0]);
+
+    var regexp_count_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'A1B22C333') ON CONFLICT (email) DO UPDATE SET amount = regexp_count(excluded.next_status, '[0-9]+') RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_count_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_count_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_count_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", regexp_count_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("3", regexp_count_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_count_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":3}", regexp_count_patch.batch.returning_rows[0]);
+
+    var regexp_instr_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'A1B22C333') ON CONFLICT (email) DO UPDATE SET amount = regexp_instr(excluded.next_status, '[0-9]+') RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_instr_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_instr_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_instr_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", regexp_instr_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("2", regexp_instr_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_instr_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":2}", regexp_instr_patch.batch.returning_rows[0]);
+
+    var regexp_substr_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'A1B22C333') ON CONFLICT (email) DO UPDATE SET status = regexp_substr(excluded.next_status, '[A-Z]+') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_substr_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_substr_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_substr_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", regexp_substr_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"A\"", regexp_substr_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_substr_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"A\"}", regexp_substr_patch.batch.returning_rows[0]);
+
+    var regexp_match_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE_USER') ON CONFLICT (email) DO UPDATE SET enabled = regexp_like(excluded.next_status, '^active_', true) RETURNING id, enabled",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_match_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_match_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_match_patch.batch.transformed);
+    try std.testing.expectEqualStrings("enabled", regexp_match_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("true", regexp_match_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_match_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"enabled\":true}", regexp_match_patch.batch.returning_rows[0]);
+
+    var ascii_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = ascii(excluded.next_status) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer ascii_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), ascii_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), ascii_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", ascii_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("65", ascii_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), ascii_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":65}", ascii_patch.batch.returning_rows[0]);
+
+    var chr_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 90) ON CONFLICT (email) DO UPDATE SET status = chr(excluded.amount) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer chr_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), chr_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), chr_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", chr_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"Z\"", chr_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), chr_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"Z\"}", chr_patch.batch.returning_rows[0]);
+
+    var md5_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = md5(excluded.next_status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer md5_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), md5_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), md5_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", md5_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"18ff74f43da410c5529f7d6fca84f115\"", md5_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), md5_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"18ff74f43da410c5529f7d6fca84f115\"}", md5_patch.batch.returning_rows[0]);
+
+    var concat_ws_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = concat_ws(':', status, excluded.next_status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer concat_ws_patch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), concat_ws_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), concat_ws_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", concat_ws_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"old:ACTIVE\"", concat_ws_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), concat_ws_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"old:ACTIVE\"}", concat_ws_patch.batch.returning_rows[0]);
+
+    var overlay_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = overlay(status placing excluded.next_status from 2 for 1) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer overlay_patch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), overlay_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), overlay_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", overlay_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"oACTIVEd\"", overlay_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), overlay_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"oACTIVEd\"}", overlay_patch.batch.returning_rows[0]);
+
+    var trim_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', ' ACTIVE ') ON CONFLICT (email) DO UPDATE SET status = trim(excluded.next_status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer trim_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), trim_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), trim_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", trim_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ACTIVE\"", trim_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), trim_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE\"}", trim_patch.batch.returning_rows[0]);
+
+    var replace_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE_USER') ON CONFLICT (email) DO UPDATE SET status = replace(excluded.next_status, '_', '-') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer replace_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), replace_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), replace_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", replace_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ACTIVE-USER\"", replace_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), replace_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE-USER\"}", replace_patch.batch.returning_rows[0]);
+
+    var regexp_replace_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE_USER_2026') ON CONFLICT (email) DO UPDATE SET status = regexp_replace(excluded.next_status, '[0-9]+', '#', 'g') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer regexp_replace_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), regexp_replace_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), regexp_replace_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", regexp_replace_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ACTIVE_USER_#\"", regexp_replace_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), regexp_replace_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"ACTIVE_USER_#\"}", regexp_replace_patch.batch.returning_rows[0]);
+
+    var translate_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'XYZ') ON CONFLICT (email) DO UPDATE SET status = translate(status, 'old', excluded.next_status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer translate_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), translate_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), translate_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", translate_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"XYZ\"", translate_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), translate_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"XYZ\"}", translate_patch.batch.returning_rows[0]);
+
+    var case_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, amount) VALUES ('u2', 'a@example.test', null, 10) ON CONFLICT (email) DO UPDATE SET status = CASE WHEN excluded.amount > amount THEN 'bumped' ELSE status END RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer case_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), case_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), case_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", case_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"bumped\"", case_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), case_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"bumped\"}", case_patch.batch.returning_rows[0]);
+
+    var lower_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = lower(excluded.next_status) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lower_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lower_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lower_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", lower_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lower_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), lower_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"active\"}", lower_patch.batch.returning_rows[0]);
+
+    var nested_lower_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = lower(coalesce(excluded.next_status, status) || '-ready') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer nested_lower_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), nested_lower_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), nested_lower_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", nested_lower_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active-ready\"", nested_lower_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), nested_lower_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"active-ready\"}", nested_lower_patch.batch.returning_rows[0]);
+
+    var concat_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET status = concat(status, ':', lower(excluded.next_status)) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer concat_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), concat_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), concat_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", concat_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"old:active\"", concat_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), concat_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"old:active\"}", concat_patch.batch.returning_rows[0]);
+
+    var string_to_array_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'read-write') ON CONFLICT (email) DO UPDATE SET tags = string_to_array(excluded.next_status, '-') RETURNING id, tags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer string_to_array_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), string_to_array_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), string_to_array_patch.batch.transformed);
+    try std.testing.expectEqualStrings("tags", string_to_array_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("[\"read\",\"write\"]", string_to_array_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), string_to_array_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"tags\":[\"read\",\"write\"]}", string_to_array_patch.batch.returning_rows[0]);
+
+    var json_extract_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"next_status\":\"json-ready\",\"source\":\"api\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = excluded.metadata->>'next_status' WHERE metadata->>'source' = 'old' AND excluded.metadata->>'source' = 'api' RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer json_extract_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), json_extract_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), json_extract_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", json_extract_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"json-ready\"", json_extract_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), json_extract_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"json-ready\"}", json_extract_patch.batch.returning_rows[0]);
+
+    var parenthesized_and_guard_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"next_status\":\"paren-and-ready\",\"source\":\"api\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = excluded.metadata->>'next_status' WHERE (metadata->>'source' = 'old') AND (excluded.metadata->>'source' = 'api') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer parenthesized_and_guard_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), parenthesized_and_guard_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), parenthesized_and_guard_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", parenthesized_and_guard_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"paren-and-ready\"", parenthesized_and_guard_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), parenthesized_and_guard_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"paren-and-ready\"}", parenthesized_and_guard_patch.batch.returning_rows[0]);
+
+    var or_guard_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"next_status\":\"or-ready\",\"source\":\"api\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = excluded.metadata->>'next_status' WHERE (metadata->>'source' = 'missing') OR (excluded.metadata->>'source' = 'api') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer or_guard_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), or_guard_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), or_guard_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", or_guard_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"or-ready\"", or_guard_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), or_guard_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"or-ready\"}", or_guard_patch.batch.returning_rows[0]);
+
+    var wrapped_or_guard_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"next_status\":\"wrapped-or-ready\",\"source\":\"api\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = excluded.metadata->>'next_status' WHERE (metadata->>'source' = 'missing' OR excluded.metadata->>'source' = 'api') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer wrapped_or_guard_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), wrapped_or_guard_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), wrapped_or_guard_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", wrapped_or_guard_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"wrapped-or-ready\"", wrapped_or_guard_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), wrapped_or_guard_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"wrapped-or-ready\"}", wrapped_or_guard_patch.batch.returning_rows[0]);
+
+    var not_guard_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"next_status\":\"not-ready\",\"source\":\"api\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = excluded.metadata->>'next_status' WHERE NOT ((metadata->>'source' = 'missing') OR (excluded.metadata->>'source' = 'blocked')) RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer not_guard_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), not_guard_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), not_guard_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", not_guard_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"not-ready\"", not_guard_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), not_guard_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"not-ready\"}", not_guard_patch.batch.returning_rows[0]);
+
+    var nested_length_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status) VALUES ('u2', 'a@example.test', 'ACTIVE') ON CONFLICT (email) DO UPDATE SET amount = length(lower(excluded.next_status || '-' || status)) RETURNING id, amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer nested_length_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), nested_length_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), nested_length_patch.batch.transformed);
+    try std.testing.expectEqualStrings("amount", nested_length_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("10", nested_length_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), nested_length_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"amount\":10}", nested_length_patch.batch.returning_rows[0]);
+
+    var case_now_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 10) ON CONFLICT (email) DO UPDATE SET updated_at_ns = CASE WHEN excluded.amount > amount THEN CURRENT_TIMESTAMP(6) ELSE updated_at_ns END RETURNING id, updated_at_ns",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer case_now_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), case_now_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), case_now_patch.batch.transformed);
+    try std.testing.expectEqualStrings("updated_at_ns", case_now_patch.batch.transforms[0].operations[0].path);
+    const conflict_now = try std.fmt.parseInt(u64, case_now_patch.batch.transforms[0].operations[0].value_json.?, 10);
+    try std.testing.expect(conflict_now > 0);
+    try std.testing.expectEqual(@as(u64, 14), case_now_patch.batch.predicates[0].expected_version);
+    var case_now_row = try std.json.parseFromSlice(std.json.Value, alloc, case_now_patch.batch.returning_rows[0], .{});
+    defer case_now_row.deinit();
+    try std.testing.expectEqualStrings("u1", case_now_row.value.object.get("id").?.string);
+    switch (case_now_row.value.object.get("updated_at_ns").?) {
+        .integer => |value| try std.testing.expectEqual(@as(i64, @intCast(conflict_now)), value),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var current_date_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 10) ON CONFLICT (email) DO UPDATE SET updated_at_ns = CURRENT_DATE RETURNING id, updated_at_ns",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer current_date_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), current_date_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), current_date_patch.batch.transformed);
+    try std.testing.expectEqualStrings("updated_at_ns", current_date_patch.batch.transforms[0].operations[0].path);
+    const conflict_current_date = try std.fmt.parseInt(u64, current_date_patch.batch.transforms[0].operations[0].value_json.?, 10);
+    try std.testing.expect(conflict_current_date > 0);
+    try std.testing.expectEqual(@as(u64, 0), conflict_current_date % @as(u64, 86_400 * std.time.ns_per_s));
+    try std.testing.expectEqual(@as(u64, 14), current_date_patch.batch.predicates[0].expected_version);
+
+    var interval_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 10) ON CONFLICT (email) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 second' RETURNING id, updated_at_ns",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer interval_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), interval_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), interval_patch.batch.transformed);
+    try std.testing.expectEqualStrings("updated_at_ns", interval_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("1000000001", interval_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), interval_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"updated_at_ns\":1000000001}", interval_patch.batch.returning_rows[0]);
+
+    var mixed_interval_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 10) ON CONFLICT (email) DO UPDATE SET updated_at_ns = updated_at_ns + INTERVAL '1 month 1 day' RETURNING id, updated_at_ns",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer mixed_interval_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), mixed_interval_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), mixed_interval_patch.batch.transformed);
+    try std.testing.expectEqualStrings("updated_at_ns", mixed_interval_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("2764800000000001", mixed_interval_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), mixed_interval_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"updated_at_ns\":2764800000000001}", mixed_interval_patch.batch.returning_rows[0]);
+
+    var conditional_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, amount) VALUES ('u2', 'a@example.test', 'higher', 10) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE excluded.amount > amount RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer conditional_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), conditional_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), conditional_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", conditional_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"higher\"", conditional_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), conditional_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"higher\"}", conditional_patch.batch.returning_rows[0]);
+
+    var alias_conditional_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records AS u (id, email, next_status, amount) VALUES ('u2', 'a@example.test', 'higher', 10) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE excluded.amount > u.amount RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer alias_conditional_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), alias_conditional_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), alias_conditional_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", alias_conditional_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"higher\"", alias_conditional_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), alias_conditional_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"higher\"}", alias_conditional_patch.batch.returning_rows[0]);
+
+    var boolean_guard_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, enabled) VALUES ('u2', 'a@example.test', 'boolean-guarded', true) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE excluded.enabled AND NOT starts_with(status, 'arch') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer boolean_guard_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), boolean_guard_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), boolean_guard_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", boolean_guard_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"boolean-guarded\"", boolean_guard_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), boolean_guard_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"boolean-guarded\"}", boolean_guard_patch.batch.returning_rows[0]);
+
+    var concat_guard_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, enabled) VALUES ('u2', 'a@example.test', 'concat-guarded', true) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE starts_with(concat(status, ':', excluded.next_status), 'old:') RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer concat_guard_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), concat_guard_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), concat_guard_patch.batch.transformed);
+    try std.testing.expectEqualStrings("status", concat_guard_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"concat-guarded\"", concat_guard_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), concat_guard_patch.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"concat-guarded\"}", concat_guard_patch.batch.returning_rows[0]);
+
+    var skipped_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, next_status, amount) VALUES ('u2', 'a@example.test', 'lower', 3) ON CONFLICT (email) DO UPDATE SET status = excluded.next_status WHERE excluded.amount > amount RETURNING id, status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer skipped_patch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), skipped_patch.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 0), skipped_patch.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 0), skipped_patch.batch.transforms.len);
+    try std.testing.expectEqual(@as(usize, 0), skipped_patch.batch.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), skipped_patch.batch.returning_rows.len);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 3) ON CONFLICT (email) DO UPDATE SET status = excluded.amount RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
+test "sql adapter lower dml lowers on conflict primary do nothing" {
+    const alloc = std.testing.allocator;
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"usage_records_id_pk\",\"columns\":[\"id\"]}}";
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"existing\"}", .version = 12 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING RETURNING *",
+        schema,
+        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 0), lowered.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.batch.returning_rows.len);
+
+    var named_primary = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT ON CONSTRAINT usage_records_pkey DO NOTHING RETURNING *",
+        schema,
+        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
+        resolver_ctx.resolver(),
+    );
+    defer named_primary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), named_primary.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 0), named_primary.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), named_primary.batch.returning_rows.len);
+
+    var custom_named_primary = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT ON CONSTRAINT usage_records_id_pk DO NOTHING RETURNING *",
+        schema,
+        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
+        resolver_ctx.resolver(),
+    );
+    defer custom_named_primary.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), custom_named_primary.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 0), custom_named_primary.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), custom_named_primary.batch.returning_rows.len);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT ON CONSTRAINT usage_records_missing_pk DO NOTHING",
+        schema,
+        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
+        resolver_ctx.resolver(),
+    ));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT (id, id) DO NOTHING",
+        schema,
+        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
+        resolver_ctx.resolver(),
+    ));
+}
+
 test "sql adapter lower dml lowers on conflict primary do update with excluded values" {
     const alloc = std.testing.allocator;
     const schema_json =

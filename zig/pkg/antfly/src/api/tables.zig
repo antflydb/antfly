@@ -1458,6 +1458,20 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
         try retargetRelationalSqlDdlPlanTableNameAlloc(alloc, &plan, table.name);
     }
 
+    switch (plan) {
+        .create_index => |create_index| {
+            if (create_index.derived_index_config_json) |index_json| {
+                return try applyRelationalDerivedIndexCreateToTableRecordAlloc(alloc, table, create_index, index_json);
+            }
+        },
+        .drop_index => |drop_index| {
+            if (try tableIndexesJsonContainsIndex(alloc, table.indexes_json, drop_index.index_name)) {
+                return try applyRelationalDerivedIndexDropToTableRecordAlloc(alloc, table, drop_index.index_name);
+            }
+        },
+        else => {},
+    }
+
     const current_schema_json: []const u8 = switch (plan) {
         .create_table => blk: {
             if (table.schema_json.len != 0) return error.InvalidSchemaUpdateRequest;
@@ -1480,6 +1494,154 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
         .rewrite_required = applied.rewrite_required,
         .work_items = work_items,
     };
+}
+
+fn tableIndexesJsonContainsIndex(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    index_name: []const u8,
+) !bool {
+    const source = if (indexes_json.len > 0) indexes_json else "{}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source, .{});
+    defer parsed.deinit();
+    return switch (parsed.value) {
+        .object => |object| object.contains(index_name),
+        else => error.InvalidTableIndexMetadata,
+    };
+}
+
+fn applyRelationalDerivedIndexCreateToTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    plan: relational_sql.CreateIndexPlan,
+    index_json: []const u8,
+) !AppliedRelationalSqlDdlRecord {
+    if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (try tableIndexesJsonContainsIndex(alloc, table.indexes_json, plan.index_name)) {
+        if (plan.if_not_exists) {
+            return .{
+                .table = try metadata_table_manager.cloneTable(alloc, table.*),
+                .noop = true,
+            };
+        }
+        return error.InvalidSqlCatalog;
+    }
+    try validateDerivedIndexFieldRefsForSchemaAlloc(alloc, index_json, table.schema_json);
+    try validateDerivedIndexCatalogRefsForTableIndexesAlloc(alloc, index_json, table.indexes_json);
+
+    const next_indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, plan.index_name, index_json);
+    defer alloc.free(next_indexes_json);
+    const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, table.name, next_indexes_json, table.schema_json);
+    defer alloc.free(prepared_indexes_json);
+
+    var updated = try metadata_table_manager.cloneTable(alloc, table.*);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+    alloc.free(updated.indexes_json);
+    updated.indexes_json = try alloc.dupe(u8, prepared_indexes_json);
+
+    return .{
+        .table = updated,
+        .requires_rebuild = true,
+        .work_items = try relational_sql.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, false, false),
+    };
+}
+
+fn applyRelationalDerivedIndexDropToTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    index_name: []const u8,
+) !AppliedRelationalSqlDdlRecord {
+    try validateDerivedIndexHasNoDependentsAlloc(alloc, table.indexes_json, index_name);
+    const next_indexes_json = (try indexes_api.removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.InvalidSqlCatalog;
+    defer alloc.free(next_indexes_json);
+    const prepared_indexes_json = try prepareTableIndexesForSchemaAlloc(alloc, table.name, next_indexes_json, table.schema_json);
+    defer alloc.free(prepared_indexes_json);
+
+    var updated = try metadata_table_manager.cloneTable(alloc, table.*);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+    alloc.free(updated.indexes_json);
+    updated.indexes_json = try alloc.dupe(u8, prepared_indexes_json);
+
+    return .{
+        .table = updated,
+        .requires_rebuild = true,
+        .work_items = try relational_sql.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, false, false),
+    };
+}
+
+fn validateDerivedIndexHasNoDependentsAlloc(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    index_name: []const u8,
+) !void {
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len > 0) indexes_json else "{}", .{});
+    defer parsed_indexes.deinit();
+    const indexes = switch (parsed_indexes.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    var it = indexes.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, index_name)) continue;
+        if (entry.value_ptr.* != .object) continue;
+        const type_name = requiredJsonStringField(entry.value_ptr.object, "type") catch continue;
+        if (std.mem.eql(u8, type_name, "graph_metric")) {
+            const graph_index = requiredJsonStringField(entry.value_ptr.object, "graph_index") catch continue;
+            if (std.mem.eql(u8, graph_index, index_name)) return error.InvalidTableIndexMetadata;
+        } else if (std.mem.eql(u8, type_name, "hybrid")) {
+            const sources = entry.value_ptr.object.get("sources") orelse continue;
+            if (sources != .array) continue;
+            for (sources.array.items) |source| {
+                if (source == .string and std.mem.eql(u8, source.string, index_name)) return error.InvalidTableIndexMetadata;
+            }
+        }
+    }
+}
+
+fn validateDerivedIndexCatalogRefsForTableIndexesAlloc(
+    alloc: std.mem.Allocator,
+    index_json: []const u8,
+    indexes_json: []const u8,
+) !void {
+    var parsed_index = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed_index.deinit();
+    var parsed_indexes = try std.json.parseFromSlice(std.json.Value, alloc, if (indexes_json.len > 0) indexes_json else "{}", .{});
+    defer parsed_indexes.deinit();
+
+    if (parsed_index.value != .object) return error.InvalidTableIndexMetadata;
+    const indexes = switch (parsed_indexes.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    const type_name = try requiredJsonStringField(parsed_index.value.object, "type");
+    if (std.mem.eql(u8, type_name, "graph_metric")) {
+        const graph_index = try requiredJsonStringField(parsed_index.value.object, "graph_index");
+        const graph_config = indexes.get(graph_index) orelse return error.InvalidTableIndexMetadata;
+        try validateIndexConfigType(graph_config, "graph");
+        _ = try requiredJsonStringField(parsed_index.value.object, "metric");
+    } else if (std.mem.eql(u8, type_name, "hybrid")) {
+        const sources = parsed_index.value.object.get("sources") orelse return error.InvalidTableIndexMetadata;
+        if (sources != .array) return error.InvalidTableIndexMetadata;
+        if (sources.array.items.len == 0) return error.InvalidTableIndexMetadata;
+        for (sources.array.items) |source| {
+            if (source != .string) return error.InvalidTableIndexMetadata;
+            if (!indexes.contains(source.string)) return error.InvalidTableIndexMetadata;
+        }
+    }
+}
+
+fn requiredJsonStringField(object: std.json.ObjectMap, field_name: []const u8) ![]const u8 {
+    const value = object.get(field_name) orelse return error.InvalidTableIndexMetadata;
+    return switch (value) {
+        .string => |string| string,
+        else => error.InvalidTableIndexMetadata,
+    };
+}
+
+fn validateIndexConfigType(config: std.json.Value, expected_type: []const u8) !void {
+    if (config != .object) return error.InvalidTableIndexMetadata;
+    const type_name = try requiredJsonStringField(config.object, "type");
+    if (!std.mem.eql(u8, type_name, expected_type)) return error.InvalidTableIndexMetadata;
 }
 
 pub fn relationalSqlDdlTargetAlloc(
@@ -5120,6 +5282,138 @@ test "metadata.schema update sql ddl creates relational table record schema and 
     try std.testing.expect(std.mem.indexOf(u8, applied.table.read_schema_json, "\"document_schemas\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, applied.table.indexes_json, "\"algebraic_index_v0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, applied.table.indexes_json, "\"derive_from_schema\"") == null);
+}
+
+test "metadata.schema update sql ddl applies Antfly derived indexes to table metadata" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 12,
+        .name = "docs",
+        .schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    var created = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &table,
+        \\CREATE TABLE docs (
+        \\  id text PRIMARY KEY,
+        \\  body text,
+        \\  source_doc text,
+        \\  target_doc text,
+        \\  edge_type text,
+        \\  confidence numeric
+        \\);
+        ,
+    );
+    defer created.deinit(std.testing.allocator);
+
+    var full_text = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &created.table,
+        "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');",
+    );
+    defer full_text.deinit(std.testing.allocator);
+    try std.testing.expect(full_text.requires_rebuild);
+    try std.testing.expectEqual(@as(usize, 1), full_text.work_items.len);
+    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"docs_body_fts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"type\":\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text.table.schema_json, "\"docs_body_fts\"") == null);
+
+    var semantic = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &full_text.table,
+        "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384);",
+    );
+    defer semantic.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, semantic.table.indexes_json, "\"docs_body_semantic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, semantic.table.indexes_json, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, semantic.table.indexes_json, "\"body_embedding_v1\"") != null);
+
+    var graph = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &semantic.table,
+        "CREATE GRAPH INDEX docs_graph ON docs EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all');",
+    );
+    defer graph.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"docs_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"type\":\"graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"edge_policy\":\"all\"") != null);
+
+    var graph_metric = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &graph.table,
+        "CREATE INDEX docs_graph_pagerank ON docs USING antfly_graph_metric () WITH (graph_index = 'docs_graph', metric = 'pagerank');",
+    );
+    defer graph_metric.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"docs_graph_pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"type\":\"graph_metric\"") != null);
+
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &graph_metric.table,
+            "CREATE INDEX docs_missing_metric ON docs USING antfly_graph_metric () WITH (graph_index = 'missing_graph', metric = 'pagerank');",
+        ),
+    );
+
+    var hybrid = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &graph_metric.table,
+        "CREATE INDEX docs_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_body_semantic,docs_graph_pagerank', fusion = 'rrf');",
+    );
+    defer hybrid.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"docs_hybrid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"sources\"") != null);
+
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &hybrid.table,
+            "CREATE INDEX docs_bad_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,missing_source', fusion = 'rrf');",
+        ),
+    );
+
+    var duplicate_noop = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &hybrid.table,
+        "CREATE INDEX IF NOT EXISTS docs_body_fts ON docs USING antfly_full_text (body);",
+    );
+    defer duplicate_noop.deinit(std.testing.allocator);
+    try std.testing.expect(duplicate_noop.noop);
+    try std.testing.expectEqualStrings(hybrid.table.indexes_json, duplicate_noop.table.indexes_json);
+
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &hybrid.table,
+            "CREATE INDEX docs_missing_fts ON docs USING antfly_full_text (missing_field);",
+        ),
+    );
+
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &hybrid.table,
+            "DROP INDEX docs_graph;",
+        ),
+    );
+
+    var dropped = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &hybrid.table,
+        "DROP INDEX docs_hybrid;",
+    );
+    defer dropped.deinit(std.testing.allocator);
+    try std.testing.expect(dropped.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, dropped.table.indexes_json, "\"docs_hybrid\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dropped.table.indexes_json, "\"docs_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dropped.table.indexes_json, "\"docs_body_semantic\"") != null);
 }
 
 test "metadata.schema update sql ddl exposes catalog target and create intent" {
