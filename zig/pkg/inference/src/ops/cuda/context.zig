@@ -53,6 +53,7 @@ pub const GraphExecUpdateOutcome = struct {
     cuda_result: driver_mod.CUresult,
     update_result: CUgraphExecUpdateResult = driver_mod.CU_GRAPH_EXEC_UPDATE_ERROR,
     error_node: CUgraphNode = null,
+    error_from_node: CUgraphNode = null,
 
     pub fn success(self: GraphExecUpdateOutcome) bool {
         return self.cuda_result == driver_mod.CUDA_SUCCESS and
@@ -183,7 +184,7 @@ pub const CudaContext = struct {
     pub fn instantiateGraph(self: *CudaContext, graph: CUgraph) driver_mod.Error!CUgraphExec {
         try self.makeCurrent();
         var exec: CUgraphExec = null;
-        try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, null, null, 0));
+        try self.driver.check(self.driver.fns.cuGraphInstantiate(&exec, graph, 0));
         if (exec == null) return error.InvalidCudaState;
         return exec;
     }
@@ -192,7 +193,11 @@ pub const CudaContext = struct {
         const update_fn = self.driver.fns.cuGraphExecUpdate orelse return error.CudaSymbolMissing;
         try self.makeCurrent();
         var outcome = GraphExecUpdateOutcome{ .cuda_result = driver_mod.CUDA_SUCCESS };
-        outcome.cuda_result = update_fn(exec, graph, &outcome.error_node, &outcome.update_result);
+        var result_info = driver_mod.CUgraphExecUpdateResultInfo{};
+        outcome.cuda_result = update_fn(exec, graph, &result_info);
+        outcome.update_result = result_info.result;
+        outcome.error_node = result_info.errorNode;
+        outcome.error_from_node = result_info.errorFromNode;
         return outcome;
     }
 

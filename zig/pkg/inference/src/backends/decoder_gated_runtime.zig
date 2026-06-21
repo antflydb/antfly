@@ -2902,33 +2902,35 @@ fn forwardFinalHiddenTensorGemmaDirect(
         const attention_apply_started_at = monotonicNowNs();
         const attn_residual = if (decode_context.attention_mode == .paged_decode and decode_context.query_sequence_len == 1) blk: {
             const fused_residual_started_at = monotonicNowNs();
-            if (!qk_already_roped and try gpt_arch.applyAttentionResidual(
-                cb,
-                gpt_config,
-                q_for_attn,
-                k_attn,
-                v_for_attn,
-                hidden,
-                1,
-                seq_len,
-                gpt_config.num_attention_heads,
-                num_kv_heads,
-                head_dim,
-                gpt_config.hidden_size,
-                layer,
-                kv_layer_index,
-                shares_kv,
-                linearSlot(layer, .attn_out_proj),
-                null,
-                normSlot(layer, .attn_post),
-                decode_context,
-            )) |fused_attn_residual| {
-                recordGemmaDirectAttentionResidual(true, true);
-                const fused_residual_finished_at = monotonicNowNs();
-                if (fused_residual_finished_at > fused_residual_started_at) {
-                    addBlockAttentionFusedResidualTiming(phase, fused_residual_finished_at - fused_residual_started_at);
+            if (!qk_already_roped) {
+                if (try gpt_arch.applyAttentionResidual(
+                    cb,
+                    gpt_config,
+                    q_for_attn,
+                    k_attn,
+                    v_for_attn,
+                    hidden,
+                    1,
+                    seq_len,
+                    gpt_config.num_attention_heads,
+                    num_kv_heads,
+                    head_dim,
+                    gpt_config.hidden_size,
+                    layer,
+                    kv_layer_index,
+                    shares_kv,
+                    linearSlot(layer, .attn_out_proj),
+                    null,
+                    normSlot(layer, .attn_post),
+                    decode_context,
+                )) |fused_attn_residual| {
+                    recordGemmaDirectAttentionResidual(true, true);
+                    const fused_residual_finished_at = monotonicNowNs();
+                    if (fused_residual_finished_at > fused_residual_started_at) {
+                        addBlockAttentionFusedResidualTiming(phase, fused_residual_finished_at - fused_residual_started_at);
+                    }
+                    break :blk fused_attn_residual;
                 }
-                break :blk fused_attn_residual;
             }
 
             const attn_out = if (qk_already_roped)

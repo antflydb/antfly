@@ -46,11 +46,16 @@ pub const CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED: CUgraphExecUpdateResult = 6;
 pub const CU_GRAPH_EXEC_UPDATE_ERROR_UNSUPPORTED_FUNCTION_CHANGE: CUgraphExecUpdateResult = 7;
 pub const CU_GRAPH_EXEC_UPDATE_ERROR_ATTRIBUTES_CHANGED: CUgraphExecUpdateResult = 8;
 
+pub const CUgraphExecUpdateResultInfo = extern struct {
+    result: CUgraphExecUpdateResult = CU_GRAPH_EXEC_UPDATE_ERROR,
+    errorNode: CUgraphNode = null,
+    errorFromNode: CUgraphNode = null,
+};
+
 pub const CUgraphExecUpdateFn = *const fn (
     hGraphExec: CUgraphExec,
     hGraph: CUgraph,
-    hErrorNode_out: ?*CUgraphNode,
-    updateResult_out: *CUgraphExecUpdateResult,
+    resultInfo: *CUgraphExecUpdateResultInfo,
 ) callconv(.c) CUresult;
 
 pub const CU_JIT_INFO_LOG_BUFFER: CUjit_option = 3;
@@ -115,7 +120,7 @@ pub const CudaDriver = struct {
             kernelParams: ?[*]?*anyopaque,
             extra: ?[*]?*anyopaque,
         ) callconv(.c) CUresult,
-        cuGraphInstantiate: *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, phErrorNode: ?*CUgraphNode, logBuffer: ?[*]u8, bufferSize: usize) callconv(.c) CUresult,
+        cuGraphInstantiate: *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: c_ulonglong) callconv(.c) CUresult,
         cuGraphExecUpdate: ?CUgraphExecUpdateFn,
         cuGraphLaunch: *const fn (hGraphExec: CUgraphExec, hStream: CUstream) callconv(.c) CUresult,
         cuGraphExecDestroy: *const fn (hGraphExec: CUgraphExec) callconv(.c) CUresult,
@@ -161,8 +166,8 @@ pub const CudaDriver = struct {
                 .cuModuleUnload = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleUnload), "cuModuleUnload") catch return error.CudaSymbolMissing,
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
-                .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiate_v2") catch return error.CudaSymbolMissing,
-                .cuGraphExecUpdate = lib.lookup(CUgraphExecUpdateFn, "cuGraphExecUpdate"),
+                .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiateWithFlags") catch return error.CudaSymbolMissing,
+                .cuGraphExecUpdate = lib.lookup(CUgraphExecUpdateFn, "cuGraphExecUpdate_v2"),
                 .cuGraphLaunch = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphLaunch), "cuGraphLaunch") catch return error.CudaSymbolMissing,
                 .cuGraphExecDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphExecDestroy), "cuGraphExecDestroy") catch return error.CudaSymbolMissing,
                 .cuGraphDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphDestroy), "cuGraphDestroy") catch return error.CudaSymbolMissing,
