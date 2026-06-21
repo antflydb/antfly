@@ -1,0 +1,22 @@
+{
+  "requirement_format": 1,
+  "required": [
+    "aggregate_duplicate_output_name",
+    "bulk_io_plan",
+    "cte_mutation_source_plan",
+    "duplicate_conflict_update_target",
+    "duplicate_output_name",
+    "duplicate_row_batch_target",
+    "duplicate_update_target",
+    "enforced_unique_conflict_target",
+    "invalid_expression_conflict_target",
+    "invalid_named_conflict_target",
+    "multi_output_subquery_delete_selector",
+    "multi_output_subquery_update_selector",
+    "multi_table_generation_barrier",
+    "routine_body_plan",
+    "routine_option_plan",
+    "row_lock_mode_plan",
+    "set_operation_output_shape"
+  ]
+}

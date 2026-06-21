@@ -1210,7 +1210,12 @@ source-table and assignment tokens, update-source plans must carry mutation
 operation tokens, joined update/delete plans must carry exact source/join
 tokens, and delete-source plans must carry the lock/returning tokens that prove
 the statement reached the source-driven mutation lowerer. A fixture family label
-alone is not coverage. SQL adapter
+alone is not coverage. Required unsupported/invalid native-requirement labels
+live in `api/fixtures/sql_api_required_native_requirements.json`, must stay
+sorted, and must match every non-noop `classification_reason` used by the
+source corpus. That turns remaining native model gaps into explicit reviewable
+typed-plan work items instead of letting unsupported fingerprints appear or
+disappear silently. SQL adapter
 edge cases that are not golden typed-plan entries, such as comment preservation,
 malformed placeholder suffixes, statement-kind classification, and fail-closed
 point-lowerer boundaries, live in

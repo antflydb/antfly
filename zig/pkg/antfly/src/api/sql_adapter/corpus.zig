@@ -456,6 +456,7 @@ pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityC
 pub const app_parity_fixture_format: u64 = 1;
 pub const app_parity_coverage_fixture_format: u64 = 1;
 pub const app_parity_coverage_regression_requirement_fixture_format: u64 = 1;
+pub const app_parity_native_requirement_fixture_format: u64 = 1;
 pub const app_parity_summary_assertion_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
@@ -485,6 +486,21 @@ pub const AppParityCoverageRequirementsRoot = struct {
 pub const AppParityCoverageRegressionRequirementsRoot = struct {
     coverage_format: u64,
     required: []const []const u8,
+};
+
+pub const AppParityNativeRequirementRoot = struct {
+    requirement_format: u64,
+    required: []const []const u8,
+};
+
+pub const AppParityNativeRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParityNativeRequirementRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeNativeRequirementRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
 };
 
 pub const AppParityCoverageRegressionRequirements = struct {
@@ -558,6 +574,56 @@ pub fn parseAppParityCoverageRequirementsAlloc(alloc: std.mem.Allocator) !AppPar
 
     const root = try parseCoverageRequirementsRootAlloc(alloc, parsed.value);
     errdefer freeCoverageRequirementsRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+pub fn parseNativeRequirementRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !AppParityNativeRequirementRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "requirement_format", "required" });
+    const requirement_format = try fixtureJsonOptionalU64(root, "requirement_format", 0);
+    if (requirement_format != app_parity_native_requirement_fixture_format) return error.TestUnexpectedResult;
+    const required = try parseFixtureStringListAlloc(alloc, root, "required");
+    errdefer if (required.len > 0) alloc.free(required);
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    for (required, 0..) |name, i| {
+        const reason = diagnostics.classificationReasonFromToken(name) orelse return error.TestUnexpectedResult;
+        if (name.len == 0 or seen.contains(name) or !diagnostics.classificationReasonIsUnsupportedRequirement(reason)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
+        try seen.put(alloc, name, {});
+    }
+
+    return .{
+        .requirement_format = requirement_format,
+        .required = required,
+    };
+}
+
+pub fn freeNativeRequirementRoot(
+    alloc: std.mem.Allocator,
+    root: AppParityNativeRequirementRoot,
+) void {
+    if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn parseAppParityNativeRequirementsAlloc(alloc: std.mem.Allocator) !AppParityNativeRequirements {
+    const requirement_json = @embedFile("../fixtures/sql_api_required_native_requirements.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, requirement_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseNativeRequirementRootAlloc(alloc, parsed.value);
+    errdefer freeNativeRequirementRoot(alloc, root);
 
     return .{
         .parsed = parsed,
@@ -4313,6 +4379,109 @@ test "sql adapter corpus parses source corpus root entries" {
     try std.testing.expectEqualStrings("prepare statement protocol plan", root.entries[0].name);
     try std.testing.expectEqual(AppParityCorpusPlanFamily.ddl, root.entries[0].family);
     try std.testing.expectEqual(AppParityDdlTag.prepare_statement, root.entries[0].summary.ddl_tag.?);
+}
+
+fn expectSourceCorpusNativeRequirements(
+    alloc: std.mem.Allocator,
+    entries: []const AppParityCorpusEntry,
+    required: []const []const u8,
+) !void {
+    if (required.len == 0) return error.TestUnexpectedResult;
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entries) |entry| {
+        if (entry.classification_reason.len == 0) continue;
+        const reason = diagnostics.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
+        if (!diagnostics.classificationReasonIsUnsupportedRequirement(reason)) continue;
+        if (!stringListContains(required, entry.classification_reason)) {
+            std.debug.print("unlisted source corpus native requirement: {s}\n", .{entry.classification_reason});
+            return error.TestUnexpectedResult;
+        }
+        try seen.put(alloc, entry.classification_reason, {});
+    }
+
+    for (required) |name| {
+        if (!seen.contains(name)) {
+            std.debug.print("missing source corpus native requirement: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "sql adapter source corpus covers required native requirement classifications" {
+    const alloc = std.testing.allocator;
+    var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer source.deinit(alloc);
+    var requirements = try parseAppParityNativeRequirementsAlloc(alloc);
+    defer requirements.deinit(alloc);
+
+    try expectSourceCorpusNativeRequirements(alloc, source.root.entries, requirements.root.required);
+}
+
+test "sql adapter corpus validates native requirement manifest" {
+    const alloc = std.testing.allocator;
+    var requirements = try parseAppParityNativeRequirementsAlloc(alloc);
+    defer requirements.deinit(alloc);
+    try std.testing.expectEqual(app_parity_native_requirement_fixture_format, requirements.root.requirement_format);
+    try std.testing.expect(requirements.root.required.len > 0);
+
+    const unknown_json =
+        \\{
+        \\  "requirement_format": 1,
+        \\  "required": [
+        \\    "aggregate_duplicate_output_name",
+        \\    "not_a_requirement"
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown = try std.json.parseFromSlice(std.json.Value, alloc, unknown_json, .{});
+    defer parsed_unknown.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseNativeRequirementRootAlloc(alloc, parsed_unknown.value));
+
+    const noop_json =
+        \\{
+        \\  "requirement_format": 1,
+        \\  "required": [
+        \\    "aggregate_duplicate_output_name",
+        \\    "session_setting"
+        \\  ]
+        \\}
+    ;
+    var parsed_noop = try std.json.parseFromSlice(std.json.Value, alloc, noop_json, .{});
+    defer parsed_noop.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseNativeRequirementRootAlloc(alloc, parsed_noop.value));
+
+    const unsorted_json =
+        \\{
+        \\  "requirement_format": 1,
+        \\  "required": [
+        \\    "bulk_io_plan",
+        \\    "aggregate_duplicate_output_name"
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
+    defer parsed_unsorted.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseNativeRequirementRootAlloc(alloc, parsed_unsorted.value));
+
+    const entries = [_]AppParityCorpusEntry{
+        .{
+            .name = "unsupported bulk",
+            .family = .unsupported_ddl,
+            .classification_reason = "bulk_io_plan",
+            .plan = "unsupported:ddl:requires=bulk_io_plan",
+            .sql = "COPY usage_records FROM STDIN",
+        },
+    };
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectSourceCorpusNativeRequirements(alloc, &entries, &.{ "aggregate_duplicate_output_name", "bulk_io_plan" }),
+    );
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectSourceCorpusNativeRequirements(alloc, &entries, &.{"aggregate_duplicate_output_name"}),
+    );
 }
 
 test "sql adapter source corpus rejects duplicate entry names" {
