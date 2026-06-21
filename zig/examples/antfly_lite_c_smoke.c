@@ -61,9 +61,11 @@ static int fail_with_buffer(const char *message, antfly_buffer *buffer) {
 int main(void) {
     const char *path = "/tmp/antfly-lite-c-smoke.aflite";
     const char *restored_path = "/tmp/antfly-lite-c-smoke-restored.aflite";
+    const char *snapshot_path = "/tmp/antfly-lite-c-smoke-snapshot.aflite";
     const char *bad_path = "/tmp/antfly-lite-c-smoke-bad.aflite";
     (void)remove(path);
     (void)remove(restored_path);
+    (void)remove(snapshot_path);
     (void)remove(bad_path);
 
     if (antfly_lite_abi_version() != 1) {
@@ -98,6 +100,7 @@ int main(void) {
         fprintf(stderr, "failed to create truncated lite file\n");
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -106,6 +109,7 @@ int main(void) {
         fclose(bad_file);
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -113,6 +117,7 @@ int main(void) {
         fprintf(stderr, "failed to close truncated lite file\n");
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -121,6 +126,7 @@ int main(void) {
     if (expect_ok(antfly_lite_check_file_json(bad_path, &check_file), "check invalid lite file") != 0) {
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -128,6 +134,7 @@ int main(void) {
         !buffer_contains(check_file, "\"issue\":\"truncated_header\"")) {
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return fail_with_buffer("file-level check did not report truncated lite file", &check_file);
     }
@@ -138,6 +145,7 @@ int main(void) {
     if (expect_ok(antfly_lite_open_with_options(path, &options, &handle), "open lite database") != 0) {
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -211,11 +219,84 @@ int main(void) {
     }
     antfly_buffer_free(&lookup);
 
+    antfly_buffer snapshot_report = {0};
+    if (expect_ok(
+            antfly_lite_copy_stable_snapshot_file_json(path, snapshot_path, false, &snapshot_report),
+            "copy stable lite snapshot file"
+        ) != 0) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    if (!buffer_contains(snapshot_report, "snapshot_size") ||
+        !buffer_contains(snapshot_report, "checkpoint_sequence")) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(bad_path);
+        return fail_with_buffer("path-level snapshot report did not include expected fields", &snapshot_report);
+    }
+    antfly_buffer_free(&snapshot_report);
+
+    antfly_buffer overwrite_report = {0};
+    antfly_error_code overwrite_code =
+        antfly_lite_copy_stable_snapshot_file_json(path, snapshot_path, false, &overwrite_report);
+    if (overwrite_code != ANTFLY_INVALID_ARGUMENT) {
+        fprintf(
+            stderr,
+            "snapshot overwrite without replace returned %s, expected ANTFLY_INVALID_ARGUMENT\n",
+            antfly_error_code_name(overwrite_code)
+        );
+        antfly_buffer_free(&overwrite_report);
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+
+    void *snapshot_handle = NULL;
+    if (expect_ok(antfly_lite_open_readonly(snapshot_path, &snapshot_handle), "open snapshot readonly") != 0) {
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    antfly_buffer snapshot_lookup = {0};
+    if (expect_ok(antfly_db_lookup_json(snapshot_handle, write.key, &snapshot_lookup), "lookup snapshot json") != 0) {
+        antfly_db_close(snapshot_handle);
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(bad_path);
+        return 1;
+    }
+    if (!buffer_contains(snapshot_lookup, "c api lite")) {
+        antfly_db_close(snapshot_handle);
+        antfly_db_close(handle);
+        (void)remove(path);
+        (void)remove(restored_path);
+        (void)remove(snapshot_path);
+        (void)remove(bad_path);
+        return fail_with_buffer("snapshot lookup json did not contain expected value", &snapshot_lookup);
+    }
+    antfly_buffer_free(&snapshot_lookup);
+    antfly_db_close(snapshot_handle);
+
     antfly_buffer compact = {0};
     if (expect_ok(antfly_lite_compact_json(handle, &compact), "compact lite database") != 0) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -223,6 +304,7 @@ int main(void) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return fail_with_buffer("compact json did not include compact/vacuum fields", &compact);
     }
@@ -233,6 +315,7 @@ int main(void) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return 1;
     }
@@ -240,6 +323,7 @@ int main(void) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return fail_with_buffer("status json did not describe native aflite storage", &status);
     }
@@ -249,6 +333,7 @@ int main(void) {
         antfly_db_close(handle);
         (void)remove(path);
         (void)remove(restored_path);
+        (void)remove(snapshot_path);
         (void)remove(bad_path);
         return fail_with_buffer("status json did not expose expected Lite inference modes", &status);
     }
@@ -257,6 +342,7 @@ int main(void) {
     antfly_db_close(handle);
     (void)remove(path);
     (void)remove(restored_path);
+    (void)remove(snapshot_path);
     (void)remove(bad_path);
     return 0;
 }
