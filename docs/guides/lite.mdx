@@ -229,7 +229,9 @@ curl http://127.0.0.1:8080/lite/v1/capabilities
 ```
 
 This is not the clustered `/db/v1` service API. Treat it as a local convenience
-surface for Lite, not as a distributed Antfly compatibility mode.
+surface for Lite, not as a distributed Antfly compatibility mode. In v1,
+`serve` only accepts loopback listen hosts such as `127.0.0.1`, `localhost`, or
+`::1`; wildcard and LAN binds are rejected.
 
 ## Back Up And Restore Lite
 

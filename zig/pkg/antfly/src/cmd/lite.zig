@@ -1000,7 +1000,16 @@ fn parseLiteListenAddress(addr: []const u8) !LiteListenAddress {
     const sep = std.mem.lastIndexOfScalar(u8, addr, ':') orelse return error.InvalidArguments;
     if (sep == 0 or sep + 1 >= addr.len) return error.InvalidArguments;
     const port = try std.fmt.parseInt(u16, addr[sep + 1 ..], 10);
-    return .{ .host = addr[0..sep], .port = port };
+    const host = addr[0..sep];
+    if (!isLiteLocalListenHost(host)) return error.InvalidArguments;
+    return .{ .host = host, .port = port };
+}
+
+fn isLiteLocalListenHost(host: []const u8) bool {
+    return std.mem.eql(u8, host, "localhost") or
+        std.mem.eql(u8, host, "127.0.0.1") or
+        std.mem.eql(u8, host, "::1") or
+        std.mem.eql(u8, host, "[::1]");
 }
 
 fn registerLiteHttpRoutes(server: *httpx.Server) !void {
@@ -1752,6 +1761,14 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
     }
     try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("127.0.0.1"));
     try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress(":8080"));
+    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("0.0.0.0:8080"));
+    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("192.168.1.10:8080"));
+    try std.testing.expectError(error.InvalidArguments, parseLiteListenAddress("[::]:8080"));
+    {
+        const listen = try parseLiteListenAddress("localhost:8080");
+        try std.testing.expectEqualStrings("localhost", listen.host);
+        try std.testing.expectEqual(@as(u16, 8080), listen.port);
+    }
 }
 
 test "lite promote parser requires values and derives default backup id" {

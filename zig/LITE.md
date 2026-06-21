@@ -119,7 +119,9 @@ appear as the public index layout for native Lite files.
 local single-node HTTP API under `/lite/v1` for development, SDK smoke tests,
 and migration testing, but the primary contract is embedded use. It should not
 pretend to be the clustered `/db/v1` service API unless a future compatibility
-profile is deliberately added.
+profile is deliberately added. The v1 serve command should bind only to
+loopback hosts; wildcard or LAN listeners should require a future explicit
+remote/development override.
 
 ### Embedded Library
 
