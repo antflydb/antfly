@@ -39,7 +39,7 @@ pub const InsertSourceParserHooks = struct {
     conflict_target_options: ConflictTargetParserOptions,
     conflict_assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
     conflict_condition_options: ConflictAssignmentExpressionParserOptions,
-    conflict_dispatch_hooks: ConflictExpressionDispatchHooks,
+    conflict_dispatch_options: ConflictExpressionDispatchOptions,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     parse_select: *const fn (
         *anyopaque,
@@ -90,7 +90,7 @@ pub const MergeMutationParserHooks = struct {
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema = null,
     context_hooks: MergeMutationParserContextHooks,
-    condition_hooks: MergeArmConditionParserHooks,
+    condition_options: MergeArmConditionParserOptions,
     assignment_hooks: MergeAssignmentParserHooks,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     realtime_ns: u64,
@@ -131,7 +131,7 @@ pub const JsonSetSqlValueParserOptions = struct {
     row_expression_hooks: lower_expr.RowExpressionParserHooks,
     arithmetic_hooks: lower_expr.ArithmeticExpressionParserHooks,
     variadic_hooks: lower_expr.VariadicRowExpressionParserHooks,
-    conflict_dispatch_hooks: ConflictExpressionDispatchHooks,
+    conflict_dispatch_options: ConflictExpressionDispatchOptions,
 };
 
 pub const ConflictUpdateAssignmentValueParserOptions = struct {
@@ -184,7 +184,7 @@ pub const ConflictClauseParserOptions = struct {
     target_options: ConflictTargetParserOptions,
     assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
     condition_options: ConflictAssignmentExpressionParserOptions,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
 };
 
 pub const ConflictAssignmentExpressionParserOptions = struct {
@@ -193,10 +193,10 @@ pub const ConflictAssignmentExpressionParserOptions = struct {
     conflict_existing_qualifiers: []const []const u8,
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
 };
 
-pub const ConflictExpressionDispatchHooks = struct {
+pub const ConflictExpressionDispatchOptions = struct {
     array_length: ConflictArrayLengthExpressionParserOptions,
     case_fold: ConflictCaseFoldExpressionParserOptions,
 };
@@ -371,7 +371,7 @@ pub const JoinedMutationJsonSetSqlValueParserOptions = struct {
     row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
 };
 
-pub const JoinedMutationAssignmentValueParserHooks = struct {
+pub const JoinedMutationAssignmentValueParserOptions = struct {
     json_set: JoinedMutationJsonSetSqlValueParserOptions,
     assignment_expression: JoinedMutationAssignmentExpressionParserOptions,
 };
@@ -565,7 +565,7 @@ pub const UpdateJoinedMutationSourceParserOptions = struct {
     row_claim: db_mod.types.RowClaimRequest,
     string_to_array_predicate_is_containment: bool,
     context_hooks: JoinedMutationSourceParserContextHooks,
-    assignment_hooks: JoinedMutationAssignmentValueParserHooks,
+    assignment_options: JoinedMutationAssignmentValueParserOptions,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
@@ -594,41 +594,14 @@ pub const MergeAssignmentExpressionParserOptions = struct {
     row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
 };
 
-pub const MergeArmExpressionPredicatesParserHooks = struct {
-    ptr: *anyopaque,
-    parse_expression_not_where: *const fn (
-        *anyopaque,
-        TableAlias,
-        TableAlias,
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void,
-    parse_expression_or_where: *const fn (
-        *anyopaque,
-        TableAlias,
-        TableAlias,
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void,
-    parse_expression_where_conditions: *const fn (
-        *anyopaque,
-        TableAlias,
-        TableAlias,
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void,
+pub const MergeArmExpressionPredicatesParserOptions = struct {
+    not_where_options: lower_expr.JoinedExpressionNotWhereParserOptions,
+    or_where_options: lower_expr.JoinedExpressionOrWhereParserOptions,
+    where_condition_options: lower_expr.JoinedExpressionWhereConditionsParserOptions,
 };
 
-pub const MergeArmConditionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_expression_predicates: *const fn (
-        *anyopaque,
-        TableAlias,
-        TableAlias,
-        bool,
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-        *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void,
+pub const MergeArmConditionParserOptions = struct {
+    expression_predicates_options: MergeArmExpressionPredicatesParserOptions,
 };
 
 pub const MutationSourceParserContext = struct {
@@ -650,7 +623,7 @@ pub const InsertParserOptions = struct {
     target_options: ConflictTargetParserOptions,
     assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
     condition_options: ConflictAssignmentExpressionParserOptions,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
@@ -865,7 +838,7 @@ pub fn parseInsertSourceWithCtesAlloc(
             .target_options = hooks.conflict_target_options,
             .assignment_hooks = hooks.conflict_assignment_hooks,
             .condition_options = hooks.conflict_condition_options,
-            .dispatch_hooks = hooks.conflict_dispatch_hooks,
+            .dispatch_options = hooks.conflict_dispatch_options,
         });
         defer freeConflictClause(alloc, parsed_conflict);
         if (parsed_conflict.where_expression != null or parsed_conflict.where_expressions.len != 0 or parsed_conflict.where_any.len != 0 or parsed_conflict.where_not.len != 0) conflict_where = true;
@@ -1059,7 +1032,7 @@ pub fn parseMergeMutationBodyAlloc(
         options.ctes.len,
         hooks.params,
         hooks.realtime_ns,
-        hooks.condition_hooks,
+        hooks.condition_options,
         hooks.assignment_hooks,
         hooks.returning_hooks,
     );
@@ -1821,7 +1794,7 @@ pub fn parseJsonSetSqlValueAlloc(
             null,
             options.type_context,
             options.defer_row_expression_field_validation,
-            options.conflict_dispatch_hooks,
+            options.conflict_dispatch_options,
         )
     else
         try lower_expr.parseRowExpressionAlloc(
@@ -2090,7 +2063,7 @@ pub fn parseConflictClauseAlloc(
     target_options: ConflictTargetParserOptions,
     assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
     condition_options: ConflictAssignmentExpressionParserOptions,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
 ) !ConflictClause {
     try parser.expectKeyword(tokens, pos, "conflict");
     const target = try parseConflictTargetAlloc(alloc, tokens, pos, schema, table_name, target_options);
@@ -2191,7 +2164,7 @@ pub fn parseConflictClauseAlloc(
             &where_any,
             &where_not,
             condition_options,
-            dispatch_hooks,
+            dispatch_options,
         );
     }
 
@@ -2227,7 +2200,7 @@ pub fn parseConflictClauseWithContextAlloc(
     const type_context = options.context_hooks.row_expression_type_context(options.context_hooks.ptr);
     const assignment_hooks = conflictUpdateSetAssignmentOptionsWithExistingQualifiers(options.assignment_hooks, options.existing_qualifiers);
     const condition_options = conflictAssignmentExpressionOptionsWithExistingQualifiers(options.condition_options, options.existing_qualifiers);
-    const dispatch_hooks = conflictDispatchHooksWithExistingQualifiers(options.dispatch_hooks, options.existing_qualifiers);
+    const dispatch_options = conflictDispatchOptionsWithExistingQualifiers(options.dispatch_options, options.existing_qualifiers);
     return try parseConflictClauseAlloc(
         alloc,
         tokens,
@@ -2243,7 +2216,7 @@ pub fn parseConflictClauseWithContextAlloc(
         options.target_options,
         assignment_hooks,
         condition_options,
-        dispatch_hooks,
+        dispatch_options,
     );
 }
 
@@ -2253,7 +2226,7 @@ fn conflictAssignmentExpressionOptionsWithExistingQualifiers(
 ) ConflictAssignmentExpressionParserOptions {
     var out = options;
     out.conflict_existing_qualifiers = conflict_existing_qualifiers;
-    out.dispatch_hooks = conflictDispatchHooksWithExistingQualifiers(out.dispatch_hooks, conflict_existing_qualifiers);
+    out.dispatch_options = conflictDispatchOptionsWithExistingQualifiers(out.dispatch_options, conflict_existing_qualifiers);
     return out;
 }
 
@@ -2263,8 +2236,8 @@ fn conflictUpdateSetAssignmentOptionsWithExistingQualifiers(
 ) ConflictUpdateSetAssignmentParserOptions {
     var out = hooks;
     out.value.json_set.conflict_existing_qualifiers = conflict_existing_qualifiers;
-    out.value.json_set.conflict_dispatch_hooks = conflictDispatchHooksWithExistingQualifiers(
-        out.value.json_set.conflict_dispatch_hooks,
+    out.value.json_set.conflict_dispatch_options = conflictDispatchOptionsWithExistingQualifiers(
+        out.value.json_set.conflict_dispatch_options,
         conflict_existing_qualifiers,
     );
     out.value.expression_options.assignment_options = conflictAssignmentExpressionOptionsWithExistingQualifiers(
@@ -2274,10 +2247,10 @@ fn conflictUpdateSetAssignmentOptionsWithExistingQualifiers(
     return out;
 }
 
-fn conflictDispatchHooksWithExistingQualifiers(
-    hooks: ConflictExpressionDispatchHooks,
+fn conflictDispatchOptionsWithExistingQualifiers(
+    hooks: ConflictExpressionDispatchOptions,
     conflict_existing_qualifiers: []const []const u8,
-) ConflictExpressionDispatchHooks {
+) ConflictExpressionDispatchOptions {
     var out = hooks;
     out.array_length.conflict_existing_qualifiers = conflict_existing_qualifiers;
     return out;
@@ -2602,7 +2575,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
     patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
     json_set: *std.ArrayListUnmanaged(JsonSetValue),
     target_transferred: *bool,
-    hooks: JoinedMutationAssignmentValueParserHooks,
+    options: JoinedMutationAssignmentValueParserOptions,
 ) !void {
     if (parser.matchKeyword(tokens, pos, "jsonb_set")) {
         if (target_column.field_type != .json) return error.InvalidSqlCatalog;
@@ -2615,7 +2588,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
         var path_transferred = false;
         errdefer if (!path_transferred) strings.freeStringSlice(alloc, path);
         try parser.expectToken(tokens, pos, .comma);
-        var json_set_options = hooks.json_set;
+        var json_set_options = options.json_set;
         json_set_options.pending_joined_source_alias = pending_joined_source_alias;
         const value = try parseJoinedMutationJsonSetSqlValueAlloc(alloc, tokens, pos, target_column, target_alias, json_set_options);
         var value_transferred = false;
@@ -2648,7 +2621,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
     }
 
     if (target_column.field_type == .boolean and canParseJoinedBooleanAssignmentExpression(tokens, pos.*, schema, joined_source_schema, pending_joined_source_alias, target_alias)) {
-        var assignment_expression_options = hooks.assignment_expression;
+        var assignment_expression_options = options.assignment_expression;
         assignment_expression_options.pending_joined_source_alias = pending_joined_source_alias;
         const expression = try parseJoinedMutationBooleanAssignmentExpressionAlloc(alloc, tokens, pos, target_alias, assignment_expression_options.type_context, assignment_expression_options);
         var expression_transferred = false;
@@ -2663,7 +2636,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
     }
 
     if (canParseJoinedAssignmentExpression(tokens, pos.*, schema, joined_source_schema, target_alias)) {
-        var assignment_expression_options = hooks.assignment_expression;
+        var assignment_expression_options = options.assignment_expression;
         assignment_expression_options.pending_joined_source_alias = pending_joined_source_alias;
         const expression = try parseJoinedMutationAssignmentExpressionAlloc(alloc, tokens, pos, target_column, target_alias, assignment_expression_options.type_context, assignment_expression_options);
         var expression_transferred = false;
@@ -2729,7 +2702,7 @@ pub fn parseJoinedMutationSetAssignmentAlloc(
     patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
     json_set: *std.ArrayListUnmanaged(JsonSetValue),
     saw_primary_key_assignment: *bool,
-    hooks: JoinedMutationAssignmentValueParserHooks,
+    options: JoinedMutationAssignmentValueParserOptions,
 ) !void {
     if (parser.peekKind(tokens, pos.*, .lparen)) {
         return try parseJoinedMutationRowAssignmentAlloc(
@@ -2747,7 +2720,7 @@ pub fn parseJoinedMutationSetAssignmentAlloc(
             patch_expr,
             json_set,
             saw_primary_key_assignment,
-            hooks,
+            options,
         );
     }
     return try parseJoinedMutationScalarAssignmentAlloc(
@@ -2765,7 +2738,7 @@ pub fn parseJoinedMutationSetAssignmentAlloc(
         patch_expr,
         json_set,
         saw_primary_key_assignment,
-        hooks,
+        options,
     );
 }
 
@@ -2784,7 +2757,7 @@ fn parseJoinedMutationRowAssignmentAlloc(
     patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
     json_set: *std.ArrayListUnmanaged(JsonSetValue),
     saw_primary_key_assignment: *bool,
-    hooks: JoinedMutationAssignmentValueParserHooks,
+    options: JoinedMutationAssignmentValueParserOptions,
 ) !void {
     try parser.expectToken(tokens, pos, .lparen);
     var targets = std.ArrayListUnmanaged([]const u8).empty;
@@ -2831,7 +2804,7 @@ fn parseJoinedMutationRowAssignmentAlloc(
             patch_expr,
             json_set,
             &target_transferred,
-            hooks,
+            options,
         );
         if (target_transferred) targets.items[i] = "";
         if (i + 1 < targets.items.len) {
@@ -2856,7 +2829,7 @@ fn parseJoinedMutationScalarAssignmentAlloc(
     patch_expr: *std.ArrayListUnmanaged(FieldExpressionValue),
     json_set: *std.ArrayListUnmanaged(JsonSetValue),
     saw_primary_key_assignment: *bool,
-    hooks: JoinedMutationAssignmentValueParserHooks,
+    options: JoinedMutationAssignmentValueParserOptions,
 ) !void {
     const target = try parseJoinedMutationTargetFieldAlloc(alloc, tokens, pos, target_alias);
     var target_transferred = false;
@@ -2882,7 +2855,7 @@ fn parseJoinedMutationScalarAssignmentAlloc(
         patch_expr,
         json_set,
         &target_transferred,
-        hooks,
+        options,
     );
 }
 
@@ -2991,7 +2964,7 @@ pub fn parseMergeMutationClausesAlloc(
     ctes_len: usize,
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
-    condition_hooks: MergeArmConditionParserHooks,
+    condition_options: MergeArmConditionParserOptions,
     assignment_hooks: MergeAssignmentParserHooks,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
 ) !ParsedMergeMutationClauses {
@@ -3022,7 +2995,7 @@ pub fn parseMergeMutationClausesAlloc(
                 source_table,
                 params,
                 realtime_ns,
-                condition_hooks,
+                condition_options,
                 assignment_hooks,
             );
             var arm_transferred = false;
@@ -3040,7 +3013,7 @@ pub fn parseMergeMutationClausesAlloc(
                 source_table,
                 params,
                 realtime_ns,
-                condition_hooks,
+                condition_options,
                 assignment_hooks,
             );
             var arm_transferred = false;
@@ -3256,7 +3229,7 @@ pub fn parseConflictAssignmentExpressionAlloc(
         column.field_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
     var expression_owned = true;
     errdefer if (expression_owned) freeExpression(alloc, expression);
@@ -3305,7 +3278,7 @@ pub fn parseConflictRowExpressionAlloc(
         expected_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
     var expression_owned = true;
     errdefer if (expression_owned) freeExpression(alloc, expression);
@@ -3338,7 +3311,7 @@ pub fn parseConflictExpressionWithExpectedAlloc(
     expected_type: ?runtime_schema.AntflyType,
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    hooks: ConflictExpressionDispatchHooks,
+    hooks: ConflictExpressionDispatchOptions,
 ) anyerror!db_mod.types.RelationalRowsExpression {
     const options = ConflictAssignmentExpressionParserOptions{
         .params = params,
@@ -3346,7 +3319,7 @@ pub fn parseConflictExpressionWithExpectedAlloc(
         .conflict_existing_qualifiers = conflict_existing_qualifiers,
         .type_context = type_context,
         .defer_row_expression_field_validation = defer_row_expression_field_validation,
-        .dispatch_hooks = hooks,
+        .dispatch_options = hooks,
     };
     if (conflictExpressionStartAt(tokens, pos.*)) |start| {
         switch (start) {
@@ -3443,7 +3416,7 @@ pub fn parseConflictExpressionWithExpectedAlloc(
         expected_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
 }
 
@@ -3477,7 +3450,7 @@ pub fn parseConflictExpressionOperandAlloc(
     expected_type: ?runtime_schema.AntflyType,
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    hooks: ConflictExpressionDispatchHooks,
+    hooks: ConflictExpressionDispatchOptions,
 ) anyerror!db_mod.types.RelationalRowsExpression {
     const options = ConflictAssignmentExpressionParserOptions{
         .params = params,
@@ -3485,7 +3458,7 @@ pub fn parseConflictExpressionOperandAlloc(
         .conflict_existing_qualifiers = conflict_existing_qualifiers,
         .type_context = type_context,
         .defer_row_expression_field_validation = defer_row_expression_field_validation,
-        .dispatch_hooks = hooks,
+        .dispatch_options = hooks,
     };
     switch (conflictExpressionOperandStartAt(tokens, pos.*)) {
         .unary_negative => return try parseConflictUnaryNegativeExpressionAlloc(alloc, tokens, pos, column, insert_columns, expected_type, options),
@@ -3528,7 +3501,7 @@ pub fn parseConflictUnaryNegativeExpressionAlloc(
         expected_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
@@ -3566,7 +3539,7 @@ pub fn parseConflictPipeConcatExpressionRestAlloc(
             null,
             options.type_context,
             options.defer_row_expression_field_validation,
-            options.dispatch_hooks,
+            options.dispatch_options,
         );
         var rhs_transferred = false;
         errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
@@ -3618,7 +3591,7 @@ pub fn parseConflictArithmeticExpressionRestAlloc(
             column.field_type,
             options.type_context,
             options.defer_row_expression_field_validation,
-            options.dispatch_hooks,
+            options.dispatch_options,
         );
         var rhs_owned = true;
         errdefer if (rhs_owned) freeExpression(alloc, rhs);
@@ -3663,7 +3636,7 @@ fn parseConflictAssignmentExpressionOperandWithExpectedAlloc(
         expected_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
 }
 
@@ -3730,7 +3703,7 @@ pub fn parseConflictNullifExpressionAlloc(
         column.field_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
@@ -3747,7 +3720,7 @@ pub fn parseConflictNullifExpressionAlloc(
         column.field_type,
         options.type_context,
         options.defer_row_expression_field_validation,
-        options.dispatch_hooks,
+        options.dispatch_options,
     );
     var rhs_transferred = false;
     errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
@@ -4003,7 +3976,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
     defer_row_expression_field_validation: bool,
     alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     condition_options: ConflictAssignmentExpressionParserOptions,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
 ) !void {
     const parenthesized = parser.matchToken(tokens, pos, .lparen) != null;
     if (canParseBareBooleanConflictExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, insert_columns)) {
@@ -4025,7 +3998,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
         null,
         type_context,
         defer_row_expression_field_validation,
-        dispatch_hooks,
+        dispatch_options,
     );
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
@@ -4093,7 +4066,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
                 null,
                 type_context,
                 defer_row_expression_field_validation,
-                dispatch_hooks,
+                dispatch_options,
             );
             out_transferred = true;
             break :blk out;
@@ -4132,14 +4105,14 @@ pub fn parseConflictActionWhereClause(
     where_any: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     where_not: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     condition_options: ConflictAssignmentExpressionParserOptions,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
 ) !void {
     if (schema.relational_columns.len == 0) return error.InvalidSqlCatalog;
     const column = schema.relational_columns[0];
     if (parser.matchKeyword(tokens, pos, "not")) {
         try parser.expectToken(tokens, pos, .lparen);
         while (true) {
-            const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_hooks);
+            const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_options);
             var branch_groups_transferred = false;
             errdefer if (!branch_groups_transferred) {
                 freeExpressionPredicateGroups(alloc, branch_groups);
@@ -4162,7 +4135,7 @@ pub fn parseConflictActionWhereClause(
     defer groups.deinit(alloc);
     errdefer if (!groups_transferred) freeExpressionPredicateGroups(alloc, groups.items);
     while (true) {
-        const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_hooks);
+        const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_options);
         var branch_groups_transferred = false;
         errdefer if (!branch_groups_transferred) {
             freeExpressionPredicateGroups(alloc, branch_groups);
@@ -4205,7 +4178,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
     type_context: lower_expr.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     condition_options: ConflictAssignmentExpressionParserOptions,
-    dispatch_hooks: ConflictExpressionDispatchHooks,
+    dispatch_options: ConflictExpressionDispatchOptions,
 ) ![]const db_mod.types.RelationalRowsExpressionPredicateGroup {
     const parenthesized = conflictParenthesizedConjunctionCanStart(tokens, pos.*);
     if (parenthesized) try parser.expectToken(tokens, pos, .lparen);
@@ -4234,7 +4207,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
             defer_row_expression_field_validation,
             &alternatives,
             condition_options,
-            dispatch_hooks,
+            dispatch_options,
         );
         try lower_expr.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
@@ -5639,7 +5612,7 @@ pub fn parseMergeArmConditionAlloc(
     expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
     expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    hooks: MergeArmConditionParserHooks,
+    options: MergeArmConditionParserOptions,
 ) !void {
     const checkpoint = pos.*;
     if (parseMergeArmPredicateAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, allow_target, params, realtime_ns)) |predicate| {
@@ -5649,7 +5622,7 @@ pub fn parseMergeArmConditionAlloc(
             freeMergeArmPredicateValue(alloc, predicate);
             predicate_transferred = true;
             pos.* = checkpoint;
-            try hooks.parse_expression_predicates(hooks.ptr, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates);
+            try parseMergeArmExpressionPredicatesAlloc(alloc, tokens, pos, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates, options.expression_predicates_options);
             return;
         }
         try predicates.append(alloc, predicate);
@@ -5660,7 +5633,7 @@ pub fn parseMergeArmConditionAlloc(
         else => return err,
     }
 
-    try hooks.parse_expression_predicates(hooks.ptr, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates);
+    try parseMergeArmExpressionPredicatesAlloc(alloc, tokens, pos, target_table, source_table, allow_target, expression_predicates, expression_or_predicates, expression_not_predicates, options.expression_predicates_options);
 }
 
 pub fn parseMergeMatchedArmAlloc(
@@ -5673,7 +5646,7 @@ pub fn parseMergeMatchedArmAlloc(
     source_table: TableAlias,
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
-    condition_hooks: MergeArmConditionParserHooks,
+    condition_options: MergeArmConditionParserOptions,
     assignment_hooks: MergeAssignmentParserHooks,
 ) !MergeMatchedArm {
     var predicates = std.ArrayListUnmanaged(MergeArmPredicate).empty;
@@ -5713,7 +5686,7 @@ pub fn parseMergeMatchedArmAlloc(
                 &expression_predicates,
                 &expression_or_predicates,
                 &expression_not_predicates,
-                condition_hooks,
+                condition_options,
             );
             if (!parser.matchKeyword(tokens, pos, "and")) break;
         }
@@ -5775,7 +5748,7 @@ pub fn parseMergeNotMatchedArmAlloc(
     source_table: TableAlias,
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
-    condition_hooks: MergeArmConditionParserHooks,
+    condition_options: MergeArmConditionParserOptions,
     assignment_hooks: MergeAssignmentParserHooks,
 ) !MergeNotMatchedArm {
     try parser.expectKeyword(tokens, pos, "matched");
@@ -5816,7 +5789,7 @@ pub fn parseMergeNotMatchedArmAlloc(
                 &expression_predicates,
                 &expression_or_predicates,
                 &expression_not_predicates,
-                condition_hooks,
+                condition_options,
             );
             if (!parser.matchKeyword(tokens, pos, "and")) break;
         }
@@ -5858,14 +5831,14 @@ pub fn parseMergeNotMatchedArmAlloc(
 pub fn parseMergeArmExpressionPredicatesAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
-    pos: usize,
+    pos: *usize,
     target_table: TableAlias,
     source_table: TableAlias,
     allow_target: bool,
     expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
     expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    hooks: MergeArmExpressionPredicatesParserHooks,
+    options: MergeArmExpressionPredicatesParserOptions,
 ) !void {
     var conditions = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
     defer conditions.deinit(alloc);
@@ -5877,12 +5850,12 @@ pub fn parseMergeArmExpressionPredicatesAlloc(
     defer not_groups.deinit(alloc);
     errdefer freeExpressionPredicateGroups(alloc, not_groups.items);
 
-    if (mergeCanParseExpressionNotWhere(tokens, pos)) {
-        try hooks.parse_expression_not_where(hooks.ptr, target_table, source_table, &not_groups);
-    } else if (parser.hasTopLevelOrBeforeTail(tokens, pos, lower_expr.sqlWhereTailClauseKeyword) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos)) {
-        try hooks.parse_expression_or_where(hooks.ptr, target_table, source_table, &or_groups);
+    if (mergeCanParseExpressionNotWhere(tokens, pos.*)) {
+        try lower_expr.parseExpressionNotWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &not_groups, options.not_where_options);
+    } else if (parser.hasTopLevelOrBeforeTail(tokens, pos.*, lower_expr.sqlWhereTailClauseKeyword) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos.*)) {
+        try lower_expr.parseExpressionOrWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &or_groups, options.or_where_options);
     } else {
-        try hooks.parse_expression_where_conditions(hooks.ptr, target_table, source_table, &conditions, &or_groups, &not_groups);
+        try lower_expr.parseExpressionWhereConditionsWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &conditions, &or_groups, &not_groups, options.where_condition_options);
     }
     if (conditions.items.len == 0 and or_groups.items.len == 0 and not_groups.items.len == 0) return error.UnsupportedSqlShape;
     if (!allow_target) {
@@ -7244,7 +7217,7 @@ pub fn parseUpdateJoinedMutationSourceWithCtesAlloc(
             &patch_expr,
             &json_set,
             &saw_primary_key_assignment,
-            options.assignment_hooks,
+            options.assignment_options,
         );
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
@@ -9002,7 +8975,7 @@ fn parseInsertConflictClauseAlloc(
             existing_qualifiers,
         ),
         conflictAssignmentExpressionOptionsWithExistingQualifiers(options.condition_options, existing_qualifiers),
-        conflictDispatchHooksWithExistingQualifiers(options.dispatch_hooks, existing_qualifiers),
+        conflictDispatchOptionsWithExistingQualifiers(options.dispatch_options, existing_qualifiers),
     );
 }
 

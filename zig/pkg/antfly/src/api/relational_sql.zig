@@ -2224,7 +2224,7 @@ const Parser = struct {
             .conflict_target_options = self.conflictTargetParserOptions(),
             .conflict_assignment_hooks = self.conflictUpdateSetAssignmentParserOptions(&.{}, &.{}),
             .conflict_condition_options = self.conflictAssignmentExpressionParserOptions(),
-            .conflict_dispatch_hooks = self.conflictExpressionDispatchHooks(),
+            .conflict_dispatch_options = self.conflictExpressionDispatchOptions(),
             .returning_hooks = self.returningProjectionParserOptions(),
             .parse_select = parseInsertSourceSelectHook,
         };
@@ -2268,7 +2268,7 @@ const Parser = struct {
             .schema = self.schema,
             .joined_source_schema = self.joined_source_schema,
             .context_hooks = self.mergeMutationParserContextHooks(),
-            .condition_hooks = self.mergeArmConditionParserHooks(),
+            .condition_options = self.mergeArmConditionParserOptions(),
             .assignment_hooks = self.mergeAssignmentParserHooks(),
             .returning_hooks = self.returningProjectionParserOptions(),
             .realtime_ns = platform_time.realtimeNs(),
@@ -2785,7 +2785,7 @@ const Parser = struct {
             .row_expression_hooks = self.rowExpressionParserHooks(),
             .arithmetic_hooks = self.arithmeticExpressionParserHooks(),
             .variadic_hooks = self.variadicRowExpressionParserHooks(),
-            .conflict_dispatch_hooks = self.conflictExpressionDispatchHooks(),
+            .conflict_dispatch_options = self.conflictExpressionDispatchOptions(),
         };
     }
 
@@ -2829,14 +2829,14 @@ const Parser = struct {
             .conflict_existing_qualifiers = self.conflict_existing_qualifiers,
             .type_context = self.rowExpressionTypeContext(),
             .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
-            .dispatch_hooks = self.conflictExpressionDispatchHooks(),
+            .dispatch_options = self.conflictExpressionDispatchOptions(),
         };
     }
 
-    fn conflictExpressionDispatchHooks(self: *@This()) sql_adapter.ConflictExpressionDispatchHooks {
+    fn conflictExpressionDispatchOptions(self: *@This()) sql_adapter.ConflictExpressionDispatchOptions {
         return .{
             .array_length = self.conflictArrayLengthExpressionParserOptions(),
-            .case_fold = self.conflictCaseFoldExpressionParserHooks(),
+            .case_fold = self.conflictCaseFoldExpressionParserOptions(),
         };
     }
 
@@ -3036,7 +3036,7 @@ const Parser = struct {
         };
     }
 
-    fn conflictCaseFoldExpressionParserHooks(self: *@This()) sql_adapter.ConflictCaseFoldExpressionParserOptions {
+    fn conflictCaseFoldExpressionParserOptions(self: *@This()) sql_adapter.ConflictCaseFoldExpressionParserOptions {
         return .{
             .period_bound = .{
                 .schema = self.schema,
@@ -3050,34 +3050,31 @@ const Parser = struct {
 
     fn parseRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        const defer_field_validation =
-            self.defer_row_expression_field_validation or
-            self.joined_source_expression_qualifiers.len != 0 or
-            self.joined_target_expression_qualifiers.len != 0;
-        var type_context = self.rowExpressionTypeContext();
-        type_context.defer_row_expression_field_validation = defer_field_validation;
-        return try sql_adapter.parseRowExpressionOperandAlloc(
+        return try sql_adapter.parseRowExpressionOperandFromContextAlloc(
             self.alloc,
             self.tokens,
             &self.pos,
             self.params,
-            self.schema,
             self.joined_source_schema,
             self.function_bindings,
-            self.field_expression_qualifiers,
-            self.returning_expression_qualifiers,
-            self.joined_source_expression_qualifiers,
-            self.joined_target_expression_qualifiers,
-            defer_field_validation,
             self.rowExpressionFieldSource(),
-            type_context,
+            self.selectParserContextHooks(),
+            self.joinedExpressionParserContextHooks(),
             self.rowExpressionOperandParserOptions(),
         );
     }
 
     fn parseFixedUnaryRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseRowExpressionAlloc(self.alloc, self.tokens, &self.pos, self.rowExpressionTypeContext(), self.rowExpressionParserHooks(), self.arithmeticExpressionParserHooks(), self.variadicRowExpressionParserHooks());
+        return try sql_adapter.parseRowExpressionFromContextAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.selectParserContextHooks(),
+            self.rowExpressionParserHooks(),
+            self.arithmeticExpressionParserHooks(),
+            self.variadicRowExpressionParserHooks(),
+        );
     }
 
     fn joinedMutationJsonSetSqlValueParserOptions(self: *@This()) sql_adapter.JoinedMutationJsonSetSqlValueParserOptions {
@@ -3093,7 +3090,7 @@ const Parser = struct {
         };
     }
 
-    fn joinedMutationAssignmentValueParserHooks(self: *@This()) sql_adapter.JoinedMutationAssignmentValueParserHooks {
+    fn joinedMutationAssignmentValueParserOptions(self: *@This()) sql_adapter.JoinedMutationAssignmentValueParserOptions {
         return .{
             .json_set = self.joinedMutationJsonSetSqlValueParserOptions(),
             .assignment_expression = self.joinedMutationAssignmentExpressionParserOptions(),
@@ -3143,114 +3140,30 @@ const Parser = struct {
         };
     }
 
-    fn mergeArmConditionParserHooks(self: *@This()) sql_adapter.MergeArmConditionParserHooks {
+    fn mergeArmConditionParserOptions(self: *@This()) sql_adapter.MergeArmConditionParserOptions {
         return .{
-            .ptr = self,
-            .parse_expression_predicates = parseMergeArmExpressionPredicatesHook,
+            .expression_predicates_options = self.mergeArmExpressionPredicatesParserOptions(),
         };
     }
 
-    fn mergeArmExpressionPredicatesParserHooks(self: *@This()) sql_adapter.MergeArmExpressionPredicatesParserHooks {
+    fn mergeArmExpressionPredicatesParserOptions(self: *@This()) sql_adapter.MergeArmExpressionPredicatesParserOptions {
         return .{
-            .ptr = self,
-            .parse_expression_not_where = parseMergeExpressionNotWhereHook,
-            .parse_expression_or_where = parseMergeExpressionOrWhereHook,
-            .parse_expression_where_conditions = parseMergeExpressionWhereConditionsHook,
-        };
-    }
-
-    fn parseMergeArmExpressionPredicatesHook(
-        ptr: *anyopaque,
-        target_table: TableAlias,
-        source_table: TableAlias,
-        allow_target: bool,
-        expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-        expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-        expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseMergeArmExpressionPredicatesAlloc(
-            self.alloc,
-            self.tokens,
-            self.pos,
-            target_table,
-            source_table,
-            allow_target,
-            expression_predicates,
-            expression_or_predicates,
-            expression_not_predicates,
-            self.mergeArmExpressionPredicatesParserHooks(),
-        );
-    }
-
-    fn parseMergeExpressionNotWhereHook(
-        ptr: *anyopaque,
-        target_table: TableAlias,
-        source_table: TableAlias,
-        expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseExpressionNotWhereWithTableQualifiersAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            target_table,
-            source_table,
-            expression_not_predicates,
-            .{
+            .not_where_options = .{
                 .params = self.params,
                 .context_hooks = self.joinedExpressionParserContextHooks(),
                 .alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
             },
-        );
-    }
-
-    fn parseMergeExpressionOrWhereHook(
-        ptr: *anyopaque,
-        target_table: TableAlias,
-        source_table: TableAlias,
-        expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseExpressionOrWhereWithTableQualifiersAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            target_table,
-            source_table,
-            expression_or_predicates,
-            .{
+            .or_where_options = .{
                 .params = self.params,
                 .context_hooks = self.joinedExpressionParserContextHooks(),
                 .alternatives_hooks = self.expressionWhereConditionAlternativesParserHooks(),
             },
-        );
-    }
-
-    fn parseMergeExpressionWhereConditionsHook(
-        ptr: *anyopaque,
-        target_table: TableAlias,
-        source_table: TableAlias,
-        expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-        expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-        expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    ) anyerror!void {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try sql_adapter.parseExpressionWhereConditionsWithTableQualifiersAlloc(
-            self.alloc,
-            self.tokens,
-            &self.pos,
-            target_table,
-            source_table,
-            expression_predicates,
-            expression_or_predicates,
-            expression_not_predicates,
-            .{
+            .where_condition_options = .{
                 .params = self.params,
                 .context_hooks = self.joinedExpressionParserContextHooks(),
                 .condition_hooks = self.expressionWhereConditionsParserHooks(),
             },
-        );
+        };
     }
 
     fn parseSelect(self: *@This()) !LoweredSelect {
@@ -3349,7 +3262,7 @@ const Parser = struct {
             .target_options = self.conflictTargetParserOptions(),
             .assignment_value_hooks = self.conflictUpdateAssignmentValueParserOptions(&.{}, &.{}),
             .condition_options = self.conflictAssignmentExpressionParserOptions(),
-            .dispatch_hooks = self.conflictExpressionDispatchHooks(),
+            .dispatch_options = self.conflictExpressionDispatchOptions(),
             .returning_hooks = self.returningProjectionParserOptions(),
             .realtime_ns = try checkedPlatformRealtimeNsU64(),
         });
@@ -3503,7 +3416,7 @@ const Parser = struct {
             .base_table_name = base_table_name,
             .string_to_array_predicate_is_containment = sql_adapter.stringToArrayPredicateIsContainment(self.tokens, self.pos),
             .context_hooks = self.joinedMutationSourceParserContextHooks(),
-            .assignment_hooks = self.joinedMutationAssignmentValueParserHooks(),
+            .assignment_options = self.joinedMutationAssignmentValueParserOptions(),
             .source_query_context_hooks = self.semiJoinSourceQueryParserContextHooks(),
             .fixed_binary_hooks = self.fixedBinaryRowExpressionParserOptions(),
             .bare_boolean_hooks = self.bareBooleanWhereExpressionParserOptions(),
@@ -5207,6 +5120,81 @@ test "postgres sql adapter lowers create index ddl into typed schema plan" {
         .drop_table => return error.TestUnexpectedResult,
         .alter_table => return error.TestUnexpectedResult,
         .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var derived_full_text = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');",
+    );
+    defer derived_full_text.deinit(alloc);
+    switch (derived_full_text) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.antfly_full_text, plan.method);
+            try std.testing.expectEqualStrings("docs_body_fts", plan.index_name);
+            try std.testing.expectEqualStrings("docs", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("body", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"full_text\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"analyzer\":\"standard\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var external_vector = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_cosine_ops) WITH (dimension = 1536, m = 16, ef_construction = 64);",
+    );
+    defer external_vector.deinit(alloc);
+    switch (external_vector) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.hnsw, plan.method);
+            try std.testing.expectEqual(sql_adapter.DdlIndexOpClass.vector_cosine_ops, plan.opclass);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"embeddings\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"embedding\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":true") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"cosine\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"dimension\":1536") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var managed_aknn = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', metric = 'cosine', dimension = 384, chunk_size = 512);",
+    );
+    defer managed_aknn.deinit(alloc);
+    switch (managed_aknn) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.antfly_aknn, plan.method);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"embeddings\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"external\":false") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"enrichments\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"name\":\"body_embedding_v1\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"kind\":\"embedding\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"expected_dims\":384") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"chunk_size\":512") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var algebraic = try lowerDdlPlanAlloc(
+        alloc,
+        "CREATE INDEX docs_algebraic ON docs USING antfly_algebraic () WITH (derive_from_schema = true);",
+    );
+    defer algebraic.deinit(alloc);
+    switch (algebraic) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(sql_adapter.DdlIndexMethod.antfly_algebraic, plan.method);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"algebraic\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"derive_from_schema\":true") != null);
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -20547,59 +20535,6 @@ const AppParityDdlTag = sql_adapter.AppParityDdlTag;
 const AppParityPlanSummary = sql_adapter.AppParityPlanSummary;
 const AppParityCorpusEntry = sql_adapter.AppParityCorpusEntry;
 
-const AppParityExternalSourceCorpus = struct {
-    parsed: std.json.Parsed(std.json.Value),
-    root: sql_adapter.AppParitySourceCorpusRoot,
-    source_sha256: []u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.source_sha256);
-        sql_adapter.freeSourceCorpusRoot(alloc, self.root);
-        self.parsed.deinit();
-    }
-};
-
-fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
-    const source_json = @embedFile("fixtures/sql_api_parity_source_corpus.json");
-    const source_sha256 = try sql_adapter.sourceCorpusSha256HexAlloc(alloc, source_json);
-    errdefer alloc.free(source_sha256);
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
-    errdefer parsed.deinit();
-
-    const root = try sql_adapter.parseSourceCorpusRootAlloc(alloc, parsed.value);
-    errdefer sql_adapter.freeSourceCorpusRoot(alloc, root);
-
-    return .{
-        .parsed = parsed,
-        .root = root,
-        .source_sha256 = source_sha256,
-    };
-}
-
-const AppParityCoverageRequirements = struct {
-    parsed: std.json.Parsed(std.json.Value),
-    root: sql_adapter.AppParityCoverageRequirementsRoot,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        sql_adapter.freeCoverageRequirementsRoot(alloc, self.root);
-        self.parsed.deinit();
-    }
-};
-
-fn parseAppParityCoverageRequirementsAlloc(alloc: std.mem.Allocator) !AppParityCoverageRequirements {
-    const coverage_json = @embedFile("fixtures/sql_api_required_coverage.json");
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
-    errdefer parsed.deinit();
-
-    const root = try sql_adapter.parseCoverageRequirementsRootAlloc(alloc, parsed.value);
-    errdefer sql_adapter.freeCoverageRequirementsRoot(alloc, root);
-
-    return .{
-        .parsed = parsed,
-        .root = root,
-    };
-}
-
 fn expectOptionalUsize(expected: ?usize, actual: usize) !void {
     if (expected) |value| try std.testing.expectEqual(value, actual);
 }
@@ -26663,10 +26598,10 @@ test "postgres sql adapter classifies application parity corpus" {
         .txn_id = txn_id,
     };
 
-    var external_source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    var external_source = try sql_adapter.parseAppParityExternalSourceCorpusAlloc(alloc);
     defer external_source.deinit(alloc);
     const corpus = external_source.root.entries;
-    var required_coverage = try parseAppParityCoverageRequirementsAlloc(alloc);
+    var required_coverage = try sql_adapter.parseAppParityCoverageRequirementsAlloc(alloc);
     defer required_coverage.deinit(alloc);
 
     try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, external_source.source_sha256, corpus);
@@ -26715,7 +26650,7 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     defer seen_names.deinit(alloc);
     var seen_skipped_names = std.StringHashMapUnmanaged(void){};
     defer seen_skipped_names.deinit(alloc);
-    var required_coverage = try parseAppParityCoverageRequirementsAlloc(alloc);
+    var required_coverage = try sql_adapter.parseAppParityCoverageRequirementsAlloc(alloc);
     defer required_coverage.deinit(alloc);
     for (skipped_entries) |name| {
         if (name.len == 0 or seen_skipped_names.contains(name)) return error.TestUnexpectedResult;

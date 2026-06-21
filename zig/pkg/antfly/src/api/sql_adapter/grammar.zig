@@ -4160,6 +4160,14 @@ pub fn parseCreateIndexHeaderAlloc(
             method = .btree;
         } else if (std.ascii.eqlIgnoreCase(method_token.text, "gin")) {
             method = .gin;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_full_text")) {
+            method = .antfly_full_text;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "hnsw")) {
+            method = .hnsw;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_aknn")) {
+            method = .antfly_aknn;
+        } else if (std.ascii.eqlIgnoreCase(method_token.text, "antfly_algebraic")) {
+            method = .antfly_algebraic;
         } else return error.UnsupportedSqlShape;
     }
 
@@ -4187,6 +4195,16 @@ pub fn parseCreateIndexElementSuffix(
             suffix.opclass = .jsonb_path_ops;
         } else if (std.ascii.eqlIgnoreCase(opclass_token.text, "array_ops")) {
             suffix.opclass = .array_ops;
+        } else return error.UnsupportedSqlShape;
+    }
+    if (allow_opclass and method == .hnsw and cursor.peekKind(.identifier)) {
+        const opclass_token = cursor.matchToken(.identifier) orelse unreachable;
+        if (std.ascii.eqlIgnoreCase(opclass_token.text, "vector_l2_ops")) {
+            suffix.opclass = .vector_l2_ops;
+        } else if (std.ascii.eqlIgnoreCase(opclass_token.text, "vector_ip_ops")) {
+            suffix.opclass = .vector_ip_ops;
+        } else if (std.ascii.eqlIgnoreCase(opclass_token.text, "vector_cosine_ops")) {
+            suffix.opclass = .vector_cosine_ops;
         } else return error.UnsupportedSqlShape;
     }
 

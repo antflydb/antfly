@@ -6081,6 +6081,26 @@ pub fn parseRowExpressionAlloc(
     return expression;
 }
 
+pub fn parseRowExpressionFromContextAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    context_hooks: SelectParserContextHooks,
+    row_expression_hooks: RowExpressionParserHooks,
+    arithmetic_hooks: ArithmeticExpressionParserHooks,
+    variadic_hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    return try parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        context_hooks.row_expression_type_context(context_hooks.ptr),
+        row_expression_hooks,
+        arithmetic_hooks,
+        variadic_hooks,
+    );
+}
+
 pub const RecursiveCteMemberProjectionExpressionParserOptions = struct {
     type_context: RowExpressionTypeContext,
     row_expression_hooks: RowExpressionParserHooks,
@@ -20392,6 +20412,46 @@ pub fn parseRowExpressionOperandAlloc(
     const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
     errdefer alloc.free(value_json);
     return .{ .kind = .value, .value_json = value_json };
+}
+
+pub fn parseRowExpressionOperandFromContextAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    function_bindings: SqlFunctionBindings,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    select_context_hooks: SelectParserContextHooks,
+    joined_context_hooks: JoinedExpressionParserContextHooks,
+    options: RowExpressionOperandParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    const select_context = select_context_hooks.get_context(select_context_hooks.ptr);
+    const joined_context = joined_context_hooks.get_context(joined_context_hooks.ptr);
+    const defer_field_validation =
+        select_context.defer_row_expression_field_validation or
+        joined_context.defer_row_expression_field_validation or
+        joined_context.joined_source_expression_qualifiers.len != 0 or
+        joined_context.joined_target_expression_qualifiers.len != 0;
+    var type_context = select_context_hooks.row_expression_type_context(select_context_hooks.ptr);
+    type_context.defer_row_expression_field_validation = defer_field_validation;
+    return try parseRowExpressionOperandAlloc(
+        alloc,
+        tokens,
+        pos,
+        params,
+        select_context.schema,
+        joined_source_schema,
+        function_bindings,
+        select_context.field_expression_qualifiers,
+        select_context.returning_expression_qualifiers,
+        joined_context.joined_source_expression_qualifiers,
+        joined_context.joined_target_expression_qualifiers,
+        defer_field_validation,
+        field_source,
+        type_context,
+        options,
+    );
 }
 
 pub fn parseRowExpressionFieldOperandOrNullAlloc(

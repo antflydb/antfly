@@ -1370,12 +1370,54 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
         try svc.runRound();
         return dropped;
     }
+    if (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(alloc, svc, table, target, sql, function_bindings)) |derived_applied| {
+        try svc.runRound();
+        return derived_applied;
+    }
     var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, table, sql, session, function_bindings);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
     try svc.runRound();
     return applied;
+}
+
+fn applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    table: *const metadata_table_manager.TableRecord,
+    target: tables_api.RelationalSqlDdlTarget,
+    sql: []const u8,
+    function_bindings: relational_sql.SqlFunctionBindings,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    _ = target;
+    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    defer plan.deinit(alloc);
+    const create_index = switch (plan) {
+        .create_index => |value| value,
+        else => return null,
+    };
+    const index_json = create_index.derived_index_config_json orelse return null;
+    if (try indexes_api.hasIndexConfig(alloc, table.indexes_json, create_index.index_name)) {
+        if (!create_index.if_not_exists) return error.InvalidTableIndexMetadata;
+        return .{
+            .table = try metadata_table_manager.cloneTable(alloc, table.*),
+            .noop = true,
+        };
+    }
+
+    const expanded_index_json = try tables_api.expandSchemaDerivedAlgebraicIndexAlloc(alloc, table.name, index_json, table.schema_json);
+    defer alloc.free(expanded_index_json);
+
+    var updated_record = table.*;
+    updated_record.indexes_json = try indexes_api.addIndexToTableIndexesJson(alloc, table.indexes_json, create_index.index_name, expanded_index_json);
+    defer alloc.free(updated_record.indexes_json);
+    try svc.upsertTable(updated_record);
+
+    return .{
+        .table = try metadata_table_manager.cloneTable(alloc, updated_record),
+        .requires_rebuild = true,
+    };
 }
 
 fn scheduleSchemaRewriteJobsForAppliedDdlOnService(
@@ -2029,6 +2071,125 @@ test "api http server rejects schema rewrite jobs without typed row operation" {
     var service = FakeService{};
     try std.testing.expectError(error.UnsupportedSqlShape, scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied));
     try std.testing.expectEqual(@as(usize, 0), service.upsert_count);
+}
+
+test "api http server applies SQL derived index DDL to catalog index metadata" {
+    const alloc = std.testing.allocator;
+    const FakeService = struct {
+        table: metadata_table_manager.TableRecord,
+        upsert_count: usize = 0,
+        run_round_count: usize = 0,
+
+        fn init(allocator: std.mem.Allocator) !@This() {
+            return .{
+                .table = try metadata_table_manager.cloneTable(allocator, .{
+                    .table_id = 99,
+                    .name = "docs",
+                    .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"body\":{\"type\":\"text\"},\"embedding\":{\"type\":\"array\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+                    .indexes_json = "{}",
+                    .placement_role = "data",
+                }),
+            };
+        }
+
+        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            metadata_table_manager.freeTable(allocator, self.table);
+            self.* = undefined;
+        }
+
+        pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{self.table})[0..]),
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        pub fn freeAdminSnapshot(_: *@This(), _: *metadata_api.AdminSnapshot) void {}
+
+        pub fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            const owned = try metadata_table_manager.cloneTable(std.testing.allocator, record);
+            metadata_table_manager.freeTable(std.testing.allocator, self.table);
+            self.table = owned;
+            self.upsert_count += 1;
+        }
+
+        pub fn runRound(self: *@This()) !void {
+            self.run_round_count += 1;
+        }
+    };
+
+    var service = try FakeService.init(alloc);
+    defer service.deinit(alloc);
+
+    const full_text_sql = "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');";
+    var full_text_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        full_text_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer full_text_target.deinit(alloc);
+    var full_text = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        full_text_target,
+        full_text_sql,
+        .{},
+    )).?;
+    defer full_text.deinit(alloc);
+    try std.testing.expect(full_text.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"docs_body_fts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full_text.table.indexes_json, "\"type\":\"full_text\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, service.table.indexes_json, "\"field\":\"body\"") != null);
+
+    const vector_sql = "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 3);";
+    var vector_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        vector_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer vector_target.deinit(alloc);
+    var vector = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        vector_target,
+        vector_sql,
+        .{},
+    )).?;
+    defer vector.deinit(alloc);
+    try std.testing.expect(vector.requires_rebuild);
+    try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"docs_embedding_hnsw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"type\":\"embeddings\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"external\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"metric\":\"l2_squared\"") != null);
+
+    const noop_sql = "CREATE INDEX IF NOT EXISTS docs_embedding_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 3);";
+    var noop_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        noop_sql,
+        catalog_resources.SqlCatalogSession.default(),
+        .{},
+    );
+    defer noop_target.deinit(alloc);
+    var noop = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+        alloc,
+        &service,
+        &service.table,
+        noop_target,
+        noop_sql,
+        .{},
+    )).?;
+    defer noop.deinit(alloc);
+    try std.testing.expect(noop.noop);
+    try std.testing.expectEqual(@as(usize, 2), service.upsert_count);
 }
 
 test "api http server wakes durable schema rewrite worker after SQL ALTER rewrite DDL" {
@@ -27664,6 +27825,193 @@ test "api http server executes public relational row plan endpoints" {
     try std.testing.expectEqualStrings("o9", disjunctive_returning.get("id").?.string);
     try std.testing.expectEqualStrings("claimed", disjunctive_returning.get("status").?.string);
     try db.commitTransaction(disjunctive_mutation_txn_id, 1_003);
+}
+
+test "api http server executes public cross-table relational join and lateral row plans" {
+    const alloc = std.testing.allocator;
+    const orders_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","customer_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const customers_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const orders_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-plan-cross-table-orders", .{tmp.sub_path});
+    defer alloc.free(orders_path);
+    const customers_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rows-plan-cross-table-customers", .{tmp.sub_path});
+    defer alloc.free(customers_path);
+
+    var orders_db = try db_mod.DB.open(alloc, orders_path, .{});
+    defer orders_db.close();
+    try orders_db.applyTableSchemaJson(alloc, orders_schema_json, .{});
+    var customers_db = try db_mod.DB.open(alloc, customers_path, .{});
+    defer customers_db.close();
+    try customers_db.applyTableSchemaJson(alloc, customers_schema_json, .{});
+
+    const FakeStatusSource = struct {
+        tables: [2]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 2 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var status_source = FakeStatusSource{ .tables = .{
+        .{
+            .table_id = 1,
+            .name = "orders",
+            .schema_json = orders_schema_json,
+            .desired_replica_count = 1,
+        },
+        .{
+            .table_id = 2,
+            .name = "customers",
+            .schema_json = customers_schema_json,
+            .desired_replica_count = 1,
+        },
+    } };
+
+    var orders_write_source = table_writes.BoundTableWriteSource.init("orders", &orders_db);
+    var customers_write_source = table_writes.BoundTableWriteSource.init("customers", &customers_db);
+    var orders_seed_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), null, orders_write_source.source());
+    var customers_seed_server = ApiHttpServer.init(alloc, .{}, status_source.iface(), null, customers_write_source.source());
+
+    var orders_insert_resp = try orders_seed_server.handlePublicTableRowsBatch("orders", "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"o1\",\"customer_id\":\"c1\",\"status\":\"open\",\"amount\":10}},{\"op\":\"insert\",\"row\":{\"id\":\"o2\",\"customer_id\":\"c2\",\"status\":\"open\",\"amount\":20}},{\"op\":\"insert\",\"row\":{\"id\":\"o3\",\"customer_id\":\"c1\",\"status\":\"closed\",\"amount\":30}}]}", null);
+    defer orders_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), orders_insert_resp.status);
+    var customers_insert_resp = try customers_seed_server.handlePublicTableRowsBatch("customers", "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"c1\",\"name\":\"Ada\",\"enabled\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"c2\",\"name\":\"Bob\",\"enabled\":false}}]}", null);
+    defer customers_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), customers_insert_resp.status);
+
+    var orders_read_source = table_reads.BoundTableReadSource.init("orders", 1, &orders_db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var customers_read_source = table_reads.BoundTableReadSource.init("customers", 2, &customers_db, raft_mod.read_gate.noopReadableLeaseRequester());
+    const MultiTableReadSource = struct {
+        orders: table_reads.TableReadSource,
+        customers: table_reads.TableReadSource,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn table(self: *@This(), table_name: []const u8) ?table_reads.TableReadSource {
+            if (std.mem.eql(u8, table_name, "orders")) return self.orders;
+            if (std.mem.eql(u8, table_name, "customers")) return self.customers;
+            return null;
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const table_source = self.table(table_name) orelse return null;
+            return try table_source.lookup(lookup_alloc, table_name, key, opts, consistency);
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const table_source = self.table(table_name) orelse return null;
+            return try table_source.scan(scan_alloc, table_name, from_key, to_key, opts, consistency);
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const table_source = self.table(table_name) orelse return null;
+            return try table_source.query(query_alloc, table_name, req, consistency);
+        }
+    };
+    var multi_read_source = MultiTableReadSource{
+        .orders = orders_read_source.source(),
+        .customers = customers_read_source.source(),
+    };
+    var server = ApiHttpServer.init(alloc, .{}, status_source.iface(), multi_read_source.source(), null);
+
+    var join_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/orders/rows/join",
+        .content_type = "application/json",
+        .body = "{\"left_table\":\"orders\",\"right_table\":\"customers\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}},\"right\":{\"where\":{\"field\":\"enabled\",\"op\":\"eq\",\"value\":true}},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"}],\"order_by\":[{\"field\":\"order_id\"}]}}",
+    });
+    defer join_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), join_resp.status);
+    var parsed_join = try std.json.parseFromSlice(std.json.Value, alloc, join_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_join.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed_join.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("o1", parsed_join.value.object.get("rows").?.array.items[0].object.get("order_id").?.string);
+    try std.testing.expectEqualStrings("Ada", parsed_join.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
+    try expectRowsResultSchemaColumn(parsed_join.value, "order_id", "keyword", false, null);
+    try expectRowsResultSchemaColumn(parsed_join.value, "customer_name", "keyword", true, null);
+
+    var lateral_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/orders/rows/lateral",
+        .content_type = "application/json",
+        .body = "{\"left_table\":\"orders\",\"right_table\":\"customers\",\"lateral\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"},\"order_by\":[{\"field\":\"id\"}]},\"right\":{\"where\":{\"field\":\"enabled\",\"op\":\"eq\",\"value\":true},\"order_by\":[{\"field\":\"name\"}],\"limit\":1},\"correlations\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}],\"select\":[{\"as\":\"order_id\",\"side\":\"left\",\"field\":\"id\"},{\"as\":\"customer_name\",\"side\":\"right\",\"field\":\"name\"}],\"order_by\":[{\"field\":\"order_id\"}]}}",
+    });
+    defer lateral_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), lateral_resp.status);
+    var parsed_lateral = try std.json.parseFromSlice(std.json.Value, alloc, lateral_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_lateral.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_lateral.value.object.get("total_rows").?.integer);
+    try std.testing.expectEqualStrings("o1", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("order_id").?.string);
+    try std.testing.expectEqualStrings("Ada", parsed_lateral.value.object.get("rows").?.array.items[0].object.get("customer_name").?.string);
+    try std.testing.expectEqualStrings("o2", parsed_lateral.value.object.get("rows").?.array.items[1].object.get("order_id").?.string);
+    try std.testing.expectEqual(std.json.Value{ .null = {} }, parsed_lateral.value.object.get("rows").?.array.items[1].object.get("customer_name").?);
+    try expectRowsResultSchemaColumn(parsed_lateral.value, "order_id", "keyword", false, null);
+    try expectRowsResultSchemaColumn(parsed_lateral.value, "customer_name", "keyword", true, null);
 }
 
 test "api http server lake text candidate planning rejects ambiguous field sidecars" {

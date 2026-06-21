@@ -343,6 +343,59 @@ pub const AppParityCoverageRequirementsRoot = struct {
     required: []const []const u8,
 };
 
+pub const AppParityExternalSourceCorpus = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParitySourceCorpusRoot,
+    source_sha256: []u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.source_sha256);
+        freeSourceCorpusRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
+    const source_json = @embedFile("../fixtures/sql_api_parity_source_corpus.json");
+    const source_sha256 = try sourceCorpusSha256HexAlloc(alloc, source_json);
+    errdefer alloc.free(source_sha256);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSourceCorpusRootAlloc(alloc, parsed.value);
+    errdefer freeSourceCorpusRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+        .source_sha256 = source_sha256,
+    };
+}
+
+pub const AppParityCoverageRequirements = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParityCoverageRequirementsRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeCoverageRequirementsRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub fn parseAppParityCoverageRequirementsAlloc(alloc: std.mem.Allocator) !AppParityCoverageRequirements {
+    const coverage_json = @embedFile("../fixtures/sql_api_required_coverage.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseCoverageRequirementsRootAlloc(alloc, parsed.value);
+    errdefer freeCoverageRequirementsRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
 pub const SqlAdapterEdgeCaseAction = enum {
     select,
     update,

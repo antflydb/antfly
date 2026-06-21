@@ -2113,11 +2113,11 @@ and lateral executors without accepting SQL text.
 Join and lateral execution also has side-schema-aware native helpers for direct
 cross-table plans: the CTE stream, left stream, and right stream can each be
 validated against their own runtime schema and collected from their own DB
-handle before feeding the same join/lateral executor. That is the execution
-target for catalog-owned cross-table read routing; the remaining wire/API
-extension is durable table identity on the public plan envelope so provisioned
-and hosted sources can resolve those side streams from catalog ownership instead
-of receiving pre-collected side rows.
+handle before feeding the same join/lateral executor. The public plan envelope
+carries durable side-table identity with `left_table` and `right_table`; omitted
+side names resolve to the endpoint table, while explicit side names make
+catalog-backed and hosted sources resolve each side stream through table/range
+ownership before running the same typed executor.
 The same gate includes a DB-backed write-plan execution bridge:
 representative SQL `INSERT`, claimed `UPDATE`, claimed `DELETE`, joined
 `UPDATE ... FROM`, and joined `DELETE ... USING` statements are classified

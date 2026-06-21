@@ -1323,6 +1323,8 @@ fn applyCreateIndexPlanAlloc(
         return error.InvalidSqlCatalog;
     }
 
+    if (plan.derived_index_config_json != null) return error.UnsupportedSqlShape;
+
     if (plan.method == .gin) {
         if (plan.unique or plan.columns.len != 1 or plan.expressions.len != 0 or plan.generated_expression != null) return error.UnsupportedSqlShape;
         const column = binder.relationalColumnForDdl(schema.relational_columns, plan.columns[0]) orelse return error.InvalidSqlCatalog;

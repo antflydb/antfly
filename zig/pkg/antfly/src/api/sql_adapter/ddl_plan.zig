@@ -936,6 +936,7 @@ pub const CreateIndexPlan = struct {
     nulls_not_distinct: bool = false,
     where: []const runtime_schema.UniquePredicate = &.{},
     where_expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
+    derived_index_config_json: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.index_name);
@@ -948,6 +949,7 @@ pub const CreateIndexPlan = struct {
         freeDdlUniquePredicates(alloc, self.where);
         freeExpressionConditions(alloc, self.where_expressions);
         if (self.where_expressions.len > 0) alloc.free(self.where_expressions);
+        if (self.derived_index_config_json) |json| alloc.free(json);
         self.* = undefined;
     }
 };
@@ -960,13 +962,27 @@ pub const CreateIndexOptions = struct {
 pub const DdlIndexMethod = enum {
     btree,
     gin,
+    antfly_full_text,
+    hnsw,
+    antfly_aknn,
+    antfly_algebraic,
 };
 
 pub const DdlIndexOpClass = enum {
     default,
     jsonb_path_ops,
     array_ops,
+    vector_l2_ops,
+    vector_ip_ops,
+    vector_cosine_ops,
 };
+
+pub fn ddlIndexMethodIsDerived(method: DdlIndexMethod) bool {
+    return switch (method) {
+        .antfly_full_text, .hnsw, .antfly_aknn, .antfly_algebraic => true,
+        .btree, .gin => false,
+    };
+}
 
 pub fn runtimeSchemaFromCreateTablePlanAlloc(
     alloc: std.mem.Allocator,
@@ -4602,7 +4618,8 @@ pub fn parseCreateIndexPlanAlloc(
     var without_overlaps_period: ?[]const u8 = null;
     errdefer if (without_overlaps_period) |period| alloc.free(period);
     try cursor.expectToken(.lparen);
-    while (true) {
+    const empty_algebraic_index = method == .antfly_algebraic and cursor.matchToken(.rparen) != null;
+    while (!empty_algebraic_index) {
         if (grammar.peekDdlIndexElementExpression(tokens, pos.*, true)) {
             const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
             if (unique) {
@@ -4640,10 +4657,38 @@ pub fn parseCreateIndexPlanAlloc(
         }
         if (cursor.matchToken(.comma) == null) break;
     }
-    try cursor.expectToken(.rparen);
+    if (!empty_algebraic_index) try cursor.expectToken(.rparen);
     if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null) return error.UnsupportedSqlShape;
     try grammar.validateSqlIdentifierListUnique(columns.items);
     try lower_expr.validateSqlUniqueExpressionListUnique(expressions.items);
+
+    if (ddlIndexMethodIsDerived(method)) {
+        if (unique or expressions.items.len != 0 or generated_expression != null or without_overlaps_period != null) return error.UnsupportedSqlShape;
+        if (columns.items.len != 1 and method != .antfly_algebraic) return error.UnsupportedSqlShape;
+        if (method == .antfly_algebraic and columns.items.len != 0) return error.UnsupportedSqlShape;
+        const derived_index_config_json = try derivedIndexConfigJsonAlloc(alloc, tokens, pos, method, opclass, columns.items);
+        var derived_transferred = false;
+        errdefer if (!derived_transferred) alloc.free(derived_index_config_json);
+        try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+        const owned_columns = try columns.toOwnedSlice(alloc);
+        var columns_transferred = false;
+        errdefer if (!columns_transferred) freeStringSlice(alloc, owned_columns);
+
+        header_transferred = true;
+        columns_transferred = true;
+        derived_transferred = true;
+        return .{
+            .index_name = header.index_name,
+            .table_name = header.table_name,
+            .if_not_exists = header.if_not_exists,
+            .unique = false,
+            .method = method,
+            .opclass = opclass,
+            .columns = owned_columns,
+            .derived_index_config_json = derived_index_config_json,
+        };
+    }
 
     const nulls_policy = try grammar.parseOptionalDdlUniqueNullsDistinct(tokens, pos);
     if (nulls_policy != null and !unique) return error.UnsupportedSqlShape;
@@ -4715,6 +4760,254 @@ pub fn parseCreateIndexPlanAlloc(
         .where = predicates,
         .where_expressions = where_expressions,
     };
+}
+
+const DerivedIndexOptionValue = union(enum) {
+    string: []const u8,
+    number: []const u8,
+    boolean: bool,
+};
+
+const DerivedIndexOption = struct {
+    name: []const u8,
+    value: DerivedIndexOptionValue,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        switch (self.value) {
+            .string => |value| alloc.free(value),
+            .number => |value| alloc.free(value),
+            .boolean => {},
+        }
+        self.* = undefined;
+    }
+};
+
+fn parseDerivedIndexOptionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) ![]DerivedIndexOption {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("with")) return &.{};
+    try cursor.expectToken(.lparen);
+
+    var options = std.ArrayListUnmanaged(DerivedIndexOption).empty;
+    errdefer {
+        for (options.items) |*option| option.deinit(alloc);
+        options.deinit(alloc);
+    }
+    while (true) {
+        const name_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+        const name = try alloc.dupe(u8, name_token.text);
+        var name_transferred = false;
+        errdefer if (!name_transferred) alloc.free(name);
+        try cursor.expectToken(.eq);
+
+        const value_token = cursor.matchToken(.string) orelse
+            cursor.matchToken(.number) orelse
+            cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+        const value: DerivedIndexOptionValue = switch (value_token.kind) {
+            .string => .{ .string = try alloc.dupe(u8, value_token.text) },
+            .number => .{ .number = try alloc.dupe(u8, value_token.text) },
+            .identifier => blk: {
+                if (std.ascii.eqlIgnoreCase(value_token.text, "true")) break :blk .{ .boolean = true };
+                if (std.ascii.eqlIgnoreCase(value_token.text, "false")) break :blk .{ .boolean = false };
+                break :blk .{ .string = try alloc.dupe(u8, value_token.text) };
+            },
+            else => unreachable,
+        };
+        var value_transferred = false;
+        errdefer if (!value_transferred) switch (value) {
+            .string => |owned| alloc.free(owned),
+            .number => |owned| alloc.free(owned),
+            .boolean => {},
+        };
+
+        try options.append(alloc, .{ .name = name, .value = value });
+        name_transferred = true;
+        value_transferred = true;
+
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    return try options.toOwnedSlice(alloc);
+}
+
+fn freeDerivedIndexOptions(alloc: std.mem.Allocator, options: []DerivedIndexOption) void {
+    for (options) |*option| option.deinit(alloc);
+    if (options.len > 0) alloc.free(options);
+}
+
+fn derivedIndexOption(options: []const DerivedIndexOption, name: []const u8) ?DerivedIndexOptionValue {
+    for (options) |option| {
+        if (std.ascii.eqlIgnoreCase(option.name, name)) return option.value;
+    }
+    return null;
+}
+
+fn derivedIndexOptionString(options: []const DerivedIndexOption, name: []const u8) ?[]const u8 {
+    const value = derivedIndexOption(options, name) orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        .number => |text| text,
+        .boolean => null,
+    };
+}
+
+fn derivedIndexOptionNumber(options: []const DerivedIndexOption, name: []const u8) ?[]const u8 {
+    const value = derivedIndexOption(options, name) orelse return null;
+    return switch (value) {
+        .number => |text| text,
+        else => null,
+    };
+}
+
+fn appendJsonStringLiteral(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: []const u8,
+) !void {
+    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(encoded);
+    try out.appendSlice(alloc, encoded);
+}
+
+fn appendJsonStringField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try appendJsonStringLiteral(alloc, out, name);
+    try out.append(alloc, ':');
+    try appendJsonStringLiteral(alloc, out, value);
+}
+
+fn appendJsonBoolField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    value: bool,
+) !void {
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try appendJsonStringLiteral(alloc, out, name);
+    try out.append(alloc, ':');
+    try out.appendSlice(alloc, if (value) "true" else "false");
+}
+
+fn appendJsonNumberField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try appendJsonStringLiteral(alloc, out, name);
+    try out.append(alloc, ':');
+    try out.appendSlice(alloc, value);
+}
+
+fn appendJsonOptionField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    option: DerivedIndexOption,
+) !void {
+    switch (option.value) {
+        .string => |value| try appendJsonStringField(alloc, out, first, option.name, value),
+        .number => |value| try appendJsonNumberField(alloc, out, first, option.name, value),
+        .boolean => |value| try appendJsonBoolField(alloc, out, first, option.name, value),
+    }
+}
+
+fn vectorMetricForOpClass(opclass: DdlIndexOpClass) []const u8 {
+    return switch (opclass) {
+        .vector_l2_ops => "l2_squared",
+        .vector_ip_ops => "inner_product",
+        .vector_cosine_ops, .default => "cosine",
+        .jsonb_path_ops, .array_ops => "cosine",
+    };
+}
+
+fn derivedIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    method: DdlIndexMethod,
+    opclass: DdlIndexOpClass,
+    columns: []const []const u8,
+) ![]const u8 {
+    const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, pos);
+    defer freeDerivedIndexOptions(alloc, options);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+
+    switch (method) {
+        .antfly_full_text => {
+            try appendJsonStringField(alloc, &out, &first, "type", "full_text");
+            try appendJsonStringField(alloc, &out, &first, "field", columns[0]);
+        },
+        .hnsw => {
+            try appendJsonStringField(alloc, &out, &first, "type", "embeddings");
+            try appendJsonStringField(alloc, &out, &first, "field", columns[0]);
+            try appendJsonBoolField(alloc, &out, &first, "external", true);
+            try appendJsonStringField(alloc, &out, &first, "metric", derivedIndexOptionString(options, "metric") orelse vectorMetricForOpClass(opclass));
+            if (derivedIndexOptionNumber(options, "dimension")) |dimension| try appendJsonNumberField(alloc, &out, &first, "dimension", dimension);
+        },
+        .antfly_aknn => {
+            const enrichment_name = derivedIndexOptionString(options, "embedding_name") orelse "embedding";
+            try appendJsonStringField(alloc, &out, &first, "type", "embeddings");
+            try appendJsonStringField(alloc, &out, &first, "field", columns[0]);
+            try appendJsonBoolField(alloc, &out, &first, "external", false);
+            try appendJsonStringField(alloc, &out, &first, "metric", derivedIndexOptionString(options, "metric") orelse "cosine");
+            if (derivedIndexOptionNumber(options, "dimension")) |dimension| try appendJsonNumberField(alloc, &out, &first, "dimension", dimension);
+            try out.append(alloc, ',');
+            try appendJsonStringLiteral(alloc, &out, "enrichments");
+            try out.appendSlice(alloc, ":[{");
+            var enrichment_first = true;
+            try appendJsonStringField(alloc, &out, &enrichment_first, "name", enrichment_name);
+            try appendJsonStringField(alloc, &out, &enrichment_first, "kind", "embedding");
+            try appendJsonStringField(alloc, &out, &enrichment_first, "field", columns[0]);
+            if (derivedIndexOptionNumber(options, "dimension")) |dimension| try appendJsonNumberField(alloc, &out, &enrichment_first, "expected_dims", dimension);
+            if (derivedIndexOptionString(options, "model")) |model| try appendJsonStringField(alloc, &out, &enrichment_first, "model", model);
+            try out.appendSlice(alloc, "}]");
+        },
+        .antfly_algebraic => {
+            try appendJsonStringField(alloc, &out, &first, "type", "algebraic");
+            if (derivedIndexOption(options, "derive_from_schema")) |value| switch (value) {
+                .boolean => |enabled| try appendJsonBoolField(alloc, &out, &first, "derive_from_schema", enabled),
+                else => return error.UnsupportedSqlShape,
+            } else {
+                try appendJsonBoolField(alloc, &out, &first, "derive_from_schema", true);
+            }
+        },
+        .btree, .gin => unreachable,
+    }
+
+    for (options) |option| {
+        if (std.ascii.eqlIgnoreCase(option.name, "metric") or
+            std.ascii.eqlIgnoreCase(option.name, "embedding_name") or
+            std.ascii.eqlIgnoreCase(option.name, "dimension") or
+            std.ascii.eqlIgnoreCase(option.name, "derive_from_schema"))
+        {
+            continue;
+        }
+        try appendJsonOptionField(alloc, &out, &first, option);
+    }
+
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 pub fn isAdapterNoopExtensionName(extension_name: []const u8) bool {
