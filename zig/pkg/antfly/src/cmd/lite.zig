@@ -1843,6 +1843,66 @@ test "lite backup writer handles absolute output paths" {
     try std.testing.expectEqualStrings("portable-backup", body);
 }
 
+test "lite backup command exports stable data while writer has open transaction" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-active-writer.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const backup_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-active-writer.afb", .{tmp.sub_path});
+    defer allocator.free(backup_path);
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/backup-active-writer-restored.aflite", .{tmp.sub_path});
+    defer allocator.free(restored_path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    defer allocator.free(backup_path_z);
+
+    var writer = try LiteDb.open(allocator, path, .writer);
+    defer writer.close();
+
+    const committed = try batchJson(allocator, &writer.db,
+        \\{"inserts":{"doc:backup-committed":{"title":"backup committed"}}}
+    );
+    defer allocator.free(committed);
+    try std.testing.expect(std.mem.indexOf(u8, committed, "\"inserted\":1") != null);
+
+    const txn_id: db_types.TxnId = .{ 0x6c, 0x69, 0x74, 0x65, 0x2d, 0x63, 0x6c, 0x69, 0x2d, 0x62, 0x61, 0x63, 0x6b, 0, 0, 1 };
+    _ = try writer.db.beginTransactionWithId(txn_id, 2_000);
+    try writer.db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "doc:backup-pending", .value = "{\"title\":\"backup pending\"}" }},
+    });
+
+    const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try backup(allocator, io, &args);
+
+    try writer.db.abortTransaction(txn_id, 0);
+
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
+    defer allocator.free(body);
+    try portable_backup.validatePortable(allocator, body);
+
+    try restoreFromSourceFile(allocator, io, backup_path, restored_path, false);
+
+    var restored = try LiteDb.open(allocator, restored_path, .query_readonly);
+    defer restored.close();
+
+    const committed_lookup = try lookupJson(allocator, &restored.db, "doc:backup-committed", "");
+    defer allocator.free(committed_lookup);
+    try std.testing.expect(std.mem.indexOf(u8, committed_lookup, "\"backup committed\"") != null);
+
+    const pending_lookup = try lookupJson(allocator, &restored.db, "doc:backup-pending", "");
+    defer allocator.free(pending_lookup);
+    try std.testing.expect(std.mem.indexOf(u8, pending_lookup, "\"found\":false") != null);
+}
+
 test "lite restore source can be an aflite database" {
     const allocator = std.testing.allocator;
 
