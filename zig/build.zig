@@ -4370,6 +4370,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "postgres sql adapter classifies application parity corpus",
             "postgres sql adapter classifies fixture-backed application parity corpus",
+            "postgres sql adapter rejects data-driven application edge cases explicitly",
             "postgres sql adapter applies incremental ddl plans to public schema json",
             "api http server executes public relational row plan endpoints",
             "api http server routes public external lake row queries through configured resolver",
