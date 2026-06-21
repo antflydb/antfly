@@ -498,6 +498,8 @@ test "restore input plan stages aflite as portable table restore" {
 
     const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-input-plan-src.aflite", .{tmp.sub_path});
     defer allocator.free(src_path);
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-input-plan-normal-db", .{tmp.sub_path});
+    defer allocator.free(restored_path);
     const cwd_tmp = try std.Io.Dir.cwd().realPathFileAlloc(io, ".zig-cache/tmp", allocator);
     defer allocator.free(cwd_tmp);
     const backup_root = try std.fmt.allocPrint(allocator, "{s}/{s}/restore-input-plan-backups", .{ cwd_tmp, tmp.sub_path });
@@ -522,6 +524,26 @@ test "restore input plan stages aflite as portable table restore" {
         var db = try antfly.db.DB.open(allocator, src_path, opts);
         defer db.close();
         try db.setSchemaJson(allocator, schema_json);
+        try db.addEnrichment(.{
+            .name = "restore_input_chunks_v1",
+            .kind = .chunk,
+            .field = "body",
+            .chunk_size = 96,
+            .chunk_overlap = 12,
+        });
+        try db.addIndex(.{
+            .name = "restore_input_ft_body",
+            .kind = .full_text,
+            .config_json = "{\"chunk_name\":\"restore_input_chunks_v1\"}",
+        });
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:restore-input",
+                .value = "{\"title\":\"restore input document\",\"body\":\"normal restore input staging\"}",
+            }},
+            .sync_level = .full_index,
+        });
+        try db.runUntilIdle();
     }
 
     var plan = try prepareInputRestorePlan(allocator, src_path, "docs", null, location);
@@ -541,8 +563,24 @@ test "restore input plan stages aflite as portable table restore" {
     try std.testing.expectEqualStrings("docs", manifest.table_name);
     try std.testing.expectEqualStrings(plan.request.backup_id, manifest.backup_id);
     try std.testing.expectEqualStrings(schema_json, manifest.schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_input_ft_body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"enrichments\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest.indexes_json, "\"restore_input_chunks_v1\"") != null);
     try std.testing.expectEqual(@as(usize, 1), manifest.shards.len);
     try std.testing.expectEqualStrings(plan.staged.snapshot_path, manifest.shards[0].snapshot_path);
+
+    const afb_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ backup_root, plan.staged.snapshot_path });
+    defer allocator.free(afb_path);
+    const portable = try std.Io.Dir.cwd().readFileAlloc(io, afb_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
+    defer allocator.free(portable);
+    try portable_backup.validatePortable(allocator, portable);
+
+    var restored = try antfly.db.DB.open(allocator, restored_path, .{});
+    defer restored.close();
+    try portable_backup.importPortable(allocator, restored.core.store, portable);
+    const value = (try restored.get(allocator, "doc:restore-input")) orelse return error.TestExpectedEqual;
+    defer allocator.free(value);
+    try std.testing.expect(std.mem.indexOf(u8, value, "restore input document") != null);
 }
 
 test "restore cli parser accepts help flag" {
