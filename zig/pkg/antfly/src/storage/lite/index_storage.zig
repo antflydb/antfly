@@ -89,6 +89,14 @@ fn validateIndexPath(self: *const Store, path: []const u8) !void {
     if (path.len == 0) return error.InvalidNativeIndexPath;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativeIndexPath;
     if (!pathContains(self.namespace_prefix, path)) return error.InvalidNativeIndexPath;
+    if (self.namespace_prefix.len != 0) {
+        if (path.len == self.namespace_prefix.len) return;
+        var it = std.mem.splitScalar(u8, path[self.namespace_prefix.len + 1 ..], '/');
+        while (it.next()) |segment| {
+            if (segment.len == 0) return error.InvalidNativeIndexPath;
+            if (std.mem.eql(u8, segment, ".") or std.mem.eql(u8, segment, "..")) return error.InvalidNativeIndexPath;
+        }
+    }
 }
 
 fn readFileAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -360,6 +368,9 @@ test "lite native index storage can be scoped to the Lite index namespace" {
     try std.testing.expectError(error.InvalidNativeIndexPath, storage.deleteTree("__antfly_lite_other"));
     try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("", "bad"));
     try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("__antfly_lite/indexes/ft/\x00bad", "bad"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("__antfly_lite/../outside", "bad"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("__antfly_lite/./indexes/ft/a.tbl", "bad"));
+    try std.testing.expectError(error.InvalidNativeIndexPath, storage.writeFileAbsolute("__antfly_lite/indexes//ft/a.tbl", "bad"));
 }
 
 test "lite native index storage handles large files rename and delete tree" {
