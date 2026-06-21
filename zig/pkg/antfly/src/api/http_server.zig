@@ -3562,6 +3562,9 @@ pub const ApiHttpServer = struct {
             },
             .prepared_transaction => |prepared_plan| {
                 _ = try self.source.applyPreparedTransactionPlan(self.alloc, prepared_plan, sqlDdlTimestampNs());
+                if (prepared_plan.action == .prepare) {
+                    try session.clearTransactionLocalState(self.alloc);
+                }
                 var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                 errdefer applied.deinit(self.alloc);
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -21690,10 +21693,28 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
     var session = try relational_sql.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
     defer session.deinit(alloc);
 
+    var set_path = try server.applyRelationalSqlDdlWithSession("SET search_path TO analytics, public;", &session);
+    defer set_path.deinit(alloc);
+    var set_local_path = try server.applyRelationalSqlDdlWithSession("SET LOCAL search_path TO public;", &session);
+    defer set_local_path.deinit(alloc);
+    var set_local_tenant = try server.applyRelationalSqlDdlWithSession("SET LOCAL app.tenant_id = 'tenant-b';", &session);
+    defer set_local_tenant.deinit(alloc);
+    try std.testing.expect(session.transaction_local_search_path);
+    try std.testing.expect(session.transaction_local_settings);
+    try std.testing.expectEqualStrings("public", session.search_path[0]);
+    try std.testing.expectEqualStrings("tenant-b", session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
     var prepared = try server.applyRelationalSqlDdlWithSession("PREPARE TRANSACTION 'usage_batch';", &session);
     defer prepared.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), source.applied);
     try std.testing.expect(source.last_pending);
+    try std.testing.expect(!session.transaction_local_search_path);
+    try std.testing.expect(session.transaction_local_search_path_base == null);
+    try std.testing.expect(!session.transaction_local_settings);
+    try std.testing.expect(session.transaction_local_settings_base == null);
+    try std.testing.expectEqualStrings("analytics", session.search_path[0]);
+    try std.testing.expectEqualStrings("public", session.search_path[1]);
+    try std.testing.expect(session.session().settingValue("app.tenant_id") == null);
 
     var committed = try server.applyRelationalSqlDdlWithSession("COMMIT PREPARED 'usage_batch';", &session);
     defer committed.deinit(alloc);
