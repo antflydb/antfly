@@ -35267,7 +35267,7 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
 
     var coverage = sql_adapter.SqlAdapterEdgeCaseCoverage{};
     for (root.cases) |edge_case| {
-        coverage.observe(edge_case);
+        try coverage.observe(edge_case);
         try expectSqlAdapterEdgeCase(alloc, edge_case, schema, resolver_ctx.resolver());
     }
     try sql_adapter.expectSqlAdapterEdgeCaseCoverageRequirements(coverage, required_coverage.root.required);
