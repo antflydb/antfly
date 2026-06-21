@@ -195,6 +195,9 @@ jobs:
           node-version: 24.x
           registry-url: https://registry.npmjs.org/
 
+      - name: Test Lite C ABI packaging
+        run: python scripts/packaging/test_lite_cabi_packaging.py
+
       - name: Build wheels and populate npm packages
         run: |
           python scripts/packaging/package_cli_release.py \
@@ -300,6 +303,7 @@ jobs:
 
       - name: Render formula
         run: |
+          python scripts/packaging/test_lite_cabi_packaging.py
           version="${GITHUB_REF_NAME#v}"
           python scripts/packaging/render_homebrew_antfly_formula.py \
             --version "$version" \
