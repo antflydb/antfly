@@ -13,14 +13,15 @@
 // limitations.
 
 pub const backend = @import("backend.zig");
-pub const bridge = @import("bridge.zig");
+pub const capabilities = @import("capabilities.zig");
 pub const docstore = @import("docstore.zig");
 pub const index_storage = @import("index_storage.zig");
 pub const native = @import("native.zig");
 
 test {
     _ = backend;
-    _ = bridge;
+    _ = @import("bridge.zig");
+    _ = capabilities;
     _ = docstore;
     _ = index_storage;
     _ = native;
