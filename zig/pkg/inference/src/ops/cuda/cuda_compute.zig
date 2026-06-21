@@ -31,6 +31,8 @@ const quant_codec = @import("../../gguf/quant_codec.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
 const operator_plan = @import("../../graph/operator_plan.zig");
 const kv_storage_runtime = @import("../../runtime/kv/storage_runtime.zig");
+const kv_pool_mod = @import("../../runtime/kv/pool.zig");
+const kv_block_mod = @import("../../runtime/kv/block.zig");
 const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
 const gpt_arch = @import("../../architectures/gpt.zig");
 const gpt_model = @import("../../models/gpt.zig");
@@ -449,6 +451,11 @@ pub const RuntimeStats = struct {
     device_kv_fail_write: usize = 0,
     device_kv_fail_read: usize = 0,
     device_kv_fail_shape: usize = 0,
+    device_kv_paged_block_table_uploads: usize = 0,
+    device_kv_paged_block_table_bytes: usize = 0,
+    device_kv_compressed_v_writes: usize = 0,
+    device_kv_compressed_v_reads: usize = 0,
+    device_kv_compressed_v_bytes: usize = 0,
     qkv_fused_q8: usize = 0,
     qkv_fused_q4: usize = 0,
     qkv_fused_q4_q4_f32: usize = 0,
@@ -1084,14 +1091,26 @@ pub fn smokeDecoderRuntimeSlots(allocator: std.mem.Allocator) !void {
 const CudaKvLayer = struct {
     k: buffer_mod.DeviceBuffer = .{},
     v: buffer_mod.DeviceBuffer = .{},
+    block_table: buffer_mod.DeviceBuffer = .{},
     capacity_tokens: usize = 0,
     token_count: usize = 0,
     row_width: usize = 0,
+    key_row_bytes: usize = 0,
+    base_key_row_bytes: usize = 0,
+    value_row_bytes: usize = 0,
+    compressed_format: ?u32 = null,
+    value_format: u32 = cuda_kv_value_format_f32,
+    page_size_tokens: u16 = 0,
+    block_table_len: usize = 0,
+    block_table_capacity: usize = 0,
+    block_table_signature: u64 = 0,
+    block_table_valid: bool = false,
     position_offset: usize = 0,
 
     fn deinit(self: *CudaKvLayer, compute: *CudaCompute) void {
         self.k.free(&compute.ctx);
         self.v.free(&compute.ctx);
+        self.block_table.free(&compute.ctx);
         self.* = .{};
     }
 };
@@ -1129,13 +1148,15 @@ fn traceCudaDeviceKvGatherFailure(
 const CudaKvDeviceStorage = struct {
     allocator: std.mem.Allocator,
     compute: *CudaCompute,
+    dtype: kv_pool_mod.KvDType,
     layers: std.AutoHashMapUnmanaged(u64, CudaKvLayer) = .{},
 
-    fn create(allocator: std.mem.Allocator, compute: *CudaCompute) !*CudaKvDeviceStorage {
+    fn create(allocator: std.mem.Allocator, compute: *CudaCompute, dtype: kv_pool_mod.KvDType) !*CudaKvDeviceStorage {
         const self = try allocator.create(CudaKvDeviceStorage);
         self.* = .{
             .allocator = allocator,
             .compute = compute,
+            .dtype = dtype,
         };
         return self;
     }
@@ -1153,34 +1174,135 @@ const CudaKvDeviceStorage = struct {
         return (@as(u64, sequence_id) << 32) | @as(u64, @intCast(layer_index));
     }
 
+    fn layerKey(self: *const CudaKvDeviceStorage, sequence_id: kv_storage_runtime.SequenceId, layer_index: usize) !u64 {
+        if (cudaTurboquantKvFormat(self.dtype) != null) return key(0, layer_index);
+        return key(sequence_id, layer_index);
+    }
+
+    fn neededBlockCount(token_count: usize, page_size_tokens: u16) !usize {
+        if (token_count == 0 or page_size_tokens == 0) return 0;
+        return std.math.divCeil(usize, token_count, page_size_tokens) catch error.InvalidPagedKvState;
+    }
+
+    fn physicalCapacityTokens(logical_blocks: []const kv_block_mod.KvBlockId, needed_blocks: usize, page_size_tokens: u16) !usize {
+        if (needed_blocks == 0) return 0;
+        if (logical_blocks.len < needed_blocks or page_size_tokens == 0) return error.InvalidPagedKvState;
+        var max_block: usize = 0;
+        for (logical_blocks[0..needed_blocks]) |block_id| {
+            max_block = @max(max_block, @as(usize, block_id));
+        }
+        return checkedMul(try checkedAdd(max_block, 1), page_size_tokens);
+    }
+
+    fn blockTableSignature(logical_blocks: []const kv_block_mod.KvBlockId, needed_blocks: usize, page_size_tokens: u16) u64 {
+        var hash = std.hash.Wyhash.init(0x9d2166f7_3b6a1b89);
+        hash.update(std.mem.asBytes(&page_size_tokens));
+        const needed_blocks_u64: u64 = @intCast(needed_blocks);
+        hash.update(std.mem.asBytes(&needed_blocks_u64));
+        hash.update(std.mem.sliceAsBytes(logical_blocks[0..needed_blocks]));
+        return hash.final();
+    }
+
+    fn ensureLayerBlockTable(
+        self: *CudaKvDeviceStorage,
+        layer: *CudaKvLayer,
+        logical_blocks: []const kv_block_mod.KvBlockId,
+        token_count: usize,
+        page_size_tokens: u16,
+    ) !void {
+        const needed_blocks = try neededBlockCount(token_count, page_size_tokens);
+        if (needed_blocks == 0) return;
+        if (logical_blocks.len < needed_blocks) return error.InvalidPagedKvState;
+        const block_table_bytes = try checkedMul(needed_blocks, @sizeOf(kv_block_mod.KvBlockId));
+        const signature = blockTableSignature(logical_blocks, needed_blocks, page_size_tokens);
+        if (layer.block_table_valid and
+            layer.block_table_len == needed_blocks and
+            layer.page_size_tokens == page_size_tokens and
+            layer.block_table_signature == signature)
+        {
+            return;
+        }
+        if (layer.block_table_capacity < needed_blocks) {
+            var new_table = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, block_table_bytes);
+            errdefer new_table.free(&self.compute.ctx);
+            self.compute.noteDeviceBytes(block_table_bytes);
+            layer.block_table.free(&self.compute.ctx);
+            layer.block_table = new_table;
+            layer.block_table_capacity = needed_blocks;
+        }
+        try copyFromHostTracked(self.compute, layer.block_table, std.mem.sliceAsBytes(logical_blocks[0..needed_blocks]));
+        layer.block_table_len = needed_blocks;
+        layer.page_size_tokens = page_size_tokens;
+        layer.block_table_signature = signature;
+        layer.block_table_valid = true;
+        self.compute.stats.device_kv_paged_block_table_uploads += 1;
+        self.compute.stats.device_kv_paged_block_table_bytes += block_table_bytes;
+    }
+
     fn ensureLayer(self: *CudaKvDeviceStorage, write: kv_storage_runtime.KvSuffixWrite) !*CudaKvLayer {
         const row_width = try checkedMul(@as(usize, write.num_kv_heads), @as(usize, write.head_dim));
-        const layer_key = try key(write.sequence_id, write.layer_index);
+        const compressed_format = cudaTurboquantKvFormat(self.dtype);
+        const key_row_bytes = if (compressed_format != null)
+            self.dtype.bytesForKeyRow(write.num_kv_heads, write.head_dim)
+        else
+            try checkedMul(row_width, @sizeOf(f32));
+        if (key_row_bytes == 0) return error.DeviceWriteFormatUnsupported;
+        const base_key_row_bytes = switch (self.dtype) {
+            .turbo3 => kv_pool_mod.KvDType.turbo3.bytesForKeyRow(write.num_kv_heads, write.head_dim) -
+                @as(usize, write.num_kv_heads) * ((32 + 7) / 8),
+            else => key_row_bytes,
+        };
+        const value_format: u32 = if (compressed_format != null and !cudaTurboquantCompressedVDisabled())
+            cuda_kv_value_format_int8_per_head
+        else
+            cuda_kv_value_format_f32;
+        const value_row_bytes = if (value_format == cuda_kv_value_format_int8_per_head)
+            self.dtype.bytesForValueRow(write.num_kv_heads, write.head_dim)
+        else
+            try checkedMul(row_width, @sizeOf(f32));
+        if (value_row_bytes == 0) return error.DeviceWriteFormatUnsupported;
+        const layer_key = try self.layerKey(write.sequence_id, write.layer_index);
         const gop = try self.layers.getOrPut(self.allocator, layer_key);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{};
         }
         const layer = gop.value_ptr;
         if (layer.row_width != 0 and layer.row_width != row_width) return error.InvalidKvShape;
+        if (layer.key_row_bytes != 0 and layer.key_row_bytes != key_row_bytes) return error.InvalidKvShape;
+        if (layer.value_row_bytes != 0 and layer.value_row_bytes != value_row_bytes) return error.InvalidKvShape;
+        if (layer.key_row_bytes != 0 and layer.compressed_format != compressed_format) return error.InvalidKvShape;
+        if (layer.key_row_bytes != 0 and layer.value_format != value_format) return error.InvalidKvShape;
         layer.row_width = row_width;
+        layer.key_row_bytes = key_row_bytes;
+        layer.base_key_row_bytes = base_key_row_bytes;
+        layer.value_row_bytes = value_row_bytes;
+        layer.compressed_format = compressed_format;
+        layer.value_format = value_format;
+        layer.page_size_tokens = write.page_size_tokens;
         layer.position_offset = write.position_offset;
 
-        const required_capacity = if (cudaDebugGraphPersistentReplayEnabled())
+        const required_capacity = if (compressed_format != null and write.logical_blocks != null and write.page_size_tokens != 0) blk: {
+            const logical_blocks = write.logical_blocks.?;
+            const needed_blocks = try neededBlockCount(write.total_token_count, write.page_size_tokens);
+            break :blk try physicalCapacityTokens(logical_blocks, needed_blocks, write.page_size_tokens);
+        } else if (cudaDebugGraphPersistentReplayEnabled())
             try std.math.add(usize, write.total_token_count, 256)
         else
             write.total_token_count;
         if (layer.capacity_tokens < required_capacity) {
             const new_capacity = @max(required_capacity, @max(@as(usize, 16), layer.capacity_tokens * 2));
-            const bytes = try checkedMul(try checkedMul(new_capacity, row_width), @sizeOf(f32));
-            var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, bytes);
+            const k_bytes = try checkedMul(new_capacity, key_row_bytes);
+            const v_bytes = try checkedMul(new_capacity, value_row_bytes);
+            var new_k = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, k_bytes);
             errdefer new_k.free(&self.compute.ctx);
-            var new_v = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, bytes);
+            var new_v = try buffer_mod.DeviceBuffer.alloc(&self.compute.ctx, v_bytes);
             errdefer new_v.free(&self.compute.ctx);
-            self.compute.noteDeviceBytes(bytes * 2);
-            if (layer.token_count != 0) {
-                const old_bytes = try checkedMul(try checkedMul(layer.token_count, row_width), @sizeOf(f32));
-                try new_k.copyFromDevice(&self.compute.ctx, layer.k, old_bytes);
-                try new_v.copyFromDevice(&self.compute.ctx, layer.v, old_bytes);
+            self.compute.noteDeviceBytes(k_bytes + v_bytes);
+            if (layer.capacity_tokens != 0) {
+                const old_k_bytes = try checkedMul(layer.capacity_tokens, key_row_bytes);
+                const old_v_bytes = try checkedMul(layer.capacity_tokens, value_row_bytes);
+                try new_k.copyFromDevice(&self.compute.ctx, layer.k, old_k_bytes);
+                try new_v.copyFromDevice(&self.compute.ctx, layer.v, old_v_bytes);
             }
             layer.k.free(&self.compute.ctx);
             layer.v.free(&self.compute.ctx);
@@ -1201,6 +1323,10 @@ const CudaKvDeviceStorage = struct {
                 }
             }
         }
+        if (compressed_format != null) {
+            const logical_blocks = write.logical_blocks orelse return error.InvalidPagedKvState;
+            try self.ensureLayerBlockTable(layer, logical_blocks, write.total_token_count, write.page_size_tokens);
+        }
         return layer;
     }
 
@@ -1218,9 +1344,45 @@ const CudaKvDeviceStorage = struct {
         if (k_ref.byte_len < suffix_bytes or v_ref.byte_len < suffix_bytes) return error.InvalidKvShape;
         const layer = try self.ensureLayer(write);
         const token_start = write.total_token_count - write.suffix_token_count;
-        const dst_offset = try checkedMul(try checkedMul(token_start, row_width), @sizeOf(f32));
         const k_src = buffer_mod.DeviceBuffer{ .ptr = @as(@TypeOf(layer.k.ptr), @intCast(@intFromPtr(k_ref.handle) + k_ref.byte_offset)), .len = suffix_bytes };
         const v_src = buffer_mod.DeviceBuffer{ .ptr = @as(@TypeOf(layer.v.ptr), @intCast(@intFromPtr(v_ref.handle) + v_ref.byte_offset)), .len = suffix_bytes };
+        if (layer.compressed_format) |format| {
+            const decode_scalars = if (cudaDebugDecodeScalarsReady(self.compute))
+                self.compute.debug_cuda_decode_scalars
+            else
+                buffer_mod.DeviceBuffer{};
+            try self.compute.kernels.launchKvWriteSuffixTurboquantF32(
+                &self.compute.ctx,
+                layer.k,
+                layer.v,
+                layer.block_table,
+                k_src,
+                v_src,
+                decode_scalars,
+                write.suffix_token_count,
+                row_width,
+                @intCast(write.num_kv_heads),
+                @intCast(write.head_dim),
+                layer.key_row_bytes,
+                layer.base_key_row_bytes,
+                layer.value_row_bytes,
+                write.total_token_count,
+                layer.block_table_len,
+                write.page_size_tokens,
+                format,
+                layer.value_format,
+                layer.capacity_tokens,
+            );
+            layer.token_count = @max(layer.token_count, write.total_token_count);
+            layer.position_offset = write.position_offset;
+            self.compute.stats.device_kv_writes += 1;
+            if (layer.value_format == cuda_kv_value_format_int8_per_head) {
+                self.compute.stats.device_kv_compressed_v_writes += 1;
+                self.compute.stats.device_kv_compressed_v_bytes += try checkedMul(write.suffix_token_count, layer.value_row_bytes);
+            }
+            return;
+        }
+        const dst_offset = try checkedMul(token_start, layer.value_row_bytes);
         if (cudaDebugDecodeScalarsReady(self.compute) and write.suffix_token_count == 1) {
             try self.compute.kernels.launchKvWriteSuffixDecodeScalarsF32(
                 &self.compute.ctx,
@@ -1252,12 +1414,16 @@ const CudaKvDeviceStorage = struct {
         gather: kv_storage_runtime.DeviceKvLayerGather,
     ) anyerror!kv_storage_runtime.DeviceKvLayer {
         const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
-        const layer_key = try key(gather.sequence_id, gather.layer_index);
+        const layer_key = try self.layerKey(gather.sequence_id, gather.layer_index);
         const row_width = try checkedMul(@as(usize, gather.num_kv_heads), @as(usize, gather.head_dim));
         const layer = self.layers.getPtr(layer_key) orelse {
             traceCudaDeviceKvGatherFailure("missing_layer", gather, row_width, null);
             return error.DeviceReadFallback;
         };
+        if (layer.compressed_format != null) {
+            traceCudaDeviceKvGatherFailure("compressed_layer", gather, row_width, layer);
+            return error.DeviceReadFallback;
+        }
         if (layer.row_width != row_width or layer.token_count < gather.token_count) {
             traceCudaDeviceKvGatherFailure("shape_or_tokens", gather, row_width, layer);
             return error.DeviceReadFallback;
@@ -1272,6 +1438,40 @@ const CudaKvDeviceStorage = struct {
             .row_width = row_width,
             .position_offset = layer.position_offset,
             .value_element_bytes = @sizeOf(f32),
+        };
+    }
+
+    fn pagedLayerKvDevice(
+        ctx: *anyopaque,
+        gather: kv_storage_runtime.DeviceKvLayerGather,
+    ) anyerror!kv_storage_runtime.DevicePagedKvLayer {
+        const self: *CudaKvDeviceStorage = @ptrCast(@alignCast(ctx));
+        const layer_key = try self.layerKey(gather.sequence_id, gather.layer_index);
+        const row_width = try checkedMul(@as(usize, gather.num_kv_heads), @as(usize, gather.head_dim));
+        const layer = self.layers.getPtr(layer_key) orelse {
+            traceCudaDeviceKvGatherFailure("missing_paged_layer", gather, row_width, null);
+            return error.DeviceReadFallback;
+        };
+        const format = layer.compressed_format orelse {
+            traceCudaDeviceKvGatherFailure("not_compressed", gather, row_width, layer);
+            return error.DeviceReadFallback;
+        };
+        if (layer.row_width != row_width or layer.token_count < gather.token_count) {
+            traceCudaDeviceKvGatherFailure("paged_shape_or_tokens", gather, row_width, layer);
+            return error.DeviceReadFallback;
+        }
+        if (layer_key > std.math.maxInt(usize)) return error.InvalidPagedKvState;
+        self.compute.stats.device_kv_reads += 1;
+        return .{
+            .runtime = self,
+            .slot = @intCast(layer_key),
+            .format = format,
+            .token_count = gather.token_count,
+            .key_row_bytes = layer.key_row_bytes,
+            .base_key_row_bytes = layer.base_key_row_bytes,
+            .v_row_stride = layer.value_row_bytes,
+            .page_size_tokens = layer.page_size_tokens,
+            .position_offset = layer.position_offset,
         };
     }
 
@@ -1302,6 +1502,7 @@ const CudaKvDeviceStorage = struct {
     const hook_vtable = kv_storage_runtime.DeviceWriteHook.VTable{
         .writeLayerKvSuffix = writeLayerKvSuffix,
         .gatherLayerKvDevice = gatherLayerKvDevice,
+        .pagedLayerKvDevice = pagedLayerKvDevice,
         .releaseSequence = releaseSequence,
         .deinit = hookDeinit,
     };
@@ -1317,6 +1518,27 @@ fn cudaDequantizeQuantWeightsOnUpload() bool {
 
 fn cudaCublasLtEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_CUBLASLT", true);
+}
+
+const cuda_kv_format_polar4: u32 = 0;
+const cuda_kv_format_turbo3: u32 = 1;
+const cuda_kv_value_format_f32: u32 = 0;
+const cuda_kv_value_format_int8_per_head: u32 = 1;
+
+fn cudaTurboquantKvFormat(dtype: kv_pool_mod.KvDType) ?u32 {
+    return switch (dtype) {
+        .polar4 => cuda_kv_format_polar4,
+        .turbo3 => cuda_kv_format_turbo3,
+        else => null,
+    };
+}
+
+fn cudaTurboquantKvDisabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_TURBOQUANT_KV", false);
+}
+
+fn cudaTurboquantCompressedVDisabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_CUDA_DISABLE_TURBOQUANT_COMPRESSED_V", false);
 }
 
 fn cudaFfnStreamEnabled() bool {
@@ -1642,9 +1864,9 @@ fn provisionKvDeviceWriteHook(ctx: *anyopaque, storage: *kv_storage_runtime.KvSt
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (storage.device_write_hook != null) return;
     const config = storage.storage.config;
-    if (config.dtype != .f32) return;
+    if (config.dtype != .f32 and cudaTurboquantKvFormat(config.dtype) == null) return;
     if (config.num_kv_heads == 0 or config.head_dim == 0) return;
-    const device_storage = try CudaKvDeviceStorage.create(self.allocator, self);
+    const device_storage = try CudaKvDeviceStorage.create(self.allocator, self, storage.storage.config.dtype);
     errdefer {
         device_storage.deinit();
         self.allocator.destroy(device_storage);
@@ -7093,6 +7315,109 @@ fn gqaPagedAttentionWithHostKv(
     );
 }
 
+fn gqaPagedAttentionWithCompressedDeviceKv(
+    self: *CudaCompute,
+    q_ct: CT,
+    attn_bias_ct: ?CT,
+    attention: ops.AttentionContext,
+    paged: kv_storage_runtime.DevicePagedKvLayer,
+    batch: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) anyerror!CT {
+    const q_tensor = tensorFromCt(q_ct);
+    try ensureF32(q_tensor);
+    if (num_kv_heads == 0 or num_heads % num_kv_heads != 0) return error.InvalidShape;
+    const q_hidden = try checkedMul(num_heads, head_dim);
+    const h_kv = try checkedMul(num_kv_heads, head_dim);
+    const q_count = try checkedMul(try checkedMul(batch, attention.query_sequence_len), q_hidden);
+    const kv_count = try checkedMul(attention.kv_sequence_len, h_kv);
+    try ensureCount(q_tensor, q_count);
+    if (paged.token_count < attention.kv_sequence_len) return error.DeviceReadFallback;
+    if (paged.key_row_bytes == 0 or paged.base_key_row_bytes == 0 or paged.base_key_row_bytes > paged.key_row_bytes) return error.DeviceReadFallback;
+    if (paged.page_size_tokens == 0) return error.DeviceReadFallback;
+
+    const runtime = paged.runtime orelse return error.DeviceReadFallback;
+    const device_storage: *CudaKvDeviceStorage = @ptrCast(@alignCast(runtime));
+    const layer_key: u64 = @intCast(paged.slot);
+    const layer = device_storage.layers.getPtr(layer_key) orelse return error.DeviceReadFallback;
+    if (layer.compressed_format == null or layer.compressed_format.? != paged.format) return error.DeviceReadFallback;
+    if (layer.key_row_bytes != paged.key_row_bytes or layer.value_row_bytes != paged.v_row_stride) return error.DeviceReadFallback;
+    if (layer.value_format == cuda_kv_value_format_f32 and layer.value_row_bytes < h_kv * @sizeOf(f32)) return error.DeviceReadFallback;
+    if (layer.value_format == cuda_kv_value_format_int8_per_head and layer.value_row_bytes != kv_pool_mod.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim))) return error.DeviceReadFallback;
+    const logical_blocks = if (attention.kv_cache) |kv| blk: {
+        if (kv.logical_blocks) |blocks| break :blk blocks;
+        const storage = attention.kv_storage orelse return error.DeviceReadFallback;
+        const table = storage.blockTable(kv.sequence_id) orelse return error.DeviceReadFallback;
+        break :blk table.blocks.items;
+    } else return error.DeviceReadFallback;
+    try device_storage.ensureLayerBlockTable(layer, logical_blocks, attention.kv_sequence_len, paged.page_size_tokens);
+
+    const bias_tensor: ?*CudaTensor = if (attn_bias_ct) |bct| tensorFromCt(bct) else null;
+    const bias_mode = try biasModeFor(bias_tensor, batch, num_heads, attention.query_sequence_len, attention.kv_sequence_len);
+    const bias_buffer = if (bias_tensor) |bt| bt.buffer else buffer_mod.DeviceBuffer{};
+    const mask_device = if (attention.attn_or_mask) |mask| try uploadTempU8(self, mask) else buffer_mod.DeviceBuffer{};
+    const mask_len = if (attention.attn_or_mask) |mask| mask.len else 0;
+    const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
+    const query_end = try checkedAdd(query_position_offset, attention.query_sequence_len);
+    const kv_end = try checkedAdd(attention.kv_position_offset, attention.kv_sequence_len);
+    const mask_sequence_len = @max(query_end, kv_end);
+
+    const shape = try dupeShape(self.allocator, q_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+
+    const launch_kind = try self.kernels.launchGqaAttentionDecodeTurboquantF32(
+        &self.ctx,
+        device,
+        q_tensor.buffer,
+        layer.k,
+        layer.v,
+        layer.block_table,
+        mask_device,
+        bias_buffer,
+        batch,
+        attention.query_sequence_len,
+        attention.kv_sequence_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        query_position_offset,
+        attention.kv_position_offset,
+        attention.sliding_window,
+        mask_sequence_len,
+        mask_len,
+        bias_mode,
+        paged.key_row_bytes,
+        paged.base_key_row_bytes,
+        paged.v_row_stride,
+        layer.block_table_len,
+        paged.page_size_tokens,
+        paged.format,
+        layer.value_format,
+        layer.capacity_tokens,
+    );
+    switch (launch_kind) {
+        .decode => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_decode += 1;
+        },
+        .scalar => {
+            self.stats.launch_attention += 1;
+            self.stats.launch_attention_gqa_scalar += 1;
+        },
+        .none => {},
+    }
+    if (layer.value_format == cuda_kv_value_format_int8_per_head) {
+        self.stats.device_kv_compressed_v_reads += 1;
+        self.stats.device_kv_compressed_v_bytes += try checkedMul(attention.kv_sequence_len, layer.value_row_bytes);
+    }
+    _ = kv_count;
+    return createTensor(self, device, shape, q_count);
+}
+
 fn gqaPagedAttentionWithDeviceKv(
     self: *CudaCompute,
     q_ct: CT,
@@ -7131,6 +7456,11 @@ fn gqaPagedAttentionWithDeviceKv(
         return error.InvalidShape;
     }
     const h_kv = try checkedMul(num_kv_heads, head_dim);
+    const compressed_format = cudaTurboquantKvFormat(storage.storage.config.dtype);
+    if (compressed_format != null and cudaTurboquantKvDisabled()) {
+        self.stats.device_kv_fail_read += 1;
+        return error.CudaPagedKvUnsupported;
+    }
 
     if (!attention.skip_kv_write) {
         const k_tensor = tensorFromCt(k_ct);
@@ -7157,6 +7487,45 @@ fn gqaPagedAttentionWithDeviceKv(
             self.stats.device_kv_fail_write += 1;
             return err;
         };
+    }
+
+    if (compressed_format) |expected_format| {
+        const paged = hook.pagedLayerKvDevice(.{
+            .sequence_id = kv.sequence_id,
+            .layer_index = attention.layer_index,
+            .token_count = attention.kv_sequence_len,
+            .num_kv_heads = @intCast(num_kv_heads),
+            .head_dim = @intCast(head_dim),
+        }) catch |err| {
+            self.stats.device_kv_fail_read += 1;
+            return err;
+        };
+        if (paged.format != expected_format) {
+            self.stats.device_kv_fail_shape += 1;
+            return error.DeviceReadFallback;
+        }
+        const result = gqaPagedAttentionWithCompressedDeviceKv(
+            self,
+            q_ct,
+            attn_bias_ct,
+            attention,
+            paged,
+            batch,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable,
+            error.DeviceReadFallback,
+            error.DeviceWriteFormatUnsupported,
+            => {
+                self.stats.device_kv_fail_read += 1;
+                return error.DeviceReadFallback;
+            },
+            else => return err,
+        };
+        self.stats.device_kv_successes += 1;
+        return result;
     }
 
     const gathered = hook.gatherLayerKvDevice(.{

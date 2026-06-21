@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-pub const supported_head_dims = [_]u32{ 64, 80, 128, 256 };
+pub const supported_head_dims = [_]u32{ 64, 80, 128, 256, 512 };
 pub const turbo3_residual_bits_per_head: u32 = 32;
 pub const turbo3_residual_default_scale: f32 = 0.125;
 const dot_lanes = 8;
@@ -155,6 +155,7 @@ pub fn dotPolar4KeyFast(query: []const f32, encoded_key: []const u8, num_kv_head
         80 => dotPolar4Key(query, encoded_key, num_kv_heads, head_dim, kv_head),
         128 => dotPolar4KeyPackedVector(query, encoded_key, kv_head, 128),
         256 => dotPolar4Key(query, encoded_key, num_kv_heads, head_dim, kv_head),
+        512 => dotPolar4KeyPackedVector(query, encoded_key, kv_head, 512),
         else => unreachable,
     };
 }
@@ -313,10 +314,12 @@ fn randomSign(head: usize, projection: usize, dim: usize) f32 {
     return if ((x & 1) == 0) 1.0 else -1.0;
 }
 
-test "polar4 supports current metal head dimensions" {
+test "polar4 supports staged direct-attention head dimensions" {
     try std.testing.expect(isSupportedHeadDim(64));
     try std.testing.expect(isSupportedHeadDim(80));
     try std.testing.expect(isSupportedHeadDim(128));
+    try std.testing.expect(isSupportedHeadDim(256));
+    try std.testing.expect(isSupportedHeadDim(512));
     try std.testing.expect(!isSupportedHeadDim(96));
 }
 
@@ -325,6 +328,7 @@ test "polar4 key bytes packs two values per byte" {
     try std.testing.expectEqual(@as(usize, 320), polar4KeyBytes(8, 80));
     try std.testing.expectEqual(@as(usize, 512), polar4KeyBytes(8, 128));
     try std.testing.expectEqual(@as(usize, 1024), polar4KeyBytes(8, 256));
+    try std.testing.expectEqual(@as(usize, 2048), polar4KeyBytes(8, 512));
     try std.testing.expectEqual(@as(usize, 0), polar4KeyBytes(8, 96));
 }
 
@@ -333,6 +337,7 @@ test "turbo3 key bytes packs three bits per value" {
     try std.testing.expectEqual(@as(usize, 240), turbo3KeyBytes(8, 80));
     try std.testing.expectEqual(@as(usize, 384), turbo3KeyBytes(8, 128));
     try std.testing.expectEqual(@as(usize, 768), turbo3KeyBytes(8, 256));
+    try std.testing.expectEqual(@as(usize, 1536), turbo3KeyBytes(8, 512));
     try std.testing.expectEqual(@as(usize, 0), turbo3KeyBytes(8, 96));
 }
 
@@ -341,6 +346,7 @@ test "turbo3 residual bytes stores fixed one-bit sketch per head" {
     try std.testing.expectEqual(@as(usize, 32), turbo3ResidualBytes(8, 80));
     try std.testing.expectEqual(@as(usize, 32), turbo3ResidualBytes(8, 128));
     try std.testing.expectEqual(@as(usize, 32), turbo3ResidualBytes(8, 256));
+    try std.testing.expectEqual(@as(usize, 32), turbo3ResidualBytes(8, 512));
     try std.testing.expectEqual(@as(usize, 0), turbo3ResidualBytes(8, 96));
 }
 

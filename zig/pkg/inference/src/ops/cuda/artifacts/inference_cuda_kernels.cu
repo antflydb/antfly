@@ -2187,6 +2187,409 @@ extern "C" __global__ void termite_kv_write_suffix_decode_scalars_f32(
     v_dst[dst_idx] = v_src[idx];
 }
 
+__device__ __forceinline__ unsigned char termite_tq_encode_polar4_scalar(float value) {
+    float clipped = fminf(fmaxf(value, -1.0f), 1.0f);
+    float scaled = roundf((clipped + 1.0f) * 7.5f);
+    return (unsigned char)fminf(fmaxf(scaled, 0.0f), 15.0f);
+}
+
+__device__ __forceinline__ float termite_tq_decode_polar4_scalar(unsigned char code) {
+    return ((float)(code & 0x0fu) / 7.5f) - 1.0f;
+}
+
+__device__ __forceinline__ float termite_tq_decode_polar4_at(const unsigned char* encoded, unsigned int value_index) {
+    unsigned char packed = encoded[value_index >> 1];
+    unsigned char code = (value_index & 1u) == 0u ? (packed & 0x0fu) : ((packed >> 4) & 0x0fu);
+    return termite_tq_decode_polar4_scalar(code);
+}
+
+__device__ __forceinline__ unsigned char termite_tq_encode_turbo3_scalar(float value) {
+    float clipped = fminf(fmaxf(value, -1.0f), 1.0f);
+    float scaled = roundf((clipped + 1.0f) * 3.5f);
+    return (unsigned char)fminf(fmaxf(scaled, 0.0f), 7.0f);
+}
+
+__device__ __forceinline__ float termite_tq_decode_turbo3_scalar(unsigned char code) {
+    return ((float)(code & 0x07u) / 3.5f) - 1.0f;
+}
+
+__device__ __forceinline__ unsigned char termite_tq_get_packed3(const unsigned char* encoded, unsigned int value_index) {
+    unsigned int bit_offset = value_index * 3u;
+    unsigned int byte_index = bit_offset >> 3;
+    unsigned int shift = bit_offset & 7u;
+    unsigned int bits = ((unsigned int)encoded[byte_index]) >> shift;
+    if (shift > 5u) bits |= ((unsigned int)encoded[byte_index + 1u]) << (8u - shift);
+    return (unsigned char)(bits & 0x07u);
+}
+
+__device__ __forceinline__ float termite_tq_decode_turbo3_at(const unsigned char* encoded, unsigned int value_index) {
+    return termite_tq_decode_turbo3_scalar(termite_tq_get_packed3(encoded, value_index));
+}
+
+__device__ __forceinline__ unsigned char termite_tq_packed3_byte(const float* src, unsigned int value_count, unsigned int byte_index) {
+    unsigned char out = 0u;
+    unsigned int first_bit = byte_index * 8u;
+    for (unsigned int bit = 0u; bit < 8u; ++bit) {
+        unsigned int global_bit = first_bit + bit;
+        unsigned int value_index = global_bit / 3u;
+        if (value_index >= value_count) continue;
+        unsigned char code = termite_tq_encode_turbo3_scalar(src[value_index]);
+        unsigned int code_bit = global_bit - value_index * 3u;
+        if (((code >> code_bit) & 1u) != 0u) out |= (unsigned char)(1u << bit);
+    }
+    return out;
+}
+
+__device__ __forceinline__ float termite_tq_random_sign(unsigned int head, unsigned int projection, unsigned int dim) {
+    unsigned long long x = ((unsigned long long)(head + 1u)) * 0x9e3779b97f4a7c15ull;
+    x ^= ((unsigned long long)(projection + 1u)) * 0xbf58476d1ce4e5b9ull;
+    x ^= ((unsigned long long)(dim + 1u)) * 0x94d049bb133111ebull;
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return (x & 1ull) == 0ull ? 1.0f : -1.0f;
+}
+
+__device__ unsigned char termite_tq_turbo3_residual_byte(
+    const float* src,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int byte_index
+) {
+    unsigned char out = 0u;
+    unsigned int first_bit = byte_index * 8u;
+    unsigned int total_bits = num_kv_heads * 32u;
+    for (unsigned int bit = 0u; bit < 8u; ++bit) {
+        unsigned int bit_index = first_bit + bit;
+        if (bit_index >= total_bits) continue;
+        unsigned int kv_head = bit_index / 32u;
+        unsigned int projection = bit_index - kv_head * 32u;
+        unsigned int value_start = kv_head * head_dim;
+        float projected_residual = 0.0f;
+        for (unsigned int d = 0u; d < head_dim; ++d) {
+            float decoded = termite_tq_decode_turbo3_scalar(termite_tq_encode_turbo3_scalar(src[value_start + d]));
+            float residual = src[value_start + d] - decoded;
+            projected_residual += termite_tq_random_sign(kv_head, projection, d) * residual;
+        }
+        if (projected_residual >= 0.0f) out |= (unsigned char)(1u << bit);
+    }
+    return out;
+}
+
+__device__ float termite_tq_turbo3_projected_residual_score(
+    const float* projected_query,
+    const unsigned char* residual_sketch,
+    unsigned int kv_head
+) {
+    float acc = 0.0f;
+    for (unsigned int projection = 0u; projection < 32u; ++projection) {
+        unsigned int bit_index = kv_head * 32u + projection;
+        unsigned char packed = residual_sketch[bit_index >> 3];
+        float residual_sign = ((packed >> (bit_index & 7u)) & 1u) != 0u ? 1.0f : -1.0f;
+        acc += residual_sign * projected_query[projection];
+    }
+    return acc / 32.0f;
+}
+
+__device__ __forceinline__ unsigned int termite_tq_physical_token(
+    unsigned int logical_token,
+    const unsigned int* block_table,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int physical_token_capacity
+) {
+    unsigned int physical = logical_token;
+    if (block_table != 0 && block_count != 0u && page_size_tokens != 0u) {
+        unsigned int block_index = logical_token / page_size_tokens;
+        if (block_index >= block_count) return 0xffffffffu;
+        unsigned int token_offset = logical_token - block_index * page_size_tokens;
+        physical = block_table[block_index] * page_size_tokens + token_offset;
+    }
+    return physical < physical_token_capacity ? physical : 0xffffffffu;
+}
+
+__device__ __forceinline__ void termite_tq_store_f32_byte(unsigned char* dst, float value, unsigned int byte) {
+    const unsigned char* src = reinterpret_cast<const unsigned char*>(&value);
+    dst[byte] = src[byte];
+}
+
+__device__ __forceinline__ float termite_tq_load_f32_bytes(const unsigned char* src) {
+    unsigned int bits =
+        ((unsigned int)src[0]) |
+        ((unsigned int)src[1] << 8) |
+        ((unsigned int)src[2] << 16) |
+        ((unsigned int)src[3] << 24);
+    return __uint_as_float(bits);
+}
+
+__device__ float termite_tq_int8_head_scale(const float* src_head, unsigned int head_dim) {
+    float max_abs = 0.0f;
+    for (unsigned int d = 0u; d < head_dim; ++d) {
+        max_abs = fmaxf(max_abs, fabsf(src_head[d]));
+    }
+    return max_abs == 0.0f ? 1.0f : max_abs / 127.0f;
+}
+
+__device__ __forceinline__ float termite_tq_value_int8_per_head(
+    const unsigned char* row,
+    unsigned int kv_head,
+    unsigned int lane,
+    unsigned int head_dim
+) {
+    unsigned int head_stride = head_dim + 4u;
+    const unsigned char* head = row + kv_head * head_stride;
+    float scale = termite_tq_load_f32_bytes(head);
+    signed char q = (signed char)head[4u + lane];
+    return (float)q * scale;
+}
+
+extern "C" __global__ void termite_kv_write_suffix_turboquant_f32(
+    unsigned char* k_dst,
+    unsigned char* v_dst,
+    const unsigned int* block_table,
+    const float* k_src,
+    const float* v_src,
+    const unsigned int* decode_scalars,
+    unsigned int suffix_token_count,
+    unsigned int row_width,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int key_row_bytes,
+    unsigned int base_key_row_bytes,
+    unsigned int value_row_bytes,
+    unsigned int fallback_total_token_count,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int format,
+    unsigned int value_format,
+    unsigned int physical_token_capacity
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (suffix_token_count == 0u || row_width == 0u || key_row_bytes == 0u || base_key_row_bytes == 0u || value_row_bytes == 0u) return;
+    unsigned int total_token_count = fallback_total_token_count;
+    if (decode_scalars != 0) total_token_count = decode_scalars[2];
+    if (total_token_count < suffix_token_count) return;
+    unsigned int token_start = total_token_count - suffix_token_count;
+
+    unsigned int key_total = suffix_token_count * key_row_bytes;
+    if (idx < key_total) {
+        unsigned int token = idx / key_row_bytes;
+        unsigned int byte = idx - token * key_row_bytes;
+        const float* src_row = k_src + token * row_width;
+        unsigned int physical_token = termite_tq_physical_token(token_start + token, block_table, block_count, page_size_tokens, physical_token_capacity);
+        if (physical_token == 0xffffffffu) return;
+        unsigned char* dst_row = k_dst + physical_token * key_row_bytes;
+        if (format == 0u) {
+            unsigned int value_index = byte * 2u;
+            unsigned char lo = value_index < row_width ? termite_tq_encode_polar4_scalar(src_row[value_index]) : 0u;
+            unsigned char hi = (value_index + 1u) < row_width ? termite_tq_encode_polar4_scalar(src_row[value_index + 1u]) : 0u;
+            dst_row[byte] = lo | (unsigned char)(hi << 4);
+        } else if (format == 1u) {
+            if (byte < base_key_row_bytes) {
+                dst_row[byte] = termite_tq_packed3_byte(src_row, row_width, byte);
+            } else {
+                dst_row[byte] = termite_tq_turbo3_residual_byte(src_row, num_kv_heads, head_dim, byte - base_key_row_bytes);
+            }
+        }
+    }
+
+    unsigned int value_total = suffix_token_count * (value_format == 0u ? row_width : value_row_bytes);
+    if (idx < value_total) {
+        unsigned int token;
+        unsigned int lane_or_byte;
+        if (value_format == 0u) {
+            token = idx / row_width;
+            lane_or_byte = idx - token * row_width;
+        } else {
+            token = idx / value_row_bytes;
+            lane_or_byte = idx - token * value_row_bytes;
+        }
+        unsigned int physical_token = termite_tq_physical_token(token_start + token, block_table, block_count, page_size_tokens, physical_token_capacity);
+        if (physical_token == 0xffffffffu) return;
+        const float* src_row = v_src + token * row_width;
+        unsigned char* dst_row = v_dst + physical_token * value_row_bytes;
+        if (value_format == 0u) {
+            reinterpret_cast<float*>(dst_row)[lane_or_byte] = src_row[lane_or_byte];
+        } else if (value_format == 1u) {
+            unsigned int head_stride = head_dim + 4u;
+            unsigned int kv_head = lane_or_byte / head_stride;
+            unsigned int head_byte = lane_or_byte - kv_head * head_stride;
+            if (kv_head >= num_kv_heads) return;
+            const float* src_head = src_row + kv_head * head_dim;
+            float scale = termite_tq_int8_head_scale(src_head, head_dim);
+            if (head_byte < 4u) {
+                termite_tq_store_f32_byte(dst_row + kv_head * head_stride, scale, head_byte);
+            } else {
+                unsigned int lane = head_byte - 4u;
+                if (lane >= head_dim) return;
+                float scaled = roundf(src_head[lane] / scale);
+                scaled = fminf(fmaxf(scaled, -127.0f), 127.0f);
+                signed char q = (signed char)scaled;
+                dst_row[kv_head * head_stride + 4u + lane] = (unsigned char)q;
+            }
+        }
+    }
+}
+
+extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(
+    float* dst,
+    const float* q,
+    const unsigned char* k,
+    const unsigned char* v,
+    const unsigned int* block_table,
+    const unsigned char* attn_or_mask,
+    const float* bias,
+    unsigned int batch,
+    unsigned int q_seq_len,
+    unsigned int kv_seq_len,
+    unsigned int num_heads,
+    unsigned int num_kv_heads,
+    unsigned int head_dim,
+    unsigned int query_position_offset,
+    unsigned int kv_position_offset,
+    unsigned int sliding_window,
+    unsigned int total_sequence_len,
+    unsigned int mask_len,
+    unsigned int bias_mode,
+    unsigned int key_row_bytes,
+    unsigned int base_key_row_bytes,
+    unsigned int value_row_bytes,
+    unsigned int block_count,
+    unsigned int page_size_tokens,
+    unsigned int format,
+    unsigned int value_format,
+    unsigned int physical_token_capacity
+) {
+    __shared__ float reduce[512];
+    __shared__ float shared_max_score;
+    __shared__ float shared_denom;
+    __shared__ float shared_score;
+    __shared__ float shared_turbo3_projected_query[32];
+    unsigned int lane = threadIdx.x;
+    unsigned int block = blockIdx.x;
+    unsigned int total_blocks = batch * q_seq_len * num_heads;
+    if (block >= total_blocks || batch != 1u || head_dim > 512u || blockDim.x < head_dim || num_kv_heads == 0u || (num_heads % num_kv_heads) != 0u) return;
+    if (key_row_bytes == 0u || base_key_row_bytes == 0u || value_row_bytes == 0u || base_key_row_bytes > key_row_bytes) return;
+
+    unsigned int head = block % num_heads;
+    unsigned int tmp = block / num_heads;
+    unsigned int qi = tmp % q_seq_len;
+    unsigned int b = tmp / q_seq_len;
+    unsigned int heads_per_group = num_heads / num_kv_heads;
+    unsigned int kv_head = head / heads_per_group;
+    unsigned int q_hidden = num_heads * head_dim;
+    unsigned int query_pos = query_position_offset + qi;
+    unsigned int q_base = (b * q_seq_len + qi) * q_hidden + head * head_dim;
+    float scale = rsqrtf((float)head_dim);
+    if (format == 1u && lane < 32u) {
+        float projected_query = 0.0f;
+        for (unsigned int d = 0u; d < head_dim; ++d) {
+            projected_query += termite_tq_random_sign(kv_head, lane, d) * q[q_base + d];
+        }
+        shared_turbo3_projected_query[lane] = projected_query;
+    }
+    if (lane == 0u) shared_max_score = -3.402823466e+38f;
+    __syncthreads();
+
+    for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
+        unsigned int key_pos = kv_position_offset + ki;
+        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        bool future_blocked = key_pos > query_pos && !future_allowed;
+        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        bool valid = !(future_blocked || past_blocked);
+        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        if (physical_token == 0xffffffffu) valid = false;
+        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
+        float partial = 0.0f;
+        if (valid && lane < head_dim) {
+            unsigned int value_index = kv_head * head_dim + lane;
+            float key_value = format == 0u
+                ? termite_tq_decode_polar4_at(k_row, value_index)
+                : termite_tq_decode_turbo3_at(k_row, value_index);
+            partial = q[q_base + lane] * key_value;
+        }
+        reduce[lane] = partial;
+        __syncthreads();
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) reduce[lane] += reduce[lane + stride];
+            __syncthreads();
+        }
+        if (lane == 0u && valid) {
+            float score = reduce[0];
+            if (format == 1u) {
+                score += 0.125f * termite_tq_turbo3_projected_residual_score(shared_turbo3_projected_query, k_row + base_key_row_bytes, kv_head);
+            }
+            score *= scale;
+            if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
+            if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
+            shared_max_score = fmaxf(shared_max_score, score);
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0u) shared_denom = 0.0f;
+    __syncthreads();
+    float acc = 0.0f;
+    for (unsigned int ki = 0u; ki < kv_seq_len; ++ki) {
+        unsigned int key_pos = kv_position_offset + ki;
+        unsigned int mask_idx = query_pos * total_sequence_len + key_pos;
+        bool future_allowed = attn_or_mask != 0 && mask_idx < mask_len && attn_or_mask[mask_idx] != 0u;
+        bool future_blocked = key_pos > query_pos && !future_allowed;
+        bool past_blocked = key_pos > query_pos || (sliding_window != 0u && (query_pos - key_pos) >= sliding_window);
+        bool valid = !(future_blocked || past_blocked);
+        unsigned int physical_token = termite_tq_physical_token(ki, block_table, block_count, page_size_tokens, physical_token_capacity);
+        if (physical_token == 0xffffffffu) valid = false;
+        const unsigned char* k_row = valid ? k + physical_token * key_row_bytes : k;
+        float partial = 0.0f;
+        if (valid && lane < head_dim) {
+            unsigned int value_index = kv_head * head_dim + lane;
+            float key_value = format == 0u
+                ? termite_tq_decode_polar4_at(k_row, value_index)
+                : termite_tq_decode_turbo3_at(k_row, value_index);
+            partial = q[q_base + lane] * key_value;
+        }
+        reduce[lane] = partial;
+        __syncthreads();
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+            if (lane < stride) reduce[lane] += reduce[lane + stride];
+            __syncthreads();
+        }
+        if (lane == 0u) {
+            if (valid) {
+                float score = reduce[0];
+                if (format == 1u) {
+                    score += 0.125f * termite_tq_turbo3_projected_residual_score(shared_turbo3_projected_query, k_row + base_key_row_bytes, kv_head);
+                }
+                score *= scale;
+                if (bias_mode == 1u) score += bias[(head * q_seq_len + qi) * kv_seq_len + ki];
+                if (bias_mode == 2u) score += bias[((b * num_heads + head) * q_seq_len + qi) * kv_seq_len + ki];
+                shared_score = score;
+            } else {
+                shared_score = -3.402823466e+38f;
+            }
+        }
+        __syncthreads();
+        float e = valid ? expf(shared_score - shared_max_score) : 0.0f;
+        if (lane == 0u) shared_denom += e;
+        if (valid && lane < head_dim) {
+            const unsigned char* v_row = v + physical_token * value_row_bytes;
+            float value = value_format == 0u
+                ? reinterpret_cast<const float*>(v_row)[kv_head * head_dim + lane]
+                : termite_tq_value_int8_per_head(v_row, kv_head, lane, head_dim);
+            acc += e * value;
+        }
+        __syncthreads();
+    }
+
+    if (lane < head_dim) {
+        unsigned int out_idx = (b * q_seq_len + qi) * q_hidden + head * head_dim + lane;
+        dst[out_idx] = shared_denom > 0.0f ? acc / shared_denom : 0.0f;
+    }
+}
+
 __device__ __forceinline__ float termite_half_to_float(unsigned short h) {
     return __half2float(__ushort_as_half(h));
 }

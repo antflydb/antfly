@@ -65,11 +65,14 @@ if [ -z "$nvcc" ]; then
 fi
 
 version="$("$nvcc" --version)"
-if ! printf '%s\n' "$version" | grep -q 'release 13\.2'; then
-  printf 'error: expected CUDA toolkit 13.2 for artifact regeneration.\n' >&2
-  printf '%s\n' "$version" >&2
-  exit 1
-fi
+case "$version" in
+  *"release 13.2"*) ;;
+  *)
+    printf 'error: expected CUDA toolkit 13.2 for artifact regeneration.\n' >&2
+    printf '%s\n' "$version" >&2
+    exit 1
+    ;;
+esac
 
 cuobjdump=""
 if [ -n "${CUOBJDUMP:-}" ]; then
@@ -100,6 +103,8 @@ required_symbols=(
   termite_rms_norm_heads_rope_decode_scalars_f32
   termite_gqa_attention_decode_scalars_f32
   termite_kv_write_suffix_decode_scalars_f32
+  termite_gqa_attention_decode_turboquant_f32
+  termite_kv_write_suffix_turboquant_f32
   termite_gemma4_mtp_masked_argmax_f32
   termite_gemma4_mtp_verify_commit_u32
   termite_linear_q8_0_argmax_rows_stage1_tile4

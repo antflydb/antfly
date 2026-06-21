@@ -18,6 +18,8 @@ const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
 const cuda_artifact = @import("artifact.zig");
 const platform = @import("antfly_platform");
+const turboquant = @import("../../runtime/kv/turboquant.zig");
+const kv_pool_mod = @import("../../runtime/kv/pool.zig");
 
 fn captureParamTraceIndex(ctx: *context_mod.CudaContext) ?usize {
     if (!ctx.debug_graph_capture_active) return null;
@@ -105,6 +107,8 @@ pub const KernelModule = struct {
     gqa_attention_decode_f32: driver_mod.CUfunction = null,
     gqa_attention_decode_scalars_f32: driver_mod.CUfunction = null,
     kv_write_suffix_decode_scalars_f32: driver_mod.CUfunction = null,
+    gqa_attention_decode_turboquant_f32: driver_mod.CUfunction = null,
+    kv_write_suffix_turboquant_f32: driver_mod.CUfunction = null,
     deberta_attention_f32: driver_mod.CUfunction = null,
     split_last_dim3_f32: driver_mod.CUfunction = null,
     linear_q8_0_f32: driver_mod.CUfunction = null,
@@ -282,6 +286,8 @@ pub const KernelModule = struct {
         const gqa_attention_decode_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_f32");
         const gqa_attention_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_scalars_f32");
         const kv_write_suffix_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_decode_scalars_f32");
+        const gqa_attention_decode_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_gqa_attention_decode_turboquant_f32");
+        const kv_write_suffix_turboquant_f32 = loadOptionalFunction(ctx, module, "termite_kv_write_suffix_turboquant_f32");
         var deberta_attention_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&deberta_attention_f32, module, "termite_deberta_attention_f32"));
         var split_last_dim3_f32: driver_mod.CUfunction = null;
@@ -458,6 +464,8 @@ pub const KernelModule = struct {
             .gqa_attention_decode_f32 = gqa_attention_decode_f32,
             .gqa_attention_decode_scalars_f32 = gqa_attention_decode_scalars_f32,
             .kv_write_suffix_decode_scalars_f32 = kv_write_suffix_decode_scalars_f32,
+            .gqa_attention_decode_turboquant_f32 = gqa_attention_decode_turboquant_f32,
+            .kv_write_suffix_turboquant_f32 = kv_write_suffix_turboquant_f32,
             .deberta_attention_f32 = deberta_attention_f32,
             .split_last_dim3_f32 = split_last_dim3_f32,
             .linear_q8_0_f32 = linear_q8_0_f32,
@@ -599,6 +607,8 @@ pub const KernelModule = struct {
             self.gqa_attention_decode_f32 = null;
             self.gqa_attention_decode_scalars_f32 = null;
             self.kv_write_suffix_decode_scalars_f32 = null;
+            self.gqa_attention_decode_turboquant_f32 = null;
+            self.kv_write_suffix_turboquant_f32 = null;
             self.deberta_attention_f32 = null;
             self.split_last_dim3_f32 = null;
             self.linear_q8_0_f32 = null;
@@ -3408,6 +3418,252 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, total, &params);
     }
 
+    pub fn launchKvWriteSuffixTurboquantF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        k_dst: buffer_mod.DeviceBuffer,
+        v_dst: buffer_mod.DeviceBuffer,
+        block_table: buffer_mod.DeviceBuffer,
+        k_src: buffer_mod.DeviceBuffer,
+        v_src: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        suffix_token_count: usize,
+        row_width: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        key_row_bytes: usize,
+        base_key_row_bytes: usize,
+        value_row_bytes: usize,
+        fallback_total_token_count: usize,
+        block_count: usize,
+        page_size_tokens: usize,
+        format: u32,
+        value_format: u32,
+        physical_token_capacity: usize,
+    ) driver_mod.Error!void {
+        const function = self.kv_write_suffix_turboquant_f32 orelse return error.CudaKernelUnavailable;
+        if (suffix_token_count == 0 or row_width == 0 or key_row_bytes == 0 or base_key_row_bytes == 0 or value_row_bytes == 0) return error.InvalidCudaState;
+        if (base_key_row_bytes > key_row_bytes) return error.InvalidCudaState;
+        const suffix_values = try checkedTensorElements(suffix_token_count, row_width);
+        try checkBytes(k_src, suffix_values);
+        try checkBytes(v_src, suffix_values);
+        try checkRawBytes(k_dst, try checkedTensorElements(physical_token_capacity, key_row_bytes));
+        try checkRawBytes(v_dst, try checkedTensorElements(physical_token_capacity, value_row_bytes));
+        if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
+        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+
+        var k_dst_ptr = k_dst.ptr;
+        var v_dst_ptr = v_dst.ptr;
+        var block_table_ptr = block_table.ptr;
+        var k_src_ptr = k_src.ptr;
+        var v_src_ptr = v_src.ptr;
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var suffix_token_count_u32 = try toU32(suffix_token_count);
+        var row_width_u32 = try toU32(row_width);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var key_row_bytes_u32 = try toU32(key_row_bytes);
+        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
+        var value_row_bytes_u32 = try toU32(value_row_bytes);
+        var fallback_total_token_count_u32 = try toU32(fallback_total_token_count);
+        var block_count_u32 = try toU32(block_count);
+        var page_size_tokens_u32 = try toU32(page_size_tokens);
+        var format_u32 = format;
+        var value_format_u32 = value_format;
+        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var params = [_]?*anyopaque{
+            @ptrCast(&k_dst_ptr),
+            @ptrCast(&v_dst_ptr),
+            @ptrCast(&block_table_ptr),
+            @ptrCast(&k_src_ptr),
+            @ptrCast(&v_src_ptr),
+            @ptrCast(&decode_scalars_ptr),
+            @ptrCast(&suffix_token_count_u32),
+            @ptrCast(&row_width_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&key_row_bytes_u32),
+            @ptrCast(&base_key_row_bytes_u32),
+            @ptrCast(&value_row_bytes_u32),
+            @ptrCast(&fallback_total_token_count_u32),
+            @ptrCast(&block_count_u32),
+            @ptrCast(&page_size_tokens_u32),
+            @ptrCast(&format_u32),
+            @ptrCast(&value_format_u32),
+            @ptrCast(&physical_token_capacity_u32),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=kv_write_suffix_turboquant k_dst=0x{x} v_dst=0x{x} block_table=0x{x} k_src=0x{x} v_src=0x{x} scalars=0x{x} suffix={d} row_width={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} fallback_total_token_count={d} block_count={d} page_size={d} format={d} value_format={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                k_dst_ptr,
+                v_dst_ptr,
+                block_table_ptr,
+                k_src_ptr,
+                v_src_ptr,
+                decode_scalars_ptr,
+                suffix_token_count_u32,
+                row_width_u32,
+                key_row_bytes_u32,
+                base_key_row_bytes_u32,
+                value_row_bytes_u32,
+                fallback_total_token_count_u32,
+                block_count_u32,
+                page_size_tokens_u32,
+                format_u32,
+                value_format_u32,
+            });
+        }
+        const work_items = @max(try checkedTensorElements(suffix_token_count, key_row_bytes), try checkedTensorElements(suffix_token_count, value_row_bytes));
+        try launch1d(function, ctx, work_items, &params);
+    }
+
+    pub fn launchGqaAttentionDecodeTurboquantF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        block_table: buffer_mod.DeviceBuffer,
+        attn_or_mask: buffer_mod.DeviceBuffer,
+        bias: buffer_mod.DeviceBuffer,
+        batch: usize,
+        q_seq_len: usize,
+        kv_seq_len: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        query_position_offset: usize,
+        kv_position_offset: usize,
+        sliding_window: usize,
+        total_sequence_len: usize,
+        mask_len: usize,
+        bias_mode: u32,
+        key_row_bytes: usize,
+        base_key_row_bytes: usize,
+        value_row_bytes: usize,
+        block_count: usize,
+        page_size_tokens: usize,
+        format: u32,
+        value_format: u32,
+        physical_token_capacity: usize,
+    ) driver_mod.Error!GqaAttentionLaunchKind {
+        const function = self.gqa_attention_decode_turboquant_f32 orelse return error.CudaKernelUnavailable;
+        if (head_dim > 512 or key_row_bytes == 0 or base_key_row_bytes == 0 or value_row_bytes == 0 or base_key_row_bytes > key_row_bytes) return error.CudaKernelUnavailable;
+        const q_hidden = try checkedTensorElements(num_heads, head_dim);
+        const q_count = try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), q_hidden);
+        try checkBytes(dst, q_count);
+        try checkBytes(q, q_count);
+        try checkRawBytes(k, try checkedTensorElements(physical_token_capacity, key_row_bytes));
+        try checkRawBytes(v, try checkedTensorElements(physical_token_capacity, value_row_bytes));
+        if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
+        if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
+        if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
+        if (q_count == 0) return .none;
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var block_table_ptr = block_table.ptr;
+        var mask_ptr = attn_or_mask.ptr;
+        var bias_ptr = bias.ptr;
+        var batch_u32 = try toU32(batch);
+        var q_seq_len_u32 = try toU32(q_seq_len);
+        var kv_seq_len_u32 = try toU32(kv_seq_len);
+        var num_heads_u32 = try toU32(num_heads);
+        var num_kv_heads_u32 = try toU32(num_kv_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var query_position_offset_u32 = try toU32(query_position_offset);
+        var kv_position_offset_u32 = try toU32(kv_position_offset);
+        var sliding_window_u32 = try toU32(sliding_window);
+        var total_sequence_len_u32 = try toU32(total_sequence_len);
+        var mask_len_u32 = try toU32(mask_len);
+        var bias_mode_u32 = bias_mode;
+        var key_row_bytes_u32 = try toU32(key_row_bytes);
+        var base_key_row_bytes_u32 = try toU32(base_key_row_bytes);
+        var value_row_bytes_u32 = try toU32(value_row_bytes);
+        var block_count_u32 = try toU32(block_count);
+        var page_size_tokens_u32 = try toU32(page_size_tokens);
+        var format_u32 = format;
+        var value_format_u32 = value_format;
+        var physical_token_capacity_u32 = try toU32(physical_token_capacity);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&block_table_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&bias_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&q_seq_len_u32),
+            @ptrCast(&kv_seq_len_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&num_kv_heads_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&query_position_offset_u32),
+            @ptrCast(&kv_position_offset_u32),
+            @ptrCast(&sliding_window_u32),
+            @ptrCast(&total_sequence_len_u32),
+            @ptrCast(&mask_len_u32),
+            @ptrCast(&bias_mode_u32),
+            @ptrCast(&key_row_bytes_u32),
+            @ptrCast(&base_key_row_bytes_u32),
+            @ptrCast(&value_row_bytes_u32),
+            @ptrCast(&block_count_u32),
+            @ptrCast(&page_size_tokens_u32),
+            @ptrCast(&format_u32),
+            @ptrCast(&value_format_u32),
+            @ptrCast(&physical_token_capacity_u32),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=gqa_attention_decode_turboquant dst=0x{x} q=0x{x} k=0x{x} v=0x{x} block_table=0x{x} mask=0x{x} bias=0x{x} batch={d} q_seq_len={d} kv_seq_len={d} num_heads={d} num_kv_heads={d} head_dim={d} key_row_bytes={d} base_key_row_bytes={d} value_row_bytes={d} block_count={d} page_size={d} format={d} value_format={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                block_table_ptr,
+                mask_ptr,
+                bias_ptr,
+                batch_u32,
+                q_seq_len_u32,
+                kv_seq_len_u32,
+                num_heads_u32,
+                num_kv_heads_u32,
+                head_dim_u32,
+                key_row_bytes_u32,
+                base_key_row_bytes_u32,
+                value_row_bytes_u32,
+                block_count_u32,
+                page_size_tokens_u32,
+                format_u32,
+                value_format_u32,
+            });
+        }
+        const block: c_uint = if (head_dim <= 256) 256 else 512;
+        const grid = try toU32(try checkedTensorElements(try checkedTensorElements(batch, q_seq_len), num_heads));
+        try ctx.makeCurrent();
+        try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+            function,
+            grid,
+            1,
+            1,
+            block,
+            1,
+            1,
+            0,
+            ctx.stream,
+            &params,
+            null,
+        ));
+        ctx.noteKernelLaunch();
+        return .decode;
+    }
+
     pub fn launchDebertaAttentionF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -5941,6 +6197,201 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     try smokeArgmaxLastRowSuppressF32(&ctx, &module);
     try smokeGemma4MtpMaskedArgmaxF32(&ctx, &module);
     try smokeGemma4MtpVerifyCommitU32(&ctx, &module);
+}
+
+pub fn smokeTurboquantKv(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    try smokeTurboquantKvFormat(allocator, &ctx, &module, 0);
+    try smokeTurboquantKvFormat(allocator, &ctx, &module, 1);
+}
+
+fn smokeTurboquantKvFormat(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+    format: u32,
+) !void {
+    const num_kv_heads: usize = 1;
+    const num_heads: usize = 1;
+    const head_dim: usize = 64;
+    const token_count: usize = 2;
+    const row_width = num_kv_heads * head_dim;
+    const base_key_row_bytes = switch (format) {
+        0 => turboquant.polar4KeyBytes(num_kv_heads, head_dim),
+        1 => turboquant.turbo3KeyBytes(num_kv_heads, head_dim),
+        else => return error.CudaSmokeMismatch,
+    };
+    const key_row_bytes = switch (format) {
+        0 => base_key_row_bytes,
+        1 => base_key_row_bytes + turboquant.turbo3ResidualBytes(num_kv_heads, head_dim),
+        else => unreachable,
+    };
+    const value_row_bytes = kv_pool_mod.KvDType.int8.bytesForValueRow(@intCast(num_kv_heads), @intCast(head_dim));
+    const page_size_tokens: usize = 1;
+    const block_table_host = [_]u32{ 1, 3 };
+    const physical_token_capacity: usize = 4;
+    if (key_row_bytes == 0 or base_key_row_bytes == 0) return error.CudaSmokeMismatch;
+
+    var q_host: [head_dim]f32 = undefined;
+    var k_host: [token_count * row_width]f32 = undefined;
+    var v_host: [token_count * row_width]f32 = undefined;
+    for (0..head_dim) |d| {
+        q_host[d] = (@as(f32, @floatFromInt(@as(i32, @intCast(d % 11)) - 5)) / 9.0);
+        k_host[d] = (@as(f32, @floatFromInt(@as(i32, @intCast(d % 13)) - 6)) / 8.0);
+        k_host[row_width + d] = (@as(f32, @floatFromInt(@as(i32, @intCast((d * 3) % 17)) - 8)) / 10.0);
+        v_host[d] = @as(f32, @floatFromInt(@as(i32, @intCast(d % 7)) - 3)) / 5.0;
+        v_host[row_width + d] = @as(f32, @floatFromInt(@as(i32, @intCast((d * 5) % 9)) - 4)) / 6.0;
+    }
+
+    var k_src = try buffer_mod.DeviceBuffer.alloc(ctx, k_host.len * @sizeOf(f32));
+    defer k_src.free(ctx);
+    var v_src = try buffer_mod.DeviceBuffer.alloc(ctx, v_host.len * @sizeOf(f32));
+    defer v_src.free(ctx);
+    var block_table = try buffer_mod.DeviceBuffer.alloc(ctx, block_table_host.len * @sizeOf(u32));
+    defer block_table.free(ctx);
+    var k_dst = try buffer_mod.DeviceBuffer.alloc(ctx, physical_token_capacity * key_row_bytes);
+    defer k_dst.free(ctx);
+    var v_dst = try buffer_mod.DeviceBuffer.alloc(ctx, physical_token_capacity * value_row_bytes);
+    defer v_dst.free(ctx);
+    var q = try buffer_mod.DeviceBuffer.alloc(ctx, q_host.len * @sizeOf(f32));
+    defer q.free(ctx);
+    var out = try buffer_mod.DeviceBuffer.alloc(ctx, q_host.len * @sizeOf(f32));
+    defer out.free(ctx);
+
+    try k_src.copyFromHost(ctx, std.mem.sliceAsBytes(&k_host));
+    try v_src.copyFromHost(ctx, std.mem.sliceAsBytes(&v_host));
+    try block_table.copyFromHost(ctx, std.mem.sliceAsBytes(&block_table_host));
+    try q.copyFromHost(ctx, std.mem.sliceAsBytes(&q_host));
+    try module.launchKvWriteSuffixTurboquantF32(
+        ctx,
+        k_dst,
+        v_dst,
+        block_table,
+        k_src,
+        v_src,
+        .{},
+        token_count,
+        row_width,
+        num_kv_heads,
+        head_dim,
+        key_row_bytes,
+        base_key_row_bytes,
+        value_row_bytes,
+        token_count,
+        block_table_host.len,
+        page_size_tokens,
+        format,
+        1,
+        physical_token_capacity,
+    );
+    try ctx.synchronize();
+
+    const encoded_actual = try allocator.alloc(u8, physical_token_capacity * key_row_bytes);
+    defer allocator.free(encoded_actual);
+    try k_dst.copyToHost(ctx, encoded_actual);
+    try ctx.synchronize();
+    const encoded_expected = try allocator.alloc(u8, token_count * key_row_bytes);
+    defer allocator.free(encoded_expected);
+    const value_actual = try allocator.alloc(u8, physical_token_capacity * value_row_bytes);
+    defer allocator.free(value_actual);
+    try v_dst.copyToHost(ctx, value_actual);
+    try ctx.synchronize();
+    const value_expected = try allocator.alloc(u8, token_count * value_row_bytes);
+    defer allocator.free(value_expected);
+    const value_dequant = try allocator.alloc(f32, token_count * row_width);
+    defer allocator.free(value_dequant);
+    for (0..token_count) |token| {
+        const src_row = k_host[token * row_width ..][0..row_width];
+        const dst_row = encoded_expected[token * key_row_bytes ..][0..key_row_bytes];
+        switch (format) {
+            0 => try turboquant.encodePolar4Key(src_row, dst_row, num_kv_heads, head_dim),
+            1 => {
+                try turboquant.encodeTurbo3Key(src_row, dst_row[0..base_key_row_bytes], num_kv_heads, head_dim);
+                try turboquant.encodeTurbo3ResidualSketch(src_row, dst_row[0..base_key_row_bytes], dst_row[base_key_row_bytes..], num_kv_heads, head_dim);
+            },
+            else => unreachable,
+        }
+        const value_src = v_host[token * row_width ..][0..row_width];
+        const value_dst = value_expected[token * value_row_bytes ..][0..value_row_bytes];
+        kv_pool_mod.quantizeF32ToInt8PerHead(value_src, value_dst, @intCast(num_kv_heads), @intCast(head_dim));
+        kv_pool_mod.dequantizeInt8PerHeadToF32(value_dst, value_dequant[token * row_width ..][0..row_width], @intCast(num_kv_heads), @intCast(head_dim));
+    }
+    for (0..token_count) |token| {
+        const physical = @as(usize, block_table_host[token]) * page_size_tokens;
+        const key_actual_row = encoded_actual[physical * key_row_bytes ..][0..key_row_bytes];
+        const key_expected_row = encoded_expected[token * key_row_bytes ..][0..key_row_bytes];
+        if (!std.mem.eql(u8, key_actual_row, key_expected_row)) return error.CudaSmokeMismatch;
+        const value_actual_row = value_actual[physical * value_row_bytes ..][0..value_row_bytes];
+        const value_expected_row = value_expected[token * value_row_bytes ..][0..value_row_bytes];
+        if (!std.mem.eql(u8, value_actual_row, value_expected_row)) return error.CudaSmokeMismatch;
+    }
+
+    _ = try module.launchGqaAttentionDecodeTurboquantF32(
+        ctx,
+        out,
+        q,
+        k_dst,
+        v_dst,
+        block_table,
+        .{},
+        .{},
+        1,
+        1,
+        token_count,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        1,
+        0,
+        0,
+        token_count,
+        0,
+        0,
+        key_row_bytes,
+        base_key_row_bytes,
+        value_row_bytes,
+        block_table_host.len,
+        page_size_tokens,
+        format,
+        1,
+        physical_token_capacity,
+    );
+    try ctx.synchronize();
+    const out_host = try allocator.alloc(f32, q_host.len);
+    defer allocator.free(out_host);
+    try out.copyToHost(ctx, std.mem.sliceAsBytes(out_host));
+    try ctx.synchronize();
+
+    var scores: [token_count]f32 = undefined;
+    for (0..token_count) |token| {
+        const encoded_row = encoded_expected[token * key_row_bytes ..][0..key_row_bytes];
+        const raw_score = switch (format) {
+            0 => try turboquant.dotPolar4KeyFast(&q_host, encoded_row, num_kv_heads, head_dim, 0),
+            1 => blk: {
+                const base = encoded_row[0..base_key_row_bytes];
+                const residual = encoded_row[base_key_row_bytes..];
+                var projected_query: [turboquant.turbo3_residual_bits_per_head]f32 = undefined;
+                try turboquant.projectTurbo3ResidualQuery(&q_host, &projected_query, head_dim, 0);
+                const residual_score = try turboquant.dotTurbo3ProjectedResidualSketch(&projected_query, residual, num_kv_heads, head_dim, 0);
+                break :blk try turboquant.dotTurbo3KeyFast(&q_host, base, num_kv_heads, head_dim, 0) +
+                    turboquant.turbo3_residual_default_scale * residual_score;
+            },
+            else => unreachable,
+        };
+        scores[token] = raw_score / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    }
+    const max_score = @max(scores[0], scores[1]);
+    const e0 = @exp(scores[0] - max_score);
+    const e1 = @exp(scores[1] - max_score);
+    const denom = e0 + e1;
+    for (0..head_dim) |d| {
+        const expected = (e0 * value_dequant[d] + e1 * value_dequant[row_width + d]) / denom;
+        if (@abs(out_host[d] - expected) > 0.0005) return error.CudaSmokeMismatch;
+    }
 }
 
 fn smokeBf16WeightPrimitives(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {

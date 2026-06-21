@@ -200,6 +200,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: gemma4_primitives ok\n", .{});
+            cuda_kernels.smokeTurboquantKv(allocator) catch |err| {
+                print("smoke: turboquant_kv failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: turboquant_kv ok\n", .{});
             cuda_compute.smokeDecoderRuntimeSlots(allocator) catch |err| {
                 print("smoke: decoder_runtime_slots failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
