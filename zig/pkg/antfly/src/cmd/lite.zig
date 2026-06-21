@@ -37,6 +37,7 @@ const lite_http_state_key = "antfly.lite.state";
 const LiteDb = struct {
     backend: antfly.lite.backend.Handle,
     db: db_mod.DB,
+    open_mode: db_mod.OpenOptions.OpenMode,
 
     fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
         var backend = try antfly.lite.backend.Handle.open(allocator, path, .{
@@ -57,6 +58,7 @@ const LiteDb = struct {
         return .{
             .backend = backend,
             .db = db,
+            .open_mode = open_mode,
         };
     }
 
@@ -77,15 +79,27 @@ const LiteDb = struct {
         return .{
             .backend = backend,
             .db = db,
+            .open_mode = .writer,
         };
     }
 
     fn close(self: *LiteDb) void {
+        if (liteOpenModeCanWrite(self.open_mode)) {
+            self.db.sync(true) catch {};
+            self.db.syncIndexes(true) catch {};
+        }
         self.db.close();
         self.backend.deinit();
         self.* = undefined;
     }
 };
+
+fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return switch (open_mode) {
+        .writer, .writer_no_replay => true,
+        else => false,
+    };
+}
 
 const CompactReport = struct {
     compacted: bool,
@@ -2933,6 +2947,36 @@ test "lite http handlers expose narrow embedded api" {
         defer resp.deinit();
         try std.testing.expectEqual(@as(u16, 200), resp.status.code);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
+    }
+}
+
+test "lite writer close syncs unsynced batch before readonly reopen" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/writer-close-sync.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    {
+        var lite = try LiteDb.create(allocator, path, true);
+        defer lite.close();
+
+        const batch_response = try batchJson(allocator, &lite.db,
+            \\{"inserts":{"doc:writer-close-sync":{"body":"close persists unsynced batch"}}}
+        );
+        defer allocator.free(batch_response);
+        try std.testing.expect(std.mem.indexOf(u8, batch_response, "\"inserted\":1") != null);
+    }
+
+    {
+        var reopened = try LiteDb.open(allocator, path, .query_readonly);
+        defer reopened.close();
+
+        const lookup_response = try lookupJson(allocator, &reopened.db, "doc:writer-close-sync", "");
+        defer allocator.free(lookup_response);
+        try std.testing.expect(std.mem.indexOf(u8, lookup_response, "\"close persists unsynced batch\"") != null);
     }
 }
 
