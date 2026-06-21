@@ -327,6 +327,30 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("remote inference status = %#v", remoteStatus.Inference)
 	}
 
+	localPath := filepath.Join(t.TempDir(), "go-local-inference.aflite")
+	localDB, err := OpenWithOptions(localPath, OpenOptions{
+		Mode:                   OpenModeWriter,
+		Profile:                ProfileNative,
+		LocalRuntimeConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("open local inference Lite database: %v", err)
+	}
+	localStatus, err := localDB.Status()
+	if err != nil {
+		t.Fatalf("local inference status: %v", err)
+	}
+	if err := localDB.Close(); err != nil {
+		t.Fatalf("close local inference Lite database: %v", err)
+	}
+	if localStatus.Inference.Mode != InferenceModeLocalEmbedded ||
+		!localStatus.Inference.Configured ||
+		localStatus.Inference.RemoteProviderConfigured ||
+		!localStatus.Inference.LocalRuntimeConfigured ||
+		!localStatus.Inference.LocalRuntimeAvailable {
+		t.Fatalf("local inference status = %#v", localStatus.Inference)
+	}
+
 	caps, err := db.CapabilitiesJSON()
 	if err != nil {
 		t.Fatalf("capabilities: %v", err)

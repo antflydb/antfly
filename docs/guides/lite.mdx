@@ -206,6 +206,9 @@ Embedded applications that configure a remote inference provider should mark
 that at open time. Lite status then reports `mode: "remote_provider"`,
 `configured: true`, and `remote_provider_configured: true`, so bindings and
 applications can branch from status instead of probing enrichment failures.
+Applications that embed a local inference runtime should mark that at open time
+as well; status then reports `mode: "local_embedded"`,
+`local_runtime_configured: true`, and `local_runtime_available: true`.
 
 Use `antfly lite run-until-idle app.aflite` after writes when you want the CLI
 to drain available local maintenance work before querying or backing up.

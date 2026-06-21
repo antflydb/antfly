@@ -43,7 +43,9 @@ Use `OpenWithOptions` for advanced settings such as map size, native-profile
 TTL cleanup, and explicit inference status reporting. Set
 `RemoteProviderConfigured` when the embedding producer is backed by a configured
 remote provider so `Status().Inference` reports `remote_provider` instead of the
-default caller-supplied/deferred mode.
+default caller-supplied/deferred mode. Set `LocalRuntimeConfigured` when the
+application embeds a local inference runtime and wants status to report
+`local_embedded`.
 
 Use `BackupToFile` to write a portable `.afb` archive from an open Lite handle.
 Use `RestoreBackupFile` or `RestoreBackup` to stage a portable backup into a

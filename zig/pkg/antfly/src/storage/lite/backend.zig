@@ -528,10 +528,23 @@ test "lite backend inference status reflects explicit remote provider configurat
     try std.testing.expect(remote.no_inference_configured_ok);
 
     const local_requested = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
-    try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
-    try std.testing.expect(!local_requested.configured);
-    try std.testing.expect(!local_requested.local_runtime_configured);
-    try std.testing.expect(!local_requested.local_runtime_available);
+    if (builtin.os.tag == .freestanding) {
+        try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
+        try std.testing.expect(!local_requested.configured);
+        try std.testing.expect(!local_requested.local_runtime_configured);
+        try std.testing.expect(!local_requested.local_runtime_available);
+    } else {
+        try std.testing.expectEqualStrings("local_embedded", local_requested.mode);
+        try std.testing.expect(local_requested.configured);
+        try std.testing.expect(!local_requested.remote_provider_configured);
+        try std.testing.expect(local_requested.local_runtime_configured);
+        try std.testing.expect(local_requested.local_runtime_available);
+        var found_local = false;
+        for (local_requested.available_modes) |mode| {
+            if (std.mem.eql(u8, mode, "local_embedded")) found_local = true;
+        }
+        try std.testing.expect(found_local);
+    }
 }
 
 test "lite backend native engine creates and checks aflite file" {

@@ -431,6 +431,33 @@ test "embedded db liteStatus reflects explicitly configured remote inference" {
     try std.testing.expect(status.inference.no_inference_configured_ok);
 }
 
+test "embedded db liteStatus reflects explicitly configured local inference" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-status-local-inference.aflite");
+    defer alloc.free(path);
+
+    var db = try DB.openLite(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .inference = .{ .local_runtime_configured = true },
+    });
+    defer db.close();
+
+    var status = try db.liteStatus(alloc);
+    defer status.deinit(alloc);
+
+    try std.testing.expectEqualStrings("local_embedded", status.inference.mode);
+    try std.testing.expect(status.inference.configured);
+    try std.testing.expect(!status.inference.remote_provider_configured);
+    try std.testing.expect(status.inference.local_runtime_configured);
+    try std.testing.expect(status.inference.local_runtime_available);
+    try std.testing.expect(status.inference.caller_supplied_artifacts);
+    try std.testing.expect(status.inference.no_inference_configured_ok);
+}
+
 test "embedded db openLite can run ttl cleanup over aflite file" {
     const alloc = std.testing.allocator;
 

@@ -33,6 +33,13 @@ const native_available_inference_modes = [_][]const u8{
     "disabled_deferred",
 };
 
+const native_local_available_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "remote_provider",
+    "local_embedded",
+    "disabled_deferred",
+};
+
 const native_freestanding_available_inference_modes = [_][]const u8{
     "caller_supplied_artifacts",
     "disabled_deferred",
@@ -41,6 +48,14 @@ const native_freestanding_available_inference_modes = [_][]const u8{
 const hosted_available_inference_modes = [_][]const u8{
     "caller_supplied_artifacts",
     "remote_provider",
+    "manual_maintenance",
+    "disabled_deferred",
+};
+
+const hosted_local_available_inference_modes = [_][]const u8{
+    "caller_supplied_artifacts",
+    "remote_provider",
+    "local_embedded",
     "manual_maintenance",
     "disabled_deferred",
 };
@@ -157,8 +172,13 @@ pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
 pub fn inferenceStatusForProfileWithOptions(profile: Profile, opts: InferenceOpenOptions) InferenceStatus {
     const caps = capabilitiesForProfile(profile);
     const remote_configured = opts.remote_provider_configured and caps.remote_inference_providers;
-    const local_configured = opts.local_runtime_configured and caps.local_inference_runtime;
+    const local_available = opts.local_runtime_configured and builtin.os.tag != .freestanding;
+    const local_configured = opts.local_runtime_configured and local_available;
     const configured = remote_configured or local_configured;
+    const available_modes = if (local_available)
+        if (profile == .hosted) &hosted_local_available_inference_modes else &native_local_available_inference_modes
+    else
+        caps.available_inference_modes;
     return .{
         .mode = if (remote_configured)
             "remote_provider"
@@ -166,11 +186,11 @@ pub fn inferenceStatusForProfileWithOptions(profile: Profile, opts: InferenceOpe
             "local_embedded"
         else
             caps.inference_mode,
-        .available_modes = caps.available_inference_modes,
+        .available_modes = available_modes,
         .configured = configured,
         .remote_provider_configured = remote_configured,
         .local_runtime_configured = local_configured,
-        .local_runtime_available = caps.local_inference_runtime,
+        .local_runtime_available = local_available or caps.local_inference_runtime,
         .caller_supplied_artifacts = caps.caller_supplied_artifacts,
         .no_inference_configured_ok = caps.no_inference_configured_ok,
     };

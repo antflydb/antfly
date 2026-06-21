@@ -6241,6 +6241,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(src_path);
     const remote_inference_path = try tempTestAflitePath(alloc, "capi-lite-remote-inference");
     defer alloc.free(remote_inference_path);
+    const local_inference_path = try tempTestAflitePath(alloc, "capi-lite-local-inference");
+    defer alloc.free(local_inference_path);
     const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
     defer alloc.free(dst_path);
     const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
@@ -6260,6 +6262,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(short_lite_path);
     cleanupTestFile(src_path);
     cleanupTestFile(remote_inference_path);
+    cleanupTestFile(local_inference_path);
     cleanupTestFile(dst_path);
     cleanupTestFile(bad_dst_path);
     cleanupTestFile(schema_dst_path);
@@ -6272,6 +6275,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(short_lite_path);
     defer cleanupTestFile(src_path);
     defer cleanupTestFile(remote_inference_path);
+    defer cleanupTestFile(local_inference_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(bad_dst_path);
     defer cleanupTestFile(schema_dst_path);
@@ -6382,6 +6386,23 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"configured\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"remote_provider_configured\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"local_runtime_configured\":false") != null);
+
+    var local_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_local_runtime_configured,
+    };
+    var local_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(local_inference_path, &local_options, &local_handle));
+    defer antfly_db_close(local_handle);
+    var local_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(local_handle, &local_status));
+    defer antfly_db_buffer_free(local_status.ptr, local_status.len);
+    const local_status_json = local_status.ptr.?[0..local_status.len];
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"mode\":\"local_embedded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"remote_provider_configured\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_runtime_configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_runtime_available\":true") != null);
 
     var capabilities: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));
