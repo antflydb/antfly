@@ -37,8 +37,16 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(imported_path);
     const backup_path = try join(allocator, root, "app.afb");
     defer allocator.free(backup_path);
+    const schema_path = try join(allocator, root, "schema.json");
+    defer allocator.free(schema_path);
+    const enrichment_path = try join(allocator, root, "enrichment.json");
+    defer allocator.free(enrichment_path);
+    const temp_enrichment_path = try join(allocator, root, "temp-enrichment.json");
+    defer allocator.free(temp_enrichment_path);
     const text_index_path = try join(allocator, root, "text-index.json");
     defer allocator.free(text_index_path);
+    const temp_index_path = try join(allocator, root, "temp-index.json");
+    defer allocator.free(temp_index_path);
     const dense_index_path = try join(allocator, root, "dense-index.json");
     defer allocator.free(dense_index_path);
     const sparse_index_path = try join(allocator, root, "sparse-index.json");
@@ -60,8 +68,20 @@ pub fn main(init: std.process.Init) !void {
     const graph_query_path = try join(allocator, root, "graph-query.json");
     defer allocator.free(graph_query_path);
 
+    try writeFile(io, schema_path,
+        \\{"version":0,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","required":["title"],"additionalProperties":true}}}}
+    );
+    try writeFile(io, enrichment_path,
+        \\{"name":"cli_chunks","kind":"chunk","field":"body","chunk_size":64,"chunk_overlap":8}
+    );
+    try writeFile(io, temp_enrichment_path,
+        \\{"name":"cli_temp_chunks","kind":"chunk","field":"body","chunk_size":32,"chunk_overlap":4}
+    );
     try writeFile(io, text_index_path,
         \\{"name":"ft_body","kind":"full_text","config_json":"{}"}
+    );
+    try writeFile(io, temp_index_path,
+        \\{"name":"ft_temp","kind":"full_text","config_json":"{}"}
     );
     try writeFile(io, dense_index_path,
         \\{"name":"dv_cli","kind":"dense_vector","config_json":"{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"external\":true}"}
@@ -96,10 +116,20 @@ pub fn main(init: std.process.Init) !void {
 
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "init", db_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "status", db_path }, "\"engine\":\"native_single_file\"");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "schema", "set", db_path, "--file", schema_path }, "\"updated\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "schema", "get", db_path }, "\"required\":[\"title\"]");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "enrichment", "create", db_path, "--file", enrichment_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "enrichment", "create", db_path, "--file", temp_enrichment_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "enrichment", "list", db_path }, "cli_chunks");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "enrichment", "drop", db_path, "--kind", "chunk", "--name", "cli_temp_chunks" }, "\"removed\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", text_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", temp_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "list", db_path }, "ft_temp");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "drop", db_path, "--index", "ft_temp" }, "\"removed\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", dense_index_path }, "\"created\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", sparse_index_path }, "\"created\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "create", db_path, "--file", graph_index_path }, "\"created\":true");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "index", "list", db_path }, "gr_cli");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "batch", db_path, "--file", batch_path }, "\"inserted\":4");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "run-until-idle", db_path }, "\"has_async_indexes\":true");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", db_path, "--key", "doc:cli-smoke", "--file", lookup_path }, "native lite command smoke");
@@ -113,6 +143,8 @@ pub fn main(init: std.process.Init) !void {
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "backup", db_path, "--out", backup_path }, "\"format\":\"afb\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "restore", backup_path, "--out", restored_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", restored_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "schema", "get", restored_path }, "\"required\":[\"title\"]");
+    try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "enrichment", "list", restored_path }, "cli_chunks");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "init", imported_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "import", imported_path, "--from", backup_path }, "\"format\":\"aflite\"");
     try expectCommandContains(allocator, io, &.{ antfly_path, "lite", "lookup", imported_path, "--key", "doc:cli-smoke" }, "native lite command smoke");
