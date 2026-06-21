@@ -11705,6 +11705,119 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
+test "sql adapter lower dml lowers on conflict primary do update with excluded values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"existing\"}", .version = 12 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING status, CASE WHEN status = 'pending' THEN 'updated' ELSE status END AS status_label",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.transforms.len);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"pending\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.predicates.len);
+    try std.testing.expectEqual(@as(u64, 12), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqual(@as(usize, 1), lowered.returning_expression_count);
+    try std.testing.expectEqualStrings("{\"status\":\"pending\",\"status_label\":\"updated\"}", lowered.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET status = excluded.status, status = lower(status)",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
+test "sql adapter lower dml lowers excluded explicit default values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"existing\"}", .version = 14 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', DEFAULT) ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers conflict update explicit default values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"existing\"}", .version = 15 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("status", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 15), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"status\":\"active\"}", lowered.batch.returning_rows[0]);
+
+    var row_assignment = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET (status) = ROW(DEFAULT) RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer row_assignment.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), row_assignment.batch.inserted);
+    try std.testing.expectEqual(@as(u32, 1), row_assignment.batch.transformed);
+    try std.testing.expectEqualStrings("status", row_assignment.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", row_assignment.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 15), row_assignment.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"status\":\"active\"}", row_assignment.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'pending') ON CONFLICT (id) DO UPDATE SET id = DEFAULT RETURNING id",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
 test "sql adapter lower dml lowers insert default values into defaulted row batch" {
     const alloc = std.testing.allocator;
     const schema_json =
