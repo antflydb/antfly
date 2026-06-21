@@ -56,7 +56,7 @@ function MyComponent() {
 
 ### useAnswerStream
 
-Stream Answer Agent responses with state management.
+Stream Retrieval Agent responses with state management. The hook name is retained for React component API compatibility.
 
 ```jsx
 import { useAnswerStream } from '@antfly/components';
@@ -89,7 +89,7 @@ function MyComponent() {
 
 ### useCitations
 
-Parse and render citations in RAG/Answer Agent responses.
+Parse and render citations in RAG and Retrieval Agent responses.
 
 ```jsx
 import { useCitations } from '@antfly/components';

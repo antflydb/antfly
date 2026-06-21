@@ -28,6 +28,8 @@ class EnrichmentConfig:
             chunk_size (int | Unset): Chunk size for chunk enrichments.
             chunk_overlap (int | Unset): Chunk overlap for chunk enrichments.
             chunker_json (str | Unset): Serialized chunker configuration for chunk enrichments.
+            full_text_index (bool | Unset): When true on a chunk enrichment, route generated chunk text into the table's
+                default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
             producer_json (str | Unset): Serialized asset producer configuration.
     """
@@ -41,6 +43,7 @@ class EnrichmentConfig:
     chunk_size: int | Unset = UNSET
     chunk_overlap: int | Unset = UNSET
     chunker_json: str | Unset = UNSET
+    full_text_index: bool | Unset = False
     content_type: str | Unset = UNSET
     producer_json: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -63,6 +66,8 @@ class EnrichmentConfig:
         chunk_overlap = self.chunk_overlap
 
         chunker_json = self.chunker_json
+
+        full_text_index = self.full_text_index
 
         content_type = self.content_type
 
@@ -90,6 +95,8 @@ class EnrichmentConfig:
             field_dict["chunk_overlap"] = chunk_overlap
         if chunker_json is not UNSET:
             field_dict["chunker_json"] = chunker_json
+        if full_text_index is not UNSET:
+            field_dict["full_text_index"] = full_text_index
         if content_type is not UNSET:
             field_dict["content_type"] = content_type
         if producer_json is not UNSET:
@@ -118,6 +125,8 @@ class EnrichmentConfig:
 
         chunker_json = d.pop("chunker_json", UNSET)
 
+        full_text_index = d.pop("full_text_index", UNSET)
+
         content_type = d.pop("content_type", UNSET)
 
         producer_json = d.pop("producer_json", UNSET)
@@ -132,6 +141,7 @@ class EnrichmentConfig:
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             chunker_json=chunker_json,
+            full_text_index=full_text_index,
             content_type=content_type,
             producer_json=producer_json,
         )

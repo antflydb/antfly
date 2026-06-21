@@ -26,7 +26,7 @@ const STEP_ICONS: Record<string, React.ReactNode> = {
   full_text_search: <Search className="h-3.5 w-3.5" />,
   tree_search: <TreePine className="h-3.5 w-3.5" />,
   graph_search: <Waypoints className="h-3.5 w-3.5" />,
-  websearch: <Globe className="h-3.5 w-3.5" />,
+  web_search: <Globe className="h-3.5 w-3.5" />,
   fetch: <Globe className="h-3.5 w-3.5" />,
   add_filter: <Filter className="h-3.5 w-3.5" />,
 };

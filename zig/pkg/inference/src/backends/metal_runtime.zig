@@ -2731,11 +2731,12 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
     if (!request.input.isDevice()) return false;
     const planned_layer_contract: ops.PlannedLayerContract = if (@hasField(@TypeOf(request), "planned_layer_contract")) request.planned_layer_contract else .{};
     const raw_planned_layer_contract = RawPlannedLayerContract.fromContract(planned_layer_contract);
+    const trace_decode = getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE");
     if (linear_kind == .quantized) {
         const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, request.linear_slot, request.hidden_size, request.out_dim);
         const format = metalQuantFormatForKind(quant_kind);
         if (format == .unsupported) return false;
-        return termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
+        const rc = termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
             runtime,
             request.norm_slot,
             request.linear_slot,
@@ -2746,9 +2747,14 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
             request.eps,
             request.out_dim,
             raw_planned_layer_contract,
-        ) == 0;
+        );
+        if (trace_decode and rc != 0) std.debug.print(
+            "decoder-runtime-decode: planned-tail-quantized rc={d} linear_slot={d} format={s} hidden={d} out={d} ops={d}\n",
+            .{ rc, request.linear_slot, @tagName(format), request.hidden_size, request.out_dim, planned_layer_contract.command_ops.len },
+        );
+        return rc == 0;
     }
-    return termite_metal_decode_runtime_encode_rms_norm_linear_argmax_device(
+    const rc = termite_metal_decode_runtime_encode_rms_norm_linear_argmax_device(
         runtime,
         request.norm_slot,
         request.linear_slot,
@@ -2758,7 +2764,12 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
         request.eps,
         request.out_dim,
         raw_planned_layer_contract,
-    ) == 0;
+    );
+    if (trace_decode and rc != 0) std.debug.print(
+        "decoder-runtime-decode: planned-tail-dense rc={d} linear_slot={d} hidden={d} out={d} ops={d}\n",
+        .{ rc, request.linear_slot, request.hidden_size, request.out_dim, planned_layer_contract.command_ops.len },
+    );
+    return rc == 0;
 }
 
 pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: anytype) !?MetalTensor {
@@ -5515,11 +5526,11 @@ pub const RawAttentionGatedBlockTiming = extern struct {
     failure_stage: u32 = 0,
     failure_code: i32 = 0,
     attention_f32_kernels: u64 = 0,
-    q8_0_linear_kernels: u64 = 0,
-    q8_0_attention_linear_kernels: u64 = 0,
-    q8_0_ffn_down_linear_kernels: u64 = 0,
-    q8_0_ple_linear_kernels: u64 = 0,
-    q8_0_pair_activation_kernels: u64 = 0,
+    quant_linear_kernels: u64 = 0,
+    quant_attention_linear_kernels: u64 = 0,
+    quant_ffn_down_linear_kernels: u64 = 0,
+    quant_ple_linear_kernels: u64 = 0,
+    quant_gate_up_pair_kernels: u64 = 0,
     rms_norm_kernels: u64 = 0,
     rms_norm_add_kernels: u64 = 0,
     layer_norm_kernels: u64 = 0,
@@ -8533,8 +8544,12 @@ pub extern fn termite_metal_decode_runtime_apply_attention_gated_block_q8_0_devi
     output_offset: usize,
     timing: ?*RawAttentionGatedBlockTiming,
 ) c_int;
-pub extern fn termite_metal_decode_runtime_apply_attention_f32_gated_block_q8_0_device_kv_device(
+pub extern fn termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
     runtime: ?*RawMetalDecodeRuntime,
+    attention_quant_format: u32,
+    ffn_gate_up_quant_format: u32,
+    ffn_down_quant_format: u32,
+    ple_quant_format: u32,
     q_handle: ?*anyopaque,
     q_offset: usize,
     k_handle: ?*anyopaque,
@@ -10619,6 +10634,7 @@ pub fn runPrefillPagedGatedFrameLayerDevice(
     }
 
     const direct_block_format = directQuantizedBlockFormatForRequest(self, .{
+        .layer_index = request.layer_index,
         .num_heads = request.num_heads,
         .num_kv_heads = request.num_kv_heads,
         .head_dim = request.head_dim,
@@ -10634,7 +10650,10 @@ pub fn runPrefillPagedGatedFrameLayerDevice(
         .ple_post_norm_slot = request.ple_post_norm_slot,
         .ple_hidden_size = request.ple_hidden_size,
     }) orelse return null;
-    if (direct_block_format != .q8_0) return null;
+    if (direct_block_format.attention != .q8_0 or
+        direct_block_format.ffn_gate_up != .q8_0 or
+        direct_block_format.ffn_down != .q8_0 or
+        (direct_block_format.ple != .unsupported and direct_block_format.ple != .q8_0)) return null;
 
     if (ple_mt_opt) |ple_mt| {
         const ple_post_norm_slot = request.ple_post_norm_slot orelse return null;
@@ -10781,11 +10800,11 @@ pub fn runPrefillPagedGatedFrameLayerDevice(
     stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
     stats.compressed_block_gpu_nanos += timing.gpu_nanos;
     stats.active_decode_attention_f32_kernels += timing.attention_f32_kernels;
-    stats.active_decode_q8_0_linear_kernels += timing.q8_0_linear_kernels;
-    stats.active_decode_q8_0_attention_linear_kernels += timing.q8_0_attention_linear_kernels;
-    stats.active_decode_q8_0_ffn_down_linear_kernels += timing.q8_0_ffn_down_linear_kernels;
-    stats.active_decode_q8_0_ple_linear_kernels += timing.q8_0_ple_linear_kernels;
-    stats.active_decode_q8_0_pair_activation_kernels += timing.q8_0_pair_activation_kernels;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
     stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
     stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
     stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
@@ -12828,8 +12847,11 @@ fn runQuantizedGatedFfnResidualMetalTensor(
     return MetalTensor.owned(output, &shape);
 }
 
-const DirectQuantizedBlockFormat = enum {
-    q8_0,
+const DirectQuantizedBlockFormats = struct {
+    attention: MetalQuantFormat,
+    ffn_gate_up: MetalQuantFormat,
+    ffn_down: MetalQuantFormat,
+    ple: MetalQuantFormat = .unsupported,
 };
 
 fn preparedQuantizedLinearSlotKind(self: anytype, slot: usize, in_dim: usize, out_dim: usize) RawQuantizedRuntimeLinearKind {
@@ -12839,49 +12861,117 @@ fn preparedQuantizedLinearSlotKind(self: anytype, slot: usize, in_dim: usize, ou
     return ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
 }
 
-fn directQuantizedBlockFormatForKind(kind: RawQuantizedRuntimeLinearKind) ?DirectQuantizedBlockFormat {
+fn directQuantizedBlockFormatForKind(kind: RawQuantizedRuntimeLinearKind) ?MetalQuantFormat {
     return switch (kind) {
-        .q8_0 => .q8_0,
+        .q4_k, .q5_k, .q6_k, .q8_0 => metalQuantFormatForKind(kind),
         else => null,
     };
 }
 
-fn mergeDirectQuantizedBlockFormat(
-    current: ?DirectQuantizedBlockFormat,
-    next: RawQuantizedRuntimeLinearKind,
-) ?DirectQuantizedBlockFormat {
-    const next_format = directQuantizedBlockFormatForKind(next) orelse return null;
-    if (current) |format| {
-        if (format != next_format) return null;
-        return format;
+fn directQuantizedBlockFormatForSlot(
+    self: anytype,
+    layer_index: usize,
+    label: []const u8,
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+) ?MetalQuantFormat {
+    const trace = traceQuantBlockRequested();
+    if (slot >= decoder_runtime_linear_slot_capacity) {
+        if (trace) std.debug.print("metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=slot-range\n", .{ layer_index, label, slot });
+        return null;
     }
+    if (!self.raw_linear_slots_prepared[slot]) {
+        if (trace) std.debug.print("metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=slot-unprepared\n", .{ layer_index, label, slot });
+        return null;
+    }
+    if (self.raw_linear_slot_kinds[slot] != .quantized) {
+        if (trace) std.debug.print(
+            "metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=not-quantized kind={s}\n",
+            .{ layer_index, label, slot, @tagName(self.raw_linear_slot_kinds[slot]) },
+        );
+        return null;
+    }
+    if (self.raw_linear_slot_in_dims[slot] != in_dim or self.raw_linear_slot_out_dims[slot] != out_dim) {
+        if (trace) std.debug.print(
+            "metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=dim-mismatch got={d}x{d} expected={d}x{d}\n",
+            .{ layer_index, label, slot, self.raw_linear_slot_in_dims[slot], self.raw_linear_slot_out_dims[slot], in_dim, out_dim },
+        );
+        return null;
+    }
+    const storage = self.raw_linear_slot_quantized_storage[slot] orelse {
+        if (trace) std.debug.print("metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=no-quant-storage\n", .{ layer_index, label, slot });
+        return null;
+    };
+    const raw_kind = quantizedRuntimeLinearKind(storage);
+    const runtime_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
+    const next_format = directQuantizedBlockFormatForKind(runtime_kind) orelse {
+        if (trace) std.debug.print(
+            "metal-quant-block-slot-skip layer={d} slot={s} id={d} reason=unsupported-kind raw={s} runtime={s}\n",
+            .{ layer_index, label, slot, @tagName(raw_kind), @tagName(runtime_kind) },
+        );
+        return null;
+    };
     return next_format;
 }
 
-fn directQuantizedBlockFormatForRequest(self: anytype, request: anytype) ?DirectQuantizedBlockFormat {
+fn directQuantizedBlockFormatForRequest(self: anytype, request: anytype) ?DirectQuantizedBlockFormats {
     const attention_input_size = request.num_heads * request.head_dim;
-    var format: ?DirectQuantizedBlockFormat = null;
-    format = mergeDirectQuantizedBlockFormat(format, preparedQuantizedLinearSlotKind(self, request.attention_linear_slot, attention_input_size, request.hidden_size)) orelse return null;
-    format = mergeDirectQuantizedBlockFormat(format, preparedQuantizedLinearSlotKind(self, request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size)) orelse return null;
-    format = mergeDirectQuantizedBlockFormat(format, preparedQuantizedLinearSlotKind(self, request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size)) orelse return null;
-    format = mergeDirectQuantizedBlockFormat(format, preparedQuantizedLinearSlotKind(self, request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size)) orelse return null;
+    const layer_index = request.layer_index;
+    const attention_format = directQuantizedBlockFormatForSlot(self, layer_index, "attention", request.attention_linear_slot, attention_input_size, request.hidden_size) orelse return null;
+    const gate_format = directQuantizedBlockFormatForSlot(self, layer_index, "ffn-gate", request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return null;
+    const up_format = directQuantizedBlockFormatForSlot(self, layer_index, "ffn-up", request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return null;
+    if (gate_format != up_format) return null;
+    const down_format = directQuantizedBlockFormatForSlot(self, layer_index, "ffn-down", request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size) orelse return null;
+    var formats: DirectQuantizedBlockFormats = .{
+        .attention = attention_format,
+        .ffn_gate_up = gate_format,
+        .ffn_down = down_format,
+    };
     const ple_mt_opt: ?MetalTensor = if (@hasField(@TypeOf(request), "ple")) request.ple else null;
     if (ple_mt_opt != null) {
         const ple_gate_slot = request.ple_gate_linear_slot orelse return null;
         const ple_proj_slot = request.ple_proj_linear_slot orelse return null;
         const ple_post_norm_slot = request.ple_post_norm_slot orelse return null;
         if (request.ple_hidden_size == 0) return null;
-        format = mergeDirectQuantizedBlockFormat(format, preparedQuantizedLinearSlotKind(self, ple_gate_slot, request.hidden_size, request.ple_hidden_size)) orelse return null;
-        format = mergeDirectQuantizedBlockFormat(format, preparedQuantizedLinearSlotKind(self, ple_proj_slot, request.ple_hidden_size, request.hidden_size)) orelse return null;
+        const ple_gate_format = directQuantizedBlockFormatForSlot(self, layer_index, "ple-gate", ple_gate_slot, request.hidden_size, request.ple_hidden_size) orelse return null;
+        const ple_proj_format = directQuantizedBlockFormatForSlot(self, layer_index, "ple-proj", ple_proj_slot, request.ple_hidden_size, request.hidden_size) orelse return null;
+        if (ple_gate_format != ple_proj_format) return null;
+        formats.ple = ple_gate_format;
         if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return null;
         if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return null;
         if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return null;
     }
-    return format;
+    return formats;
 }
 
 pub fn supportsDirectPagedGatedDecoderBlockDevice(self: anytype, request: anytype) bool {
     return directQuantizedBlockFormatForRequest(self, request) != null;
+}
+
+pub fn supportsDirectPagedGatedDecoderBlockSlots(self: anytype, request: anytype) bool {
+    const attention_input_size = request.num_heads * request.head_dim;
+    const layer_index = request.layer_index;
+    _ = directQuantizedBlockFormatForSlot(self, layer_index, "attention", request.attention_linear_slot, attention_input_size, request.hidden_size) orelse return false;
+    const gate_format = directQuantizedBlockFormatForSlot(self, layer_index, "ffn-gate", request.gate_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return false;
+    const up_format = directQuantizedBlockFormatForSlot(self, layer_index, "ffn-up", request.up_ffn_linear_slot, request.hidden_size, request.intermediate_size) orelse return false;
+    if (gate_format != up_format) return false;
+    _ = directQuantizedBlockFormatForSlot(self, layer_index, "ffn-down", request.down_ffn_linear_slot, request.intermediate_size, request.hidden_size) orelse return false;
+
+    const has_ple = if (@hasField(@TypeOf(request), "has_ple")) request.has_ple else false;
+    if (has_ple) {
+        const ple_gate_slot = request.ple_gate_linear_slot orelse return false;
+        const ple_proj_slot = request.ple_proj_linear_slot orelse return false;
+        const ple_post_norm_slot = request.ple_post_norm_slot orelse return false;
+        if (request.ple_hidden_size == 0) return false;
+        const ple_gate_format = directQuantizedBlockFormatForSlot(self, layer_index, "ple-gate", ple_gate_slot, request.hidden_size, request.ple_hidden_size) orelse return false;
+        const ple_proj_format = directQuantizedBlockFormatForSlot(self, layer_index, "ple-proj", ple_proj_slot, request.ple_hidden_size, request.hidden_size) orelse return false;
+        if (ple_gate_format != ple_proj_format) return false;
+        if (ple_post_norm_slot >= decoder_runtime_rms_norm_slot_capacity) return false;
+        if (!self.raw_rms_norm_slots_prepared[ple_post_norm_slot]) return false;
+        if (self.raw_rms_norm_slot_hidden_sizes[ple_post_norm_slot] != request.hidden_size) return false;
+    }
+    return true;
 }
 
 fn traceQuantBlockRequested() bool {
@@ -12946,65 +13036,67 @@ fn runAttentionF32GatedDecoderBlockQuantizedDevice(
     const raw_planned_layer_contract = RawPlannedLayerContract.fromContract(planned_layer_contract);
     var timing: RawAttentionGatedBlockTiming = .{};
     const started_at = monotonicNowNs();
-    const rc = switch (direct_block_format) {
-        .q8_0 => termite_metal_decode_runtime_apply_attention_f32_gated_block_q8_0_device_kv_device(
-            runtime,
-            q_mt.deviceHandle(),
-            q_mt.deviceByteOffset(),
-            k_full_mt.deviceHandle(),
-            k_full_mt.deviceByteOffset(),
-            v_full_mt.deviceHandle(),
-            v_full_mt.deviceByteOffset(),
-            rows,
-            request.kv_tokens,
-            request.num_heads,
-            request.num_kv_heads,
-            request.head_dim,
-            request.query_position_offset,
-            request.kv_position_offset,
-            request.sliding_window,
-            request.total_sequence_len,
-            request.attention_linear_slot,
-            request.attention_pre_linear_rms_norm_slot orelse none,
-            request.attention_post_linear_rms_norm_slot orelse none,
-            residual_mt.deviceHandle(),
-            residual_mt.deviceByteOffset(),
-            attention_input_size,
-            request.hidden_size,
-            request.eps,
-            request.ffn_layer_norm_slot orelse none,
-            request.ffn_rms_norm_slot orelse none,
-            request.ffn_post_gate_rms_norm_slot orelse none,
-            request.ffn_post_down_rms_norm_slot orelse none,
-            request.gate_ffn_linear_slot,
-            request.up_ffn_linear_slot,
-            request.down_ffn_linear_slot,
-            request.intermediate_size,
-            @intFromEnum(request.activation),
-            request.layer_index,
-            if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
-            if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
-            request.ple_gate_linear_slot orelse none,
-            request.ple_proj_linear_slot orelse none,
-            request.ple_post_norm_slot orelse none,
-            if (ple_mt_opt != null) request.ple_hidden_size else 0,
-            if (output_scale_value_opt != null) 1 else 0,
-            output_scale_value_opt orelse 1.0,
-            device_output.deviceHandle(),
-            device_output.deviceByteOffset(),
-            raw_planned_layer_contract,
-            &timing,
-            none,
-            0,
-            null,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-    };
+    const rc = termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
+        runtime,
+        @intFromEnum(direct_block_format.attention),
+        @intFromEnum(direct_block_format.ffn_gate_up),
+        @intFromEnum(direct_block_format.ffn_down),
+        @intFromEnum(direct_block_format.ple),
+        q_mt.deviceHandle(),
+        q_mt.deviceByteOffset(),
+        k_full_mt.deviceHandle(),
+        k_full_mt.deviceByteOffset(),
+        v_full_mt.deviceHandle(),
+        v_full_mt.deviceByteOffset(),
+        rows,
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        request.total_sequence_len,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        residual_mt.deviceHandle(),
+        residual_mt.deviceByteOffset(),
+        attention_input_size,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+        request.layer_index,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
+        request.ple_gate_linear_slot orelse none,
+        request.ple_proj_linear_slot orelse none,
+        request.ple_post_norm_slot orelse none,
+        if (ple_mt_opt != null) request.ple_hidden_size else 0,
+        if (output_scale_value_opt != null) 1 else 0,
+        output_scale_value_opt orelse 1.0,
+        device_output.deviceHandle(),
+        device_output.deviceByteOffset(),
+        raw_planned_layer_contract,
+        &timing,
+        none,
+        0,
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
     stats.compressed_block_attention_prefix_nanos += timing.attention_prefix_nanos;
@@ -13012,11 +13104,11 @@ fn runAttentionF32GatedDecoderBlockQuantizedDevice(
     stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
     stats.compressed_block_gpu_nanos += timing.gpu_nanos;
     stats.active_decode_attention_f32_kernels += timing.attention_f32_kernels;
-    stats.active_decode_q8_0_linear_kernels += timing.q8_0_linear_kernels;
-    stats.active_decode_q8_0_attention_linear_kernels += timing.q8_0_attention_linear_kernels;
-    stats.active_decode_q8_0_ffn_down_linear_kernels += timing.q8_0_ffn_down_linear_kernels;
-    stats.active_decode_q8_0_ple_linear_kernels += timing.q8_0_ple_linear_kernels;
-    stats.active_decode_q8_0_pair_activation_kernels += timing.q8_0_pair_activation_kernels;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
     stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
     stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
     stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
@@ -13190,65 +13282,67 @@ fn runAttentionPagedGatedDecoderBlockQuantizedDeviceInto(
     const k_offset = if (k_suffix_mt) |k| k.deviceByteOffset() else 0;
     const v_handle = if (v_suffix_mt) |v| v.deviceHandle() else null;
     const v_offset = if (v_suffix_mt) |v| v.deviceByteOffset() else 0;
-    const rc = switch (direct_block_format) {
-        .q8_0 => termite_metal_decode_runtime_apply_attention_f32_gated_block_q8_0_device_kv_device(
-            runtime,
-            q_mt.deviceHandle(),
-            q_mt.deviceByteOffset(),
-            k_handle,
-            k_offset,
-            v_handle,
-            v_offset,
-            rows,
-            request.kv_tokens,
-            request.num_heads,
-            request.num_kv_heads,
-            request.head_dim,
-            request.query_position_offset,
-            request.kv_position_offset,
-            request.sliding_window,
-            request.total_sequence_len,
-            request.attention_linear_slot,
-            request.attention_pre_linear_rms_norm_slot orelse none,
-            request.attention_post_linear_rms_norm_slot orelse none,
-            residual_mt.deviceHandle(),
-            residual_mt.deviceByteOffset(),
-            attention_input_size,
-            request.hidden_size,
-            request.eps,
-            request.ffn_layer_norm_slot orelse none,
-            request.ffn_rms_norm_slot orelse none,
-            request.ffn_post_gate_rms_norm_slot orelse none,
-            request.ffn_post_down_rms_norm_slot orelse none,
-            request.gate_ffn_linear_slot,
-            request.up_ffn_linear_slot,
-            request.down_ffn_linear_slot,
-            request.intermediate_size,
-            @intFromEnum(request.activation),
-            request.layer_index,
-            if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
-            if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
-            request.ple_gate_linear_slot orelse none,
-            request.ple_proj_linear_slot orelse none,
-            request.ple_post_norm_slot orelse none,
-            if (ple_mt_opt != null) request.ple_hidden_size else 0,
-            if (output_scale_value_opt != null) 1 else 0,
-            output_scale_value_opt orelse 1.0,
-            output_mt.deviceHandle(),
-            output_mt.deviceByteOffset(),
-            raw_planned_layer_contract,
-            &timing,
-            paged_layer.slot,
-            paged_layer.format,
-            block_token_offsets.ptr,
-            block_token_offsets.len,
-            @intCast(paged_layer.page_size_tokens),
-            paged_layer.key_row_bytes,
-            paged_layer.base_key_row_bytes,
-            paged_layer.v_row_stride,
-            suffix_tokens,
-        ),
-    };
+    const rc = termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
+        runtime,
+        @intFromEnum(direct_block_format.attention),
+        @intFromEnum(direct_block_format.ffn_gate_up),
+        @intFromEnum(direct_block_format.ffn_down),
+        @intFromEnum(direct_block_format.ple),
+        q_mt.deviceHandle(),
+        q_mt.deviceByteOffset(),
+        k_handle,
+        k_offset,
+        v_handle,
+        v_offset,
+        rows,
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        request.total_sequence_len,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        residual_mt.deviceHandle(),
+        residual_mt.deviceByteOffset(),
+        attention_input_size,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+        request.layer_index,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
+        request.ple_gate_linear_slot orelse none,
+        request.ple_proj_linear_slot orelse none,
+        request.ple_post_norm_slot orelse none,
+        if (ple_mt_opt != null) request.ple_hidden_size else 0,
+        if (output_scale_value_opt != null) 1 else 0,
+        output_scale_value_opt orelse 1.0,
+        output_mt.deviceHandle(),
+        output_mt.deviceByteOffset(),
+        raw_planned_layer_contract,
+        &timing,
+        paged_layer.slot,
+        paged_layer.format,
+        block_token_offsets.ptr,
+        block_token_offsets.len,
+        @intCast(paged_layer.page_size_tokens),
+        paged_layer.key_row_bytes,
+        paged_layer.base_key_row_bytes,
+        paged_layer.v_row_stride,
+        suffix_tokens,
+    );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
     stats.compressed_block_attention_prefix_nanos += timing.attention_prefix_nanos;
@@ -13256,11 +13350,11 @@ fn runAttentionPagedGatedDecoderBlockQuantizedDeviceInto(
     stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
     stats.compressed_block_gpu_nanos += timing.gpu_nanos;
     stats.active_decode_attention_f32_kernels += timing.attention_f32_kernels;
-    stats.active_decode_q8_0_linear_kernels += timing.q8_0_linear_kernels;
-    stats.active_decode_q8_0_attention_linear_kernels += timing.q8_0_attention_linear_kernels;
-    stats.active_decode_q8_0_ffn_down_linear_kernels += timing.q8_0_ffn_down_linear_kernels;
-    stats.active_decode_q8_0_ple_linear_kernels += timing.q8_0_ple_linear_kernels;
-    stats.active_decode_q8_0_pair_activation_kernels += timing.q8_0_pair_activation_kernels;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
     stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
     stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
     stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
@@ -13358,65 +13452,67 @@ fn runAttentionF32GatedDecoderBlockQuantizedDeviceInto(
     const raw_planned_layer_contract = RawPlannedLayerContract.fromContract(planned_layer_contract);
     var timing: RawAttentionGatedBlockTiming = .{};
     const started_at = monotonicNowNs();
-    const rc = switch (direct_block_format) {
-        .q8_0 => termite_metal_decode_runtime_apply_attention_f32_gated_block_q8_0_device_kv_device(
-            runtime,
-            q_mt.deviceHandle(),
-            q_mt.deviceByteOffset(),
-            k_full_mt.deviceHandle(),
-            k_full_mt.deviceByteOffset(),
-            v_full_mt.deviceHandle(),
-            v_full_mt.deviceByteOffset(),
-            rows,
-            request.kv_tokens,
-            request.num_heads,
-            request.num_kv_heads,
-            request.head_dim,
-            request.query_position_offset,
-            request.kv_position_offset,
-            request.sliding_window,
-            request.total_sequence_len,
-            request.attention_linear_slot,
-            request.attention_pre_linear_rms_norm_slot orelse none,
-            request.attention_post_linear_rms_norm_slot orelse none,
-            residual_mt.deviceHandle(),
-            residual_mt.deviceByteOffset(),
-            attention_input_size,
-            request.hidden_size,
-            request.eps,
-            request.ffn_layer_norm_slot orelse none,
-            request.ffn_rms_norm_slot orelse none,
-            request.ffn_post_gate_rms_norm_slot orelse none,
-            request.ffn_post_down_rms_norm_slot orelse none,
-            request.gate_ffn_linear_slot,
-            request.up_ffn_linear_slot,
-            request.down_ffn_linear_slot,
-            request.intermediate_size,
-            @intFromEnum(request.activation),
-            request.layer_index,
-            if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
-            if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
-            request.ple_gate_linear_slot orelse none,
-            request.ple_proj_linear_slot orelse none,
-            request.ple_post_norm_slot orelse none,
-            if (ple_mt_opt != null) request.ple_hidden_size else 0,
-            if (output_scale_value_opt != null) 1 else 0,
-            output_scale_value_opt orelse 1.0,
-            output_mt.deviceHandle(),
-            output_mt.deviceByteOffset(),
-            raw_planned_layer_contract,
-            &timing,
-            none,
-            0,
-            null,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ),
-    };
+    const rc = termite_metal_decode_runtime_apply_attention_f32_gated_block_quantized_device_kv_device(
+        runtime,
+        @intFromEnum(direct_block_format.attention),
+        @intFromEnum(direct_block_format.ffn_gate_up),
+        @intFromEnum(direct_block_format.ffn_down),
+        @intFromEnum(direct_block_format.ple),
+        q_mt.deviceHandle(),
+        q_mt.deviceByteOffset(),
+        k_full_mt.deviceHandle(),
+        k_full_mt.deviceByteOffset(),
+        v_full_mt.deviceHandle(),
+        v_full_mt.deviceByteOffset(),
+        rows,
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.query_position_offset,
+        request.kv_position_offset,
+        request.sliding_window,
+        request.total_sequence_len,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        residual_mt.deviceHandle(),
+        residual_mt.deviceByteOffset(),
+        attention_input_size,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+        request.layer_index,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceHandle() else null,
+        if (ple_mt_opt) |ple_mt| ple_mt.deviceByteOffset() else 0,
+        request.ple_gate_linear_slot orelse none,
+        request.ple_proj_linear_slot orelse none,
+        request.ple_post_norm_slot orelse none,
+        if (ple_mt_opt != null) request.ple_hidden_size else 0,
+        if (output_scale_value_opt != null) 1 else 0,
+        output_scale_value_opt orelse 1.0,
+        output_mt.deviceHandle(),
+        output_mt.deviceByteOffset(),
+        raw_planned_layer_contract,
+        &timing,
+        none,
+        0,
+        null,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - started_at);
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
     stats.compressed_block_attention_prefix_nanos += timing.attention_prefix_nanos;
@@ -13424,11 +13520,11 @@ fn runAttentionF32GatedDecoderBlockQuantizedDeviceInto(
     stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
     stats.compressed_block_gpu_nanos += timing.gpu_nanos;
     stats.active_decode_attention_f32_kernels += timing.attention_f32_kernels;
-    stats.active_decode_q8_0_linear_kernels += timing.q8_0_linear_kernels;
-    stats.active_decode_q8_0_attention_linear_kernels += timing.q8_0_attention_linear_kernels;
-    stats.active_decode_q8_0_ffn_down_linear_kernels += timing.q8_0_ffn_down_linear_kernels;
-    stats.active_decode_q8_0_ple_linear_kernels += timing.q8_0_ple_linear_kernels;
-    stats.active_decode_q8_0_pair_activation_kernels += timing.q8_0_pair_activation_kernels;
+    stats.active_decode_quant_linear_kernels += timing.quant_linear_kernels;
+    stats.active_decode_quant_attention_linear_kernels += timing.quant_attention_linear_kernels;
+    stats.active_decode_quant_ffn_down_linear_kernels += timing.quant_ffn_down_linear_kernels;
+    stats.active_decode_quant_ple_linear_kernels += timing.quant_ple_linear_kernels;
+    stats.active_decode_quant_gate_up_pair_kernels += timing.quant_gate_up_pair_kernels;
     stats.active_decode_rms_norm_kernels += timing.rms_norm_kernels;
     stats.active_decode_rms_norm_add_kernels += timing.rms_norm_add_kernels;
     stats.active_decode_layer_norm_kernels += timing.layer_norm_kernels;
@@ -13573,9 +13669,12 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
     const apply_started_at = monotonicNowNs();
     if (trace) {
         std.debug.print(
-            "metal-quant-block-apply format={s} kv_tokens={d} q_dim={d} k_rows={d} k_dim={d} v_rows={d} v_dim={d} key_row_bytes={d} base_key_row_bytes={d} v_stride={d} layer={d}\n",
+            "metal-quant-block-apply attn={s} ffn_gate_up={s} ffn_down={s} ple={s} kv_tokens={d} q_dim={d} k_rows={d} k_dim={d} v_rows={d} v_dim={d} key_row_bytes={d} base_key_row_bytes={d} v_stride={d} layer={d}\n",
             .{
-                @tagName(direct_block_format),
+                @tagName(direct_block_format.attention),
+                @tagName(direct_block_format.ffn_gate_up),
+                @tagName(direct_block_format.ffn_down),
+                @tagName(direct_block_format.ple),
                 request.kv_tokens,
                 q_mt.dim(1),
                 gathered.k.dim(0),
@@ -13589,52 +13688,54 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
             },
         );
     }
-    const rc = switch (direct_block_format) {
-        .q8_0 => termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_device(
-            runtime,
-            switch (request.format) {
-                .polar4 => 0,
-                .turbo3 => 1,
-            },
-            q_mt.deviceHandle(),
-            q_mt.deviceByteOffset(),
-            gathered.k.deviceHandle(),
-            gathered.k.deviceByteOffset(),
-            gathered.v.deviceHandle(),
-            gathered.v.deviceByteOffset(),
-            request.kv_tokens,
-            request.num_heads,
-            request.num_kv_heads,
-            request.head_dim,
-            request.key_row_bytes,
-            v_row_stride,
-            base_key_row_bytes,
-            request.query_position,
-            request.kv_position_offset,
-            request.sliding_window,
-            request.attention_linear_slot,
-            request.attention_pre_linear_rms_norm_slot orelse none,
-            request.attention_post_linear_rms_norm_slot orelse none,
-            request.residual.deviceHandle(),
-            request.residual.deviceByteOffset(),
-            attention_input_size,
-            request.hidden_size,
-            request.eps,
-            request.ffn_layer_norm_slot orelse none,
-            request.ffn_rms_norm_slot orelse none,
-            request.ffn_post_gate_rms_norm_slot orelse none,
-            request.ffn_post_down_rms_norm_slot orelse none,
-            request.gate_ffn_linear_slot,
-            request.up_ffn_linear_slot,
-            request.down_ffn_linear_slot,
-            request.intermediate_size,
-            @intFromEnum(request.activation),
-            request.layer_index,
-            device_output.deviceHandle(),
-            device_output.deviceByteOffset(),
-            &timing,
-        ),
-    };
+    if (direct_block_format.attention != .q8_0 or
+        direct_block_format.ffn_gate_up != .q8_0 or
+        direct_block_format.ffn_down != .q8_0 or
+        (direct_block_format.ple != .unsupported and direct_block_format.ple != .q8_0)) return null;
+    const rc = termite_metal_decode_runtime_apply_attention_gated_block_q8_0_device_kv_device(
+        runtime,
+        switch (request.format) {
+            .polar4 => 0,
+            .turbo3 => 1,
+        },
+        q_mt.deviceHandle(),
+        q_mt.deviceByteOffset(),
+        gathered.k.deviceHandle(),
+        gathered.k.deviceByteOffset(),
+        gathered.v.deviceHandle(),
+        gathered.v.deviceByteOffset(),
+        request.kv_tokens,
+        request.num_heads,
+        request.num_kv_heads,
+        request.head_dim,
+        request.key_row_bytes,
+        v_row_stride,
+        base_key_row_bytes,
+        request.query_position,
+        request.kv_position_offset,
+        request.sliding_window,
+        request.attention_linear_slot,
+        request.attention_pre_linear_rms_norm_slot orelse none,
+        request.attention_post_linear_rms_norm_slot orelse none,
+        request.residual.deviceHandle(),
+        request.residual.deviceByteOffset(),
+        attention_input_size,
+        request.hidden_size,
+        request.eps,
+        request.ffn_layer_norm_slot orelse none,
+        request.ffn_rms_norm_slot orelse none,
+        request.ffn_post_gate_rms_norm_slot orelse none,
+        request.ffn_post_down_rms_norm_slot orelse none,
+        request.gate_ffn_linear_slot,
+        request.up_ffn_linear_slot,
+        request.down_ffn_linear_slot,
+        request.intermediate_size,
+        @intFromEnum(request.activation),
+        request.layer_index,
+        device_output.deviceHandle(),
+        device_output.deviceByteOffset(),
+        &timing,
+    );
     stats.compressed_block_apply_nanos += @intCast(monotonicNowNs() - apply_started_at);
     stats.compressed_block_replace_span_nanos += timing.replace_span_nanos;
     stats.compressed_block_attention_span_nanos += timing.attention_span_nanos;
@@ -13642,7 +13743,7 @@ fn runCompressedAttentionGatedDecoderBlockQuantizedDevice(
     stats.compressed_block_gated_ffn_residual_nanos += timing.gated_ffn_residual_nanos;
     stats.compressed_block_command_wait_nanos += timing.command_wait_nanos;
     stats.compressed_block_gpu_nanos += timing.gpu_nanos;
-    if (trace) std.debug.print("metal-quant-block-rc format={s} rc={d} stage={d} code={d}\n", .{ @tagName(direct_block_format), rc, timing.failure_stage, timing.failure_code });
+    if (trace) std.debug.print("metal-quant-block-rc attn={s} ffn_gate_up={s} ffn_down={s} ple={s} rc={d} stage={d} code={d}\n", .{ @tagName(direct_block_format.attention), @tagName(direct_block_format.ffn_gate_up), @tagName(direct_block_format.ffn_down), @tagName(direct_block_format.ple), rc, timing.failure_stage, timing.failure_code });
     if (rc != 0) {
         stats.compressed_block_gated_direct_runtime_failures += 1;
         switch (timing.failure_stage) {
@@ -22013,6 +22114,38 @@ test "planned command contract exports quant matmul dispatches" {
     try std.testing.expectEqual(@as(u8, @intCast(@intFromEnum(metal_command_planner.QuantMatmulFormat.q8_0))), contract.command_ops[1].format);
     try std.testing.expectEqual(@as(u8, 1), contract.command_ops[1].barrier_before);
     try std.testing.expectEqual(@intFromEnum(ComputeSource.tail), contract.command_ops[1].source);
+}
+
+test "planned command contract preserves quantized tail format" {
+    var tail_plan = metal_command_planner.TailCommandLowerer{};
+    try tail_plan.build(.{
+        .final_norm_slot = 3,
+        .lm_head_slot = 9,
+        .source = @intFromEnum(ComputeSource.tail),
+        .region = @intFromEnum(ComputeRegion.tail),
+        .hidden_size = 2560,
+        .vocab_size = 262144,
+        .quant_format = .q6_k,
+    });
+
+    var op_storage = [_]u16{0} ** 3;
+    var barrier_storage = [_]u8{0} ** 3;
+    var quant_dispatch_storage = [_]u8{0} ** 3;
+    var command_op_storage = [_]ops.PlannedCommandOp{.{}} ** 3;
+    const contract = plannedContractFromCommandPlan(
+        tail_plan.commandView(),
+        &op_storage,
+        &barrier_storage,
+        &quant_dispatch_storage,
+        &command_op_storage,
+        0,
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), contract.command_ops.len);
+    try std.testing.expectEqual(@intFromEnum(metal_command_planner.OpKind.tail_lm_head), contract.command_ops[1].kind);
+    try std.testing.expectEqual(@intFromEnum(metal_command_planner.QuantMatmulDispatchKind.mmv), contract.command_ops[1].quant_dispatch);
+    try std.testing.expectEqual(@intFromEnum(metal_command_planner.Operator.mul_mv), contract.command_ops[1].operator);
+    try std.testing.expectEqual(@as(u8, @intCast(@intFromEnum(metal_command_planner.QuantMatmulFormat.q6_k))), contract.command_ops[1].format);
 }
 
 test "planned command contract exports activation dtypes" {

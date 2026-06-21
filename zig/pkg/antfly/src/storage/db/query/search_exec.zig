@@ -23,6 +23,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const doc_set = @import("../doc_set.zig");
 const doc_identity = @import("../doc_identity.zig");
 const graph_exec = @import("graph_exec.zig");
+const result_shape = @import("result_shape.zig");
 const search_mod = @import("../../../search/search.zig");
 const index_mod = @import("../../../index.zig");
 const segment_mod = @import("../../../segment.zig");
@@ -540,6 +541,16 @@ pub const MatchAllExecutor = struct {
         req: types.SearchRequest,
         key: []const u8,
     ) anyerror![]u8,
+    load_stored: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        key: []const u8,
+    ) anyerror!?[]u8,
+    load_many_stored: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        keys: []const []const u8,
+    ) anyerror![]?[]u8 = null,
 };
 
 pub const MatchAllCandidateCollector = struct {
@@ -5254,6 +5265,54 @@ pub fn searchMatchAll(
     defer native_constraints.deinit(alloc);
     try applyMatchAllDocIdConstraintsAlloc(alloc, &candidates, &native_constraints);
 
+    const needs_stored_pattern_filter =
+        req.filter_query_json.len > 0 or
+        req.exclusion_query_json.len > 0 or
+        req.resolved_doc_filter != null;
+    if (needs_stored_pattern_filter) {
+        var hits = try alloc.alloc(types.SearchHit, candidates.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (hits[0..initialized]) |*hit| hit.deinit(alloc);
+            if (hits.len > 0) alloc.free(hits);
+        }
+        for (candidates.items, 0..) |*candidate, i| {
+            hits[i] = .{
+                .id = candidate.id,
+                .doc_ordinal = candidate.ordinal,
+                .score = 1.0,
+                .stored_data = null,
+            };
+            candidate.id = @constCast(&[_]u8{});
+            initialized += 1;
+        }
+
+        var filtered = try result_shape.applyStoredSearchPatternFilters(alloc, req, .{
+            .alloc = alloc,
+            .hits = hits,
+            .total_hits = @intCast(hits.len),
+            .graph_results = &.{},
+        }, .{
+            .ctx = executor.ctx,
+            .load_stored = executor.load_stored,
+            .load_many_stored = executor.load_many_stored,
+            .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+            .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        });
+        var filtered_owned = true;
+        errdefer if (filtered_owned) filtered.deinit();
+
+        var paged = try pageSearchResultInPlace(alloc, filtered, componentPaging(req));
+        filtered_owned = false;
+        errdefer paged.deinit();
+        if (req.include_stored) {
+            for (paged.hits) |*hit| {
+                hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+            }
+        }
+        return paged;
+    }
+
     const paging = componentPaging(req);
 
     const total_hits: u32 = @intCast(candidates.items.len);
@@ -6181,6 +6240,22 @@ fn testMatchAllLoadProjectedCallback(
     return error.UnexpectedTestCall;
 }
 
+fn testMatchAllLoadStoredCallback(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    key: []const u8,
+) anyerror!?[]u8 {
+    const json = if (std.mem.eql(u8, key, "doc:a"))
+        "{\"tier\":\"gold\"}"
+    else if (std.mem.eql(u8, key, "doc:b"))
+        "{\"tier\":\"silver\"}"
+    else if (std.mem.eql(u8, key, "doc:c"))
+        "{\"tier\":\"gold\"}"
+    else
+        return null;
+    return try alloc.dupe(u8, json);
+}
+
 fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {
     return .{
         .ctx = @constCast(ctx),
@@ -6190,6 +6265,7 @@ fn testMatchAllExecutor(ctx: *const TestMatchAllCtx) MatchAllExecutor {
         .resolve_doc_ids_to_doc_set = testResolveDocIdsToDocSetCallback,
         .live_filter_doc_set = testLiveFilterDocSetCallback,
         .load_projected_document = testMatchAllLoadProjectedCallback,
+        .load_stored = testMatchAllLoadStoredCallback,
     };
 }
 
@@ -6293,6 +6369,28 @@ test "match_all consumes resolved ordinal filters without doc id projection" {
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:b", result.hits[0].id);
+}
+
+test "match_all applies stored pattern filters before paging" {
+    const alloc = std.testing.allocator;
+    const ctx = TestMatchAllCtx{
+        .ids = &.{ "doc:a", "doc:b", "doc:c" },
+        .ordinals = &.{ 1, 2, 3 },
+    };
+
+    var executor = testMatchAllExecutor(&ctx);
+    executor.live_filter_doc_set = null;
+    var result = try searchMatchAll(alloc, .{
+        .filter_query_json = "{\"term\":{\"tier\":\"gold\"}}",
+        .include_stored = false,
+        .limit = 1,
+        .offset = 1,
+    }, executor);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqualStrings("doc:c", result.hits[0].id);
 }
 
 fn testResolveDocSetDocIdsCallback(

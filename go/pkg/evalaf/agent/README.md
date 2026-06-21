@@ -176,10 +176,10 @@ func main() {
 }
 ```
 
-## Evaluating Antfly's Answer Agent
+## Evaluating Antfly's Retrieval Agent
 
 ```go
-func evaluateAntflyAnswerAgent() {
+func evaluateAntflyRetrievalAgent() {
     ctx := context.Background()
 
     // Create evaluators
@@ -200,11 +200,11 @@ func evaluateAntflyAnswerAgent() {
         },
     })
 
-    // Target function calls Antfly Answer Agent
+    // Target function calls Antfly Retrieval Agent
     target := func(ctx context.Context, example eval.Example) (any, error) {
-        // Call /api/v1/agents/answer
+        // Call /db/v1/agents/retrieval
         resp, err := http.Post(
-            "http://localhost:3210/api/v1/agents/answer",
+            "http://localhost:3210/db/v1/agents/retrieval",
             "application/json",
             createAgentRequest(example.Input),
         )

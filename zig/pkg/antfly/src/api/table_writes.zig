@@ -36,6 +36,8 @@ const hbc_mod = @import("../storage/hbc_adapter.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
+const ha_primary_mod = @import("../storage/ha/primary.zig");
+const ha_write_gate_mod = @import("../storage/ha/write_gate.zig");
 const storage_schema = @import("../storage/schema.zig");
 const lmdb = @import("../storage/lmdb.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -415,6 +417,14 @@ pub const ProvisionedTableWriteCache = struct {
     /// managed DB gets a group-specific `PromotionOwner` so only the local leader
     /// promotes resolution replay into cross-shard entity writes.
     promotion_leadership_source: ?PromotionLeadershipSource = null,
+    /// Optional HA ownership gate applied when this cache opens managed writer
+    /// DBs. Changing the gate retires live cached DBs so the next operation
+    /// reopens with the correct primary/standby role and background runtimes.
+    ha_write_gate: ?db_mod.HAWriteGate = null,
+    /// Optional HA primary mirror applied when this cache opens managed writer
+    /// DBs. Changing the mirror retires live cached DBs so already-open tables
+    /// cannot silently continue without primary-side replication.
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     open_mutex: std.atomic.Mutex = .unlocked,
     entry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -645,6 +655,61 @@ pub const ProvisionedTableWriteCache = struct {
         return a.?.ptr == b.?.ptr and a.?.vtable == b.?.vtable;
     }
 
+    fn haWriteGatesEqual(a: ?db_mod.HAWriteGate, b: ?db_mod.HAWriteGate) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return switch (a.?) {
+            .primary => |left| switch (b.?) {
+                .primary => |right| left == right,
+                .fenced_primary => false,
+                .standby => false,
+            },
+            .fenced_primary => |left| switch (b.?) {
+                .primary => false,
+                .fenced_primary => |right| left.primary == right.primary and
+                    left.fence_store == right.fence_store and
+                    std.mem.eql(u8, left.node_id, right.node_id),
+                .standby => false,
+            },
+            .standby => |left| switch (b.?) {
+                .primary => false,
+                .fenced_primary => false,
+                .standby => |right| left == right,
+            },
+        };
+    }
+
+    fn syncPoliciesEqual(a: ha_primary_mod.SyncPolicy, b: ha_primary_mod.SyncPolicy) bool {
+        if (a.mode != b.mode or
+            a.selection != b.selection or
+            a.required != b.required or
+            a.failure_policy != b.failure_policy or
+            a.standby_names.len != b.standby_names.len)
+        {
+            return false;
+        }
+        for (a.standby_names, b.standby_names) |left, right| {
+            if (!std.mem.eql(u8, left, right)) return false;
+        }
+        return true;
+    }
+
+    fn haAsyncMirrorsEqual(a: ?db_mod.HAAsyncEffectMirror, b: ?db_mod.HAAsyncEffectMirror) bool {
+        if (a == null or b == null) return a == null and b == null;
+        const left = a.?;
+        const right = b.?;
+        return left.primary == right.primary and
+            left.last_lsn == right.last_lsn and
+            left.failure_count == right.failure_count and
+            syncPoliciesEqual(left.sync_policy, right.sync_policy) and
+            left.sync_wait_ctx == right.sync_wait_ctx and
+            left.sync_wait_fn == right.sync_wait_fn and
+            left.last_gate_lsn == right.last_gate_lsn and
+            left.last_gate_action == right.last_gate_action and
+            left.sync_reject_count == right.sync_reject_count and
+            left.sync_wait_count == right.sync_wait_count and
+            left.sync_degraded_count == right.sync_degraded_count;
+    }
+
     fn runtimeHooksEqual(
         self: *const ProvisionedTableWriteCache,
         candidate_source: ?db_mod.CandidateSource,
@@ -667,6 +732,46 @@ pub const ProvisionedTableWriteCache = struct {
         self.entity_sink = entity_sink_value;
         self.promotion_leadership_source = leadership_source;
         self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setResolutionCandidateSource(self: *ProvisionedTableWriteCache, source: ?db_mod.CandidateSource) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (candidateSourcesEqual(self.resolution_candidate_source, source)) return;
+        self.resolution_candidate_source = source;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setEntitySink(self: *ProvisionedTableWriteCache, sink: ?db_mod.EntitySink) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (entitySinksEqual(self.entity_sink, sink)) return;
+        self.entity_sink = sink;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setPromotionLeadershipSource(self: *ProvisionedTableWriteCache, source: ?PromotionLeadershipSource) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (promotionLeadershipSourcesEqual(self.promotion_leadership_source, source)) return;
+        self.promotion_leadership_source = source;
+        self.refreshRuntimeHooksLocked();
+    }
+
+    pub fn setHAWriteGate(self: *ProvisionedTableWriteCache, gate: ?db_mod.HAWriteGate) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (haWriteGatesEqual(self.ha_write_gate, gate)) return;
+        self.ha_write_gate = gate;
+        self.clear();
+    }
+
+    pub fn setHAMirror(self: *ProvisionedTableWriteCache, mirror: ?db_mod.HAAsyncEffectMirror) void {
+        lockAtomic(&self.open_mutex);
+        defer self.open_mutex.unlock();
+        if (haAsyncMirrorsEqual(self.ha_async_mirror, mirror)) return;
+        self.ha_async_mirror = mirror;
+        self.clear();
     }
 
     const ActiveBulkIngestSession = struct {
@@ -854,7 +959,10 @@ pub const ProvisionedTableWriteCache = struct {
                 antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
                 identity_namespace: ?doc_identity.Namespace,
+                ha_write_gate: ?db_mod.HAWriteGate,
+                ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
             ) !OpenedDb {
+                const effective_ha_mirror = haMirrorForManagedDbOpenMode(open_mode, ha_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
                     try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                         allocator,
@@ -870,7 +978,13 @@ pub const ProvisionedTableWriteCache = struct {
                         secret_store,
                         null,
                         identity_namespace,
-                        .{ .drain_resolver_backfill = false },
+                        .{
+                            .drain_resolver_backfill = false,
+                            .ha_write_gate = ha_write_gate,
+                            .ha_async_effect_mirror = effective_ha_mirror,
+                            .ha_async_batch_mirror = effective_ha_mirror,
+                            .ha_async_metadata_mirror = effective_ha_mirror,
+                        },
                     )
                 else
                     try db_mod.DB.open(allocator, db_path, .{
@@ -881,6 +995,10 @@ pub const ProvisionedTableWriteCache = struct {
                         .backend_runtime = runtime,
                         .identity_namespace = identity_namespace,
                         .prefer_existing_identity_namespace = identity_namespace != null,
+                        .ha_write_gate = ha_write_gate,
+                        .ha_async_effect_mirror = effective_ha_mirror,
+                        .ha_async_batch_mirror = effective_ha_mirror,
+                        .ha_async_metadata_mirror = effective_ha_mirror,
                         .open_mode = switch (open_mode) {
                             .default => .writer,
                             .default_async, .writer_no_replay => .writer_no_replay,
@@ -920,6 +1038,8 @@ pub const ProvisionedTableWriteCache = struct {
                 self.antfly_provider,
                 self.secret_store,
                 identity_namespace,
+                self.ha_write_gate,
+                self.ha_async_mirror,
             );
             const owned_db = try self.alloc.create(db_mod.DB);
             errdefer self.alloc.destroy(owned_db);
@@ -962,6 +1082,8 @@ pub const ProvisionedTableWriteCache = struct {
             self.antfly_provider,
             self.secret_store,
             identity_namespace,
+            self.ha_write_gate,
+            self.ha_async_mirror,
         );
         errdefer opened.db.close();
         const start_bulk_session = opened.start_bulk_session and self.bulkIngestSessionActiveForTable(table_name);
@@ -3142,6 +3264,8 @@ pub const ProvisionedTableWriteSource = struct {
     resolution_candidate_source: ?db_mod.CandidateSource = null,
     entity_sink: ?db_mod.EntitySink = null,
     promotion_leadership_source: ?ProvisionedTableWriteCache.PromotionLeadershipSource = null,
+    ha_write_gate: ?db_mod.HAWriteGate = null,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror = null,
     dirty_write_tables_mutex: std.atomic.Mutex = .unlocked,
     dirty_write_table_count: std.atomic.Value(u32) = .init(0),
     startup_catch_up_active: std.atomic.Value(bool) = .init(false),
@@ -3247,6 +3371,26 @@ pub const ProvisionedTableWriteSource = struct {
     ) *ProvisionedTableWriteSource {
         self.promotion_leadership_source = leadership_source;
         self.syncRuntimeHooksToCaches();
+        return self;
+    }
+
+    pub fn withHAWriteGate(
+        self: *ProvisionedTableWriteSource,
+        gate: ?db_mod.HAWriteGate,
+    ) *ProvisionedTableWriteSource {
+        self.ha_write_gate = gate;
+        if (self.write_cache) |cache| cache.setHAWriteGate(gate);
+        if (self.startup_write_cache) |cache| cache.setHAWriteGate(gate);
+        return self;
+    }
+
+    pub fn withHAMirror(
+        self: *ProvisionedTableWriteSource,
+        mirror: ?db_mod.HAAsyncEffectMirror,
+    ) *ProvisionedTableWriteSource {
+        self.ha_async_mirror = mirror;
+        if (self.write_cache) |cache| cache.setHAMirror(mirror);
+        if (self.startup_write_cache) |cache| cache.setHAMirror(mirror);
         return self;
     }
 
@@ -3846,6 +3990,7 @@ pub const ProvisionedTableWriteSource = struct {
             prepared_open.?.schema_json = metadata.schema_json;
         }
 
+        const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, self.ha_async_mirror);
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
             try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 cache.alloc,
@@ -3861,7 +4006,13 @@ pub const ProvisionedTableWriteSource = struct {
                 self.secret_store,
                 cache.remote_content,
                 identity_namespace,
-                .{ .drain_resolver_backfill = false },
+                .{
+                    .drain_resolver_backfill = false,
+                    .ha_write_gate = self.ha_write_gate,
+                    .ha_async_effect_mirror = effective_ha_mirror,
+                    .ha_async_batch_mirror = effective_ha_mirror,
+                    .ha_async_metadata_mirror = effective_ha_mirror,
+                },
             )
         else
             try db_mod.DB.open(cache.alloc, path, .{
@@ -3872,6 +4023,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .backend_runtime = cache.backend_runtime,
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = identity_namespace != null,
+                .ha_write_gate = self.ha_write_gate,
+                .ha_async_effect_mirror = effective_ha_mirror,
+                .ha_async_batch_mirror = effective_ha_mirror,
+                .ha_async_metadata_mirror = effective_ha_mirror,
                 .open_mode = switch (mode) {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
@@ -4345,7 +4500,7 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         }
 
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         db.close();
     }
 
@@ -4483,6 +4638,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id)
             else
                 null;
+            const effective_ha_mirror = haMirrorForManagedDbOpenMode(startup_open_mode, self.ha_async_mirror);
             uncached_db = if (indexes_json) |value|
                 try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
@@ -4498,7 +4654,13 @@ pub const ProvisionedTableWriteSource = struct {
                     self.secret_store,
                     self.remote_content,
                     identity_namespace,
-                    .{ .drain_resolver_backfill = false },
+                    .{
+                        .drain_resolver_backfill = false,
+                        .ha_write_gate = self.ha_write_gate,
+                        .ha_async_effect_mirror = effective_ha_mirror,
+                        .ha_async_batch_mirror = effective_ha_mirror,
+                        .ha_async_metadata_mirror = effective_ha_mirror,
+                    },
                 )
             else
                 try db_mod.DB.open(alloc, path, .{
@@ -4512,6 +4674,10 @@ pub const ProvisionedTableWriteSource = struct {
                     .text_merge = .{ .enabled = false },
                     .identity_namespace = identity_namespace,
                     .prefer_existing_identity_namespace = identity_namespace != null,
+                    .ha_write_gate = self.ha_write_gate,
+                    .ha_async_effect_mirror = effective_ha_mirror,
+                    .ha_async_batch_mirror = effective_ha_mirror,
+                    .ha_async_metadata_mirror = effective_ha_mirror,
                 });
             errdefer if (uncached_db) |*owned| owned.close();
             try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &uncached_db.?);
@@ -5594,6 +5760,13 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_change_hook) |hook| hook.on_change(hook.ptr, table_name, kind);
     }
 
+    fn changeKindForHARecord(record: db_mod.HAReplicationRecordView) LocalChangeKind {
+        return switch (record.kind) {
+            .metadata_mutation => .structural,
+            else => .data,
+        };
+    }
+
     fn publishRestoreRepairComplete(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         self.invalidateReadCache(table_name);
         self.invalidateWriteCacheForTable(table_name);
@@ -5852,6 +6025,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return null;
@@ -5865,6 +6039,7 @@ pub const ProvisionedTableWriteSource = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         lockAtomic(&self.local_db_mutex);
         defer self.local_db_mutex.unlock();
         const cache = self.write_cache orelse return null;
@@ -5922,6 +6097,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: tables_api.CreateTableRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         std.log.info("provisioned create table local begin table={s}", .{table_name});
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
@@ -5997,6 +6173,7 @@ pub const ProvisionedTableWriteSource = struct {
         schema_json: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
             self.catalog,
@@ -6018,7 +6195,7 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try applyLocalTableSchemaJson(alloc, &db, schema_json);
@@ -6039,6 +6216,7 @@ pub const ProvisionedTableWriteSource = struct {
         _: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
         const managed_visibility_changed = try reconcileLocalTableIndexCreate(self, alloc, table_name, index_name);
@@ -6057,6 +6235,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginLocalStructuralMutation(table_name);
         errdefer self.abortLocalStructuralMutation(table_name);
         runTestBeforeDropIndexWorkHook();
@@ -6072,6 +6251,7 @@ pub const ProvisionedTableWriteSource = struct {
         group_ids: []const u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (group_ids.len == 0) return null;
 
         self.beginLocalStructuralMutation(table_name);
@@ -6370,7 +6550,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer cached.deinit(alloc);
             try applyGroupBatchWithSchemaJson(alloc, cached.db, cached.schema_json, group, req);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group.group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group.group_id, &db);
             try applyGroupBatch(alloc, self.catalog, &db, table_name, group, req);
@@ -6385,6 +6565,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         lockAtomic(&self.local_db_mutex);
@@ -6478,7 +6659,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
         if (plan.format == .portable) {
             return try exportPortableBackupShard(alloc, &db, plan.backup_root, plan.backup_id, group_id);
@@ -6514,6 +6695,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableRestorePlan,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (plan.manifest.shards.len == 0) return error.UnsupportedBackupFormat;
 
         const local_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
@@ -6591,6 +6773,7 @@ pub const ProvisionedTableWriteSource = struct {
         _: db_mod.types.SyncLevel,
     ) !?distributed_txn.CommitOutcome {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
         const commit_version = begin_timestamp + 1;
         return try distributed_txn.executeMultiTableCommit(
@@ -6613,6 +6796,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.BatchRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroupLocal(alloc, group_id, table_name, req);
             return {};
@@ -6667,7 +6851,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
             self.notifyLocalChange(table_name, .data);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
@@ -6678,6 +6862,49 @@ pub const ProvisionedTableWriteSource = struct {
             self.markWriteCacheDirty(table_name);
             self.local_db_mutex.unlock();
             self.notifyLocalChange(table_name, .data);
+        }
+    }
+
+    pub fn applyHAReplicationRecordGroupLocal(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        record: db_mod.HAReplicationRecordView,
+    ) !void {
+        self.beginGroupOperation(table_name, group_id);
+        defer self.endGroupOperation(table_name, group_id);
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+
+        if (self.write_cache) |cache| {
+            var cached = try self.getOrOpenCachedDbMode(
+                alloc,
+                cache,
+                path,
+                group_id,
+                table_name,
+                .default_async,
+                null,
+                null,
+            );
+            defer cached.deinit(alloc);
+            try cached.db.applyHAReplicationRecord(record);
+            lockAtomic(&self.local_db_mutex);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            self.notifyLocalChange(table_name, changeKindForHARecord(record));
+        } else {
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
+            defer db.close();
+            try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            try db.applyHAReplicationRecord(record);
+            self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
+            lockAtomic(&self.local_db_mutex);
+            self.markWriteCacheDirty(table_name);
+            self.local_db_mutex.unlock();
+            self.notifyLocalChange(table_name, changeKindForHARecord(record));
         }
     }
 
@@ -6713,12 +6940,13 @@ pub const ProvisionedTableWriteSource = struct {
             try cached.db.waitForCurrentSyncLevel(sync_level);
             self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
         } else {
-            var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+            var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try db.waitForCurrentSyncLevel(sync_level);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
+        self.notifyLocalChange(table_name, .data);
     }
 
     fn finishTransientManagedDbWriteBeforeClose(
@@ -6752,12 +6980,13 @@ pub const ProvisionedTableWriteSource = struct {
         participants: []const []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
@@ -6774,12 +7003,13 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         try table_catalog.validateTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
@@ -6797,6 +7027,7 @@ pub const ProvisionedTableWriteSource = struct {
         commit_version: u64,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
         if (status == .committed) {
@@ -6813,7 +7044,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try db.resolveTransactionIntents(txn_id, status, commit_version);
@@ -6842,7 +7073,7 @@ pub const ProvisionedTableWriteSource = struct {
         defer self.endGroupOperation(table_name, group_id);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
         try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
         try recoverProvisionedTransactionsOnce(self, alloc, &db);
@@ -7033,6 +7264,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         lockAtomic(&self.local_db_mutex);
@@ -7070,7 +7302,7 @@ pub const ProvisionedTableWriteSource = struct {
                         return;
                     }
                 } else {
-                    var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+                    var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
                     defer db.close();
                     try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
                     if (try corruptEmbeddingArtifactInDb(alloc, &db, doc_key, index_name)) {
@@ -7189,6 +7421,7 @@ pub const ProvisionedTableWriteSource = struct {
         artifact_name: []const u8,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7225,7 +7458,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+                try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.reprocessDocumentArtifact(alloc, doc_key, artifact_name);
@@ -7252,6 +7485,7 @@ pub const ProvisionedTableWriteSource = struct {
         update: db_mod.types.DocumentArtifactChildRangePlacementUpdate,
     ) !?bool {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7288,7 +7522,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+                try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.updateDocumentArtifactChildRangePlacement(alloc, doc_key, artifact_name, update);
@@ -7315,6 +7549,7 @@ pub const ProvisionedTableWriteSource = struct {
         child_batch: db_mod.DocumentArtifactChildRangeApplyBatch,
     ) !?u64 {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7351,7 +7586,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+                try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const result = try db.applyDocumentArtifactChildRangeBatch(child_batch);
@@ -7377,6 +7612,7 @@ pub const ProvisionedTableWriteSource = struct {
         req: db_mod.types.DocumentArtifactTableReprocessRequest,
     ) !?db_mod.types.DocumentArtifactTableReprocessResult {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginTableRequest(table_name);
         defer self.endTableRequest(table_name);
         self.beginGroupOperation(table_name, group_id);
@@ -7413,7 +7649,7 @@ pub const ProvisionedTableWriteSource = struct {
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
                 )
             else
-                try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+                try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             const range_result = try db.reprocessDocumentArtifactRange(alloc, artifact_name, req);
@@ -7431,6 +7667,21 @@ pub const ProvisionedTableWriteSource = struct {
         return result;
     }
 };
+
+fn enforceHAWriteGateOptional(gate: ?db_mod.HAWriteGate) !void {
+    const configured = gate orelse return;
+    const decision = switch (configured) {
+        .primary => |primary| try ha_write_gate_mod.evaluatePrimary(primary, .{}),
+        .fenced_primary => |gate_value| try ha_write_gate_mod.evaluateFencedPrimary(gate_value, .{}),
+        .standby => |standby| try ha_write_gate_mod.evaluateStandby(standby, .{}),
+    };
+    switch (decision.action) {
+        .allow_write => return,
+        .reject_read_only_standby => return error.HAReadOnlyStandby,
+        .open_promoted_primary => return error.HAPromotedStandbyRequiresPrimaryOpen,
+        .reject_fenced_primary => return error.HAFencedPrimary,
+    }
+}
 
 pub const HostedProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
@@ -7575,6 +7826,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             prepared_open.?.schema_json = metadata.schema_json;
         }
 
+        const effective_ha_mirror = haMirrorForManagedDbOpenMode(mode, cache.write_cache.ha_async_mirror);
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
             try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 cache.write_cache.alloc,
@@ -7590,7 +7842,13 @@ pub const HostedProvisionedTableWriteSource = struct {
                 cache.write_cache.secret_store,
                 cache.write_cache.remote_content,
                 identity_namespace,
-                .{ .drain_resolver_backfill = false },
+                .{
+                    .drain_resolver_backfill = false,
+                    .ha_write_gate = cache.write_cache.ha_write_gate,
+                    .ha_async_effect_mirror = effective_ha_mirror,
+                    .ha_async_batch_mirror = effective_ha_mirror,
+                    .ha_async_metadata_mirror = effective_ha_mirror,
+                },
             )
         else
             try db_mod.DB.open(cache.write_cache.alloc, path, .{
@@ -7601,6 +7859,10 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .backend_runtime = cache.write_cache.backend_runtime,
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = identity_namespace != null,
+                .ha_write_gate = cache.write_cache.ha_write_gate,
+                .ha_async_effect_mirror = effective_ha_mirror,
+                .ha_async_batch_mirror = effective_ha_mirror,
+                .ha_async_metadata_mirror = effective_ha_mirror,
                 .open_mode = switch (mode) {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
@@ -8683,7 +8945,20 @@ fn openManagedDbForTableGroupWithRuntime(
     group_id: u64,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
-    return try openManagedDbForTableGroupWithCacheAndRuntime(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime);
+    return try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, backend_runtime, null, null);
+}
+
+fn openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, null, null, table_reads.backend_current_root_generation, null, backend_runtime, ha_write_gate, ha_async_mirror);
 }
 
 fn openManagedDbForTableWithCache(
@@ -8734,6 +9009,24 @@ fn openManagedDbForTableGroupWithCacheAndRuntime(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !db_mod.DB {
+    return try openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(alloc, path, catalog, table_name, group_id, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, backend_runtime, null, null);
+}
+
+fn openManagedDbForTableGroupWithCacheAndRuntimeAndHAWriteGate(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    group_id: u64,
+    lsm_cache: ?*lsm_backend.Cache,
+    hbc_cache: ?*hbc_mod.Cache,
+    lsm_root_generation: u64,
+    resource_manager: ?*resource_manager_mod.ResourceManager,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    ha_write_gate: ?db_mod.HAWriteGate,
+    ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
+) !db_mod.DB {
+    const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default, ha_async_mirror);
     const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
         var db = try db_mod.DB.open(alloc, path, .{
@@ -8744,6 +9037,10 @@ fn openManagedDbForTableGroupWithCacheAndRuntime(
             .backend_runtime = backend_runtime,
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
+            .ha_write_gate = ha_write_gate,
+            .ha_async_effect_mirror = effective_ha_mirror,
+            .ha_async_batch_mirror = effective_ha_mirror,
+            .ha_async_metadata_mirror = effective_ha_mirror,
         });
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -8751,7 +9048,27 @@ fn openManagedDbForTableGroupWithCacheAndRuntime(
     };
     defer alloc.free(indexes_json);
 
-    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(alloc, path, indexes_json, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, .default, backend_runtime, identity_namespace);
+    return try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+        alloc,
+        path,
+        indexes_json,
+        lsm_cache,
+        hbc_cache,
+        lsm_root_generation,
+        resource_manager,
+        .default,
+        backend_runtime,
+        null,
+        null,
+        null,
+        identity_namespace,
+        .{
+            .ha_write_gate = ha_write_gate,
+            .ha_async_effect_mirror = effective_ha_mirror,
+            .ha_async_batch_mirror = effective_ha_mirror,
+            .ha_async_metadata_mirror = effective_ha_mirror,
+        },
+    );
 }
 
 fn openManagedDbForTableWithIndexesJson(
@@ -8876,7 +9193,7 @@ fn reconcileUncachedLocalTableIndexCreate(
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var db = try openManagedDbForTableGroupWithRuntime(alloc, path, self.catalog, table_name, group_id, self.backend_runtime);
+        var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
         defer db.close();
 
         try catchUpManagedIndexCreate(alloc, &db, index_name);
@@ -9271,6 +9588,13 @@ const ManagedDbOpenMode = enum {
     status_only,
 };
 
+fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAAsyncEffectMirror) ?db_mod.HAAsyncEffectMirror {
+    return switch (mode) {
+        .default, .default_async, .writer_no_replay => mirror,
+        .startup_catch_up, .restore_repair, .query_readonly, .status_only => null,
+    };
+}
+
 fn openManagedDbWithIndexesJsonAndCacheMode(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -9414,6 +9738,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
 
 const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
+    ha_write_gate: ?db_mod.HAWriteGate = null,
+    ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
+    ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
+    ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
 };
 
 fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -9510,6 +9838,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             store: ?*common_secrets.FileStore,
             remote: ?*const scraping.RemoteContentConfig,
             namespace: ?doc_identity.Namespace,
+            open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
@@ -9522,6 +9851,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 .identity_namespace = namespace,
                 .prefer_existing_identity_namespace = namespace != null,
                 .enrichment = enrichment_cfg,
+                .ha_write_gate = open_options.ha_write_gate,
+                .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
+                .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
+                .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
             };
             return switch (open_mode) {
                 .default => if (enrichment_cfg != null)
@@ -9537,6 +9870,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .ha_write_gate = open_options.ha_write_gate,
+                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
+                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
+                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                     }),
                 .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -9550,6 +9887,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
+                        .ha_write_gate = open_options.ha_write_gate,
+                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
+                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
+                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .open_mode = .writer_no_replay,
                         // The managed write cache opens DBs synchronously while
                         // table/index metadata can still be settling. Keep
@@ -9568,6 +9909,10 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .ha_write_gate = open_options.ha_write_gate,
+                        .ha_async_effect_mirror = open_options.ha_async_effect_mirror,
+                        .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
+                        .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -9581,6 +9926,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .remote_content = remote,
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
+                    .ha_write_gate = open_options.ha_write_gate,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
                     .start_optional_runtimes = false,
@@ -9600,6 +9946,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
+                        .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -9617,6 +9964,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -9635,6 +9983,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
+                        .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .query_readonly,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -9652,6 +10001,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .query_readonly,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -9670,6 +10020,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
+                        .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -9687,6 +10038,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .remote_content = remote,
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
+                        .ha_write_gate = open_options.ha_write_gate,
                         .open_mode = .status_only,
                         .start_index_workers = false,
                         .ttl_cleanup = .{ .enabled = false },
@@ -9699,7 +10051,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
 
     var db = blk: {
         const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
-        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
+        const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
         enrichments.dense = null;
         enrichments.sparse = null;
         enrichments.asset_runtime = null;
@@ -9725,7 +10077,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
-            const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace);
+            const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);
             enrichments.dense = null;
             enrichments.sparse = null;
             enrichments.asset_runtime = null;
@@ -12902,7 +13254,7 @@ test "auto bulk group writes release leases so idle finish can publish" {
                     .description = "docs table",
                     .schema_json = "",
                     .read_schema_json = "",
-                    .indexes_json = "{\"dense_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
                     .replication_sources_json = "[]",
                     .placement_role = "data",
                 }})[0..]),
@@ -12931,7 +13283,8 @@ test "auto bulk group writes release leases so idle finish can publish" {
     source.write_cache = &write_cache;
     source.runtime_status_cache = &snapshot_cache;
 
-    const batch_size = 250;
+    const batch_size = auto_bulk_ingest_min_batch_ops;
+    const total_docs = batch_size;
     const writes = try alloc.alloc(db_mod.types.BatchWrite, batch_size);
     defer {
         for (writes) |write| {
@@ -12943,12 +13296,12 @@ test "auto bulk group writes release leases so idle finish can publish" {
     for (writes, 0..) |*write, i| {
         write.* = .{
             .key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{i}),
-            .value = try std.fmt.allocPrint(alloc, "{{\"_embeddings\":{{\"dense_idx\":[1.0,0.0]}}}}", .{}),
+            .value = try std.fmt.allocPrint(alloc, "{{\"body\":\"auto bulk doc {d}\"}}", .{i}),
         };
     }
 
     var offset: usize = 0;
-    while (offset < 1000) : (offset += batch_size) {
+    while (offset < total_docs) : (offset += batch_size) {
         for (writes, 0..) |*write, i| {
             alloc.free(@constCast(write.key));
             write.key = try std.fmt.allocPrint(alloc, "doc:{d:0>8}", .{offset + i});
@@ -12957,7 +13310,7 @@ test "auto bulk group writes release leases so idle finish can publish" {
         _ = try source.source().batchGroupLocal(alloc, 7001, "docs", .{
             .writes = writes,
             .timestamp_ns = @intCast(offset + 1),
-            .sync_level = .write,
+            .sync_level = .full_index,
         });
 
         try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
@@ -12977,18 +13330,12 @@ test "auto bulk group writes release leases so idle finish can publish" {
     try std.testing.expect(!write_cache.entries.items[0].auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 
-    try write_cache.entries.items[0].db.executor.waitForAll(replay_target);
-    const stats = try write_cache.entries.items[0].db.stats(alloc);
-    defer db_mod.types.freeDBStats(alloc, stats);
-    try std.testing.expectEqual(@as(u64, 1000), stats.indexes[0].doc_count);
-    try std.testing.expectEqual(replay_target, stats.indexes[0].replay_applied_sequence);
-
     try std.testing.expect(source.publishManagedRuntimeStatusBestEffort("docs", 7001, &write_cache.entries.items[0].db));
     var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
-    try std.testing.expectEqual(@as(u64, 1000), statuses.items[0].stats.indexes[0].doc_count);
-    try std.testing.expectEqual(replay_target, statuses.items[0].stats.indexes[0].replay_applied_sequence);
+    try std.testing.expectEqual(@as(usize, 1), statuses.items[0].stats.indexes.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items[0].active_leases);
 }
 
 test "weak-sync group writes publish all docs after background dense catch-up" {
@@ -17923,6 +18270,88 @@ test "provisioned table write source visibility hook publishes owner db status" 
     defer retained.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), retained.items.len);
     try std.testing.expectEqual(@as(u64, 1), retained.items[0].stats.doc_count);
+}
+
+test "provisioned replicated sync marks local runtime status dirty" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Hook = struct {
+        calls: usize = 0,
+        kind: ?ProvisionedTableWriteSource.LocalChangeKind = null,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, kind: ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.kind = kind;
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicated-sync-runtime-dirty", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    source.write_cache = &write_cache;
+    source.runtime_status_cache = &snapshot_cache;
+
+    var hook = Hook{};
+    source.setLocalChangeHook(.{
+        .ptr = &hook,
+        .on_change = Hook.onChange,
+    });
+
+    _ = try source.applyReplicatedBatchGroupLocal(alloc, 7001, "docs", .{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+
+    hook.calls = 0;
+    hook.kind = null;
+    try source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
+
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(ProvisionedTableWriteSource.LocalChangeKind.data, hook.kind.?);
 }
 
 test "provisioned table write source consistent visibility hook does not block on busy apply lock" {

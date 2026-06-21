@@ -44,8 +44,6 @@ This directory tracks major features and architectural changes in Antfly. Each d
 | Feature | Document | Summary |
 |---------|----------|---------|
 | RAG Streaming Evolution | [rag-streaming-evolution.md](completed/rag-streaming-evolution.md) | Token-by-token streaming, multi-table, parallel LLM |
-| Retrieval/Generation Agents | [retrieval-generation-agents.md](completed/retrieval-generation-agents.md) | DFA-based `/agents/retrieval` with tool calling |
-| Generation Mode | [generation-mode-feature.md](completed/generation-mode-feature.md) | `without_generation` flag for retrieval-only mode |
 | Link Processing | [link-processing.md](completed/link-processing.md) | Schema-aware link download: HTML, PDF, images |
 
 ### ML & Termite
@@ -74,8 +72,7 @@ This directory tracks major features and architectural changes in Antfly. Each d
 
 | Feature | Document | Status |
 |---------|----------|--------|
-| Answer Agent Enhancements | [answer-agent-enhancements.md](planned/answer-agent-enhancements.md) | Core agent done; semantic caching, citation verification, feedback loop, etc. not built |
-| Chat Agent Frontend | [chat-agent-frontend-spec.md](planned/chat-agent-frontend-spec.md) | SDK types generated; React components not built |
+| Native Agents And A2A | [A2A.md](../zig/A2A.md) | Canonical bounded-agent, retrieval, query-builder, frontend, and A2A integration design |
 | Audio TTS/STT | [audio.md](planned/audio.md) | STT done (OpenAI, Vertex, Termite); TTS partial (ElevenLabs only) |
 | Separate Termite Packages | [separate-termite-packages.md](planned/separate-termite-packages.md) | Operator/proxy/client separated; core module still at root |
 | Admission Webhooks | [admission-webhooks.md](planned/admission-webhooks.md) | Validation logic exists; webhook infrastructure not wired |

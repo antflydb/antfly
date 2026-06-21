@@ -140,6 +140,10 @@ fn traceMissingWeightDebug() bool {
     return getenvBool("TERMITE_METAL_TRACE_MISSING_WEIGHT");
 }
 
+fn traceKvCacheMiss() bool {
+    return getenvBool("TERMITE_METAL_TRACE_KV_CACHE_MISS");
+}
+
 fn prepareDecodeInputsDebug() bool {
     return getenvBool("TERMITE_METAL_PREPARE_DECODE_INPUTS_DEBUG");
 }
@@ -3027,13 +3031,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const key = dynamicLinearSlotKey(weight, bias, in_dim, out_dim);
         if (self.dynamic_linear_slots.get(key)) |slot| return slot;
         const slot = self.nextFreeDynamicLinearSlot() orelse return null;
+        const weight_buf = toBuf(weight);
+        const retain_dense_fallback = weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null;
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
             .weight = weight,
             .bias = bias,
             .in_dim = in_dim,
             .out_dim = out_dim,
-            .retain_dense_fallback = true,
+            .retain_dense_fallback = retain_dense_fallback,
         }))) return null;
         try self.dynamic_linear_slots.put(self.allocator, key, slot);
         return slot;
@@ -7722,7 +7728,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (try gatherPagedKvLayerFromStorageHost(allocator, storage, kv, token_count, layer_index)) |rows| {
                 return rows;
             }
-            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+            if (traceKvCacheMiss() and !storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
                 std.log.info(
                     "metal backend kv cache miss: no entry seq={d} layer={d} tokens={d} offset={d} source=0x{x}",
                     .{ kv.sequence_id, layer_index, token_count, kv.position_offset, key.source_ptr_id },
@@ -7731,7 +7737,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         if (!backendEntryMatches(entry, token_count, kv.position_offset, entry.row_width, kvViewBlockSignature(kv))) {
-            if (!storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
+            if (traceKvCacheMiss() and !storage.getPool(kv.pool_id).?.config.store_cpu_bytes) {
                 std.log.info(
                     "metal backend kv cache miss: shape/signature mismatch seq={d} layer={d} want_tokens={d} have_tokens={d} want_offset={d} have_offset={d} want_sig=0x{x} have_sig=0x{x} source=0x{x}",
                     .{ kv.sequence_id, layer_index, token_count, entry.token_count, kv.position_offset, entry.position_offset, kvViewBlockSignature(kv), entry.block_signature, key.source_ptr_id },
@@ -11621,6 +11627,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const use_active_paged_block = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
                 (attention.mode == .paged_prefill or enableActiveCompressedQuantBlock());
             const direct_paged_request = .{
+                .layer_index = attention.layer_index,
                 .num_heads = request.num_heads,
                 .num_kv_heads = request.num_kv_heads,
                 .head_dim = request.head_dim,
@@ -15705,6 +15712,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) final_tail_blk: {
             var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
             defer tail_region_scope.deinit();
+            const tail_quant_format = self.preparedLinearMatmulFormatForLinearSlot(
+                request.final_lm_head_slot,
+                request.hidden_size,
+                request.vocab_size,
+            ) orelse break :final_tail_blk;
             var tail_plan_storage = metal_command_planner.TailCommandLowerer{};
             tail_plan_storage.build(.{
                 .final_norm_slot = request.final_norm_slot,
@@ -15713,6 +15725,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .region = @intFromEnum(metal_runtime.ComputeRegion.tail),
                 .hidden_size = request.hidden_size,
                 .vocab_size = request.vocab_size,
+                .quant_format = tail_quant_format,
             }) catch {};
             var planned_tail_op_storage = [_]u16{0} ** 3;
             var planned_tail_barrier_storage = [_]u8{0} ** 3;
@@ -15814,6 +15827,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn activeDecodeFrameDirectBlocksSupported(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimeDecodeRequest,
+    ) bool {
+        const has_ple = switch (request.contract) {
+            .gemma4_gated_ple_shared_kv => true,
+            .gliner_deberta_encoder, .qwen3_dense_text_embedding => false,
+        };
+        for (request.layers, 0..) |layer, layer_index| {
+            if (!metal_runtime.supportsDirectPagedGatedDecoderBlockSlots(self.provider_impl, .{
+                .layer_index = layer_index,
+                .num_heads = request.num_attention_heads,
+                .head_dim = layer.head_dim,
+                .hidden_size = request.hidden_size,
+                .intermediate_size = layer.intermediate_size,
+                .attention_linear_slot = layer.attention_linear_slot,
+                .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
+                .up_ffn_linear_slot = layer.up_ffn_linear_slot,
+                .down_ffn_linear_slot = layer.down_ffn_linear_slot,
+                .has_ple = has_ple,
+                .ple_gate_linear_slot = layer.ple_gate_linear_slot,
+                .ple_proj_linear_slot = layer.ple_proj_linear_slot,
+                .ple_post_norm_slot = layer.ple_post_norm_slot,
+                .ple_hidden_size = request.ple_hidden_size,
+            })) return false;
+        }
+        return true;
+    }
+
     fn decoderRuntimeDecodeOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         self.timing_stats.active_decode_frame_attempts += 1;
@@ -15871,11 +15913,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .gliner_deberta_encoder => return false,
             .qwen3_dense_text_embedding => return false,
         }
+        const active_decode_frame_requested = enableActiveDecodeFrame();
+        if (active_decode_frame_requested and !self.activeDecodeFrameDirectBlocksSupported(request)) {
+            self.timing_stats.active_decode_frame_disabled += 1;
+            return false;
+        }
         if (!metal_runtime.decoderRuntimeReserveGreedyTailScratch(self.provider_impl, request.vocab_size)) {
             self.timing_stats.active_decode_frame_scratch_failures += 1;
             return false;
         }
-        const active_decode_frame_enabled = enableActiveDecodeFrame();
+        const active_decode_frame_enabled = active_decode_frame_requested;
         if (active_decode_frame_enabled) {
             for (request.layers) |layer| {
                 if (layer.head_dim == 0 or layer.kv_heads == 0 or layer.intermediate_size == 0) return false;

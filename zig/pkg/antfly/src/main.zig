@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, subcommand, "inference")) return try cmd.inference.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "serverless")) return try cmd.serverless.runFromIterator(runtimeInit(init), argv0, &args);
     if (std.mem.eql(u8, subcommand, "lite")) return try cmd.lite.runFromIterator(runtimeInit(init), argv0, &args);
+    if (std.mem.eql(u8, subcommand, "ha")) return try cmd.ha.runFromIterator(runtimeInit(init), argv0, &args);
 
     if (std.mem.eql(u8, subcommand, "cloud")) {
         const code = try runAntflyCloud(init.gpa, init.io, &args);
@@ -69,7 +70,10 @@ pub fn main(init: std.process.Init) !void {
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
-            return runCliCommand(init.gpa, cli_cmd, &args);
+            return runCliCommand(init.gpa, cli_cmd, &args) catch |err| switch (err) {
+                error.ApiError => std.process.exit(1),
+                else => return err,
+            };
         }
     }
 
@@ -170,6 +174,7 @@ fn printUsage(argv0: []const u8) void {
         \\  inference
         \\  serverless
         \\  lite           Embedded Antfly Lite databases (*.aflite)
+        \\  ha             Local hot-standby HA administration
         \\
         \\client subcommands:
         \\  table          Manage tables (create, drop, list, get)

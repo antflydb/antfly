@@ -267,7 +267,7 @@ if reportB.Summary.AverageScore > reportA.Summary.AverageScore {
 See the `examples/` directory for complete examples:
 
 - **`examples/simple/`**: Basic evaluation example
-- **`examples/antfly/`**: Antfly RAG and Answer Agent evaluation
+- **`examples/antfly/`**: Antfly RAG and Retrieval Agent evaluation
 - **`examples/searchaf/`**: searchaf integration example
 
 ## Development

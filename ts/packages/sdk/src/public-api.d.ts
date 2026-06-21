@@ -1045,6 +1045,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Stable generated artifact name. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Register or replace an artifact enrichment
+         * @description Registers a table-level generated artifact definition. Reusing the same
+         *     artifact name replaces the existing mapping. Chunk enrichments may set
+         *     `full_text_index: true` to map generated chunk text into the table's
+         *     default full-text index.
+         */
+        put: operations["putArtifactEnrichment"];
+        post?: never;
+        /**
+         * Delete an artifact enrichment
+         * @description Removes the table-level generated artifact definition. Local table
+         *     reconciliation drops no-longer-desired enrichment registrations when it
+         *     is safe to do so.
+         */
+        delete: operations["deleteArtifactEnrichment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs": {
         parameters: {
             query?: never;
@@ -3440,6 +3474,8 @@ export interface components {
         };
         TableStatus: components["schemas"]["Table"] & {
             storage_status: components["schemas"]["StorageStatus"];
+            /** @description Table-level generated artifact enrichments registered outside a specific index. */
+            artifact_enrichments?: components["schemas"]["EnrichmentConfig"][];
         };
         /**
          * @description MongoDB-style update operator
@@ -4453,23 +4489,33 @@ export interface components {
             prune_stats?: components["schemas"]["PruneStats"];
         };
         /**
+         * @description Configuration for the retrieval step. Retrieval tools are constrained by
+         *     the top-level request tools policy when both are present.
+         */
+        RetrievalStepConfig: {
+            /**
+             * @description Tool configuration for the retrieval step. When set, this narrows
+             *     the top-level tools policy for retrieval execution.
+             */
+            tools?: components["schemas"]["ChatToolsConfig"];
+        };
+        /**
          * @description Configuration for the retrieval agent's pipeline steps and tool-use behavior.
          *     Each step can have its own generator (or chain of generators) and step-specific options.
          *     If a step is not configured, it is skipped (retrieval always runs).
          */
         RetrievalAgentSteps: {
             /**
-             * @description Tool configuration for the retrieval agent. Controls which tools
-             *     are available and their settings. If not specified, tools are
-             *     automatically determined from the table's available indexes.
-             */
-            tools?: components["schemas"]["ChatToolsConfig"];
-            /**
              * @description Configuration for query classification and transformation.
              *     When set, runs classification before retrieval to select the optimal
              *     strategy (simple/decompose/step_back/hyde) and transform the query.
              */
             classification?: components["schemas"]["ClassificationStepConfig"];
+            /**
+             * @description Configuration for retrieval tool execution. Retrieval-step tools
+             *     narrow the top-level tools policy when both are provided.
+             */
+            retrieval?: components["schemas"]["RetrievalStepConfig"];
             /**
              * @description Configuration for generation from retrieved documents.
              *     When set, generates a response with citations after retrieval completes.
@@ -4582,7 +4628,13 @@ export interface components {
             generator?: components["schemas"]["GeneratorConfig"];
             /** @description Chain of generators */
             chain?: components["schemas"]["ChainLink"][];
-            /** @description Tool and step configuration */
+            /**
+             * @description Default tool policy for this agent run. Step-specific tool policies
+             *     narrow this default for their step; retrieval currently uses
+             *     steps.retrieval.tools.
+             */
+            tools?: components["schemas"]["ChatToolsConfig"];
+            /** @description Step configuration */
             steps?: components["schemas"]["RetrievalAgentSteps"];
             /**
              * @description Handlebars template for rendering documents in the generation prompt.
@@ -7308,7 +7360,7 @@ export interface components {
         };
         /** @description Configuration for graph index type */
         GraphIndexConfig: {
-            /** @description Configuration for generating node summaries (enables tree navigation in AnswerAgent) */
+            /** @description Configuration for generating node summaries (enables tree navigation in Retrieval Agent) */
             summarizer?: components["schemas"]["GeneratorConfig"];
             /**
              * @description Handlebars template for generating summarizer input text.
@@ -7357,6 +7409,11 @@ export interface components {
             chunk_overlap?: number;
             /** @description Serialized chunker configuration for chunk enrichments. */
             chunker_json?: string;
+            /**
+             * @description When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
+             * @default false
+             */
+            full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
             /** @description Serialized asset producer configuration. */
@@ -7904,11 +7961,10 @@ export interface components {
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
         /**
-         * @description Available tool names for the chat and retrieval agents.
+         * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
          *     - ask_clarification: Ask user for clarification
-         *     - search: Execute semantic searches (legacy, use semantic_search for retrieval)
-         *     - websearch: Search the web (requires websearch_connection or websearch_config)
+         *     - web_search: Search the web (requires web_search_connection or web_search_config)
          *     - fetch: Fetch URL content (subject to security controls)
          *     - semantic_search: Execute semantic/vector search against an index
          *     - full_text_search: Execute full-text BM25 search against an index
@@ -7917,7 +7973,7 @@ export interface components {
          *     - aggregate: Execute aggregations against an index
          * @enum {string}
          */
-        ChatToolName: "add_filter" | "ask_clarification" | "search" | "websearch" | "fetch" | "semantic_search" | "full_text_search" | "tree_search" | "graph_search" | "aggregate";
+        ChatToolName: "add_filter" | "ask_clarification" | "web_search" | "fetch" | "semantic_search" | "full_text_search" | "tree_search" | "graph_search" | "aggregate";
         /**
          * @description The web search provider to use.
          *
@@ -8330,36 +8386,39 @@ export interface components {
             timeout_seconds?: number;
         };
         /**
-         * @description Configuration for chat agent tools.
+         * @description Configuration for retrieval agent tools.
          *
-         *     If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search.
+         *     If `enabled_tools` is empty/omitted, retrieval agents default to all retrieval tools
+         *     available for the request. Explicit retrieval policies should use semantic_search
+         *     for vector retrieval.
          *
          *     For models that don't support native tool calling (e.g., Ollama),
          *     a prompt-based fallback is used with structured output parsing.
          */
         ChatToolsConfig: {
             /**
-             * @description List of tools to enable. If empty, defaults to filter, clarification, and search.
+             * @description List of tools to enable. If empty, retrieval agents default to all retrieval
+             *     tools available for the request.
              * @example [
              *       "add_filter",
-             *       "search",
-             *       "websearch"
+             *       "semantic_search",
+             *       "web_search"
              *     ]
              */
             enabled_tools?: components["schemas"]["ChatToolName"][];
             /**
-             * @description Inline web search provider configuration. Prefer websearch_connection for
+             * @description Inline web search provider configuration. Prefer web_search_connection for
              *     configured production agents; inline config remains useful for CLI/dev
              *     requests. See specs/openapi/antfly/websearch.yaml for provider-specific
              *     options.
              */
-            websearch_config?: components["schemas"]["WebSearchConfig"];
+            web_search_config?: components["schemas"]["WebSearchConfig"];
             /**
              * @description Name of a configured connections.<id> resource with kind web_search.
              *     Request-level tool options may reduce scope, but cannot expand the
              *     connection's configured capabilities or policy.
              */
-            websearch_connection?: string;
+            web_search_connection?: string;
             /**
              * @description URL fetching configuration. See specs/openapi/antfly/websearch.yaml
              *     for available options and security controls.
@@ -8579,7 +8638,7 @@ export interface components {
         };
         /**
          * @description Configuration for inline evaluation of query results.
-         *     Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+         *     Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
          */
         EvalConfig: {
             /** @description List of evaluators to run */
@@ -10374,7 +10433,7 @@ export interface components {
             schema_json?: string;
         };
         /** @enum {string} */
-        ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
+        ExtensionObjectKind: "data_shape" | "table_schema" | "extension_relation" | "generated_artifact" | "index" | "enrichment" | "resolver" | "mcp_tool" | "skill" | "agent" | "query_function" | "api_endpoint" | "a2a_agent" | "auth_policy" | "workflow" | "maintenance_task" | "provider_config" | "text_analyzer" | "text_tokenizer" | "provider_adapter" | "connector" | "index_backend";
         ExtensionObjectDecl: {
             kind: components["schemas"]["ExtensionObjectKind"];
             name: components["schemas"]["ExtensionIdentifier"];
@@ -11931,6 +11990,12 @@ export interface operations {
                  * @example title,author,metadata.tags
                  */
                 fields?: string;
+                /**
+                 * @description Read consistency for the lookup. The default `read_index` routes to
+                 *     the primary for linearizable reads. `stale` allows a hot standby to
+                 *     serve the lookup at its safe-read LSN.
+                 */
+                consistency?: "read_index" | "leader_lease" | "stale";
             };
             header?: never;
             path: {
@@ -12026,6 +12091,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DocumentArtifactTableReprocessResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    putArtifactEnrichment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Stable generated artifact name. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EnrichmentConfig"];
+            };
+        };
+        responses: {
+            /** @description Artifact enrichment registered */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            405: components["responses"]["MethodNotAllowed"];
+            500: components["responses"]["InternalServerError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    deleteArtifactEnrichment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Stable generated artifact name. */
+                artifactName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact enrichment deleted */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": Record<string, never>;
                 };
             };
             400: components["responses"]["BadRequest"];

@@ -50,6 +50,7 @@ func TestSetRuntimeConditionsReportsModelPullFailure(t *testing.T) {
 	modelsReady := meta.FindStatusCondition(pool.Status.Conditions, antflyaiv1alpha1.TypeModelsReady)
 	if modelsReady == nil {
 		t.Fatalf("expected %s condition", antflyaiv1alpha1.TypeModelsReady)
+		return
 	}
 	if modelsReady.Status != metav1.ConditionFalse {
 		t.Fatalf("expected ModelsReady false, got %s", modelsReady.Status)
@@ -85,6 +86,7 @@ func TestSetRuntimeConditionsClearsAfterPodsReady(t *testing.T) {
 		condition := meta.FindStatusCondition(pool.Status.Conditions, conditionType)
 		if condition == nil {
 			t.Fatalf("expected %s condition", conditionType)
+			return
 		}
 		if condition.Status != metav1.ConditionTrue {
 			t.Fatalf("expected %s true, got %s", conditionType, condition.Status)
@@ -138,6 +140,7 @@ func TestUpdateStatusMissingStatefulSetStaysPending(t *testing.T) {
 		condition := meta.FindStatusCondition(updated.Status.Conditions, conditionType)
 		if condition == nil {
 			t.Fatalf("expected %s condition", conditionType)
+			return
 		}
 		if condition.Status != metav1.ConditionFalse {
 			t.Fatalf("expected %s false without StatefulSet, got %s", conditionType, condition.Status)
@@ -156,6 +159,7 @@ func TestUpdateStatusMissingStatefulSetStaysPending(t *testing.T) {
 		condition := meta.FindStatusCondition(updated.Status.Conditions, conditionType)
 		if condition == nil {
 			t.Fatalf("expected %s condition", conditionType)
+			return
 		}
 		if condition.Status != metav1.ConditionUnknown {
 			t.Fatalf("expected %s unknown without StatefulSet, got %s", conditionType, condition.Status)

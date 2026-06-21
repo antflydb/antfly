@@ -395,10 +395,9 @@ const (
 	ChatToolNameFetch            = oapi.ChatToolNameFetch
 	ChatToolNameFullTextSearch   = oapi.ChatToolNameFullTextSearch
 	ChatToolNameGraphSearch      = oapi.ChatToolNameGraphSearch
-	ChatToolNameSearch           = oapi.ChatToolNameSearch
 	ChatToolNameSemanticSearch   = oapi.ChatToolNameSemanticSearch
 	ChatToolNameTreeSearch       = oapi.ChatToolNameTreeSearch
-	ChatToolNameWebsearch        = oapi.ChatToolNameWebsearch
+	ChatToolNameWebSearch        = oapi.ChatToolNameWebSearch
 
 	// FilterSpecOperator values
 	FilterSpecOperatorEq       = oapi.FilterSpecOperatorEq
@@ -550,8 +549,8 @@ const (
 
 // allToolNames is the complete set of valid ChatToolName values.
 var allToolNames = []ChatToolName{
-	ChatToolNameAddFilter, ChatToolNameAskClarification, ChatToolNameSearch,
-	ChatToolNameWebsearch, ChatToolNameFetch,
+	ChatToolNameAddFilter, ChatToolNameAskClarification,
+	ChatToolNameWebSearch, ChatToolNameFetch,
 	ChatToolNameSemanticSearch, ChatToolNameFullTextSearch,
 	ChatToolNameTreeSearch, ChatToolNameGraphSearch, ChatToolNameAggregate,
 }

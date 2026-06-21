@@ -109,6 +109,7 @@ fn nodeHasSafeOnnxShapes(
                 shapeIsConcretePositive(input_shape) and
                 shapeIsConcretePositive(weight_shape);
         },
+        .fused_add_mul_scalar => false,
         .fused_gelu,
         .fused_relu,
         .fused_silu,

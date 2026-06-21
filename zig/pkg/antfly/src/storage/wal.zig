@@ -522,6 +522,56 @@ pub const WAL = struct {
         try txn.commit();
     }
 
+    /// Truncate all entries with LSN > the given value and move the append
+    /// cursor back to keep_lsn + 1. Used by timeline rewind workflows that must
+    /// discard divergent suffix records before following a promoted timeline.
+    pub fn truncateAfter(self: *WAL, keep_lsn: u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        while (self.coordinator_active or self.pending_head != null) {
+            self.mutex.unlock();
+            std.Thread.yield() catch {};
+            lockAtomic(&self.mutex);
+        }
+
+        const next_lsn = try std.math.add(u64, keep_lsn, 1);
+        if (next_lsn >= self.next_lsn) return;
+
+        var txn = try self.beginWriteTxn();
+        errdefer txn.abort();
+
+        var to_delete = std.ArrayListUnmanaged([8]u8).empty;
+        defer to_delete.deinit(std.heap.page_allocator);
+
+        {
+            var cur = try txn.cursor();
+            defer cur.close();
+
+            const start_key = std.mem.toBytes(std.mem.nativeToBig(u64, next_lsn));
+            var maybe_entry = try cur.seekAtOrAfter(&start_key);
+            while (maybe_entry) |entry| {
+                if (entry.key.len != 8) break;
+
+                var key: [8]u8 = undefined;
+                @memcpy(&key, entry.key[0..8]);
+                try to_delete.append(std.heap.page_allocator, key);
+
+                maybe_entry = try cur.next();
+            }
+        }
+
+        for (to_delete.items) |key| {
+            txn.delete(&key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+        }
+        try putNextLsnMeta(&txn, next_lsn);
+        try txn.commit();
+        self.next_lsn = next_lsn;
+    }
+
     /// Iterate entries from a given LSN (inclusive). Caller owns returned slice.
     pub fn iterateFrom(self: *WAL, alloc: Allocator, from_lsn: u64) ![]WalEntry {
         var txn = try self.beginReadTxn();
@@ -554,6 +604,25 @@ pub const WAL = struct {
         }
 
         return try alloc.dupe(WalEntry, entries.items);
+    }
+
+    /// Read one retained entry by exact LSN. Caller owns the returned data.
+    pub fn readAt(self: *WAL, alloc: Allocator, lsn: u64) !?WalEntry {
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        const key = std.mem.toBytes(std.mem.nativeToBig(u64, lsn));
+        const value = txn.get(&key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        const decoded = decodeWalValue(value) catch |err| switch (err) {
+            error.CorruptWal => return error.CorruptWal,
+        };
+        return .{
+            .lsn = lsn,
+            .data = try alloc.dupe(u8, decoded),
+        };
     }
 
     /// Import ScanAction from docstore for consistent API.

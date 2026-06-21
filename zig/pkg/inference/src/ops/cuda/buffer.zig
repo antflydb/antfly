@@ -59,7 +59,11 @@ pub const DeviceBuffer = struct {
         if (len == 0) return .{};
         try ctx.makeCurrent();
         var ptr: driver_mod.CUdeviceptr = 0;
-        try ctx.driver.check(ctx.driver.fns.cuMemAlloc(&ptr, len));
+        const result = ctx.driver.fns.cuMemAlloc(&ptr, len);
+        if (result != driver_mod.CUDA_SUCCESS) {
+            std.log.err("CUDA cuMemAlloc failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
+            return error.CudaDriverError;
+        }
         return .{ .ptr = ptr, .len = len };
     }
 
@@ -76,20 +80,32 @@ pub const DeviceBuffer = struct {
         if (bytes.len > self.len) return error.InvalidCudaState;
         if (bytes.len == 0) return;
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuMemcpyHtoDAsync(self.ptr, bytes.ptr, bytes.len, ctx.stream));
+        const result = ctx.driver.fns.cuMemcpyHtoDAsync(self.ptr, bytes.ptr, bytes.len, ctx.stream);
+        if (result != driver_mod.CUDA_SUCCESS) {
+            std.log.err("CUDA cuMemcpyHtoDAsync failed: bytes={d} error={s} ({s})", .{ bytes.len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
+            return error.CudaDriverError;
+        }
     }
 
     pub fn copyToHost(self: DeviceBuffer, ctx: *context_mod.CudaContext, bytes: []u8) driver_mod.Error!void {
         if (bytes.len > self.len) return error.InvalidCudaState;
         if (bytes.len == 0) return;
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuMemcpyDtoHAsync(bytes.ptr, self.ptr, bytes.len, ctx.stream));
+        const result = ctx.driver.fns.cuMemcpyDtoHAsync(bytes.ptr, self.ptr, bytes.len, ctx.stream);
+        if (result != driver_mod.CUDA_SUCCESS) {
+            std.log.err("CUDA cuMemcpyDtoHAsync failed: bytes={d} error={s} ({s})", .{ bytes.len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
+            return error.CudaDriverError;
+        }
     }
 
     pub fn copyFromDevice(self: DeviceBuffer, ctx: *context_mod.CudaContext, src: DeviceBuffer, len: usize) driver_mod.Error!void {
         if (len > self.len or len > src.len) return error.InvalidCudaState;
         if (len == 0) return;
         try ctx.makeCurrent();
-        try ctx.driver.check(ctx.driver.fns.cuMemcpyDtoDAsync(self.ptr, src.ptr, len, ctx.stream));
+        const result = ctx.driver.fns.cuMemcpyDtoDAsync(self.ptr, src.ptr, len, ctx.stream);
+        if (result != driver_mod.CUDA_SUCCESS) {
+            std.log.err("CUDA cuMemcpyDtoDAsync failed: bytes={d} error={s} ({s})", .{ len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
+            return error.CudaDriverError;
+        }
     }
 };

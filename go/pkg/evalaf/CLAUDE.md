@@ -50,8 +50,8 @@ The codebase follows a layered architecture with minimal dependencies at the cor
   - Preset configurations (Quick, Safety, Privacy, Security, Comprehensive, LLM Judge, Hybrid)
 
 - **`antfly/`**: Antfly-specific integration
-  - Target functions for calling Antfly RAG and Answer Agent endpoints
-  - Preset evaluator configurations (Quick, RAG, AnswerAgent, Comprehensive)
+  - Target functions for calling Antfly RAG and Retrieval Agent endpoints
+  - Preset evaluator configurations (Quick, RAG, RetrievalAgent, Comprehensive)
   - Citation parsers for Antfly's `[doc_id X]` format
 
 - **`ui/`**: UI embedding helpers for dashboard integration
@@ -80,7 +80,7 @@ This decouples the evaluation framework from the system being tested.
 *Antfly presets:*
 - `QuickEvaluatorPreset()`: Fast, no LLM calls (citations, classification)
 - `RAGEvaluatorPreset()`: RAG-focused (citations + LLM-as-judge for faithfulness/relevance)
-- `AnswerAgentEvaluatorPreset()`: Agent-focused (classification + confidence + quality)
+- `RetrievalAgentEvaluatorPreset()`: Agent-focused (classification + confidence + quality)
 - `ComprehensiveEvaluatorPreset()`: All evaluators combined
 
 *Red-team presets:*
@@ -270,7 +270,7 @@ g, _ := genkit.Init(ctx,
 
 ### Antfly Integration
 
-For evaluating Antfly RAG/Answer Agent:
+For evaluating Antfly RAG/Retrieval Agent:
 
 ```go
 client := antfly.NewClient("http://localhost:3210")

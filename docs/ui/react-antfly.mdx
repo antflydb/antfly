@@ -378,13 +378,13 @@ import { replaceCitations } from '@antfly/components';
 />
 ```
 
-## Answer Agent
+## Retrieval Agent
 
-The Answer Agent is Antfly's advanced Q&A system that provides query classification, reasoning, answers, and follow-up questions.
+The Retrieval Agent is Antfly's advanced Q&A system. It provides query classification, reasoning, retrieval, generation, confidence scoring, and follow-up questions through `/agents/retrieval`.
 
 ### AnswerResults
 
-The `<AnswerResults>` component displays Answer Agent responses with optional classification, reasoning, and follow-up questions.
+The `<AnswerResults>` component is the legacy React component name for rendering Retrieval Agent responses with optional classification, reasoning, and follow-up questions.
 
 ```jsx
 import { QueryBox, AnswerResults } from '@antfly/components';
@@ -763,7 +763,7 @@ function MyComponent() {
 
 ### useAnswerStream
 
-Stream Answer Agent responses with state management.
+Stream Retrieval Agent responses with state management. The hook name is kept for component API compatibility.
 
 ```jsx
 import { useAnswerStream } from '@antfly/components';
@@ -794,9 +794,14 @@ function MyComponent() {
           fields: ['content'],
           indexes: ['embeddings']
         }],
-        summarizer: {
+        generator: {
           provider: 'ollama',
           model: 'qwen2.5:7b'
+        },
+        steps: {
+          generation: { enabled: true },
+          classification: { enabled: true, with_reasoning: true },
+          followup: { enabled: true }
         }
       },
       headers: { 'X-API-Key': 'key' }
@@ -829,7 +834,7 @@ function MyComponent() {
 
 ### useCitations
 
-Parse and render citations in RAG/Answer Agent responses.
+Parse and render citations in RAG and Retrieval Agent responses.
 
 ```jsx
 import { useCitations } from '@antfly/components';

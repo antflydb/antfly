@@ -30,6 +30,7 @@ func TestSetComponentConditionReportsImagePullFailure(t *testing.T) {
 	condition := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeDataReady)
 	if condition == nil {
 		t.Fatalf("expected %s condition", antflyv1.TypeDataReady)
+		return
 	}
 	if condition.Status != metav1.ConditionFalse {
 		t.Fatalf("expected condition false, got %s", condition.Status)
@@ -54,6 +55,7 @@ func TestSetAvailableConditionClearsWhenReady(t *testing.T) {
 	condition := meta.FindStatusCondition(cluster.Status.Conditions, antflyv1.TypeAvailable)
 	if condition == nil {
 		t.Fatalf("expected %s condition", antflyv1.TypeAvailable)
+		return
 	}
 	if condition.Status != metav1.ConditionTrue {
 		t.Fatalf("expected Available true, got %s", condition.Status)

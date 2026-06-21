@@ -106,6 +106,7 @@ from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
 from .date_range_string_query import DateRangeStringQuery
+from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .disjunction_query import DisjunctionQuery
 from .distance_metric import DistanceMetric
 from .distance_range import DistanceRange
@@ -387,6 +388,7 @@ from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_users_response_200_item import ListUsersResponse200Item
+from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
 from .lsm_storage_status import LsmStorageStatus
 from .match_all_query import MatchAllQuery
@@ -443,6 +445,7 @@ from .phrase_query import PhraseQuery
 from .prefix_query import PrefixQuery
 from .prune_stats import PruneStats
 from .pruner import Pruner
+from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
 from .query_builder_request import QueryBuilderRequest
 from .query_builder_request_constraints import QueryBuilderRequestConstraints
 from .query_builder_request_example_documents_item import QueryBuilderRequestExampleDocumentsItem
@@ -475,6 +478,7 @@ from .restore_table_response_202 import RestoreTableResponse202
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
 from .retrieval_agent_usage import RetrievalAgentUsage
+from .retrieval_step_config import RetrievalStepConfig
 from .retrieval_strategy import RetrievalStrategy
 from .retry_config import RetryConfig
 from .role_assignment import RoleAssignment
@@ -685,6 +689,7 @@ __all__ = (
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
+    "DeleteArtifactEnrichmentResponse201",
     "DisjunctionQuery",
     "DistanceMetric",
     "DistanceRange",
@@ -964,6 +969,7 @@ __all__ = (
     "LinkupSearchConfigOutputType",
     "ListDocumentArtifactManifestsDetail",
     "ListUsersResponse200Item",
+    "LookupKeyConsistency",
     "LookupKeyResponse200",
     "LsmStorageStatus",
     "MatchAllQuery",
@@ -1020,6 +1026,7 @@ __all__ = (
     "PrefixQuery",
     "Pruner",
     "PruneStats",
+    "PutArtifactEnrichmentResponse201",
     "QueryBuilderRequest",
     "QueryBuilderRequestConstraints",
     "QueryBuilderRequestExampleDocumentsItem",
@@ -1052,6 +1059,7 @@ __all__ = (
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
     "RetrievalAgentUsage",
+    "RetrievalStepConfig",
     "RetrievalStrategy",
     "RetryConfig",
     "RoleAssignment",

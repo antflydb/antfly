@@ -56,6 +56,8 @@ const distributed_graph = @import("distributed_graph.zig");
 const distributed_join = @import("distributed_join.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
+const admin_routes = @import("../admin/routes.zig");
+const internal_api_routes = @import("../internal/routes.zig");
 const http_internal_routes = @import("http_internal_routes.zig");
 const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
@@ -270,6 +272,8 @@ pub const ApiHttpServerConfig = struct {
     session_executor: ?http_common.RequestExecutor = null,
     session_store: ?*transactions_api.DurableSessionStore = null,
     session_store_path: ?[]const u8 = null,
+    ha_admin_executor: ?http_common.RequestExecutor = null,
+    ha_internal_executor: ?http_common.RequestExecutor = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -1764,7 +1768,9 @@ pub const ApiHttpServer = struct {
         if (self.cfg.user_manager == null and self.cfg.trusted_principal_secret == null) return false;
         if (std.mem.eql(u8, path, routes.Routes.ai_catalog) and self.cfg.ard_public_catalog_enabled) return false;
         if (std.mem.eql(u8, path, routes.Routes.agent_card) or std.mem.eql(u8, path, routes.Routes.agent_card_legacy)) return false;
-        return !std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix);
+        if (std.mem.startsWith(u8, path, routes.Routes.internal_groups_prefix)) return false;
+        if (isHaInternalPath(path)) return false;
+        return true;
     }
 
     fn requestCarriesAuthentication(_: *const ApiHttpServer, req: http_common.HttpRequest) bool {
@@ -1946,6 +1952,7 @@ pub const ApiHttpServer = struct {
             }
         }
 
+        if (try self.dispatchHaRoutes(req, uri_parts)) |resp| return resp;
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.status)) {
             const metadata_status = try self.source.status();
             var public_status = try cluster.fromMetadataStatus(self.alloc, metadata_status);
@@ -2010,6 +2017,18 @@ pub const ApiHttpServer = struct {
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
         if (try self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         return try textResponse(self.alloc, 404, "not found");
+    }
+
+    fn dispatchHaRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
+        if (isHaAdminPath(uri_parts.path)) {
+            const ha_exec = self.cfg.ha_admin_executor orelse return null;
+            return try ha_exec.execute(self.alloc, req);
+        }
+        if (isHaInternalPath(uri_parts.path)) {
+            const ha_exec = self.cfg.ha_internal_executor orelse return null;
+            return try ha_exec.execute(self.alloc, req);
+        }
+        return null;
     }
 
     fn dispatchProtocolRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
@@ -4080,8 +4099,18 @@ pub const ApiHttpServer = struct {
                 defer self.alloc.free(decoded_key);
                 var lookup_opts = try http_route_helpers.parseLookupOptions(self.alloc, uri_parts.query);
                 defer lookup_opts.deinit(self.alloc);
+                const consistency = parseLookupReadConsistency(uri_parts.query) catch {
+                    return try textResponse(self.alloc, 400, "invalid read consistency");
+                };
 
-                var result = (try source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, .read_index)) orelse {
+                var result = (source.lookup(self.alloc, lookup.table_name, decoded_key, lookup_opts.opts, consistency) catch |err| switch (err) {
+                    error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return try textResponse(self.alloc, 503, "read requires primary"),
+                    error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return try textResponse(self.alloc, 503, "standby read unavailable"),
+                    else => {
+                        std.log.err("public table lookup failed table={s} key={s} err={}", .{ lookup.table_name, decoded_key, err });
+                        return try textResponse(self.alloc, 500, "lookup failed");
+                    },
+                }) orelse {
                     return try textResponse(self.alloc, 404, "not found");
                 };
                 defer result.deinit(self.alloc);
@@ -5462,6 +5491,9 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => return error.NotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.EnrichmentRetryInProgress => return error.Backpressured,
+            error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
+            error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
+            error.HAFencedPrimary => return error.HAFencedPrimary,
             else => {
                 std.log.err("public table batch failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5481,6 +5513,9 @@ pub const ApiHttpServer = struct {
         return self.executePublicTableQueryDispatchWithReadinessRetry(alloc, source, table_name, body, row_filter_json, null) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5551,7 +5586,10 @@ pub const ApiHttpServer = struct {
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
                 error.TableNotFound => return error.TableNotFound,
+                error.ModelNotFound => return error.ModelNotFound,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+                error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+                error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
                 else => {
                     std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                     return error.InternalFailure;
@@ -5566,7 +5604,10 @@ pub const ApiHttpServer = struct {
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.ModelNotFound => return error.ModelNotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
                 std.log.err("foreign public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5600,7 +5641,10 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
+            error.ModelNotFound => return error.ModelNotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
+            error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -6337,6 +6381,8 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifest(alloc, table_name, doc_key, artifact_name, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest lookup failed table={s} doc={s} artifact={s} err={}", .{ table_name, doc_key, artifact_name, err });
@@ -6355,6 +6401,8 @@ pub const ApiHttpServer = struct {
         const source = self.table_reads orelse return error.NotFound;
         return (source.documentArtifactManifests(alloc, table_name, doc_key, .read_index) catch |err| switch (err) {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
+            error.HAReadRequiresPrimary => return error.ReadRequiresPrimary,
+            error.HAReadWaitForApply, error.HAReadWaitForMetadata => return error.ReadUnavailable,
             error.InvalidArgument => return error.NotFound,
             else => {
                 std.log.err("public document artifact manifest list failed table={s} doc={s} err={}", .{ table_name, doc_key, err });
@@ -6702,6 +6750,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -6761,6 +6810,7 @@ pub const ApiHttpServer = struct {
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 else => {
                     std.log.err("public table multiquery execution failed table={s} err={}", .{ table_name, err });
@@ -7939,6 +7989,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (isHaAdminPath(path)) return true;
     if (isExtensionPath(path)) return true;
     if (std.mem.eql(u8, path, routes.Routes.secrets) or std.mem.startsWith(u8, path, routes.Routes.secrets_prefix)) return true;
     if (std.mem.eql(u8, path, routes.Routes.backup) or std.mem.eql(u8, path, routes.Routes.restore) or std.mem.eql(u8, path, routes.Routes.backups)) return true;
@@ -7946,6 +7997,14 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, routes.Routes.users_me)) return false;
     if (std.mem.eql(u8, path, routes.Routes.auth_subjects) or std.mem.startsWith(u8, path, routes.Routes.auth_subjects_prefix)) return true;
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
+}
+
+fn isHaAdminPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, admin_routes.ha) or std.mem.startsWith(u8, path, admin_routes.ha ++ "/");
+}
+
+fn isHaInternalPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, internal_api_routes.ha) or std.mem.startsWith(u8, path, internal_api_routes.ha ++ "/");
 }
 
 fn isExtensionPath(path: []const u8) bool {
@@ -8398,6 +8457,14 @@ fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8)
         .status = status,
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt(message, .{})}),
+    };
+}
+
+fn modelNotFoundResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    return .{
+        .status = 404,
+        .content_type = try alloc.dupe(u8, "application/json"),
+        .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
     };
 }
 
@@ -9535,6 +9602,16 @@ fn parseSimpleQueryParam(query: []const u8, key: []const u8) ?[]const u8 {
         return part[key.len + 1 ..];
     }
     return null;
+}
+
+pub fn parseLookupReadConsistency(query: []const u8) !raft_mod.ReadConsistency {
+    const value = parseSimpleQueryParam(query, "consistency") orelse
+        parseSimpleQueryParam(query, "read_consistency") orelse
+        return .read_index;
+    if (std.mem.eql(u8, value, "stale")) return .stale;
+    if (std.mem.eql(u8, value, "read_index") or std.mem.eql(u8, value, "read-index")) return .read_index;
+    if (std.mem.eql(u8, value, "leader_lease") or std.mem.eql(u8, value, "leader-lease")) return .leader_lease;
+    return error.InvalidReadConsistency;
 }
 
 pub fn runtimeSchemaDebugRequested(query: []const u8) bool {
@@ -12039,6 +12116,193 @@ test "api http server requires auth on public routes when enabled" {
     try std.testing.expectEqual(@as(u16, 200), readyz.status);
 }
 
+test "api http server dispatches HA admin and internal executors" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const RecordingExecutor = struct {
+        alloc: std.mem.Allocator,
+        body: []const u8,
+        calls: usize = 0,
+        last_method: ?http_common.Method = null,
+        last_uri: ?[]const u8 = null,
+        last_body: ?[]const u8 = null,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_method = req.method;
+            self.last_uri = req.uri;
+            self.last_body = req.body;
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "application/json"),
+                .body = try self.alloc.dupe(u8, self.body),
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var admin_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-admin\"}" };
+    var internal_exec = RecordingExecutor{ .alloc = alloc, .body = "{\"handler\":\"ha-internal\"}" };
+    var server = ApiHttpServer.init(alloc, .{
+        .ha_admin_executor = admin_exec.executor(),
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+
+    var admin_resp = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status ++ "?max_lag_lsn=0",
+    });
+    defer admin_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), admin_resp.status);
+    try std.testing.expectEqualStrings("{\"handler\":\"ha-admin\"}", admin_resp.body);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+    try std.testing.expectEqual(http_common.Method.GET, admin_exec.last_method.?);
+    try std.testing.expectEqualStrings(admin_routes.ha_primary_status ++ "?max_lag_lsn=0", admin_exec.last_uri.?);
+
+    var internal_resp = try server.handle(.{
+        .method = .POST,
+        .uri = internal_api_routes.ha_replication_status,
+        .body = "{\"slot_name\":\"standby-a\"}",
+    });
+    defer internal_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal_resp.status);
+    try std.testing.expectEqualStrings("{\"handler\":\"ha-internal\"}", internal_resp.body);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+    try std.testing.expectEqual(http_common.Method.POST, internal_exec.last_method.?);
+    try std.testing.expectEqualStrings(internal_api_routes.ha_replication_status, internal_exec.last_uri.?);
+    try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
+
+    var missing = try server.handle(.{ .method = .GET, .uri = admin_routes.ha });
+    defer missing.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), missing.status);
+    try std.testing.expectEqual(@as(usize, 2), admin_exec.calls);
+}
+
+test "api http server protects HA admin routes while exempting HA internal routes" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+    const RecordingExecutor = struct {
+        alloc: std.mem.Allocator,
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 200,
+                .content_type = try self.alloc.dupe(u8, "text/plain"),
+                .body = try self.alloc.dupe(u8, "ha"),
+            };
+        }
+    };
+
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+
+    var reader = try auth.manager.createUser("reader", "reader", &.{});
+    defer reader.deinit(alloc);
+
+    var admin_permission = [_]usermgr.Permission{
+        try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin),
+    };
+    defer admin_permission[0].deinit(alloc);
+    var admin = try auth.manager.createUser("admin", "admin", &admin_permission);
+    defer admin.deinit(alloc);
+
+    var source = FakeSource{};
+    var admin_exec = RecordingExecutor{ .alloc = alloc };
+    var internal_exec = RecordingExecutor{ .alloc = alloc };
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .ha_admin_executor = admin_exec.executor(),
+        .ha_internal_executor = internal_exec.executor(),
+    }, source.iface(), null, null);
+
+    var unauthorized = try server.handle(.{ .method = .GET, .uri = admin_routes.ha_primary_status });
+    defer unauthorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
+    defer alloc.free(reader_auth);
+    var forbidden = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = reader_auth,
+    });
+    defer forbidden.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 403), forbidden.status);
+    try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
+
+    const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
+    defer alloc.free(admin_auth);
+    var authorized = try server.handle(.{
+        .method = .GET,
+        .uri = admin_routes.ha_primary_status,
+        .authorization = admin_auth,
+    });
+    defer authorized.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), authorized.status);
+    try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
+
+    var internal = try server.handle(.{
+        .method = .GET,
+        .uri = internal_api_routes.ha_replication_identify,
+    });
+    defer internal.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), internal.status);
+    try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
+}
+
 test "api http server auth fixture can be moved before binding" {
     const alloc = std.testing.allocator;
 
@@ -13134,6 +13398,75 @@ test "api http server serves table lookup with version header" {
     try std.testing.expectEqual(@as(usize, 1), resp.headers.len);
     try std.testing.expectEqualStrings("X-Antfly-Version", resp.headers[0].name);
     try std.testing.expectEqualStrings("4321", resp.headers[0].value);
+}
+
+test "api http server allows explicit stale table lookup consistency" {
+    const alloc = std.testing.allocator;
+
+    const FakeSource = struct {
+        fn iface() StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("doc:a", key);
+            try std.testing.expectEqual(raft_mod.ReadConsistency.stale, consistency);
+            return .{
+                .json = try inner_alloc.dupe(u8, "{\"title\":\"alpha\"}"),
+                .version = 42,
+            };
+        }
+
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+    };
+
+    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), FakeReads.source(), null);
+    var resp = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=stale" });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("application/json", resp.content_type.?);
+    try std.testing.expectEqualStrings("{\"title\":\"alpha\"}", resp.body);
+
+    var invalid = try server.handle(.{ .method = .GET, .uri = "/tables/docs/documents/doc:a?consistency=linearizable" });
+    defer invalid.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), invalid.status);
+    try std.testing.expectEqualStrings("invalid read consistency", invalid.body);
 }
 
 test "api http server decodes percent-encoded lookup keys" {

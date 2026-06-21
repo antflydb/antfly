@@ -8,11 +8,19 @@ on:
     branches: ["main"]
     paths:
       - 'go/pkg/operator/**'
+      - 'go/pkg/sdk/admin/**'
+      - 'go/pkg/sdk/go.mod'
+      - 'go/pkg/sdk/go.sum'
+      - 'specs/openapi/antfly/admin.yaml'
       - '.github/workflows/antfly-operator-go.yml'
   pull_request:
     branches: ["main"]
     paths:
       - 'go/pkg/operator/**'
+      - 'go/pkg/sdk/admin/**'
+      - 'go/pkg/sdk/go.mod'
+      - 'go/pkg/sdk/go.sum'
+      - 'specs/openapi/antfly/admin.yaml'
       - '.github/workflows/antfly-operator-go.yml'
   workflow_dispatch:
 

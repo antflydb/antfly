@@ -205,9 +205,9 @@ architecture:
 - `expand_entity(id)` — graph traversal one-hop from a canonical entity
 - `write_memory(namespace, content, entities?)` — memoryaf write
 
-SSE events (`step_started`/`step_completed` from
-`work-log/planned/retrieval-agent-tool-use.md`) already give the frontend
-per-step observability. That same telemetry is the training signal for §6.
+SSE events (`step_started`/`step_completed` in `zig/A2A.md`) already give
+the frontend per-step observability. That same telemetry is the training
+signal for §6.
 
 ## The RL Loop
 
@@ -342,8 +342,8 @@ The dashboard surface (Antfarm, built on `@antfly/components`) exposes:
 
 - `work-log/planned/entity-relationship-extraction.md` — the canonical
   entity lifecycle this design sits on top of.
-- `work-log/planned/retrieval-agent-tool-use.md` — SSE step events that
-  provide the training signal.
+- `zig/A2A.md` — native agent and A2A design, including retrieval SSE step
+  events that provide the training signal.
 - `work-log/planned/row-level-auth.md` — needed for shared-cluster tenancy.
 - `pkg/memoryaf/README.md` — current memoryaf surface and MCP server.
 - `pkg/docsaf/` — existing document processors and entity enricher.
