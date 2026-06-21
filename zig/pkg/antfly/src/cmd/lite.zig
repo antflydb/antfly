@@ -142,25 +142,29 @@ pub fn runFromIterator(init: std.process.Init, argv0: []const u8, args: *std.pro
         return;
     }
 
-    if (std.mem.eql(u8, subcommand, "init")) return try initLite(init.gpa, init.io, args);
-    if (isStatusSubcommand(subcommand)) return try status(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "batch")) return try batch(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "lookup")) return try lookup(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "scan")) return try scan(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "query")) return try query(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "index")) return try indexCommand(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "enrichment")) return try enrichmentCommand(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "schema")) return try schemaCommand(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "run-until-idle")) return try runUntilIdle(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "backup") or std.mem.eql(u8, subcommand, "export")) return try backup(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "snapshot")) return try snapshot(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "restore")) return try restore(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "import")) return try importBackup(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "promote")) return try promote(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "check")) return try check(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "compact")) return try compact(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(init.gpa, init.io, args);
-    if (std.mem.eql(u8, subcommand, "serve")) return try serve(init.gpa, init.io, args);
+    return try dispatchSubcommand(init.gpa, init.io, argv0, subcommand, args);
+}
+
+fn dispatchSubcommand(allocator: Allocator, io: std.Io, argv0: []const u8, subcommand: []const u8, args: *std.process.Args.Iterator) !void {
+    if (std.mem.eql(u8, subcommand, "init")) return try initLite(allocator, io, args);
+    if (isStatusSubcommand(subcommand)) return try status(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "batch")) return try batch(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "lookup")) return try lookup(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "scan")) return try scan(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "query")) return try query(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "index")) return try indexCommand(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "enrichment")) return try enrichmentCommand(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "schema")) return try schemaCommand(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "run-until-idle")) return try runUntilIdle(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "backup") or std.mem.eql(u8, subcommand, "export")) return try backup(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "snapshot")) return try snapshot(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "restore")) return try restore(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "import")) return try importBackup(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "promote")) return try promote(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "check")) return try check(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "compact")) return try compact(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "vacuum")) return try vacuum(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "serve")) return try serve(allocator, io, args);
 
     std.debug.print("unknown lite subcommand: {s}\n", .{subcommand});
     printUsage(argv0);
@@ -2023,6 +2027,56 @@ test "lite backup command exports stable data while writer has open transaction"
     const pending_lookup = try lookupJson(allocator, &restored.db, "doc:backup-pending", "");
     defer allocator.free(pending_lookup);
     try std.testing.expect(std.mem.indexOf(u8, pending_lookup, "\"found\":false") != null);
+}
+
+test "lite export subcommand dispatches portable backup alias" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/export-alias.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const backup_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/export-alias.afb", .{tmp.sub_path});
+    defer allocator.free(backup_path);
+    const restored_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/export-alias-restored.aflite", .{tmp.sub_path});
+    defer allocator.free(restored_path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const backup_path_z = try allocator.dupeZ(u8, backup_path);
+    defer allocator.free(backup_path_z);
+
+    {
+        var lite = try LiteDb.open(allocator, path, .writer);
+        defer lite.close();
+
+        const json = try batchJson(allocator, &lite.db,
+            \\{"inserts":{"doc:export-alias":{"title":"export alias portable"}}}
+        );
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.indexOf(u8, json, "\"inserted\":1") != null);
+    }
+
+    const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try dispatchSubcommand(allocator, io, "antfly lite", "export", &args);
+
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, backup_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
+    defer allocator.free(body);
+    try portable_backup.validatePortable(allocator, body);
+
+    try restoreFromSourceFile(allocator, io, backup_path, restored_path, false);
+
+    var restored = try LiteDb.open(allocator, restored_path, .query_readonly);
+    defer restored.close();
+
+    const lookup_response = try lookupJson(allocator, &restored.db, "doc:export-alias", "");
+    defer allocator.free(lookup_response);
+    try std.testing.expect(std.mem.indexOf(u8, lookup_response, "\"export alias portable\"") != null);
 }
 
 test "lite restore source can be an aflite database" {
