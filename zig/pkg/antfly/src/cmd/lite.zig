@@ -824,6 +824,7 @@ fn check(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !vo
     const json = try std.json.Stringify.valueAlloc(allocator, report, .{});
     defer allocator.free(json);
     writeJsonLine(io, json);
+    if (!report.valid) return error.LiteCheckFailed;
 }
 
 fn vacuum(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -1870,6 +1871,31 @@ test "lite restore result json distinguishes portable restore and snapshot copy"
         "{\"format\":\"aflite\",\"operation\":\"snapshot\",\"source_format\":\"aflite\",\"path\":\"copy.aflite\"}",
         snapshot_json,
     );
+}
+
+test "lite check returns an error for invalid aflite files after writing report" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/check-invalid.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    try writeFileAtomically(allocator, io, path, "short native lite header");
+
+    const report = try antfly.lite.backend.checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("truncated_header", report.issue.?);
+
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const argv = [_][*:0]const u8{path_z.ptr};
+    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    try std.testing.expectError(error.LiteCheckFailed, check(allocator, io, &args));
 }
 
 test "lite restore publishes staged aflite from aflite source" {
