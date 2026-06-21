@@ -181,6 +181,13 @@ fail with an explicit integrity error. Compatibility branches should only be
 added after a format has shipped and users can reasonably have files that need
 preservation.
 
+The implementation consequence is that the production Lite open path should be
+small and direct: parse the v1 header, validate the v1 checkpoint, recover within
+the v1 format if needed, and otherwise return an explicit error. It should not
+carry readers for discarded prototype layouts, and tests should assert rejection
+of invalid headers, unsupported versions, and bridge-profile files opened through
+the default `.aflite` path.
+
 Internal bridge profiles are explicit developer/test engine selections, not
 compatibility modes. The default `auto` path should never inspect a failed
 native open and then silently retry a bridge or prototype layout.
@@ -579,6 +586,8 @@ query-visible results should match within documented index rebuild semantics.
 - Do not add legacy fallback code for pre-release Lite layouts, v0 directories,
   or LSM-container prototypes; reject unknown versions and invalid headers with
   explicit errors while preserving same-format checkpoint recovery.
+- Add negative open tests proving that the default `.aflite` path does not fall
+  back to bridge profiles or prototype readers.
 
 ### Phase 2: Name And CLI Shell
 
