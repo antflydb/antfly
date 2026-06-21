@@ -815,6 +815,45 @@ test "lite backend auto rejects internal bridge aflite files" {
     try std.testing.expectError(error.TruncatedNativeHeader, Handle.open(allocator, path, .{}));
 }
 
+test "lite backend auto rejects invalid native headers without fallback" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const invalid_magic_path = try testPath(allocator, tmp, "auto-invalid-magic.aflite");
+    defer allocator.free(invalid_magic_path);
+    const unsupported_version_path = try testPath(allocator, tmp, "auto-unsupported-version.aflite");
+    defer allocator.free(unsupported_version_path);
+
+    {
+        var encoded: [native.header_size]u8 = .{0} ** native.header_size;
+        @memcpy(encoded[0.."AFLITE0X".len], "AFLITE0X");
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, invalid_magic_path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, &encoded, 0);
+    }
+
+    try std.testing.expectError(error.InvalidNativeMagic, Handle.open(allocator, invalid_magic_path, .{}));
+    const invalid_report = try checkFile(allocator, invalid_magic_path);
+    try std.testing.expect(!invalid_report.valid);
+    try std.testing.expectEqualStrings("invalid_magic", invalid_report.issue.?);
+
+    {
+        var encoded: [native.header_size]u8 = undefined;
+        native.encodeHeader(&encoded, .{});
+        std.mem.writeInt(u32, encoded[native.magic.len..][0..4], native.format_version + 1, .little);
+        var file = try std.Io.Dir.cwd().createFile(std.testing.io, unsupported_version_path, .{});
+        defer file.close(std.testing.io);
+        try file.writePositionalAll(std.testing.io, &encoded, 0);
+    }
+
+    try std.testing.expectError(error.UnsupportedNativeFormatVersion, Handle.open(allocator, unsupported_version_path, .{}));
+    const unsupported_report = try checkFile(allocator, unsupported_version_path);
+    try std.testing.expect(!unsupported_report.valid);
+    try std.testing.expectEqualStrings("unsupported_format_version", unsupported_report.issue.?);
+}
+
 test "lite backend native engine can back db primary documents" {
     const allocator = std.testing.allocator;
 
