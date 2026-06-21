@@ -485,6 +485,20 @@ pub const NativeFile = struct {
         return try self.getCatalogRecordFromRootAlloc(allocator, .index, key);
     }
 
+    pub fn getIndexCatalogRecordSize(self: *NativeFile, key: []const u8) !?usize {
+        return try self.getCatalogRecordSizeFromRoot(.index, key);
+    }
+
+    pub fn getIndexCatalogRecordRangeAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        key: []const u8,
+        offset: u64,
+        len: usize,
+    ) !?[]u8 {
+        return try self.getCatalogRecordRangeFromRootAlloc(allocator, .index, key, offset, len);
+    }
+
     fn getCatalogRecordFromRootAlloc(
         self: *NativeFile,
         allocator: Allocator,
@@ -499,6 +513,47 @@ pub const NativeFile = struct {
             if (std.mem.eql(u8, entry.key, key)) {
                 if (entry.is_delete) return null;
                 return try self.catalogEntryValueAlloc(allocator, entry);
+            }
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
+    fn getCatalogRecordSizeFromRoot(
+        self: *NativeFile,
+        root: CatalogRoot,
+        key: []const u8,
+    ) !?usize {
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            defer self.allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+            }
+            page_id = entry.previous_page;
+        }
+        return null;
+    }
+
+    fn getCatalogRecordRangeFromRootAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root: CatalogRoot,
+        key: []const u8,
+        offset: u64,
+        len: usize,
+    ) !?[]u8 {
+        var page_id = catalogRootPage(self.activeCheckpoint(), root);
+        while (page_id != 0) {
+            const payload = try self.readPagePayloadByKindAlloc(self.allocator, page_id, .catalog);
+            defer self.allocator.free(payload);
+            const entry = try decodeCatalogEntry(payload);
+            if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.is_delete) return null;
+                return try self.catalogEntryRangeAlloc(allocator, entry, offset, len);
             }
             page_id = entry.previous_page;
         }
@@ -900,6 +955,17 @@ pub const NativeFile = struct {
         return try allocator.dupe(u8, entry.value);
     }
 
+    fn catalogEntryRangeAlloc(self: *NativeFile, allocator: Allocator, entry: CatalogEntry, offset: u64, len: usize) ![]u8 {
+        const value_len = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+        if (offset > std.math.maxInt(usize)) return error.EndOfStream;
+        const start: usize = @intCast(offset);
+        if (start > value_len or value_len - start < len) return error.EndOfStream;
+        if (entry.external_value_root_page != 0) {
+            return try self.readValuePagesRangeAlloc(allocator, entry.external_value_root_page, value_len, start, len);
+        }
+        return try allocator.dupe(u8, entry.value[start..][0..len]);
+    }
+
     fn validateDocumentMutation(self: *const NativeFile, mutation: DocumentMutation) !void {
         if (mutation.key.len > std.math.maxInt(u32) or mutation.value.len > std.math.maxInt(u32)) return error.RecordTooLarge;
         const fixed_len = 20 + mutation.key.len;
@@ -1127,6 +1193,56 @@ pub const NativeFile = struct {
 
         if (written != value_len) return error.InvalidNativeValueChain;
         return value;
+    }
+
+    fn readValuePagesRangeAlloc(
+        self: *NativeFile,
+        allocator: Allocator,
+        root_page_id: u64,
+        value_len: usize,
+        range_start: usize,
+        range_len: usize,
+    ) ![]u8 {
+        if (value_len == 0 or root_page_id == 0) return error.InvalidNativeValueChain;
+
+        const out = try allocator.alloc(u8, range_len);
+        errdefer allocator.free(out);
+
+        const range_end = range_start + range_len;
+        var value_offset: usize = 0;
+        var written: usize = 0;
+        var page_id = root_page_id;
+        var pages_seen: u64 = 0;
+        while (page_id != 0) {
+            pages_seen += 1;
+            if (pages_seen > self.activeCheckpoint().page_count) return error.InvalidNativeValueChain;
+
+            const payload = try self.readPagePayloadByKindAlloc(allocator, page_id, .value);
+            defer allocator.free(payload);
+            const page = try decodeValuePage(payload);
+            if (page.chunk.len == 0) return error.InvalidNativeValueChain;
+            if (page.chunk.len > value_len - value_offset) return error.InvalidNativeValueChain;
+
+            const page_start = value_offset;
+            const page_end = page_start + page.chunk.len;
+            if (page_end > range_start and page_start < range_end) {
+                const copy_start = if (range_start > page_start) range_start - page_start else 0;
+                const copy_end = @min(page.chunk.len, range_end - page_start);
+                const copy_len = copy_end - copy_start;
+                @memcpy(out[written..][0..copy_len], page.chunk[copy_start..][0..copy_len]);
+                written += copy_len;
+            }
+
+            value_offset = page_end;
+            page_id = page.next_page;
+            if (value_offset == value_len and page_id != 0) return error.InvalidNativeValueChain;
+            if (value_offset >= range_end and written == range_len) {
+                break;
+            }
+        }
+
+        if (written != range_len) return error.InvalidNativeValueChain;
+        return out;
     }
 
     fn validateReachableValuePages(

@@ -91,12 +91,7 @@ fn readFileRangeAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, o
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(allocator, path)) orelse return error.FileNotFound;
-    defer allocator.free(stored);
-    if (offset > std.math.maxInt(usize)) return error.EndOfStream;
-    const start: usize = @intCast(offset);
-    if (start > stored.len or stored.len - start < len) return error.EndOfStream;
-    return try allocator.dupe(u8, stored[start .. start + len]);
+    return (try self.docs.file.getIndexCatalogRecordRangeAlloc(allocator, path, offset, len)) orelse return error.FileNotFound;
 }
 
 fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
@@ -104,9 +99,8 @@ fn fileSize(ptr: *anyopaque, path: []const u8) !u64 {
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(self.allocator, path)) orelse return error.FileNotFound;
-    defer self.allocator.free(stored);
-    return stored.len;
+    const size = (try self.docs.file.getIndexCatalogRecordSize(path)) orelse return error.FileNotFound;
+    return @intCast(size);
 }
 
 fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) ![]u8 {
@@ -114,10 +108,9 @@ fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8,
     lockStore(self.docs);
     defer self.docs.mutex.unlock();
 
-    const stored = (try self.docs.file.getIndexCatalogRecordAlloc(allocator, path)) orelse return error.FileNotFound;
-    defer allocator.free(stored);
-    if (stored.len < len) return error.EndOfStream;
-    return try allocator.dupe(u8, stored[stored.len - len ..]);
+    const size = (try self.docs.file.getIndexCatalogRecordSize(path)) orelse return error.FileNotFound;
+    if (size < len) return error.EndOfStream;
+    return (try self.docs.file.getIndexCatalogRecordRangeAlloc(allocator, path, @intCast(size - len), len)) orelse return error.FileNotFound;
 }
 
 fn writeFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8) !void {
@@ -349,9 +342,15 @@ test "lite native index storage handles large files rename and delete tree" {
     try storage.renameAbsolute("/dense/a/blob", "/dense/a/blob2");
     try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/dense/a/blob", 8));
 
+    const range_offset = native.default_page_size + 19;
+    const range = try storage.readFileRangeAlloc(allocator, "/dense/a/blob2", range_offset, 41);
+    defer allocator.free(range);
+    try std.testing.expectEqualSlices(u8, large[range_offset..][0..41], range);
+
     const trailer = try storage.readFileTrailerAlloc(allocator, "/dense/a/blob2", 17);
     defer allocator.free(trailer);
     try std.testing.expectEqualSlices(u8, large[large.len - 17 ..], trailer);
+    try std.testing.expectError(error.EndOfStream, storage.readFileRangeAlloc(allocator, "/dense/a/blob2", large.len - 4, 8));
 
     try storage.writeFileAbsolute("/dense/a/sub/file", "child");
     try storage.deleteTree("/dense/a");
