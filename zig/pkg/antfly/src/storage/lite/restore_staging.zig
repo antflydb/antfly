@@ -177,10 +177,10 @@ pub fn stageAfliteRestoreBackup(
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
-    try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable.items, "application/vnd.antfly.backup");
-
     const manifest = try promoteManifest(allocator, &lite.db, table_name, backup_id, snapshot_path);
     defer freeManifest(allocator, manifest);
+
+    try backups_api.writeFileToLocation(allocator, &location, snapshot_path, portable.items, "application/vnd.antfly.backup");
     try backups_api.writeManifestToLocation(allocator, &location, &manifest);
 
     return .{
