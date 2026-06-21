@@ -57,6 +57,46 @@ const LiteDb = struct {
     }
 };
 
+pub fn isImportTargetEmpty(allocator: Allocator, db: *db_mod.DB) !bool {
+    if (try db.primaryDocCount(allocator) != 0) return false;
+    if (db.core.indexCount() != 0) return false;
+
+    const enrichments = try db.listEnrichments(allocator);
+    defer db_types.freeEnrichmentConfigs(allocator, enrichments);
+    if (enrichments.len != 0) return false;
+
+    const resolvers = try db.listResolvers(allocator);
+    defer {
+        for (resolvers) |*resolver| resolver.deinit(allocator);
+        if (resolvers.len > 0) allocator.free(resolvers);
+    }
+    if (resolvers.len != 0) return false;
+
+    if (try db.getSchemaJson(allocator)) |schema_json| {
+        allocator.free(schema_json);
+        return false;
+    }
+
+    return true;
+}
+
+pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
+    try db.core.loadIndexes();
+    _ = try db.rebuildDenseIndexesForTargetCoverage(allocator);
+    _ = try db.rebuildSparseIndexesForTargetCoverage(allocator);
+    try db.rebuildGraphIndexesForTargetCoverage(allocator);
+    _ = try db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
+    try db.runUntilIdle();
+    try db.sync(true);
+    try db.syncIndexes(true);
+}
+
+pub fn importPortableIntoLiteDb(allocator: Allocator, db: *db_mod.DB, backup: []const u8) !void {
+    try portable_backup.validatePortable(allocator, backup);
+    try portable_backup.importPortable(allocator, db.core.store, backup);
+    try finalizeRestoredLiteDb(allocator, db);
+}
+
 pub const StagedRestore = struct {
     backup_id: []const u8,
     location: []const u8,
@@ -759,13 +799,7 @@ test "lite restore staging accepts aflite input for normal restore" {
     {
         var restored = try LiteDb.open(allocator, restored_path, .writer);
         defer restored.close();
-        try portable_backup.importPortable(allocator, restored.db.core.store, portable);
-        try restored.db.core.loadIndexes();
-        _ = try restored.db.rebuildDenseIndexesForTargetCoverage(allocator);
-        _ = try restored.db.rebuildSparseIndexesForTargetCoverage(allocator);
-        try restored.db.rebuildGraphIndexesForTargetCoverage(allocator);
-        _ = try restored.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
-        try restored.db.runUntilIdle();
+        try importPortableIntoLiteDb(allocator, &restored.db, portable);
 
         const dense = try searchJson(
             allocator,
@@ -943,13 +977,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
         var restored = try LiteDb.open(allocator, restored_path, .writer);
         defer restored.close();
 
-        try portable_backup.importPortable(allocator, restored.db.core.store, normal_portable);
-        try restored.db.core.loadIndexes();
-        _ = try restored.db.rebuildDenseIndexesForTargetCoverage(allocator);
-        _ = try restored.db.rebuildSparseIndexesForTargetCoverage(allocator);
-        try restored.db.rebuildGraphIndexesForTargetCoverage(allocator);
-        _ = try restored.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
-        try restored.db.runUntilIdle();
+        try importPortableIntoLiteDb(allocator, &restored.db, normal_portable);
 
         const schema = (try restored.db.getSchemaJson(allocator)) orelse return error.MissingLiteSchemaJson;
         defer allocator.free(schema);

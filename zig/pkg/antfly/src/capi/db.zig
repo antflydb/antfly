@@ -30,6 +30,7 @@ const aggregations_mod = db_mod.aggregations;
 const search_agg_mod = antfly.aggregation;
 const geo_mod = antfly.geo;
 const lite_backend = antfly.lite.backend;
+const lite_restore_staging = antfly.lite.restore_staging;
 const backup_codec = antfly.backup_codec;
 const portable_backup = antfly.portable_backup;
 const query_api = antfly.public_api.query;
@@ -1827,46 +1828,14 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
     return .ok;
 }
 
-fn liteImportTargetIsEmpty(handle: *Handle) !bool {
-    if (try handle.db.primaryDocCount(handle.alloc) != 0) return false;
-    if (handle.db.core.indexCount() != 0) return false;
-
-    const enrichments = try handle.db.listEnrichments(handle.alloc);
-    defer db_mod.types.freeEnrichmentConfigs(handle.alloc, enrichments);
-    if (enrichments.len != 0) return false;
-
-    const resolvers = try handle.db.listResolvers(handle.alloc);
-    defer {
-        for (resolvers) |*resolver| resolver.deinit(handle.alloc);
-        if (resolvers.len > 0) handle.alloc.free(resolvers);
-    }
-    if (resolvers.len != 0) return false;
-
-    if (try handle.db.getSchemaJson(handle.alloc)) |schema_json| {
-        handle.alloc.free(schema_json);
-        return false;
-    }
-
-    return true;
-}
-
 pub export fn antfly_lite_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
     if (backup.len == 0) return .invalid_argument;
     if (backup.ptr == null and backup.len != 0) return .invalid_argument;
-    if (!(liteImportTargetIsEmpty(handle) catch |err| return capi.mapError(err))) return .invalid_argument;
+    if (!(lite_restore_staging.isImportTargetEmpty(handle.alloc, &handle.db) catch |err| return capi.mapError(err))) return .invalid_argument;
     const bytes = backup.bytes();
-    portable_backup.validatePortable(handle.alloc, bytes) catch |err| return capi.mapError(err);
-    portable_backup.importPortable(handle.alloc, handle.db.core.store, bytes) catch |err| return capi.mapError(err);
-    handle.db.core.loadIndexes() catch |err| return capi.mapError(err);
-    _ = handle.db.rebuildDenseIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
-    _ = handle.db.rebuildSparseIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
-    handle.db.rebuildGraphIndexesForTargetCoverage(handle.alloc) catch |err| return capi.mapError(err);
-    _ = handle.db.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
-    handle.db.runUntilIdle() catch |err| return capi.mapError(err);
-    handle.db.sync(true) catch |err| return capi.mapError(err);
-    handle.db.syncIndexes(true) catch |err| return capi.mapError(err);
+    lite_restore_staging.importPortableIntoLiteDb(handle.alloc, &handle.db, bytes) catch |err| return capi.mapError(err);
     return .ok;
 }
 
@@ -1999,30 +1968,7 @@ fn restorePortableBackupToLiteFile(
 
         var db = try db_mod.DB.open(alloc, tmp_path, opts);
         defer db.close();
-        try portable_backup.importPortable(alloc, db.core.store, backup);
-        try db.sync(true);
-        try db.syncIndexes(true);
-    }
-
-    {
-        var backend = try lite_backend.Handle.open(alloc, tmp_path, .{});
-        defer backend.deinit();
-
-        var opts = db_mod.OpenOptions{
-            .open_mode = .writer,
-            .external_derived_checkpoints = false,
-        };
-        try backend.configureDbOpenOptions(&opts);
-
-        var db = try db_mod.DB.open(alloc, tmp_path, opts);
-        defer db.close();
-        _ = try db.rebuildDenseIndexesForTargetCoverage(alloc);
-        _ = try db.rebuildSparseIndexesForTargetCoverage(alloc);
-        try db.rebuildGraphIndexesForTargetCoverage(alloc);
-        _ = try db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
-        try db.runUntilIdle();
-        try db.sync(true);
-        try db.syncIndexes(true);
+        try lite_restore_staging.importPortableIntoLiteDb(alloc, &db, backup);
     }
 
     try preflightLiteRestoreTarget(alloc, io, dest_path, replace);

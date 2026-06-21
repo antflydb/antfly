@@ -604,7 +604,7 @@ fn importPortableIntoExistingLite(
     {
         var lite = try LiteDb.open(allocator, target_path, .writer);
         defer lite.close();
-        if (!(try liteImportTargetIsEmpty(allocator, &lite))) {
+        if (!(try lite_restore_staging.isImportTargetEmpty(allocator, &lite.db))) {
             return error.LiteImportTargetNotEmpty;
         }
     }
@@ -663,10 +663,8 @@ fn restoreFromSourceFile(
     {
         var lite = try LiteDb.create(allocator, tmp_path, true);
         defer lite.close();
-        try portable_backup.importPortable(allocator, lite.db.core.store, body);
+        try lite_restore_staging.importPortableIntoLiteDb(allocator, &lite.db, body);
     }
-
-    try finishRestoredLiteImportPath(allocator, tmp_path);
 
     renameFilePath(io, tmp_path, out_path) catch |err| {
         deleteFilePath(io, tmp_path) catch {};
@@ -702,41 +700,6 @@ fn readPortableRestoreSourceAlloc(allocator: Allocator, io: std.Io, source_path:
         return try cli.readFileAlloc(io, allocator, source_path, max_afb_file_bytes);
     }
     return error.InvalidArguments;
-}
-
-fn finishRestoredLiteImportPath(allocator: Allocator, path: []const u8) !void {
-    var lite = try LiteDb.open(allocator, path, .writer);
-    defer lite.close();
-    _ = try lite.db.rebuildDenseIndexesForTargetCoverage(allocator);
-    _ = try lite.db.rebuildSparseIndexesForTargetCoverage(allocator);
-    try lite.db.rebuildGraphIndexesForTargetCoverage(allocator);
-    _ = try lite.db.replayGeneratedEnrichmentsFromStoredDocs(allocator);
-    try lite.db.runUntilIdle();
-    try lite.db.sync(true);
-    try lite.db.syncIndexes(true);
-}
-
-fn liteImportTargetIsEmpty(allocator: Allocator, lite: *LiteDb) !bool {
-    if (try lite.db.primaryDocCount(allocator) != 0) return false;
-    if (lite.db.core.indexCount() != 0) return false;
-
-    const enrichments = try lite.db.listEnrichments(allocator);
-    defer db_types.freeEnrichmentConfigs(allocator, enrichments);
-    if (enrichments.len != 0) return false;
-
-    const resolvers = try lite.db.listResolvers(allocator);
-    defer {
-        for (resolvers) |*resolver| resolver.deinit(allocator);
-        if (resolvers.len > 0) allocator.free(resolvers);
-    }
-    if (resolvers.len != 0) return false;
-
-    if (try lite.db.getSchemaJson(allocator)) |schema_json| {
-        allocator.free(schema_json);
-        return false;
-    }
-
-    return true;
 }
 
 const PromoteOptions = struct {
