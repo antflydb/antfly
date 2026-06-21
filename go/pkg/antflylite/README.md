@@ -39,8 +39,11 @@ handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
 wants hosted/manual maintenance and will call `RunUntilIdle` itself. Use
 `RunUntilIdleStatus` when the application also wants the typed post-drain
 pending-work readiness document.
-Use `OpenWithOptions` for advanced settings such as map size and native-profile
-TTL cleanup.
+Use `OpenWithOptions` for advanced settings such as map size, native-profile
+TTL cleanup, and explicit inference status reporting. Set
+`RemoteProviderConfigured` when the embedding producer is backed by a configured
+remote provider so `Status().Inference` reports `remote_provider` instead of the
+default caller-supplied/deferred mode.
 
 Use `BackupToFile` to write a portable `.afb` archive from an open Lite handle.
 Use `RestoreBackupFile` or `RestoreBackup` to stage a portable backup into a

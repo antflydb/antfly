@@ -99,6 +99,11 @@ pub const InferenceStatus = struct {
     no_inference_configured_ok: bool = true,
 };
 
+pub const InferenceOpenOptions = struct {
+    remote_provider_configured: bool = false,
+    local_runtime_configured: bool = false,
+};
+
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
     const freestanding = builtin.os.tag == .freestanding;
     const hosted = profile == .hosted;
@@ -146,13 +151,25 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
 }
 
 pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
+    return inferenceStatusForProfileWithOptions(profile, .{});
+}
+
+pub fn inferenceStatusForProfileWithOptions(profile: Profile, opts: InferenceOpenOptions) InferenceStatus {
     const caps = capabilitiesForProfile(profile);
+    const remote_configured = opts.remote_provider_configured and caps.remote_inference_providers;
+    const local_configured = opts.local_runtime_configured and caps.local_inference_runtime;
+    const configured = remote_configured or local_configured;
     return .{
-        .mode = caps.inference_mode,
+        .mode = if (remote_configured)
+            "remote_provider"
+        else if (local_configured)
+            "local_embedded"
+        else
+            caps.inference_mode,
         .available_modes = caps.available_inference_modes,
-        .configured = false,
-        .remote_provider_configured = false,
-        .local_runtime_configured = false,
+        .configured = configured,
+        .remote_provider_configured = remote_configured,
+        .local_runtime_configured = local_configured,
         .local_runtime_available = caps.local_inference_runtime,
         .caller_supplied_artifacts = caps.caller_supplied_artifacts,
         .no_inference_configured_ok = caps.no_inference_configured_ok,

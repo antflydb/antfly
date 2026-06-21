@@ -58,11 +58,13 @@ const (
 
 // OpenOptions configures OpenWithOptions.
 type OpenOptions struct {
-	Mode       OpenMode
-	Profile    Profile
-	NoSync     bool
-	MapSize    uint64
-	TTLCleanup *TTLCleanupOptions
+	Mode                     OpenMode
+	Profile                  Profile
+	NoSync                   bool
+	RemoteProviderConfigured bool
+	LocalRuntimeConfigured   bool
+	MapSize                  uint64
+	TTLCleanup               *TTLCleanupOptions
 }
 
 // TTLCleanupOptions configures the optional Lite TTL cleanup runtime.
@@ -182,6 +184,12 @@ func OpenWithOptions(path string, opts OpenOptions) (*DB, error) {
 	cOpts.map_size = C.uint64_t(opts.MapSize)
 	if opts.NoSync {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_NO_SYNC
+	}
+	if opts.RemoteProviderConfigured {
+		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED
+	}
+	if opts.LocalRuntimeConfigured {
+		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED
 	}
 	if opts.TTLCleanup != nil {
 		cOpts.flags |= C.ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP

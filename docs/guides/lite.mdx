@@ -202,6 +202,11 @@ reports `configured: false` with `no_inference_configured_ok: true`; this means
 caller-supplied artifacts and deferred enrichment are valid, not that the
 database is unhealthy.
 
+Embedded applications that configure a remote inference provider should mark
+that at open time. Lite status then reports `mode: "remote_provider"`,
+`configured: true`, and `remote_provider_configured: true`, so bindings and
+applications can branch from status instead of probing enrichment failures.
+
 Use `antfly lite run-until-idle app.aflite` after writes when you want the CLI
 to drain available local maintenance work before querying or backing up.
 

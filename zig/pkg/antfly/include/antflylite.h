@@ -60,6 +60,8 @@ typedef struct antfly_buffer {
 
 #define ANTFLY_LITE_OPEN_FLAG_NO_SYNC (1u << 0)
 #define ANTFLY_LITE_OPEN_FLAG_TTL_CLEANUP (1u << 1)
+#define ANTFLY_LITE_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED (1u << 2)
+#define ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED (1u << 3)
 
 typedef struct antfly_lite_open_options {
     uint32_t abi_size;

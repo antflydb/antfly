@@ -304,6 +304,29 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("typed status pending work = %#v", typedStatus.PendingWork)
 	}
 
+	remotePath := filepath.Join(t.TempDir(), "go-remote-inference.aflite")
+	remoteDB, err := OpenWithOptions(remotePath, OpenOptions{
+		Mode:                     OpenModeWriter,
+		Profile:                  ProfileNative,
+		RemoteProviderConfigured: true,
+	})
+	if err != nil {
+		t.Fatalf("open remote inference Lite database: %v", err)
+	}
+	remoteStatus, err := remoteDB.Status()
+	if err != nil {
+		t.Fatalf("remote inference status: %v", err)
+	}
+	if err := remoteDB.Close(); err != nil {
+		t.Fatalf("close remote inference Lite database: %v", err)
+	}
+	if remoteStatus.Inference.Mode != InferenceModeRemoteProvider ||
+		!remoteStatus.Inference.Configured ||
+		!remoteStatus.Inference.RemoteProviderConfigured ||
+		remoteStatus.Inference.LocalRuntimeConfigured {
+		t.Fatalf("remote inference status = %#v", remoteStatus.Inference)
+	}
+
 	caps, err := db.CapabilitiesJSON()
 	if err != nil {
 		t.Fatalf("capabilities: %v", err)

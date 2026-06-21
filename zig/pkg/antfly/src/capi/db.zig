@@ -68,6 +68,7 @@ const Handle = struct {
     readable_lease_hook: ?ReadableLeaseHook = null,
     owned_lite_backend: ?lite_backend.Handle = null,
     lite_profile: ?lite_backend.Profile = null,
+    lite_inference_status: ?lite_backend.InferenceStatus = null,
 
     fn prepareSearchRequest(self: *Handle, req: db_mod.types.SearchRequest) !void {
         const hook = self.readable_lease_hook orelse return;
@@ -1608,7 +1609,10 @@ pub export fn antfly_lite_open_options_init(options: ?*capi.LiteOpenOptions) cap
     return .ok;
 }
 
-const lite_open_known_flags = capi.lite_open_flag_no_sync | capi.lite_open_flag_ttl_cleanup;
+const lite_open_known_flags = capi.lite_open_flag_no_sync |
+    capi.lite_open_flag_ttl_cleanup |
+    capi.lite_open_flag_remote_provider_configured |
+    capi.lite_open_flag_local_runtime_configured;
 
 const LiteResolvedOpenOptions = struct {
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
@@ -1616,6 +1620,7 @@ const LiteResolvedOpenOptions = struct {
     map_size: ?usize = null,
     no_sync: bool = false,
     ttl_cleanup: ?db_mod.ttl_runtime.Config = null,
+    inference: lite_backend.InferenceOpenOptions = .{},
 };
 
 fn validateLiteOpenOptionsReserved(options: *const capi.LiteOpenOptions) !void {
@@ -1651,6 +1656,10 @@ fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolv
         .profile = profile,
         .map_size = if (options.map_size == 0) null else @as(usize, @intCast(options.map_size)),
         .no_sync = (options.flags & capi.lite_open_flag_no_sync) != 0,
+        .inference = .{
+            .remote_provider_configured = (options.flags & capi.lite_open_flag_remote_provider_configured) != 0,
+            .local_runtime_configured = (options.flags & capi.lite_open_flag_local_runtime_configured) != 0,
+        },
     };
     if ((options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
         if (options.ttl_cleanup_owner_id.ptr == null and options.ttl_cleanup_owner_id.len != 0) {
@@ -1711,6 +1720,7 @@ fn openLiteHandle(
         .db = db,
         .owned_lite_backend = backend,
         .lite_profile = resolved.profile,
+        .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
     };
     out.* = handle;
     return .ok;
@@ -1790,7 +1800,7 @@ pub export fn antfly_lite_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.B
         .storage = backend.storageStatus(),
         .stats = jsonDBStatsProjection(stats, indexes),
         .pending_work = handle.db.pendingWorkStats(),
-        .inference = lite_backend.inferenceStatusForProfile(handle.lite_profile orelse .native),
+        .inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(handle.lite_profile orelse .native),
         .capabilities = lite_backend.capabilitiesForProfile(handle.lite_profile orelse .native),
     };
 
@@ -6229,6 +6239,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(short_lite_path);
     const src_path = try tempTestAflitePath(alloc, "capi-lite-src");
     defer alloc.free(src_path);
+    const remote_inference_path = try tempTestAflitePath(alloc, "capi-lite-remote-inference");
+    defer alloc.free(remote_inference_path);
     const dst_path = try tempTestAflitePath(alloc, "capi-lite-dst");
     defer alloc.free(dst_path);
     const bad_dst_path = try tempTestAflitePath(alloc, "capi-lite-bad-dst");
@@ -6247,6 +6259,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(invalid_lite_path);
     cleanupTestFile(short_lite_path);
     cleanupTestFile(src_path);
+    cleanupTestFile(remote_inference_path);
     cleanupTestFile(dst_path);
     cleanupTestFile(bad_dst_path);
     cleanupTestFile(schema_dst_path);
@@ -6258,6 +6271,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_lite_path);
     defer cleanupTestFile(short_lite_path);
     defer cleanupTestFile(src_path);
+    defer cleanupTestFile(remote_inference_path);
     defer cleanupTestFile(dst_path);
     defer cleanupTestFile(bad_dst_path);
     defer cleanupTestFile(schema_dst_path);
@@ -6352,6 +6366,22 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     antfly_db_buffer_free_zero(&status);
     try std.testing.expect(status.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), status.len);
+
+    var remote_options = capi.LiteOpenOptions{
+        .abi_size = @sizeOf(capi.LiteOpenOptions),
+        .flags = capi.lite_open_flag_remote_provider_configured,
+    };
+    var remote_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(remote_inference_path, &remote_options, &remote_handle));
+    defer antfly_db_close(remote_handle);
+    var remote_status: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(remote_handle, &remote_status));
+    defer antfly_db_buffer_free(remote_status.ptr, remote_status.len);
+    const remote_status_json = remote_status.ptr.?[0..remote_status.len];
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"mode\":\"remote_provider\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"remote_provider_configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, remote_status_json, "\"local_runtime_configured\":false") != null);
 
     var capabilities: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));

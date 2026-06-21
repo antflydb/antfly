@@ -36,8 +36,10 @@ pub const Profile = capabilities.Profile;
 pub const supported_inference_modes = capabilities.supported_inference_modes;
 pub const Capabilities = capabilities.Capabilities;
 pub const InferenceStatus = capabilities.InferenceStatus;
+pub const InferenceOpenOptions = capabilities.InferenceOpenOptions;
 pub const capabilitiesForProfile = capabilities.capabilitiesForProfile;
 pub const inferenceStatusForProfile = capabilities.inferenceStatusForProfile;
+pub const inferenceStatusForProfileWithOptions = capabilities.inferenceStatusForProfileWithOptions;
 
 pub const EngineKind = enum {
     /// Internal LSM bridge for explicit storage-engine development.
@@ -513,6 +515,23 @@ test "lite backend inference status reports disabled as clean state" {
     try std.testing.expect(hosted_has_manual);
     try std.testing.expect(!hosted.configured);
     try std.testing.expect(hosted.no_inference_configured_ok);
+}
+
+test "lite backend inference status reflects explicit remote provider configuration" {
+    const remote = inferenceStatusForProfileWithOptions(.native, .{ .remote_provider_configured = true });
+    try std.testing.expectEqualStrings("remote_provider", remote.mode);
+    try std.testing.expect(remote.configured);
+    try std.testing.expect(remote.remote_provider_configured);
+    try std.testing.expect(!remote.local_runtime_configured);
+    try std.testing.expect(!remote.local_runtime_available);
+    try std.testing.expect(remote.caller_supplied_artifacts);
+    try std.testing.expect(remote.no_inference_configured_ok);
+
+    const local_requested = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
+    try std.testing.expect(!local_requested.configured);
+    try std.testing.expect(!local_requested.local_runtime_configured);
+    try std.testing.expect(!local_requested.local_runtime_available);
 }
 
 test "lite backend native engine creates and checks aflite file" {

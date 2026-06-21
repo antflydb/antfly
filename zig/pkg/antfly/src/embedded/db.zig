@@ -43,16 +43,20 @@ pub const OpenOptions = struct {
     storage: ?support.lsm_storage.Storage = null,
     index_backends: IndexBackendOptions = .{},
     enrichment: ?support.enrichment_runtime.Config = null,
+    inference: support.lite.backend.InferenceOpenOptions = .{},
     ttl_cleanup: ttl_runtime.Config = .{},
 };
 
 pub const Profile = support.lite.backend.Profile;
 pub const Capabilities = support.lite.backend.Capabilities;
+pub const InferenceOpenOptions = support.lite.backend.InferenceOpenOptions;
+pub const InferenceStatus = support.lite.backend.InferenceStatus;
 
 pub const DB = struct {
     allocator: Allocator,
     inner: db_mod.DB,
     profile: Profile,
+    lite_inference_status: ?InferenceStatus = null,
     owned_lite_backend: ?support.lite.backend.Handle = null,
 
     pub fn open(alloc: Allocator, path: []const u8, opts: OpenOptions) !DB {
@@ -76,6 +80,7 @@ pub const DB = struct {
             .allocator = alloc,
             .inner = try db_mod.DB.open(alloc, path, toDbOpenOptions(opts, profile)),
             .profile = profile,
+            .lite_inference_status = null,
         };
     }
 
@@ -97,6 +102,7 @@ pub const DB = struct {
             .allocator = alloc,
             .inner = inner,
             .profile = profile,
+            .lite_inference_status = support.lite.backend.inferenceStatusForProfileWithOptions(profile, opts.inference),
             .owned_lite_backend = lite_backend,
         };
     }
@@ -132,7 +138,9 @@ pub const DB = struct {
 
     pub fn liteStatus(self: *DB, alloc: Allocator) !LiteStatus {
         const backend = if (self.owned_lite_backend) |*lite_backend| lite_backend else return error.NotLiteDatabase;
-        return try backend.fullStatus(alloc, &self.inner, self.profile);
+        var status = try backend.fullStatus(alloc, &self.inner, self.profile);
+        status.inference = self.lite_inference_status orelse status.inference;
+        return status;
     }
 
     pub fn batch(self: *DB, req: types.BatchRequest) !void {
@@ -394,6 +402,33 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
     try std.testing.expect(status.capabilities.no_inference_configured_ok);
     try std.testing.expect(!status.capabilities.raft_replication);
     try std.testing.expect(!status.capabilities.cluster_placement);
+}
+
+test "embedded db liteStatus reflects explicitly configured remote inference" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testLitePath(alloc, tmp, "embedded-status-remote-inference.aflite");
+    defer alloc.free(path);
+
+    var db = try DB.openLite(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .inference = .{ .remote_provider_configured = true },
+    });
+    defer db.close();
+
+    var status = try db.liteStatus(alloc);
+    defer status.deinit(alloc);
+
+    try std.testing.expectEqualStrings("remote_provider", status.inference.mode);
+    try std.testing.expect(status.inference.configured);
+    try std.testing.expect(status.inference.remote_provider_configured);
+    try std.testing.expect(!status.inference.local_runtime_configured);
+    try std.testing.expect(!status.inference.local_runtime_available);
+    try std.testing.expect(status.inference.caller_supplied_artifacts);
+    try std.testing.expect(status.inference.no_inference_configured_ok);
 }
 
 test "embedded db openLite can run ttl cleanup over aflite file" {
