@@ -3954,6 +3954,93 @@ test "sql adapter source corpus validates entry metadata while allowing derived 
     try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_invalid.value));
 }
 
+test "sql adapter source corpus validates catalog table metadata" {
+    const alloc = std.testing.allocator;
+    const valid_source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "catalog backed set op",
+        \\      "family": "read",
+        \\      "summary": {"table_name": "usage_records"},
+        \\      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:right=right:table=archived_records",
+        \\      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1}"}],
+        \\      "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_valid = try std.json.parseFromSlice(std.json.Value, alloc, valid_source_json, .{});
+    defer parsed_valid.deinit();
+    const valid_root = try parseSourceCorpusRootAlloc(alloc, parsed_valid.value);
+    defer freeSourceCorpusRoot(alloc, valid_root);
+    try std.testing.expectEqual(@as(usize, 1), valid_root.entries[0].catalog_tables.len);
+    try std.testing.expect(appParityEntryHasCatalogSchemas(valid_root.entries[0]));
+    try std.testing.expectEqualStrings("archived_records", valid_root.entries[0].catalog_tables[0].name);
+
+    const duplicate_source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "duplicate catalog tables",
+        \\      "family": "read",
+        \\      "summary": {"table_name": "usage_records"},
+        \\      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:right=right:table=archived_records",
+        \\      "catalog_tables": [
+        \\        {"name": "archived_records", "schema_json": "{\"version\":1}"},
+        \\        {"name": "archived_records", "schema_json": "{\"version\":1}"}
+        \\      ],
+        \\      "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_duplicate = try std.json.parseFromSlice(std.json.Value, alloc, duplicate_source_json, .{});
+    defer parsed_duplicate.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_duplicate.value));
+
+    const mixed_source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "mixed catalog forms",
+        \\      "family": "read",
+        \\      "summary": {"table_name": "usage_records"},
+        \\      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:right=right:table=archived_records",
+        \\      "source_schema_json": "{\"version\":1}",
+        \\      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1}"}],
+        \\      "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_mixed = try std.json.parseFromSlice(std.json.Value, alloc, mixed_source_json, .{});
+    defer parsed_mixed.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_mixed.value));
+
+    const stale_source_json =
+        \\{
+        \\  "source_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "name": "stale catalog table",
+        \\      "family": "read",
+        \\      "summary": {"table_name": "usage_records"},
+        \\      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:right=right:table=archived_records",
+        \\      "catalog_tables": [{"name": "missing_records", "schema_json": "{\"version\":1}"}],
+        \\      "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_stale = try std.json.parseFromSlice(std.json.Value, alloc, stale_source_json, .{});
+    defer parsed_stale.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSourceCorpusRootAlloc(alloc, parsed_stale.value));
+}
+
 test "sql adapter source corpus validates deterministic json payloads" {
     const alloc = std.testing.allocator;
     const invalid_returning_json =
