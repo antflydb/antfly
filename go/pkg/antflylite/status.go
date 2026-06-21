@@ -17,7 +17,9 @@ type StorageStatus struct {
 	Format             string  `json:"format"`
 	Engine             string  `json:"engine"`
 	PrimaryLayout      string  `json:"primary_layout"`
+	ReplayLayout       string  `json:"replay_layout"`
 	IndexLayout        string  `json:"index_layout"`
+	IndexNamespace     *string `json:"index_namespace,omitempty"`
 	FormatVersion      *uint32 `json:"format_version,omitempty"`
 	PageSize           *uint32 `json:"page_size,omitempty"`
 	ActiveCheckpoint   *uint8  `json:"active_checkpoint,omitempty"`

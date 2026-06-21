@@ -57,6 +57,20 @@ func (db *DB) Check() (*CheckReport, error) {
 	return &report, nil
 }
 
+// CheckFile runs Lite integrity checks for path without opening a database
+// handle and returns the typed result.
+func CheckFile(path string) (*CheckReport, error) {
+	body, err := CheckFileJSON(path)
+	if err != nil {
+		return nil, err
+	}
+	var report CheckReport
+	if err := json.Unmarshal(body, &report); err != nil {
+		return nil, err
+	}
+	return &report, nil
+}
+
 // Vacuum compacts free space and returns the typed result.
 func (db *DB) Vacuum() (*VacuumReport, error) {
 	body, err := db.VacuumJSON()

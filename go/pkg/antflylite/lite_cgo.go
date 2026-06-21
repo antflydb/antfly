@@ -299,6 +299,22 @@ func (db *DB) CheckJSON() ([]byte, error) {
 	})
 }
 
+// CheckFileJSON runs Lite integrity checks for path without opening a database
+// handle and returns the JSON result.
+func CheckFileJSON(path string) ([]byte, error) {
+	if err := ValidateABI(); err != nil {
+		return nil, err
+	}
+	cPath := C.CString(path)
+	defer C.free(unsafe.Pointer(cPath))
+
+	var out C.antfly_buffer
+	if err := check(C.antfly_lite_check_file_json(cPath, &out)); err != nil {
+		return nil, err
+	}
+	return takeBuffer(out), nil
+}
+
 // VacuumJSON compacts free space and returns the JSON result.
 func (db *DB) VacuumJSON() ([]byte, error) {
 	return db.readBuffer(func(handle unsafe.Pointer, out *C.antfly_buffer) C.antfly_error_code {

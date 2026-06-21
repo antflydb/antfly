@@ -330,8 +330,12 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("typed status storage = %#v", typedStatus.Storage)
 	}
 	if typedStatus.Storage.PrimaryLayout != "native_document_pages" ||
-		typedStatus.Storage.IndexLayout != "lsm_logical_files_in_native_index_catalog" {
+		typedStatus.Storage.ReplayLayout != "native_replay_lanes_in_document_catalog" ||
+		typedStatus.Storage.IndexLayout != "native_index_catalog_pages" {
 		t.Fatalf("typed status storage layout = %#v", typedStatus.Storage)
+	}
+	if typedStatus.Storage.IndexNamespace == nil || *typedStatus.Storage.IndexNamespace != "__antfly_lite" {
+		t.Fatalf("typed status index namespace = %#v", typedStatus.Storage.IndexNamespace)
 	}
 	if typedStatus.Inference.Mode != InferenceModeCallerSuppliedOrDisabled {
 		t.Fatalf("typed status inference mode = %q", typedStatus.Inference.Mode)
@@ -450,6 +454,18 @@ func TestLiteCAPI(t *testing.T) {
 	}
 	if !checkReport.Valid || checkReport.FileSize == 0 || checkReport.CompactSize == 0 || checkReport.Issue != nil {
 		t.Fatalf("unexpected check report: %#v", checkReport)
+	}
+
+	badPath := filepath.Join(t.TempDir(), "go-truncated.aflite")
+	if err := os.WriteFile(badPath, []byte("short native lite header"), 0o600); err != nil {
+		t.Fatalf("write truncated lite file: %v", err)
+	}
+	badReport, err := CheckFile(badPath)
+	if err != nil {
+		t.Fatalf("check truncated lite file: %v", err)
+	}
+	if badReport.Valid || badReport.Issue == nil || *badReport.Issue != "truncated_header" {
+		t.Fatalf("truncated file check report = %#v", badReport)
 	}
 
 	snapshotPath := filepath.Join(t.TempDir(), "go-snapshot.aflite")

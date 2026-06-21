@@ -35,6 +35,8 @@ Typed `PendingWorkStats`, `RunUntilIdleStatus`, `Check`, `Vacuum`, and
 keeping the raw JSON methods available. `ReplayGeneratedEnrichments` recreates
 generated enrichment work from stored documents after a manual-maintenance or
 restore pause.
+Use `CheckFile` or `CheckFileJSON` to inspect an invalid, truncated, or
+corrupted `.aflite` file without opening a database handle.
 
 Use `Open` for the normal writer profile, `OpenReadonly` for read-only query
 handles, `OpenStatusOnly` for inspection, and `OpenHosted` when the application
