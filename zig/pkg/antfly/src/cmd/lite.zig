@@ -1064,7 +1064,12 @@ fn liteHttpStatus(ctx: *httpx.Context) anyerror!httpx.Response {
 }
 
 fn liteHttpCapabilities(ctx: *httpx.Context) anyerror!httpx.Response {
-    const json = std.json.Stringify.valueAlloc(ctx.allocator, antfly.lite.backend.capabilitiesForProfile(.native), .{}) catch |err| return liteHttpError(ctx, err);
+    const state = liteHttpState(ctx) catch |err| return liteHttpError(ctx, err);
+    lockLiteHttpState(state);
+    defer state.mutex.unlock();
+    var status_value = state.lite.backend.fullStatus(ctx.allocator, &state.lite.db, .native) catch |err| return liteHttpError(ctx, err);
+    defer status_value.deinit(ctx.allocator);
+    const json = std.json.Stringify.valueAlloc(ctx.allocator, status_value.capabilities, .{}) catch |err| return liteHttpError(ctx, err);
     defer ctx.allocator.free(json);
     return liteHttpJson(ctx, 200, json);
 }
@@ -2412,6 +2417,14 @@ test "lite http handlers expose narrow embedded api" {
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"format\":\"aflite\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"engine\":\"native_single_file\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"capabilities\":") != null);
+    }
+    {
+        var resp = try testLiteHttpCall(allocator, &state, liteHttpCapabilities, .GET, "http://lite.test/lite/v1/capabilities", "", &.{});
+        defer resp.deinit();
+        try std.testing.expectEqual(@as(u16, 200), resp.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"dense_vector_search\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, testLiteHttpBody(&resp), "\"raft_replication\":false") != null);
     }
     {
         var req = try httpx.Request.init(allocator, .GET, "http://lite.test/lite/v1/status");
