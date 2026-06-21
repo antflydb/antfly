@@ -16,6 +16,7 @@ const std = @import("std");
 const support = @import("embedded_support");
 const db_mod = support.db;
 const db_core = support.db_core;
+const lite_restore_staging = support.lite.restore_staging;
 const template_remote_host = support.template_remote_host;
 
 pub const lsm_storage = support.lsm_storage;
@@ -237,6 +238,10 @@ pub const DB = struct {
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
+        if (self.owned_lite_backend != null) {
+            try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, backup);
+            return;
+        }
         try support.portable_backup.validatePortable(alloc, backup);
         try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
     }
