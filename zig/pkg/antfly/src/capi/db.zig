@@ -6981,6 +6981,17 @@ test "capi lite exposes hosted and status-only profiles" {
 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(hosted_handle));
 
+    const hosted_query =
+        \\{"full_text_search":{"match":{"field":"title","text":"hosted"}},"limit":1}
+    ;
+    var hosted_search: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_search_json(hosted_handle, .{
+        .ptr = hosted_query,
+        .len = hosted_query.len,
+    }, &hosted_search));
+    defer antfly_db_buffer_free(hosted_search.ptr, hosted_search.len);
+    try std.testing.expect(std.mem.indexOf(u8, hosted_search.ptr.?[0..hosted_search.len], "\"doc:capi-lite-profile\"") != null);
+
     antfly_db_close(hosted_handle);
     hosted_handle = null;
 
