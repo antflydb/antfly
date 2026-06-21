@@ -252,6 +252,7 @@ static void termite_metal_record_active_frame_blit_source(id<MTLCommandBuffer> c
 
 typedef struct termite_metal_embedding_table_cache_entry {
     id<MTLBuffer> buffer;
+    size_t buffer_offset;
     size_t bytes;
     size_t rows;
     size_t dim;
@@ -567,6 +568,7 @@ typedef struct termite_metal_decode_runtime {
     uint8_t linear_weight_dtypes[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     uint32_t quant_linear_formats[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     id<MTLBuffer> quant_linear_weight_buffers[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
+    size_t quant_linear_weight_offsets[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     size_t quant_linear_in_dims[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     size_t quant_linear_out_dims[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
     uint8_t quant_linear_slot_prepared[TERMITE_METAL_LINEAR_SLOT_CAPACITY];
@@ -609,6 +611,7 @@ typedef struct termite_metal_decode_runtime {
     size_t token_embedding_table_bytes;
     size_t position_embedding_table_bytes;
     size_t generic_embedding_table_bytes;
+    size_t generic_embedding_buffer_offset;
     size_t resident_vocab_size;
     size_t resident_max_position_embeddings;
     size_t resident_hidden_size;
@@ -1376,6 +1379,8 @@ typedef struct termite_metal_linear_params {
     uint32_t in_dim;
     uint32_t out_dim;
     uint32_t row_blocks;
+    uint32_t weight_offset;
+    uint32_t second_weight_offset;
 } termite_metal_linear_params;
 
 typedef struct termite_metal_qkv_linear_params {
@@ -1384,6 +1389,9 @@ typedef struct termite_metal_qkv_linear_params {
     uint32_t q_out_dim;
     uint32_t kv_out_dim;
     uint32_t row_blocks;
+    uint32_t q_weight_offset;
+    uint32_t k_weight_offset;
+    uint32_t v_weight_offset;
 } termite_metal_qkv_linear_params;
 
 static const size_t TERMITE_METAL_Q8_0_PAIR_ACTIVATION_SPLIT_MM_SG_MIN_ROWS = 129u;
@@ -1901,8 +1909,8 @@ typedef struct termite_metal_conv2d_f32_params {
 static NSString *termite_metal_shader_source(void) {
     return @"#include <metal_stdlib>\n"
            "using namespace metal;\n"
-           "struct termite_metal_linear_params { uint rows; uint in_dim; uint out_dim; uint row_blocks; };\n"
-           "struct termite_metal_qkv_linear_params { uint rows; uint in_dim; uint q_out_dim; uint kv_out_dim; uint row_blocks; };\n"
+           "struct termite_metal_linear_params { uint rows; uint in_dim; uint out_dim; uint row_blocks; uint weight_offset; uint second_weight_offset; };\n"
+           "struct termite_metal_qkv_linear_params { uint rows; uint in_dim; uint q_out_dim; uint kv_out_dim; uint row_blocks; uint q_weight_offset; uint k_weight_offset; uint v_weight_offset; };\n"
            "struct termite_metal_key_scores_params { uint q_len; uint block_tokens; uint num_heads; uint num_kv_heads; uint head_dim; uint key_row_bytes; };\n"
            "struct termite_metal_head_rms_rope_params { uint total_heads; uint head_dim; uint rope_dim; uint position; float theta; float freq_scale; float eps; float value_scale; uint consecutive_pairs; uint heads_per_row; uint position_period; };\n"
            "struct termite_metal_tl1_params { uint rows; uint in_dim; uint out_dim; uint packed_len; uint bm; uint cfg_by; uint bmm; };\n"
@@ -2139,6 +2147,7 @@ static NSString *termite_metal_shader_source(void) {
            "inline float termite_q8_1_block_scale(device const uchar *weight, uint off) { ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); return float(as_type<half>(bits)); }\n"
            "inline float termite_q8_1_block_value(device const uchar *weight, uint off, uint i) { return float(as_type<char>(weight[off + 4u + i])); }\n"
            "kernel void termite_q8_0_linear(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 34u; float acc = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 34u; float d = termite_q8_0_block_scale(weight, off); float block_acc = 0.0f; uint in_off = r * p.in_dim + b * 32u; for (uint i = 0; i < 32; ++i) { block_acc += input[in_off + i] * termite_q8_0_block_value(weight, off, i); } acc += d * block_acc; }\n"
            "    output[gid] = acc;\n"
@@ -2149,6 +2158,7 @@ static NSString *termite_metal_shader_source(void) {
            "    output[gid] += bias[col];\n"
            "}\n"
            "kernel void termite_q8_0_pair_linear(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], uint gid [[thread_position_in_grid]]) {\n"
+           "    weight_a += p.weight_offset; weight_b += p.second_weight_offset;\n"
            "    uint total = p.rows * p.out_dim; if (gid >= total) return; uint r = gid / p.out_dim; uint o = gid % p.out_dim; uint row_offset = o * p.row_blocks * 34u; float acc_a = 0.0f; float acc_b = 0.0f;\n"
            "    for (uint b = 0; b < p.row_blocks; ++b) { uint off = row_offset + b * 34u; float d_a = termite_q8_0_block_scale(weight_a, off); float d_b = termite_q8_0_block_scale(weight_b, off); float block_acc_a = 0.0f; float block_acc_b = 0.0f; uint in_off = r * p.in_dim + b * 32u; for (uint i = 0; i < 32; ++i) { float x = input[in_off + i]; block_acc_a += x * termite_q8_0_block_value(weight_a, off, i); block_acc_b += x * termite_q8_0_block_value(weight_b, off, i); } acc_a += d_a * block_acc_a; acc_b += d_b * block_acc_b; }\n"
            "    output_a[gid] = acc_a; output_b[gid] = acc_b;\n"
@@ -2167,6 +2177,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = total0; if (first_o + 1u < p.out_dim) output[idx + 1u] = total1; }\n"
            "}\n"
            "kernel void termite_q8_0_linear_mmv(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = uint(sgitg) * NQ + ix; uint in_row = r * p.in_dim; float acc0 = 0.0f; float acc1 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0u; i < NQ; ++i) { x[i] = input[in_off + i]; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block_acc = 0.0f; for (uint i = 0u; i < NQ; ++i) { char q = as_type<char>(weight[off + 2u + il * NQ + i]); block_acc += x[i] * float(q); } if (row == 0u) acc0 += d * block_acc; else acc1 += d * block_acc; } }\n"
@@ -2175,6 +2186,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = total0; if (first_o + 1u < p.out_dim) output[idx + 1u] = total1; }\n"
            "}\n"
            "kernel void termite_q8_0_linear_mmv_in_f16(device const half *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = uint(sgitg) * NQ + ix; uint in_row = r * p.in_dim; float acc0 = 0.0f; float acc1 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0u; i < NQ; ++i) { x[i] = float(input[in_off + i]); } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block_acc = 0.0f; for (uint i = 0u; i < NQ; ++i) { char q = as_type<char>(weight[off + 2u + il * NQ + i]); block_acc += x[i] * float(q); } if (row == 0u) acc0 += d * block_acc; else acc1 += d * block_acc; } }\n"
@@ -2183,6 +2195,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = total0; if (first_o + 1u < p.out_dim) output[idx + 1u] = total1; }\n"
            "}\n"
            "kernel void termite_q8_0_linear_rms_scale_mmv(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], device const float *norm_weight [[buffer(4)]], device const float *inv_scale [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = uint(sgitg) * NQ + ix; uint in_row = r * p.in_dim; float scale = inv_scale[r]; float acc0 = 0.0f; float acc1 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; uint norm_off = b * 32u + il * NQ; for (uint i = 0u; i < NQ; ++i) { x[i] = input[in_off + i] * norm_weight[norm_off + i] * scale; } for (uint row = 0u; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block_acc = 0.0f; for (uint i = 0u; i < NQ; ++i) { char q = as_type<char>(weight[off + 2u + il * NQ + i]); block_acc += x[i] * float(q); } if (row == 0u) acc0 += d * block_acc; else acc1 += d * block_acc; } }\n"
@@ -2191,6 +2204,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float total0 = simd_sum(shmem[lane]); float total1 = simd_sum(shmem[32u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = total0; if (first_o + 1u < p.out_dim) output[idx + 1u] = total1; }\n"
            "}\n"
            "inline void termite_q8_0_linear_r_ext_impl(device const float *input, device const uchar *weight, device float *output, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint first_r = tg.y * RPTG; if (o >= p.out_dim) return; float acc[5]; for (uint i = 0u; i < 5u; ++i) acc[i] = 0.0f; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float4 w = float4(float(as_type<char>(weight[off + 2u + ci * 4u])), float(as_type<char>(weight[off + 3u + ci * 4u])), float(as_type<char>(weight[off + 4u + ci * 4u])), float(as_type<char>(weight[off + 5u + ci * 4u]))) * d; uint in_col = c * 4u; for (uint rr = 0u; rr < RPTG; ++rr) { uint r = first_r + rr; if (r >= p.rows) continue; uint in_off = r * p.in_dim + in_col; float4 x = float4(input[in_off], input[in_off + 1u], input[in_off + 2u], input[in_off + 3u]); acc[rr] += dot(x, w); } } }\n"
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total = acc[rr]; total += simd_shuffle_down(total, 4u); total += simd_shuffle_down(total, 2u); total += simd_shuffle_down(total, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) output[r * p.out_dim + o] = total; }\n"
@@ -2207,6 +2221,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float d = float(xb->d); for (short i = 0; i < 16; ++i) reg[i / 4][i % 4] = half(float(xb->qs[i + 16 * il]) * d);\n"
            "}\n"
            "kernel void termite_q8_0_linear_mm_sg(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], threadgroup char *shmem [[threadgroup(0)]], ushort tiitg [[thread_index_in_threadgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    threadgroup half *sa = (threadgroup half *)(shmem); threadgroup half *sb = (threadgroup half *)(shmem + 4096u);\n"
            "    const short NR0 = 64; const short NR1 = 32; const short NK = 32; const short NL0 = 2; const short NL1 = 4;\n"
            "    const int r0 = int(tg.x) * NR0; const int r1 = int(tg.y) * NR1; if (r0 >= int(p.out_dim) || r1 >= int(p.rows)) return;\n"
@@ -2227,6 +2242,7 @@ static NSString *termite_metal_shader_source(void) {
            "    else { threadgroup_barrier(mem_flags::mem_threadgroup); threadgroup float *temp_str = ((threadgroup float *)shmem) + 32u * (uint(sgitg) & 1u) + 16u * (uint(sgitg) >> 1u) * uint(NR0); for (short i = 0; i < 8; ++i) simdgroup_store(mc[i], temp_str + 8u * uint(i % 4) + 8u * uint(NR0) * uint(i / 4), uint(NR0), 0, false); threadgroup_barrier(mem_flags::mem_threadgroup); if (sgitg == 0) { for (int j = int(tiitg); j < int(nr1); j += NR1) { device float *D = output + uint(r1 + j) * p.out_dim + uint(r0); threadgroup float *C = ((threadgroup float *)shmem) + uint(j) * uint(NR0); uint i = 0u; for (; i < uint(nr0); ++i) D[i] = C[i]; } } }\n"
            "}\n"
            "kernel void termite_q8_0_linear_mm(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
            "    uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint first_o = (tg.x * (NY * NSG) + uint(sgitg) * NY + ty) * OPG; uint first_r = tg.y * RPTG; if (first_o >= p.out_dim) return;\n"
            "    float acc0[8]; float acc1[8]; for (uint i = 0u; i < RPTG; ++i) { acc0[i] = 0.0f; acc1[i] = 0.0f; }\n"
@@ -2235,6 +2251,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total0 = acc0[rr]; float total1 = acc1[rr]; total0 += simd_shuffle_down(total0, 4u); total1 += simd_shuffle_down(total1, 4u); total0 += simd_shuffle_down(total0, 2u); total1 += simd_shuffle_down(total1, 2u); total0 += simd_shuffle_down(total0, 1u); total1 += simd_shuffle_down(total1, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + first_o; output[idx] = total0; if (has_o1) output[idx + 1u] = total1; } }\n"
            "}\n"
            "kernel void termite_q8_0_linear_mm_in_f16(device const half *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device float *output [[buffer(2)]], constant termite_metal_linear_params &p [[buffer(3)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
            "    uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint first_o = (tg.x * (NY * NSG) + uint(sgitg) * NY + ty) * OPG; uint first_r = tg.y * RPTG; if (first_o >= p.out_dim) return;\n"
            "    float acc0[8]; float acc1[8]; for (uint i = 0u; i < RPTG; ++i) { acc0[i] = 0.0f; acc1[i] = 0.0f; }\n"
@@ -2243,6 +2260,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total0 = acc0[rr]; float total1 = acc1[rr]; total0 += simd_shuffle_down(total0, 4u); total1 += simd_shuffle_down(total1, 4u); total0 += simd_shuffle_down(total0, 2u); total1 += simd_shuffle_down(total1, 2u); total0 += simd_shuffle_down(total0, 1u); total1 += simd_shuffle_down(total1, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + first_o; output[idx] = total0; if (has_o1) output[idx + 1u] = total1; } }\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_mm(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
            "    uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint first_o = (tg.x * (NY * NSG) + uint(sgitg) * NY + ty) * OPG; uint first_r = tg.y * RPTG; if (first_o >= p.out_dim) return;\n"
            "    float gate0[8]; float up0[8]; float gate1[8]; float up1[8]; for (uint i = 0u; i < RPTG; ++i) { gate0[i] = 0.0f; up0[i] = 0.0f; gate1[i] = 0.0f; up1[i] = 0.0f; }\n"
@@ -2251,6 +2269,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total_gate0 = gate0[rr]; float total_up0 = up0[rr]; float total_gate1 = gate1[rr]; float total_up1 = up1[rr]; total_gate0 += simd_shuffle_down(total_gate0, 4u); total_up0 += simd_shuffle_down(total_up0, 4u); total_gate1 += simd_shuffle_down(total_gate1, 4u); total_up1 += simd_shuffle_down(total_up1, 4u); total_gate0 += simd_shuffle_down(total_gate0, 2u); total_up0 += simd_shuffle_down(total_up0, 2u); total_gate1 += simd_shuffle_down(total_gate1, 2u); total_up1 += simd_shuffle_down(total_up1, 2u); total_gate0 += simd_shuffle_down(total_gate0, 1u); total_up0 += simd_shuffle_down(total_up0, 1u); total_gate1 += simd_shuffle_down(total_gate1, 1u); total_up1 += simd_shuffle_down(total_up1, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + first_o; output[idx] = termite_gated_activation_product(total_gate0, total_up0, ap.activation_kind); if (has_o1) output[idx + 1u] = termite_gated_activation_product(total_gate1, total_up1, ap.activation_kind); } }\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_mm_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint RPTG = 8u; const uint CHPT = 4u; const uint OPG = 2u;\n"
            "    uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint first_o = (tg.x * (NY * NSG) + uint(sgitg) * NY + ty) * OPG; uint first_r = tg.y * RPTG; if (first_o >= p.out_dim) return;\n"
            "    float gate0[8]; float up0[8]; float gate1[8]; float up1[8]; for (uint i = 0u; i < RPTG; ++i) { gate0[i] = 0.0f; up0[i] = 0.0f; gate1[i] = 0.0f; up1[i] = 0.0f; }\n"
@@ -2259,6 +2278,7 @@ static NSString *termite_metal_shader_source(void) {
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total_gate0 = gate0[rr]; float total_up0 = up0[rr]; float total_gate1 = gate1[rr]; float total_up1 = up1[rr]; total_gate0 += simd_shuffle_down(total_gate0, 4u); total_up0 += simd_shuffle_down(total_up0, 4u); total_gate1 += simd_shuffle_down(total_gate1, 4u); total_up1 += simd_shuffle_down(total_up1, 4u); total_gate0 += simd_shuffle_down(total_gate0, 2u); total_up0 += simd_shuffle_down(total_up0, 2u); total_gate1 += simd_shuffle_down(total_gate1, 2u); total_up1 += simd_shuffle_down(total_up1, 2u); total_gate0 += simd_shuffle_down(total_gate0, 1u); total_up0 += simd_shuffle_down(total_up0, 1u); total_gate1 += simd_shuffle_down(total_gate1, 1u); total_up1 += simd_shuffle_down(total_up1, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + first_o; output[idx] = half(termite_gated_activation_product(total_gate0, total_up0, ap.activation_kind)); if (has_o1) output[idx + 1u] = half(termite_gated_activation_product(total_gate1, total_up1, ap.activation_kind)); } }\n"
            "}\n"
            "kernel void termite_q8_0_pair_linear_mmv(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_a += p.weight_offset; weight_b += p.second_weight_offset;\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; float acc_a0 = 0.0f; float acc_b0 = 0.0f; float acc_a1 = 0.0f; float acc_b1 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0; i < NQ; ++i) { x[i] = input[in_off + i]; } uint o0 = first_o; if (o0 < p.out_dim) { uint off = o0 * p.row_blocks * 34u + b * 34u; ushort bits_a = (ushort(weight_a[off + 1]) << 8) | ushort(weight_a[off]); ushort bits_b = (ushort(weight_b[off + 1]) << 8) | ushort(weight_b[off]); float d_a = float(as_type<half>(bits_a)); float d_b = float(as_type<half>(bits_b)); float block_a = 0.0f; float block_b = 0.0f; for (uint i = 0; i < NQ; ++i) { float xv = x[i]; block_a += xv * float(as_type<char>(weight_a[off + 2u + il * NQ + i])); block_b += xv * float(as_type<char>(weight_b[off + 2u + il * NQ + i])); } acc_a0 += d_a * block_a; acc_b0 += d_b * block_b; } uint o1 = first_o + 1u; if (o1 < p.out_dim) { uint off = o1 * p.row_blocks * 34u + b * 34u; ushort bits_a = (ushort(weight_a[off + 1]) << 8) | ushort(weight_a[off]); ushort bits_b = (ushort(weight_b[off + 1]) << 8) | ushort(weight_b[off]); float d_a = float(as_type<half>(bits_a)); float d_b = float(as_type<half>(bits_b)); float block_a = 0.0f; float block_b = 0.0f; for (uint i = 0; i < NQ; ++i) { float xv = x[i]; block_a += xv * float(as_type<char>(weight_a[off + 2u + il * NQ + i])); block_b += xv * float(as_type<char>(weight_b[off + 2u + il * NQ + i])); } acc_a1 += d_a * block_a; acc_b1 += d_b * block_b; } }\n"
@@ -2267,6 +2287,7 @@ static NSString *termite_metal_shader_source(void) {
            "    float total_a0 = simd_sum(shmem[lane]); float total_b0 = simd_sum(shmem[32u + lane]); float total_a1 = simd_sum(shmem[64u + lane]); float total_b1 = simd_sum(shmem[96u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) { output_a[idx] = total_a0; output_b[idx] = total_b0; } if (first_o + 1u < p.out_dim) { output_a[idx + 1u] = total_a1; output_b[idx + 1u] = total_b1; } }\n"
            "}\n"
            "inline void termite_q8_0_pair_linear_r_ext_impl(device const float *input, device const uchar *weight_a, device const uchar *weight_b, device float *output_a, device float *output_b, constant termite_metal_linear_params &p, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
+           "    weight_a += p.weight_offset; weight_b += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint first_r = tg.y * RPTG; if (o >= p.out_dim) return; float acc_a[5]; float acc_b[5]; for (uint i = 0u; i < 5u; ++i) { acc_a[i] = 0.0f; acc_b[i] = 0.0f; } uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits_a = (ushort(weight_a[off + 1u]) << 8) | ushort(weight_a[off]); ushort bits_b = (ushort(weight_b[off + 1u]) << 8) | ushort(weight_b[off]); float da = float(as_type<half>(bits_a)); float db = float(as_type<half>(bits_b)); float4 wa = float4(float(as_type<char>(weight_a[off + 2u + ci * 4u])), float(as_type<char>(weight_a[off + 3u + ci * 4u])), float(as_type<char>(weight_a[off + 4u + ci * 4u])), float(as_type<char>(weight_a[off + 5u + ci * 4u]))) * da; float4 wb = float4(float(as_type<char>(weight_b[off + 2u + ci * 4u])), float(as_type<char>(weight_b[off + 3u + ci * 4u])), float(as_type<char>(weight_b[off + 4u + ci * 4u])), float(as_type<char>(weight_b[off + 5u + ci * 4u]))) * db; uint in_col = c * 4u; for (uint rr = 0u; rr < RPTG; ++rr) { uint r = first_r + rr; if (r >= p.rows) continue; uint in_off = r * p.in_dim + in_col; float4 x = float4(input[in_off], input[in_off + 1u], input[in_off + 2u], input[in_off + 3u]); acc_a[rr] += dot(x, wa); acc_b[rr] += dot(x, wb); } } }\n"
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total_a = acc_a[rr]; float total_b = acc_b[rr]; total_a += simd_shuffle_down(total_a, 4u); total_b += simd_shuffle_down(total_b, 4u); total_a += simd_shuffle_down(total_a, 2u); total_b += simd_shuffle_down(total_b, 2u); total_a += simd_shuffle_down(total_a, 1u); total_b += simd_shuffle_down(total_b, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) { uint idx = r * p.out_dim + o; output_a[idx] = total_a; output_b[idx] = total_b; } }\n"
@@ -2276,6 +2297,7 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_q8_0_pair_linear_r4_ext(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_pair_linear_r_ext_impl(input, weight_a, weight_b, output_a, output_b, p, lane, sgitg, tg, 4u); }\n"
            "kernel void termite_q8_0_pair_linear_r5_ext(device const float *input [[buffer(0)]], device const uchar *weight_a [[buffer(1)]], device const uchar *weight_b [[buffer(2)]], device float *output_a [[buffer(3)]], device float *output_b [[buffer(4)]], constant termite_metal_linear_params &p [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_pair_linear_r_ext_impl(input, weight_a, weight_b, output_a, output_b, p, lane, sgitg, tg, 5u); }\n"
            "kernel void termite_q8_0_qkv_linear_mmv(device const float *input [[buffer(0)]], device const uchar *weight_q [[buffer(1)]], device const uchar *weight_k [[buffer(2)]], device const uchar *weight_v [[buffer(3)]], device float *output_q [[buffer(4)]], device float *output_k [[buffer(5)]], device float *output_v [[buffer(6)]], constant termite_metal_qkv_linear_params &p [[buffer(7)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_q += p.q_weight_offset; weight_k += p.k_weight_offset; weight_v += p.v_weight_offset;\n"
            "    const uint NR0 = 2u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint q_groups = (p.q_out_dim + 1u) / 2u; uint first_o = tg.x < q_groups ? tg.x * NR0 : (tg.x - q_groups) * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim;\n"
            "    if (tg.x < q_groups) {\n"
@@ -2293,6 +2315,7 @@ static NSString *termite_metal_shader_source(void) {
            "    }\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_1x_reduce4(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; float gate0 = 0.0f; float up0 = 0.0f; float gate1 = 0.0f; float up1 = 0.0f; float gate2 = 0.0f; float up2 = 0.0f; float gate3 = 0.0f; float up3 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0; i < NQ; ++i) { x[i] = input[in_off + i]; } for (uint row = 0; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits_g = (ushort(weight_gate[off + 1]) << 8) | ushort(weight_gate[off]); ushort bits_u = (ushort(weight_up[off + 1]) << 8) | ushort(weight_up[off]); float dg = float(as_type<half>(bits_g)); float du = float(as_type<half>(bits_u)); float block_g = 0.0f; float block_u = 0.0f; for (uint i = 0; i < NQ; ++i) { float xv = x[i]; block_g += xv * float(as_type<char>(weight_gate[off + 2u + il * NQ + i])); block_u += xv * float(as_type<char>(weight_up[off + 2u + il * NQ + i])); } if (row == 0u) { gate0 += dg * block_g; up0 += du * block_u; } else if (row == 1u) { gate1 += dg * block_g; up1 += du * block_u; } else if (row == 2u) { gate2 += dg * block_g; up2 += du * block_u; } else { gate3 += dg * block_g; up3 += du * block_u; } } }\n"
@@ -2301,21 +2324,25 @@ static NSString *termite_metal_shader_source(void) {
            "    float total_gate0 = simd_sum(shmem[lane]); float total_up0 = simd_sum(shmem[32u + lane]); float total_gate1 = simd_sum(shmem[64u + lane]); float total_up1 = simd_sum(shmem[96u + lane]); float total_gate2 = simd_sum(shmem[128u + lane]); float total_up2 = simd_sum(shmem[160u + lane]); float total_gate3 = simd_sum(shmem[192u + lane]); float total_up3 = simd_sum(shmem[224u + lane]); if (lane == 0u && sgitg == 0u) { uint idx = r * p.out_dim + first_o; if (first_o < p.out_dim) output[idx] = termite_gated_activation_product(total_gate0, total_up0, ap.activation_kind); if (first_o + 1u < p.out_dim) output[idx + 1u] = termite_gated_activation_product(total_gate1, total_up1, ap.activation_kind); if (first_o + 2u < p.out_dim) output[idx + 2u] = termite_gated_activation_product(total_gate2, total_up2, ap.activation_kind); if (first_o + 3u < p.out_dim) output[idx + 3u] = termite_gated_activation_product(total_gate3, total_up3, ap.activation_kind); }\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_1r_ext(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float gate = 0.0f; float up = 0.0f;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits_g = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort bits_u = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float dg = float(as_type<half>(bits_g)); float du = float(as_type<half>(bits_u)); float4 wg = float4(float(as_type<char>(weight_gate[off + 2u + ci * 4u])), float(as_type<char>(weight_gate[off + 3u + ci * 4u])), float(as_type<char>(weight_gate[off + 4u + ci * 4u])), float(as_type<char>(weight_gate[off + 5u + ci * 4u]))) * dg; float4 wu = float4(float(as_type<char>(weight_up[off + 2u + ci * 4u])), float(as_type<char>(weight_up[off + 3u + ci * 4u])), float(as_type<char>(weight_up[off + 4u + ci * 4u])), float(as_type<char>(weight_up[off + 5u + ci * 4u]))) * du; uint in_col = input_row + c * 4u; float4 x = float4(input[in_col], input[in_col + 1u], input[in_col + 2u], input[in_col + 3u]); gate += dot(x, wg); up += dot(x, wu); } }\n"
            "    gate += simd_shuffle_down(gate, 4u); up += simd_shuffle_down(up, 4u); gate += simd_shuffle_down(gate, 2u); up += simd_shuffle_down(up, 2u); gate += simd_shuffle_down(gate, 1u); up += simd_shuffle_down(up, 1u); if (tx == 0u) output[r * p.out_dim + o] = termite_gated_activation_product(gate, up, ap.activation_kind);\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], device const float *norm_weight [[buffer(6)]], device const float *inv_scale [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float scale = inv_scale[r]; float gate = 0.0f; float up = 0.0f;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits_g = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort bits_u = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float dg = float(as_type<half>(bits_g)); float du = float(as_type<half>(bits_u)); float4 wg = float4(float(as_type<char>(weight_gate[off + 2u + ci * 4u])), float(as_type<char>(weight_gate[off + 3u + ci * 4u])), float(as_type<char>(weight_gate[off + 4u + ci * 4u])), float(as_type<char>(weight_gate[off + 5u + ci * 4u]))) * dg; float4 wu = float4(float(as_type<char>(weight_up[off + 2u + ci * 4u])), float(as_type<char>(weight_up[off + 3u + ci * 4u])), float(as_type<char>(weight_up[off + 4u + ci * 4u])), float(as_type<char>(weight_up[off + 5u + ci * 4u]))) * du; uint in_col = input_row + c * 4u; uint norm_col = c * 4u; float4 x = float4(input[in_col] * norm_weight[norm_col], input[in_col + 1u] * norm_weight[norm_col + 1u], input[in_col + 2u] * norm_weight[norm_col + 2u], input[in_col + 3u] * norm_weight[norm_col + 3u]) * scale; gate += dot(x, wg); up += dot(x, wu); } }\n"
            "    gate += simd_shuffle_down(gate, 4u); up += simd_shuffle_down(up, 4u); gate += simd_shuffle_down(gate, 2u); up += simd_shuffle_down(up, 2u); gate += simd_shuffle_down(gate, 1u); up += simd_shuffle_down(up, 1u); if (tx == 0u) output[r * p.out_dim + o] = termite_gated_activation_product(gate, up, ap.activation_kind);\n"
            "}\n"
            "kernel void termite_q8_0_pair_activation_multiply_rms_scale_1r_ext_out_f16(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device half *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], device const float *norm_weight [[buffer(6)]], device const float *inv_scale [[buffer(7)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float scale = inv_scale[r]; float gate = 0.0f; float up = 0.0f;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits_g = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort bits_u = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float dg = float(as_type<half>(bits_g)); float du = float(as_type<half>(bits_u)); float4 wg = float4(float(as_type<char>(weight_gate[off + 2u + ci * 4u])), float(as_type<char>(weight_gate[off + 3u + ci * 4u])), float(as_type<char>(weight_gate[off + 4u + ci * 4u])), float(as_type<char>(weight_gate[off + 5u + ci * 4u]))) * dg; float4 wu = float4(float(as_type<char>(weight_up[off + 2u + ci * 4u])), float(as_type<char>(weight_up[off + 3u + ci * 4u])), float(as_type<char>(weight_up[off + 4u + ci * 4u])), float(as_type<char>(weight_up[off + 5u + ci * 4u]))) * du; uint in_col = input_row + c * 4u; uint norm_col = c * 4u; float4 x = float4(input[in_col] * norm_weight[norm_col], input[in_col + 1u] * norm_weight[norm_col + 1u], input[in_col + 2u] * norm_weight[norm_col + 2u], input[in_col + 3u] * norm_weight[norm_col + 3u]) * scale; gate += dot(x, wg); up += dot(x, wu); } }\n"
            "    gate += simd_shuffle_down(gate, 4u); up += simd_shuffle_down(up, 4u); gate += simd_shuffle_down(gate, 2u); up += simd_shuffle_down(up, 2u); gate += simd_shuffle_down(gate, 1u); up += simd_shuffle_down(up, 1u); if (tx == 0u) output[r * p.out_dim + o] = half(termite_gated_activation_product(gate, up, ap.activation_kind));\n"
            "}\n"
            "inline void termite_q8_0_pair_activation_multiply_r_ext_impl(device const float *input, device const uchar *weight_gate, device const uchar *weight_up, device float *output, constant termite_metal_linear_params &p, constant termite_metal_apply_activation_params &ap, ushort lane, ushort sgitg, uint3 tg, uint RPTG) {\n"
+           "    weight_gate += p.weight_offset; weight_up += p.second_weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint first_r = tg.y * RPTG; if (o >= p.out_dim) return; float gate[5]; float up[5]; for (uint i = 0u; i < 5u; ++i) { gate[i] = 0.0f; up[i] = 0.0f; } uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits_g = (ushort(weight_gate[off + 1u]) << 8) | ushort(weight_gate[off]); ushort bits_u = (ushort(weight_up[off + 1u]) << 8) | ushort(weight_up[off]); float dg = float(as_type<half>(bits_g)); float du = float(as_type<half>(bits_u)); float4 wg = float4(float(as_type<char>(weight_gate[off + 2u + ci * 4u])), float(as_type<char>(weight_gate[off + 3u + ci * 4u])), float(as_type<char>(weight_gate[off + 4u + ci * 4u])), float(as_type<char>(weight_gate[off + 5u + ci * 4u]))) * dg; float4 wu = float4(float(as_type<char>(weight_up[off + 2u + ci * 4u])), float(as_type<char>(weight_up[off + 3u + ci * 4u])), float(as_type<char>(weight_up[off + 4u + ci * 4u])), float(as_type<char>(weight_up[off + 5u + ci * 4u]))) * du; uint in_col = c * 4u; for (uint rr = 0u; rr < RPTG; ++rr) { uint r = first_r + rr; if (r >= p.rows) continue; uint in_off = r * p.in_dim + in_col; float4 x = float4(input[in_off], input[in_off + 1u], input[in_off + 2u], input[in_off + 3u]); gate[rr] += dot(x, wg); up[rr] += dot(x, wu); } } }\n"
            "    for (uint rr = 0u; rr < RPTG; ++rr) { float total_gate = gate[rr]; float total_up = up[rr]; total_gate += simd_shuffle_down(total_gate, 4u); total_up += simd_shuffle_down(total_up, 4u); total_gate += simd_shuffle_down(total_gate, 2u); total_up += simd_shuffle_down(total_up, 2u); total_gate += simd_shuffle_down(total_gate, 1u); total_up += simd_shuffle_down(total_up, 1u); uint r = first_r + rr; if (tx == 0u && r < p.rows) output[r * p.out_dim + o] = termite_gated_activation_product(total_gate, total_up, ap.activation_kind); }\n"
@@ -2325,11 +2352,13 @@ static NSString *termite_metal_shader_source(void) {
            "kernel void termite_q8_0_pair_activation_multiply_r4_ext(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_pair_activation_multiply_r_ext_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 4u); }\n"
            "kernel void termite_q8_0_pair_activation_multiply_r5_ext(device const float *input [[buffer(0)]], device const uchar *weight_gate [[buffer(1)]], device const uchar *weight_up [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) { termite_q8_0_pair_activation_multiply_r_ext_impl(input, weight_gate, weight_up, output, p, ap, lane, sgitg, tg, 5u); }\n"
            "kernel void termite_q8_0_activation_multiply_1r_ext(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const float *rhs [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NX = 8u; const uint NY = 4u; const uint NSG = 4u; const uint CHPT = 4u; uint tx = uint(lane) & 7u; uint ty = uint(lane) >> 3; uint o = tg.x * (NY * NSG) + uint(sgitg) * NY + ty; uint r = tg.y; if (r >= p.rows || o >= p.out_dim) return; uint row_offset = o * p.row_blocks * 34u; uint total_chunks = p.row_blocks * 8u; uint input_row = r * p.in_dim; float acc = 0.0f;\n"
            "    for (uint chunk = tx; chunk < total_chunks; chunk += CHPT * NX) { for (uint ch = 0u; ch < CHPT; ++ch) { uint c = chunk + ch * NX; if (c >= total_chunks) continue; uint b = c >> 3; uint ci = c & 7u; uint off = row_offset + b * 34u; ushort bits = (ushort(weight[off + 1u]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float4 w = float4(float(as_type<char>(weight[off + 2u + ci * 4u])), float(as_type<char>(weight[off + 3u + ci * 4u])), float(as_type<char>(weight[off + 4u + ci * 4u])), float(as_type<char>(weight[off + 5u + ci * 4u]))) * d; uint in_col = input_row + c * 4u; float4 x = float4(input[in_col], input[in_col + 1u], input[in_col + 2u], input[in_col + 3u]); acc += dot(x, w); } }\n"
            "    acc += simd_shuffle_down(acc, 4u); acc += simd_shuffle_down(acc, 2u); acc += simd_shuffle_down(acc, 1u); if (tx == 0u) { uint idx = r * p.out_dim + o; output[idx] = termite_gated_activation_product(acc, rhs[idx], ap.activation_kind); }\n"
            "}\n"
            "kernel void termite_q8_0_activation_multiply_1x_reduce4(device const float *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], device const float *rhs [[buffer(2)]], device float *output [[buffer(3)]], constant termite_metal_linear_params &p [[buffer(4)]], constant termite_metal_apply_activation_params &ap [[buffer(5)]], threadgroup float *shmem [[threadgroup(0)]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint3 tg [[threadgroup_position_in_grid]]) {\n"
+           "    weight += p.weight_offset;\n"
            "    const uint NR0 = 4u; const uint NSG = 4u; const uint NQ = 8u; const uint NW = 32u; uint first_o = tg.x * NR0; uint r = tg.y; if (r >= p.rows || lane >= NW) return;\n"
            "    uint ix = lane / (NW / NQ); uint il = lane - ix * (NW / NQ); uint ib0 = sgitg * NQ + ix; uint in_row = r * p.in_dim; float acc0 = 0.0f; float acc1 = 0.0f; float acc2 = 0.0f; float acc3 = 0.0f;\n"
            "    for (uint b = ib0; b < p.row_blocks; b += NSG * NQ) { float x[8]; uint in_off = in_row + b * 32u + il * NQ; for (uint i = 0; i < NQ; ++i) { x[i] = input[in_off + i]; } for (uint row = 0; row < NR0; ++row) { uint o = first_o + row; if (o >= p.out_dim) continue; uint off = o * p.row_blocks * 34u + b * 34u; ushort bits = (ushort(weight[off + 1]) << 8) | ushort(weight[off]); float d = float(as_type<half>(bits)); float block = 0.0f; for (uint i = 0; i < NQ; ++i) block += x[i] * float(as_type<char>(weight[off + 2u + il * NQ + i])); if (row == 0u) acc0 += d * block; else if (row == 1u) acc1 += d * block; else if (row == 2u) acc2 += d * block; else acc3 += d * block; } }\n"
@@ -5708,6 +5737,7 @@ static void termite_metal_decode_runtime_clear_quant_linear_descriptor(termite_m
     if (runtime == NULL || slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY) return;
     termite_metal_decode_runtime_invalidate_q8_qkv_pack_slot(runtime, slot);
     runtime->quant_linear_weight_buffers[slot] = nil;
+    runtime->quant_linear_weight_offsets[slot] = 0;
     runtime->quant_linear_in_dims[slot] = 0;
     runtime->quant_linear_out_dims[slot] = 0;
     runtime->quant_linear_slot_prepared[slot] = 0;
@@ -5747,6 +5777,7 @@ static int termite_metal_decode_runtime_check_quant_linear_descriptor(
 typedef struct termite_metal_quant_linear_slot_view {
     id<MTLComputePipelineState> pipeline;
     id<MTLBuffer> weight_buffer;
+    size_t weight_offset;
     uint8_t prepared;
     size_t in_dim;
     size_t out_dim;
@@ -5788,9 +5819,9 @@ static int termite_metal_decode_runtime_ensure_q8_qkv_packed_weight(
     const size_t q_bytes = q_out_dim * row_stride_bytes;
     const size_t kv_bytes = kv_out_dim * row_stride_bytes;
     const size_t packed_bytes = total_out_dim * row_stride_bytes;
-    if (q_view->weight_buffer.length < q_bytes ||
-        k_view->weight_buffer.length < kv_bytes ||
-        v_view->weight_buffer.length < kv_bytes)
+    if (q_view->weight_offset > q_view->weight_buffer.length || q_bytes > q_view->weight_buffer.length - q_view->weight_offset ||
+        k_view->weight_offset > k_view->weight_buffer.length || kv_bytes > k_view->weight_buffer.length - k_view->weight_offset ||
+        v_view->weight_offset > v_view->weight_buffer.length || kv_bytes > v_view->weight_buffer.length - v_view->weight_offset)
     {
         return -2;
     }
@@ -5810,9 +5841,9 @@ static int termite_metal_decode_runtime_ensure_q8_qkv_packed_weight(
     if (packed == nil) return -3;
     id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
     if (blit == nil) return -4;
-    [blit copyFromBuffer:q_view->weight_buffer sourceOffset:0 toBuffer:packed destinationOffset:0 size:q_bytes];
-    [blit copyFromBuffer:k_view->weight_buffer sourceOffset:0 toBuffer:packed destinationOffset:q_bytes size:kv_bytes];
-    [blit copyFromBuffer:v_view->weight_buffer sourceOffset:0 toBuffer:packed destinationOffset:q_bytes + kv_bytes size:kv_bytes];
+    [blit copyFromBuffer:q_view->weight_buffer sourceOffset:q_view->weight_offset toBuffer:packed destinationOffset:0 size:q_bytes];
+    [blit copyFromBuffer:k_view->weight_buffer sourceOffset:k_view->weight_offset toBuffer:packed destinationOffset:q_bytes size:kv_bytes];
+    [blit copyFromBuffer:v_view->weight_buffer sourceOffset:v_view->weight_offset toBuffer:packed destinationOffset:q_bytes + kv_bytes size:kv_bytes];
     [blit endEncoding];
 
     runtime->q8_qkv_packed_weight_buffers[q_slot] = packed;
@@ -5878,8 +5909,11 @@ typedef struct termite_metal_quant_matmul_descriptor {
     id<MTLBuffer> input_buffer;
     size_t input_offset;
     id<MTLBuffer> weight_buffer;
+    size_t weight_offset;
     id<MTLBuffer> second_weight_buffer;
+    size_t second_weight_offset;
     id<MTLBuffer> third_weight_buffer;
+    size_t third_weight_offset;
     id<MTLBuffer> output_buffer;
     size_t output_offset;
     id<MTLBuffer> second_output_buffer;
@@ -6020,6 +6054,7 @@ static void termite_metal_decode_runtime_set_quant_linear_slot_view(
     termite_metal_quant_linear_slot_view *view,
     id<MTLComputePipelineState> pipeline,
     id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
     uint8_t prepared,
     size_t in_dim,
     size_t out_dim,
@@ -6029,6 +6064,7 @@ static void termite_metal_decode_runtime_set_quant_linear_slot_view(
 ) {
     view->pipeline = pipeline;
     view->weight_buffer = weight_buffer;
+    view->weight_offset = weight_offset;
     view->prepared = prepared;
     view->in_dim = in_dim;
     view->out_dim = out_dim;
@@ -6117,7 +6153,7 @@ static int termite_metal_decode_runtime_quant_linear_slot_view(
         default:
             return -3;
     }
-    termite_metal_decode_runtime_set_quant_linear_slot_view(view, pipeline, runtime->quant_linear_weight_buffers[slot], runtime->quant_linear_slot_prepared[slot], runtime->quant_linear_in_dims[slot], runtime->quant_linear_out_dims[slot], format, runtime->quant_linear_values_per_block[slot], runtime->quant_linear_bytes_per_block[slot]);
+    termite_metal_decode_runtime_set_quant_linear_slot_view(view, pipeline, runtime->quant_linear_weight_buffers[slot], runtime->quant_linear_weight_offsets[slot], runtime->quant_linear_slot_prepared[slot], runtime->quant_linear_in_dims[slot], runtime->quant_linear_out_dims[slot], format, runtime->quant_linear_values_per_block[slot], runtime->quant_linear_bytes_per_block[slot]);
     return 0;
 }
 
@@ -6135,6 +6171,17 @@ static int termite_metal_decode_runtime_require_quant_linear_slot(
     if (view->prepared == 0) return -21;
     if (view->in_dim != in_dim || view->out_dim != out_dim) return -22;
     if (termite_metal_decode_runtime_check_quant_linear_descriptor(runtime, slot, format, view->values_per_block, view->bytes_per_block, in_dim) != 0) return -23;
+    if (view->values_per_block == 0 || view->bytes_per_block == 0) return -24;
+    const size_t row_blocks = in_dim / view->values_per_block;
+    if (row_blocks > SIZE_MAX / view->bytes_per_block) return -24;
+    const size_t row_stride_bytes = row_blocks * view->bytes_per_block;
+    if (out_dim > SIZE_MAX / row_stride_bytes) return -24;
+    const size_t weight_bytes = out_dim * row_stride_bytes;
+    if (view->weight_offset > view->weight_buffer.length ||
+        weight_bytes > view->weight_buffer.length - view->weight_offset)
+    {
+        return -24;
+    }
     return 0;
 }
 
@@ -6209,8 +6256,8 @@ static int termite_metal_encode_quant_matmul_generic_pair_on_encoder(
     };
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:descriptor->input_buffer offset:descriptor->input_offset atIndex:0];
-    [encoder setBuffer:descriptor->weight_buffer offset:0 atIndex:1];
-    [encoder setBuffer:descriptor->second_weight_buffer offset:0 atIndex:2];
+    [encoder setBuffer:descriptor->weight_buffer offset:descriptor->weight_offset atIndex:1];
+    [encoder setBuffer:descriptor->second_weight_buffer offset:descriptor->second_weight_offset atIndex:2];
     [encoder setBuffer:descriptor->output_buffer offset:descriptor->output_offset atIndex:3];
     [encoder setBuffer:descriptor->second_output_buffer offset:descriptor->second_output_offset atIndex:4];
     [encoder setBytes:&params length:sizeof(params) atIndex:5];
@@ -6237,6 +6284,14 @@ static int termite_metal_prepare_quant_matmul_accesses(
     size_t output_bytes = 0;
     if (!termite_metal_size_mul3(descriptor->rows, descriptor->in_dim, termite_metal_quant_matmul_dtype_size(descriptor->input_dtype), &input_bytes)) return failure_code;
     if (!termite_metal_size_mul3(descriptor->rows, descriptor->out_dim, termite_metal_quant_matmul_dtype_size(descriptor->output_dtype), &output_bytes)) return failure_code;
+    if (descriptor->values_per_block == 0 || descriptor->in_dim % descriptor->values_per_block != 0) return failure_code;
+    size_t row_stride_bytes = 0;
+    if (!termite_metal_size_mul(descriptor->in_dim / descriptor->values_per_block, descriptor->bytes_per_block, &row_stride_bytes)) return failure_code;
+    size_t weight_bytes = 0;
+    if (!termite_metal_size_mul(descriptor->out_dim, row_stride_bytes, &weight_bytes)) return failure_code;
+    const size_t second_weight_out_dim = descriptor->second_out_dim != 0 ? descriptor->second_out_dim : descriptor->out_dim;
+    size_t second_weight_bytes = 0;
+    if (!termite_metal_size_mul(second_weight_out_dim, row_stride_bytes, &second_weight_bytes)) return failure_code;
 
     termite_metal_planned_encoder_range accesses[12];
     size_t count = 0;
@@ -6246,14 +6301,14 @@ static int termite_metal_prepare_quant_matmul_accesses(
     } while (0)
 
     TERMITE_PLAN_ACCESS(descriptor->input_buffer, descriptor->input_offset, input_bytes, TERMITE_METAL_PLANNED_RANGE_READ);
-    TERMITE_PLAN_ACCESS(descriptor->weight_buffer, 0, descriptor->weight_buffer.length, TERMITE_METAL_PLANNED_RANGE_READ);
+    TERMITE_PLAN_ACCESS(descriptor->weight_buffer, descriptor->weight_offset, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ);
     TERMITE_PLAN_ACCESS(descriptor->output_buffer, descriptor->output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE);
 
     if (descriptor->second_weight_buffer != nil) {
-        TERMITE_PLAN_ACCESS(descriptor->second_weight_buffer, 0, descriptor->second_weight_buffer.length, TERMITE_METAL_PLANNED_RANGE_READ);
+        TERMITE_PLAN_ACCESS(descriptor->second_weight_buffer, descriptor->second_weight_offset, second_weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ);
     }
     if (descriptor->third_weight_buffer != nil) {
-        TERMITE_PLAN_ACCESS(descriptor->third_weight_buffer, 0, descriptor->third_weight_buffer.length, TERMITE_METAL_PLANNED_RANGE_READ);
+        TERMITE_PLAN_ACCESS(descriptor->third_weight_buffer, descriptor->third_weight_offset, second_weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ);
     }
     if (descriptor->second_output_buffer != nil) {
         const size_t second_out_dim = descriptor->second_out_dim != 0 ? descriptor->second_out_dim : descriptor->out_dim;
@@ -6453,6 +6508,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_slot_device_direc
     if (rows == 0 || in_dim == 0 || out_dim == 0) return -5;
     if (rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -6;
     if (termite_metal_decode_runtime_check_quant_linear_descriptor(runtime, slot, format, values_per_block, bytes_per_block, in_dim) != 0) return -7;
+    const size_t weight_offset = runtime->quant_linear_weight_offsets[slot];
     @autoreleasepool {
         id<MTLBuffer> input_buffer = (__bridge id<MTLBuffer>)input_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
@@ -6472,6 +6528,7 @@ static int termite_metal_decode_runtime_apply_quantized_linear_slot_device_direc
             .input_buffer = input_buffer,
             .input_offset = input_offset,
             .weight_buffer = weight_buffer,
+            .weight_offset = weight_offset,
             .output_buffer = output_buffer,
             .output_offset = output_offset,
             .rows = rows,
@@ -6548,6 +6605,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_slot_host(
             .input_buffer = input_buffer,
             .input_offset = 0,
             .weight_buffer = view.weight_buffer,
+            .weight_offset = view.weight_offset,
             .output_buffer = output_buffer,
             .output_offset = 0,
             .rows = rows,
@@ -6727,6 +6785,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
         .in_dim = (uint32_t)descriptor->in_dim,
         .out_dim = (uint32_t)descriptor->out_dim,
         .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+        .weight_offset = q8_0_format ? (uint32_t)descriptor->weight_offset : 0u,
     };
     const uint8_t planned_dispatch = termite_metal_quant_matmul_descriptor_planned_dispatch(descriptor);
     const termite_metal_quant_matmul_dispatch_kind quant_dispatch_kind = termite_metal_select_quant_matmul_dispatch_preferred(
@@ -6822,7 +6881,7 @@ static int termite_metal_encode_quant_matmul_none_on_encoder_family(
     if (pipeline == nil) return failure_code;
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:descriptor->input_buffer offset:descriptor->input_offset atIndex:0];
-    [encoder setBuffer:descriptor->weight_buffer offset:0 atIndex:1];
+    [encoder setBuffer:descriptor->weight_buffer offset:q8_0_format ? 0u : descriptor->weight_offset atIndex:1];
     [encoder setBuffer:descriptor->output_buffer offset:descriptor->output_offset atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
     if (use_mm_sg) {
@@ -6924,6 +6983,7 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
             .in_dim = (uint32_t)descriptor->in_dim,
             .out_dim = (uint32_t)descriptor->out_dim,
             .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+            .weight_offset = (uint32_t)descriptor->weight_offset,
         };
         termite_metal_apply_activation_params activation_params = {
             .activation_kind = descriptor->activation_kind,
@@ -6951,6 +7011,7 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
 
         [encoder setComputePipelineState:runtime->q8_0_mm_sg_pipeline];
         [encoder setBuffer:descriptor->input_buffer offset:descriptor->input_offset atIndex:0];
+        params.weight_offset = (uint32_t)descriptor->second_weight_offset;
         [encoder setBuffer:descriptor->second_weight_buffer offset:0 atIndex:1];
         [encoder setBuffer:up_output_buffer offset:0 atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
@@ -7025,6 +7086,8 @@ static int termite_metal_encode_quant_matmul_pair_activation_mul_on_encoder(
         .in_dim = (uint32_t)descriptor->in_dim,
         .out_dim = (uint32_t)descriptor->out_dim,
         .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+        .weight_offset = (uint32_t)descriptor->weight_offset,
+        .second_weight_offset = (uint32_t)descriptor->second_weight_offset,
     };
     termite_metal_apply_activation_params activation_params = {
         .activation_kind = descriptor->activation_kind,
@@ -7117,6 +7180,8 @@ static int termite_metal_encode_quant_matmul_pair_activation_rms_scale_1x_on_enc
         .in_dim = (uint32_t)descriptor->in_dim,
         .out_dim = (uint32_t)descriptor->out_dim,
         .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+        .weight_offset = (uint32_t)descriptor->weight_offset,
+        .second_weight_offset = (uint32_t)descriptor->second_weight_offset,
     };
     termite_metal_apply_activation_params activation_params = {
         .activation_kind = descriptor->activation_kind,
@@ -7183,6 +7248,7 @@ static int termite_metal_encode_quant_matmul_activation_rhs_mul_on_encoder(
         .in_dim = (uint32_t)descriptor->in_dim,
         .out_dim = (uint32_t)descriptor->out_dim,
         .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+        .weight_offset = (uint32_t)descriptor->weight_offset,
     };
     termite_metal_apply_activation_params activation_params = {
         .activation_kind = descriptor->activation_kind,
@@ -7244,6 +7310,7 @@ static int termite_metal_encode_quant_matmul_pair_on_encoder(
         if (rc != 0) return rc;
         termite_metal_quant_matmul_descriptor second = first;
         second.weight_buffer = descriptor->second_weight_buffer;
+        second.weight_offset = descriptor->second_weight_offset;
         second.output_buffer = descriptor->second_output_buffer;
         second.output_offset = descriptor->second_output_offset;
         return termite_metal_encode_quant_matmul_none_on_encoder_family(
@@ -7257,6 +7324,8 @@ static int termite_metal_encode_quant_matmul_pair_on_encoder(
         .in_dim = (uint32_t)descriptor->in_dim,
         .out_dim = (uint32_t)descriptor->out_dim,
         .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+        .weight_offset = (uint32_t)descriptor->weight_offset,
+        .second_weight_offset = (uint32_t)descriptor->second_weight_offset,
     };
     const uint8_t planned_dispatch = termite_metal_quant_matmul_descriptor_planned_dispatch(descriptor);
     const termite_metal_q8_0_linear_dispatch_kind dispatch_kind = termite_metal_q8_0_dispatch_from_quant_dispatch(
@@ -7363,6 +7432,7 @@ static int termite_metal_encode_quant_matmul_qkv_on_encoder(
         if (rc != 0) return rc;
         termite_metal_quant_matmul_descriptor k = q;
         k.weight_buffer = descriptor->second_weight_buffer;
+        k.weight_offset = descriptor->second_weight_offset;
         k.output_buffer = descriptor->second_output_buffer;
         k.output_offset = descriptor->second_output_offset;
         k.out_dim = descriptor->second_out_dim;
@@ -7374,6 +7444,7 @@ static int termite_metal_encode_quant_matmul_qkv_on_encoder(
         if (rc != 0) return rc;
         termite_metal_quant_matmul_descriptor v = k;
         v.weight_buffer = descriptor->third_weight_buffer;
+        v.weight_offset = descriptor->third_weight_offset;
         v.output_buffer = descriptor->third_output_buffer;
         v.output_offset = descriptor->third_output_offset;
         return termite_metal_encode_quant_matmul_none_on_encoder_family(
@@ -7397,6 +7468,9 @@ static int termite_metal_encode_quant_matmul_qkv_on_encoder(
         .q_out_dim = (uint32_t)descriptor->out_dim,
         .kv_out_dim = (uint32_t)descriptor->second_out_dim,
         .row_blocks = (uint32_t)(descriptor->in_dim / descriptor->values_per_block),
+        .q_weight_offset = (uint32_t)descriptor->weight_offset,
+        .k_weight_offset = (uint32_t)descriptor->second_weight_offset,
+        .v_weight_offset = (uint32_t)descriptor->third_weight_offset,
     };
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:descriptor->input_buffer offset:descriptor->input_offset atIndex:0];
@@ -7600,7 +7674,7 @@ static int termite_metal_encode_quant_matmul_generic_none_on_encoder(
     };
     [encoder setComputePipelineState:pipeline];
     [encoder setBuffer:descriptor->input_buffer offset:descriptor->input_offset atIndex:0];
-    [encoder setBuffer:descriptor->weight_buffer offset:0 atIndex:1];
+    [encoder setBuffer:descriptor->weight_buffer offset:descriptor->weight_offset atIndex:1];
     [encoder setBuffer:descriptor->output_buffer offset:descriptor->output_offset atIndex:2];
     [encoder setBytes:&params length:sizeof(params) atIndex:3];
     if (use_reduce) {
@@ -8258,6 +8332,495 @@ static int termite_metal_encode_q8_0_activation_multiply_on_encoder_planned(
     return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
 }
 
+
+static int termite_metal_encode_q8_0_linear_family_with_offset(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    termite_metal_q8_0_linear_family_kind q8_family,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = weight_buffer,
+        .weight_offset = weight_offset,
+        .output_buffer = output_buffer,
+        .output_offset = output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .q8_family = q8_family,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_NONE,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = weight_buffer,
+        .weight_offset = weight_offset,
+        .output_buffer = output_buffer,
+        .output_offset = output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .use_planned_dispatch = true,
+        .planned_dispatch = TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_pair_linear_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> first_weight_buffer,
+    size_t first_weight_offset,
+    id<MTLBuffer> second_weight_buffer,
+    size_t second_weight_offset,
+    id<MTLBuffer> first_output_buffer,
+    size_t first_output_offset,
+    id<MTLBuffer> second_output_buffer,
+    size_t second_output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pair_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = first_weight_buffer,
+        .weight_offset = first_weight_offset,
+        .second_weight_buffer = second_weight_buffer,
+        .second_weight_offset = second_weight_offset,
+        .output_buffer = first_output_buffer,
+        .output_offset = first_output_offset,
+        .second_output_buffer = second_output_buffer,
+        .second_output_offset = second_output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_qkv_linear_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> q_weight_buffer,
+    size_t q_weight_offset,
+    id<MTLBuffer> k_weight_buffer,
+    size_t k_weight_offset,
+    id<MTLBuffer> v_weight_buffer,
+    size_t v_weight_offset,
+    id<MTLBuffer> q_output_buffer,
+    size_t q_output_offset,
+    id<MTLBuffer> k_output_buffer,
+    size_t k_output_offset,
+    id<MTLBuffer> v_output_buffer,
+    size_t v_output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t q_out_dim,
+    size_t kv_out_dim,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_QKV,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_qkv_mmv_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = q_weight_buffer,
+        .weight_offset = q_weight_offset,
+        .second_weight_buffer = k_weight_buffer,
+        .second_weight_offset = k_weight_offset,
+        .third_weight_buffer = v_weight_buffer,
+        .third_weight_offset = v_weight_offset,
+        .output_buffer = q_output_buffer,
+        .output_offset = q_output_offset,
+        .second_output_buffer = k_output_buffer,
+        .second_output_offset = k_output_offset,
+        .third_output_buffer = v_output_buffer,
+        .third_output_offset = v_output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = q_out_dim,
+        .second_out_dim = kv_out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_pair_activation_multiply_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
+    id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_MUL,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pair_activation_reduce_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = gate_weight_buffer,
+        .weight_offset = gate_weight_offset,
+        .second_weight_buffer = up_weight_buffer,
+        .second_weight_offset = up_weight_offset,
+        .output_buffer = output_buffer,
+        .output_offset = output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .activation_kind = activation_kind,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor(runtime, command_buffer, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_pair_activation_multiply_on_encoder_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
+    id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_MUL,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pair_activation_reduce_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = gate_weight_buffer,
+        .weight_offset = gate_weight_offset,
+        .second_weight_buffer = up_weight_buffer,
+        .second_weight_offset = up_weight_offset,
+        .output_buffer = output_buffer,
+        .output_offset = output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .activation_kind = activation_kind,
+        .use_planned_dispatch = true,
+        .planned_dispatch = TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    size_t norm_slot,
+    id<MTLBuffer> inv_scale_buffer,
+    size_t inv_scale_offset,
+    id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
+    id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+);
+
+static int termite_metal_encode_q8_0_activation_multiply_on_encoder_with_offset(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> rhs_buffer,
+    size_t rhs_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+);
+
+static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    size_t norm_slot,
+    id<MTLBuffer> inv_scale_buffer,
+    size_t inv_scale_offset,
+    id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
+    id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+) {
+    if (runtime == NULL || command_buffer == nil || input_buffer == nil || inv_scale_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || output_buffer == nil) return failure_code;
+    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_PAIR_ACT);
+    if (encoder == nil) return failure_code;
+    const int rc = termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_with_offsets(runtime, encoder, input_buffer, input_offset, norm_slot, inv_scale_buffer, inv_scale_offset, gate_weight_buffer, gate_weight_offset, up_weight_buffer, up_weight_offset, output_buffer, output_offset, in_dim, out_dim, activation_kind, failure_code);
+    [encoder endEncoding];
+    return rc;
+}
+
+static int termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_with_offsets(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    size_t norm_slot,
+    id<MTLBuffer> inv_scale_buffer,
+    size_t inv_scale_offset,
+    id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
+    id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_PAIR_ACTIVATION_RMS_SCALE_1X,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_pair_activation_rms_scale_mmv_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = gate_weight_buffer,
+        .weight_offset = gate_weight_offset,
+        .second_weight_buffer = up_weight_buffer,
+        .second_weight_offset = up_weight_offset,
+        .output_buffer = output_buffer,
+        .output_offset = output_offset,
+        .inv_scale_buffer = inv_scale_buffer,
+        .inv_scale_offset = inv_scale_offset,
+        .norm_slot = norm_slot,
+        .rows = 1,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .activation_kind = activation_kind,
+        .use_planned_dispatch = true,
+        .planned_dispatch = TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_activation_multiply_with_offset(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> rhs_buffer,
+    size_t rhs_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+) {
+    if (runtime == NULL || command_buffer == nil || input_buffer == nil || weight_buffer == nil || rhs_buffer == nil || output_buffer == nil) return failure_code;
+    BOOL encoder_owned = YES;
+    id<MTLComputeCommandEncoder> encoder = termite_metal_scoped_compute_encoder_for(runtime, command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_PAIR_ACT, &encoder_owned);
+    if (encoder == nil) return failure_code;
+    const int rc = termite_metal_encode_q8_0_activation_multiply_on_encoder_with_offset(runtime, encoder, input_buffer, input_offset, weight_buffer, weight_offset, rhs_buffer, rhs_offset, output_buffer, output_offset, rows, in_dim, out_dim, activation_kind, failure_code);
+    termite_metal_end_scoped_compute_encoder(encoder, encoder_owned);
+    return rc;
+}
+
+static int termite_metal_encode_q8_0_activation_multiply_on_encoder_with_offset(
+    termite_metal_decode_runtime *runtime,
+    id<MTLComputeCommandEncoder> encoder,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> rhs_buffer,
+    size_t rhs_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    uint32_t activation_kind,
+    int failure_code
+) {
+    termite_metal_quant_matmul_descriptor descriptor = {
+        .slot = SIZE_MAX,
+        .format = TERMITE_METAL_QUANT_FORMAT_Q8_0,
+        .activation_dtype = TERMITE_METAL_QUANT_MATMUL_ACTIVATION_F32,
+        .epilogue = TERMITE_METAL_QUANT_MATMUL_EPILOGUE_ACTIVATION_RHS_MUL,
+        .fallback_pipeline = runtime != NULL ? runtime->q8_0_activation_multiply_reduce_pipeline : nil,
+        .input_buffer = input_buffer,
+        .input_offset = input_offset,
+        .weight_buffer = weight_buffer,
+        .weight_offset = weight_offset,
+        .rhs_buffer = rhs_buffer,
+        .rhs_offset = rhs_offset,
+        .output_buffer = output_buffer,
+        .output_offset = output_offset,
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .values_per_block = 32u,
+        .bytes_per_block = 34u,
+        .activation_kind = activation_kind,
+        .use_planned_dispatch = true,
+        .planned_dispatch = TERMITE_METAL_QUANT_MATMUL_DISPATCH_UNKNOWN,
+        .failure_code = failure_code,
+    };
+    return termite_metal_encode_quant_matmul_descriptor_on_encoder(runtime, encoder, &descriptor);
+}
+
+static int termite_metal_encode_q8_0_linear_rms_scale_1x_with_offset(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    size_t norm_slot,
+    id<MTLBuffer> inv_scale_buffer,
+    size_t inv_scale_offset,
+    id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
+    id<MTLBuffer> output_buffer,
+    size_t output_offset,
+    size_t in_dim,
+    size_t out_dim,
+    int failure_code
+) {
+    if (runtime == NULL || command_buffer == nil || input_buffer == nil || inv_scale_buffer == nil || weight_buffer == nil || output_buffer == nil) return failure_code;
+    if (runtime->q8_0_rms_scale_mmv_pipeline == nil) return failure_code;
+    if (norm_slot >= TERMITE_METAL_RMS_NORM_SLOT_CAPACITY) return failure_code;
+    if (runtime->rms_norm_slot_prepared[norm_slot] == 0 || runtime->rms_norm_hidden_sizes[norm_slot] != in_dim) return failure_code;
+    if (in_dim == 0 || out_dim == 0 || in_dim % 32u != 0 || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return failure_code;
+    termite_metal_linear_params params = {
+        .rows = 1,
+        .in_dim = (uint32_t)in_dim,
+        .out_dim = (uint32_t)out_dim,
+        .row_blocks = (uint32_t)(in_dim / 32u),
+        .weight_offset = (uint32_t)weight_offset,
+    };
+    termite_metal_record_q8_0_linear_dispatch(runtime, TERMITE_METAL_Q8_0_LINEAR_DISPATCH_MMV, 1, TERMITE_METAL_Q8_0_LINEAR_FAMILY_RMS_SCALE);
+    id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_QUANT_LINEAR);
+    if (encoder == nil) return failure_code;
+    [encoder setComputePipelineState:runtime->q8_0_rms_scale_mmv_pipeline];
+    [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+    [encoder setBuffer:weight_buffer offset:0 atIndex:1];
+    [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
+    [encoder setBytes:&params length:sizeof(params) atIndex:3];
+    [encoder setBuffer:runtime->rms_norm_weight_buffers[norm_slot] offset:0 atIndex:4];
+    [encoder setBuffer:inv_scale_buffer offset:inv_scale_offset atIndex:5];
+    [encoder setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake((out_dim + 3u) / 4u, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [encoder endEncoding];
+    return 0;
+}
+
 static int termite_metal_encode_rms_norm_add(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -8549,6 +9112,7 @@ static int termite_metal_encode_q8_0_linear_rms_add_planned_1x(
     id<MTLBuffer> linear_input_buffer,
     size_t linear_input_offset,
     id<MTLBuffer> linear_weight_buffer,
+    size_t linear_weight_offset,
     id<MTLBuffer> projected_buffer,
     size_t projected_offset,
     size_t in_dim,
@@ -8567,12 +9131,13 @@ static int termite_metal_encode_q8_0_linear_rms_add_planned_1x(
     if (linear_input_buffer == nil || linear_weight_buffer == nil || projected_buffer == nil || residual_buffer == nil || output_buffer == nil) return failure_code;
     if (termite_metal_decode_runtime_begin_planned_compute_scope(runtime, source, region) != 0) return failure_code;
     id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-    int rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+    int rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
         runtime,
         encoder,
         linear_input_buffer,
         linear_input_offset,
         linear_weight_buffer,
+        linear_weight_offset,
         projected_buffer,
         projected_offset,
         1,
@@ -8607,9 +9172,12 @@ static int termite_metal_encode_q8_0_ffn_pair_down_rms_add_planned_1x(
     id<MTLBuffer> input_buffer,
     size_t input_offset,
     id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
     id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
     id<MTLBuffer> gated_buffer,
     id<MTLBuffer> down_weight_buffer,
+    size_t down_weight_offset,
     id<MTLBuffer> projected_buffer,
     size_t hidden_size,
     size_t intermediate_size,
@@ -8626,13 +9194,15 @@ static int termite_metal_encode_q8_0_ffn_pair_down_rms_add_planned_1x(
     if (input_buffer == nil || gate_weight_buffer == nil || up_weight_buffer == nil || gated_buffer == nil || down_weight_buffer == nil || projected_buffer == nil || residual_buffer == nil || output_buffer == nil) return failure_code;
     if (termite_metal_decode_runtime_begin_planned_compute_scope(runtime, TERMITE_METAL_COMPUTE_SOURCE_FFN, TERMITE_METAL_COMPUTE_REGION_FFN) != 0) return failure_code;
     id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-    int rc = termite_metal_encode_q8_0_pair_activation_multiply_on_encoder(
+    int rc = termite_metal_encode_q8_0_pair_activation_multiply_on_encoder_with_offsets(
         runtime,
         encoder,
         input_buffer,
         input_offset,
         gate_weight_buffer,
+        gate_weight_offset,
         up_weight_buffer,
+        up_weight_offset,
         gated_buffer,
         0,
         1,
@@ -8642,12 +9212,13 @@ static int termite_metal_encode_q8_0_ffn_pair_down_rms_add_planned_1x(
         failure_code
     );
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+        rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
             runtime,
             encoder,
             gated_buffer,
             0,
             down_weight_buffer,
+            down_weight_offset,
             projected_buffer,
             0,
             1,
@@ -8685,9 +9256,12 @@ static int termite_metal_encode_q8_0_ffn_pregate_pair_down_rms_add_planned_1x(
     size_t pre_gate_rms_norm_slot,
     id<MTLBuffer> inv_scale_buffer,
     id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
     id<MTLBuffer> up_weight_buffer,
+    size_t up_weight_offset,
     id<MTLBuffer> gated_buffer,
     id<MTLBuffer> down_weight_buffer,
+    size_t down_weight_offset,
     id<MTLBuffer> projected_buffer,
     size_t hidden_size,
     size_t intermediate_size,
@@ -8716,7 +9290,7 @@ static int termite_metal_encode_q8_0_ffn_pregate_pair_down_rms_add_planned_1x(
         failure_code
     );
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder(
+        rc = termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_with_offsets(
             runtime,
             encoder,
             input_buffer,
@@ -8725,7 +9299,9 @@ static int termite_metal_encode_q8_0_ffn_pregate_pair_down_rms_add_planned_1x(
             inv_scale_buffer,
             0,
             gate_weight_buffer,
+            gate_weight_offset,
             up_weight_buffer,
+            up_weight_offset,
             gated_buffer,
             0,
             hidden_size,
@@ -8735,12 +9311,13 @@ static int termite_metal_encode_q8_0_ffn_pregate_pair_down_rms_add_planned_1x(
         );
     }
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+        rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
             runtime,
             encoder,
             gated_buffer,
             0,
             down_weight_buffer,
+            down_weight_offset,
             projected_buffer,
             0,
             1,
@@ -8790,6 +9367,7 @@ static int termite_metal_encode_attention_q8_0_linear_rms_add_planned_1x(
     size_t sliding_window,
     size_t total_sequence_len,
     id<MTLBuffer> linear_weight_buffer,
+    size_t linear_weight_offset,
     id<MTLBuffer> projected_buffer,
     size_t projected_offset,
     size_t attention_input_size,
@@ -8829,12 +9407,13 @@ static int termite_metal_encode_attention_q8_0_linear_rms_add_planned_1x(
         failure_code
     );
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+        rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
             runtime,
             encoder,
             attention_output_buffer,
             attention_output_offset,
             linear_weight_buffer,
+            linear_weight_offset,
             projected_buffer,
             projected_offset,
             1,
@@ -8920,6 +9499,7 @@ static int termite_metal_encode_q8_0_linear_rms_add_scale_planned_1x(
     id<MTLBuffer> linear_input_buffer,
     size_t linear_input_offset,
     id<MTLBuffer> linear_weight_buffer,
+    size_t linear_weight_offset,
     id<MTLBuffer> projected_buffer,
     size_t projected_offset,
     size_t in_dim,
@@ -8939,12 +9519,13 @@ static int termite_metal_encode_q8_0_linear_rms_add_scale_planned_1x(
     if (linear_input_buffer == nil || linear_weight_buffer == nil || projected_buffer == nil || residual_buffer == nil || output_buffer == nil) return failure_code;
     if (termite_metal_decode_runtime_begin_planned_compute_scope(runtime, source, region) != 0) return failure_code;
     id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-    int rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+    int rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
         runtime,
         encoder,
         linear_input_buffer,
         linear_input_offset,
         linear_weight_buffer,
+        linear_weight_offset,
         projected_buffer,
         projected_offset,
         1,
@@ -8982,8 +9563,10 @@ static int termite_metal_encode_q8_0_ple_gate_proj_rms_add_scale_planned_1x(
     id<MTLBuffer> ple_buffer,
     size_t ple_offset,
     id<MTLBuffer> gate_weight_buffer,
+    size_t gate_weight_offset,
     id<MTLBuffer> gated_buffer,
     id<MTLBuffer> proj_weight_buffer,
+    size_t proj_weight_offset,
     id<MTLBuffer> projected_buffer,
     size_t hidden_size,
     size_t ple_hidden_size,
@@ -9000,12 +9583,13 @@ static int termite_metal_encode_q8_0_ple_gate_proj_rms_add_scale_planned_1x(
     if (hidden_buffer == nil || ple_buffer == nil || gate_weight_buffer == nil || gated_buffer == nil || proj_weight_buffer == nil || projected_buffer == nil || output_buffer == nil) return failure_code;
     if (termite_metal_decode_runtime_begin_planned_compute_scope(runtime, TERMITE_METAL_COMPUTE_SOURCE_PLE, TERMITE_METAL_COMPUTE_REGION_PLE) != 0) return failure_code;
     id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-    int rc = termite_metal_encode_q8_0_activation_multiply_on_encoder(
+    int rc = termite_metal_encode_q8_0_activation_multiply_on_encoder_with_offset(
         runtime,
         encoder,
         hidden_buffer,
         hidden_offset,
         gate_weight_buffer,
+        gate_weight_offset,
         ple_buffer,
         ple_offset,
         gated_buffer,
@@ -9017,12 +9601,13 @@ static int termite_metal_encode_q8_0_ple_gate_proj_rms_add_scale_planned_1x(
         failure_code
     );
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+        rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
             runtime,
             encoder,
             gated_buffer,
             0,
             proj_weight_buffer,
+            proj_weight_offset,
             projected_buffer,
             0,
             1,
@@ -9144,7 +9729,7 @@ static int termite_metal_encode_q8_0_ffn_pregate_ple_planned_1x(
         failure_code
     );
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder(
+        rc = termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_on_encoder_with_offsets(
             runtime,
             encoder,
             input_buffer,
@@ -9153,7 +9738,9 @@ static int termite_metal_encode_q8_0_ffn_pregate_ple_planned_1x(
             inv_scale_buffer,
             0,
             gate_view.weight_buffer,
+            gate_view.weight_offset,
             up_view.weight_buffer,
+            up_view.weight_offset,
             ffn_gated_buffer,
             0,
             hidden_size,
@@ -9163,12 +9750,13 @@ static int termite_metal_encode_q8_0_ffn_pregate_ple_planned_1x(
         );
     }
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+        rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
             runtime,
             encoder,
             ffn_gated_buffer,
             0,
             down_view.weight_buffer,
+            down_view.weight_offset,
             ffn_projected_buffer,
             0,
             1,
@@ -9194,12 +9782,13 @@ static int termite_metal_encode_q8_0_ffn_pregate_ple_planned_1x(
         );
     }
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_activation_multiply_on_encoder(
+        rc = termite_metal_encode_q8_0_activation_multiply_on_encoder_with_offset(
             runtime,
             encoder,
             ffn_output_buffer,
             ffn_output_offset,
             ple_gate_view.weight_buffer,
+            ple_gate_view.weight_offset,
             ple_buffer,
             ple_offset,
             ple_gated_buffer,
@@ -9212,12 +9801,13 @@ static int termite_metal_encode_q8_0_ffn_pregate_ple_planned_1x(
         );
     }
     if (rc == 0) {
-        rc = termite_metal_encode_q8_0_linear_raw_on_encoder(
+        rc = termite_metal_encode_q8_0_linear_raw_on_encoder_with_offset(
             runtime,
             encoder,
             ple_gated_buffer,
             0,
             ple_proj_view.weight_buffer,
+            ple_proj_view.weight_offset,
             ple_projected_buffer,
             0,
             1,
@@ -9678,6 +10268,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                         .fallback_pipeline = runtime->q8_0_pipeline,
                         .input_buffer = attention_output_buffer,
                         .weight_buffer = attention_view.weight_buffer,
+                        .weight_offset = attention_view.weight_offset,
                         .output_buffer = attention_projected_buffer,
                         .rows = 1,
                         .in_dim = attention_input_size,
@@ -9738,7 +10329,9 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                         .fallback_pipeline = runtime->q8_0_pair_activation_rms_scale_mmv_pipeline,
                         .input_buffer = attn_added_buffer,
                         .weight_buffer = gate_view.weight_buffer,
+                        .weight_offset = gate_view.weight_offset,
                         .second_weight_buffer = up_view.weight_buffer,
+                        .second_weight_offset = up_view.weight_offset,
                         .output_buffer = ffn_gated_buffer,
                         .inv_scale_buffer = inv_scale_buffer,
                         .norm_slot = ffn_pre_gate_rms_norm_slot,
@@ -9774,6 +10367,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                         .fallback_pipeline = runtime->q8_0_pipeline,
                         .input_buffer = ffn_gated_buffer,
                         .weight_buffer = down_view.weight_buffer,
+                        .weight_offset = down_view.weight_offset,
                         .output_buffer = ffn_projected_buffer,
                         .rows = 1,
                         .in_dim = intermediate_size,
@@ -9823,6 +10417,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                         .input_buffer = ffn_output_buffer,
                         .input_offset = ffn_output_offset,
                         .weight_buffer = ple_gate_view.weight_buffer,
+                        .weight_offset = ple_gate_view.weight_offset,
                         .rhs_buffer = ple_buffer,
                         .rhs_offset = ple_offset,
                         .output_buffer = ple_gated_buffer,
@@ -9858,6 +10453,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
                         .fallback_pipeline = runtime->q8_0_pipeline,
                         .input_buffer = ple_gated_buffer,
                         .weight_buffer = ple_proj_view.weight_buffer,
+                        .weight_offset = ple_proj_view.weight_offset,
                         .output_buffer = ple_projected_buffer,
                         .rows = 1,
                         .in_dim = ple_hidden_size,
@@ -10051,6 +10647,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
             .fallback_pipeline = runtime->q8_0_pipeline,
             .input_buffer = attention_output_buffer,
             .weight_buffer = attention_view.weight_buffer,
+            .weight_offset = attention_view.weight_offset,
             .output_buffer = attention_projected_buffer,
             .rows = 1,
             .in_dim = attention_input_size,
@@ -10116,7 +10713,9 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
             .fallback_pipeline = runtime->q8_0_pair_activation_rms_scale_mmv_pipeline,
             .input_buffer = attn_added_buffer,
             .weight_buffer = gate_view.weight_buffer,
+            .weight_offset = gate_view.weight_offset,
             .second_weight_buffer = up_view.weight_buffer,
+            .second_weight_offset = up_view.weight_offset,
             .output_buffer = ffn_gated_buffer,
             .inv_scale_buffer = inv_scale_buffer,
             .norm_slot = ffn_pre_gate_rms_norm_slot,
@@ -10147,6 +10746,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
             .fallback_pipeline = runtime->q8_0_pipeline,
             .input_buffer = ffn_gated_buffer,
             .weight_buffer = down_view.weight_buffer,
+            .weight_offset = down_view.weight_offset,
             .output_buffer = ffn_projected_buffer,
             .rows = 1,
             .in_dim = intermediate_size,
@@ -10196,6 +10796,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
             .input_buffer = ffn_output_buffer,
             .input_offset = ffn_output_offset,
             .weight_buffer = ple_gate_view.weight_buffer,
+            .weight_offset = ple_gate_view.weight_offset,
             .rhs_buffer = ple_buffer,
             .rhs_offset = ple_offset,
             .output_buffer = ple_gated_buffer,
@@ -10226,6 +10827,7 @@ static int termite_metal_encode_attention_ffn_ple_q8_0_planned_1x(
             .fallback_pipeline = runtime->q8_0_pipeline,
             .input_buffer = ple_gated_buffer,
             .weight_buffer = ple_proj_view.weight_buffer,
+            .weight_offset = ple_proj_view.weight_offset,
             .output_buffer = ple_projected_buffer,
             .rows = 1,
             .in_dim = ple_hidden_size,
@@ -11402,6 +12004,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->generic_embedding_table_buffer = nil;
     for (size_t slot = 0; slot < TERMITE_METAL_GENERIC_EMBEDDING_CACHE_CAPACITY; ++slot) {
         runtime->generic_embedding_cache[slot].buffer = nil;
+        runtime->generic_embedding_cache[slot].buffer_offset = 0;
         runtime->generic_embedding_cache[slot].bytes = 0;
         runtime->generic_embedding_cache[slot].rows = 0;
         runtime->generic_embedding_cache[slot].dim = 0;
@@ -11452,6 +12055,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
         runtime->dense_pair_packed_out_dims[slot] = 0;
         runtime->dense_pair_packed_mps_rows[slot] = 0;
         runtime->quant_linear_weight_buffers[slot] = nil;
+        runtime->quant_linear_weight_offsets[slot] = 0;
         runtime->quant_linear_in_dims[slot] = 0;
         runtime->quant_linear_out_dims[slot] = 0;
         runtime->quant_linear_slot_prepared[slot] = 0;
@@ -11572,6 +12176,7 @@ void termite_metal_decode_runtime_destroy(termite_metal_decode_runtime *runtime)
     runtime->token_embedding_table_bytes = 0;
     runtime->position_embedding_table_bytes = 0;
     runtime->generic_embedding_table_bytes = 0;
+    runtime->generic_embedding_buffer_offset = 0;
     runtime->resident_vocab_size = 0;
     runtime->resident_max_position_embeddings = 0;
     runtime->resident_hidden_size = 0;
@@ -12061,6 +12666,7 @@ static bool termite_metal_decode_runtime_select_embedding_cache(
             entry->dim == dim &&
             entry->bytes == bytes) {
             runtime->generic_embedding_table_buffer = entry->buffer;
+            runtime->generic_embedding_buffer_offset = entry->buffer_offset;
             runtime->generic_embedding_table_bytes = entry->bytes;
             runtime->generic_embedding_rows = entry->rows;
             runtime->generic_embedding_dim = entry->dim;
@@ -12075,6 +12681,7 @@ static bool termite_metal_decode_runtime_select_embedding_cache(
 static void termite_metal_decode_runtime_store_embedding_cache(
     termite_metal_decode_runtime *runtime,
     id<MTLBuffer> buffer,
+    size_t buffer_offset,
     uintptr_t source_id,
     size_t source_offset,
     size_t rows,
@@ -12095,12 +12702,14 @@ static void termite_metal_decode_runtime_store_embedding_cache(
 
     termite_metal_embedding_table_cache_entry *entry = &runtime->generic_embedding_cache[slot];
     entry->buffer = buffer;
+    entry->buffer_offset = buffer_offset;
     entry->bytes = bytes;
     entry->rows = rows;
     entry->dim = dim;
     entry->source_id = source_id;
     entry->source_offset = source_offset;
     runtime->generic_embedding_table_buffer = buffer;
+    runtime->generic_embedding_buffer_offset = buffer_offset;
     runtime->generic_embedding_table_bytes = bytes;
     runtime->generic_embedding_rows = rows;
     runtime->generic_embedding_dim = dim;
@@ -12123,7 +12732,7 @@ int termite_metal_decode_runtime_prepare_embedding_table(
     @autoreleasepool {
         id<MTLBuffer> buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, bytes);
         if (buffer == nil) return -4;
-        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, source_id, 0, rows, dim, bytes);
+        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, 0, source_id, 0, rows, dim, bytes);
         return 0;
     }
 }
@@ -12145,7 +12754,7 @@ int termite_metal_decode_runtime_prepare_embedding_table_bf16(
     @autoreleasepool {
         id<MTLBuffer> buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, expected_bytes);
         if (buffer == nil) return -5;
-        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, source_id, 0, rows, dim, expected_bytes);
+        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, 0, source_id, 0, rows, dim, expected_bytes);
         return 0;
     }
 }
@@ -12179,7 +12788,7 @@ int termite_metal_decode_runtime_prepare_embedding_table_device(
         [blit copyFromBuffer:src sourceOffset:src_offset toBuffer:dst destinationOffset:0 size:bytes];
         [blit endEncoding];
         if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8) != 0) return -8;
-        termite_metal_decode_runtime_store_embedding_cache(runtime, dst, source_id, src_offset, rows, dim, bytes);
+        termite_metal_decode_runtime_store_embedding_cache(runtime, dst, 0, source_id, src_offset, rows, dim, bytes);
         return 0;
     }
 }
@@ -12206,7 +12815,42 @@ int termite_metal_decode_runtime_prepare_quant_embedding_table(
     @autoreleasepool {
         id<MTLBuffer> buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight_raw, expected_bytes);
         if (buffer == nil) return -7;
-        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, source_id, 0, rows, dim, expected_bytes);
+        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, 0, source_id, 0, rows, dim, expected_bytes);
+        return 0;
+    }
+}
+
+int termite_metal_decode_runtime_prepare_quant_embedding_table_no_copy_region(
+    termite_metal_decode_runtime *runtime,
+    uint32_t format,
+    const uint8_t *mapped_raw,
+    size_t mapped_bytes,
+    size_t weight_offset,
+    size_t weight_bytes,
+    size_t rows,
+    size_t dim
+) {
+    if (runtime == NULL || mapped_raw == NULL) return -1;
+    if (runtime->device == nil || runtime->queue == nil) return -2;
+    size_t values_per_block = 0;
+    size_t bytes_per_block = 0;
+    if (!termite_metal_quant_format_block_layout(format, &values_per_block, &bytes_per_block)) return -3;
+    if (termite_metal_decode_runtime_quant_get_rows_pipeline(runtime, format) == nil) return -4;
+    if (rows == 0 || dim == 0 || values_per_block == 0 || dim % values_per_block != 0) return -5;
+    const size_t expected_bytes = rows * (dim / values_per_block) * bytes_per_block;
+    if (expected_bytes > weight_bytes) return -6;
+    if (weight_offset > mapped_bytes || expected_bytes > mapped_bytes - weight_offset) return -7;
+    if (!termite_metal_can_make_no_copy_buffer(mapped_raw, mapped_bytes)) return -8;
+    const uintptr_t source_id = (uintptr_t)mapped_raw;
+    if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, weight_offset, rows, dim, expected_bytes)) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> buffer = [runtime->device
+            newBufferWithBytesNoCopy:(void *)mapped_raw
+                              length:mapped_bytes
+                             options:MTLResourceStorageModeShared
+                         deallocator:nil];
+        if (buffer == nil) return -9;
+        termite_metal_decode_runtime_store_embedding_cache(runtime, buffer, weight_offset, source_id, weight_offset, rows, dim, expected_bytes);
         return 0;
     }
 }
@@ -12245,7 +12889,7 @@ int termite_metal_decode_runtime_embedding_lookup_prepared(
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING);
         if (encoder == nil) return -8;
         [encoder setComputePipelineState:runtime->embedding_lookup_pipeline];
-        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:0 atIndex:0];
+        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:runtime->generic_embedding_buffer_offset atIndex:0];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:1];
         [encoder setBuffer:output_buffer offset:0 atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
@@ -12296,7 +12940,7 @@ int termite_metal_decode_runtime_embedding_lookup_prepared_device(
             if (encoder == nil) return -9;
         }
         termite_metal_planned_encoder_range accesses[3];
-        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, 0, runtime->generic_embedding_table_buffer.length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, runtime->generic_embedding_buffer_offset, runtime->generic_embedding_table_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
             termite_metal_planned_range_make(ids_slice.buffer, ids_slice.offset, ids_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
             termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -9) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -9) != 0)
@@ -12304,7 +12948,7 @@ int termite_metal_decode_runtime_embedding_lookup_prepared_device(
             return -9;
         }
         [encoder setComputePipelineState:runtime->embedding_lookup_pipeline];
-        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:0 atIndex:0];
+        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:runtime->generic_embedding_buffer_offset atIndex:0];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
@@ -12504,7 +13148,8 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
         const size_t scale_bytes = dim * sizeof(float);
         const size_t ids_bytes = total * sizeof(uint32_t);
         const size_t output_bytes = total * dim * sizeof(float);
-        if (weight_bytes > weight_buffer.length) return -5;
+        const size_t weight_offset = runtime->generic_embedding_buffer_offset;
+        if (weight_offset > weight_buffer.length || weight_bytes > weight_buffer.length - weight_offset) return -5;
         if (output_offset + output_bytes > output_buffer.length) return -6;
         id<MTLBuffer> gamma_buffer = [runtime->device newBufferWithBytes:gamma length:scale_bytes options:MTLResourceStorageModeShared];
         id<MTLBuffer> beta_buffer = [runtime->device newBufferWithBytes:beta length:scale_bytes options:MTLResourceStorageModeShared];
@@ -12538,7 +13183,7 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
             if (encoder == nil) return -12;
         }
         termite_metal_planned_encoder_range accesses[6];
-        if (termite_metal_planned_range_make(weight_buffer, 0, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -13) != 0 ||
+        if (termite_metal_planned_range_make(weight_buffer, weight_offset, weight_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -13) != 0 ||
             termite_metal_planned_range_make(gamma_buffer, 0, scale_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -13) != 0 ||
             termite_metal_planned_range_make(beta_buffer, 0, scale_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[2], -13) != 0 ||
             termite_metal_planned_range_make(ids_slice.buffer, ids_slice.offset, ids_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[3], -13) != 0 ||
@@ -12549,7 +13194,7 @@ int termite_metal_decode_runtime_deberta_embeddings_f32(
             return -13;
         }
         [encoder setComputePipelineState:runtime->deberta_embeddings_f32_pipeline];
-        [encoder setBuffer:weight_buffer offset:0 atIndex:0];
+        [encoder setBuffer:weight_buffer offset:weight_offset atIndex:0];
         [encoder setBuffer:gamma_buffer offset:0 atIndex:1];
         [encoder setBuffer:beta_buffer offset:0 atIndex:2];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:3];
@@ -12602,7 +13247,7 @@ int termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device(
             if (encoder == nil) return -9;
         }
         termite_metal_planned_encoder_range accesses[3];
-        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, 0, runtime->generic_embedding_table_buffer.length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
+        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, runtime->generic_embedding_buffer_offset, runtime->generic_embedding_table_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -9) != 0 ||
             termite_metal_planned_range_make(ids_slice.buffer, ids_slice.offset, ids_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -9) != 0 ||
             termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -9) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -9) != 0)
@@ -12610,7 +13255,7 @@ int termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device(
             return -9;
         }
         [encoder setComputePipelineState:runtime->embedding_lookup_bf16_pipeline];
-        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:0 atIndex:0];
+        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:runtime->generic_embedding_buffer_offset atIndex:0];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
@@ -12676,7 +13321,7 @@ int termite_metal_decode_runtime_quant_embedding_lookup_prepared_device(
             if (encoder == nil) return -10;
         }
         termite_metal_planned_encoder_range accesses[3];
-        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, 0, runtime->generic_embedding_table_buffer.length, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -10) != 0 ||
+        if (termite_metal_planned_range_make(runtime->generic_embedding_table_buffer, runtime->generic_embedding_buffer_offset, runtime->generic_embedding_table_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[0], -10) != 0 ||
             termite_metal_planned_range_make(ids_slice.buffer, ids_slice.offset, ids_bytes, TERMITE_METAL_PLANNED_RANGE_READ, &accesses[1], -10) != 0 ||
             termite_metal_planned_range_make(output_buffer, output_offset, output_bytes, TERMITE_METAL_PLANNED_RANGE_WRITE, &accesses[2], -10) != 0 ||
             termite_metal_decode_runtime_prepare_planned_compute_accesses(runtime, accesses, 3, -10) != 0)
@@ -12684,7 +13329,7 @@ int termite_metal_decode_runtime_quant_embedding_lookup_prepared_device(
             return -10;
         }
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:0 atIndex:0];
+        [encoder setBuffer:runtime->generic_embedding_table_buffer offset:runtime->generic_embedding_buffer_offset atIndex:0];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
@@ -12824,7 +13469,7 @@ int termite_metal_decode_runtime_quant_get_rows_linear_slot_device(
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING);
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:view.weight_buffer offset:0 atIndex:0];
+        [encoder setBuffer:view.weight_buffer offset:view.weight_offset atIndex:0];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:1];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
@@ -12910,7 +13555,7 @@ int termite_metal_decode_runtime_quant_copy_linear_slot_to_f32_device(
         id<MTLComputeCommandEncoder> encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_EMBEDDING);
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:view.weight_buffer offset:0 atIndex:0];
+        [encoder setBuffer:view.weight_buffer offset:view.weight_offset atIndex:0];
         [encoder setBuffer:output_buffer offset:output_offset atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         const size_t total_values = rows * dim;
@@ -12996,7 +13641,7 @@ int termite_metal_decode_runtime_quant_copy_f32_to_linear_slot_device(
         if (encoder == nil) return -10;
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder setBuffer:view.weight_buffer offset:0 atIndex:1];
+        [encoder setBuffer:view.weight_buffer offset:view.weight_offset atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
         const size_t row_blocks = dim / 32u;
         const size_t total_blocks = rows * row_blocks;
@@ -13061,7 +13706,7 @@ int termite_metal_decode_runtime_quant_set_rows_linear_slot_device(
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
         [encoder setBuffer:ids_slice.buffer offset:ids_slice.offset atIndex:1];
-        [encoder setBuffer:view.weight_buffer offset:0 atIndex:2];
+        [encoder setBuffer:view.weight_buffer offset:view.weight_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         const size_t row_blocks = dim / 32u;
         const size_t total_blocks = total * row_blocks;
@@ -15285,12 +15930,14 @@ static void termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buff
     uint32_t format,
     size_t slot,
     id<MTLBuffer> weight_buffer,
+    size_t weight_offset,
     size_t in_dim,
     size_t out_dim,
     size_t values_per_block,
     size_t bytes_per_block
 ) {
     runtime->quant_linear_weight_buffers[slot] = weight_buffer;
+    runtime->quant_linear_weight_offsets[slot] = weight_offset;
     runtime->quant_linear_in_dims[slot] = in_dim;
     runtime->quant_linear_out_dims[slot] = out_dim;
     runtime->quant_linear_slot_prepared[slot] = 1;
@@ -15316,7 +15963,40 @@ int termite_metal_decode_runtime_prepare_quantized_linear_slot(
         id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight_raw, weight_bytes);
         if (weight_buffer == nil) return -6;
         termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
-            runtime, format, slot, weight_buffer, in_dim, out_dim, values_per_block, bytes_per_block);
+            runtime, format, slot, weight_buffer, 0, in_dim, out_dim, values_per_block, bytes_per_block);
+        return 0;
+    }
+}
+
+int termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
+    termite_metal_decode_runtime *runtime,
+    uint32_t format,
+    size_t slot,
+    const uint8_t *mapped_raw,
+    size_t mapped_bytes,
+    size_t weight_offset,
+    size_t weight_bytes,
+    size_t in_dim,
+    size_t out_dim
+) {
+    if (mapped_raw == NULL) return -1;
+    if (weight_offset > mapped_bytes || weight_bytes > mapped_bytes - weight_offset) return -8;
+    size_t values_per_block = 0;
+    size_t bytes_per_block = 0;
+    const uint8_t *weight_raw = mapped_raw + weight_offset;
+    const int validation_rc = termite_metal_decode_runtime_validate_quantized_linear_slot(
+        runtime, format, slot, weight_raw, weight_bytes, in_dim, out_dim, &values_per_block, &bytes_per_block);
+    if (validation_rc != 0) return validation_rc;
+    if (!termite_metal_can_make_no_copy_buffer(mapped_raw, mapped_bytes)) return -8;
+    @autoreleasepool {
+        id<MTLBuffer> weight_buffer = [runtime->device
+            newBufferWithBytesNoCopy:(void *)mapped_raw
+                              length:mapped_bytes
+                             options:MTLResourceStorageModeShared
+                         deallocator:nil];
+        if (weight_buffer == nil) return -6;
+        termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
+            runtime, format, slot, weight_buffer, weight_offset, in_dim, out_dim, values_per_block, bytes_per_block);
         return 0;
     }
 }
@@ -15344,7 +16024,7 @@ int termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy(
                          deallocator:nil];
         if (weight_buffer == nil) return -6;
         termite_metal_decode_runtime_prepare_quantized_linear_slot_from_buffer(
-            runtime, format, slot, weight_buffer, in_dim, out_dim, values_per_block, bytes_per_block);
+            runtime, format, slot, weight_buffer, 0, in_dim, out_dim, values_per_block, bytes_per_block);
         return 0;
     }
 }
@@ -15370,6 +16050,7 @@ int termite_metal_decode_runtime_prepare_bitnet_tl1_linear_slot(
         id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight_raw, weight_bytes);
         if (weight_buffer == nil) return -6;
         runtime->quant_linear_weight_buffers[slot] = weight_buffer;
+        runtime->quant_linear_weight_offsets[slot] = 0;
         runtime->quant_linear_in_dims[slot] = in_dim;
         runtime->quant_linear_out_dims[slot] = out_dim;
         runtime->quant_linear_slot_prepared[slot] = 1;
@@ -15409,6 +16090,7 @@ int termite_metal_decode_runtime_prepare_bitnet_tl2_linear_slot(
         id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight_raw, weight_bytes);
         if (weight_buffer == nil) return -7;
         runtime->quant_linear_weight_buffers[slot] = weight_buffer;
+        runtime->quant_linear_weight_offsets[slot] = 0;
         runtime->quant_linear_in_dims[slot] = in_dim;
         runtime->quant_linear_out_dims[slot] = out_dim;
         runtime->quant_linear_slot_prepared[slot] = 1;
@@ -17070,7 +17752,7 @@ int termite_metal_decode_runtime_apply_i2_s_linear_slot(
         if (encoder == nil) return -11;
         [encoder setComputePipelineState:runtime->i2_s_linear_i8_pipeline];
         [encoder setBuffer:qinput_buffer offset:0 atIndex:0];
-        [encoder setBuffer:view.weight_buffer offset:0 atIndex:1];
+        [encoder setBuffer:view.weight_buffer offset:view.weight_offset atIndex:1];
         [encoder setBuffer:scale_buffer offset:0 atIndex:2];
         [encoder setBuffer:output_buffer offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
@@ -17300,14 +17982,17 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
             : runtime->active_frame_cb;
         if (command_buffer == nil) return -14;
 
-        if (rows == 1 && termite_metal_encode_q8_0_qkv_linear(
+        if (rows == 1 && termite_metal_encode_q8_0_qkv_linear_with_offsets(
                 runtime,
                 command_buffer,
                 input_buffer,
                 input_offset,
                 q_view.weight_buffer,
+                q_view.weight_offset,
                 k_view.weight_buffer,
+                k_view.weight_offset,
                 v_view.weight_buffer,
+                v_view.weight_offset,
                 q_output_buffer,
                 q_output_offset,
                 k_output_buffer,
@@ -17320,63 +18005,71 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_device(
                 kv_out_dim,
                 -15) != 0) return -15;
 
-        if (rows != 1 && termite_metal_encode_q8_0_linear(
+        if (rows != 1 && termite_metal_encode_q8_0_linear_family_with_offset(
                 runtime,
                 command_buffer,
                 input_buffer,
                 input_offset,
                 q_view.weight_buffer,
+                q_view.weight_offset,
                 q_output_buffer,
                 q_output_offset,
                 rows,
                 in_dim,
                 q_out_dim,
+                TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                 -15) != 0) return -15;
 
         if (rows != 1) {
             if (rows >= 9u && runtime->q8_0_mm_pipeline != nil) {
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         input_buffer,
                         input_offset,
                         k_view.weight_buffer,
+                        k_view.weight_offset,
                         k_output_buffer,
                         k_output_offset,
                         rows,
                         in_dim,
                         kv_out_dim,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -16) != 0) return -16;
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         input_buffer,
                         input_offset,
                         v_view.weight_buffer,
+                        v_view.weight_offset,
+                        v_output_buffer,
+                        v_output_offset,
+                        rows,
+                        in_dim,
+                        kv_out_dim,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
+                        -16) != 0) return -16;
+            } else {
+                if (termite_metal_encode_q8_0_pair_linear_with_offsets(
+                        runtime,
+                        command_buffer,
+                        input_buffer,
+                        input_offset,
+                        k_view.weight_buffer,
+                        k_view.weight_offset,
+                        v_view.weight_buffer,
+                        v_view.weight_offset,
+                        k_output_buffer,
+                        k_output_offset,
                         v_output_buffer,
                         v_output_offset,
                         rows,
                         in_dim,
                         kv_out_dim,
                         -16) != 0) return -16;
-	            } else {
-	                if (termite_metal_encode_q8_0_pair_linear(
-	                    runtime,
-	                    command_buffer,
-                    input_buffer,
-                    input_offset,
-                    k_view.weight_buffer,
-                    v_view.weight_buffer,
-                    k_output_buffer,
-                    k_output_offset,
-                    v_output_buffer,
-                    v_output_offset,
-                    rows,
-                    in_dim,
-	                    kv_out_dim,
-	                    -16) != 0) return -16;
-	        }
-	        }
+            }
+        }
 
 	        if (!frame_owned) return 0;
         [command_buffer commit];
@@ -17435,6 +18128,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_slot_scratch_device(
                 .input_buffer = input_buffer,
                 .input_offset = input_offset,
                 .weight_buffer = view.weight_buffer,
+                .weight_offset = view.weight_offset,
                 .output_buffer = output_buffer,
                 .output_offset = 0,
                 .rows = rows,
@@ -17557,6 +18251,7 @@ int termite_metal_decode_runtime_apply_prefill_quantized_setup_device(
                     .input_buffer = input_buffer,
                     .input_offset = input_offset,
                     .weight_buffer = q_view.weight_buffer,
+                    .weight_offset = q_view.weight_offset,
                     .output_buffer = q_projected_buffer,
                     .rows = rows,
                     .in_dim = hidden_size,
@@ -17585,6 +18280,7 @@ int termite_metal_decode_runtime_apply_prefill_quantized_setup_device(
                     .input_buffer = input_buffer,
                     .input_offset = input_offset,
                     .weight_buffer = k_view.weight_buffer,
+                    .weight_offset = k_view.weight_offset,
                     .output_buffer = k_projected_buffer,
                     .rows = rows,
                     .in_dim = hidden_size,
@@ -17613,6 +18309,7 @@ int termite_metal_decode_runtime_apply_prefill_quantized_setup_device(
                     .input_buffer = input_buffer,
                     .input_offset = input_offset,
                     .weight_buffer = v_view.weight_buffer,
+                    .weight_offset = v_view.weight_offset,
                     .output_buffer = v_projected_buffer,
                     .rows = rows,
                     .in_dim = hidden_size,
@@ -17740,14 +18437,17 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -14;
         if (all_q8_0 && rows == 1) {
-            if (termite_metal_encode_q8_0_qkv_linear(
+            if (termite_metal_encode_q8_0_qkv_linear_with_offsets(
                     runtime,
                     command_buffer,
                     input_buffer,
                     input_offset,
                     q_view.weight_buffer,
+                    q_view.weight_offset,
                     k_view.weight_buffer,
+                    k_view.weight_offset,
                     v_view.weight_buffer,
+                    v_view.weight_offset,
                     q_output_buffer,
                     0,
                     k_output_buffer,
@@ -17781,7 +18481,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
             if (can_pack_large_qkv) {
                 id<MTLBuffer> packed_output_buffer = runtime->active_layer_projection_buffers[3];
                 if (packed_output_buffer == nil) return -15;
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family(
                         runtime,
                         command_buffer,
                         input_buffer,
@@ -17792,6 +18492,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
                         rows,
                         in_dim,
                         total_out_dim,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -15) != 0) return -15;
 
                 termite_metal_dense_qkv_split_bias_params split_params = {
@@ -17822,51 +18523,59 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
                        threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->dense_qkv_split_pipeline, rows * total_out_dim), 1, 1)];
                 termite_metal_end_scoped_compute_encoder(split_encoder, split_encoder_owned);
             } else {
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         input_buffer,
                         input_offset,
                         q_view.weight_buffer,
+                        q_view.weight_offset,
                         q_output_buffer,
                         0,
                         rows,
                         in_dim,
                         q_out_dim,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -15) != 0) return -15;
                 if (rows >= 9u && runtime->q8_0_mm_pipeline != nil) {
-                    if (termite_metal_encode_q8_0_linear(
+                    if (termite_metal_encode_q8_0_linear_family_with_offset(
                             runtime,
                             command_buffer,
                             input_buffer,
                             input_offset,
                             k_view.weight_buffer,
+                            k_view.weight_offset,
                             k_output_buffer,
                             0,
                             rows,
                             in_dim,
                             kv_out_dim,
+                            TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                             -16) != 0) return -16;
-                    if (termite_metal_encode_q8_0_linear(
+                    if (termite_metal_encode_q8_0_linear_family_with_offset(
                             runtime,
                             command_buffer,
                             input_buffer,
                             input_offset,
                             v_view.weight_buffer,
+                            v_view.weight_offset,
                             v_output_buffer,
                             0,
                             rows,
                             in_dim,
                             kv_out_dim,
+                            TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                             -16) != 0) return -16;
                 } else {
-                    if (termite_metal_encode_q8_0_pair_linear(
+                    if (termite_metal_encode_q8_0_pair_linear_with_offsets(
                             runtime,
                             command_buffer,
                             input_buffer,
                             input_offset,
                             k_view.weight_buffer,
+                            k_view.weight_offset,
                             v_view.weight_buffer,
+                            v_view.weight_offset,
                             k_output_buffer,
                             0,
                             v_output_buffer,
@@ -17927,6 +18636,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
                     .input_buffer = input_buffer,
                     .input_offset = input_offset,
                     .weight_buffer = q_view.weight_buffer,
+                    .weight_offset = q_view.weight_offset,
                     .output_buffer = q_output_buffer,
                     .output_offset = 0,
                     .rows = rows,
@@ -17946,6 +18656,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
                     .input_buffer = input_buffer,
                     .input_offset = input_offset,
                     .weight_buffer = k_view.weight_buffer,
+                    .weight_offset = k_view.weight_offset,
                     .output_buffer = k_output_buffer,
                     .output_offset = 0,
                     .rows = rows,
@@ -17965,6 +18676,7 @@ int termite_metal_decode_runtime_apply_quantized_linear_qkv_slots_scratch_device
                     .input_buffer = input_buffer,
                     .input_offset = input_offset,
                     .weight_buffer = v_view.weight_buffer,
+                    .weight_offset = v_view.weight_offset,
                     .output_buffer = v_output_buffer,
                     .output_offset = 0,
                     .rows = rows,
@@ -18027,7 +18739,9 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_slots(
             .input_buffer = input_buffer,
             .input_offset = 0,
             .weight_buffer = view_a.weight_buffer,
+            .weight_offset = view_a.weight_offset,
             .second_weight_buffer = view_b.weight_buffer,
+            .second_weight_offset = view_b.weight_offset,
             .output_buffer = output_a_buffer,
             .output_offset = 0,
             .second_output_buffer = output_b_buffer,
@@ -18090,7 +18804,9 @@ int termite_metal_decode_runtime_apply_quantized_linear_pair_slots_device(
             .input_buffer = input_buffer,
             .input_offset = input_offset,
             .weight_buffer = view_a.weight_buffer,
+            .weight_offset = view_a.weight_offset,
             .second_weight_buffer = view_b.weight_buffer,
+            .second_weight_offset = view_b.weight_offset,
             .output_buffer = output_a_buffer,
             .output_offset = output_a_offset,
             .second_output_buffer = output_b_buffer,
@@ -19043,6 +19759,7 @@ static int termite_metal_encode_quant_q_plus_kv_pair_descriptors(
         .input_buffer = input_buffer,
         .input_offset = input_offset,
         .weight_buffer = q_view->weight_buffer,
+        .weight_offset = q_view->weight_offset,
         .output_buffer = q_output_buffer,
         .output_offset = q_output_offset,
         .rows = rows,
@@ -19063,7 +19780,9 @@ static int termite_metal_encode_quant_q_plus_kv_pair_descriptors(
         .input_buffer = input_buffer,
         .input_offset = input_offset,
         .weight_buffer = k_view->weight_buffer,
+        .weight_offset = k_view->weight_offset,
         .second_weight_buffer = v_view->weight_buffer,
+        .second_weight_offset = v_view->weight_offset,
         .output_buffer = k_output_buffer,
         .output_offset = k_output_offset,
         .second_output_buffer = v_output_buffer,
@@ -19943,6 +20662,7 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
                             .fallback_pipeline = linear_view.pipeline,
                             .input_buffer = hidden_buffer,
                             .weight_buffer = linear_view.weight_buffer,
+                            .weight_offset = linear_view.weight_offset,
                             .output_buffer = runtime->sample_logits_buffer,
                             .rows = 1,
                             .in_dim = hidden_size,
@@ -19998,6 +20718,7 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
             .fallback_pipeline = linear_view.pipeline,
             .input_buffer = hidden_buffer,
             .weight_buffer = linear_view.weight_buffer,
+            .weight_offset = linear_view.weight_offset,
             .output_buffer = runtime->sample_logits_buffer,
             .rows = 1,
             .in_dim = hidden_size,
@@ -20110,6 +20831,7 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_logits_device(
                             .fallback_pipeline = linear_view.pipeline,
                             .input_buffer = hidden_buffer,
                             .weight_buffer = linear_view.weight_buffer,
+                            .weight_offset = linear_view.weight_offset,
                             .output_buffer = runtime->sample_logits_buffer,
                             .rows = 1,
                             .in_dim = hidden_size,
@@ -20158,6 +20880,7 @@ int termite_metal_decode_runtime_encode_rms_norm_quantized_linear_logits_device(
             .fallback_pipeline = linear_view.pipeline,
             .input_buffer = hidden_buffer,
             .weight_buffer = linear_view.weight_buffer,
+            .weight_offset = linear_view.weight_offset,
             .output_buffer = runtime->sample_logits_buffer,
             .rows = 1,
             .in_dim = hidden_size,
@@ -20246,8 +20969,10 @@ static int termite_metal_encode_ple_residual_q8_0_device(
                 ple_buffer,
                 ple_offset,
                 gate_view.weight_buffer,
+                gate_view.weight_offset,
                 gated_buffer,
                 proj_view.weight_buffer,
+                proj_view.weight_offset,
                 projected_buffer,
                 hidden_size,
                 ple_hidden_size,
@@ -20262,12 +20987,13 @@ static int termite_metal_encode_ple_residual_q8_0_device(
             if (planned_status != 0) return planned_status;
             return 0;
         }
-        const bool fused_gate = rows == 1 && termite_metal_encode_q8_0_activation_multiply(
+        const bool fused_gate = rows == 1 && termite_metal_encode_q8_0_activation_multiply_with_offset(
                 runtime,
                 command_buffer,
                 hidden_buffer,
                 hidden_offset,
                 gate_view.weight_buffer,
+                gate_view.weight_offset,
                 ple_buffer,
                 ple_offset,
                 gated_buffer,
@@ -20283,12 +21009,13 @@ static int termite_metal_encode_ple_residual_q8_0_device(
                 TERMITE_METAL_PLAN_OP_DECODE_PLE_GATE_ACTIVATION,
                 TERMITE_METAL_OPERATOR_MUL_MM,
                 TERMITE_METAL_QUANT_MATMUL_DISPATCH_MM);
-            if (termite_metal_encode_q8_0_linear_family(
+            if (termite_metal_encode_q8_0_linear_family_with_offset(
                     runtime,
                     command_buffer,
                     hidden_buffer,
                     hidden_offset,
                     gate_view.weight_buffer,
+                    gate_view.weight_offset,
                     gate_buffer,
                     0,
                     rows,
@@ -20329,6 +21056,7 @@ static int termite_metal_encode_ple_residual_q8_0_device(
                     gated_buffer,
                     0,
                     proj_view.weight_buffer,
+                    proj_view.weight_offset,
                     projected_buffer,
                     0,
                     ple_hidden_size,
@@ -20349,6 +21077,7 @@ static int termite_metal_encode_ple_residual_q8_0_device(
                     gated_buffer,
                     0,
                     proj_view.weight_buffer,
+                    proj_view.weight_offset,
                     projected_buffer,
                     0,
                     ple_hidden_size,
@@ -20371,12 +21100,13 @@ static int termite_metal_encode_ple_residual_q8_0_device(
             TERMITE_METAL_PLAN_OP_DECODE_PLE_PROJECTION,
             TERMITE_METAL_OPERATOR_MUL_MM,
             TERMITE_METAL_QUANT_MATMUL_DISPATCH_MM);
-        if (termite_metal_encode_q8_0_linear_family(
+        if (termite_metal_encode_q8_0_linear_family_with_offset(
                 runtime,
                 command_buffer,
                 gated_buffer,
                 0,
                 proj_view.weight_buffer,
+                proj_view.weight_offset,
                 projected_buffer,
                 0,
                 rows,
@@ -23828,7 +24558,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_i2_s
             if (encoder == nil) return -14;
             [encoder setComputePipelineState:runtime->i2_s_pipeline];
             [encoder setBuffer:current_buffer offset:0 atIndex:0];
-            [encoder setBuffer:attention_view.weight_buffer offset:0 atIndex:1];
+            [encoder setBuffer:attention_view.weight_buffer offset:attention_view.weight_offset atIndex:1];
             [encoder setBuffer:projected_buffer offset:0 atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, hidden_size), 1, 1)];
@@ -23931,7 +24661,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q4_k
             if (encoder == nil) return -13;
             [encoder setComputePipelineState:runtime->q4_k_pipeline];
             [encoder setBuffer:current_buffer offset:0 atIndex:0];
-            [encoder setBuffer:attention_view.weight_buffer offset:0 atIndex:1];
+            [encoder setBuffer:attention_view.weight_buffer offset:attention_view.weight_offset atIndex:1];
             [encoder setBuffer:projected_buffer offset:0 atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q4_k_pipeline, hidden_size), 1, 1)];
@@ -24035,7 +24765,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q5_k
             if (encoder == nil) return -13;
             [encoder setComputePipelineState:runtime->q5_k_pipeline];
             [encoder setBuffer:current_buffer offset:0 atIndex:0];
-            [encoder setBuffer:attention_view.weight_buffer offset:0 atIndex:1];
+            [encoder setBuffer:attention_view.weight_buffer offset:attention_view.weight_offset atIndex:1];
             [encoder setBuffer:projected_buffer offset:0 atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             [encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q5_k_pipeline, hidden_size), 1, 1)];
@@ -24152,6 +24882,7 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q8_0
                 current_buffer,
                 0,
                 attention_view.weight_buffer,
+                attention_view.weight_offset,
                 projected_buffer,
                 0,
                 attention_input_size,
@@ -24174,12 +24905,13 @@ static int termite_metal_decode_runtime_encode_attention_quantized_residual_q8_0
             TERMITE_METAL_PLAN_OP_DECODE_ATTENTION_OUTPUT_LINEAR,
             TERMITE_METAL_OPERATOR_MUL_MM,
             TERMITE_METAL_QUANT_MATMUL_DISPATCH_MM);
-        if (termite_metal_encode_q8_0_linear_family(
+        if (termite_metal_encode_q8_0_linear_family_with_offset(
                 runtime,
                 command_buffer,
                 current_buffer,
                 0,
                 attention_view.weight_buffer,
+                attention_view.weight_offset,
                 projected_buffer,
                 0,
                 rows,
@@ -25287,8 +26019,8 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         if (pair_encoder == nil) return -14;
         [pair_encoder setComputePipelineState:runtime->i2_s_pair_pipeline];
         [pair_encoder setBuffer:input_buffer offset:0 atIndex:0];
-        [pair_encoder setBuffer:gate_view.weight_buffer offset:0 atIndex:1];
-        [pair_encoder setBuffer:up_view.weight_buffer offset:0 atIndex:2];
+        [pair_encoder setBuffer:gate_view.weight_buffer offset:gate_view.weight_offset atIndex:1];
+        [pair_encoder setBuffer:up_view.weight_buffer offset:up_view.weight_offset atIndex:2];
         [pair_encoder setBuffer:gate_output_buffer offset:0 atIndex:3];
         [pair_encoder setBuffer:up_output_buffer offset:0 atIndex:4];
         [pair_encoder setBytes:&pair_params length:sizeof(pair_params) atIndex:5];
@@ -25332,7 +26064,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_i2_s_slots(
         if (down_encoder == nil) return -18;
         [down_encoder setComputePipelineState:runtime->i2_s_pipeline];
         [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, rows * hidden_size), 1, 1)];
@@ -25431,7 +26163,9 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
             .fallback_pipeline = runtime->q4_k_pair_pipeline,
             .input_buffer = input_buffer,
             .weight_buffer = gate_view.weight_buffer,
+            .weight_offset = gate_view.weight_offset,
             .second_weight_buffer = up_view.weight_buffer,
+            .second_weight_offset = up_view.weight_offset,
             .output_buffer = gate_output_buffer,
             .second_output_buffer = up_output_buffer,
             .rows = rows,
@@ -25495,7 +26229,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_slots(
         if (down_encoder == nil) return -20;
         [down_encoder setComputePipelineState:runtime->q4_k_pipeline];
         [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q4_k_pipeline, rows * hidden_size), 1, 1)];
@@ -25672,7 +26406,7 @@ int termite_metal_decode_runtime_apply_rms_norm_i2_s_linear_residual_slot(
         if (down_encoder == nil) return -13;
         [down_encoder setComputePipelineState:runtime->i2_s_pipeline];
         [down_encoder setBuffer:normed_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBuffer:down_params_buffer offset:0 atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->i2_s_pipeline, hidden_size), 1, 1)];
@@ -26245,7 +26979,9 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q5_k_down_sl
             .fallback_pipeline = runtime->q4_k_pair_pipeline,
             .input_buffer = input_buffer,
             .weight_buffer = gate_view.weight_buffer,
+            .weight_offset = gate_view.weight_offset,
             .second_weight_buffer = up_view.weight_buffer,
+            .second_weight_offset = up_view.weight_offset,
             .output_buffer = gate_output_buffer,
             .second_output_buffer = up_output_buffer,
             .rows = rows,
@@ -26295,7 +27031,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q5_k_down_sl
         if (down_encoder == nil) return -20;
         [down_encoder setComputePipelineState:runtime->q5_k_pipeline];
         [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q5_k_pipeline, rows * hidden_size), 1, 1)];
@@ -26408,7 +27144,9 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
             .fallback_pipeline = runtime->q4_k_pair_pipeline,
             .input_buffer = input_buffer,
             .weight_buffer = gate_view.weight_buffer,
+            .weight_offset = gate_view.weight_offset,
             .second_weight_buffer = up_view.weight_buffer,
+            .second_weight_offset = up_view.weight_offset,
             .output_buffer = gate_output_buffer,
             .second_output_buffer = up_output_buffer,
             .rows = rows,
@@ -26458,7 +27196,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_k_pair_q6_k_down_sl
         if (down_encoder == nil) return -20;
         [down_encoder setComputePipelineState:runtime->q6_k_pipeline];
         [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q6_k_pipeline, rows * hidden_size), 1, 1)];
@@ -26566,7 +27304,9 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
             .fallback_pipeline = runtime->q6_k_pair_pipeline,
             .input_buffer = input_buffer,
             .weight_buffer = gate_view.weight_buffer,
+            .weight_offset = gate_view.weight_offset,
             .second_weight_buffer = up_view.weight_buffer,
+            .second_weight_offset = up_view.weight_offset,
             .output_buffer = gate_output_buffer,
             .second_output_buffer = up_output_buffer,
             .rows = rows,
@@ -26616,7 +27356,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q6_k_slots(
         if (down_encoder == nil) return -20;
         [down_encoder setComputePipelineState:runtime->q6_k_pipeline];
         [down_encoder setBuffer:down_input_buffer offset:0 atIndex:0];
-        [down_encoder setBuffer:down_view.weight_buffer offset:0 atIndex:1];
+        [down_encoder setBuffer:down_view.weight_buffer offset:down_view.weight_offset atIndex:1];
         [down_encoder setBuffer:projected_buffer offset:0 atIndex:2];
         [down_encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
         [down_encoder dispatchThreads:MTLSizeMake(rows * hidden_size, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->q6_k_pipeline, rows * hidden_size), 1, 1)];
@@ -26724,7 +27464,9 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
             .fallback_pipeline = runtime->q4_0_pair_pipeline,
             .input_buffer = input_buffer,
             .weight_buffer = gate_view.weight_buffer,
+            .weight_offset = gate_view.weight_offset,
             .second_weight_buffer = up_view.weight_buffer,
+            .second_weight_offset = up_view.weight_offset,
             .output_buffer = gate_output_buffer,
             .second_output_buffer = up_output_buffer,
             .rows = rows,
@@ -26770,7 +27512,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
                     intermediate_size,
                     0.0f,
                     -19);
-                const int down_status = scale_status == 0 ? termite_metal_encode_q8_0_linear_rms_scale_1x(
+                const int down_status = scale_status == 0 ? termite_metal_encode_q8_0_linear_rms_scale_1x_with_offset(
                     runtime,
                     command_buffer,
                     gated_buffer,
@@ -26779,6 +27521,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
                     ffn_scalar_or_post_down_buffer,
                     0,
                     down_view.weight_buffer,
+                    down_view.weight_offset,
                     projected_buffer,
                     0,
                     intermediate_size,
@@ -26800,17 +27543,19 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q4_0_pair_q8_0_down_sl
             }
         }
 
-        if (!down_projection_done && termite_metal_encode_q8_0_linear(
+        if (!down_projection_done && termite_metal_encode_q8_0_linear_family_with_offset(
                 runtime,
                 command_buffer,
                 down_input_buffer,
                 0,
                 down_view.weight_buffer,
+                down_view.weight_offset,
                 projected_buffer,
                 0,
                 rows,
                 intermediate_size,
                 hidden_size,
+                TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                 -20) != 0) return -20;
 
         id<MTLBuffer> add_lhs_buffer = projected_buffer;
@@ -26927,38 +27672,44 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
             -16) == 0;
         if (!fused_gate_up) {
             if (split_gate_up_linear) {
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         input_buffer,
                         0,
                         gate_view.weight_buffer,
+                        gate_view.weight_offset,
                         gate_output_buffer,
                         0,
                         rows,
                         hidden_size,
                         intermediate_size,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -16) != 0) return -16;
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         input_buffer,
                         0,
                         up_view.weight_buffer,
+                        up_view.weight_offset,
                         up_output_buffer,
                         0,
                         rows,
                         hidden_size,
                         intermediate_size,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -16) != 0) return -16;
             } else {
-                if (termite_metal_encode_q8_0_pair_linear(
+                if (termite_metal_encode_q8_0_pair_linear_with_offsets(
                         runtime,
                         command_buffer,
                         input_buffer,
                         0,
                         gate_view.weight_buffer,
+                        gate_view.weight_offset,
                         up_view.weight_buffer,
+                        up_view.weight_offset,
                         gate_output_buffer,
                         0,
                         up_output_buffer,
@@ -27007,7 +27758,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
                     intermediate_size,
                     0.0f,
                     -19);
-                const int down_status = scale_status == 0 ? termite_metal_encode_q8_0_linear_rms_scale_1x(
+                const int down_status = scale_status == 0 ? termite_metal_encode_q8_0_linear_rms_scale_1x_with_offset(
                     runtime,
                     command_buffer,
                     gated_buffer,
@@ -27016,6 +27767,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
                     ffn_scalar_or_post_down_buffer,
                     0,
                     down_view.weight_buffer,
+                    down_view.weight_offset,
                     projected_buffer,
                     0,
                     intermediate_size,
@@ -27037,17 +27789,19 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots(
             }
         }
 
-        if (!down_projection_done && termite_metal_encode_q8_0_linear(
+        if (!down_projection_done && termite_metal_encode_q8_0_linear_family_with_offset(
                 runtime,
                 command_buffer,
                 down_input_buffer,
                 0,
                 down_view.weight_buffer,
+                down_view.weight_offset,
                 projected_buffer,
                 0,
                 rows,
                 intermediate_size,
                 hidden_size,
+                TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                 -20) != 0) return -20;
 
         id<MTLBuffer> add_lhs_buffer = projected_buffer;
@@ -27172,9 +27926,12 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 pre_gate_rms_norm_slot,
                 pre_norm_input_buffer,
                 gate_view.weight_buffer,
+                gate_view.weight_offset,
                 up_view.weight_buffer,
+                up_view.weight_offset,
                 gated_buffer,
                 down_view.weight_buffer,
+                down_view.weight_offset,
                 projected_buffer,
                 hidden_size,
                 intermediate_size,
@@ -27211,7 +27968,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                     hidden_size,
                     eps,
                     -16);
-                const int pair_status = scale_status == 0 ? termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x(
+                const int pair_status = scale_status == 0 ? termite_metal_encode_q8_0_pair_activation_multiply_rms_scale_1x_with_offsets(
                     runtime,
                     command_buffer,
                     input_buffer,
@@ -27220,7 +27977,9 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                     pre_norm_input_buffer,
                     0,
                     gate_view.weight_buffer,
+                    gate_view.weight_offset,
                     up_view.weight_buffer,
+                    up_view.weight_offset,
                     gated_buffer,
                     0,
                     hidden_size,
@@ -27273,9 +28032,12 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 gate_input_buffer,
                 gate_input_offset,
                 gate_view.weight_buffer,
+                gate_view.weight_offset,
                 up_view.weight_buffer,
+                up_view.weight_offset,
                 gated_buffer,
                 down_view.weight_buffer,
+                down_view.weight_offset,
                 projected_buffer,
                 hidden_size,
                 intermediate_size,
@@ -27318,7 +28080,9 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 .input_buffer = gate_input_buffer,
                 .input_offset = gate_input_offset,
                 .weight_buffer = gate_view.weight_buffer,
+                .weight_offset = gate_view.weight_offset,
                 .second_weight_buffer = up_view.weight_buffer,
+                .second_weight_offset = up_view.weight_offset,
                 .output_buffer = gated_buffer,
                 .rows = rows,
                 .in_dim = hidden_size,
@@ -27346,38 +28110,44 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
         const bool fused_gate_up = pre_gate_pair_done || (!split_gate_up_linear && gate_up_status == 0);
         if (!fused_gate_up) {
             if (split_gate_up_linear) {
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         gate_input_buffer,
                         gate_input_offset,
                         gate_view.weight_buffer,
+                        gate_view.weight_offset,
                         gate_output_buffer,
                         0,
                         rows,
                         hidden_size,
                         intermediate_size,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -16) != 0) return -16;
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family_with_offset(
                         runtime,
                         command_buffer,
                         gate_input_buffer,
                         gate_input_offset,
                         up_view.weight_buffer,
+                        up_view.weight_offset,
                         up_output_buffer,
                         0,
                         rows,
                         hidden_size,
                         intermediate_size,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -16) != 0) return -16;
             } else {
-                if (termite_metal_encode_q8_0_pair_linear(
+                if (termite_metal_encode_q8_0_pair_linear_with_offsets(
                         runtime,
                         command_buffer,
                         gate_input_buffer,
                         gate_input_offset,
                         gate_view.weight_buffer,
+                        gate_view.weight_offset,
                         up_view.weight_buffer,
+                        up_view.weight_offset,
                         gate_output_buffer,
                         0,
                         up_output_buffer,
@@ -27413,7 +28183,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                     intermediate_size,
                     eps,
                     -19);
-                const int down_status = scale_status == 0 ? termite_metal_encode_q8_0_linear_rms_scale_1x(
+                const int down_status = scale_status == 0 ? termite_metal_encode_q8_0_linear_rms_scale_1x_with_offset(
                     runtime,
                     command_buffer,
                     gated_buffer,
@@ -27422,6 +28192,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                     ffn_scalar_or_hidden_buffer,
                     0,
                     down_view.weight_buffer,
+                    down_view.weight_offset,
                     projected_buffer,
                     0,
                     intermediate_size,
@@ -27461,6 +28232,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 down_input_buffer,
                 0,
                 down_view.weight_buffer,
+                down_view.weight_offset,
                 projected_buffer,
                 0,
                 intermediate_size,
@@ -27502,6 +28274,7 @@ static int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0_slots_devi
                 .fallback_pipeline = runtime->q8_0_pipeline,
                 .input_buffer = down_input_buffer,
                 .weight_buffer = down_view.weight_buffer,
+                .weight_offset = down_view.weight_offset,
                 .output_buffer = projected_buffer,
                 .rows = rows,
                 .in_dim = intermediate_size,
@@ -27728,7 +28501,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
             -15) == 0;
         if (!fused_gate_up) {
             if (split_gate_up_linear) {
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family(
                         runtime,
                         command_buffer,
                         input_buffer,
@@ -27739,8 +28512,9 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
                         rows,
                         hidden_size,
                         intermediate_size,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -15) != 0) return -15;
-                if (termite_metal_encode_q8_0_linear(
+                if (termite_metal_encode_q8_0_linear_family(
                         runtime,
                         command_buffer,
                         input_buffer,
@@ -27751,6 +28525,7 @@ int termite_metal_decode_runtime_apply_gated_ffn_residual_q8_0(
                         rows,
                         hidden_size,
                         intermediate_size,
+                        TERMITE_METAL_Q8_0_LINEAR_FAMILY_NONE,
                         -15) != 0) return -15;
             } else {
                 if (termite_metal_encode_q8_0_pair_linear(
@@ -32121,6 +32896,7 @@ int termite_metal_decode_runtime_apply_attention_f32_gated_block_q8_0_device_kv_
                     sliding_window,
                     total_sequence_len,
                     attention_view.weight_buffer,
+                    attention_view.weight_offset,
                     runtime->hot_hidden_buffers[3],
                     0,
                     attention_input_size,
@@ -32834,6 +33610,7 @@ static bool termite_metal_decode_runtime_active_frame_empty(termite_metal_decode
         runtime->active_frame_blit_encoder_count == 0 &&
         runtime->active_frame_planned_compute_scope_count == 0 &&
         runtime->active_frame_planned_barrier_count == 0 &&
+        runtime->active_frame_mps_dense_linear_count == 0 &&
         runtime->active_frame_planned_command_op_count == 0 &&
         runtime->active_planned_compute_encoder == nil;
 }

@@ -717,6 +717,10 @@ pub fn decoderRuntimePreparedSlotsMatchFamily(self: anytype, gpt_config: anytype
                 if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer=final kind=final_norm slot={d} hidden={d}\n", .{ @tagName(gpt_config.family), decoder_gated_runtime.finalNormSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size });
                 return false;
             }
+            if (!decoderRuntimeLinearSlotPrepared(self, decoder_gated_runtime.finalLmHeadSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size, gpt_config.vocab_size)) {
+                if (trace) std.debug.print("prepare-trace: slot-miss family={s} layer=final kind=lm_head slot={d} in={d} out={d}\n", .{ @tagName(gpt_config.family), decoder_gated_runtime.finalLmHeadSlot(gpt_config.num_hidden_layers), gpt_config.hidden_size, gpt_config.vocab_size });
+                return false;
+            }
             return true;
         },
         .gpt2 => {
@@ -1349,15 +1353,44 @@ pub fn decoderRuntimeQuantEmbeddingLookup(
     }
 
     const source_bytes = storage.raw_bytes;
-    const prep_rc = termite_metal_decode_runtime_prepare_quant_embedding_table(
-        runtime,
-        @intFromEnum(format),
-        source_bytes.ptr,
-        source_bytes.len,
-        rows,
-        dim,
-    );
-    if (prep_rc != 0) return null;
+    const mapped_forced = quantMappedWeightsForced();
+    const mapped_span = if (!quantMappedWeightsDisabled()) mappedQuantRawSpan(storage, source_bytes, @alignOf(u16)) else null;
+    var prepared = false;
+    if (mapped_span) |span| {
+        incrementRuntimeQuantMappedAttempts(self);
+        const mapped_started_at = monotonicNowNs();
+        const mapped_rc = termite_metal_decode_runtime_prepare_quant_embedding_table_no_copy_region(
+            runtime,
+            @intFromEnum(format),
+            span.base_ptr,
+            span.base_len,
+            span.weight_offset,
+            span.weight_len,
+            rows,
+            dim,
+        );
+        addRuntimeQuantMappedPrepareNanos(self, monotonicNowNs() - mapped_started_at);
+        if (mapped_rc == 0) {
+            prepared = true;
+        } else {
+            incrementRuntimeQuantMappedFallbacks(self);
+        }
+    } else if (mapped_forced) {
+        incrementRuntimeQuantMappedFailures(self);
+        return null;
+    }
+    if (!prepared) {
+        if (mapped_forced) return null;
+        const prep_rc = termite_metal_decode_runtime_prepare_quant_embedding_table(
+            runtime,
+            @intFromEnum(format),
+            source_bytes.ptr,
+            source_bytes.len,
+            rows,
+            dim,
+        );
+        if (prep_rc != 0) return null;
+    }
 
     const shape = [_]i32{ @intCast(total), @intCast(dim) };
     var output = try MetalTensor.deviceAllocate(runtime, total * dim * @sizeOf(f32), .private, &shape);
@@ -5029,6 +5062,10 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         request.retain_dense_fallback
     else
         false;
+    const disable_mapped_quant_weight = if (@hasField(@TypeOf(request), "disable_mapped_quant_weight"))
+        request.disable_mapped_quant_weight
+    else
+        false;
     if (self.raw_linear_slots_prepared[request.slot] and
         self.raw_linear_slot_in_dims[request.slot] == request.in_dim and
         self.raw_linear_slot_out_dims[request.slot] == request.out_dim and
@@ -5083,6 +5120,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
                 }
                 stats.decoder_runtime_prepare_linear_calls += 1;
                 self.raw_linear_slot_quantized_storage[request.slot] = q8_storage;
+                setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
                 self.raw_linear_slot_kinds[request.slot] = .quantized;
                 self.raw_linear_slots_prepared[request.slot] = true;
                 self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
@@ -5113,6 +5151,7 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
 
         stats.decoder_runtime_prepare_linear_calls += 1;
         self.raw_linear_slot_quantized_storage[request.slot] = try dupQuantizedStorage(storage);
+        setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
         self.raw_linear_slot_kinds[request.slot] = .quantized;
         self.raw_linear_slots_prepared[request.slot] = true;
         self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
@@ -6326,6 +6365,16 @@ pub extern fn termite_metal_decode_runtime_prepare_quant_embedding_table(
     rows: usize,
     dim: usize,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_quant_embedding_table_no_copy_region(
+    runtime: ?*RawMetalDecodeRuntime,
+    format: u32,
+    mapped_raw: [*c]const u8,
+    mapped_bytes: usize,
+    weight_offset: usize,
+    weight_bytes: usize,
+    rows: usize,
+    dim: usize,
+) c_int;
 pub extern fn termite_metal_decode_runtime_embedding_lookup_prepared_device(
     runtime: ?*RawMetalDecodeRuntime,
     ids: [*c]const u32,
@@ -6813,6 +6862,17 @@ pub extern fn termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy
     format: u32,
     slot: usize,
     weight_raw: [*c]const u8,
+    weight_bytes: usize,
+    in_dim: usize,
+    out_dim: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
+    runtime: ?*RawMetalDecodeRuntime,
+    format: u32,
+    slot: usize,
+    mapped_raw: [*c]const u8,
+    mapped_bytes: usize,
+    weight_offset: usize,
     weight_bytes: usize,
     in_dim: usize,
     out_dim: usize,
@@ -9515,6 +9575,23 @@ fn runtimeQuantPrepareMode(self: anytype, slot: usize) RawQuantizedRuntimeLinear
     return .none;
 }
 
+fn setRuntimeQuantMappedDisabled(self: anytype, slot: usize, disabled: bool) void {
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_disable_mapped_quant_weight")) {
+        if (slot < @field(self, "raw_linear_slot_disable_mapped_quant_weight").len) {
+            @field(self, "raw_linear_slot_disable_mapped_quant_weight")[slot] = disabled;
+        }
+    }
+}
+
+fn runtimeQuantMappedDisabled(self: anytype, slot: usize) bool {
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_disable_mapped_quant_weight")) {
+        if (slot < @field(self, "raw_linear_slot_disable_mapped_quant_weight").len) {
+            return @field(self, "raw_linear_slot_disable_mapped_quant_weight")[slot];
+        }
+    }
+    return false;
+}
+
 fn addRuntimeQuantField(self: anytype, comptime field_name: []const u8, value: anytype) void {
     if (comptime typeHasField(@TypeOf(self), field_name)) {
         @field(self, field_name) += value;
@@ -9549,22 +9626,56 @@ fn quantMappedWeightsForced() bool {
     return getenvBool("TERMITE_METAL_FORCE_MAPPED_QUANT_WEIGHTS");
 }
 
-fn quantStorageEligibleForMappedRuntime(storage: *const QuantizedStorage, descriptor: PackedWeightDescriptor) bool {
-    // Metal's newBufferWithBytesNoCopy requires page-shaped host memory. A
-    // borrowed quantized tensor may be stack/heap/synthetic data; only mmap
-    // storage advertises a lifetime and backing suitable for this fast path.
+fn quantMappedWeightOffsetsEnabled() bool {
+    return !getenvBool("TERMITE_METAL_DISABLE_OFFSET_MAPPED_QUANT_WEIGHTS");
+}
+
+const MappedQuantWeightSpan = struct {
+    base_ptr: [*]const u8,
+    base_len: usize,
+    weight_offset: usize,
+    weight_len: usize,
+};
+
+fn mappedQuantRawSpan(storage: *const QuantizedStorage, raw_bytes: []const u8, offset_alignment: usize) ?MappedQuantWeightSpan {
+    if (storage.raw_owned or !storage.raw_mmap_backed) return null;
+    if (raw_bytes.len == 0) return null;
+    if (raw_bytes.ptr != storage.raw_bytes.ptr or raw_bytes.len != storage.raw_bytes.len) return null;
+
     const page_size = std.heap.page_size_min;
-    const ptr_value = @intFromPtr(descriptor.raw_bytes.ptr);
-    return !storage.raw_owned and
-        storage.raw_mmap_backed and
-        descriptor.raw_bytes.len != 0 and
-        ptr_value % page_size == 0 and
-        descriptor.raw_bytes.len % page_size == 0 and
-        storage.preparedBytes(.row_major_blocks) == null and
-        storage.preparedBytes(.panel4) == null and
-        storage.preparedBytes(.panel8) == null and
-        descriptor.raw_bytes.ptr == storage.raw_bytes.ptr and
-        descriptor.raw_bytes.len == storage.raw_bytes.len;
+    const ptr_value = @intFromPtr(raw_bytes.ptr);
+    if (ptr_value % page_size == 0 and raw_bytes.len % page_size == 0) {
+        return .{
+            .base_ptr = raw_bytes.ptr,
+            .base_len = raw_bytes.len,
+            .weight_offset = 0,
+            .weight_len = raw_bytes.len,
+        };
+    }
+    if (!quantMappedWeightOffsetsEnabled()) return null;
+    if (ptr_value % @alignOf(u16) != 0) return null;
+    const aligned_start = ptr_value - (ptr_value % page_size);
+    const weight_offset = ptr_value - aligned_start;
+    if (offset_alignment > 1 and weight_offset % offset_alignment != 0) return null;
+    const raw_end = std.math.add(usize, ptr_value, raw_bytes.len) catch return null;
+    const aligned_end = std.mem.alignForward(usize, raw_end, page_size);
+    if (aligned_end <= aligned_start) return null;
+    return .{
+        .base_ptr = @as([*]const u8, @ptrFromInt(aligned_start)),
+        .base_len = aligned_end - aligned_start,
+        .weight_offset = weight_offset,
+        .weight_len = raw_bytes.len,
+    };
+}
+
+fn mappedQuantWeightSpan(storage: *const QuantizedStorage, descriptor: PackedWeightDescriptor) ?MappedQuantWeightSpan {
+    if (descriptor.format != .q8_0) return null;
+    if (storage.preparedBytes(.row_major_blocks) != null or
+        storage.preparedBytes(.panel4) != null or
+        storage.preparedBytes(.panel8) != null) return null;
+    if (descriptor.raw_bytes.ptr != storage.raw_bytes.ptr or
+        descriptor.raw_bytes.len != storage.raw_bytes.len) return null;
+    return mappedQuantRawSpan(storage, descriptor.raw_bytes, @alignOf(u16));
 }
 
 fn ensureRuntimeQuantSlotPrepared(
@@ -9590,21 +9701,23 @@ fn ensureRuntimeQuantSlotPrepared(
     {
         const descriptor = slot_descriptor.descriptor;
         const mapped_forced = quantMappedWeightsForced();
-        const mapped_disabled = quantMappedWeightsDisabled();
-        const mapped_eligible = !mapped_disabled and quantStorageEligibleForMappedRuntime(slot_descriptor.storage, descriptor);
-        if (mapped_forced and !mapped_eligible) {
+        const mapped_disabled = quantMappedWeightsDisabled() or runtimeQuantMappedDisabled(self, slot);
+        const mapped_span = if (!mapped_disabled) mappedQuantWeightSpan(slot_descriptor.storage, descriptor) else null;
+        if (mapped_forced and mapped_span == null) {
             incrementRuntimeQuantMappedFailures(self);
             return false;
         }
-        if (mapped_eligible) {
+        if (mapped_span) |span| {
             incrementRuntimeQuantMappedAttempts(self);
             const mapped_started_at = monotonicNowNs();
-            const mapped_rc = termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy(
+            const mapped_rc = termite_metal_decode_runtime_prepare_quantized_linear_slot_no_copy_region(
                 slot_descriptor.runtime,
                 @intFromEnum(layout.format),
                 slot,
-                descriptor.raw_bytes.ptr,
-                descriptor.raw_bytes.len,
+                span.base_ptr,
+                span.base_len,
+                span.weight_offset,
+                span.weight_len,
                 in_dim,
                 out_dim,
             );
@@ -10150,6 +10263,7 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     self.raw_linear_slot_in_dims[slot] = 0;
     self.raw_linear_slot_out_dims[slot] = 0;
     self.raw_linear_slot_runtime_prepared_kind[slot] = .none;
+    setRuntimeQuantMappedDisabled(self, slot, false);
     setRuntimeQuantPrepareMode(self, slot, .none);
     self.raw_linear_slots_prepared[slot] = false;
 }
@@ -10183,6 +10297,7 @@ pub fn dupQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage 
         .source_name = source_name,
         .packed_expert = storage.packed_expert,
         .raw_owned = storage.raw_owned,
+        .raw_mmap_backed = storage.raw_mmap_backed,
         .allocator = std.heap.c_allocator,
     };
     errdefer owned.deinit();
@@ -10192,6 +10307,29 @@ pub fn dupQuantizedStorage(storage: *const QuantizedStorage) !*QuantizedStorage 
         owned.setPreparedBytes(@enumFromInt(idx), bytes, buffer.panel_cols, buffer.row_blocks);
     }
     return owned;
+}
+
+test "dupQuantizedStorage preserves mmap backing metadata" {
+    var raw: [34]u8 = [_]u8{0} ** 34;
+    const shape = [_]i64{ 1, 32 };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q8_0 },
+        .raw_bytes = &raw,
+        .shape = &shape,
+        .raw_owned = false,
+        .raw_mmap_backed = true,
+        .allocator = std.testing.allocator,
+    };
+
+    const duped = try dupQuantizedStorage(&storage);
+    defer {
+        duped.deinit();
+        std.heap.c_allocator.destroy(duped);
+    }
+
+    try std.testing.expect(!duped.raw_owned);
+    try std.testing.expect(duped.raw_mmap_backed);
+    try std.testing.expect(duped.raw_bytes.ptr == storage.raw_bytes.ptr);
 }
 
 pub fn tryApplyQuantizedRuntimeLinear(
@@ -19488,6 +19626,132 @@ test "metal native PLE residual q4_0 uses generic device descriptor path" {
     for (expected, actual) |exp, got| {
         try std.testing.expectApproxEqAbs(exp, got, 1e-4);
     }
+}
+
+test "metal native q8_0 mapped linear slot supports page-offset mmap slice" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const hidden_size: usize = 32;
+    const out_dim: usize = 2;
+    const page_size = std.heap.page_size_min;
+    const file_len = page_size * 2;
+    const raw_offset: usize = 256;
+    var file_bytes = try std.testing.allocator.alloc(u8, file_len);
+    defer std.testing.allocator.free(file_bytes);
+    @memset(file_bytes, 0);
+    const file_weight_raw = file_bytes[raw_offset..][0..68];
+
+    file_weight_raw[0] = 0x00;
+    file_weight_raw[1] = 0x3C;
+    for (0..32) |i| file_weight_raw[2 + i] = @bitCast(@as(i8, 1));
+    file_weight_raw[34] = 0x00;
+    file_weight_raw[35] = 0x3C;
+    for (0..32) |i| file_weight_raw[36 + i] = @bitCast(@as(i8, -2));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(std.testing.io, "mapped-q8.bin", .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, file_bytes, 0);
+    const mapped = try std.posix.mmap(null, file_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+    defer std.posix.munmap(mapped);
+    const weight_raw = mapped[raw_offset..][0..68];
+
+    const shape = [_]i64{ @intCast(out_dim), @intCast(hidden_size) };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q8_0 },
+        .raw_bytes = weight_raw,
+        .shape = &shape,
+        .raw_owned = false,
+        .raw_mmap_backed = true,
+        .allocator = std.testing.allocator,
+    };
+
+    const descriptor = packedWeightDescriptorForMatrix(&storage, hidden_size, out_dim, .q8_0) orelse return error.UnexpectedNull;
+    if (!quantMappedWeightOffsetsEnabled()) {
+        try std.testing.expect(mappedQuantWeightSpan(&storage, descriptor) == null);
+        return;
+    }
+
+    const span = mappedQuantWeightSpan(&storage, descriptor) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(raw_offset, span.weight_offset);
+    try std.testing.expectEqual(@as(usize, 68), span.weight_len);
+    try std.testing.expect(@intFromPtr(span.base_ptr) % page_size == 0);
+    try std.testing.expect(span.base_len >= raw_offset + span.weight_len);
+
+    if (!getenvBool("TERMITE_METAL_TEST_MAPPED_QUANT_NUMERIC")) return;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+
+    const bias_data = [_]f32{ 0.0, 0.0 };
+    var bias = try MetalTensor.ownedCloneFrom(&bias_data, &[_]i32{@intCast(out_dim)});
+    defer bias.deinit();
+    var dummy_weight_value = [_]f32{0.0};
+    const dummy_weight = MetalTensor.borrowed(dummy_weight_value[0..].ptr, 1, &[_]i32{0});
+    var stats: ops.NativeQuantTimingStats = .{};
+    try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{
+        .weight = dummy_weight,
+        .bias = bias,
+        .quantized_storage = @as(?*const QuantizedStorage, &storage),
+        .slot = 1,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+        .retain_dense_fallback = false,
+    }, &stats));
+
+    try std.testing.expectEqual(@as(RawQuantizedRuntimeLinearStorageMode, .mapped_shared), provider.raw_linear_slot_runtime_prepared_modes[1]);
+    try std.testing.expectEqual(@as(u64, 1), provider.raw_quant_runtime_mapped_attempts);
+    try std.testing.expectEqual(@as(u64, 0), provider.raw_quant_runtime_mapped_failures);
+
+    const input_data = [_]f32{1.0} ** hidden_size;
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 1, @intCast(hidden_size) });
+    defer input.deinit();
+    var output = (try decoderRuntimeApplyLinear(&provider, .{
+        .slot = 1,
+        .input = input,
+        .in_dim = hidden_size,
+        .out_dim = out_dim,
+    })) orelse return error.UnexpectedNull;
+    defer output.deinit();
+
+    var output_mut = output;
+    const actual = try tensorHostSlice(&output_mut);
+    try std.testing.expectEqual(@as(usize, out_dim), actual.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), actual[0], 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, -64.0), actual[1], 1e-3);
+}
+
+test "mapped quant raw span permits embedding and linear offsets" {
+    const page_size = std.heap.page_size_min;
+    const raw_offset: usize = @alignOf(u16);
+    const raw_len: usize = 68;
+    const bytes = try std.heap.page_allocator.alloc(u8, page_size * 2);
+    defer std.heap.page_allocator.free(bytes);
+    @memset(bytes, 0);
+    const raw_bytes = bytes[raw_offset..][0..raw_len];
+    const shape = [_]i64{ 2, 32 };
+    const storage = QuantizedStorage{
+        .tensor_type = .{ .known = .Q8_0 },
+        .raw_bytes = raw_bytes,
+        .shape = &shape,
+        .raw_owned = false,
+        .raw_mmap_backed = true,
+        .allocator = std.testing.allocator,
+    };
+
+    const embedding_span = mappedQuantRawSpan(&storage, raw_bytes, @alignOf(u16)) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(raw_offset, embedding_span.weight_offset);
+    try std.testing.expectEqual(raw_len, embedding_span.weight_len);
+
+    const descriptor = packedWeightDescriptorForMatrix(&storage, 32, 2, .q8_0) orelse return error.UnexpectedNull;
+    const linear_span = mappedQuantWeightSpan(&storage, descriptor) orelse return error.UnexpectedNull;
+    try std.testing.expectEqual(raw_offset, linear_span.weight_offset);
+    try std.testing.expectEqual(raw_len, linear_span.weight_len);
 }
 
 test "metal native decoderRuntimeApplyRmsNorm plus q8_0 linear matches reference" {

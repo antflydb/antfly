@@ -373,6 +373,7 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     in_dim: usize,
     out_dim: usize,
     retain_dense_fallback: bool = true,
+    disable_mapped_quant_weight: bool = false,
 };
 
 pub const DecoderRuntimeEnsureLinearSlotRequest = struct {

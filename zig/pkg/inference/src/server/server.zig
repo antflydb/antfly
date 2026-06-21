@@ -98,6 +98,8 @@ pub const NodeConfig = struct {
     ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
+    warm_generators: []const []const u8 = &.{},
+    warm_generator_backend: ?backends_mod.BackendType = null,
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
@@ -160,6 +162,17 @@ fn configureGenerateBackendPreference(
     native_backend_choice.configureSessionPreference(session_manager, selection.native_choice);
 }
 
+fn singleBackendPreference(backend: backends_mod.BackendType) []const backends_mod.BackendType {
+    return switch (backend) {
+        .native => &.{.native},
+        .onnx => &.{.onnx},
+        .metal => &.{.metal},
+        .cuda => &.{.cuda},
+        .pjrt => &.{.pjrt},
+        .wasm => &.{.wasm},
+    };
+}
+
 /// Global node pointer for operational handlers.
 var active_node: ?*Node = null;
 var active_models_dir: ?[]const u8 = null;
@@ -186,6 +199,11 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     const now = embedTimingNowNs();
     const elapsed_us = if (now > start_ns) @divTrunc(now - start_ns, 1000) else 0;
     std.log.info("antfly inference embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
+}
+
+fn elapsedMs(from_ns: u128, to_ns: u128) u64 {
+    if (to_ns <= from_ns) return 0;
+    return @intCast(@divTrunc(to_ns - from_ns, std.time.ns_per_ms));
 }
 
 fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
@@ -579,69 +597,7 @@ pub const Node = struct {
             };
         }
 
-        const configured_max_tokens: i32 = 256;
-        const queue_units = self.estimateGenerateQueueUnits(messages, configured_max_tokens);
-        try self.request_queue.acquireUnits(queue_units);
-        defer self.releaseSlotUnits(queue_units);
-        self.metrics.incRequest("generate.local");
-        defer self.metrics.decActive();
-
-        var io_impl = std.Io.Threaded.init(allocator, .{});
-        defer io_impl.deinit();
-        const io = io_impl.io();
-
-        const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
-        const model = try self.model_manager.loadFromDir(model_path);
-        const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
-        const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
-            .native => .native,
-            .metal => .metal,
-            .cuda => .cuda,
-            .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
-        };
-        const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
-
-        var kv_manager = runtime.kv.manager.KvManager.init(allocator);
-        defer kv_manager.deinit();
-        var cb = try session_factory.getComputeBackend(model.session, allocator);
-        defer cb.deinit();
-
-        const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
-            null
-        else if (gpt_config.sliding_window > 0)
-            gpt_config.sliding_window
-        else if (gpt_config.max_position_embeddings > 0)
-            gpt_config.max_position_embeddings
-        else
-            null;
-        const pool_id = try kv_manager.addPool(.{
-            .backend = backend_kind,
-            .dtype = kv_dtype,
-            .page_size_tokens = 16,
-            .num_layers_packed = @intCast(gpt_config.num_hidden_layers),
-            .num_kv_heads = gpt_config.maxKvHeads(),
-            .head_dim = gpt_config.maxHeadDim(),
-            .sliding_window_size = sliding_window_size,
-        });
-        var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
-        defer decode_state.deinit();
-
-        var pipeline = generation.NativeGenerationPipeline{
-            .allocator = allocator,
-            .io = io,
-            .cb = cb,
-            .gpt_config = gpt_config,
-            .tokenizer = model.getTokenizer(),
-            .add_bos_token = model.manifest.add_bos_token,
-            .bos_token = model.manifest.bos_token,
-            .chat_template = model.chat_tmpl,
-            .model_dir = model_path,
-            .gguf_projector_path = model.manifest.gguf_projector_path,
-            .decode_state = &decode_state,
-        };
-        var result = try pipeline.generate(messages, .{ .max_tokens = configured_max_tokens, .prefill_chunk_size = 256 });
-        defer result.deinit();
-        return try allocator.dupe(u8, result.text);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
     }
 
     pub fn generateMessagesDirect(
@@ -650,10 +606,30 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        if (messages.len == 0) return error.InvalidGenerationRequest;
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+    }
 
-        const configured_max_tokens: i32 = 256;
-        const queue_units = self.estimateGenerateQueueUnits(messages, configured_max_tokens);
+    const DirectGenerateTiming = struct {
+        resolve_ms: u64 = 0,
+        load_ms: u64 = 0,
+        setup_ms: u64 = 0,
+        generate_ms: u64 = 0,
+        total_ms: u64 = 0,
+    };
+
+    fn generateMessagesDirectMaxTokens(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        max_tokens: i32,
+        preferred_backends: ?[]const backends_mod.BackendType,
+        timing: ?*DirectGenerateTiming,
+    ) ![]u8 {
+        if (messages.len == 0) return error.InvalidGenerationRequest;
+        const started_at_ns = embedTimingNowNs();
+
+        const queue_units = self.estimateGenerateQueueUnits(messages, max_tokens);
         try self.request_queue.acquireUnits(queue_units);
         defer self.releaseSlotUnits(queue_units);
         self.metrics.incRequest("generate.local");
@@ -664,7 +640,14 @@ pub const Node = struct {
         const io = io_impl.io();
 
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "generators");
-        const model = try self.model_manager.loadFromDir(model_path);
+        const resolved_at_ns = embedTimingNowNs();
+        const model = if (preferred_backends) |backends|
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, backends, false)
+        else
+            try self.model_manager.loadFromDir(model_path);
+        const loaded_at_ns = embedTimingNowNs();
+        model.lockNativeGeneration();
+        defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
         const backend_kind: runtime.kv.pool.BackendKind = switch (model.session.backend()) {
             .native => .native,
@@ -699,22 +682,81 @@ pub const Node = struct {
         var decode_state = generation.NativeDecodeState.initPaged(allocator, &kv_manager, pool_id, model.shared_moe_cache);
         defer decode_state.deinit();
 
+        const use_metal_whole_model = build_options.enable_metal and
+            model.session.backend() == .metal and
+            graph_mod.metal_executor.supportsSession(model.session) and
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
             .io = io,
             .cb = cb,
+            .session = model.session,
             .gpt_config = gpt_config,
+            .kv_dtype = kv_dtype,
             .tokenizer = model.getTokenizer(),
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
             .chat_template = model.chat_tmpl,
+            .print_timing = timing != null,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
             .decode_state = &decode_state,
+            .graph_cache = if (use_metal_whole_model) &model.native_generation_graph_cache else null,
+            .compiled_partition_backend = if (use_metal_whole_model) .metal else null,
+            .compiled_attachment_target = if (use_metal_whole_model) .whole_model else .partitioned,
         };
-        var result = try pipeline.generate(messages, .{ .max_tokens = configured_max_tokens, .prefill_chunk_size = 256 });
+        const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
+        if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        const setup_at_ns = embedTimingNowNs();
+        var result = try pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 });
+        const generated_at_ns = embedTimingNowNs();
         defer result.deinit();
+        if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        }
+        if (timing) |t| {
+            t.* = .{
+                .resolve_ms = elapsedMs(started_at_ns, resolved_at_ns),
+                .load_ms = elapsedMs(resolved_at_ns, loaded_at_ns),
+                .setup_ms = elapsedMs(loaded_at_ns, setup_at_ns),
+                .generate_ms = elapsedMs(setup_at_ns, generated_at_ns),
+                .total_ms = elapsedMs(started_at_ns, generated_at_ns),
+            };
+        }
         return try allocator.dupe(u8, result.text);
+    }
+
+    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+        for (self.config.warm_generators) |model_name| try self.warmGenerator(allocator, model_name);
+    }
+
+    pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
+        if (model_name.len == 0) return error.InvalidGenerationRequest;
+        const started_at_ns = embedTimingNowNs();
+        std.log.info("warming inference generator model={s}", .{model_name});
+        const preferred_backends = if (self.config.warm_generator_backend) |backend| singleBackendPreference(backend) else null;
+        const messages = [_]generation.Message{.{
+            .role = "user",
+            .content = "ping",
+        }};
+        var timing = DirectGenerateTiming{};
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing);
+        defer allocator.free(text);
+        const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
+        std.log.info(
+            "warmed inference generator model={s} elapsed_ms={d} resolve_ms={d} load_ms={d} setup_ms={d} generate_ms={d}",
+            .{
+                model_name,
+                elapsed_ms,
+                timing.resolve_ms,
+                timing.load_ms,
+                timing.setup_ms,
+                timing.generate_ms,
+            },
+        );
     }
 
     pub fn embedDenseJsonInputDirect(
@@ -2241,6 +2283,8 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
         } else self.model_manager.loadFromDir(model_path) catch |err|
             return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+        model.lockNativeGeneration();
+        defer model.unlockNativeGeneration();
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
         const prompt_tokens = self.estimateNativePromptTokens(ctx.allocator, model, messages.items) catch |err|
             return ctx.status(500).json(.{ .@"error" = "TOKENIZE_FAILED", .message = @errorName(err) });
@@ -2434,8 +2478,24 @@ pub const Node = struct {
             backend_selection.compiled_partition_backend != null or
             graphModeEnabled();
         const use_scheduler = !graph_mode;
-        var graph_cache = graph_mod.cache.GraphCache.init(ctx.allocator);
-        defer graph_cache.deinit();
+        const use_model_graph_cache = graph_mode and
+            build_options.enable_metal and
+            model.session.backend() == .metal and
+            backend_selection.compiled_partition_backend == .metal and
+            backend_selection.compiled_attachment_target == .whole_model and
+            graph_mod.metal_executor.supportsSession(model.session) and
+            !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config);
+        var request_graph_cache: ?graph_mod.cache.GraphCache = if (graph_mode and !use_model_graph_cache)
+            graph_mod.cache.GraphCache.init(ctx.allocator)
+        else
+            null;
+        defer if (request_graph_cache) |*cache| cache.deinit();
+        const graph_cache = if (!graph_mode)
+            null
+        else if (use_model_graph_cache)
+            &model.native_generation_graph_cache
+        else
+            &request_graph_cache.?;
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = ctx.allocator,
@@ -2457,7 +2517,7 @@ pub const Node = struct {
             .draft_cb = if (draft_cb) |cb_value| cb_value else null,
             .draft_gpt_config = draft_gpt_config,
             .draft_decode_state = if (draft_decode_state) |*state| state else null,
-            .graph_cache = if (graph_mode) &graph_cache else null,
+            .graph_cache = graph_cache,
             .compiled_partition_backend = backend_selection.compiled_partition_backend,
             .compiled_attachment_target = backend_selection.compiled_attachment_target,
             .pjrt_client = if (pjrt_client) |*client| client else null,
@@ -5601,6 +5661,10 @@ test "generate backend selection keeps compiled mode explicit" {
     try std.testing.expect(auto_compiled.graph_mode_requested);
     try std.testing.expectError(error.InvalidGenerateMode, parseGenerateBackendSelection(null, "graph", null));
     try std.testing.expectError(error.InvalidCompiledTarget, parseGenerateBackendSelection(null, "compiled", "full"));
+}
+
+test "singleBackendPreference is strict" {
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.metal}, singleBackendPreference(.metal));
 }
 
 test "download remote content accepts data uri" {

@@ -324,6 +324,12 @@ fn disableGemmaFusedQkvRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_GEMMA_FUSED_QKV");
 }
 
+fn shouldDisableMappedGemmaSharedKvQ(gpt_config: gpt_mod.Config, layer: usize) bool {
+    return gpt_config.family == .gemma and
+        gpt_config.num_kv_shared_layers != 0 and
+        gpt_config.layerSharesKv(layer);
+}
+
 fn disableDirectPleRequested() bool {
     return getenvBool("TERMITE_METAL_DISABLE_DIRECT_PLE");
 }
@@ -452,28 +458,46 @@ fn compareLastHiddenRow(
     var max_abs: f32 = 0;
     var max_idx: usize = 0;
     var sum_abs: f64 = 0;
+    var finite_count: usize = 0;
+    var got_nonfinite: usize = 0;
+    var want_nonfinite: usize = 0;
     for (got_last, want_last, 0..) |got_value, want_value, idx| {
+        const got_finite = std.math.isFinite(got_value);
+        const want_finite = std.math.isFinite(want_value);
+        if (!got_finite) got_nonfinite += 1;
+        if (!want_finite) want_nonfinite += 1;
+        if (!got_finite or !want_finite) {
+            if (max_idx == 0) max_idx = idx;
+            continue;
+        }
         const abs_value = @abs(got_value - want_value);
         sum_abs += abs_value;
+        finite_count += 1;
         if (abs_value > max_abs) {
             max_abs = abs_value;
             max_idx = idx;
         }
     }
     const tolerance = gatedFamilyCompareTolerance();
-    const ok = max_abs <= tolerance;
+    const ok = got_nonfinite == 0 and want_nonfinite == 0 and max_abs <= tolerance;
+    const mean_abs = if (finite_count != 0)
+        sum_abs / @as(f64, @floatFromInt(finite_count))
+    else
+        0;
 
     std.debug.print(
-        "gated-family-compare {s}: ok={} row_dim={d} max_abs={d:.6}@{d} mean_abs={d:.6} got={d:.6} want={d:.6} tol={d:.6}\n",
+        "gated-family-compare {s}: ok={} row_dim={d} max_abs={d:.6}@{d} mean_abs={d:.6} got={d:.6} want={d:.6} got_nonfinite={d} want_nonfinite={d} tol={d:.6}\n",
         .{
             label,
             ok,
             got_last.len,
             max_abs,
             max_idx,
-            sum_abs / @as(f64, @floatFromInt(got_last.len)),
+            mean_abs,
             got_last[max_idx],
             want_last[max_idx],
+            got_nonfinite,
+            want_nonfinite,
             tolerance,
         },
     );
@@ -858,7 +882,7 @@ fn pleProjSlot(configured_layer_count: usize, layer: usize) usize {
     return gemma4_runtime.pleProjSlot(configured_layer_count, layer);
 }
 
-fn finalLmHeadSlot(configured_layer_count: usize) usize {
+pub fn finalLmHeadSlot(configured_layer_count: usize) usize {
     return gemma4_runtime.finalLmHeadSlot(configured_layer_count);
 }
 
@@ -4127,9 +4151,12 @@ fn prepareLinearNoBiasSlotForConfig(
     weight: ops.CT,
     in_dim: usize,
     out_dim: usize,
+    disable_mapped_quant_weight: bool,
 ) !bool {
     if (gpt_config.family != .qwen3) {
-        return decoder_rms_runtime.prepareLinearNoBiasSlot(cb, allocator, slot, weight, in_dim, out_dim);
+        return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, weight, in_dim, out_dim, .{
+            .disable_mapped_quant_weight = disable_mapped_quant_weight,
+        });
     }
 
     // Jina v5 applies a LoRA retrieval adapter into the loaded f32 tensor.
@@ -4143,7 +4170,9 @@ fn prepareLinearNoBiasSlotForConfig(
     defer allocator.free(values);
     const dense = try cb.fromFloat32Shape(values, shape_i32);
     defer cb.free(dense);
-    return decoder_rms_runtime.prepareLinearNoBiasDenseSlot(cb, allocator, slot, dense, in_dim, out_dim, true);
+    return decoder_rms_runtime.prepareLinearNoBiasSlotWithOptions(cb, allocator, slot, dense, in_dim, out_dim, .{
+        .disable_mapped_quant_weight = disable_mapped_quant_weight,
+    });
 }
 
 pub fn prepareDecodeRuntime(
@@ -4299,7 +4328,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_q), q_w, gpt_config.hidden_size, attention_input_size))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_q), q_w, gpt_config.hidden_size, attention_input_size, shouldDisableMappedGemmaSharedKvQ(gpt_config, layer)))) {
             timing_stats.prepare_attn_q_failures += 1;
             tracePrepareLayerFailure(layer, "attn_q", linearSlot(layer, .attn_q), gpt_config.hidden_size, attention_input_size);
             return false;
@@ -4314,7 +4343,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_k), k_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
             timing_stats.prepare_attn_k_failures += 1;
             tracePrepareLayerFailure(layer, "attn_k", linearSlot(layer, .attn_k), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
             return false;
@@ -4329,7 +4358,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .attn_v), v_w, gpt_config.hidden_size, layer_kv_heads * layer_head_dim, false))) {
             timing_stats.prepare_attn_v_failures += 1;
             tracePrepareLayerFailure(layer, "attn_v", linearSlot(layer, .attn_v), gpt_config.hidden_size, layer_kv_heads * layer_head_dim);
             return false;
@@ -4359,6 +4388,7 @@ pub fn prepareDecodeRuntime(
             attn_out_w,
             attention_input_size,
             gpt_config.hidden_size,
+            false,
         );
         if (!prepared_attn_out) {
             timing_stats.prepare_attn_out_failures += 1;
@@ -4374,7 +4404,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_gate), gate_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer)))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_gate), gate_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer), false))) {
             timing_stats.prepare_mlp_gate_failures += 1;
             tracePrepareLayerFailure(layer, "mlp_gate", linearSlot(layer, .mlp_gate), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
             return false;
@@ -4388,7 +4418,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_up), up_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer)))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_up), up_w, gpt_config.hidden_size, gpt_config.intermediateSize(layer), false))) {
             timing_stats.prepare_mlp_up_failures += 1;
             tracePrepareLayerFailure(layer, "mlp_up", linearSlot(layer, .mlp_up), gpt_config.hidden_size, gpt_config.intermediateSize(layer));
             return false;
@@ -4402,7 +4432,7 @@ pub fn prepareDecodeRuntime(
         finished_at = monotonicNowNs();
         if (finished_at > started_at) timing_stats.lookup_nanos += finished_at - started_at;
         started_at = monotonicNowNs();
-        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_down), down_w, gpt_config.intermediateSize(layer), gpt_config.hidden_size))) {
+        if (!(try prepareLinearNoBiasSlotForConfig(cb, allocator, gpt_config, linearSlot(layer, .mlp_down), down_w, gpt_config.intermediateSize(layer), gpt_config.hidden_size, false))) {
             timing_stats.prepare_mlp_down_failures += 1;
             tracePrepareLayerFailure(layer, "mlp_down", linearSlot(layer, .mlp_down), gpt_config.intermediateSize(layer), gpt_config.hidden_size);
             return false;

@@ -15,6 +15,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const platform = @import("antfly_platform");
+const httpx = @import("httpx");
+const api = @import("inference_api");
 const backends = @import("backends/backends.zig");
 const decoder_gated_runtime = @import("backends/decoder_gated_runtime.zig");
 const debug_timing = @import("debug_timing.zig");
@@ -47,6 +49,8 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 
 const print = std.debug.print;
 const BackendChoice = native_backend_choice.Choice;
+const default_server_url = "http://127.0.0.1:8090";
+const default_server_port: u16 = 8090;
 
 const ExecutionMode = enum {
     eager,
@@ -91,12 +95,41 @@ const Options = struct {
     mode: ?ExecutionMode = null,
     compiled_target: ?CompiledTarget = null,
     artifact_dir: ?[]const u8 = null,
+    server_url: ?[]const u8 = null,
+    require_server: bool = false,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     const opts = try parseArgs(args);
     try native_backend_choice.validate(opts.backend);
+    const require_server = requireWarmServer(opts);
     if (opts.draft_model != null and opts.backend == .onnx) return error.SpeculativeDecodingRequiresNativeBackend;
+    if (opts.server_url orelse platform.env.getenv("ANTFLY_INFERENCE_SERVER_URL")) |server_url| {
+        var server_opts = opts;
+        server_opts.server_url = server_url;
+        return try runServerGenerate(allocator, io, server_opts);
+    }
+    if (shouldTryDefaultServer(opts, require_server) and loopbackTcpConnects(default_server_port)) {
+        var server_opts = opts;
+        server_opts.server_url = default_server_url;
+        if (defaultServerModelName(opts.model_dir)) |model_name| server_opts.model_dir = model_name;
+        var used_server = true;
+        runServerGenerate(allocator, io, server_opts) catch |err| switch (err) {
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.HostUnreachable,
+            error.NetworkUnreachable,
+            error.Timeout,
+            error.AccessDenied,
+            => used_server = false,
+            else => return err,
+        };
+        if (used_server) return;
+    }
+    if (require_server) {
+        if (!serverGenerateSupportsOptions(opts)) return error.UnsupportedServerGenerateOption;
+        return error.WarmInferenceServerUnavailable;
+    }
     const started_at = std.Io.Timestamp.now(io, .awake);
 
     var preflight_manifest = try manifest_mod.loadFromDir(allocator, opts.model_dir);
@@ -999,8 +1032,9 @@ fn metalExecutorReuseProbeEnabled() bool {
     return envFlagEnabled("TERMITE_METAL_EXECUTOR_REUSE_PROBE");
 }
 
-fn gemmaPrefillPrewarmDisabled() bool {
-    return envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM");
+fn gemmaPrefillPrewarmEnabled() bool {
+    if (envFlagEnabled("TERMITE_METAL_DISABLE_GEMMA_PREFILL_PREWARM")) return false;
+    return envFlagEnabled("TERMITE_METAL_ENABLE_GEMMA_PREFILL_PREWARM");
 }
 
 fn printLiveWholeModelExecutorDetails(runtime_opt: ?*const graph_mod.model_runtime.ModelRuntime) void {
@@ -1031,6 +1065,7 @@ fn runLiveWholeModelExecutorReuseProbe(
     allocator: std.mem.Allocator,
     io: std.Io,
     model: *model_manager_mod.LoadedModel,
+    gpt_config: @import("models/gpt.zig").Config,
     prompt_ids: []const i64,
     prefill_chunk_size: usize,
     kv_dtype: runtime.kv.pool.KvDType,
@@ -1061,15 +1096,30 @@ fn runLiveWholeModelExecutorReuseProbe(
         });
         processed = chunk_end;
     }
+    const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
+    var first_token_at = finished_prefill_at;
+    if (runtime_model.capabilities().supports_greedy_decode) {
+        _ = try output_accum.?.greedyToken(allocator, gpt_config.vocab_size);
+        first_token_at = std.Io.Timestamp.now(io, .awake);
+    }
     if (output_accum) |*owned| owned.deinit(allocator);
-    const finished_at = std.Io.Timestamp.now(io, .awake);
+    const finished_at = first_token_at;
 
     print(
-        "metal_executor_reuse_ms: backend_setup={d} prefill={d} total={d}\n",
+        "metal_executor_reuse_ms: backend_setup={d} prefill={d} first_token={d} total={d}\n",
         .{
             durationMillis(started_at, created_runtime_at),
-            durationMillis(created_runtime_at, finished_at),
+            durationMillis(created_runtime_at, finished_prefill_at),
+            durationMillis(finished_prefill_at, first_token_at),
             durationMillis(started_at, finished_at),
+        },
+    );
+    print(
+        "metal_executor_reuse_first_token_ms: service={d} prefill={d} sample={d}\n",
+        .{
+            durationMillis(created_runtime_at, first_token_at),
+            durationMillis(created_runtime_at, finished_prefill_at),
+            durationMillis(finished_prefill_at, first_token_at),
         },
     );
     printLiveWholeModelExecutorDetails(&runtime_model);
@@ -1125,7 +1175,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     if (build_options.enable_metal and
         gpt_config.family == .gemma and
         model.session.backend().usesGpuHostedSession() and
-        !gemmaPrefillPrewarmDisabled())
+        gemmaPrefillPrewarmEnabled())
     {
         const prewarm_started_at = std.Io.Timestamp.now(io, .awake);
         const prewarm_ok = runtime_model.prepare(allocator, .{
@@ -1167,6 +1217,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     const use_sample_decode = runtime_caps.supports_sample_decode and !use_greedy_decode;
     var prefill_chunk_size = if (config.prefill_chunk_size > 0) config.prefill_chunk_size else prompt_ids.len;
     prefill_chunk_size = @max(@min(prefill_chunk_size, prompt_ids.len), 1);
+    const prefill_started_at = std.Io.Timestamp.now(io, .awake);
     var output = blk: {
         var processed: usize = 0;
         var output_accum: ?graph_mod.model_runtime.ModelOutput = null;
@@ -1185,9 +1236,11 @@ fn tryRunLiveWholeModelExecutorGenerate(
         }
         break :blk output_accum.?;
     };
+    const finished_prefill_at = std.Io.Timestamp.now(io, .awake);
     defer output.deinit(allocator);
 
     var generated: usize = 0;
+    var first_token_at: ?std.Io.Timestamp = null;
     while (generated < max_tokens) {
         const next_token_i32: i32 = if (generated == 0) blk: {
             if (use_greedy_decode) {
@@ -1231,6 +1284,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
         try generated_token_ids.append(allocator, next_token_i32);
         try all_token_ids.append(allocator, next_token_i64);
         generated += 1;
+        if (generated == 1) first_token_at = std.Io.Timestamp.now(io, .awake);
 
         if (gpt_config.eos_token_id >= 0 and next_token_i32 == gpt_config.eos_token_id) {
             finish_reason = "stop";
@@ -1284,6 +1338,16 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 durationMillis(started_at, finished_generate_at),
             },
         );
+        const first_token_value_at = first_token_at orelse finished_generate_at;
+        print(
+            "first_token_ms: request={d} service={d} prefill={d} sample={d}\n",
+            .{
+                durationMillis(started_at, first_token_value_at),
+                durationMillis(warmed_runtime_at, first_token_value_at),
+                durationMillis(prefill_started_at, finished_prefill_at),
+                durationMillis(finished_prefill_at, first_token_value_at),
+            },
+        );
         if (model.session.backend().usesGpuHostedSession()) {
             printLiveWholeModelExecutorDetails(&runtime_model);
             if (metalExecutorReuseProbeEnabled()) {
@@ -1291,6 +1355,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
                     allocator,
                     io,
                     model,
+                    gpt_config,
                     prompt_ids,
                     prefill_chunk_size,
                     kv_dtype,
@@ -1798,6 +1863,155 @@ fn emitArtifactResultAndExit(
     std.process.exit(0);
 }
 
+fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    if (!serverGenerateSupportsOptions(opts)) {
+        return error.UnsupportedServerGenerateOption;
+    }
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    var http = httpx.Client.init(allocator, io_impl.io());
+    defer http.deinit();
+
+    const url = try generateEndpointUrl(allocator, opts.server_url.?);
+    defer allocator.free(url);
+
+    const messages = [_]api.ChatMessage{.{
+        .role = .user,
+        .content = .{ .string = opts.prompt },
+    }};
+    const request = api.GenerateRequest{
+        .model = opts.model_dir,
+        .messages = &messages,
+        .max_tokens = opts.max_tokens,
+        .temperature = opts.temperature,
+        .top_p = opts.top_p,
+        .top_k = opts.top_k,
+        .repetition_penalty = opts.repetition_penalty,
+        .cache_dtype = opts.cache_dtype,
+        .cache_compaction_ratio = opts.cache_compaction_ratio,
+        .backend = if (opts.backend == .auto) null else @tagName(opts.backend),
+        .mode = serverGenerateModeName(opts),
+        .compiled_target = serverGenerateCompiledTargetName(opts),
+    };
+    const body = try httpx.json.Json.stringify(allocator, request);
+    defer allocator.free(body);
+
+    const started_at = std.Io.Timestamp.now(io, .awake);
+    var resp = try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
+    defer resp.deinit();
+    const finished_at = std.Io.Timestamp.now(io, .awake);
+    if (!resp.ok()) {
+        if (resp.body) |payload| {
+            print("server_error status={d} body={s}\n", .{ resp.status.code, payload });
+        } else {
+            print("server_error status={d}\n", .{resp.status.code});
+        }
+        return error.GenerateRequestFailed;
+    }
+    const payload = resp.body orelse return error.EmptyResponse;
+    var parsed = try std.json.parseFromSlice(api.GenerateResponse, allocator, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const choice = if (parsed.value.choices.len > 0) parsed.value.choices[0] else return error.EmptyResponse;
+
+    print("{s}\n", .{choice.message.content orelse ""});
+    if (opts.print_finish_reason or opts.print_token_count) {
+        if (opts.print_finish_reason and opts.print_token_count) {
+            print("finish_reason={s} tokens={d}\n", .{ @tagName(choice.finish_reason), parsed.value.usage.completion_tokens });
+        } else if (opts.print_finish_reason) {
+            print("finish_reason={s}\n", .{@tagName(choice.finish_reason)});
+        } else {
+            print("tokens={d}\n", .{parsed.value.usage.completion_tokens});
+        }
+    }
+    if (opts.print_timing) {
+        const total_ms = durationMillis(started_at, finished_at);
+        const tokens_per_sec: f64 = if (total_ms > 0)
+            @as(f64, @floatFromInt(parsed.value.usage.completion_tokens)) * 1000.0 / @as(f64, @floatFromInt(total_ms))
+        else
+            0;
+        print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+    }
+}
+
+fn shouldTryDefaultServer(opts: Options, require_server: bool) bool {
+    return (require_server or opts.backend == .metal) and serverGenerateSupportsOptions(opts);
+}
+
+fn requireWarmServer(opts: Options) bool {
+    return opts.require_server or platform.env.getenvBool("ANTFLY_INFERENCE_REQUIRE_WARM_SERVER");
+}
+
+fn defaultServerModelName(model_dir: []const u8) ?[]const u8 {
+    const home = platform.env.getenv("HOME") orelse return null;
+    return stripDefaultModelsDir(home, model_dir);
+}
+
+fn stripDefaultModelsDir(home: []const u8, model_dir: []const u8) ?[]const u8 {
+    const marker = "/.antfly/inference/models/";
+    if (!std.mem.startsWith(u8, model_dir, home)) return null;
+    const rest = model_dir[home.len..];
+    if (!std.mem.startsWith(u8, rest, marker)) return null;
+    const model_name = rest[marker.len..];
+    if (model_name.len == 0) return null;
+    return model_name;
+}
+
+fn serverGenerateSupportsOptions(opts: Options) bool {
+    return opts.image_count == 0 and opts.audio_count == 0 and !opts.raw_prompt and !opts.no_bos and !opts.no_chat_template and opts.draft_model == null and
+        !opts.print_token_ids and !opts.print_prompt_token_ids and !opts.print_prompt and !opts.print_chat_template_status;
+}
+
+fn loopbackTcpConnects(port: u16) bool {
+    const fd_rc = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (std.posix.errno(fd_rc) != .SUCCESS) return false;
+    const fd: std.posix.fd_t = @intCast(fd_rc);
+    defer _ = std.posix.system.close(fd);
+
+    var addr = std.c.sockaddr.in{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f000001),
+    };
+    return std.posix.errno(std.posix.system.connect(
+        fd,
+        @ptrCast(&addr),
+        @sizeOf(@TypeOf(addr)),
+    )) == .SUCCESS;
+}
+
+fn compiledTargetName(target: CompiledTarget) []const u8 {
+    return switch (target) {
+        .partitioned => "partitioned",
+        .whole_model => "whole-model",
+    };
+}
+
+fn serverGenerateModeName(opts: Options) ?[]const u8 {
+    if (opts.mode) |mode| return @tagName(mode);
+    if (opts.backend == .metal) return @tagName(ExecutionMode.compiled);
+    return null;
+}
+
+fn serverGenerateCompiledTargetName(opts: Options) ?[]const u8 {
+    if (opts.compiled_target) |target| return compiledTargetName(target);
+    if (opts.backend == .metal and (opts.mode == null or opts.mode.? != .eager)) return compiledTargetName(.whole_model);
+    return null;
+}
+
+fn generateEndpointUrl(allocator: std.mem.Allocator, server_url: []const u8) ![]u8 {
+    const root = trimRightSlash(server_url);
+    if (std.mem.endsWith(u8, root, "/ai/v1")) {
+        return try std.fmt.allocPrint(allocator, "{s}/generate", .{root});
+    }
+    return try std.fmt.allocPrint(allocator, "{s}/ai/v1/generate", .{root});
+}
+
+fn trimRightSlash(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and value[end - 1] == '/') : (end -= 1) {}
+    return value[0..end];
+}
+
 fn validateDraftTokenizerCompatibility(
     target_tokenizer: tokenizer_mod.Tokenizer,
     draft_tokenizer: tokenizer_mod.Tokenizer,
@@ -1944,6 +2158,12 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingScratchBudget;
             opts.scratch_budget_mb = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--server")) {
+            i += 1;
+            if (i >= args.len) return error.MissingServerUrl;
+            opts.server_url = args[i];
+        } else if (std.mem.eql(u8, arg, "--require-server")) {
+            opts.require_server = true;
         } else {
             printUsage();
             return error.InvalidArguments;
@@ -2089,8 +2309,10 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir> <prompt> [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
+        \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
+        \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails instead of taking the slow direct path.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  Explicit compiled backends consult ~/.antfly/inference/artifacts/<owner>/<model>/<backend>/... by default.
         \\  artifact-dir overrides that lookup root.
@@ -2160,6 +2382,72 @@ test "parseArgs accepts compiled target" {
     try std.testing.expectEqual(BackendChoice.xla, opts.backend);
     try std.testing.expectEqual(ExecutionMode.compiled, opts.mode.?);
     try std.testing.expectEqual(CompiledTarget.whole_model, opts.compiled_target.?);
+}
+
+test "parseArgs accepts server URL" {
+    const opts = try parseArgs(&.{
+        "gemma-e2b",
+        "hello",
+        "--server",
+        "http://127.0.0.1:8090",
+        "--require-server",
+        "--max-tokens",
+        "4",
+    });
+    try std.testing.expectEqualStrings("gemma-e2b", opts.model_dir);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8090", opts.server_url.?);
+    try std.testing.expect(opts.require_server);
+    try std.testing.expectEqual(@as(i32, 4), opts.max_tokens);
+}
+
+test "server generate routes metal requests to whole model" {
+    const opts = Options{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+    };
+    try std.testing.expectEqualStrings("compiled", serverGenerateModeName(opts).?);
+    try std.testing.expectEqualStrings("whole-model", serverGenerateCompiledTargetName(opts).?);
+}
+
+test "default server auto route is metal only" {
+    try std.testing.expectEqual(@as(u16, 8090), default_server_port);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8090", default_server_url);
+    try std.testing.expect(shouldTryDefaultServer(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+    }, false));
+    try std.testing.expect(!shouldTryDefaultServer(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .native,
+    }, false));
+    try std.testing.expect(shouldTryDefaultServer(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .native,
+    }, true));
+    try std.testing.expect(!shouldTryDefaultServer(.{
+        .model_dir = "gemma-e2b",
+        .prompt = "hello",
+        .backend = .metal,
+        .print_token_ids = true,
+    }, true));
+}
+
+test "default server strips local models dir prefix" {
+    try std.testing.expectEqualStrings(
+        "ggml-org/gemma-4-e2b-it-gguf",
+        stripDefaultModelsDir(
+            "/Users/alice",
+            "/Users/alice/.antfly/inference/models/ggml-org/gemma-4-e2b-it-gguf",
+        ).?,
+    );
+    try std.testing.expect(stripDefaultModelsDir(
+        "/Users/alice",
+        "/tmp/models/ggml-org/gemma-4-e2b-it-gguf",
+    ) == null);
 }
 
 test "explicit compiled whole model does not route through live executor" {

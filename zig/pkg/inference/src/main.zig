@@ -43,6 +43,8 @@ const RunConfig = struct {
     ml_dir: ?[]const u8 = null,
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
+    warm_generators: []const []const u8 = &.{},
+    warm_generator_backend: ?[]const u8 = null,
     keep_alive_ms: ?u64 = null,
     max_loaded_models: ?usize = null,
     max_concurrent_requests: ?usize = null,
@@ -57,6 +59,15 @@ fn loadRunConfig(allocator: std.mem.Allocator, path: []const u8) !RunConfig {
         .ignore_unknown_fields = true,
     });
     return parsed.value;
+}
+
+fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "onnx")) return .onnx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+    return null;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -160,6 +171,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var config_path: ?[]const u8 = null;
     var models_overridden = false;
     var ml_overridden = false;
+    var warm_generators = std.ArrayListUnmanaged([]const u8).empty;
+    defer warm_generators.deinit(allocator);
+    var warm_generator_backend: ?inference.backends.BackendType = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -179,6 +193,12 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             i += 1;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--warm-generator") and i + 1 < args.len) {
+            try warm_generators.append(allocator, args[i + 1]);
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--warm-generator-backend") and i + 1 < args.len) {
+            warm_generator_backend = parseBackendType(args[i + 1]) orelse return error.InvalidArguments;
             i += 1;
         }
     }
@@ -203,7 +223,6 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     });
     print("ai models: {s}\n", .{models_dir});
     print("ml models: {s}\n", .{ml_dir});
-    print("listening on {s}:{d}\n", .{ host, port });
 
     // Leave SIGINT/SIGTERM on the default OS behavior for now. The previous
     // signal-context stop path could close the listener while accept() was in
@@ -212,10 +231,16 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
+        .warm_generators = warm_generators.items,
+        .warm_generator_backend = warm_generator_backend,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
+        if (warm_generators.items.len == 0) node_cfg.warm_generators = cfg.warm_generators;
+        if (node_cfg.warm_generator_backend == null) {
+            if (cfg.warm_generator_backend) |value| node_cfg.warm_generator_backend = parseBackendType(value) orelse return error.InvalidArguments;
+        }
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
         if (cfg.max_concurrent_requests) |value| node_cfg.max_concurrent_requests = value;
@@ -225,6 +250,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var node = try inference.server.Node.init(allocator, node_cfg);
     defer node.deinit();
 
+    try node.warmConfiguredGenerators(allocator);
+    print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(allocator, io, host, port);
 
     print("server stopped.\n", .{});
@@ -359,6 +386,8 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
+        \\  --warm-generator <name> Preload and warm a generator model before serving (repeatable)
+        \\  --warm-generator-backend <backend> Require warm generators to load on one backend
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)
@@ -387,6 +416,8 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\  "s3_credentials": {
         \\    "endpoint": "s3.amazonaws.com"
         \\  },
+        \\  "warm_generators": ["gemma-e2b"],
+        \\  "warm_generator_backend": "metal",
         \\  "max_loaded_models": 8,
         \\  "pool_size": 4
         \\}
@@ -401,6 +432,9 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("/tmp/ml", parsed.value.ml_dir.?);
     try std.testing.expectEqual(@as(?bool, true), parsed.value.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", parsed.value.s3_credentials.?.endpoint.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.warm_generators.len);
+    try std.testing.expectEqualStrings("gemma-e2b", parsed.value.warm_generators[0]);
+    try std.testing.expectEqualStrings("metal", parsed.value.warm_generator_backend.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
 }

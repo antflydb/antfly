@@ -646,6 +646,9 @@ pub const LoadedModel = struct {
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
+    native_generation_graph_cache: graph_mod.cache.GraphCache,
+    // ponytail: per-model native generation lock; replace with Metal-safe batching if throughput matters.
+    native_generate_lock: std.atomic.Mutex = .unlocked,
     // Multimodal sessions (CLIP/CLAP/CLIPCLAP)
     embedding_session_lock: std.atomic.Mutex = .unlocked,
     reranking_session_lock: std.atomic.Mutex = .unlocked,
@@ -662,6 +665,14 @@ pub const LoadedModel = struct {
         if (self.hf_tok) |ht| return ht.tokenizer();
         if (self.sp_tok) |sp| return sp.tokenizer();
         unreachable;
+    }
+
+    pub fn lockNativeGeneration(self: *LoadedModel) void {
+        spinLock(&self.native_generate_lock);
+    }
+
+    pub fn unlockNativeGeneration(self: *LoadedModel) void {
+        self.native_generate_lock.unlock();
     }
 
     pub fn wholeModelExecutor(self: *LoadedModel, allocator: std.mem.Allocator, kv_dtype: ?runtime.kv.pool.KvDType) !?graph_mod.model_runtime.ModelExecutor {
@@ -866,6 +877,7 @@ pub const LoadedModel = struct {
     }
 
     pub fn deinit(self: *LoadedModel) void {
+        self.native_generation_graph_cache.deinit();
         self.session.close();
         if (self.vision_session) |vs| vs.close();
         if (self.audio_session) |as_| as_.close();
@@ -1078,6 +1090,7 @@ pub const ModelManager = struct {
             .shared_moe_cache = shared_moe_cache,
             .shared_prefetch = shared_prefetch,
             .native_generate_coordinator = native_generate_coordinator,
+            .native_generation_graph_cache = graph_mod.cache.GraphCache.init(self.allocator),
             .vision_session = null,
             .audio_session = null,
             .text_projection = null,

@@ -103,6 +103,8 @@ pub const Config = struct {
         ml_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
+        warm_generators: []const []u8 = &.{},
+        warm_generator_backend: ?[]u8 = null,
 
         fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
@@ -111,6 +113,8 @@ pub const Config = struct {
             if (self.ml_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
+            freeOwnedStringSlice(alloc, self.warm_generators);
+            if (self.warm_generator_backend) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -391,6 +395,8 @@ pub const Config = struct {
                 .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
+                .warm_generators = try parseInferenceWarmGenerators(alloc, raw_root.get("inference"), inference.preload),
+                .warm_generator_backend = try rawOptionalStringField(alloc, raw_root.get("inference"), "warm_generator_backend"),
             } else .{},
             .remote_content = if (raw_root.get("remote_content")) |remote_content|
                 try parseRemoteContentConfig(alloc, remote_content)
@@ -978,6 +984,24 @@ fn optionalStringArrayField(alloc: std.mem.Allocator, object: std.json.ObjectMap
     return out;
 }
 
+fn parseInferenceWarmGenerators(
+    alloc: std.mem.Allocator,
+    raw_inference: ?std.json.Value,
+    preload: ?[]const []const u8,
+) ![]const []u8 {
+    const value = raw_inference orelse {
+        if (preload) |values| return try dupOwnedStringSlice(alloc, values);
+        return &.{};
+    };
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    if (try optionalStringArrayField(alloc, object, "preload")) |values| return values;
+    if (preload) |values| return try dupOwnedStringSlice(alloc, values);
+    return try optionalStringArrayField(alloc, object, "warm_generators") orelse &.{};
+}
+
 fn contentSecurityFromOpenApi(
     alloc: std.mem.Allocator,
     value: scraping_openapi.ContentSecurityConfig,
@@ -1152,6 +1176,8 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "preload": ["gemma-e2b"],
+        \\    "warm_generator_backend": "metal",
         \\    "content_security": {
         \\      "allowed_hosts": ["models.example.com"],
         \\      "block_private_ips": true
@@ -1174,11 +1200,32 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference.warm_generators.len);
+    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference.warm_generators[0]);
+    try std.testing.expectEqualStrings("metal", cfg.inference.warm_generator_backend.?);
     try std.testing.expectEqualStrings("models.example.com", cfg.inference.content_security.?.allowed_hosts.?[0]);
     try std.testing.expectEqual(@as(?bool, true), cfg.inference.content_security.?.block_private_ips);
     try std.testing.expectEqualStrings("s3.amazonaws.com", cfg.inference.s3_credentials.?.endpoint.?);
     try std.testing.expectEqualStrings("antfly-key", cfg.inference.s3_credentials.?.access_key_id.?);
     try std.testing.expectEqualStrings("antfly-secret", cfg.inference.s3_credentials.?.secret_access_key.?);
+}
+
+test "common config parses inference warm_generators alias" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{
+        \\  "inference": {
+        \\    "api_url": "http://127.0.0.1:8090",
+        \\    "warm_generators": ["gemma-e2b", "gemma-e4b"]
+        \\  }
+        \\}
+    ;
+    var cfg = try Config.parseFromSlice(alloc, raw);
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.inference.warm_generators.len);
+    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference.warm_generators[0]);
+    try std.testing.expectEqualStrings("gemma-e4b", cfg.inference.warm_generators[1]);
 }
 
 test "common config defaults shard scalar fields" {

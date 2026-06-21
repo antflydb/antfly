@@ -6529,7 +6529,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const weight_buf = toBuf(weight);
-        const quantized_storage = weight_buf.quantized_storage;
+        const quantized_storage = weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage;
         const shape = if (quantized_storage) |storage|
             storage.shape
         else
@@ -13694,7 +13694,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !?MetalTensor {
         if (token_ids.len == 0 or dim == 0) return null;
         const weight_buf = toBuf(weight);
-        if (weight_buf.quantized_storage) |storage| {
+        if (weight_buf.quantized_storage orelse weight_buf.runtime_quantized_storage) |storage| {
             return metal_runtime.decoderRuntimeQuantEmbeddingLookup(
                 self.provider_impl,
                 storage,
@@ -16468,12 +16468,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .rope_consecutive_pairs = request.rope_consecutive_pairs,
                 .global_head_dim = request.global_head_dim,
                 .attention_linear_slot = layer.attention_linear_slot,
-                .attention_post_linear_rms_norm_slot = null,
+                .attention_post_linear_rms_norm_slot = layer.attn_post_norm_slot,
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
                 .ffn_rms_norm_slot = layer.ffn_pre_norm_slot,
                 .ffn_post_gate_rms_norm_slot = null,
-                .ffn_post_down_rms_norm_slot = null,
+                .ffn_post_down_rms_norm_slot = layer.ffn_post_norm_slot,
                 .gate_ffn_linear_slot = layer.gate_ffn_linear_slot,
                 .up_ffn_linear_slot = layer.up_ffn_linear_slot,
                 .down_ffn_linear_slot = layer.down_ffn_linear_slot,
@@ -17247,6 +17247,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.in_dim,
             .out_dim = request.out_dim,
             .retain_dense_fallback = request.retain_dense_fallback,
+            .disable_mapped_quant_weight = request.disable_mapped_quant_weight,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
         }, &self.timing_stats);

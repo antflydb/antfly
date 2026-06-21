@@ -68,6 +68,8 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
+    warm_generators: []const []const u8 = &.{},
+    warm_generator_backend: ?inference.backends.BackendType = null,
 };
 
 const BudgetOverridesMb = struct {
@@ -77,6 +79,15 @@ const BudgetOverridesMb = struct {
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
 };
+
+pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
+    if (std.mem.eql(u8, value, "native")) return .native;
+    if (std.mem.eql(u8, value, "onnx")) return .onnx;
+    if (std.mem.eql(u8, value, "metal")) return .metal;
+    if (std.mem.eql(u8, value, "cuda")) return .cuda;
+    if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+    return null;
+}
 
 pub fn run(init: std.process.Init) !void {
     const alloc = init.gpa;
@@ -105,7 +116,21 @@ pub fn runFromIterator(
     } else if (std.mem.eql(u8, command, "classify")) {
         return try inference.native_classify.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "generate")) {
-        return try inference.native_generate.main(alloc, io, try collectArgs(alloc, args));
+        inference.native_generate.main(alloc, io, try collectArgs(alloc, args)) catch |err| switch (err) {
+            error.WarmInferenceServerUnavailable => {
+                std.debug.print(
+                    "warm inference server unavailable; start one with `antfly inference run --warm-generator <model> --warm-generator-backend metal` or pass --server\n",
+                    .{},
+                );
+                std.process.exit(1);
+            },
+            error.UnsupportedServerGenerateOption => {
+                std.debug.print("--require-server does not support one of the requested generate options\n", .{});
+                std.process.exit(1);
+            },
+            else => return err,
+        };
+        return;
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
         return try inference.native_compile.main(alloc, io, try collectArgs(alloc, args));
     } else if (std.mem.eql(u8, command, "export")) {
@@ -149,6 +174,9 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
+    var warm_generators = std.ArrayListUnmanaged([]const u8).empty;
+    defer warm_generators.deinit(alloc);
+    var warm_generator_backend: ?inference.backends.BackendType = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host")) {
@@ -169,21 +197,28 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.kv_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--scratch-budget-mb")) {
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
+        } else if (std.mem.eql(u8, arg, "--warm-generator")) {
+            try warm_generators.append(alloc, args.next() orelse return error.InvalidArguments);
+        } else if (std.mem.eql(u8, arg, "--warm-generator-backend")) {
+            warm_generator_backend = parseBackendType(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
         }
     }
 
     std.debug.print("antfly inference\n", .{});
     std.debug.print("ai models: {s}\n", .{models_dir});
     std.debug.print("ml models: {s}\n", .{ml_dir});
-    std.debug.print("listening on {s}:{d}\n", .{ host, port });
 
     var node = try inference.server.Node.init(alloc, .{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
+        .warm_generators = warm_generators.items,
+        .warm_generator_backend = warm_generator_backend,
     });
     defer node.deinit();
 
+    try node.warmConfiguredGenerators(alloc);
+    std.debug.print("listening on {s}:{d}\n", .{ host, port });
     try node.serve(alloc, io, host, port);
 }
 
@@ -200,6 +235,8 @@ pub fn spawnServerProcess(
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
+        .warm_generators = config.warm_generators,
+        .warm_generator_backend = config.warm_generator_backend,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -225,6 +262,10 @@ pub fn spawnServerProcess(
 fn serveThread(node: *inference.server.Node, alloc: std.mem.Allocator, host: []const u8, port: u16) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
+    node.warmConfiguredGenerators(alloc) catch |err| {
+        std.debug.print("inference warmup error: {}\n", .{err});
+        return;
+    };
     node.serve(alloc, io_impl.io(), host, port) catch |err| {
         std.debug.print("inference server error: {}\n", .{err});
     };
@@ -391,6 +432,8 @@ fn printUsage() void {
         \\  --combined-budget-mb <n>  Native generation combined budget override
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
+        \\  --warm-generator <name>   Preload and warm a generator model before serving (repeatable)
+        \\  --warm-generator-backend <backend> Require warm generators to load on one backend
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)
@@ -408,4 +451,10 @@ test "inference runtime module compiles" {
     _ = run;
     _ = runFromIterator;
     _ = spawnServerProcess;
+}
+
+test "parseBackendType accepts warm generator backends" {
+    try std.testing.expectEqual(inference.backends.BackendType.metal, parseBackendType("metal").?);
+    try std.testing.expectEqual(inference.backends.BackendType.wasm, parseBackendType("webgpu").?);
+    try std.testing.expect(parseBackendType("xla") == null);
 }
