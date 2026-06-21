@@ -6270,6 +6270,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer alloc.free(schema_dst_path);
     const snapshot_path = try tempTestAflitePath(alloc, "capi-lite-snapshot");
     defer alloc.free(snapshot_path);
+    const pinned_snapshot_path = try tempTestAflitePath(alloc, "capi-lite-pinned-snapshot");
+    defer alloc.free(pinned_snapshot_path);
     const restore_path = try tempTestAflitePath(alloc, "capi-lite-restore");
     defer alloc.free(restore_path);
     const locked_restore_path = try tempTestAflitePath(alloc, "capi-lite-restore-locked");
@@ -6288,6 +6290,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     cleanupTestFile(bad_dst_path);
     cleanupTestFile(schema_dst_path);
     cleanupTestFile(snapshot_path);
+    cleanupTestFile(pinned_snapshot_path);
     cleanupTestFile(restore_path);
     cleanupTestFile(locked_restore_path);
     cleanupTestFile(restore_malformed_path);
@@ -6302,6 +6305,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(bad_dst_path);
     defer cleanupTestFile(schema_dst_path);
     defer cleanupTestFile(snapshot_path);
+    defer cleanupTestFile(pinned_snapshot_path);
     defer cleanupTestFile(restore_path);
     defer cleanupTestFile(locked_restore_path);
     defer cleanupTestFile(restore_malformed_path);
@@ -6635,6 +6639,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_buffer_free(lite_txn_lookup.ptr, lite_txn_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, lite_txn_lookup.ptr.?[0..lite_txn_lookup.len], "\"transactional\"") != null);
 
+    const pinned_seed_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-pinned", .len = "doc:capi-pinned".len },
+        .value = .{ .ptr = "{\"title\":\"pinned-before\"}", .len = "{\"title\":\"pinned-before\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &pinned_seed_writes, pinned_seed_writes.len, null, 0, 4_100, 0));
+
     var concurrent_readonly_handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(src_path, &concurrent_readonly_handle));
     defer antfly_db_close(concurrent_readonly_handle);
@@ -6648,6 +6659,50 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     }, &concurrent_lookup));
     defer antfly_db_buffer_free(concurrent_lookup.ptr, concurrent_lookup.len);
     try std.testing.expect(std.mem.indexOf(u8, concurrent_lookup.ptr.?[0..concurrent_lookup.len], "\"second\"") != null);
+
+    const pinned_advance_a = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-pinned", .len = "doc:capi-pinned".len },
+        .value = .{ .ptr = "{\"title\":\"pinned-after-a\"}", .len = "{\"title\":\"pinned-after-a\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &pinned_advance_a, pinned_advance_a.len, null, 0, 4_200, 0));
+    const pinned_advance_b = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:capi-pinned", .len = "doc:capi-pinned".len },
+        .value = .{ .ptr = "{\"title\":\"pinned-after-b\"}", .len = "{\"title\":\"pinned-after-b\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(src_handle, &pinned_advance_b, pinned_advance_b.len, null, 0, 4_300, 0));
+
+    var pinned_snapshot_report: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_copy_stable_snapshot_json(concurrent_readonly_handle, pinned_snapshot_path, false, &pinned_snapshot_report));
+    defer antfly_db_buffer_free(pinned_snapshot_report.ptr, pinned_snapshot_report.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_report.ptr.?[0..pinned_snapshot_report.len], "\"tail_bytes\":") != null);
+
+    var pinned_snapshot_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_readonly(pinned_snapshot_path, &pinned_snapshot_handle));
+    defer antfly_db_close(pinned_snapshot_handle);
+    var pinned_snapshot_check: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_check_json(pinned_snapshot_handle, &pinned_snapshot_check));
+    defer antfly_db_buffer_free(pinned_snapshot_check.ptr, pinned_snapshot_check.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_check.ptr.?[0..pinned_snapshot_check.len], "\"valid\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_check.ptr.?[0..pinned_snapshot_check.len], "\"tail_bytes\":0") != null);
+
+    var pinned_snapshot_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(pinned_snapshot_handle, .{
+        .ptr = "doc:capi-pinned",
+        .len = "doc:capi-pinned".len,
+    }, &pinned_snapshot_lookup));
+    defer antfly_db_buffer_free(pinned_snapshot_lookup.ptr, pinned_snapshot_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_lookup.ptr.?[0..pinned_snapshot_lookup.len], "\"pinned-before\"") != null);
+
+    var pinned_writer_lookup: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(src_handle, .{
+        .ptr = "doc:capi-pinned",
+        .len = "doc:capi-pinned".len,
+    }, &pinned_writer_lookup));
+    defer antfly_db_buffer_free(pinned_writer_lookup.ptr, pinned_writer_lookup.len);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_writer_lookup.ptr.?[0..pinned_writer_lookup.len], "\"pinned-after-b\"") != null);
+
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(concurrent_readonly_handle, &writes_a, 1, null, 0, 4_500, 0));
 
     var concurrent_status_handle: ?*anyopaque = null;
