@@ -403,6 +403,58 @@ test "lite native index storage aborts atomic writes without publishing partial 
     }
 }
 
+test "lite native index storage read-only open rejects mutations" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-index-storage-readonly.aflite");
+    defer allocator.free(path);
+
+    {
+        var docs = try docstore.Store.open(allocator, path, false);
+        defer docs.close();
+        var index_store = Store.init(allocator, &docs);
+        const storage = index_store.storage();
+
+        try storage.writeFileAbsolute("/indexes/ft/stable.tbl", "stable");
+    }
+
+    {
+        var docs = try docstore.Store.open(allocator, path, true);
+        defer docs.close();
+        var index_store = Store.init(allocator, &docs);
+        const storage = index_store.storage();
+
+        const stable = try storage.readFileAlloc(allocator, "/indexes/ft/stable.tbl", 64);
+        defer allocator.free(stable);
+        try std.testing.expectEqualStrings("stable", stable);
+
+        try std.testing.expectError(error.ReadOnly, storage.writeFileAbsolute("/indexes/ft/new.tbl", "new"));
+        try std.testing.expectError(error.ReadOnly, storage.appendFileAbsolute(allocator, "/indexes/ft/stable.tbl", "!", true));
+        try std.testing.expectError(error.ReadOnly, storage.renameAbsolute("/indexes/ft/stable.tbl", "/indexes/ft/renamed.tbl"));
+        try std.testing.expectError(error.ReadOnly, storage.deleteFileAbsolute("/indexes/ft/stable.tbl"));
+        try std.testing.expectError(error.ReadOnly, storage.deleteTree("/indexes/ft"));
+
+        var writer = try storage.beginAtomicWrite(allocator, "/indexes/ft/atomic.tbl");
+        try writer.appendSlice("atomic");
+        try std.testing.expectError(error.ReadOnly, writer.finish());
+    }
+
+    {
+        var reopened_docs = try docstore.Store.open(allocator, path, true);
+        defer reopened_docs.close();
+        var reopened_index_store = Store.init(allocator, &reopened_docs);
+        const storage = reopened_index_store.storage();
+
+        const stable = try storage.readFileAlloc(allocator, "/indexes/ft/stable.tbl", 64);
+        defer allocator.free(stable);
+        try std.testing.expectEqualStrings("stable", stable);
+        try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/new.tbl", 64));
+        try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/atomic.tbl", 64));
+    }
+}
+
 test "lite native index storage recovers previous checkpoint after interrupted update" {
     const allocator = std.testing.allocator;
 
