@@ -6858,7 +6858,10 @@ jobs invalid with the stable execution error token so bad catalog work does
 not spin indefinitely. Stale snapshot claim races, including jobs already
 claimed, completed, removed, or otherwise no longer declared by metadata, are
 skipped so one concurrent worker does not block later claimable jobs in the same
-drain pass. Storage still does not store or interpret SQL text; only
+drain pass. If the owner-local route observes that a raced job reached a
+terminal `ready` or `invalid` state before this worker claimed it, the
+schema-rewrite pass reports that terminal state instead of counting the job as a
+busy lease. Storage still does not store or interpret SQL text; only
 `SchemaRewriteJobRecord` metadata and shared row-expression ASTs cross the
 boundary. The provisioned/hosted table-write source boundary now exposes a
 schema-rewrite worker pass plus group-local internal route: catalog scans

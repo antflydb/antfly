@@ -2296,8 +2296,15 @@ fn runSchemaRewriteWorkerPassForCatalog(
             continue;
         };
         if (!one.claimed) {
-            result.jobs_busy += 1;
-            result.complete = false;
+            if (one.completed) {
+                result.jobs_completed += 1;
+            } else if (one.invalidated) {
+                result.jobs_invalidated += 1;
+                result.complete = false;
+            } else {
+                result.jobs_busy += 1;
+                result.complete = false;
+            }
             try groups.append(alloc, one);
             continue;
         }
@@ -21129,6 +21136,129 @@ test "provisioned schema rewrite worker pass drains projected catalog range job"
     const materialized = (try reopened.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
     defer alloc.free(materialized);
     try std.testing.expect(std.mem.indexOf(u8, materialized, "\"status_key\":\"active\"") != null);
+}
+
+test "schema rewrite worker pass treats unclaimed terminal jobs as terminal" {
+    const alloc = std.testing.allocator;
+
+    const Catalog = struct {
+        table: metadata_table_manager.TableRecord = .{
+            .table_id = 77,
+            .name = "events",
+            .placement_role = "data",
+            .indexes_json = "{}",
+            .schema_json = "{}",
+        },
+        jobs: [2]metadata_table_manager.SchemaRewriteJobRecord = .{
+            .{
+                .job_id = 8101,
+                .table_id = 77,
+                .group_id = 9001,
+                .schema_generation = 11,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .end_row_key = null,
+                .target_column = "status_key",
+                .expression = .{
+                    .kind = .lower,
+                    .operands = &.{.{ .kind = .field, .field = "status" }},
+                },
+            },
+            .{
+                .job_id = 8102,
+                .table_id = 77,
+                .group_id = 9002,
+                .schema_generation = 11,
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .end_row_key = null,
+                .target_column = "status_key",
+                .expression = .{
+                    .kind = .lower,
+                    .operands = &.{.{ .kind = .field, .field = "status" }},
+                },
+            },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @as([*]metadata_table_manager.TableRecord, @ptrCast(&self.table))[0..1],
+                .ranges = &.{},
+                .schema_rewrite_jobs = self.jobs[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const Source = struct {
+        fn iface(self: *@This()) TableWriteSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .schema_rewrite_group_local = schemaRewriteGroupLocal },
+            };
+        }
+
+        fn schemaRewriteGroupLocal(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            record: metadata_table_manager.SchemaRewriteJobRecord,
+            _: []const u8,
+            _: u64,
+        ) !?SchemaRewriteWorkerResult {
+            return .{
+                .group_id = group_id,
+                .table_id = record.table_id,
+                .job_id = record.job_id,
+                .claimed = false,
+                .completed = record.job_id == 8101,
+                .invalidated = record.job_id == 8102,
+            };
+        }
+    };
+
+    var catalog = Catalog{};
+    var source = Source{};
+    var pass = try runSchemaRewriteWorkerPassForCatalog(
+        alloc,
+        source.iface(),
+        catalog.iface(),
+        "events",
+        "worker-a",
+        500,
+        4,
+    );
+    defer pass.deinit(alloc);
+
+    try std.testing.expect(!pass.complete);
+    try std.testing.expectEqual(@as(u64, 2), pass.jobs_scanned);
+    try std.testing.expectEqual(@as(u64, 0), pass.jobs_claimed);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_completed);
+    try std.testing.expectEqual(@as(u64, 1), pass.jobs_invalidated);
+    try std.testing.expectEqual(@as(u64, 0), pass.jobs_busy);
+    try std.testing.expectEqual(@as(usize, 2), pass.groups.len);
+    try std.testing.expect(pass.groups[0].completed);
+    try std.testing.expect(pass.groups[1].invalidated);
 }
 
 test "secondary index promotion ignores stale ready rebuild generation" {
