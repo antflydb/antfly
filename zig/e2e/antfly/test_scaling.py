@@ -958,7 +958,7 @@ def _insert_docs(
 
     def route_ready() -> str | None:
         try:
-            api_url = _data_api_url_for_table(
+            api_urls = _data_api_urls_for_table(
                 cluster,
                 table_name,
                 require_all_group_leaders=True,
@@ -966,11 +966,10 @@ def _insert_docs(
             )
         except (AssertionError, requests.RequestException, ValueError):
             return None
-        if api_url is None:
-            return None
-        if not wait_for_server(api_url, timeout=1.0):
-            return None
-        return api_url
+        for api_url in api_urls:
+            if wait_for_server(api_url, timeout=1.0):
+                return api_url
+        return None
 
     api_url = wait_until(route_ready, timeout_s=60.0, interval_s=0.5)
     assert api_url is not None, (
@@ -1020,6 +1019,22 @@ def _data_api_url_for_table(
     require_all_group_leaders: bool = False,
     min_group_count: int = 1,
 ) -> str | None:
+    urls = _data_api_urls_for_table(
+        cluster,
+        table_name,
+        require_all_group_leaders=require_all_group_leaders,
+        min_group_count=min_group_count,
+    )
+    return urls[0] if urls else None
+
+
+def _data_api_urls_for_table(
+    cluster: MultiNodeScalingCluster,
+    table_name: str,
+    *,
+    require_all_group_leaders: bool = False,
+    min_group_count: int = 1,
+) -> list[str]:
     snapshot = cluster.metadata_snapshot()
     table_id: int | None = None
     for table in snapshot.get("tables", []):
@@ -1027,13 +1042,13 @@ def _data_api_url_for_table(
             table_id = int(table.get("table_id", 0))
             break
     if table_id is None:
-        return None
+        return []
     group_ids: list[int] = []
     for table_range in snapshot.get("ranges", []):
         if isinstance(table_range, dict) and int(table_range.get("table_id", 0)) == table_id:
             group_ids.append(int(table_range.get("group_id", 0)))
     if len(group_ids) < min_group_count:
-        return None
+        return []
     group_ids.sort()
 
     leader_store_by_group: dict[int, int] = {}
@@ -1047,20 +1062,34 @@ def _data_api_url_for_table(
         if raw_leader != 0:
             leader_store_by_group[group_id] = raw_leader
     if require_all_group_leaders and any(group_id not in leader_store_by_group for group_id in group_ids):
-        return None
+        return []
+
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def append_node_url(node_id: int) -> None:
+        for node in cluster.data_nodes:
+            if int(node["id"]) != node_id:
+                continue
+            url = cluster.data_api_url_for_node(node)
+            if url not in seen:
+                seen.add(url)
+                urls.append(url)
+            return
+
+    store_node_by_id = {
+        int(store.get("store_id", 0)): int(store.get("node_id", 0))
+        for store in snapshot.get("stores", [])
+        if isinstance(store, dict)
+    }
+    for group_id in group_ids:
+        leader_store_id = leader_store_by_group.get(group_id)
+        if leader_store_id is not None:
+            append_node_url(store_node_by_id.get(leader_store_id, 0))
+    if urls:
+        return urls
 
     group_id = group_ids[0]
-    leader_store_id: int | None = None
-    if group_id in leader_store_by_group:
-        leader_store_id = leader_store_by_group[group_id]
-    if leader_store_id is not None:
-        for store in snapshot.get("stores", []):
-            if not isinstance(store, dict) or int(store.get("store_id", 0)) != leader_store_id:
-                continue
-            leader_node_id = int(store.get("node_id", 0))
-            for node in cluster.data_nodes:
-                if int(node["id"]) == leader_node_id:
-                    return cluster.data_api_url_for_node(node)
     placed_node_ids = {
         int(intent.get("record", {}).get("local_node_id", 0))
         for intent in snapshot.get("placement_intents", [])
@@ -1068,8 +1097,8 @@ def _data_api_url_for_table(
     }
     for node in cluster.data_nodes:
         if int(node["id"]) in placed_node_ids:
-            return cluster.data_api_url_for_node(node)
-    return None
+            append_node_url(int(node["id"]))
+    return urls
 
 
 def _assert_docs_readable(
