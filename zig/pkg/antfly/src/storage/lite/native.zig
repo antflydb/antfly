@@ -595,6 +595,7 @@ pub const NativeFile = struct {
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
         if (self.read_only) return error.ReadOnly;
+        if (std.mem.eql(u8, old_key, new_key)) return;
 
         const previous = self.activeCheckpoint();
         var found_entry: ?CatalogEntry = null;
@@ -629,7 +630,7 @@ pub const NativeFile = struct {
 
         var external_value_root_page: u64 = 0;
         if (entry.external_value_root_page != 0) {
-            external_value_root_page = try self.copyValuePagesAllocated(&page_allocator, entry.external_value_root_page, entry.external_value_len);
+            external_value_root_page = entry.external_value_root_page;
         }
 
         {
@@ -1279,6 +1280,13 @@ pub const NativeFile = struct {
         checkpoint: CheckpointSlot,
         reachable_pages: *ReachablePageSet,
     ) !u64 {
+        var seen_catalog_keys = std.StringHashMapUnmanaged(void).empty;
+        defer {
+            var it = seen_catalog_keys.iterator();
+            while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+            seen_catalog_keys.deinit(self.allocator);
+        }
+
         var count: u64 = 0;
         var page_id = root_page_id;
         while (page_id != 0) {
@@ -1288,7 +1296,13 @@ pub const NativeFile = struct {
             page_id = switch (kind) {
                 .catalog => blk: {
                     const entry = try decodeCatalogEntry(payload);
-                    if (entry.external_value_root_page != 0) {
+                    const seen = seen_catalog_keys.contains(entry.key);
+                    if (!seen) {
+                        const owned_key = try self.allocator.dupe(u8, entry.key);
+                        errdefer self.allocator.free(owned_key);
+                        try seen_catalog_keys.put(self.allocator, owned_key, {});
+                    }
+                    if (!seen and entry.external_value_root_page != 0) {
                         try self.validateReachableValuePages(entry.external_value_root_page, entry.external_value_len, checkpoint, reachable_pages);
                     }
                     break :blk entry.previous_page;
