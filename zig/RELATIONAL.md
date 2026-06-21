@@ -6773,12 +6773,17 @@ data.
 Adapter-only DDL and unsupported DDL classifications reject setup SQL because
 those entries prove adapter/no-op or fail-closed behavior, not catalog evolution.
 
-Source-schema fixtures are tied to the typed source table. A fixture that carries
-`source_schema_json` must parse a separate relational source table from the SQL,
-and the golden fingerprint must name that same table in the `source_table`,
-`source`, or `right` slot, depending on the plan family. Valid schema JSON alone
-is not enough; stale source/right table names are rejected before the lowerer can
-use the fixture.
+Source-schema fixtures are tied to the typed source table. Existing single-source
+fixtures may carry `source_schema_json`, which must parse a separate relational
+source table from the SQL, and the golden fingerprint must name that same table
+in the `source_table`, `source`, or `right` slot, depending on the plan family.
+New multi-table catalog examples should instead use `catalog_tables`, an array of
+`name` plus `schema_json` entries that represents the committed catalog snapshot
+visible to the SQL binder. `catalog_tables` and `source_schema_json` are mutually
+exclusive, every listed schema must parse as a relational table schema, and every
+listed table must appear in the typed fingerprint. Valid schema JSON alone is not
+enough; stale source/right table names are rejected before the lowerer can use
+the fixture.
 
 Applied DDL fixture fingerprints pin both the coarse rebuild/validation/rewrite
 booleans and the ordered typed catalog work list. A schema change that needs

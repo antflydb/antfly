@@ -670,7 +670,6 @@
     "unsupported_read_duplicate_output_name",
     "unsupported_read_row_lock_target",
     "unsupported_read_set_operation_output_shape",
-    "unsupported_read_set_operation_source_schema",
     "unsupported_unvalidated_unique_conflict_target",
     "unsupported_update_joined_multi_output_subquery_selector",
     "unsupported_update_joined_source",

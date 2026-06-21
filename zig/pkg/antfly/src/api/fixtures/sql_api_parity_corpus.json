@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "5d14b7e62ba16a38b4de2751e7b4a1ccb8faf7ff7e7851174dc2898feca500f1",
+  "source_sha256": "f1baf270622b4e4b8489fdcaaeb86b57afde18ab6b1dcea787e9687f31532903",
   "source_entry_count": 1013,
   "entry_count": 1013,
   "skipped_entries": [
@@ -5818,10 +5818,13 @@
       "sql": "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT amount AS status_key FROM usage_records WHERE enabled IS TRUE"
     },
     {
-      "name": "unsupported read except cross table set operation",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=set_operation_source_schema",
-      "classification_reason": "set_operation_source_schema",
+      "name": "read catalog backed cross table except set operation",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:set_operation:set_operation:op=except:left=left:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=archived_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1",
+      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "SELECT id FROM usage_records EXCEPT SELECT id FROM archived_records WHERE status = 'deleted'"
     },
     {

@@ -321,15 +321,57 @@ pub const AppParityCorpusEntry = struct {
     resolver_version: u64 = 0,
     resolver_exists: ?bool = null,
     source_schema_json: []const u8 = "",
+    catalog_tables: []const AppParityCatalogTable = &.{},
+};
+
+pub const AppParityCatalogTable = struct {
+    name: []const u8,
+    schema_json: []const u8,
 };
 
 pub const AppParitySourceSchemaCatalog = struct {
-    tables: [1]metadata_table_manager.TableRecord,
+    single_table: [1]metadata_table_manager.TableRecord = undefined,
+    owned_tables: []metadata_table_manager.TableRecord = &.{},
+    owned_source_table_name: []u8 = &.{},
+    table_count: usize = 0,
 
     pub fn init(table_name: []const u8, source_schema_json: []const u8) @This() {
-        return .{ .tables = .{
+        return .{ .single_table = .{
             .{ .table_id = 90_001, .name = table_name, .placement_role = "data", .schema_json = source_schema_json },
-        } };
+        }, .table_count = 1 };
+    }
+
+    pub fn initSourceSchemaAlloc(alloc: std.mem.Allocator, table_name: []const u8, source_schema_json: []const u8) !@This() {
+        const owned_table_name = try alloc.dupe(u8, table_name);
+        errdefer alloc.free(owned_table_name);
+        return .{
+            .single_table = .{
+                .{ .table_id = 90_001, .name = owned_table_name, .placement_role = "data", .schema_json = source_schema_json },
+            },
+            .owned_source_table_name = owned_table_name,
+            .table_count = 1,
+        };
+    }
+
+    pub fn initCatalogTablesAlloc(alloc: std.mem.Allocator, catalog_tables: []const AppParityCatalogTable) !@This() {
+        if (catalog_tables.len == 0) return error.InvalidSqlCatalog;
+        var records = try alloc.alloc(metadata_table_manager.TableRecord, catalog_tables.len);
+        errdefer alloc.free(records);
+        for (catalog_tables, 0..) |table, i| {
+            records[i] = .{
+                .table_id = 90_001 + @as(u64, @intCast(i)),
+                .name = table.name,
+                .placement_role = "data",
+                .schema_json = table.schema_json,
+            };
+        }
+        return .{ .owned_tables = records, .table_count = catalog_tables.len };
+    }
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.owned_tables.len > 0) alloc.free(self.owned_tables);
+        if (self.owned_source_table_name.len > 0) alloc.free(self.owned_source_table_name);
+        self.* = undefined;
     }
 
     pub fn iface(self: *@This()) table_catalog.CatalogSource {
@@ -346,7 +388,7 @@ pub const AppParitySourceSchemaCatalog = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         return .{
             .status = .{ .metadata_group_id = 1, .metrics = .{} },
-            .tables = self.tables[0..],
+            .tables = self.tables(),
             .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
             .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
             .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
@@ -356,7 +398,26 @@ pub const AppParitySourceSchemaCatalog = struct {
     }
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+    fn tables(self: *@This()) []metadata_table_manager.TableRecord {
+        if (self.owned_tables.len > 0) return self.owned_tables;
+        return self.single_table[0..self.table_count];
+    }
 };
+
+pub fn appParityEntryHasCatalogSchemas(entry: AppParityCorpusEntry) bool {
+    return entry.source_schema_json.len > 0 or entry.catalog_tables.len > 0;
+}
+
+pub fn appParityCatalogForEntryAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?AppParitySourceSchemaCatalog {
+    if (entry.source_schema_json.len > 0 and entry.catalog_tables.len > 0) return error.InvalidSqlCatalog;
+    if (entry.catalog_tables.len > 0) {
+        return try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, entry.catalog_tables);
+    }
+    const source_table_name = (try appParitySourceTableNameAlloc(alloc, entry)) orelse return null;
+    defer alloc.free(@constCast(source_table_name));
+    return try AppParitySourceSchemaCatalog.initSourceSchemaAlloc(alloc, source_table_name, entry.source_schema_json);
+}
 
 pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?[]const u8 {
     if (entry.source_schema_json.len == 0) return null;
@@ -777,6 +838,29 @@ pub fn parseFixtureStringListAlloc(
     return try strings.toOwnedSlice(alloc);
 }
 
+fn parseAppParityCatalogTablesAlloc(
+    alloc: std.mem.Allocator,
+    object: std.json.ObjectMap,
+) ![]const AppParityCatalogTable {
+    const value = object.get("catalog_tables") orelse return &.{};
+    const array = switch (value) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (array.items.len == 0) return error.TestUnexpectedResult;
+    var tables = std.ArrayListUnmanaged(AppParityCatalogTable).empty;
+    errdefer tables.deinit(alloc);
+    for (array.items) |item| {
+        const table_object = try fixtureJsonObject(item);
+        try fixtureRequireOnlyKeys(table_object, &.{ "name", "schema_json" });
+        const name = try fixtureJsonString(table_object.get("name") orelse return error.TestUnexpectedResult);
+        const schema_json = try fixtureJsonString(table_object.get("schema_json") orelse return error.TestUnexpectedResult);
+        if (name.len == 0 or schema_json.len == 0) return error.TestUnexpectedResult;
+        try tables.append(alloc, .{ .name = name, .schema_json = schema_json });
+    }
+    return try tables.toOwnedSlice(alloc);
+}
+
 pub fn parseFixtureSqlValue(value: std.json.Value) !SqlValue {
     const object = try fixtureJsonObject(value);
     try fixtureRequireOnlyKeys(object, &.{ "null", "bool", "integer", "float", "string", "json" });
@@ -847,6 +931,7 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         "resolver_version",
         "resolver_exists",
         "source_schema_json",
+        "catalog_tables",
     });
     const family_text = try fixtureJsonString(object.get("family") orelse return error.TestUnexpectedResult);
     const family = std.meta.stringToEnum(AppParityCorpusPlanFamily, family_text) orelse return error.TestUnexpectedResult;
@@ -872,6 +957,7 @@ pub fn parseFixtureEntryAlloc(alloc: std.mem.Allocator, value: std.json.Value) !
         .resolver_version = try fixtureJsonOptionalU64(object, "resolver_version", 0),
         .resolver_exists = try fixtureJsonOptionalBool(object, "resolver_exists"),
         .source_schema_json = try fixtureJsonOptionalString(object, "source_schema_json", ""),
+        .catalog_tables = try parseAppParityCatalogTablesAlloc(alloc, object),
     };
 }
 
@@ -938,6 +1024,7 @@ pub fn freeFixtureEntry(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) v
     if (entry.params.len > 0) alloc.free(entry.params);
     if (entry.apply_setup_sql.len > 0) alloc.free(entry.apply_setup_sql);
     if (entry.returning_rows.len > 0) alloc.free(entry.returning_rows);
+    if (entry.catalog_tables.len > 0) alloc.free(entry.catalog_tables);
 }
 
 fn appParityCoverageFlag(coverage: AppParityCorpusCoverage, name: []const u8) !bool {
@@ -1290,6 +1377,20 @@ fn fixtureWriteStringListField(writer: anytype, first: *bool, indent: []const u8
     try writer.writeByte(']');
 }
 
+fn fixtureWriteCatalogTablesField(writer: anytype, first: *bool, indent: []const u8, tables: []const AppParityCatalogTable) !void {
+    if (tables.len == 0) return;
+    try fixtureWriteObjectComma(writer, first);
+    try writer.print("{s}\"catalog_tables\": [", .{indent});
+    for (tables, 0..) |table, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print(
+            "{{\"name\": {f}, \"schema_json\": {f}}}",
+            .{ std.json.fmt(table.name, .{}), std.json.fmt(table.schema_json, .{}) },
+        );
+    }
+    try writer.writeByte(']');
+}
+
 fn fixtureWriteSqlValue(writer: anytype, value: SqlValue) !void {
     switch (value) {
         .null => try writer.writeAll("{\"null\": true}"),
@@ -1405,6 +1506,7 @@ pub fn fixtureJsonAlloc(
         if (entry.resolver_version != 0) try fixtureWriteU64Field(entries_writer, &first, "      ", "resolver_version", entry.resolver_version);
         if (entry.resolver_exists) |exists| try fixtureWriteBoolField(entries_writer, &first, "      ", "resolver_exists", exists);
         if (entry.source_schema_json.len > 0) try fixtureWriteStringField(entries_writer, &first, "      ", "source_schema_json", entry.source_schema_json);
+        try fixtureWriteCatalogTablesField(entries_writer, &first, "      ", entry.catalog_tables);
         try fixtureWriteParamsField(entries_writer, &first, "      ", entry.params);
         try fixtureWriteStringField(entries_writer, &first, "      ", "sql", entry.sql);
         try entries_writer.writeAll("\n    }");
@@ -2083,9 +2185,13 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
     for (entry.apply_setup_sql) |setup_sql| {
         if (setup_sql.len == 0) return error.TestUnexpectedResult;
     }
-    if (entry.source_schema_json.len > 0 and !corpusFixtureFamilyAllowsSourceSchema(entry.family)) {
+    if (entry.source_schema_json.len > 0 and entry.catalog_tables.len > 0) {
         return error.TestUnexpectedResult;
     }
+    if (appParityEntryHasCatalogSchemas(entry) and !corpusFixtureFamilyAllowsSourceSchema(entry.family)) {
+        return error.TestUnexpectedResult;
+    }
+    if (!corpusFixtureCatalogTablesAreValid(entry)) return error.TestUnexpectedResult;
     if (entry.returning_rows.len > 0 and !corpusFixtureFamilyAllowsReturningRows(entry.family)) {
         return error.TestUnexpectedResult;
     }
@@ -2139,6 +2245,22 @@ fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppPar
     if (entry.resolver_row_json.len > 0 and !(try fixtureJsonTextIsObjectAlloc(alloc, entry.resolver_row_json))) {
         return error.TestUnexpectedResult;
     }
+    for (entry.catalog_tables) |table| {
+        if (!(try fixtureJsonTextIsObjectAlloc(alloc, table.schema_json))) return error.TestUnexpectedResult;
+    }
+}
+
+fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
+    if (entry.catalog_tables.len == 0) return true;
+    for (entry.catalog_tables, 0..) |table, i| {
+        if (table.name.len == 0 or table.schema_json.len == 0) return false;
+        if (!corpusFixturePlanMatchesSourceTable(entry, table.name)) return false;
+        var j: usize = i + 1;
+        while (j < entry.catalog_tables.len) : (j += 1) {
+            if (std.mem.eql(u8, table.name, entry.catalog_tables[j].name)) return false;
+        }
+    }
+    return true;
 }
 
 fn fixtureJsonTextIsObjectAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
@@ -4747,7 +4869,6 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_read_duplicate_output_name: bool = false,
     unsupported_read_aggregate_duplicate_output_name: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
-    unsupported_read_set_operation_source_schema: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
@@ -5908,24 +6029,24 @@ pub const AppParityCorpusCoverage = struct {
                 self.read_window = self.read_window or is_read_window;
                 self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
-                        entry.source_schema_json.len > 0 and
+                        appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "customer_records"));
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:lateral:") and
-                        entry.source_schema_json.len > 0 and
+                        appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "balance_records"));
                 self.read_set_operation_cross_table_source_schema_classifier = self.read_set_operation_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
-                        entry.source_schema_json.len > 0 and
+                        appParityEntryHasCatalogSchemas(entry) and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_set_operation_cross_table_except_classifier = self.read_set_operation_cross_table_except_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
-                        entry.source_schema_json.len > 0 and
+                        appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "except") and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_set_operation_cross_table_intersect_classifier = self.read_set_operation_cross_table_intersect_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
-                        entry.source_schema_json.len > 0 and
+                        appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "intersect") and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_cte_query_expression = self.read_cte_query_expression or
@@ -5943,9 +6064,6 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);
-            self.unsupported_read_set_operation_source_schema = self.unsupported_read_set_operation_source_schema or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_source_schema") and
-                    std.mem.indexOf(u8, entry.sql, " EXCEPT ") != null);
             self.unsupported_read_row_lock_target = self.unsupported_read_row_lock_target or
                 (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
                     std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
@@ -7079,7 +7197,7 @@ pub const AppParityCorpusCoverage = struct {
             (entry.family == .delete and std.mem.indexOf(u8, entry.name, "expression partial unique selector") != null);
         self.insert_source_cross_table_source_schema = self.insert_source_cross_table_source_schema or
             (entry.family == .insert_source and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":source_table=", "archived_records"));
         self.insert_source_expression_assignment = self.insert_source_expression_assignment or
             (entry.family == .insert_source and
@@ -7125,33 +7243,33 @@ pub const AppParityCorpusCoverage = struct {
                 std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null);
         self.joined_source_cross_table_source_schema = self.joined_source_cross_table_source_schema or
             ((entry.family == .update_joined_source or entry.family == .delete_joined_source) and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":source=", "source_records"));
         self.read_join_cross_table_source_schema = self.read_join_cross_table_source_schema or
             (entry.family == .join and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":right=", "customer_records"));
         self.read_lateral_cross_table_source_schema = self.read_lateral_cross_table_source_schema or
             (entry.family == .lateral and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":right=", "balance_records"));
         self.read_set_operation_cross_table_source_schema = self.read_set_operation_cross_table_source_schema or
             (entry.family == .read and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 setOperationPlanHasRightTable(entry.plan, "archived_records"));
         self.read_set_operation_cross_table_except = self.read_set_operation_cross_table_except or
             (entry.family == .read and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "except") and
                 setOperationPlanHasRightTable(entry.plan, "archived_records"));
         self.read_set_operation_cross_table_intersect = self.read_set_operation_cross_table_intersect or
             (entry.family == .read and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "intersect") and
                 setOperationPlanHasRightTable(entry.plan, "archived_records"));
         self.merge_cross_table_source_schema = self.merge_cross_table_source_schema or
             (entry.family == .merge_mutation and
-                entry.source_schema_json.len > 0 and
+                appParityEntryHasCatalogSchemas(entry) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":source=", "archived_records"));
     }
 };

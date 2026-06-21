@@ -22602,9 +22602,9 @@ fn lowerAppParityReadPlanAlloc(
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
 ) !LoweredReadPlan {
-    if (try appParitySourceTableNameAlloc(alloc, entry)) |source_table_name| {
-        defer alloc.free(@constCast(source_table_name));
-        var catalog = AppParitySourceSchemaCatalog.init(source_table_name, entry.source_schema_json);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryAlloc(alloc, entry);
+    if (catalog_opt) |*catalog| {
+        defer catalog.deinit(alloc);
         return try lowerReadPlanWithCatalogAlloc(
             alloc,
             entry.sql,
@@ -22623,9 +22623,9 @@ fn lowerAppParityExplainPlanAlloc(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredExplainPlan {
-    if (try appParitySourceTableNameAlloc(alloc, entry)) |source_table_name| {
-        defer alloc.free(@constCast(source_table_name));
-        var catalog = AppParitySourceSchemaCatalog.init(source_table_name, entry.source_schema_json);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryAlloc(alloc, entry);
+    if (catalog_opt) |*catalog| {
+        defer catalog.deinit(alloc);
         return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsAlloc(
             alloc,
             entry.sql,
@@ -22969,9 +22969,9 @@ fn lowerAppParityWritePlanAlloc(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredWritePlan {
-    if (try appParitySourceTableNameAlloc(alloc, entry)) |source_table_name| {
-        defer alloc.free(@constCast(source_table_name));
-        var catalog = AppParitySourceSchemaCatalog.init(source_table_name, entry.source_schema_json);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryAlloc(alloc, entry);
+    if (catalog_opt) |*catalog| {
+        defer catalog.deinit(alloc);
         return try lowerWritePlanWithCatalogAlloc(alloc, entry.sql, effective_schema, entry.params, .{
             .unique_resolver = unique_resolver,
             .row_claim = row_claim,
@@ -23482,6 +23482,14 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
     }
     if (entry.source_schema_json.len > 0 and !(try appParitySourceSchemaJsonIsValid(alloc, entry.source_schema_json))) {
         return error.TestUnexpectedResult;
+    }
+    for (entry.catalog_tables) |catalog_table| {
+        if (!(try appParitySourceSchemaJsonIsValid(alloc, catalog_table.schema_json))) {
+            return error.TestUnexpectedResult;
+        }
+        if (entry.summary.table_name) |target_table_name| {
+            if (std.mem.eql(u8, catalog_table.name, target_table_name)) return error.TestUnexpectedResult;
+        }
     }
     if (entry.source_schema_json.len > 0) {
         const source_table_name = (appParitySourceTableNameAlloc(alloc, entry) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
