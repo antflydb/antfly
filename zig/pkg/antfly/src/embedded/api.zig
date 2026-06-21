@@ -187,6 +187,11 @@ pub const Api = struct {
         return try self.pendingWorkStatsJson(alloc);
     }
 
+    pub fn replayGeneratedEnrichmentsJson(self: *Api, alloc: Allocator) ![]u8 {
+        const replayed = try self.db.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+        return try std.fmt.allocPrint(alloc, "{{\"replayed\":{d}}}", .{replayed});
+    }
+
     pub fn listIndexesJson(self: *Api, alloc: Allocator) ![]u8 {
         const configs = try self.db.listIndexes(alloc);
         defer embedded_db.types.freeIndexConfigs(alloc, configs);
@@ -753,6 +758,83 @@ test "embedded api openLite manages index and enrichment definitions over aflite
         const removed_enrichment = try reopened.dropEnrichmentJson(alloc, .chunk, "body_chunks_v1");
         defer alloc.free(removed_enrichment);
         try std.testing.expect(std.mem.indexOf(u8, removed_enrichment, "\"removed\":true") != null);
+    }
+}
+
+test "embedded api openLite resumes generated enrichment after hosted maintenance pause" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-enrichment-resume.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    {
+        var hosted = try Api.openLiteHosted(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+            },
+        });
+        defer hosted.close();
+
+        const caps = try hosted.capabilitiesJson(alloc);
+        defer alloc.free(caps);
+        try std.testing.expect(std.mem.indexOf(u8, caps, "\"manual_maintenance\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, caps, "\"background_enrichment_runtime\":false") != null);
+
+        const created_enrichment = try hosted.addEnrichmentJson(
+            alloc,
+            "{\"name\":\"body_chunks_v1\",\"kind\":\"chunk\",\"field\":\"body\",\"chunk_size\":24,\"chunk_overlap\":0}",
+        );
+        defer alloc.free(created_enrichment);
+        try std.testing.expect(std.mem.indexOf(u8, created_enrichment, "\"created\":true") != null);
+
+        const created_index = try hosted.addIndexJson(
+            alloc,
+            "{\"name\":\"ft_body_chunks\",\"kind\":\"full_text\",\"config_json\":\"{\\\"chunk_name\\\":\\\"body_chunks_v1\\\"}\"}",
+        );
+        defer alloc.free(created_index);
+        try std.testing.expect(std.mem.indexOf(u8, created_index, "\"created\":true") != null);
+
+        const written = try hosted.batchJson(
+            alloc,
+            "{\"inserts\":{\"doc:paused\":{\"title\":\"paused\",\"body\":\"manual maintenance pause resume phrase\"}},\"sync_level\":\"write\"}",
+        );
+        defer alloc.free(written);
+        try std.testing.expect(std.mem.indexOf(u8, written, "\"inserted\":1") != null);
+
+        const pending = try hosted.pendingWorkStatsJson(alloc);
+        defer alloc.free(pending);
+        try std.testing.expect(std.mem.indexOf(u8, pending, "\"has_async_indexes\":true") != null);
+    }
+
+    {
+        var resumed = try Api.openLite(alloc, path, .{
+            .table_name = "docs",
+            .db = .{
+                .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+                .enrichment = .{ .enable_without_producers = true },
+            },
+        });
+        defer resumed.close();
+
+        const replayed = try resumed.replayGeneratedEnrichmentsJson(alloc);
+        defer alloc.free(replayed);
+        try std.testing.expect(std.mem.indexOf(u8, replayed, "\"replayed\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, replayed, "\"replayed\":0") == null);
+
+        const idle = try resumed.runUntilIdleJson(alloc);
+        defer alloc.free(idle);
+        try std.testing.expect(std.mem.indexOf(u8, idle, "\"has_async_indexes\":true") != null);
+
+        const query_json = try resumed.searchJson(
+            alloc,
+            "{\"full_text_search\":{\"match\":{\"field\":\"body\",\"text\":\"resume phrase\"}},\"limit\":1}",
+        );
+        defer alloc.free(query_json);
+        try std.testing.expect(std.mem.indexOf(u8, query_json, "\"doc:paused\"") != null);
     }
 }
 

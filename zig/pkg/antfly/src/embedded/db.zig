@@ -199,6 +199,10 @@ pub const DB = struct {
         try self.maintenanceDriver().runUntilIdle();
     }
 
+    pub fn replayGeneratedEnrichmentsFromStoredDocs(self: *DB, alloc: Allocator) !usize {
+        return try self.inner.replayGeneratedEnrichmentsFromStoredDocs(alloc);
+    }
+
     pub fn addIndex(self: *DB, cfg: types.IndexConfig) !void {
         try self.inner.addIndex(cfg);
     }
