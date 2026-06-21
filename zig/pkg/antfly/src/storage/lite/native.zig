@@ -1477,7 +1477,7 @@ pub const NativeFile = struct {
     fn readFreePagesAlloc(self: *NativeFile, checkpoint: CheckpointSlot) ![]u64 {
         if (checkpoint.free_map_root_page == 0) return try self.allocator.alloc(u64, 0);
 
-        const payload = try self.readPagePayloadByKindAlloc(self.allocator, checkpoint.free_map_root_page, .free_map);
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
         defer self.allocator.free(payload);
         const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
         return free_map.free_pages;
@@ -1662,7 +1662,7 @@ pub const NativeFile = struct {
         if (checkpoint.free_map_root_page == 0) return;
         try self.markReachablePage(reachable_pages, checkpoint.free_map_root_page, checkpoint.page_count);
 
-        const payload = try self.readPagePayloadByKindAlloc(self.allocator, checkpoint.free_map_root_page, .free_map);
+        const payload = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
         defer self.allocator.free(payload);
         const free_map = try decodeFreeMapAlloc(self.allocator, payload, checkpoint.page_count);
         defer self.allocator.free(free_map.free_pages);
@@ -3711,6 +3711,31 @@ test "lite native check validates committed free map root" {
     const report = try file.check();
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_free_map", report.issue.?);
+}
+
+test "lite native free map reads are bounded by supplied checkpoint" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-free-map-checkpoint-bound.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.create(allocator, path);
+    defer file.close();
+
+    try file.putDocument("doc:1", "value");
+
+    var checkpoint = file.activeCheckpoint();
+    try std.testing.expect(checkpoint.free_map_root_page != 0);
+    checkpoint.page_count = checkpoint.free_map_root_page;
+
+    try std.testing.expectError(error.InvalidPageId, file.readFreePagesAlloc(checkpoint));
+
+    var reachable_pages = std.AutoHashMapUnmanaged(u64, void){};
+    defer reachable_pages.deinit(allocator);
+    try std.testing.expectError(error.InvalidPageId, file.validateReachableFreeMap(checkpoint, &reachable_pages));
 }
 
 test "lite native free map cannot reclaim previous checkpoint pages" {
