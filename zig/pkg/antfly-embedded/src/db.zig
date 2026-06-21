@@ -36,3 +36,22 @@ pub const capabilitiesForProfile = embedded.capabilitiesForProfile;
 pub const checkLiteFile = embedded.checkLiteFile;
 pub const setRemoteTemplateRenderer = embedded.setRemoteTemplateRenderer;
 pub const renderRemoteTemplateText = embedded.renderRemoteTemplateText;
+
+test "pkg antfly embedded db Lite surface compiles" {
+    _ = OpenOptions;
+    _ = Profile;
+    _ = Capabilities;
+    _ = InferenceOpenOptions;
+    _ = InferenceStatus;
+    _ = LiteCheckReport;
+    _ = LiteStableSnapshotReport;
+    _ = LiteStatus;
+    _ = LiteStorageStatus;
+    _ = LiteVacuumReport;
+    _ = DB.openLite;
+    _ = DB.openLiteHosted;
+    _ = DB.liteStatus;
+    _ = DB.checkLite;
+    _ = capabilitiesForProfile;
+    _ = checkLiteFile;
+}

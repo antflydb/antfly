@@ -17,3 +17,13 @@ const embedded = @import("embedded_api_surface");
 pub const OpenOptions = embedded.OpenOptions;
 pub const Api = embedded.Api;
 pub const checkLiteFileJson = embedded.checkLiteFileJson;
+
+test "pkg antfly embedded api Lite surface compiles" {
+    _ = OpenOptions;
+    _ = Api.openLite;
+    _ = Api.openLiteHosted;
+    _ = Api.statusJson;
+    _ = Api.checkLiteJson;
+    _ = Api.checkLiteFileJson;
+    _ = checkLiteFileJson;
+}

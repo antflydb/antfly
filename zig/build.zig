@@ -1724,6 +1724,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     @call(.auto, configureEmbeddedModule, .{ b, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
+    embedded_support_mod.addImport("antfly_scraping", scraping_mod);
 
     const embedded_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/embedded/root.zig"),
@@ -1755,6 +1756,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_embedded_pkg_mod.addImport("embedded_surface", embedded_mod);
+
+    const antfly_embedded_db_pkg_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/db.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_embedded_db_pkg_mod.addImport("embedded_db_surface", embedded_db_mod);
+
+    const antfly_embedded_api_pkg_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/api.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_embedded_api_pkg_mod.addImport("embedded_api_surface", embedded_api_mod);
 
     const antfly_client_pkg_mod = b.addModule("antfly-client", .{
         .root_source_file = b.path("pkg/antfly-client/src/root.zig"),
@@ -2688,8 +2703,20 @@ pub fn build(b: *std.Build) void {
         .filters = &.{"pkg antfly embedded root"},
     });
     const run_antfly_embedded_pkg_tests = b.addRunArtifact(antfly_embedded_pkg_tests);
+    const antfly_embedded_db_pkg_tests = b.addTest(.{
+        .root_module = antfly_embedded_db_pkg_mod,
+        .filters = &.{"pkg antfly embedded db"},
+    });
+    const run_antfly_embedded_db_pkg_tests = b.addRunArtifact(antfly_embedded_db_pkg_tests);
+    const antfly_embedded_api_pkg_tests = b.addTest(.{
+        .root_module = antfly_embedded_api_pkg_mod,
+        .filters = &.{"pkg antfly embedded api"},
+    });
+    const run_antfly_embedded_api_pkg_tests = b.addRunArtifact(antfly_embedded_api_pkg_tests);
     const antfly_embedded_pkg_test_step = b.step("antfly-embedded-test", "Run the standalone antfly-embedded package compile test");
     antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
+    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_api_pkg_tests.step);
 
     const antfly_client_pkg_tests = b.addTest(.{
         .root_module = antfly_client_pkg_mod,
