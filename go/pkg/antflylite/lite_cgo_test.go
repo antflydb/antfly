@@ -468,6 +468,70 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("truncated file check report = %#v", badReport)
 	}
 
+	pinnedSnapshotPath := filepath.Join(t.TempDir(), "go-pinned-snapshot.aflite")
+	if err := db.Batch([]WriteIntent{{
+		Key:   "doc:go-pinned",
+		Value: []byte(`{"title":"pinned-before"}`),
+	}}, 9_100); err != nil {
+		t.Fatalf("seed pinned snapshot document: %v", err)
+	}
+	pinnedReader, err := OpenReadonly(path)
+	if err != nil {
+		t.Fatalf("open pinned snapshot reader: %v", err)
+	}
+	if err := db.Batch([]WriteIntent{{
+		Key:   "doc:go-pinned",
+		Value: []byte(`{"title":"pinned-after-a"}`),
+	}}, 9_200); err != nil {
+		pinnedReader.Close()
+		t.Fatalf("advance pinned snapshot document a: %v", err)
+	}
+	if err := db.Batch([]WriteIntent{{
+		Key:   "doc:go-pinned",
+		Value: []byte(`{"title":"pinned-after-b"}`),
+	}}, 9_300); err != nil {
+		pinnedReader.Close()
+		t.Fatalf("advance pinned snapshot document b: %v", err)
+	}
+	pinnedSnapshotReport, err := pinnedReader.CopyStableSnapshot(pinnedSnapshotPath, false)
+	if closeErr := pinnedReader.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("copy pinned reader snapshot: %v", err)
+	}
+	if pinnedSnapshotReport.TailBytes == 0 {
+		t.Fatalf("pinned snapshot report did not observe writer tail: %#v", pinnedSnapshotReport)
+	}
+	pinnedSnapshotCheck, err := CheckFile(pinnedSnapshotPath)
+	if err != nil {
+		t.Fatalf("check pinned snapshot: %v", err)
+	}
+	if !pinnedSnapshotCheck.Valid || pinnedSnapshotCheck.TailBytes != 0 {
+		t.Fatalf("pinned snapshot check = %#v", pinnedSnapshotCheck)
+	}
+	pinnedSnapshot, err := OpenReadonly(pinnedSnapshotPath)
+	if err != nil {
+		t.Fatalf("open pinned snapshot: %v", err)
+	}
+	pinnedSnapshotLookup, err := pinnedSnapshot.LookupJSON("doc:go-pinned")
+	if closeErr := pinnedSnapshot.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("lookup pinned snapshot: %v", err)
+	}
+	if !bytes.Contains(pinnedSnapshotLookup, []byte("pinned-before")) || bytes.Contains(pinnedSnapshotLookup, []byte("pinned-after")) {
+		t.Fatalf("pinned snapshot lookup JSON %q did not preserve reader checkpoint", pinnedSnapshotLookup)
+	}
+	pinnedWriterLookup, err := db.LookupJSON("doc:go-pinned")
+	if err != nil {
+		t.Fatalf("lookup pinned writer: %v", err)
+	}
+	if !bytes.Contains(pinnedWriterLookup, []byte("pinned-after-b")) {
+		t.Fatalf("writer lookup JSON %q did not contain latest pinned value", pinnedWriterLookup)
+	}
+
 	snapshotPath := filepath.Join(t.TempDir(), "go-snapshot.aflite")
 	snapshotReport, err := db.CopyStableSnapshot(snapshotPath, false)
 	if err != nil {
