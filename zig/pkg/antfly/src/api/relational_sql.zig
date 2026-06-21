@@ -11166,70 +11166,20 @@ const Parser = struct {
         insert_columns: []const []const u8,
         expected_type: ?runtime_schema.AntflyType,
     ) anyerror!db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.conflictExpressionStartAt(self.tokens, self.pos)) |start| {
-            switch (start) {
-                .cast => return try self.parseConflictCastExpressionAlloc(column, insert_columns),
-                .case => return try self.parseConflictCaseExpressionAlloc(column, insert_columns),
-                .case_fold => return try self.parseConflictCaseFoldExpressionAlloc(column, insert_columns, expected_type),
-                .replace => return try self.parseConflictReplaceExpressionAlloc(column, insert_columns, expected_type),
-                .regexp_replace => return try self.parseConflictRegexpReplaceExpressionAlloc(column, insert_columns, expected_type),
-                .regexp_match => return try self.parseConflictRegexpMatchExpressionAlloc(column, insert_columns, expected_type),
-                .regexp_substr => return try self.parseConflictRegexpSubstrExpressionAlloc(column, insert_columns, expected_type),
-                .regexp_count => return try self.parseConflictRegexpCountExpressionAlloc(column, insert_columns, expected_type),
-                .regexp_instr => return try self.parseConflictRegexpInstrExpressionAlloc(column, insert_columns, expected_type),
-                .translate => return try self.parseConflictTranslateExpressionAlloc(column, insert_columns, expected_type),
-                .concat => return try self.parseConflictConcatExpressionAlloc(column, insert_columns, expected_type),
-                .coalesce => return try self.parseConflictCoalesceExpressionAlloc(column, insert_columns, expected_type),
-                .nullif => return try self.parseConflictNullifExpressionAlloc(column, insert_columns),
-                .text_length => return try self.parseConflictLengthExpressionAlloc(column, insert_columns, expected_type),
-                .ascii => return try self.parseConflictAsciiExpressionAlloc(column, insert_columns, expected_type),
-                .chr => return try self.parseConflictChrExpressionAlloc(column, insert_columns, expected_type),
-                .substring => return try self.parseConflictSubstringExpressionAlloc(column, insert_columns, expected_type),
-                .overlay => return try self.parseConflictOverlayExpressionAlloc(column, insert_columns, expected_type),
-                .split_part => return try self.parseConflictSplitPartExpressionAlloc(column, insert_columns, expected_type),
-                .strpos => return try self.parseConflictStrposExpressionAlloc(column, insert_columns, expected_type),
-                .left_right => return try self.parseConflictLeftRightExpressionAlloc(column, insert_columns, expected_type),
-                .pad => return try self.parseConflictPadExpressionAlloc(column, insert_columns, expected_type),
-                .repeat => return try self.parseConflictRepeatExpressionAlloc(column, insert_columns, expected_type),
-                .reverse => return try self.parseConflictReverseExpressionAlloc(column, insert_columns, expected_type),
-                .md5 => return try self.parseConflictMd5ExpressionAlloc(column, insert_columns, expected_type),
-                .starts_with => return try self.parseConflictStartsWithExpressionAlloc(column, insert_columns, expected_type),
-                .ends_with => return try self.parseConflictEndsWithExpressionAlloc(column, insert_columns, expected_type),
-                .date_trunc => return try self.parseConflictDateTruncExpressionAlloc(column, insert_columns, expected_type),
-                .date_bin => return try self.parseConflictDateBinExpressionAlloc(column, insert_columns, expected_type),
-                .date_part => return try self.parseConflictDatePartExpressionAlloc(column, insert_columns, expected_type),
-                .abs => return try self.parseConflictAbsExpressionAlloc(column, insert_columns),
-                .round => return try self.parseConflictRoundExpressionAlloc(column, insert_columns),
-                .trunc => return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .trunc),
-                .floor => return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .floor),
-                .ceil => return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .ceil),
-                .sqrt => return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .sqrt),
-                .sign => return try self.parseConflictFloorCeilExpressionAlloc(column, insert_columns, .sign),
-                .mod => return try self.parseConflictModuloExpressionAlloc(column, insert_columns),
-                .power => return try self.parseConflictPowerExpressionAlloc(column, insert_columns),
-                .greatest_least => return try self.parseConflictGreatestLeastExpressionAlloc(column, insert_columns, expected_type),
-                .json_extract_path => return try self.parseConflictJsonExtractPathExpressionAlloc(column, insert_columns, expected_type),
-                .json_build_object => return try self.parseConflictJsonBuildObjectExpressionAlloc(column, insert_columns, expected_type),
-                .json_typeof => return try self.parseConflictJsonTypeofExpressionAlloc(column, insert_columns),
-                .json_array_length => return try self.parseConflictJsonArrayLengthExpressionAlloc(column, insert_columns),
-                .array_length => return try self.parseConflictArrayLengthExpressionAlloc(insert_columns),
-                .array_position => return try self.parseConflictArrayPositionExpressionAlloc(column, insert_columns, expected_type),
-                .array_element_transform => return try self.parseConflictArrayElementTransformExpressionAlloc(column, insert_columns, expected_type),
-                .array_to_string => return try self.parseConflictArrayToStringExpressionAlloc(column, insert_columns, expected_type),
-                .string_to_array => return try self.parseConflictStringToArrayExpressionAlloc(column, insert_columns, expected_type),
-                .uuid_v4 => return try self.parseConflictUuidV4ExpressionAlloc(expected_type),
-                .now => return try self.parseConflictNowExpressionAlloc(expected_type),
-                .current_date => return try self.parseConflictCurrentDateExpressionAlloc(expected_type),
-                .typed_datetime_literal => return try self.parseConflictTypedDatetimeLiteralExpressionAlloc(expected_type),
-                .interval => {
-                    if (expected_type) |field_type| {
-                        if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
-                    }
-                    return try sql_adapter.parseSqlIntervalRowExpressionAlloc(self.alloc, self.tokens, &self.pos);
-                },
-            }
-        }
-        return try self.parseConflictExpressionOperandAlloc(column, insert_columns, expected_type);
+        return try sql_adapter.parseConflictExpressionWithExpectedAlloc(
+            self.alloc,
+            self.tokens,
+            &self.pos,
+            self.params,
+            self.schema,
+            self.conflict_existing_qualifiers,
+            column,
+            insert_columns,
+            expected_type,
+            self.rowExpressionTypeContext(),
+            self.defer_row_expression_field_validation,
+            self.conflictExpressionDispatchHooks(),
+        );
     }
 
     fn parseConflictJsonBuildObjectExpressionAlloc(
