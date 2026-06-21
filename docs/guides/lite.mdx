@@ -301,6 +301,31 @@ backup, and restore that backup into the target Antfly table. They do not make
 For full upgrade, downgrade, restore, snapshot, and enrichment behavior, see the
 [Antfly Lite migration guide](/docs/guides/lite-migration).
 
+## Zig Embedded Package
+
+Zig applications can use the `antfly-embedded` package directly. The Lite DB
+surface opens native `.aflite` files with `db.DB.openLite`, while package-level
+helpers inspect and snapshot files without requiring the caller to keep a DB
+handle open:
+
+```zig
+const antfly = @import("antfly-embedded");
+
+const report = try antfly.db.checkLiteFile(allocator, "app.aflite");
+_ = report.valid;
+
+_ = try antfly.db.copyStableLiteSnapshotFile(
+    allocator,
+    "app.aflite",
+    "copy.aflite",
+    false,
+);
+```
+
+Use `antfly.api.checkLiteFileJson` and
+`antfly.api.copyStableLiteSnapshotFileJson` when an embedding wants the same
+JSON reports exposed by the CLI and C ABI.
+
 ## Go Embedded Binding
 
 The first language binding above Zig and C is Go:
