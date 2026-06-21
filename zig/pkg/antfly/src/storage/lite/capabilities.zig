@@ -13,6 +13,9 @@
 // limitations.
 
 const builtin = @import("builtin");
+const build_options = @import("build_options");
+
+const local_inference_runtime_available = build_options.lite_local_inference_runtime and builtin.os.tag != .freestanding;
 
 pub const Profile = enum {
     native,
@@ -84,7 +87,7 @@ pub const Capabilities = struct {
     caller_supplied_artifacts: bool = true,
     caller_supplied_embeddings: bool = true,
     remote_inference_providers: bool = true,
-    local_inference_runtime: bool = false,
+    local_inference_runtime: bool = local_inference_runtime_available,
     generated_enrichment_planning: bool = true,
     text_search: bool = true,
     dense_vector_search: bool = true,
@@ -145,7 +148,7 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .caller_supplied_artifacts = true,
         .caller_supplied_embeddings = true,
         .remote_inference_providers = !freestanding,
-        .local_inference_runtime = false,
+        .local_inference_runtime = local_inference_runtime_available,
         .generated_enrichment_planning = true,
         .text_search = true,
         .dense_vector_search = true,
@@ -180,9 +183,8 @@ pub fn inferenceStatusForProfile(profile: Profile) InferenceStatus {
 pub fn inferenceStatusForProfileWithOptions(profile: Profile, opts: InferenceOpenOptions) InferenceStatus {
     const caps = capabilitiesForProfile(profile);
     const remote_configured = opts.remote_provider_configured and caps.remote_inference_providers;
-    const local_available = opts.local_runtime_configured and builtin.os.tag != .freestanding;
-    const local_configured = opts.local_runtime_configured and local_available;
-    const configured = remote_configured or local_configured;
+    const local_available = caps.local_inference_runtime;
+    const local_configured = opts.local_runtime_configured;
     const available_modes = if (local_available)
         if (profile == .hosted) &hosted_local_available_inference_modes else &native_local_available_inference_modes
     else
@@ -190,15 +192,15 @@ pub fn inferenceStatusForProfileWithOptions(profile: Profile, opts: InferenceOpe
     return .{
         .mode = if (remote_configured)
             "remote_provider"
-        else if (local_configured)
+        else if (local_configured and local_available)
             "local_embedded"
         else
             caps.inference_mode,
         .available_modes = available_modes,
-        .configured = configured,
+        .configured = remote_configured or (local_configured and local_available),
         .remote_provider_configured = remote_configured,
         .local_runtime_configured = local_configured,
-        .local_runtime_available = local_available or caps.local_inference_runtime,
+        .local_runtime_available = local_available,
         .caller_supplied_artifacts = caps.caller_supplied_artifacts,
         .no_inference_configured_ok = caps.no_inference_configured_ok,
     };

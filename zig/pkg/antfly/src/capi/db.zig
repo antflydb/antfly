@@ -6678,14 +6678,14 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_status_json(local_handle, &local_status));
     defer antfly_db_buffer_free(local_status.ptr, local_status.len);
     const local_status_json = local_status.ptr.?[0..local_status.len];
-    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"mode\":\"local_embedded\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"configured\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"configured\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"remote_provider_configured\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_runtime_configured\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_runtime_available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_runtime_available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"capabilities\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"inference_mode\":\"local_embedded\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_inference_runtime\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_status_json, "\"local_inference_runtime\":false") != null);
 
     var capabilities: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(src_handle, &capabilities));
@@ -6710,9 +6710,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_capabilities_json(local_handle, &local_capabilities));
     defer antfly_db_buffer_free(local_capabilities.ptr, local_capabilities.len);
     const local_capabilities_json = local_capabilities.ptr.?[0..local_capabilities.len];
-    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, "\"inference_mode\":\"local_embedded\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"disabled_deferred\"]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, "\"local_inference_runtime\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, "\"local_inference_runtime\":false") != null);
 
     var pending: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_pending_work_stats_json(src_handle, &pending));

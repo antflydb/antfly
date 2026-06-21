@@ -421,9 +421,11 @@ test "lite backend capabilities distinguish native and hosted profiles" {
 
     const local_status = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
     const local_caps = capabilitiesForProfileWithInferenceStatus(.native, local_status);
-    try std.testing.expectEqualStrings("local_embedded", local_caps.inference_mode);
-    try std.testing.expect(local_caps.local_inference_runtime);
-    try std.testing.expect(std.mem.eql(u8, local_caps.available_inference_modes[2], "local_embedded"));
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_caps.inference_mode);
+    try std.testing.expect(!local_caps.local_inference_runtime);
+    for (local_caps.available_inference_modes) |mode| {
+        try std.testing.expect(!std.mem.eql(u8, mode, "local_embedded"));
+    }
 }
 
 test "lite backend capabilities contract is stable" {
@@ -564,22 +566,13 @@ test "lite backend inference status reflects explicit remote provider configurat
     try std.testing.expect(remote.no_inference_configured_ok);
 
     const local_requested = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
-    if (builtin.os.tag == .freestanding) {
-        try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
-        try std.testing.expect(!local_requested.configured);
-        try std.testing.expect(!local_requested.local_runtime_configured);
-        try std.testing.expect(!local_requested.local_runtime_available);
-    } else {
-        try std.testing.expectEqualStrings("local_embedded", local_requested.mode);
-        try std.testing.expect(local_requested.configured);
-        try std.testing.expect(!local_requested.remote_provider_configured);
-        try std.testing.expect(local_requested.local_runtime_configured);
-        try std.testing.expect(local_requested.local_runtime_available);
-        var found_local = false;
-        for (local_requested.available_modes) |mode| {
-            if (std.mem.eql(u8, mode, "local_embedded")) found_local = true;
-        }
-        try std.testing.expect(found_local);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
+    try std.testing.expect(!local_requested.configured);
+    try std.testing.expect(!local_requested.remote_provider_configured);
+    try std.testing.expect(local_requested.local_runtime_configured);
+    try std.testing.expect(!local_requested.local_runtime_available);
+    for (local_requested.available_modes) |mode| {
+        try std.testing.expect(!std.mem.eql(u8, mode, "local_embedded"));
     }
 }
 

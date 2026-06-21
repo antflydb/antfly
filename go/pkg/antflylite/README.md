@@ -51,8 +51,8 @@ size, native-profile TTL cleanup, and explicit inference status reporting. Set
 `RemoteProviderConfigured` when the embedding producer is backed by a configured
 remote provider so `Status().Inference` reports `remote_provider` instead of the
 default caller-supplied/deferred mode. Set `LocalRuntimeConfigured` when the
-application embeds a local inference runtime and wants status to report
-`local_embedded`.
+application requests a local inference runtime; Lite reports `local_embedded`
+only when the loaded build advertises `LocalInferenceRuntime`.
 
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the

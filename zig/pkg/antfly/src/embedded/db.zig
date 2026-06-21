@@ -577,7 +577,7 @@ test "embedded db liteStatus reflects explicitly configured remote inference" {
     try std.testing.expect(!caps.local_inference_runtime);
 }
 
-test "embedded db liteStatus reflects explicitly configured local inference" {
+test "embedded db liteStatus reports local inference request as unavailable in core build" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -595,19 +595,22 @@ test "embedded db liteStatus reflects explicitly configured local inference" {
     var status = try db.liteStatus(alloc);
     defer status.deinit(alloc);
 
-    try std.testing.expectEqualStrings("local_embedded", status.inference.mode);
-    try std.testing.expect(status.inference.configured);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", status.inference.mode);
+    try std.testing.expect(!status.inference.configured);
     try std.testing.expect(!status.inference.remote_provider_configured);
     try std.testing.expect(status.inference.local_runtime_configured);
-    try std.testing.expect(status.inference.local_runtime_available);
+    try std.testing.expect(!status.inference.local_runtime_available);
     try std.testing.expect(status.inference.caller_supplied_artifacts);
     try std.testing.expect(status.inference.no_inference_configured_ok);
-    try std.testing.expectEqualStrings("local_embedded", status.capabilities.inference_mode);
-    try std.testing.expect(status.capabilities.local_inference_runtime);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", status.capabilities.inference_mode);
+    try std.testing.expect(!status.capabilities.local_inference_runtime);
+    for (status.capabilities.available_inference_modes) |mode| {
+        try std.testing.expect(!std.mem.eql(u8, mode, "local_embedded"));
+    }
 
     const caps = db.capabilities();
-    try std.testing.expectEqualStrings("local_embedded", caps.inference_mode);
-    try std.testing.expect(caps.local_inference_runtime);
+    try std.testing.expectEqualStrings("caller_supplied_or_disabled", caps.inference_mode);
+    try std.testing.expect(!caps.local_inference_runtime);
 }
 
 test "embedded db openLite can run ttl cleanup over aflite file" {

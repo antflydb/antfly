@@ -1100,6 +1100,7 @@ pub fn build(b: *std.Build) void {
     else
         null;
     const antfly_version = b.option([]const u8, "antfly-version", "Antfly version string") orelse "dev";
+    const lite_local_inference_runtime = b.option(bool, "lite-local-inference-runtime", "Advertise an embedded local inference runtime in Antfly Lite status") orelse false;
     if (termite_enable_onnx) {
         const termite_onnx_available = pathExists(b, b.fmt("{s}/include/onnxruntime_c_api.h", .{termite_onnx_root})) and
             pathExists(b, b.fmt("{s}/lib", .{termite_onnx_root}));
@@ -1119,8 +1120,8 @@ pub fn build(b: *std.Build) void {
     );
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, antfly_version);
-    const swarm_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, antfly_version);
+    const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
+    const swarm_runtime_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, true, lite_local_inference_runtime, antfly_version);
     const lmdb_engine_mod = makeLmdbEngineModule(b, target, optimize, link_libc, lmdb_build_options);
     const lmdb_engine_wasm_mod = makeLmdbEngineModule(b, wasm_target, optimize, false, lmdb_build_options);
     const raft_engine_mod = b.createModule(.{
@@ -4746,7 +4747,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
-    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, antfly_version);
+    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, antfly_version);
     const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
     const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
     const lmdb_bench_mod_c = b.createModule(.{
@@ -4763,7 +4764,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
-    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, antfly_version);
+    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
     const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
     const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
     const lmdb_bench_mod_zig = b.createModule(.{
@@ -4821,7 +4822,7 @@ pub fn build(b: *std.Build) void {
     lmdb_bench_mmap_step.dependOn(&run_lmdb_bench_zig_mmap.step);
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, antfly_version);
+    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
     const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
     const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod);
     const split_bench_mod = b.createModule(.{
@@ -5111,7 +5112,7 @@ pub fn build(b: *std.Build) void {
     regex_bench_step.dependOn(&run_regex_bench.step);
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, antfly_version);
+    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
     const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
     const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod);
     const wal_bench_mod = b.createModule(.{
@@ -5202,7 +5203,7 @@ pub fn build(b: *std.Build) void {
     wal_bench_adaptive_stress_step.dependOn(&run_wal_bench_adaptive_stress.step);
 
     const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, antfly_version);
+    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
     const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, derived_log_bench_engine_options);
     const derived_log_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(antfly_benches_build.derived_log_bench_root),
@@ -6473,6 +6474,7 @@ pub fn build(b: *std.Build) void {
         .target = wasm_target,
         .optimize = optimize,
     });
+    lite_wasm_profile_mod.addOptions("build_options", build_options);
     const lite_wasm_profile = b.addExecutable(.{
         .name = "antfly_lite_wasm_profile",
         .root_module = lite_wasm_profile_mod,
@@ -6490,6 +6492,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    lite_wasm_profile_tests.root_module.addOptions("build_options", build_options);
     const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
     const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
     lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
