@@ -6455,7 +6455,10 @@ pub fn build(b: *std.Build) void {
     lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
-    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, embedded package check, and libantflylite C ABI");
+    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantflylite C ABI");
+    if (!lite_local_inference_runtime) {
+        lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
+    }
     lite_full_step.dependOn(&install_antfly.step);
     lite_full_step.dependOn(&install_lite_capi_lib.step);
     lite_full_step.dependOn(&install_lite_capi_header.step);
