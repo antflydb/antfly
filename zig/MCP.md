@@ -1,14 +1,16 @@
-# Zig MCP And A2A Support
+# Zig MCP Support
 
 ## Current State
 
-This repo now has reusable protocol cores under `go/pkg/antfly/lib/mcp` and `go/pkg/antfly/lib/a2a`, plus Antfly-specific HTTP adapters in
+This repo now has a reusable MCP protocol core under `go/pkg/antfly/lib/mcp`, plus Antfly-specific HTTP adapters in
 `pkg/antfly/src/api/protocol_adapters.zig`.
 
-The implementation intentionally keeps the protocol libraries independent of Antfly OpenAPI/generated types. Antfly
-tools and skills are registered at the product layer and delegate back through existing HTTP/API paths so auth,
-permission checks, request validation, table/query behavior, backup/restore behavior, and agent behavior stay
-centralized.
+The implementation intentionally keeps the protocol library independent of Antfly OpenAPI/generated types. Antfly tools
+are registered at the product layer and delegate back through existing HTTP/API paths so auth, permission checks,
+request validation, table/query behavior, backup/restore behavior, and agent behavior stay centralized.
+
+A2A and native bounded-agent behavior are documented in `A2A.md`. This file keeps only the MCP surface and the explicit
+handoff points where MCP clients should call native agents or A2A skills.
 
 ## Go Parity Context
 
@@ -18,11 +20,6 @@ The Go implementation uses mature protocol SDKs:
   SDK provides streamable HTTP sessions, `Mcp-Session-Id`, DELETE close, SSE reconnect behavior, and `Last-Event-ID`
   resumability. The Antfly Go product code exposes streamable HTTP; the SDK also supports stdio, but there is no
   Antfly-specific stdio server command wired in the Go tree.
-- A2A is mounted with `github.com/a2aproject/a2a-go/a2asrv.NewJSONRPCHandler` in `go/pkg/antfly/src/metadata/a2a_adapters.go`.
-  `message/stream` is a real SSE stream backed by the SDK event queue, and retrieval writes callback events into that
-  queue as work progresses.
-- A2A `tasks/get` and `tasks/cancel` are provided by the SDK's default in-memory task store. Antfly Go does not appear
-  to configure a durable task store for this surface.
 - MCP tool schemas in Go are derived by the MCP SDK from typed argument structs and `json`/`mcp` tags in
   `go/pkg/antfly/src/mcp/mcp.go`, not handwritten JSON strings.
 
@@ -38,27 +35,9 @@ The Go implementation uses mature protocol SDKs:
   - Session-scoped SSE event IDs and `Last-Event-ID` cursor handling for streamable HTTP GET.
   - Line-oriented stdio dispatch helper for newline-framed JSON-RPC messages.
   - Standalone tests via `zig build lib-mcp-test`.
-- `go/pkg/antfly/lib/a2a`
-  - Agent skill registration and metadata skill routing.
-  - Agent card production.
-  - JSON-RPC methods for `agent/getAuthenticatedExtendedCard`, `message/send`, `message/stream`, `tasks/get`, and
-    `tasks/cancel`.
-  - In-memory task store interface and implementation.
-  - Event sink plumbing for `message/stream` so queue events can be consumed as they are emitted.
-  - Text/data part helpers and event queue helpers.
-  - Standalone tests via `zig build lib-a2a-test`.
 - Antfly HTTP routes
   - `GET /mcp/v1`
   - `POST /mcp/v1`
-  - `POST /a2a`
-  - `GET /.well-known/agent.json`
-  - `GET /.well-known/agent-card.json`
-  - The built-in `StdHttpListener` has an optional streaming executor hook, and the Antfly data server wires it for
-    `POST /a2a` `message/stream` so A2A queue events are framed onto the HTTP response as chunked SSE frames when the
-    product listener is used.
-  - The retrieval agent exposes an event-sink execution path for `classification`, `step_progress`, `hit`,
-    `generation`, `followup`, `eval`, and `done` milestones. The A2A retrieval skill uses that path directly so
-    retrieval progress is forwarded into the A2A queue as it is produced.
 - Trusted-principal auth
   - Antfly can accept `X-Antfly-Trusted-Principal: <token>` from a trusted upstream proxy when
     `ANTFLY_TRUSTED_PRINCIPAL_SECRET` is configured.
@@ -82,16 +61,14 @@ The Go implementation uses mature protocol SDKs:
   - `backup`
   - `restore`
   - `batch`
-- Antfly A2A skills
-  - `query-builder`
-  - `retrieval`
 
 ## MCP Query Request Design
 
 MCP is the deterministic database control and retrieval surface. It should expose exact table/index/document/query
 operations, schema/capability discovery, and raw request pass-through. It should not duplicate the agentic query
-planner. Natural-language query planning belongs in the A2A `query-builder` skill, which can inspect context, propose a
-query plan, and then call MCP `query` with either shorthand args or a raw `queryRequest`.
+planner. Natural-language query planning belongs in native `/agents/query-builder` or the A2A `query-builder` skill,
+which can inspect context, propose a query plan, and then call MCP `query` with either shorthand args or a raw
+`queryRequest`.
 
 The MCP `query` tool has two modes:
 
@@ -151,7 +128,7 @@ without needing to scrape broad list responses:
 - `sample_documents` calls the existing lookup/scan route with bounded `limit` and optional `from`, `to`,
   `inclusiveFrom`, and `fields` arguments. It is for schema/content inspection, not agentic retrieval planning.
 - `describe_mcp_capabilities` returns MCP transport/session capabilities, deterministic tool categories, raw
-  `queryRequest` support, shorthand query args, and the A2A `query-builder` handoff guidance.
+  `queryRequest` support, shorthand query args, and native-agent query-builder handoff guidance.
 
 These tools route through the same HTTP handlers as REST calls where possible. That keeps auth, permission checks,
 validation, and error behavior aligned with the product API.
@@ -159,20 +136,15 @@ validation, and error behavior aligned with the product API.
 ## Verification
 
 - `zig build lib-mcp-test`
-- `zig build lib-a2a-test`
 - `zig build raft-transport-test`
 - `zig build lib-api-auth-test`
-- `zig build public-api-parity-test -- --test-filter "retrieval agent event sink receives live milestones" "api http server serves retrieval agent event stream"`
 - `zig build root-test -- --test-filter "api http server serves fielded full-text search through mcp tools"`
-- `go test ./src/mcp ./src/metadata`
+- `go test ./src/mcp`
 
-The API auth test bucket includes an HTTP-level coverage test for MCP initialize, the A2A well-known agent card, and
-the A2A card JSON-RPC method. It also covers MCP session response headers, MCP GET event-stream endpoint framing, A2A
-`message/stream` SSE framing, and A2A `tasks/get`/`tasks/cancel`. The raft transport test bucket covers the optional
-chunked streaming response path in `StdHttpListener`.
+The API auth test bucket includes HTTP-level coverage for MCP initialize. It also covers MCP session response headers
+and MCP GET event-stream endpoint framing.
 
-The standalone protocol tests also cover parse errors, invalid params, unknown MCP tools, unknown A2A skills, and
-missing A2A tasks.
+The standalone protocol tests also cover parse errors, invalid params, and unknown MCP tools.
 
 ## Known Gaps
 
@@ -182,11 +154,9 @@ missing A2A tasks.
   implemented yet.
 - MCP has a line-oriented stdio JSON-RPC dispatcher in `go/pkg/antfly/lib/mcp`; the product CLI does not yet expose a long-running
   stdio server mode. This is also not exposed by Antfly's Go product code, even though the Go SDK supports it.
-- A2A task storage is in-memory only. That matches the current Antfly Go mount; durable storage is still out of scope
-  until product requirements demand it.
-- The Antfly adapters now live in `protocol_adapters.zig`. They can be split further into dedicated MCP and A2A modules
-  if either surface grows.
-- Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP/A2A
+- The Antfly adapters now live in `protocol_adapters.zig`. MCP-specific adapter code can move to a dedicated module if
+  the surface grows.
+- Protocol structs are intentionally minimal. Dynamic `std.json.Value` remains the extension path for evolving MCP
   fields and tool payloads.
 - MCP schemas are generated from Antfly MCP tool descriptors and cover the current Go-parity tool arguments. They are
   not yet derived from generated OpenAPI or Zig request structs. The raw `queryRequest` field deliberately uses a
@@ -202,11 +172,10 @@ The next durability improvements should be:
 
 1. Add MCP historical event replay if clients need more than cursor-aware stream continuation.
 2. Expose the `go/pkg/antfly/lib/mcp` stdio dispatcher through a product CLI/server mode if local agent hosts need it.
-3. Add durable task store plumbing if A2A task state needs to survive process restart.
-4. Broaden adapter failure mapping, tool schema stability tests, and cross-language MCP parity tests.
-5. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
+3. Broaden adapter failure mapping, tool schema stability tests, and cross-language MCP parity tests.
+4. Consider deriving MCP tool schemas from generated OpenAPI or Zig request structs if the tool surface continues to
    expand.
 
 For Go product parity, the only remaining behavior difference worth tracking is MCP historical replay after
 `Last-Event-ID`. The other items above are product extensions or maintainability improvements, not missing behavior in
-the current Antfly Go MCP/A2A mount.
+the current Antfly Go MCP mount.

@@ -68,6 +68,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        ModelNotFound,
         InternalFailure,
     };
 
@@ -76,6 +77,7 @@ pub const TableApi = struct {
         DocIdentityUnavailable,
         ReadRequiresPrimary,
         ReadUnavailable,
+        ModelNotFound,
         InternalFailure,
     };
 
@@ -505,6 +507,10 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
             },
+            error.ModelNotFound => {
+                std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
+                return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") };
+            },
             error.InternalFailure => {
                 std.log.err("public table query failed table={s} err={}", .{ table_name, err });
                 return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") };
@@ -554,6 +560,7 @@ pub fn handleTableQueryView(
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
     };
     return .{

@@ -94,7 +94,7 @@ Type@60ms `  --semantic-search "What are the major events in Korean history?" \`
 Enter
 Type@60ms `  -i title_body --fields "title,body" --limit 5 \`
 Enter
-Type@60ms `  --generator '{"provider": "gemini", "model": "gemini-2.5-flash"}' \`
+Type@60ms `  --generator '{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF","max_tokens":128}' \`
 Enter
 Type@60ms `  --max-context-tokens 2048 \`
 Enter

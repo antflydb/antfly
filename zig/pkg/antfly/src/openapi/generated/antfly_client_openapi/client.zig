@@ -18,9 +18,10 @@ pub fn ApiResponse(comptime T: type) type {
         }
 
         pub fn fromResponse(allocator: std.mem.Allocator, resp: *httpx.Response) @This() {
+            defer resp.deinit();
             if (resp.ok()) {
                 if (resp.body) |body| {
-                    const parsed = std.json.parseFromSlice(T, allocator, body, .{}) catch {
+                    const parsed = std.json.parseFromSlice(T, allocator, body, .{ .allocate = .alloc_always }) catch {
                         return .{ .status_code = resp.status.code, .allocator = allocator };
                     };
                     return .{ .status_code = resp.status.code, .data = parsed, .allocator = allocator };
@@ -94,6 +95,7 @@ pub const RawResponse = struct {
 
     pub fn deinit(self: *@This()) void {
         if (self.body) |b| self.allocator.free(b);
+        if (self.content_type) |ct| self.allocator.free(ct);
     }
 };
 
@@ -438,7 +440,8 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// List all tables
@@ -573,7 +576,8 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Retrieve a document by key
@@ -1077,7 +1081,8 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// OpenAI Chat Completions endpoint
@@ -1088,7 +1093,8 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = resp.contentType(), .allocator = self.allocator };
+        defer resp.deinit();
+        return .{ .status_code = resp.status.code, .body = if (resp.body) |b| (self.allocator.dupe(u8, b) catch null) else null, .content_type = if (resp.contentType()) |ct| (self.allocator.dupe(u8, ct) catch null) else null, .allocator = self.allocator };
     }
 
     /// Rewrite text using Seq2Seq models

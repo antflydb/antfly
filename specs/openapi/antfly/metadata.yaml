@@ -4647,6 +4647,18 @@ components:
           $ref: "#/components/schemas/PruneStats"
           description: Token pruning statistics, present when max_context_tokens was configured
 
+    RetrievalStepConfig:
+      type: object
+      description: |
+        Configuration for the retrieval step. Retrieval tools are constrained by
+        the top-level request tools policy when both are present.
+      properties:
+        tools:
+          $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
+          description: |
+            Tool configuration for the retrieval step. When set, this narrows
+            the top-level tools policy for retrieval execution.
+
     RetrievalAgentSteps:
       type: object
       description: |
@@ -4654,18 +4666,17 @@ components:
         Each step can have its own generator (or chain of generators) and step-specific options.
         If a step is not configured, it is skipped (retrieval always runs).
       properties:
-        tools:
-          $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
-          description: |
-            Tool configuration for the retrieval agent. Controls which tools
-            are available and their settings. If not specified, tools are
-            automatically determined from the table's available indexes.
         classification:
           $ref: "generating.yaml#/components/schemas/ClassificationStepConfig"
           description: |
             Configuration for query classification and transformation.
             When set, runs classification before retrieval to select the optimal
             strategy (simple/decompose/step_back/hyde) and transform the query.
+        retrieval:
+          $ref: "#/components/schemas/RetrievalStepConfig"
+          description: |
+            Configuration for retrieval tool execution. Retrieval-step tools
+            narrow the top-level tools policy when both are provided.
         generation:
           $ref: "generating.yaml#/components/schemas/GenerationStepConfig"
           description: |
@@ -4798,9 +4809,15 @@ components:
           items:
             $ref: "../shared/generating.yaml#/components/schemas/ChainLink"
           description: Chain of generators
+        tools:
+          $ref: "generating.yaml#/components/schemas/ChatToolsConfig"
+          description: |
+            Default tool policy for this agent run. Step-specific tool policies
+            narrow this default for their step; retrieval currently uses
+            steps.retrieval.tools.
         steps:
           $ref: "#/components/schemas/RetrievalAgentSteps"
-          description: Tool and step configuration
+          description: Step configuration
         document_renderer:
           type: string
           description: |
