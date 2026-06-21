@@ -1130,12 +1130,18 @@ pub const NativeFile = struct {
 
     pub fn copyStableSnapshotToPath(self: *NativeFile, dest_path: []const u8, replace: bool) !StableSnapshotReport {
         if (std.mem.eql(u8, self.path, dest_path)) return error.InvalidNativeSnapshotPath;
+        const dest_exists = pathExists(self.io_impl.io(), dest_path);
+        if (!replace and dest_exists) return error.PathAlreadyExists;
+
+        var dest_lock = try lockWriterPath(self.allocator, dest_path);
+        defer dest_lock.close();
+
+        if (!replace and !dest_exists and pathExists(self.io_impl.io(), dest_path)) return error.PathAlreadyExists;
 
         const checkpoint = self.activeCheckpoint();
         const snapshot_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
         const source_size = (try self.file.stat(self.io_impl.io())).size;
         if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
-        if (!replace and pathExists(self.io_impl.io(), dest_path)) return error.PathAlreadyExists;
 
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp-aflite-snapshot", .{dest_path});
         defer self.allocator.free(tmp_path);
@@ -3536,6 +3542,33 @@ test "lite native stable snapshot copies committed prefix without tail bytes" {
     const doc = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
     defer allocator.free(doc);
     try std.testing.expectEqualStrings("{\"title\":\"one\"}", doc);
+}
+
+test "lite native stable snapshot holds output writer lock before staging" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const source_path = try testPath(allocator, tmp, "native-snapshot-lock-source.aflite");
+    defer allocator.free(source_path);
+    const snapshot_path = try testPath(allocator, tmp, "native-snapshot-lock-copy.aflite");
+    defer allocator.free(snapshot_path);
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-aflite-snapshot", .{snapshot_path});
+    defer allocator.free(tmp_path);
+
+    {
+        var file = try NativeFile.create(allocator, source_path);
+        defer file.close();
+        try file.putDocument("doc:visible", "visible");
+    }
+
+    var dest_lock = try lockWriterPath(allocator, snapshot_path);
+    defer dest_lock.close();
+
+    try std.testing.expectError(error.WouldBlock, copyStableSnapshot(allocator, source_path, snapshot_path, false));
+    try std.testing.expect(!pathExists(std.testing.io, snapshot_path));
+    try std.testing.expect(!pathExists(std.testing.io, tmp_path));
 }
 
 test "lite native vacuum rewrites live catalog and document records" {
