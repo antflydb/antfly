@@ -31,6 +31,7 @@ pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 const LiteDb = struct {
     backend: backend.Handle,
     db: db_mod.DB,
+    open_mode: db_mod.OpenOptions.OpenMode,
 
     fn open(allocator: Allocator, path: []const u8, open_mode: db_mod.OpenOptions.OpenMode) !LiteDb {
         var lite_backend = try backend.Handle.open(allocator, path, .{
@@ -47,15 +48,27 @@ const LiteDb = struct {
         return .{
             .backend = lite_backend,
             .db = try db_mod.DB.open(allocator, path, opts),
+            .open_mode = open_mode,
         };
     }
 
     fn close(self: *LiteDb) void {
+        if (liteOpenModeCanWrite(self.open_mode)) {
+            self.db.sync(true) catch {};
+            self.db.syncIndexes(true) catch {};
+        }
         self.db.close();
         self.backend.deinit();
         self.* = undefined;
     }
 };
+
+fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
+    return switch (open_mode) {
+        .writer, .writer_no_replay => true,
+        else => false,
+    };
+}
 
 pub fn isImportTargetEmpty(allocator: Allocator, db: *db_mod.DB) !bool {
     if (try db.primaryDocCount(allocator) != 0) return false;
@@ -556,6 +569,38 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 fn freeBackupShards(allocator: Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(allocator);
     allocator.free(@constCast(shards));
+}
+
+test "lite restore staging writer close syncs unsynced batch before readonly reopen" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-staging-close-sync.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    {
+        var lite = try LiteDb.open(allocator, path, .writer);
+        defer lite.close();
+
+        try lite.db.batch(.{
+            .writes = &.{.{
+                .key = "doc:restore-staging-close-sync",
+                .value = "{\"title\":\"restore staging close persists\"}",
+            }},
+            .sync_level = .propose,
+        });
+    }
+
+    {
+        var reopened = try LiteDb.open(allocator, path, .query_readonly);
+        defer reopened.close();
+
+        var result = (try reopened.db.lookup(allocator, "doc:restore-staging-close-sync", .{})) orelse return error.MissingRestoredLiteDocument;
+        defer result.deinit(allocator);
+        try std.testing.expect(std.mem.indexOf(u8, result.json, "\"restore staging close persists\"") != null);
+    }
 }
 
 test "lite restore staging preserves portable afb schema index and enrichment metadata" {
