@@ -39,9 +39,10 @@ typedef enum antfly_error_code {
  * - antfly_buffer is owned output. On success, the caller owns the returned
  *   memory and must release it with antfly_buffer_free, or
  *   antfly_buffer_free_zero when the bytes may contain sensitive data.
- * - Functions with an antfly_buffer *out reset the output to {NULL, 0} before
- *   validating arguments. Unless the function returns ANTFLY_OK, callers must
- *   treat the output as empty.
+ * - Lite status, maintenance, backup, restore, check, and snapshot helpers
+ *   reset antfly_buffer outputs to {NULL, 0} before validating arguments.
+ *   Lower-level antfly_db_* buffer APIs require a valid output pointer and
+ *   only transfer ownership after ANTFLY_OK.
  * - void * database handles are owned by the caller after a successful open and
  *   must be closed with antfly_db_close. Closing NULL is allowed.
  * - Search result structs own nested allocations only after ANTFLY_OK and must
