@@ -2029,7 +2029,7 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .reclaimable_bytes = 0,
         }, issueForDecodeError(err));
     };
-    _ = selectCompleteCheckpointForFile(header, file_size) catch {
+    _ = selectCompleteCheckpointForFile(header, file_size) catch |err| {
         const checkpoint = header.checkpoints[header.active_checkpoint];
         const expected_size = checkpointPrefixSize(checkpoint, header.page_size) catch 0;
         return invalidCheck(.{
@@ -2037,12 +2037,15 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .file_size = file_size,
             .valid_prefix_size = file_size,
             .tail_bytes = 0,
-            .record_count = if (checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
+            .record_count = if (expected_size > 0 and checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
             .live_file_count = 0,
             .live_bytes = 0,
             .compact_size = expected_size,
             .reclaimable_bytes = 0,
-        }, "truncated_file");
+        }, switch (err) {
+            error.InvalidNativeCheckpoint => "invalid_checkpoint",
+            error.TruncatedNativeFile => "truncated_file",
+        });
     };
     var native_file = try NativeFile.open(allocator, path, true);
     defer native_file.close();
@@ -2205,10 +2208,14 @@ fn selectActiveCheckpoint(
 fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
     var best: ?u8 = null;
     var saw_valid_slot = false;
+    var saw_invalid_size = false;
     for (header.checkpoints, 0..) |slot, index| {
         if (!validCheckpointSlot(slot)) continue;
         saw_valid_slot = true;
-        const expected_size = checkpointPrefixSize(slot, header.page_size) catch continue;
+        const expected_size = checkpointPrefixSize(slot, header.page_size) catch {
+            saw_invalid_size = true;
+            continue;
+        };
         if (expected_size > file_size) continue;
         const slot_index: u8 = @intCast(index);
         if (best) |best_index| {
@@ -2223,6 +2230,7 @@ fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
         }
     }
     if (best) |index| return index;
+    if (saw_invalid_size) return error.InvalidNativeCheckpoint;
     return if (saw_valid_slot) error.TruncatedNativeFile else error.InvalidNativeCheckpoint;
 }
 
@@ -3958,4 +3966,47 @@ test "lite native checkFile reports invalid checkpoint metadata separately from 
     const report = try checkFile(allocator, path);
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_checkpoint", report.issue.?);
+}
+
+test "lite native checkFile reports checkpoint prefix overflow as invalid metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-check-checkpoint-overflow.aflite");
+    defer allocator.free(path);
+
+    {
+        var file = try NativeFile.create(allocator, path);
+        defer file.close();
+        try file.putDocument("doc:1", "value");
+    }
+
+    var header_bytes = try readHeaderForTest(path);
+    var header = try decodeHeader(&header_bytes);
+    for (&header.checkpoints, 0..) |*slot, index| {
+        slot.* = .{
+            .commit_sequence = @as(u64, @intCast(index + 1)),
+            .catalog_root_page = 0,
+            .document_root_page = 0,
+            .index_catalog_root_page = 0,
+            .free_map_root_page = 0,
+            .page_count = std.math.maxInt(u64),
+        };
+    }
+    encodeHeader(&header_bytes, header);
+
+    {
+        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(std.testing.io);
+        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
+        try raw.sync(std.testing.io);
+    }
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(!report.valid);
+    try std.testing.expectEqualStrings("invalid_checkpoint", report.issue.?);
+    try std.testing.expectEqual(@as(u64, 0), report.record_count);
+    try std.testing.expectEqual(@as(u64, 0), report.compact_size);
 }
