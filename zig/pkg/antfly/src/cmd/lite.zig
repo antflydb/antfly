@@ -2685,14 +2685,15 @@ test "lite status json includes pending work" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"configured\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"remote_provider_configured\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"local_runtime_configured\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"local_runtime_available\":false") != null);
+    const native_local_runtime_available = antfly.lite.backend.capabilitiesForProfile(.native).local_inference_runtime;
+    try std.testing.expect(std.mem.indexOf(u8, json, if (native_local_runtime_available) "\"local_runtime_available\":true" else "\"local_runtime_available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"capabilities\":") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"manual_maintenance\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"background_enrichment_runtime\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"caller_supplied_artifacts\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"local_inference_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"raft_replication\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cluster_placement\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"cross_node_joins\":false") != null);

@@ -385,8 +385,16 @@ fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
+fn hasMode(modes: []const []const u8, expected: []const u8) bool {
+    for (modes) |mode| {
+        if (std.mem.eql(u8, mode, expected)) return true;
+    }
+    return false;
+}
+
 test "lite backend capabilities distinguish native and hosted profiles" {
     const native_caps = capabilitiesForProfile(.native);
+    const local_runtime_available = native_caps.local_inference_runtime;
     try std.testing.expect(!native_caps.hosted_profile);
     try std.testing.expect(!native_caps.manual_maintenance);
     try std.testing.expect(native_caps.generated_enrichment_planning);
@@ -397,7 +405,7 @@ test "lite backend capabilities distinguish native and hosted profiles" {
     try std.testing.expect(native_caps.no_inference_configured_ok);
     try std.testing.expect(native_caps.caller_supplied_artifacts);
     try std.testing.expect(native_caps.caller_supplied_embeddings);
-    try std.testing.expect(!native_caps.local_inference_runtime);
+    try std.testing.expectEqual(local_runtime_available, hasMode(native_caps.available_inference_modes, "local_embedded"));
     try std.testing.expect(native_caps.text_search);
     try std.testing.expect(native_caps.hybrid_search);
     try std.testing.expect(native_caps.graph_search);
@@ -421,10 +429,14 @@ test "lite backend capabilities distinguish native and hosted profiles" {
 
     const local_status = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
     const local_caps = capabilitiesForProfileWithInferenceStatus(.native, local_status);
-    try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_caps.inference_mode);
-    try std.testing.expect(!local_caps.local_inference_runtime);
-    for (local_caps.available_inference_modes) |mode| {
-        try std.testing.expect(!std.mem.eql(u8, mode, "local_embedded"));
+    if (local_runtime_available) {
+        try std.testing.expectEqualStrings("local_embedded", local_caps.inference_mode);
+        try std.testing.expect(local_caps.local_inference_runtime);
+        try std.testing.expect(hasMode(local_caps.available_inference_modes, "local_embedded"));
+    } else {
+        try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_caps.inference_mode);
+        try std.testing.expect(!local_caps.local_inference_runtime);
+        try std.testing.expect(!hasMode(local_caps.available_inference_modes, "local_embedded"));
     }
 }
 
@@ -479,10 +491,13 @@ test "lite backend capabilities contract is stable" {
     const native_available_modes =
         if (freestanding)
             "[\"caller_supplied_artifacts\",\"disabled_deferred\"]"
+        else if (capabilitiesForProfile(.native).local_inference_runtime)
+            "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"disabled_deferred\"]"
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]";
     const supported_modes_json = "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]";
-    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const native_local_runtime_available = capabilitiesForProfile(.native).local_inference_runtime;
+    const expected_native = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":false,\"manual_maintenance\":false,\"background_enrichment_runtime\":{},\"ttl_cleanup_runtime\":{},\"transaction_recovery_runtime\":{},\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         !freestanding,
@@ -492,6 +507,7 @@ test "lite backend capabilities contract is stable" {
         supported_modes_json,
         native_available_modes,
         !freestanding,
+        native_local_runtime_available,
     });
     defer allocator.free(expected_native);
     try std.testing.expectEqualStrings(expected_native, native_json);
@@ -501,15 +517,19 @@ test "lite backend capabilities contract is stable" {
     const hosted_available_modes =
         if (freestanding)
             "[\"caller_supplied_artifacts\",\"manual_maintenance\",\"disabled_deferred\"]"
+        else if (capabilitiesForProfile(.hosted).local_inference_runtime)
+            "[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"manual_maintenance\",\"disabled_deferred\"]"
         else
             "[\"caller_supplied_artifacts\",\"remote_provider\",\"manual_maintenance\",\"disabled_deferred\"]";
-    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":false,\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
+    const hosted_local_runtime_available = capabilitiesForProfile(.hosted).local_inference_runtime;
+    const expected_hosted = try std.fmt.allocPrint(allocator, "{{\"freestanding_build\":{},\"hosted_profile\":true,\"manual_maintenance\":true,\"background_enrichment_runtime\":false,\"ttl_cleanup_runtime\":false,\"transaction_recovery_runtime\":false,\"local_template_rendering\":true,\"remote_template_rendering\":{},\"remote_template_host_callbacks\":{},\"inference_mode\":\"caller_supplied_or_disabled\",\"supported_inference_modes\":{s},\"available_inference_modes\":{s},\"inference_required\":false,\"no_inference_configured_ok\":true,\"caller_supplied_artifacts\":true,\"caller_supplied_embeddings\":true,\"remote_inference_providers\":{},\"local_inference_runtime\":{},\"generated_enrichment_planning\":true,\"text_search\":true,\"dense_vector_search\":true,\"sparse_vector_search\":true,\"hybrid_search\":true,\"graph_search\":true,\"distributed_shard_ownership\":false,\"raft_replication\":false,\"cluster_placement\":false,\"cross_node_joins\":false,\"remote_shard_fanout\":false,\"distributed_transaction_coordination\":false,\"cluster_heartbeat_status_aggregation\":false,\"server_side_autoscaling\":false,\"kubernetes_operator\":false,\"object_storage_primary\":false}}", .{
         freestanding,
         !freestanding,
         freestanding,
         supported_modes_json,
         hosted_available_modes,
         !freestanding,
+        hosted_local_runtime_available,
     });
     defer allocator.free(expected_hosted);
     try std.testing.expectEqualStrings(expected_hosted, hosted_json);
@@ -540,7 +560,7 @@ test "lite backend inference status reports disabled as clean state" {
     try std.testing.expect(!status.configured);
     try std.testing.expect(!status.remote_provider_configured);
     try std.testing.expect(!status.local_runtime_configured);
-    try std.testing.expect(!status.local_runtime_available);
+    try std.testing.expectEqual(capabilitiesForProfile(.native).local_inference_runtime, status.local_runtime_available);
     try std.testing.expect(status.caller_supplied_artifacts);
     try std.testing.expect(status.no_inference_configured_ok);
 
@@ -561,19 +581,22 @@ test "lite backend inference status reflects explicit remote provider configurat
     try std.testing.expect(remote.configured);
     try std.testing.expect(remote.remote_provider_configured);
     try std.testing.expect(!remote.local_runtime_configured);
-    try std.testing.expect(!remote.local_runtime_available);
+    try std.testing.expectEqual(capabilitiesForProfile(.native).local_inference_runtime, remote.local_runtime_available);
     try std.testing.expect(remote.caller_supplied_artifacts);
     try std.testing.expect(remote.no_inference_configured_ok);
 
     const local_requested = inferenceStatusForProfileWithOptions(.native, .{ .local_runtime_configured = true });
-    try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
-    try std.testing.expect(!local_requested.configured);
+    if (capabilitiesForProfile(.native).local_inference_runtime) {
+        try std.testing.expectEqualStrings("local_embedded", local_requested.mode);
+        try std.testing.expect(local_requested.configured);
+    } else {
+        try std.testing.expectEqualStrings("caller_supplied_or_disabled", local_requested.mode);
+        try std.testing.expect(!local_requested.configured);
+    }
     try std.testing.expect(!local_requested.remote_provider_configured);
     try std.testing.expect(local_requested.local_runtime_configured);
-    try std.testing.expect(!local_requested.local_runtime_available);
-    for (local_requested.available_modes) |mode| {
-        try std.testing.expect(!std.mem.eql(u8, mode, "local_embedded"));
-    }
+    try std.testing.expectEqual(capabilitiesForProfile(.native).local_inference_runtime, local_requested.local_runtime_available);
+    try std.testing.expectEqual(capabilitiesForProfile(.native).local_inference_runtime, hasMode(local_requested.available_modes, "local_embedded"));
 }
 
 test "lite backend native engine creates and checks aflite file" {

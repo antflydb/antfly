@@ -126,9 +126,16 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
     const freestanding = builtin.os.tag == .freestanding;
     const hosted = profile == .hosted;
     const available_modes: []const []const u8 = if (hosted)
-        if (freestanding) &hosted_freestanding_available_inference_modes else &hosted_available_inference_modes
+        if (freestanding)
+            &hosted_freestanding_available_inference_modes
+        else if (local_inference_runtime_available)
+            &hosted_local_available_inference_modes
+        else
+            &hosted_available_inference_modes
     else if (freestanding)
         &native_freestanding_available_inference_modes
+    else if (local_inference_runtime_available)
+        &native_local_available_inference_modes
     else
         &native_available_inference_modes;
     return .{

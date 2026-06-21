@@ -518,8 +518,7 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("remote inference status = %#v", remoteStatus.Inference)
 	}
 	if remoteStatus.Capabilities.InferenceMode != InferenceModeRemoteProvider ||
-		!remoteStatus.Capabilities.RemoteInferenceProviders ||
-		remoteStatus.Capabilities.LocalInferenceRuntime {
+		!remoteStatus.Capabilities.RemoteInferenceProviders {
 		t.Fatalf("remote inference status capabilities = %#v", remoteStatus.Capabilities)
 	}
 
@@ -543,21 +542,26 @@ func TestLiteCAPI(t *testing.T) {
 	if err := localDB.Close(); err != nil {
 		t.Fatalf("close local inference Lite database: %v", err)
 	}
-	if localStatus.Inference.Mode != InferenceModeCallerSuppliedOrDisabled ||
-		localStatus.Inference.Configured ||
+	localRuntimeAvailable := localCaps.LocalInferenceRuntime
+	expectedLocalMode := InferenceModeCallerSuppliedOrDisabled
+	if localRuntimeAvailable {
+		expectedLocalMode = InferenceModeLocalEmbedded
+	}
+	if localStatus.Inference.Mode != expectedLocalMode ||
+		localStatus.Inference.Configured != localRuntimeAvailable ||
 		localStatus.Inference.RemoteProviderConfigured ||
 		!localStatus.Inference.LocalRuntimeConfigured ||
-		localStatus.Inference.LocalRuntimeAvailable {
+		localStatus.Inference.LocalRuntimeAvailable != localRuntimeAvailable {
 		t.Fatalf("local inference status = %#v", localStatus.Inference)
 	}
-	if localStatus.Capabilities.InferenceMode != InferenceModeCallerSuppliedOrDisabled ||
-		localStatus.Capabilities.LocalInferenceRuntime ||
-		containsString(localStatus.Capabilities.AvailableInferenceModes, InferenceModeLocalEmbedded) {
+	if localStatus.Capabilities.InferenceMode != expectedLocalMode ||
+		localStatus.Capabilities.LocalInferenceRuntime != localRuntimeAvailable ||
+		containsString(localStatus.Capabilities.AvailableInferenceModes, InferenceModeLocalEmbedded) != localRuntimeAvailable {
 		t.Fatalf("local inference status capabilities = %#v", localStatus.Capabilities)
 	}
-	if localCaps.InferenceMode != InferenceModeCallerSuppliedOrDisabled ||
-		localCaps.LocalInferenceRuntime ||
-		containsString(localCaps.AvailableInferenceModes, InferenceModeLocalEmbedded) {
+	if localCaps.InferenceMode != expectedLocalMode ||
+		localCaps.LocalInferenceRuntime != localRuntimeAvailable ||
+		containsString(localCaps.AvailableInferenceModes, InferenceModeLocalEmbedded) != localRuntimeAvailable {
 		t.Fatalf("local inference capabilities = %#v", localCaps)
 	}
 
