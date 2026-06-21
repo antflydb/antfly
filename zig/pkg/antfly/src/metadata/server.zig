@@ -36,6 +36,7 @@ pub const MetadataServerConfig = struct {
     http: raft_managed_host.ManagedHttpHostConfig,
     service: service.MetadataServiceConfig = .{},
     admin_listener: ?raft_transport.StdHttpListenerConfig = null,
+    api_server_cfg: public_api_http_server.ApiHttpServerConfig = .{},
     reconciler_config: metadata_mod.Reconciler.Config = .{},
 };
 
@@ -148,15 +149,18 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
+            _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
+            _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             owned_public_write_source = public_write_source;
+
+            var api_server_cfg = cfg.api_server_cfg;
+            api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
+            api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
             public_http_server.* = public_api_http_server.ApiHttpServer.init(
                 alloc,
-                .{
-                    .shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null,
-                    .shard_db_adapter = owned_hosted_shard_db.?.adapter(),
-                },
+                api_server_cfg,
                 public_api_http_server.StatusSource.fromMetadataHttpService(svc),
                 public_read_source.source(),
                 public_write_source.source(),
@@ -919,4 +923,110 @@ test "metadata server can expose admin listener endpoints" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.value.tables[0].name);
+}
+
+test "metadata admin mux routes public db v1 requests through public api server" {
+    const raft_engine = @import("raft_engine");
+
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .build_descriptor = buildDescriptor,
+                    .free_descriptor = freeDescriptor,
+                },
+            };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = .persisted,
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-mux-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-mux-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-mux-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+
+    var server = try MetadataServer.init(std.testing.allocator, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .local_node_id = 1,
+                    .metadata_group_id = 1992,
+                    .replica_root_dir = replica_root,
+                    .replica_catalog_path = replica_catalog_path,
+                },
+                .transport = .{
+                    .snapshot = .{ .root_dir = snapshot_root },
+                },
+            },
+        },
+        .admin_listener = .{},
+        .api_server_cfg = .{
+            .auth_enabled = true,
+            .trusted_principal_secret = "shared-secret",
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .http = .{
+                    .host = .{
+                        .descriptor_factory = factory.iface(),
+                    },
+                },
+            },
+        },
+    });
+    defer server.deinit();
+
+    try std.testing.expect(server.owned_public_http_server != null);
+    try std.testing.expect(server.owned_admin_mux != null);
+    try std.testing.expect(server.owned_public_http_server.?.cfg.auth_enabled);
+    try std.testing.expectEqualStrings("shared-secret", server.owned_public_http_server.?.cfg.trusted_principal_secret.?);
+    try std.testing.expect(MetadataAdminMux.isPublicApiRequest("/db/v1/status"));
+
+    var response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .GET,
+        .uri = "/db/v1/status",
+    });
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), response.status);
 }

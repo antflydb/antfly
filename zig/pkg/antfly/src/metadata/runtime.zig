@@ -26,6 +26,8 @@ const platform_time = @import("../platform/time.zig");
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
 const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
+const trusted_principal_secret_key = "antfly.trusted_principal.secret";
+const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
@@ -69,6 +71,7 @@ const CliConfig = struct {
     snapshot_root_dir: ?[]const u8 = null,
     extension_package_store_dir: ?[]const u8 = null,
     secret_store_path: ?[]const u8 = null,
+    auth_enabled: ?bool = null,
     help: bool = false,
 };
 
@@ -133,12 +136,14 @@ const ResolvedPaths = struct {
     replica_root_dir: []u8,
     replica_catalog_path: []u8,
     snapshot_root_dir: []u8,
+    auth_store_root_dir: []u8,
     extension_package_store_dir: []u8,
 
     fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
+        alloc.free(self.auth_store_root_dir);
         alloc.free(self.extension_package_store_dir);
     }
 };
@@ -313,6 +318,7 @@ pub const ServerConfig = struct {
     reconciler_config: antfly.metadata.reconciler.Reconciler.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
+    api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
 };
 
 const MetadataRaftStorageDiagnostics = struct {
@@ -443,6 +449,7 @@ pub const Server = struct {
                 .bind_port = cfg.admin_bind_port,
             },
             .service = service_cfg,
+            .api_server_cfg = cfg.api_server_cfg,
             .reconciler_config = cfg.reconciler_config,
         }, .{
             .http = .{
@@ -713,12 +720,20 @@ pub fn runFromIterator(
 
     const resolved = try resolvePaths(alloc, cli, if (loaded_config) |*cfg| cfg else null);
     defer resolved.deinit(alloc);
+    const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    const trusted_principal_secret = try resolveTrustedPrincipalSecret(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_secret) |value| alloc.free(value);
+    const effective_auth_enabled = auth_enabled or trusted_principal_secret != null;
 
     var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     try ensureDirPath(setup_io.io(), resolved.replica_root_dir);
     try ensureParent(setup_io.io(), resolved.replica_catalog_path);
     try ensureDirPath(setup_io.io(), resolved.snapshot_root_dir);
+    try fs_paths.createDirPathPortable(setup_io.io(), resolved.auth_store_root_dir);
 
     var active_audio_runtime = try antfly.common.audio_runtime.ActiveRuntime.init(
         alloc,
@@ -726,6 +741,36 @@ pub fn runFromIterator(
         if (loaded_config) |*cfg| cfg else null,
     );
     defer active_audio_runtime.deinit();
+
+    var auth_backend: ?antfly.lsm_backend.BackendHandle = null;
+    var auth_runtime: ?antfly.storage_backend_erased.NamespaceStore = null;
+    var auth_user_store: ?antfly.usermgr.StorageUserStore = null;
+    var auth_casbin_store: ?antfly.usermgr.StorageCasbinAdapter = null;
+    var user_manager: ?antfly.usermgr.UserManager = null;
+    if (auth_enabled) {
+        auth_backend = try antfly.lsm_backend.BackendHandle.open(alloc, resolved.auth_store_root_dir, .{});
+        errdefer if (auth_backend) |*backend| backend.close();
+        auth_runtime = try auth_backend.?.backend.runtimeNamespaceStore(alloc);
+        errdefer if (auth_runtime) |*runtime| runtime.deinit();
+        auth_user_store = antfly.usermgr.StorageUserStore.init(alloc, auth_runtime.?);
+        auth_casbin_store = antfly.usermgr.StorageCasbinAdapter.init(alloc, auth_runtime.?);
+        user_manager = try antfly.usermgr.UserManager.init(
+            alloc,
+            auth_user_store.?.iface(),
+            try antfly.usermgr.initDefaultEnforcer(alloc, auth_casbin_store.?.iface()),
+        );
+        errdefer if (user_manager) |*manager| manager.deinit();
+        try antfly.usermgr.ensureDefaultAdminUser(&user_manager.?);
+    }
+    defer if (user_manager) |*manager| manager.deinit();
+    defer if (auth_runtime) |*runtime| runtime.deinit();
+    defer if (auth_backend) |*backend| backend.close();
+
+    const trusted_principal_issuer = try resolveTrustedPrincipalIssuer(
+        alloc,
+        if (secret_store_initialized) &secret_store else null,
+    );
+    defer if (trusted_principal_issuer) |value| alloc.free(value);
 
     const local_node_id = cli.local_node_id orelse 1;
     const metadata_group_id = group_ids.main_metadata_group_id;
@@ -751,6 +796,17 @@ pub fn runFromIterator(
         .admin_bind_port = admin_listener.bind_port,
         .reconciler_config = shardAllocationReconcilerConfig(if (loaded_config) |*cfg| cfg else null),
         .secret_store = if (secret_store_initialized) &secret_store else null,
+        .api_server_cfg = .{
+            .auth_enabled = effective_auth_enabled,
+            .trusted_principal_secret = trusted_principal_secret,
+            .trusted_principal_issuer = trusted_principal_issuer,
+            .user_manager = if (user_manager) |*manager| manager else null,
+            .secret_store = if (secret_store_initialized) &secret_store else null,
+            .remote_content = if (loaded_config) |*cfg| if (cfg.remote_content) |*remote_content| remote_content else null else null,
+            .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
+            .extension_package_store_dir = resolved.extension_package_store_dir,
+            .node_config = if (loaded_config) |*cfg| cfg else null,
+        },
     });
     defer server.deinit();
     try server.start();
@@ -890,6 +946,14 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
             cfg.secret_store_path = args.next() orelse return error.InvalidArguments;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--auth")) {
+            cfg.auth_enabled = parseBoolFlag(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--auth=")) {
+            cfg.auth_enabled = parseBoolFlag(arg["--auth=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
         return error.InvalidArguments;
     }
     return cfg;
@@ -934,6 +998,12 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
         break :blk try normalizeResolvedPathAlloc(alloc, raw);
     };
     errdefer alloc.free(snapshot_root_dir);
+    const auth_store_root_dir = blk: {
+        const raw = try std.fmt.allocPrint(alloc, "{s}/auth", .{local_base});
+        defer alloc.free(raw);
+        break :blk try normalizeResolvedPathAlloc(alloc, raw);
+    };
+    errdefer alloc.free(auth_store_root_dir);
     const extension_package_store_dir = try resolveExtensionPackageStoreDir(alloc, cli.extension_package_store_dir, local_base);
     errdefer alloc.free(extension_package_store_dir);
 
@@ -941,6 +1011,7 @@ fn resolvePaths(alloc: std.mem.Allocator, cli: CliConfig, cfg: ?*const antfly.co
         .replica_root_dir = replica_root_dir,
         .replica_catalog_path = replica_catalog_path,
         .snapshot_root_dir = snapshot_root_dir,
+        .auth_store_root_dir = auth_store_root_dir,
         .extension_package_store_dir = extension_package_store_dir,
     };
 }
@@ -1233,6 +1304,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --extension-package-store <path>
         \\                                 Extension package store directory
         \\  --secret-store-path <path>     Antfly secrets.json file path
+        \\  --auth <true|false>            Enable public API auth on metadata (default: config)
         \\  -h, --help                     Show this help
         \\
     , .{argv0});
@@ -1241,6 +1313,52 @@ fn printUsage(argv0: []const u8) void {
 fn parseBoolFlag(raw: []const u8) ?bool {
     if (std.mem.eql(u8, raw, "true")) return true;
     if (std.mem.eql(u8, raw, "false")) return false;
+    return null;
+}
+
+fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) bool {
+    if (cli.auth_enabled) |value| return value;
+    if (cfg) |loaded| return loaded.auth_enabled;
+    return false;
+}
+
+fn resolveTrustedPrincipalSecret(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_secret_key);
+}
+
+fn resolveTrustedPrincipalIssuer(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+) !?[]u8 {
+    return try resolveTrustedPrincipalConfigValue(alloc, secret_store, trusted_principal_issuer_key);
+}
+
+fn resolveTrustedPrincipalConfigValue(
+    alloc: std.mem.Allocator,
+    secret_store: ?*antfly.common.secrets.FileStore,
+    key: []const u8,
+) !?[]u8 {
+    if (secret_store) |store| {
+        if (try store.getOwned(alloc, key)) |value| {
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
+            alloc.free(value);
+            return null;
+        }
+        return null;
+    }
+
+    const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
+    defer alloc.free(env_var);
+    const env_var_z = try alloc.dupeZ(u8, env_var);
+    defer alloc.free(env_var_z);
+    if (platform.env.getenvSlice(env_var_z)) |value| {
+        const raw = try alloc.dupe(u8, value);
+        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
+        alloc.free(raw);
+    }
     return null;
 }
 
@@ -1260,6 +1378,15 @@ test "metadata runtime cli accepts secret and extension package store paths" {
     const cfg = try parseCli(&iter);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_path.?);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
+}
+
+test "metadata runtime cli accepts auth flag" {
+    var argv = [_][*:0]const u8{
+        "--auth=true",
+    };
+    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    const cfg = try parseCli(&iter);
+    try std.testing.expectEqual(true, cfg.auth_enabled.?);
 }
 
 fn expectMetricPresent(output: []const u8, name: []const u8) !void {
@@ -1575,6 +1702,7 @@ test "metadata runtime resolves paths from common storage base dir" {
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/replicas", resolved.replica_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/catalog.txt", resolved.replica_catalog_path);
     try std.testing.expectEqualStrings("/tmp/antflydb/metadata/snapshots", resolved.snapshot_root_dir);
+    try std.testing.expectEqualStrings("/tmp/antflydb/auth", resolved.auth_store_root_dir);
     try std.testing.expectEqualStrings("/tmp/antflydb/extensions", resolved.extension_package_store_dir);
 }
 
