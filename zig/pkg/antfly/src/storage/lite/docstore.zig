@@ -856,6 +856,107 @@ test "lite native docstore runtime scans ordered snapshot" {
     try std.testing.expectEqualStrings("doc:c", seek.key);
 }
 
+test "lite native docstore persists replay lanes across reopen and truncation" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-replay.aflite");
+    defer allocator.free(path);
+
+    const changed_doc_keys = [_][]const u8{"doc:a"};
+    const deleted_doc_keys = [_][]const u8{"doc:gone"};
+    const hints = [_]change_journal_mod.TargetHint{ .full_text, .dense_vector };
+    const payload = try change_journal_mod.encodeRecord(allocator, .{
+        .sequence = 1,
+        .changed_doc_keys = changed_doc_keys[0..],
+        .deleted_doc_keys = deleted_doc_keys[0..],
+        .target_hints = hints[0..],
+    });
+    defer allocator.free(payload);
+
+    {
+        var store = try Store.open(allocator, path, false);
+        defer store.close();
+
+        var runtime = try store.runtimeStore(allocator);
+        defer runtime.deinit();
+
+        try runtime.appendReplayOpaque(allocator, 1, payload);
+        try std.testing.expectEqual(@as(u64, 1), runtime.lastReplaySequence(0));
+        try std.testing.expectEqual(@as(u64, 2), runtime.nextReplaySequence(0));
+    }
+
+    {
+        var store = try Store.open(allocator, path, true);
+        defer store.close();
+
+        var runtime = try store.runtimeStore(allocator);
+        defer runtime.deinit();
+
+        const entries = try runtime.iterateReplayFrom(allocator, 1);
+        defer {
+            for (entries) |*entry| entry.deinit(allocator);
+            allocator.free(entries);
+        }
+        try std.testing.expectEqual(@as(usize, 1), entries.len);
+        try std.testing.expectEqual(@as(u64, 1), entries[0].sequence);
+        try std.testing.expectEqualSlices(u8, payload, entries[0].payload);
+
+        const LaneContext = struct {
+            allocator: Allocator,
+            expected_hint: change_journal_mod.TargetHint,
+            count: usize = 0,
+
+            fn handle(ctx: *@This(), sequence: u64, lane_payload: []const u8) !void {
+                try std.testing.expectEqual(@as(u64, 1), sequence);
+                var decoded = try change_journal_mod.decodeRecord(ctx.allocator, lane_payload);
+                defer decoded.deinit();
+                try std.testing.expectEqual(@as(usize, 1), decoded.record.target_hints.len);
+                try std.testing.expectEqual(ctx.expected_hint, decoded.record.target_hints[0]);
+                ctx.count += 1;
+            }
+        };
+
+        var full_text_ctx = LaneContext{ .allocator = allocator, .expected_hint = .full_text };
+        const full_text_stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 1, 0, &full_text_ctx, LaneContext.handle);
+        try std.testing.expectEqual(@as(usize, 1), full_text_ctx.count);
+        try std.testing.expectEqual(@as(u64, 1), full_text_stats.last_sequence);
+
+        var dense_ctx = LaneContext{ .allocator = allocator, .expected_hint = .dense_vector };
+        const dense_stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.dense_vector), 1, 1, &dense_ctx, LaneContext.handle);
+        try std.testing.expectEqual(@as(usize, 1), dense_ctx.count);
+        try std.testing.expectEqual(@as(u64, 1), dense_stats.last_sequence);
+    }
+
+    {
+        var store = try Store.open(allocator, path, false);
+        defer store.close();
+
+        var runtime = try store.runtimeStore(allocator);
+        defer runtime.deinit();
+
+        try runtime.truncateReplayUpTo(allocator, 2);
+
+        const entries = try runtime.iterateReplayFrom(allocator, 1);
+        defer {
+            for (entries) |*entry| entry.deinit(allocator);
+            allocator.free(entries);
+        }
+        try std.testing.expectEqual(@as(usize, 0), entries.len);
+
+        const EmptyContext = struct {
+            fn handle(_: *@This(), _: u64, _: []const u8) !void {
+                return error.UnexpectedReplayRecord;
+            }
+        };
+        var empty_ctx = EmptyContext{};
+        const stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 1, 0, &empty_ctx, EmptyContext.handle);
+        try std.testing.expectEqual(@as(u64, 0), stats.matched_entries);
+    }
+}
+
 test "lite native docstore reserves one writer until abort or commit" {
     const allocator = std.testing.allocator;
 

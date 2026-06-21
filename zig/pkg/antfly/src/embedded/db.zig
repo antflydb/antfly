@@ -400,6 +400,7 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
 
     try std.testing.expectEqualStrings("aflite", status.storage.format);
     try std.testing.expectEqualStrings("native_single_file", status.storage.engine);
+    try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.storage.replay_layout);
     try std.testing.expectEqualStrings("__antfly_lite", status.storage.index_namespace.?);
     try std.testing.expectEqual(@as(?u32, 1), status.storage.format_version);
     try std.testing.expectEqual(@as(?u32, 4096), status.storage.page_size);

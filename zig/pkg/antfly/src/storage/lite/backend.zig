@@ -72,6 +72,7 @@ pub const StorageStatus = struct {
     format: []const u8 = "aflite",
     engine: []const u8,
     primary_layout: []const u8,
+    replay_layout: []const u8,
     index_layout: []const u8,
     index_namespace: ?[]const u8 = null,
     format_version: ?u32 = null,
@@ -205,6 +206,7 @@ pub const Handle = struct {
                 break :blk .{
                     .engine = @tagName(self.engine),
                     .primary_layout = "native_document_pages",
+                    .replay_layout = "native_replay_lanes_in_document_catalog",
                     .index_layout = "lsm_logical_files_in_native_index_catalog",
                     .index_namespace = native_index_base_path,
                     .format_version = native.format_version,
@@ -218,6 +220,7 @@ pub const Handle = struct {
                 .format = "aflite-internal",
                 .engine = @tagName(self.engine),
                 .primary_layout = "lsm_container",
+                .replay_layout = "lsm_container",
                 .index_layout = "lsm_container",
             },
         };
@@ -655,6 +658,7 @@ test "lite backend reports native storage status from active checkpoint" {
     try std.testing.expectEqualStrings("aflite", status.format);
     try std.testing.expectEqualStrings("native_single_file", status.engine);
     try std.testing.expectEqualStrings("native_document_pages", status.primary_layout);
+    try std.testing.expectEqualStrings("native_replay_lanes_in_document_catalog", status.replay_layout);
     try std.testing.expectEqualStrings("lsm_logical_files_in_native_index_catalog", status.index_layout);
     try std.testing.expectEqualStrings(native_index_base_path, status.index_namespace.?);
     try std.testing.expectEqual(native.format_version, status.format_version.?);
@@ -764,6 +768,7 @@ test "lite backend auto rejects internal bridge aflite files" {
         const status = handle.storageStatus();
         try std.testing.expectEqualStrings("aflite-internal", status.format);
         try std.testing.expectEqualStrings("bridge_lsm_container", status.engine);
+        try std.testing.expectEqualStrings("lsm_container", status.replay_layout);
         try std.testing.expect(status.index_namespace == null);
     }
 
