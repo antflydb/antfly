@@ -4235,6 +4235,11 @@ pub const DB = struct {
             .timestamp_ns = req.timestamp_ns,
             .sync_level = req.sync_level,
         };
+        if (self.core.schema) |runtime_schema| {
+            if (runtime_schema.system_versioned) {
+                try rejectSystemVersionedTableUserRowMutations(effective_req.writes, effective_req.deletes, effective_req.relational_identity_rewrites);
+            }
+        }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
 
         var effective_predicates = std.ArrayListUnmanaged(transactions_mod.VersionPredicate).empty;
@@ -8004,6 +8009,9 @@ pub const DB = struct {
             }
             break :blk relational_intents.items;
         };
+        if (self.core.schema) |runtime_schema| {
+            if (runtime_schema.system_versioned) try rejectSystemVersionedTableWriteIntents(effective_intents);
+        }
 
         var identity_upsert_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer identity_upsert_keys.deinit(self.alloc);
@@ -8021,6 +8029,14 @@ pub const DB = struct {
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
         var effective_ops = try coalesceKeyValueRequest(self, types.TransactionWrite, req.writes, req.deletes, req.transforms);
         defer effective_ops.deinit(self.alloc);
+        if (self.core.schema) |runtime_schema| {
+            if (runtime_schema.system_versioned) {
+                try rejectSystemVersionedTableUserRowMutations(effective_ops.writes, effective_ops.deletes, req.relational_identity_rewrites);
+                if (req.foreign_key_set_null_children.len > 0 or req.foreign_key_cascade_children.len > 0) {
+                    return error.UnsupportedQueryRequest;
+                }
+            }
+        }
         try self.validateForeignKeyConstraintTimingOverrides(req.foreign_key_constraint_timing_overrides);
         if (req.foreign_key_externalized_parent_checks.len > 0) {
             try self.validateExternalizedForeignKeyParentChecks(req.foreign_key_externalized_parent_checks, req.foreign_key_constraint_timing_overrides, effective_ops.writes);
@@ -9350,6 +9366,11 @@ pub const DB = struct {
             }
             for (raw_identity_deletes.items) |key| {
                 if (!isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key)) try identity_deletes.append(self.alloc, key);
+            }
+            if (self.core.schema) |runtime_schema| {
+                if (runtime_schema.system_versioned and (identity_upserts.items.len > 0 or identity_deletes.items.len > 0)) {
+                    return error.UnsupportedQueryRequest;
+                }
             }
             const metadata_mutations = try self.core.collectTransactionIntentMutations(self.alloc, txn_id);
             defer {
@@ -17072,6 +17093,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         var plan = try self.planRelationalRowsMutationSourceAlloc(alloc, runtime_schema, req);
         defer plan.deinit(alloc);
         return try self.stagePlannedRelationalRowsMutationSourceAlloc(alloc, runtime_schema, req, plan.matched, plan.candidates);
@@ -17116,6 +17138,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsMutationSourceRequest,
     ) !RelationalRowsMutationSourcePlan {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         var all_candidates = try self.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, runtime_schema, req, null);
         errdefer {
             for (all_candidates) |*candidate| candidate.deinit(alloc);
@@ -17131,6 +17154,7 @@ pub const DB = struct {
         req: types.RelationalRowsMutationSourceRequest,
         ranges: []const types.RelationalRowsDocKeyRange,
     ) !RelationalRowsMutationSourcePlan {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         var all_candidates = try self.collectRelationalRowsMutationSourceCandidatesAcrossRangesAlloc(alloc, runtime_schema, req, ranges);
         errdefer {
             for (all_candidates) |*candidate| candidate.deinit(alloc);
@@ -17280,6 +17304,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         const claim = try validateRelationalRowsMutationSourceRequest(alloc, runtime_schema, req);
         const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
 
@@ -17496,6 +17521,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
     ) !types.RelationalRowsMutationSourceResult {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         var plan = try self.planRelationalRowsJoinedMutationSourceAlloc(alloc, runtime_schema, req);
         defer plan.deinit(alloc);
         return try self.stagePlannedRelationalRowsJoinedMutationSourceAlloc(alloc, runtime_schema, req, plan.matched, plan.candidates);
@@ -17507,6 +17533,7 @@ pub const DB = struct {
         runtime_schema: schema_mod.TableSchema,
         req: types.RelationalRowsJoinedMutationSourceRequest,
     ) !RelationalRowsJoinedMutationSourcePlan {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         var all_candidates = try self.collectRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, runtime_schema, req);
         errdefer {
             for (all_candidates) |*candidate| candidate.deinit(alloc);
@@ -17523,6 +17550,7 @@ pub const DB = struct {
         target_ranges: []const types.RelationalRowsDocKeyRange,
         source_ranges: []const types.RelationalRowsDocKeyRange,
     ) !RelationalRowsJoinedMutationSourcePlan {
+        try rejectSystemVersionedRelationalMutation(runtime_schema);
         return try self.planRelationalRowsJoinedMutationSourceAcrossRangesWithSchemasAlloc(alloc, runtime_schema, runtime_schema, req, target_ranges, source_ranges);
     }
 
@@ -17535,6 +17563,7 @@ pub const DB = struct {
         target_ranges: []const types.RelationalRowsDocKeyRange,
         source_ranges: []const types.RelationalRowsDocKeyRange,
     ) !RelationalRowsJoinedMutationSourcePlan {
+        try rejectSystemVersionedRelationalMutation(target_schema);
         var all_candidates = try self.collectRelationalRowsJoinedMutationSourceCandidatesAcrossRangesWithSchemasAlloc(alloc, target_schema, source_schema, req, target_ranges, source_ranges);
         errdefer {
             for (all_candidates) |*candidate| candidate.deinit(alloc);
@@ -17981,6 +18010,7 @@ pub const DB = struct {
         matched: u32,
         candidates: []const RelationalRowsJoinedMutationSourceCandidate,
     ) !types.RelationalRowsMutationSourceResult {
+        try rejectSystemVersionedRelationalMutation(target_schema);
         const claim = try validateRelationalRowsJoinedMutationSourceRequestWithSchemas(alloc, target_schema, source_schema, req);
         const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
 
@@ -32347,6 +32377,30 @@ fn isRowClaimIntentMetadataKey(key: []const u8) bool {
 
 fn isUserRowMutationKey(key: []const u8) bool {
     return !isMetadataKey(key) and !internal_keys.isInternalPhysicalTableDataKey(key);
+}
+
+fn rejectSystemVersionedRelationalMutation(runtime_schema: schema_mod.TableSchema) !void {
+    if (runtime_schema.system_versioned) return error.UnsupportedQueryRequest;
+}
+
+fn rejectSystemVersionedTableUserRowMutations(
+    writes: anytype,
+    deletes: []const []const u8,
+    rewrites: []const types.RelationalIdentityRewrite,
+) !void {
+    for (writes) |write| {
+        if (isUserRowMutationKey(write.key)) return error.UnsupportedQueryRequest;
+    }
+    for (deletes) |key| {
+        if (isUserRowMutationKey(key)) return error.UnsupportedQueryRequest;
+    }
+    if (rewrites.len > 0) return error.UnsupportedQueryRequest;
+}
+
+fn rejectSystemVersionedTableWriteIntents(intents: []const transactions_mod.WriteIntent) !void {
+    for (intents) |intent| {
+        if (isUserRowMutationKey(intent.key)) return error.UnsupportedQueryRequest;
+    }
 }
 
 fn rowClaimIntentKeyAlloc(alloc: Allocator, row_key: []const u8) ![]u8 {
@@ -80745,6 +80799,89 @@ test "db relational composite primary keys enforce identity and back foreign key
 
     const report = try db.validateForeignKeyRefsInRange("", "");
     try std.testing.expect(report.valid());
+}
+
+test "db system-versioned relational tables reject ordinary row mutations until native history exists" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    const base_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var base_parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, base_schema_json);
+    defer base_parsed_schema.deinit(alloc);
+    const base_runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, base_parsed_schema);
+    defer schema_mod.freeSchema(alloc, base_runtime_schema);
+    try db.setSchema(base_runtime_schema);
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:1", .value = "{\"id\":\"row:1\",\"name\":\"before\"}" }},
+    });
+
+    const versioned_schema_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"system_versioned":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var versioned_parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, versioned_schema_json);
+    defer versioned_parsed_schema.deinit(alloc);
+    const versioned_runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, versioned_parsed_schema);
+    defer schema_mod.freeSchema(alloc, versioned_runtime_schema);
+    try std.testing.expect(versioned_runtime_schema.system_versioned);
+    try db.setSchema(versioned_runtime_schema);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.batch(.{
+        .writes = &.{.{ .key = "row:2", .value = "{\"id\":\"row:2\",\"name\":\"blocked\"}" }},
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.batch(.{
+        .deletes = &.{"row:1"},
+    }));
+
+    const txn_id = try db.beginTransaction(20_000);
+    defer db.abortTransaction(txn_id, 20_001) catch {};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.writeTransaction(txn_id, .{
+        .writes = &.{.{ .key = "row:txn", .value = "{\"id\":\"row:txn\",\"name\":\"blocked\"}" }},
+    }));
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.writeIntents(txn_id, &.{.{
+        .key = "row:intent",
+        .value = "{\"id\":\"row:intent\",\"name\":\"blocked\"}",
+    }}, &.{}));
+
+    const mutation_txn_id = try db.beginTransaction(30_000);
+    defer db.abortTransaction(mutation_txn_id, 30_001) catch {};
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "id",
+        .op = .eq,
+        .value_json = "\"row:1\"",
+    }};
+    const operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "name",
+        .value_json = "\"after\"",
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.mutateRelationalRowsFromSource(alloc, versioned_runtime_schema, .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:system-versioned",
+                .txn_id = mutation_txn_id,
+            },
+        },
+        .operations = operations[0..],
+    }));
+
+    const preserved = (try db.get(alloc, "row:1")) orelse return error.TestExpectedEqual;
+    defer alloc.free(preserved);
+    try std.testing.expect(std.mem.indexOf(u8, preserved, "\"before\"") != null);
 }
 
 test "db relational temporal primary keys enforce without-overlaps intervals" {

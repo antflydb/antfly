@@ -49,6 +49,17 @@ pub const UniquePredicateWhereExpressionParserHooks = struct {
     parse_condition: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpressionCondition,
 };
 
+pub const AggregateOutputFieldExpressionConditionParserHooks = struct {
+    ptr: *anyopaque,
+    parse_field: *const fn (
+        *anyopaque,
+        []const []const u8,
+        []const db_mod.types.RelationalRowsExpressionProjection,
+        []const db_mod.types.RelationalRowsAggregateSpec,
+    ) anyerror![]const u8,
+    parse_value_json: *const fn (*anyopaque) anyerror![]const u8,
+};
+
 const cloneExpressionConditionAlloc = plan_mod.cloneExpressionConditionAlloc;
 const cloneExpressionConditionsAlloc = plan_mod.cloneExpressionConditionsAlloc;
 const cloneExpressionConditionsConcatAlloc = plan_mod.cloneExpressionConditionsConcatAlloc;
@@ -5613,6 +5624,132 @@ pub fn canParseBareBooleanAggregateHavingExpression(
     return canParseBareBooleanWhereExpression(tokens, pos, aggregate_schema);
 }
 
+pub fn parseAggregateOutputFieldExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    hooks: AggregateOutputFieldExpressionConditionParserHooks,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const field = try hooks.parse_field(hooks.ptr, group_fields, group_expressions, aggregations);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
+    const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+
+    const op: runtime_schema.RelationalCheckOp = if (try parseExpressionIsTailIf(tokens, pos, .{
+        .allow_boolean_unknown = true,
+        .allow_boolean_literal = true,
+    })) |is_tail| blk: {
+        switch (is_tail.kind) {
+            .distinct_comparison, .null_test => {},
+            .boolean_unknown => {
+                if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                break :blk is_tail.op;
+            },
+            .boolean_literal => {
+                if (column.field_type != .boolean) return error.InvalidSqlCatalog;
+                const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
+                errdefer alloc.free(value_json);
+                const lhs_field = field;
+                field_transferred = true;
+                const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+                var rhs_transferred = false;
+                errdefer if (!rhs_transferred) alloc.free(rhs);
+                rhs[0] = .{
+                    .kind = .value,
+                    .value_json = value_json,
+                };
+                rhs_transferred = true;
+                return .{
+                    .lhs = .{
+                        .kind = .field,
+                        .field = lhs_field,
+                    },
+                    .op = .eq,
+                    .rhs = rhs,
+                };
+            },
+        }
+        break :blk is_tail.op;
+    } else try parseComparisonOp(tokens, pos);
+
+    const lhs: db_mod.types.RelationalRowsExpression = .{
+        .kind = .field,
+        .field = field,
+    };
+    field_transferred = true;
+
+    const rhs = switch (op) {
+        .is_null, .is_not_null => &.{},
+        else => blk: {
+            const value_json = try hooks.parse_value_json(hooks.ptr);
+            var value_transferred = false;
+            errdefer if (!value_transferred) alloc.free(value_json);
+            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+            var out_transferred = false;
+            errdefer if (!out_transferred) alloc.free(out);
+            out[0] = .{
+                .kind = .value,
+                .value_json = value_json,
+            };
+            value_transferred = true;
+            out_transferred = true;
+            break :blk out;
+        },
+    };
+
+    return .{
+        .lhs = lhs,
+        .op = op,
+        .rhs = rhs,
+    };
+}
+
+pub fn parseAggregateHavingBooleanIsNotGroups(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    type_context: RowExpressionTypeContext,
+    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
+    hooks: AggregateOutputFieldExpressionConditionParserHooks,
+) !bool {
+    const saved_pos = pos.*;
+    const field = hooks.parse_field(hooks.ptr, group_fields, group_expressions, aggregations) catch |err| {
+        pos.* = saved_pos;
+        return switch (err) {
+            error.UnsupportedSqlShape => false,
+            else => err,
+        };
+    };
+    defer alloc.free(field);
+    if (!parser.matchKeyword(tokens, pos, "is")) {
+        pos.* = saved_pos;
+        return false;
+    }
+    if (!parser.matchKeyword(tokens, pos, "not")) {
+        pos.* = saved_pos;
+        return false;
+    }
+    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) {
+        pos.* = saved_pos;
+        return false;
+    }
+
+    const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+    const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
+    try appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
+    return true;
+}
+
 pub fn aggregateHavingHasBooleanIsNot(tokens: []const Token, pos: usize) bool {
     var depth: usize = 0;
     var i = pos;
@@ -11027,6 +11164,35 @@ pub fn parseSimpleReturningFieldOwnedAlloc(
     if (peekUnsupportedSimpleFieldTail(tokens, pos.*)) return error.UnsupportedSqlShape;
     if (binder.relationalColumnForReturningField(schema, field) == null) return error.InvalidSqlCatalog;
     return field;
+}
+
+pub fn parseReturningListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+) ![]const []const u8 {
+    if (parser.matchToken(tokens, pos, .star) != null) {
+        const fields = try alloc.alloc([]const u8, 1);
+        errdefer alloc.free(fields);
+        fields[0] = try alloc.dupe(u8, "*");
+        return fields;
+    }
+
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+    while (true) {
+        const field = try parseSimpleReturningFieldOwnedAlloc(alloc, tokens, pos, schema);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try fields.append(alloc, field);
+        field_transferred = true;
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    return try fields.toOwnedSlice(alloc);
 }
 
 pub fn parseCoalesceFieldOperandOrNullOwnedAlloc(
