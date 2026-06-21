@@ -748,6 +748,25 @@ func TestLiteCAPI(t *testing.T) {
 		t.Fatalf("hosted capabilities should not report background runtimes: %#v", hostedCaps)
 	}
 
+	if err := hosted.AddIndexJSON(index); err != nil {
+		t.Fatalf("hosted add full-text index: %v", err)
+	}
+	if err := hosted.Batch([]WriteIntent{{
+		Key:   "doc:go-hosted-search",
+		Value: []byte(`{"title":"hosted","body":"go hosted manual maintenance search"}`),
+	}}, 9); err != nil {
+		t.Fatalf("hosted batch searchable document: %v", err)
+	}
+	hostedIdleStatus, err := hosted.RunUntilIdleStatus()
+	if err != nil {
+		t.Fatalf("hosted run until idle status: %v", err)
+	}
+	if hostedIdleStatus.DerivedTargetSequence == 0 || !hostedIdleStatus.HasAsyncIndexes || len(hostedIdleStatus.TextMerge) == 0 {
+		t.Fatalf("hosted run-until-idle status missing readiness fields: %#v", hostedIdleStatus)
+	}
+	hostedFullTextQuery := []byte(`{"full_text_search":{"match":{"field":"body","text":"hosted manual maintenance"}},"limit":1}`)
+	assertSearchContains(hosted, "hosted full-text", hostedFullTextQuery, "go hosted manual maintenance search")
+
 	hostedStatus, err := hosted.Status()
 	if err != nil {
 		t.Fatalf("hosted status: %v", err)
