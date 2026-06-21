@@ -12225,6 +12225,15 @@ pub const SelectFieldItemParserHooks = struct {
     parse_boolean_projection_from_field: *const fn (*anyopaque, []const u8) anyerror!db_mod.types.RelationalRowsExpressionProjection,
 };
 
+pub const SelectItemParserHooks = struct {
+    ptr: *anyopaque,
+    expression: ExpressionProjectionParserHooks,
+    json_value_expression: JsonValueExpressionProjectionParserHooks,
+    select_field: SelectFieldItemParserHooks,
+    extension_function: ExtensionFunctionRowExpressionParserHooks,
+    routine_expression: RoutineExpressionRowExpressionParserHooks,
+};
+
 pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     if (rowExpressionHasTopLevelPipeConcat(tokens, pos)) return .pipe_concat;
     if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
@@ -12471,6 +12480,26 @@ pub const RowExpressionFieldOperandParserHooks = struct {
     parse_json_array_value: *const fn (*anyopaque) anyerror![]const u8,
 };
 
+pub const RowExpressionOperandParserHooks = struct {
+    ptr: *anyopaque,
+    extension_function: ExtensionFunctionRowExpressionParserHooks,
+    routine_expression: RoutineExpressionRowExpressionParserHooks,
+    parenthesized: ParenthesizedRowExpressionParserHooks,
+    unary_negative: UnaryNegativeRowExpressionParserHooks,
+    boolean_not: BooleanNotRowExpressionParserHooks,
+    cast: CastRowExpressionParserHooks,
+    case_expression: CaseExpressionParserHooks,
+    case_fold: CaseFoldRowExpressionParserHooks,
+    coalesce: CoalesceRowExpressionParserHooks,
+    nullif: NullifRowExpressionParserHooks,
+    fixed_unary: FixedUnaryRowExpressionParserHooks,
+    fixed_binary: FixedBinaryRowExpressionParserHooks,
+    variadic: VariadicRowExpressionParserHooks,
+    json_build_object: JsonBuildObjectRowExpressionParserHooks,
+    field: RowExpressionFieldOperandParserHooks,
+    parse_json_value: *const fn (*anyopaque) anyerror![]const u8,
+};
+
 pub fn rowExpressionOperandStartAt(tokens: []const Token, pos: usize) ?RowExpressionOperandStart {
     if (peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
     if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
@@ -12539,6 +12568,113 @@ pub fn rowExpressionOperandStartWithFunctionBindingsAt(tokens: []const Token, po
     if (peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
     if (peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
     return null;
+}
+
+pub fn parseRowExpressionOperandAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    function_bindings: SqlFunctionBindings,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    joined_source_expression_qualifiers: []const []const u8,
+    joined_target_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    type_context: RowExpressionTypeContext,
+    hooks: RowExpressionOperandParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    if (rowExpressionOperandStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
+        switch (start) {
+            .parenthesized => return try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, hooks.parenthesized),
+            .unary_negative => return try parseUnaryNegativeRowExpressionAlloc(alloc, tokens, pos, hooks.unary_negative),
+            .boolean_not => return try parseBooleanNotRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.boolean_not),
+            .extension_function => return (try parseExtensionFunctionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.extension_functions, hooks.extension_function)) orelse unreachable,
+            .routine_expression => return (try parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.routine_expressions, hooks.routine_expression)) orelse unreachable,
+            .cast => return try parseCastRowExpressionAlloc(alloc, tokens, pos, hooks.cast),
+            .case => return try parseCaseRowExpressionAlloc(alloc, tokens, pos, type_context, defer_row_expression_field_validation, hooks.case_expression),
+            .now => return try parseSqlNowRowExpressionAlloc(alloc, tokens, pos),
+            .current_date => return try parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos),
+            .typed_datetime_literal => return try parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos),
+            .uuid_v4 => return try parseSqlUuidV4RowExpression(tokens, pos),
+            .interval => return try parseSqlIntervalRowExpressionAlloc(alloc, tokens, pos),
+            .case_fold => return try parseCaseFoldRowExpressionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks.case_fold),
+            .replace => return try parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .replace, type_context, hooks.variadic),
+            .regexp_replace => return try parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_replace, type_context, hooks.variadic),
+            .regexp_substr => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_substr, type_context, hooks.fixed_binary),
+            .regexp_match => return try parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_match, type_context, hooks.variadic),
+            .regexp_count => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_count, type_context, hooks.fixed_binary),
+            .regexp_instr => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_instr, type_context, hooks.fixed_binary),
+            .translate => return try parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .translate, type_context, hooks.variadic),
+            .concat => return try parseConcatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .coalesce => return try parseCoalesceRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.coalesce),
+            .nullif => return try parseNullifRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.nullif),
+            .text_length => return try parseTextLengthRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_unary),
+            .ascii => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ascii, type_context, .text, hooks.fixed_unary),
+            .chr => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .chr, type_context, .numeric, hooks.fixed_unary),
+            .substring => return try parseSubstringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .overlay => return try parseOverlayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .split_part => return try parseSplitPartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .strpos => return try parseStrposRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .left_right => return try parseLeftRightRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .pad => return try parsePadRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .repeat => return try parseRepeatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .reverse => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .reverse, type_context, .text, hooks.fixed_unary),
+            .md5 => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, hooks.fixed_unary),
+            .starts_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .starts_with, type_context, hooks.fixed_binary),
+            .ends_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .ends_with, type_context, hooks.fixed_binary),
+            .date_trunc => return try parseDateTruncRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .date_bin => return try parseDateBinRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .date_part => return try parseDatePartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .abs => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .abs, type_context, .numeric, hooks.fixed_unary),
+            .round => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .round, type_context, .numeric, hooks.fixed_unary),
+            .trunc => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .trunc, type_context, .numeric, hooks.fixed_unary),
+            .floor => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .floor, type_context, .numeric, hooks.fixed_unary),
+            .ceil => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ceil, type_context, .numeric, hooks.fixed_unary),
+            .sqrt => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sqrt, type_context, .numeric, hooks.fixed_unary),
+            .sign => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sign, type_context, .numeric, hooks.fixed_unary),
+            .mod => return try parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .mod, type_context, hooks.fixed_binary),
+            .power => return try parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .power, type_context, hooks.fixed_binary),
+            .greatest_least => return try parseGreatestLeastRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .json_extract_path => return try parseJsonExtractPathRowExpressionAlloc(alloc, tokens, pos, params, type_context, hooks.fixed_unary),
+            .json_typeof => return try parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_typeof, type_context, hooks.fixed_unary),
+            .json_array_length => return try parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_array_length, type_context, hooks.fixed_unary),
+            .json_build_object => return try parseJsonBuildObjectRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.json_build_object),
+            .to_jsonb => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .to_jsonb, type_context, .any, hooks.fixed_unary),
+            .convert_from => {
+                const value_json = try hooks.parse_json_value(hooks.ptr);
+                errdefer alloc.free(value_json);
+                return .{ .kind = .value, .value_json = value_json };
+            },
+            .array_length => return try parseArrayLengthRowExpressionAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source),
+            .array_position => return try parseArrayPositionRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .array_element_transform => return try parseArrayElementTransformRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .array_to_string => return try parseArrayToStringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .string_to_array => return try parseStringToArrayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+        }
+    }
+    if (try parseRowExpressionFieldOperandOrNullAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        joined_source_schema,
+        params,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        joined_source_expression_qualifiers,
+        joined_target_expression_qualifiers,
+        defer_row_expression_field_validation,
+        field_source,
+        hooks.field,
+    )) |expression| return expression;
+
+    const value_json = try hooks.parse_json_value(hooks.ptr);
+    errdefer alloc.free(value_json);
+    return .{ .kind = .value, .value_json = value_json };
 }
 
 pub fn parseRowExpressionFieldOperandOrNullAlloc(

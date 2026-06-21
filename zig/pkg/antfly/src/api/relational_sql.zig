@@ -3504,6 +3504,28 @@ const Parser = struct {
         };
     }
 
+    fn rowExpressionOperandParserHooks(self: *@This()) sql_adapter.RowExpressionOperandParserHooks {
+        return .{
+            .ptr = self,
+            .extension_function = self.extensionFunctionRowExpressionParserHooks(),
+            .routine_expression = self.routineExpressionRowExpressionParserHooks(),
+            .parenthesized = self.parenthesizedRowExpressionParserHooks(),
+            .unary_negative = self.unaryNegativeRowExpressionParserHooks(),
+            .boolean_not = self.booleanNotRowExpressionParserHooks(),
+            .cast = self.castRowExpressionParserHooks(),
+            .case_expression = self.caseExpressionParserHooks(),
+            .case_fold = self.caseFoldRowExpressionParserHooks(),
+            .coalesce = self.coalesceRowExpressionParserHooks(),
+            .nullif = self.nullifRowExpressionParserHooks(),
+            .fixed_unary = self.fixedUnaryRowExpressionParserHooks(),
+            .fixed_binary = self.fixedBinaryRowExpressionParserHooks(),
+            .variadic = self.variadicRowExpressionParserHooks(),
+            .json_build_object = self.jsonBuildObjectRowExpressionParserHooks(),
+            .field = self.rowExpressionFieldOperandParserHooks(),
+            .parse_json_value = parseJsonValueHook,
+        };
+    }
+
     fn extensionFunctionRowExpressionParserHooks(self: *@This()) sql_adapter.ExtensionFunctionRowExpressionParserHooks {
         return .{
             .ptr = self,
@@ -14250,94 +14272,23 @@ const Parser = struct {
     }
 
     fn parseRowExpressionOperandAlloc(self: *@This()) anyerror!db_mod.types.RelationalRowsExpression {
-        if (sql_adapter.rowExpressionOperandStartWithFunctionBindingsAt(self.tokens, self.pos, self.function_bindings)) |start| {
-            switch (start) {
-                .parenthesized => return try self.parseParenthesizedRowExpressionAlloc(),
-                .unary_negative => return try self.parseUnaryNegativeRowExpressionAlloc(),
-                .boolean_not => return try self.parseBooleanNotRowExpressionAlloc(),
-                .extension_function => return (try self.parseExtensionFunctionRowExpressionAlloc()) orelse unreachable,
-                .routine_expression => return (try self.parseRoutineExpressionRowExpressionAlloc()) orelse unreachable,
-                .cast => return try self.parseCastRowExpressionAlloc(),
-                .case => return try self.parseCaseRowExpressionAlloc(),
-                .now => return try sql_adapter.parseSqlNowRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
-                .current_date => return try sql_adapter.parseSqlCurrentDateRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
-                .typed_datetime_literal => return try sql_adapter.parseSqlTypedDatetimeLiteralRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
-                .uuid_v4 => return try sql_adapter.parseSqlUuidV4RowExpression(self.tokens, &self.pos),
-                .interval => return try sql_adapter.parseSqlIntervalRowExpressionAlloc(self.alloc, self.tokens, &self.pos),
-                .case_fold => return try self.parseCaseFoldRowExpressionAlloc(),
-                .replace => return try self.parseReplaceRowExpressionAlloc(),
-                .regexp_replace => return try self.parseRegexpReplaceRowExpressionAlloc(),
-                .regexp_substr => return try self.parseRegexpSubstrRowExpressionAlloc(),
-                .regexp_match => return try self.parseRegexpMatchRowExpressionAlloc(),
-                .regexp_count => return try self.parseRegexpCountRowExpressionAlloc(),
-                .regexp_instr => return try self.parseRegexpInstrRowExpressionAlloc(),
-                .translate => return try self.parseTranslateRowExpressionAlloc(),
-                .concat => return try self.parseConcatRowExpressionAlloc(),
-                .coalesce => return try self.parseCoalesceRowExpressionAlloc(),
-                .nullif => return try self.parseNullifRowExpressionAlloc(),
-                .text_length => return try self.parseLengthRowExpressionAlloc(),
-                .ascii => return try self.parseAsciiRowExpressionAlloc(),
-                .chr => return try self.parseChrRowExpressionAlloc(),
-                .substring => return try self.parseSubstringRowExpressionAlloc(),
-                .overlay => return try self.parseOverlayRowExpressionAlloc(),
-                .split_part => return try self.parseSplitPartRowExpressionAlloc(),
-                .strpos => return try self.parseStrposRowExpressionAlloc(),
-                .left_right => return try self.parseLeftRightRowExpressionAlloc(),
-                .pad => return try self.parsePadRowExpressionAlloc(),
-                .repeat => return try self.parseRepeatRowExpressionAlloc(),
-                .reverse => return try self.parseReverseRowExpressionAlloc(),
-                .md5 => return try self.parseMd5RowExpressionAlloc(),
-                .starts_with => return try self.parseStartsWithRowExpressionAlloc(),
-                .ends_with => return try self.parseEndsWithRowExpressionAlloc(),
-                .date_trunc => return try self.parseDateTruncRowExpressionAlloc(),
-                .date_bin => return try self.parseDateBinRowExpressionAlloc(),
-                .date_part => return try self.parseDatePartRowExpressionAlloc(),
-                .abs => return try self.parseAbsRowExpressionAlloc(),
-                .round => return try self.parseRoundRowExpressionAlloc(),
-                .trunc => return try self.parseFloorCeilRowExpressionAlloc(.trunc),
-                .floor => return try self.parseFloorCeilRowExpressionAlloc(.floor),
-                .ceil => return try self.parseFloorCeilRowExpressionAlloc(.ceil),
-                .sqrt => return try self.parseFloorCeilRowExpressionAlloc(.sqrt),
-                .sign => return try self.parseFloorCeilRowExpressionAlloc(.sign),
-                .mod => return try self.parseModuloRowExpressionAlloc(),
-                .power => return try self.parsePowerRowExpressionAlloc(),
-                .greatest_least => return try self.parseGreatestLeastRowExpressionAlloc(),
-                .json_extract_path => return try self.parseJsonExtractPathRowExpressionAlloc(),
-                .json_typeof => return try self.parseJsonTypeofRowExpressionAlloc(),
-                .json_array_length => return try self.parseJsonArrayLengthRowExpressionAlloc(),
-                .json_build_object => return try self.parseJsonBuildObjectRowExpressionAlloc(),
-                .to_jsonb => return try self.parseToJsonbRowExpressionAlloc(),
-                .convert_from => {
-                    const value_json = try self.parseJsonValueAlloc();
-                    errdefer self.alloc.free(value_json);
-                    return .{ .kind = .value, .value_json = value_json };
-                },
-                .array_length => return try self.parseArrayLengthRowExpressionAlloc(),
-                .array_position => return try self.parseArrayPositionRowExpressionAlloc(),
-                .array_element_transform => return try self.parseArrayElementTransformRowExpressionAlloc(),
-                .array_to_string => return try self.parseArrayToStringRowExpressionAlloc(),
-                .string_to_array => return try self.parseStringToArrayRowExpressionAlloc(),
-            }
-        }
-        if (try sql_adapter.parseRowExpressionFieldOperandOrNullAlloc(
+        return try sql_adapter.parseRowExpressionOperandAlloc(
             self.alloc,
             self.tokens,
             &self.pos,
+            self.params,
             self.schema,
             self.joined_source_schema,
-            self.params,
+            self.function_bindings,
             self.field_expression_qualifiers,
             self.returning_expression_qualifiers,
             self.joined_source_expression_qualifiers,
             self.joined_target_expression_qualifiers,
             self.defer_row_expression_field_validation,
             self.rowExpressionFieldSource(),
-            self.rowExpressionFieldOperandParserHooks(),
-        )) |expression| return expression;
-
-        const value_json = try self.parseJsonValueAlloc();
-        errdefer self.alloc.free(value_json);
-        return .{ .kind = .value, .value_json = value_json };
+            self.rowExpressionTypeContext(),
+            self.rowExpressionOperandParserHooks(),
+        );
     }
 
     fn parseExtensionFunctionRowExpressionAlloc(self: *@This()) !?db_mod.types.RelationalRowsExpression {
@@ -19478,7 +19429,23 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     defer alloc.free(null_trigger_body_function_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_function:name=null_audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_null", null_trigger_body_function_fingerprint);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$;"));
+    var notice_trigger_body_function = try lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$;");
+    defer notice_trigger_body_function.deinit(alloc);
+    const notice_trigger_body_function_plan = switch (notice_trigger_body_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineBodyKind.plpgsql_trigger, notice_trigger_body_function_plan.body.?.kind);
+    try std.testing.expectEqual(RoutineExecutionHook.trigger_return_new, notice_trigger_body_function_plan.body.?.hook);
+    try std.testing.expect(notice_trigger_body_function_plan.body.?.expression == null);
+    const notice_trigger_body_function_fingerprint = try ddlFingerprintAlloc(alloc, notice_trigger_body_function);
+    defer alloc.free(notice_trigger_body_function_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_function:name=audit_notice_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new", notice_trigger_body_function_fingerprint);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
 
     var drop_function = try lowerDdlPlanAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes();");
@@ -19516,6 +19483,24 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const create_noop_procedure_fingerprint = try ddlFingerprintAlloc(alloc, create_noop_procedure);
     defer alloc.free(create_noop_procedure_fingerprint);
     try std.testing.expectEqualStrings("ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop", create_noop_procedure_fingerprint);
+
+    var create_notice_procedure = try lowerDdlPlanAlloc(alloc, "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$;");
+    defer create_notice_procedure.deinit(alloc);
+    const create_notice_procedure_plan = switch (create_notice_procedure) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create_plan| create_plan,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(RoutineBodyKind.plpgsql_procedure, create_notice_procedure_plan.body.?.kind);
+    try std.testing.expectEqual(RoutineExecutionHook.procedure_noop, create_notice_procedure_plan.body.?.hook);
+    try std.testing.expect(create_notice_procedure_plan.body.?.expression == null);
+    const create_notice_procedure_fingerprint = try ddlFingerprintAlloc(alloc, create_notice_procedure);
+    defer alloc.free(create_notice_procedure_fingerprint);
+    try std.testing.expectEqualStrings("ddl:create_procedure:name=rotate_usage_notice:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop", create_notice_procedure_fingerprint);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;"));
 
     var drop_procedure = try lowerDdlPlanAlloc(alloc, "DROP PROCEDURE rotate_usage();");
     defer drop_procedure.deinit(alloc);

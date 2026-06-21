@@ -1562,9 +1562,28 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     });
     try std.testing.expectEqual(@as(usize, 7), runtime.routineCountForTest());
     try std.testing.expectError(error.RoutineNotFound, runtime.executeExpressionRoutineArgsAlloc(alloc, "rotate_usage", &.{}));
+
+    var notice_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';",
+    );
+    defer notice_trigger_plan.deinit(alloc);
+    try runtime.apply(switch (notice_trigger_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 8), runtime.routineCountForTest());
+    const trigger_notice_new = try runtime.executeTriggerRoutineAlloc(
+        alloc,
+        "audit_notice_body",
+        "{\"id\":\"u1\",\"status\":\"updated\"}",
+        "{\"id\":\"u1\",\"status\":\"old\"}",
+    );
+    defer alloc.free(trigger_notice_new);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"updated\"}", trigger_notice_new);
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';"),
+        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(); RETURN NEW; END';"),
     );
 }
 

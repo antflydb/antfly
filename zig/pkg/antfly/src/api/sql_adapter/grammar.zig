@@ -3071,6 +3071,7 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
     var pos: usize = 0;
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
     try cursor.expectKeyword("begin");
+    _ = try consumeBenignPlpgsqlStatements(cursor);
     try cursor.expectKeyword("return");
     const hook: ddl_plan.RoutineExecutionHook = if (cursor.matchKeyword("new"))
         .trigger_return_new
@@ -3103,8 +3104,12 @@ fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
     var pos: usize = 0;
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
     try cursor.expectKeyword("begin");
-    try cursor.expectKeyword("null");
-    try cursor.expectToken(.semicolon);
+    _ = try consumeBenignPlpgsqlStatements(cursor);
+    if (cursor.matchKeyword("null")) {
+        try cursor.expectToken(.semicolon);
+    } else if (!cursor.peekKeyword("end")) {
+        return error.UnsupportedSqlShape;
+    }
     try cursor.expectKeyword("end");
     _ = cursor.matchToken(.semicolon);
     if (!cursor.atEnd()) return error.UnsupportedSqlShape;
@@ -3112,6 +3117,21 @@ fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
         .kind = .plpgsql_procedure,
         .hook = .procedure_noop,
     };
+}
+
+fn consumeBenignPlpgsqlStatements(cursor: parser.Cursor) !bool {
+    var consumed = false;
+    while (true) {
+        const checkpoint = cursor.checkpoint();
+        if (!cursor.matchKeyword("raise")) return consumed;
+        if (!cursor.matchKeyword("notice")) {
+            cursor.restore(checkpoint);
+            return error.UnsupportedSqlShape;
+        }
+        _ = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+        try cursor.expectToken(.semicolon);
+        consumed = true;
+    }
 }
 
 fn routineBodyExpressionAlloc(
@@ -8763,6 +8783,17 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.procedure_noop, noop_procedure_body.body.?.hook);
     try std.testing.expect(noop_procedure_body.body.?.expression == null);
 
+    var notice_procedure_body_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''rotate''; END';");
+    defer lexer.freeTokens(alloc, &notice_procedure_body_tokens);
+    var notice_procedure_body_pos: usize = 0;
+    var notice_procedure_body = try parseCreateRoutineCatalogTailAlloc(alloc, notice_procedure_body_tokens.items, &notice_procedure_body_pos);
+    defer notice_procedure_body.deinit(alloc);
+    try std.testing.expectEqual(notice_procedure_body_tokens.items.len, notice_procedure_body_pos);
+    try std.testing.expectEqual(RoutineKindSyntax.procedure, notice_procedure_body.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_procedure, notice_procedure_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.procedure_noop, notice_procedure_body.body.?.hook);
+    try std.testing.expect(notice_procedure_body.body.?.expression == null);
+
     var drop_function_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION IF EXISTS public.normalize_status(text) CASCADE;");
     defer lexer.freeTokens(alloc, &drop_function_tokens);
     var drop_function_pos: usize = 0;
@@ -8836,7 +8867,17 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_null, null_trigger_body.body.?.hook);
     try std.testing.expect(null_trigger_body.body.?.expression == null);
 
-    var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';");
+    var notice_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';");
+    defer lexer.freeTokens(alloc, &notice_trigger_body_tokens);
+    var notice_trigger_body_pos: usize = 0;
+    var notice_trigger_body = try parseCreateRoutineCatalogTailAlloc(alloc, notice_trigger_body_tokens.items, &notice_trigger_body_pos);
+    defer notice_trigger_body.deinit(alloc);
+    try std.testing.expectEqual(notice_trigger_body_tokens.items.len, notice_trigger_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, notice_trigger_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, notice_trigger_body.body.?.hook);
+    try std.testing.expect(notice_trigger_body.body.?.expression == null);
+
+    var unsupported_trigger_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(); RETURN NEW; END';");
     defer lexer.freeTokens(alloc, &unsupported_trigger_body_tokens);
     var unsupported_trigger_body_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, unsupported_trigger_body_tokens.items, &unsupported_trigger_body_pos));

@@ -4711,11 +4711,22 @@
       "sql": "CREATE FUNCTION audit_null_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$"
     },
     {
-      "name": "unsupported create function side-effect body",
+      "name": "create trigger notice function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_notice_body",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_notice_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new",
+      "sql": "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$"
+    },
+    {
+      "name": "unsupported create function executable side-effect body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$"
+      "sql": "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$"
     },
     {
       "name": "unsupported create function routine option",
@@ -4769,11 +4780,22 @@
       "sql": "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS $$BEGIN NULL; END$$"
     },
     {
-      "name": "unsupported create procedure statement body",
+      "name": "create notice noop procedure body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_procedure",
+        "table_name": "rotate_usage_notice",
+        "operations": 0
+      },
+      "plan": "ddl:create_procedure:name=rotate_usage_notice:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop",
+      "sql": "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$"
+    },
+    {
+      "name": "unsupported create procedure executable statement body",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=routine_body_plan",
       "classification_reason": "routine_body_plan",
-      "sql": "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$"
+      "sql": "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$"
     },
     {
       "name": "drop procedure catalog ddl",
