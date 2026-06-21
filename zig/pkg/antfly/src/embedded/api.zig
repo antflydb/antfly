@@ -261,6 +261,10 @@ pub const Api = struct {
         return try std.json.Stringify.valueAlloc(alloc, try self.db.checkLite(), .{});
     }
 
+    pub fn checkLiteFileJson(alloc: Allocator, path: []const u8) ![]u8 {
+        return try std.json.Stringify.valueAlloc(alloc, try embedded_db.checkLiteFile(alloc, path), .{});
+    }
+
     pub fn copyStableLiteSnapshotJson(self: *Api, alloc: Allocator, dest_path: []const u8, replace: bool) ![]u8 {
         return try std.json.Stringify.valueAlloc(alloc, try self.db.copyStableLiteSnapshot(dest_path, replace), .{});
     }
@@ -972,6 +976,8 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     defer alloc.free(dst_path);
     const malformed_dst_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-malformed-dst.aflite", .{tmp.sub_path});
     defer alloc.free(malformed_dst_path);
+    const malformed_file_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-malformed-file.aflite", .{tmp.sub_path});
+    defer alloc.free(malformed_file_path);
     const roundtrip_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-roundtrip.aflite", .{tmp.sub_path});
     defer alloc.free(roundtrip_path);
     const snapshot_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-snapshot.aflite", .{tmp.sub_path});
@@ -981,6 +987,16 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     defer backup.deinit(alloc);
     var roundtrip_backup = std.ArrayList(u8).empty;
     defer roundtrip_backup.deinit(alloc);
+
+    {
+        var malformed_file = try std.Io.Dir.cwd().createFile(std.testing.io, malformed_file_path, .{});
+        defer malformed_file.close(std.testing.io);
+        try malformed_file.writePositionalAll(std.testing.io, "short embedded lite header", 0);
+    }
+    const malformed_check_json = try Api.checkLiteFileJson(alloc, malformed_file_path);
+    defer alloc.free(malformed_check_json);
+    try std.testing.expect(std.mem.indexOf(u8, malformed_check_json, "\"valid\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, malformed_check_json, "\"issue\":\"truncated_header\"") != null);
 
     {
         var api = try Api.openLite(alloc, src_path, .{

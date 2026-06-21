@@ -154,6 +154,8 @@ check` without first opening the database successfully.
 
 The embedded Zig API should expose the same status shape for Lite handles, with
 the storage identity available as a typed value on the lower-level DB wrapper.
+It should also expose a path-level Lite integrity check so Zig users can inspect
+invalid `.aflite` files without first opening a handle.
 
 ### File Format
 

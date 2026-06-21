@@ -266,6 +266,10 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
     return support.lite.backend.capabilitiesForProfile(profile);
 }
 
+pub fn checkLiteFile(alloc: Allocator, path: []const u8) !LiteCheckReport {
+    return try support.lite.backend.checkFile(alloc, path);
+}
+
 pub fn setRemoteTemplateRenderer(renderer: ?RemoteTemplateRenderer) void {
     template_remote_host.setHostRenderer(renderer);
 }
