@@ -744,6 +744,12 @@ const PromoteOptions = struct {
     table: []const u8,
     backup_id: []const u8,
     location: []const u8,
+
+    fn deinit(self: *PromoteOptions, allocator: Allocator) void {
+        allocator.free(self.backup_id);
+        allocator.free(self.location);
+        self.* = undefined;
+    }
 };
 
 fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -751,7 +757,10 @@ fn promote(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !
     try requireAflitePath(path);
 
     const opts = parsePromoteOptions(allocator, path, args) catch cli.fatal("invalid promote arguments", .{});
-    defer allocator.free(opts.backup_id);
+    defer {
+        var owned_opts = opts;
+        owned_opts.deinit(allocator);
+    }
 
     var staged = try lite_restore_staging.stageAfliteRestoreBackup(allocator, path, opts.table, opts.backup_id, opts.location);
     defer staged.deinit(allocator);
@@ -783,7 +792,7 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     var target: ?[]const u8 = null;
     var table: ?[]const u8 = null;
     var backup_id: ?[]const u8 = null;
-    var location: []const u8 = "file:///tmp/antfly_backups";
+    var location: ?[]const u8 = null;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--target") or std.mem.eql(u8, arg, "--url")) {
             target = try nextRequiredArg(args);
@@ -799,12 +808,29 @@ fn parsePromoteOptions(allocator: Allocator, path: []const u8, args: *std.proces
     }
     const resolved_target = target orelse return error.MissingArgument;
     const resolved_table = table orelse return error.MissingArgument;
+    const resolved_backup_id = if (backup_id) |id| try allocator.dupe(u8, id) else try lite_restore_staging.defaultBackupIdAlloc(allocator, path);
+    errdefer allocator.free(resolved_backup_id);
+    const resolved_location = if (location) |value| try allocator.dupe(u8, value) else try defaultLitePromoteLocationAlloc(allocator);
     return .{
         .target = resolved_target,
         .table = resolved_table,
-        .backup_id = if (backup_id) |id| try allocator.dupe(u8, id) else try lite_restore_staging.defaultBackupIdAlloc(allocator, path),
-        .location = location,
+        .backup_id = resolved_backup_id,
+        .location = resolved_location,
     };
+}
+
+fn defaultLitePromoteLocationAlloc(allocator: Allocator) ![]u8 {
+    const root = try defaultLiteWorkspaceRootAlloc(allocator);
+    defer allocator.free(root);
+    const backups = try std.fs.path.join(allocator, &.{ root, "backups" });
+    defer allocator.free(backups);
+    return try std.fmt.allocPrint(allocator, "file://{s}", .{backups});
+}
+
+fn defaultLiteWorkspaceRootAlloc(allocator: Allocator) ![]u8 {
+    const home_z = std.c.getenv("HOME") orelse return error.HomeNotSet;
+    const home = std.mem.span(home_z);
+    return try std.fs.path.join(allocator, &.{ home, ".antfly", "lite" });
 }
 
 fn nextRequiredArg(args: *std.process.Args.Iterator) ![]const u8 {
@@ -1697,8 +1723,8 @@ test "lite promote parser requires values and derives default backup id" {
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--location", "file:///tmp/backups" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parsePromoteOptions(allocator, "app.aflite", &args);
-        defer allocator.free(opts.backup_id);
+        var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
+        defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("http://localhost:8080", opts.target);
         try std.testing.expectEqualStrings("docs", opts.table);
         try std.testing.expectEqualStrings("lite-app", opts.backup_id);
@@ -1708,10 +1734,11 @@ test "lite promote parser requires values and derives default backup id" {
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--backup-id", "explicit-id" };
         var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
-        const opts = try parsePromoteOptions(allocator, "app.aflite", &args);
-        defer allocator.free(opts.backup_id);
+        var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
+        defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("explicit-id", opts.backup_id);
-        try std.testing.expectEqualStrings("file:///tmp/antfly_backups", opts.location);
+        try std.testing.expect(std.mem.startsWith(u8, opts.location, "file://"));
+        try std.testing.expect(std.mem.endsWith(u8, opts.location, "/.antfly/lite/backups"));
     }
 
     {

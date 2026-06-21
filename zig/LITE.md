@@ -323,6 +323,11 @@ antfly lite promote app.aflite --target http://cluster:8080 --table docs
 should not invent a separate migration protocol until backup/restore proves too
 slow for large databases.
 
+When `antfly lite promote` needs a local staging location and the user does not
+pass `--location`, it should use `~/.antfly/lite/backups`, not a process-global
+`/tmp` directory. Explicit `--location` values continue to support normal
+Antfly backup targets such as `file://`, `s3://`, or `gs://`.
+
 Normal Antfly should also be able to restore directly from a `.aflite` live
 database file:
 

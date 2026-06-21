@@ -40,6 +40,10 @@ antfly lite promote app.aflite \
 `promote` opens `app.aflite` read-only, stages a portable backup, restores that
 backup into the `docs` table, and leaves the Lite database in place.
 
+If `--location` is omitted, Lite stages the portable backup under
+`~/.antfly/lite/backups`. Use an explicit `--location` when the normal Antfly
+target needs a shared `file://`, `s3://`, or `gs://` backup location.
+
 You can run the same flow through normal restore:
 
 ```bash

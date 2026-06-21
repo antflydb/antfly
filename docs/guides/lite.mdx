@@ -280,6 +280,10 @@ antfly lite promote app.aflite \
   --location file:///tmp/antfly_backups
 ```
 
+If you omit `--location`, Lite stages the portable restore backup under
+`~/.antfly/lite/backups`. Pass `--location` when the normal Antfly target should
+restore from a shared filesystem or object-storage location.
+
 Or use the normal restore command directly with a Lite input:
 
 ```bash
