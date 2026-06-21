@@ -111,3 +111,40 @@ test "pkg antfly embedded exposes Lite path-level snapshot helpers" {
     defer result.deinit(allocator);
     try std.testing.expect(std.mem.indexOf(u8, result.value, "embedded package snapshot") != null);
 }
+
+test "pkg antfly embedded exposes Lite handle-level snapshot helper" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pkg-lite-handle-snapshot-src.aflite", .{tmp.sub_path});
+    defer allocator.free(path);
+    const snapshot_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pkg-lite-handle-snapshot-copy.aflite", .{tmp.sub_path});
+    defer allocator.free(snapshot_path);
+
+    {
+        var lite = try db.DB.createLite(allocator, path, .{});
+        defer lite.close();
+        try lite.batch(.{
+            .writes = &.{.{
+                .key = "doc:pkg-lite-handle-snapshot",
+                .value = "{\"title\":\"embedded package handle snapshot\"}",
+            }},
+            .sync_level = .write,
+        });
+
+        const report: db.LiteStableSnapshotReport = try lite.copyStableLiteSnapshot(snapshot_path, false);
+        try std.testing.expect(report.snapshot_size > 0);
+        try std.testing.expect(report.page_count > 0);
+    }
+
+    var snapshot = try db.DB.openLite(allocator, snapshot_path, .{
+        .open_mode = .query_readonly,
+    });
+    defer snapshot.close();
+
+    var result = (try snapshot.lookup(allocator, "doc:pkg-lite-handle-snapshot", .{})) orelse return error.MissingLiteHandleSnapshotDocument;
+    defer result.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.value, "embedded package handle snapshot") != null);
+}
