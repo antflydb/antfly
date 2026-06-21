@@ -937,27 +937,39 @@ fn isLiteLocalListenHost(host: []const u8) bool {
         std.mem.eql(u8, host, "[::1]");
 }
 
+const LiteHttpRoute = struct {
+    method: httpx.Method,
+    path: []const u8,
+    handler: httpx.Handler,
+};
+
+const lite_http_routes = [_]LiteHttpRoute{
+    .{ .method = .GET, .path = "/healthz", .handler = liteHttpHealth },
+    .{ .method = .GET, .path = "/lite/v1/status", .handler = liteHttpStatus },
+    .{ .method = .GET, .path = "/lite/v1/capabilities", .handler = liteHttpCapabilities },
+    .{ .method = .POST, .path = "/lite/v1/batch", .handler = liteHttpBatch },
+    .{ .method = .POST, .path = "/lite/v1/lookup/:key", .handler = liteHttpLookup },
+    .{ .method = .POST, .path = "/lite/v1/scan", .handler = liteHttpScan },
+    .{ .method = .POST, .path = "/lite/v1/query", .handler = liteHttpQuery },
+    .{ .method = .GET, .path = "/lite/v1/indexes", .handler = liteHttpIndexList },
+    .{ .method = .POST, .path = "/lite/v1/indexes", .handler = liteHttpIndexCreate },
+    .{ .method = .DELETE, .path = "/lite/v1/indexes/:name", .handler = liteHttpIndexDrop },
+    .{ .method = .GET, .path = "/lite/v1/enrichments", .handler = liteHttpEnrichmentList },
+    .{ .method = .POST, .path = "/lite/v1/enrichments", .handler = liteHttpEnrichmentCreate },
+    .{ .method = .DELETE, .path = "/lite/v1/enrichments/:kind/:name", .handler = liteHttpEnrichmentDrop },
+    .{ .method = .GET, .path = "/lite/v1/schema", .handler = liteHttpSchemaGet },
+    .{ .method = .PUT, .path = "/lite/v1/schema", .handler = liteHttpSchemaSet },
+    .{ .method = .POST, .path = "/lite/v1/run-until-idle", .handler = liteHttpRunUntilIdle },
+    .{ .method = .GET, .path = "/lite/v1/check", .handler = liteHttpCheck },
+    .{ .method = .POST, .path = "/lite/v1/compact", .handler = liteHttpCompact },
+    .{ .method = .POST, .path = "/lite/v1/vacuum", .handler = liteHttpVacuum },
+};
+
 fn registerLiteHttpRoutes(server: *httpx.Server) !void {
     try server.preRoute(liteHttpInjectState);
-    try server.get("/healthz", liteHttpHealth);
-    try server.get("/lite/v1/status", liteHttpStatus);
-    try server.get("/lite/v1/capabilities", liteHttpCapabilities);
-    try server.post("/lite/v1/batch", liteHttpBatch);
-    try server.post("/lite/v1/lookup/:key", liteHttpLookup);
-    try server.post("/lite/v1/scan", liteHttpScan);
-    try server.post("/lite/v1/query", liteHttpQuery);
-    try server.get("/lite/v1/indexes", liteHttpIndexList);
-    try server.post("/lite/v1/indexes", liteHttpIndexCreate);
-    try server.delete("/lite/v1/indexes/:name", liteHttpIndexDrop);
-    try server.get("/lite/v1/enrichments", liteHttpEnrichmentList);
-    try server.post("/lite/v1/enrichments", liteHttpEnrichmentCreate);
-    try server.delete("/lite/v1/enrichments/:kind/:name", liteHttpEnrichmentDrop);
-    try server.get("/lite/v1/schema", liteHttpSchemaGet);
-    try server.put("/lite/v1/schema", liteHttpSchemaSet);
-    try server.post("/lite/v1/run-until-idle", liteHttpRunUntilIdle);
-    try server.get("/lite/v1/check", liteHttpCheck);
-    try server.post("/lite/v1/compact", liteHttpCompact);
-    try server.post("/lite/v1/vacuum", liteHttpVacuum);
+    for (lite_http_routes) |route| {
+        try server.route(route.method, route.path, route.handler);
+    }
 }
 
 fn liteHttpInjectState(ctx: *httpx.Context) anyerror!void {
@@ -1689,6 +1701,16 @@ test "lite serve parser preserves optional addr and rejects unknown args" {
         const listen = try parseLiteListenAddress("localhost:8080");
         try std.testing.expectEqualStrings("localhost", listen.host);
         try std.testing.expectEqual(@as(u16, 8080), listen.port);
+    }
+}
+
+test "lite serve route table is narrow and unique" {
+    try std.testing.expect(lite_http_routes.len > 0);
+    for (lite_http_routes, 0..) |route, i| {
+        try std.testing.expect(std.mem.eql(u8, route.path, "/healthz") or std.mem.startsWith(u8, route.path, "/lite/v1/"));
+        for (lite_http_routes[i + 1 ..]) |other| {
+            try std.testing.expect(!(route.method == other.method and std.mem.eql(u8, route.path, other.path)));
+        }
     }
 }
 
