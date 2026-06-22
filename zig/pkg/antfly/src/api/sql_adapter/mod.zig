@@ -614,6 +614,7 @@ pub const lowerExplainPlanWithParsedSqlAlloc = plan.lowerExplainPlanWithParsedSq
 pub const lowerRelationPopulationPlanWithHooksAlloc = plan.lowerRelationPopulationPlanWithHooksAlloc;
 pub const lowerReadPlanWithHooks = plan.lowerReadPlanWithHooks;
 pub const lowerWritePlanWithHooksAlloc = plan.lowerWritePlanWithHooksAlloc;
+pub const lowerWritePlanWithParsedSqlAlloc = plan.lowerWritePlanWithParsedSqlAlloc;
 pub const sqlWritePlanFallbackAllowed = plan.sqlWritePlanFallbackAllowed;
 pub const cloneExpressionAlloc = plan.cloneExpressionAlloc;
 pub const cloneExpressionCaseBranchAlloc = plan.cloneExpressionCaseBranchAlloc;

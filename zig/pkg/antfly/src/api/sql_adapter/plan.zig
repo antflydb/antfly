@@ -739,9 +739,18 @@ pub fn lowerWritePlanWithHooksAlloc(
     options: LowerWritePlanOptions,
     hooks: WritePlanLoweringHooks,
 ) !LoweredWritePlan {
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
+    return try lowerWritePlanWithParsedSqlAlloc(&parsed_sql, schema, options, hooks);
+}
+
+pub fn lowerWritePlanWithParsedSqlAlloc(
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    options: LowerWritePlanOptions,
+    hooks: WritePlanLoweringHooks,
+) !LoweredWritePlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
 
     if (tokens.len >= 2 and std.ascii.eqlIgnoreCase(tokens[0].text, "with") and std.ascii.eqlIgnoreCase(tokens[1].text, "recursive")) {

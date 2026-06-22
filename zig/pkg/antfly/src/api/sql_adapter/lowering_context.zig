@@ -360,7 +360,9 @@ pub const WritePlanLoweringContext = struct {
     callbacks: WritePlanLoweringCallbacks,
 
     pub fn lower(self: *@This(), options: plan.LowerWritePlanOptions) !plan.LoweredWritePlan {
-        return try plan.lowerWritePlanWithHooksAlloc(self.alloc, self.sql, self.schema, options, self.hooks());
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, self.sql);
+        defer parsed_sql.deinit(self.alloc);
+        return try plan.lowerWritePlanWithParsedSqlAlloc(&parsed_sql, self.schema, options, self.hooks());
     }
 
     fn hooks(self: *@This()) plan.WritePlanLoweringHooks {

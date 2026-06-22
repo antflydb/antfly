@@ -3295,6 +3295,7 @@ fn borrowedRoutineToken(kind: TokenKind, text: []const u8, source: Token) Token 
         .owned = false,
         .source_start = source.source_start,
         .source_end = source.source_end,
+        .keyword = source.keyword,
     };
 }
 

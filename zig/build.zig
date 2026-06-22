@@ -3868,6 +3868,7 @@ pub fn build(b: *std.Build) void {
             "postgres sql adapter write plan honors renamed primary conflict constraints",
             "sql adapter ddl plan lowers create table ddl into typed schema plan",
             "catalog apply applies create table ddl plan to owned runtime schema",
+            "catalog apply applies additive alter table ddl plan to runtime schema",
             "catalog apply applies updated-at trigger ddl plan to runtime schema",
             "sql adapter lower dml detects dotted path conflicts",
             "sql adapter lower dml detects json set path conflicts",
