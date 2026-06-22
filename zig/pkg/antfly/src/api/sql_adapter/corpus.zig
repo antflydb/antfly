@@ -29,9 +29,13 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../table_catalog.zig");
+const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
 pub const SqlValue = value_mod.SqlValue;
+pub const app_parity_default_schema_json =
+    \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"cloud_instance_id":{"type":"keyword"},"user_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"metric_type":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"rating_status":{"type":"keyword"},"product_family":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"rated_quantity":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"recorded_at":{"type":"numeric"},"expires_at":{"type":"numeric"},"billing_cycle_start":{"type":"numeric"},"bucket_start":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+;
 const LoweredAggregate = plan_mod.LoweredAggregate;
 const LoweredAggregatePlan = plan_mod.LoweredAggregatePlan;
 const LoweredJoin = plan_mod.LoweredJoin;
@@ -449,26 +453,47 @@ pub fn appParityEntryHasCatalogSchemas(entry: AppParityCorpusEntry) bool {
 }
 
 pub fn appParityCatalogForEntryAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?AppParitySourceSchemaCatalog {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    return try appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
+}
+
+pub fn appParityCatalogForEntryParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !?AppParitySourceSchemaCatalog {
     if (entry.source_schema_json.len > 0 and entry.catalog_tables.len > 0) return error.InvalidSqlCatalog;
     if (entry.catalog_tables.len > 0) {
         return try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, entry.catalog_tables);
     }
-    const source_table_name = (try appParitySourceTableNameAlloc(alloc, entry)) orelse return null;
+    const source_table_name = (try appParitySourceTableNameParsedSqlAlloc(alloc, entry, parsed_sql)) orelse return null;
     defer alloc.free(@constCast(source_table_name));
     return try AppParitySourceSchemaCatalog.initSourceSchemaAlloc(alloc, source_table_name, entry.source_schema_json);
 }
 
 pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !?[]const u8 {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    return try appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql);
+}
+
+pub fn appParitySourceTableNameParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !?[]const u8 {
     if (entry.source_schema_json.len == 0) return null;
+    const tokens = parsed_sql.items();
 
     switch (entry.family) {
         .insert_source => {
-            var tables = (try binder.insertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.insertSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
         .recursive_insert_source => {
-            var tables = (try binder.recursiveInsertSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.recursiveInsertSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
@@ -476,7 +501,7 @@ pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityC
         .delete_joined_source,
         .merge_mutation,
         => {
-            var tables = (try binder.joinedWriteSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.joinedWriteSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
@@ -484,7 +509,7 @@ pub fn appParitySourceTableNameAlloc(alloc: std.mem.Allocator, entry: AppParityC
         .join,
         .lateral,
         => {
-            var tables = (try binder.readSourceTableNamesAlloc(alloc, entry.sql)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.readSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },

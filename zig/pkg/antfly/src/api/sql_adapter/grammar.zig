@@ -1344,14 +1344,13 @@ pub const RelationPopulationSyntax = struct {
     target_lifetime: ?RelationLifetimeKind = null,
     if_not_exists: bool = false,
     populate: bool = true,
-    source_sql: []u8,
     source_token_start: ?usize = null,
     source_token_end: ?usize = null,
     source_suffix_token_start: ?usize = null,
     source_suffix_token_end: ?usize = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        alloc.free(self.source_sql);
+        _ = alloc;
         self.* = undefined;
     }
 };
@@ -7661,21 +7660,19 @@ pub fn parseRelationPopulationTokensAlloc(
     sql: []const u8,
     tokens: []const Token,
 ) !RelationPopulationSyntax {
+    _ = alloc;
+    _ = sql;
     if (tokens.len == 0 or tokens[0].kind != .identifier) return error.UnsupportedSqlShape;
     if (std.ascii.eqlIgnoreCase(tokens[0].text, "select")) {
-        return try parseSelectIntoPopulationSqlAlloc(alloc, sql, tokens);
+        return try parseSelectIntoPopulationSqlAlloc(tokens);
     }
     if (std.ascii.eqlIgnoreCase(tokens[0].text, "create")) {
-        return try parseCreateTableAsPopulationSqlAlloc(alloc, sql, tokens);
+        return try parseCreateTableAsPopulationSqlAlloc(tokens);
     }
     return error.UnsupportedSqlShape;
 }
 
-fn parseSelectIntoPopulationSqlAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    tokens: []const Token,
-) !RelationPopulationSyntax {
+fn parseSelectIntoPopulationSqlAlloc(tokens: []const Token) !RelationPopulationSyntax {
     const into_relative = parser.findTopLevelKeyword(tokens[1..], "into") orelse return error.UnsupportedSqlShape;
     const into_index = 1 + into_relative;
     var target_index = into_index + 1;
@@ -7696,21 +7693,12 @@ fn parseSelectIntoPopulationSqlAlloc(
     while (source_token_end > from_index and tokens[source_token_end - 1].kind == .semicolon) source_token_end -= 1;
     if (source_token_end <= from_index) return error.UnsupportedSqlShape;
 
-    const into_start = try tokenStartOffset(sql, tokens[into_index]);
-    const from_start = try tokenStartOffset(sql, tokens[from_index]);
-    const source_end = try tokenEndOffset(sql, tokens[source_token_end - 1]);
-    const source_sql = try std.fmt.allocPrint(
-        alloc,
-        "{s} {s}",
-        .{ std.mem.trim(u8, sql[0..into_start], " \t\r\n"), std.mem.trim(u8, sql[from_start..source_end], " \t\r\n") },
-    );
     return .{
         .mode = .select_into,
         .target_identifier = tokens[target_index].text,
         .target_lifetime = target_lifetime,
         .if_not_exists = false,
         .populate = true,
-        .source_sql = source_sql,
         .source_token_start = 0,
         .source_token_end = into_index,
         .source_suffix_token_start = from_index,
@@ -7770,11 +7758,7 @@ fn topLevelTokenAt(tokens: []const Token, start_index: usize, token_index: usize
     return depth == 0;
 }
 
-fn parseCreateTableAsPopulationSqlAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    tokens: []const Token,
-) !RelationPopulationSyntax {
+fn parseCreateTableAsPopulationSqlAlloc(tokens: []const Token) !RelationPopulationSyntax {
     var index: usize = 1;
     const target_lifetime: ?RelationLifetimeKind = if (parser.matchKeyword(tokens, &index, "temporary") or parser.matchKeyword(tokens, &index, "temp"))
         .temporary
@@ -7794,42 +7778,18 @@ fn parseCreateTableAsPopulationSqlAlloc(
     index += 1;
     if (!parser.matchKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
     if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
-    const select_start = try tokenStartOffset(sql, tokens[index]);
     const data_clause = parseTrailingRelationPopulationDataClause(tokens, index);
     var source_token_end = if (data_clause) |clause| clause.start_index else tokens.len;
     while (source_token_end > index and tokens[source_token_end - 1].kind == .semicolon) source_token_end -= 1;
-    const source_end = if (data_clause) |clause|
-        try tokenStartOffset(sql, tokens[clause.start_index])
-    else if (source_token_end > index)
-        try tokenEndOffset(sql, tokens[source_token_end - 1])
-    else
-        sql.len;
-    const source_sql = try alloc.dupe(u8, std.mem.trim(u8, sql[select_start..source_end], " \t\r\n"));
     return .{
         .mode = .create_table_as,
         .target_identifier = target_identifier,
         .target_lifetime = target_lifetime,
         .if_not_exists = if_not_exists,
         .populate = if (data_clause) |clause| clause.populate else true,
-        .source_sql = source_sql,
         .source_token_start = index,
         .source_token_end = source_token_end,
     };
-}
-
-fn tokenStartOffset(sql: []const u8, token: Token) !usize {
-    const sql_start = @intFromPtr(sql.ptr);
-    const sql_end = sql_start + sql.len;
-    const token_start = @intFromPtr(token.text.ptr);
-    if (token_start >= sql_start and token_start <= sql_end) return token_start - sql_start;
-    if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
-    return error.UnsupportedSqlShape;
-}
-
-fn tokenEndOffset(sql: []const u8, token: Token) !usize {
-    const start = try tokenStartOffset(sql, token);
-    if (start + token.text.len > sql.len) return error.UnsupportedSqlShape;
-    return start + token.text.len;
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -11688,54 +11648,61 @@ test "sql adapter grammar parses row claim clauses" {
 test "sql adapter grammar parses relation population syntax" {
     const alloc = std.testing.allocator;
 
+    const select_into_sql = "SELECT account_id, total INTO public.usage_archive FROM usage_records WHERE total > 10";
     var select_into = try parseRelationPopulationSqlAlloc(
         alloc,
-        "SELECT account_id, total INTO public.usage_archive FROM usage_records WHERE total > 10",
+        select_into_sql,
     );
     defer select_into.deinit(alloc);
     try std.testing.expectEqual(RelationPopulationMode.select_into, select_into.mode);
     try std.testing.expectEqualStrings("public.usage_archive", select_into.target_identifier);
     try std.testing.expect(select_into.target_lifetime == null);
     try std.testing.expect(!select_into.if_not_exists);
-    try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into.source_sql);
-    try std.testing.expectEqual(@as(?usize, 0), select_into.source_token_start);
-    try std.testing.expect(select_into.source_token_end != null);
-    try std.testing.expect(select_into.source_suffix_token_start != null);
-    try std.testing.expect(select_into.source_suffix_token_end != null);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        select_into_sql,
+        "SELECT account_id, total",
+        "FROM usage_records WHERE total > 10",
+    );
 
+    const select_into_temp_sql = "SELECT account_id, total INTO TEMP TABLE usage_session_archive FROM usage_records WHERE total > 10";
     var select_into_temp = try parseRelationPopulationSqlAlloc(
         alloc,
-        "SELECT account_id, total INTO TEMP TABLE usage_session_archive FROM usage_records WHERE total > 10",
+        select_into_temp_sql,
     );
     defer select_into_temp.deinit(alloc);
     try std.testing.expectEqual(RelationPopulationMode.select_into, select_into_temp.mode);
     try std.testing.expectEqualStrings("usage_session_archive", select_into_temp.target_identifier);
     try std.testing.expectEqual(RelationLifetimeKind.temporary, select_into_temp.target_lifetime.?);
     try std.testing.expect(!select_into_temp.if_not_exists);
-    try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into_temp.source_sql);
-    try std.testing.expectEqual(@as(?usize, 0), select_into_temp.source_token_start);
-    try std.testing.expect(select_into_temp.source_token_end != null);
-    try std.testing.expect(select_into_temp.source_suffix_token_start != null);
-    try std.testing.expect(select_into_temp.source_suffix_token_end != null);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        select_into_temp_sql,
+        "SELECT account_id, total",
+        "FROM usage_records WHERE total > 10",
+    );
 
+    const select_into_unlogged_sql = "SELECT account_id INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE total > 10";
     var select_into_unlogged = try parseRelationPopulationSqlAlloc(
         alloc,
-        "SELECT account_id INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE total > 10",
+        select_into_unlogged_sql,
     );
     defer select_into_unlogged.deinit(alloc);
     try std.testing.expectEqual(RelationPopulationMode.select_into, select_into_unlogged.mode);
     try std.testing.expectEqualStrings("usage_ingest_archive", select_into_unlogged.target_identifier);
     try std.testing.expectEqual(RelationLifetimeKind.unlogged, select_into_unlogged.target_lifetime.?);
     try std.testing.expect(!select_into_unlogged.if_not_exists);
-    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records WHERE total > 10", select_into_unlogged.source_sql);
-    try std.testing.expectEqual(@as(?usize, 0), select_into_unlogged.source_token_start);
-    try std.testing.expect(select_into_unlogged.source_token_end != null);
-    try std.testing.expect(select_into_unlogged.source_suffix_token_start != null);
-    try std.testing.expect(select_into_unlogged.source_suffix_token_end != null);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        select_into_unlogged_sql,
+        "SELECT account_id",
+        "FROM usage_records WHERE total > 10",
+    );
 
+    const create_as_sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records";
     var create_as = try parseRelationPopulationSqlAlloc(
         alloc,
-        "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records",
+        create_as_sql,
     );
     defer create_as.deinit(alloc);
     try std.testing.expectEqual(RelationPopulationMode.create_table_as, create_as.mode);
@@ -11743,9 +11710,16 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expectEqual(RelationLifetimeKind.temporary, create_as.target_lifetime.?);
     try std.testing.expect(create_as.if_not_exists);
     try std.testing.expect(create_as.populate);
-    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as.source_sql);
     try std.testing.expect(create_as.source_token_start != null);
-    try std.testing.expect(create_as.source_token_end != null);
+    try std.testing.expect(create_as.source_token_end.? > create_as.source_token_start.?);
+    try std.testing.expect(create_as.source_suffix_token_start == null);
+    try std.testing.expect(create_as.source_suffix_token_end == null);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        create_as_sql,
+        "SELECT account_id FROM usage_records",
+        null,
+    );
 
     const padded_create_as_sql = "  CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;  ";
     var padded_tokens = try lexer.tokenizeAlloc(alloc, padded_create_as_sql);
@@ -11759,13 +11733,19 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expectEqual(RelationPopulationMode.create_table_as, parsed_from_tokens.mode);
     try std.testing.expectEqualStrings("usage_archive", parsed_from_tokens.target_identifier);
     try std.testing.expect(parsed_from_tokens.populate);
-    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", parsed_from_tokens.source_sql);
     try std.testing.expect(parsed_from_tokens.source_token_start != null);
-    try std.testing.expect(parsed_from_tokens.source_token_end != null);
+    try std.testing.expect(parsed_from_tokens.source_token_end.? > parsed_from_tokens.source_token_start.?);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        padded_create_as_sql,
+        "SELECT account_id FROM usage_records",
+        null,
+    );
 
+    const create_as_no_data_sql = "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH NO DATA;";
     var create_as_no_data = try parseRelationPopulationSqlAlloc(
         alloc,
-        "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH NO DATA;",
+        create_as_no_data_sql,
     );
     defer create_as_no_data.deinit(alloc);
     try std.testing.expectEqual(RelationPopulationMode.create_table_as, create_as_no_data.mode);
@@ -11773,21 +11753,61 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expect(create_as_no_data.target_lifetime == null);
     try std.testing.expect(!create_as_no_data.if_not_exists);
     try std.testing.expect(!create_as_no_data.populate);
-    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as_no_data.source_sql);
+    try std.testing.expect(create_as_no_data.source_token_end.? > create_as_no_data.source_token_start.?);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        create_as_no_data_sql,
+        "SELECT account_id FROM usage_records",
+        null,
+    );
 
+    const create_as_with_data_sql = "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;";
     var create_as_with_data = try parseRelationPopulationSqlAlloc(
         alloc,
-        "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;",
+        create_as_with_data_sql,
     );
     defer create_as_with_data.deinit(alloc);
     try std.testing.expectEqual(RelationPopulationMode.create_table_as, create_as_with_data.mode);
     try std.testing.expect(create_as_with_data.populate);
-    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as_with_data.source_sql);
+    try std.testing.expect(create_as_with_data.source_token_end.? > create_as_with_data.source_token_start.?);
+    try expectRelationPopulationSourceRanges(
+        alloc,
+        create_as_with_data_sql,
+        "SELECT account_id FROM usage_records",
+        null,
+    );
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         parseRelationPopulationSqlAlloc(alloc, "CREATE TABLE usage_archive SELECT account_id FROM usage_records"),
     );
+}
+
+fn expectRelationPopulationSourceRanges(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_prefix: []const u8,
+    expected_suffix: ?[]const u8,
+) !void {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    var parsed = try parseRelationPopulationTokensAlloc(alloc, sql, tokens.items);
+    defer parsed.deinit(alloc);
+
+    const start = parsed.source_token_start orelse return error.TestUnexpectedResult;
+    const end = parsed.source_token_end orelse return error.TestUnexpectedResult;
+    if (end <= start or end > tokens.items.len) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected_prefix, sql[tokens.items[start].source_start..tokens.items[end - 1].source_end]);
+
+    if (expected_suffix) |suffix| {
+        const suffix_start = parsed.source_suffix_token_start orelse return error.TestUnexpectedResult;
+        const suffix_end = parsed.source_suffix_token_end orelse return error.TestUnexpectedResult;
+        if (suffix_end <= suffix_start or suffix_end > tokens.items.len) return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(suffix, sql[tokens.items[suffix_start].source_start..tokens.items[suffix_end - 1].source_end]);
+    } else {
+        try std.testing.expect(parsed.source_suffix_token_start == null);
+        try std.testing.expect(parsed.source_suffix_token_end == null);
+    }
 }
 
 test "sql adapter grammar normalizes public object identifiers" {

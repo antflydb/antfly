@@ -304,7 +304,11 @@ Current implementation status:
   and route through parsed context entrypoints before dispatching to nested
   read/write lowerers. The data-driven SQL edge-case harness also parses each
   case once and passes `ParsedSql` through its lowering callbacks, including
-  write-family classification from parsed/tokenized metadata.
+  write-family classification from parsed/tokenized metadata. Relation
+  population syntax now carries source token ranges only; it no longer allocates
+  or stores reconstructed source SQL. App-parity catalog/source-table fixture
+  resolution has parsed entrypoints and reuses the same `ParsedSql` object as
+  read/write/explain lowering instead of retokenizing fixture SQL.
   Catalog-backed read/write prebinding now produces `BoundSqlStatement`, preserving the parsed statement variant while
   carrying owned session identity (`current_database` and `search_path`) plus
   resolved source schemas or write-plan catalog options before routing through

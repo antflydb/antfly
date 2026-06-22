@@ -2306,7 +2306,6 @@ fn lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(
 
 pub const lowerAntflyQueryFunctionSqlAlloc = sql_adapter.lowerAntflyQueryFunctionSqlAlloc;
 const AppParitySourceSchemaCatalog = sql_adapter.AppParitySourceSchemaCatalog;
-const appParitySourceTableNameAlloc = sql_adapter.appParitySourceTableNameAlloc;
 
 const Parser = sql_adapter.ParserState;
 
@@ -3061,18 +3060,21 @@ fn lowerAppParityReadPlanAlloc(
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
 ) !LoweredReadPlan {
-    var catalog_opt = try sql_adapter.appParityCatalogForEntryAlloc(alloc, entry);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
-        return try lowerReadPlanWithCatalogAlloc(
+        return try lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
             alloc,
-            entry.sql,
+            &parsed_sql,
             effective_schema,
             entry.params,
             catalog.iface(),
+            .{},
         );
     }
-    return try lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params);
+    return try lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{});
 }
 
 fn lowerAppParityExplainPlanAlloc(
@@ -3082,12 +3084,14 @@ fn lowerAppParityExplainPlanAlloc(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredExplainPlan {
-    var catalog_opt = try sql_adapter.appParityCatalogForEntryAlloc(alloc, entry);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
-        return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsAlloc(
+        return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
             alloc,
-            entry.sql,
+            &parsed_sql,
             effective_schema,
             entry.params,
             .{
@@ -3098,10 +3102,18 @@ fn lowerAppParityExplainPlanAlloc(
             .{},
         );
     }
-    return try lowerExplainPlanWithOptionsAlloc(alloc, entry.sql, effective_schema, entry.params, .{
-        .unique_resolver = unique_resolver,
-        .row_claim = row_claim,
-    });
+    return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        effective_schema,
+        entry.params,
+        .{
+            .unique_resolver = unique_resolver,
+            .row_claim = row_claim,
+        },
+        null,
+        .{},
+    );
 }
 
 fn expectAppParityReadPlanEntry(
@@ -3428,15 +3440,17 @@ fn lowerAppParityWritePlanAlloc(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredWritePlan {
-    var catalog_opt = try sql_adapter.appParityCatalogForEntryAlloc(alloc, entry);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
-        return try lowerWritePlanWithCatalogAlloc(alloc, entry.sql, effective_schema, entry.params, .{
+        return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{
             .unique_resolver = unique_resolver,
             .row_claim = row_claim,
         }, catalog.iface());
     }
-    return try lowerWritePlanAlloc(alloc, entry.sql, effective_schema, entry.params, .{
+    return try lowerWritePlanParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{
         .unique_resolver = unique_resolver,
         .row_claim = row_claim,
     });
@@ -3991,7 +4005,9 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
         }
     }
     if (entry.source_schema_json.len > 0) {
-        const source_table_name = (appParitySourceTableNameAlloc(alloc, entry) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
+        var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+        defer parsed_sql.deinit(alloc);
+        const source_table_name = (sql_adapter.appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
         defer alloc.free(@constCast(source_table_name));
         if (source_table_name.len == 0) return error.TestUnexpectedResult;
         if (entry.summary.table_name) |target_table_name| {
@@ -5489,9 +5505,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
 }
 
 const AppParityCorpusCoverage = sql_adapter.AppParityCorpusCoverage;
-const app_parity_default_schema_json =
-    \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"cloud_instance_id":{"type":"keyword"},"user_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"metric_type":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"rating_status":{"type":"keyword"},"product_family":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"rated_quantity":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"recorded_at":{"type":"numeric"},"expires_at":{"type":"numeric"},"billing_cycle_start":{"type":"numeric"},"bucket_start":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-;
+const app_parity_default_schema_json = sql_adapter.app_parity_default_schema_json;
 
 test "postgres sql adapter classifies application parity corpus" {
     const alloc = std.testing.allocator;
