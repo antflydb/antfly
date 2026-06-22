@@ -1186,7 +1186,7 @@ pub fn bindWritePlanCatalogStatementWithSessionAlloc(
     };
 }
 
-pub fn resolveWritePlanCatalogOptionsParsedSqlAlloc(
+fn resolveWritePlanCatalogOptionsParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
@@ -1195,7 +1195,7 @@ pub fn resolveWritePlanCatalogOptionsParsedSqlAlloc(
     return try resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(alloc, parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
-pub fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
+fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     options: plan_mod.LowerWritePlanOptions,
@@ -1257,7 +1257,7 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
     return out;
 }
 
-pub fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(
+fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
@@ -1265,7 +1265,7 @@ pub fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(
     return try resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
-pub fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
+fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
@@ -2101,9 +2101,7 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     try std.testing.expect((try bound_write.writeCatalog()).owned_insert_source_schema == null);
 
     try std.testing.expectError(error.UnsupportedSqlShape, bindReadPlanCatalogStatementAlloc(alloc, &parsed_write, catalog.iface()));
-    try std.testing.expectError(error.UnsupportedSqlShape, resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(alloc, &parsed_write, catalog.iface()));
     try std.testing.expectError(error.UnsupportedSqlShape, bindWritePlanCatalogStatementAlloc(alloc, &parsed_read, .{}, catalog.iface()));
-    try std.testing.expectError(error.UnsupportedSqlShape, resolveWritePlanCatalogOptionsParsedSqlAlloc(alloc, &parsed_read, .{}, catalog.iface()));
 
     const tenant_path = [_][]const u8{"analytics"};
     const tenant_session: catalog_resources.SqlCatalogSession = .{
