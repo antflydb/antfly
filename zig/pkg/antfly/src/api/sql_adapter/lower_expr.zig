@@ -24091,6 +24091,287 @@ fn testOwnedBooleanConditionAlloc(
     };
 }
 
+fn runtimeSchemaFromJsonForLowerExprTestAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !runtime_schema.TableSchema {
+    const schema_api = @import("../../schema/mod.zig");
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+}
+
+fn lowerQueryPlanForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredQueryPlan {
+    return try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(alloc, sql, schema, params, .{});
+}
+
+fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !plan_mod.LoweredQueryPlan {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+    };
+    var lowered = parseQueryPlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        params,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.queryPlanParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.simpleSelectSetTailHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsQueryPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !plan_mod.LoweredSetOperationPlan {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+    };
+    return try plan_mod.parseSetOperationPlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        schema,
+        false,
+        parser_context.ParserState.ContextAccessors.setOperationParserHooks(&parser_state),
+    );
+}
+
+test "sql adapter lower expr lowers routine expression bindings into row expressions" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const normalize_operands = [_]db_mod.types.RelationalRowsExpression{.{ .kind = .field, .field = "arg1" }};
+    const normalize_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .lower,
+        .operands = &normalize_operands,
+    };
+    const bindings = [_]RoutineExpressionBinding{.{
+        .sql_name = "normalize_status",
+        .arity = 1,
+        .expression = normalize_expression,
+    }};
+
+    var lowered = try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, normalize_status(status) AS status_key FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &bindings },
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    const expression = lowered.plan.query.expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, expression.operands[0].kind);
+    try std.testing.expectEqualStrings("status", expression.operands[0].field);
+
+    var set_operation = try lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT normalize_status(status) AS status_key FROM usage_records WHERE status = 'open' UNION ALL SELECT normalize_status(status) AS status_key FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+        .{ .routine_expressions = &bindings },
+    );
+    defer set_operation.deinit(alloc);
+    try std.testing.expectEqual(plan_mod.SelectSetOperation.union_all, set_operation.operation);
+    try std.testing.expectEqual(@as(usize, 1), set_operation.left.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), set_operation.right.plan.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, set_operation.left.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, set_operation.right.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", set_operation.left.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("status", set_operation.right.plan.query.expressions[0].expression.operands[0].field);
+
+    var ordered = try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE id = $1 ORDER BY normalize_status(status) DESC",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &bindings },
+    );
+    defer ordered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered.plan.query.order_by.len);
+    const order_expression = ordered.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, order_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), order_expression.operands.len);
+    try std.testing.expectEqualStrings("status", order_expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered.plan.query.order_by[0].direction);
+
+    const overloaded_operands = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .field, .field = "arg1" },
+        .{ .kind = .field, .field = "arg2" },
+    };
+    const overloaded_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .concat_ws,
+        .operands = &overloaded_operands,
+    };
+    const overloaded_bindings = [_]RoutineExpressionBinding{
+        .{
+            .sql_name = "status_label",
+            .arity = 1,
+            .expression = normalize_expression,
+        },
+        .{
+            .sql_name = "status_label",
+            .arity = 2,
+            .expression = overloaded_expression,
+        },
+    };
+    var overloaded = try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, status_label('prefix-', status) AS status_key FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &overloaded_bindings },
+    );
+    defer overloaded.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, overloaded.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), overloaded.plan.query.expressions[0].expression.operands.len);
+
+    const strict_bindings = [_]RoutineExpressionBinding{.{
+        .sql_name = "strict_normalize_status",
+        .arity = 1,
+        .expression = normalize_expression,
+        .null_input = .returns_null,
+    }};
+    var null_lowered = try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, strict_normalize_status(null) AS status_key FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &strict_bindings },
+    );
+    defer null_lowered.deinit(alloc);
+    const null_expression = null_lowered.plan.query.expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, null_expression.kind);
+    try std.testing.expectEqualStrings("null", null_expression.value_json);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, strict_normalize_status(status) AS status_key FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &strict_bindings },
+    ));
+
+    const duplicate_bindings = [_]RoutineExpressionBinding{
+        .{ .sql_name = "normalize_status", .arity = 1, .expression = normalize_expression },
+        .{ .sql_name = "normalize_status", .arity = 1, .expression = normalize_expression },
+    };
+    if (lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, normalize_status(status) AS status_key FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .routine_expressions = &duplicate_bindings },
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+}
+
+test "sql adapter lower expr lowers uuid generation projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"request_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var projected = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, uuid_generate_v4() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer projected.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), projected.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("request_id", projected.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.uuid_v4, projected.plan.query.expressions[0].expression.kind);
+
+    if (lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+    var projected_extension = try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .extension_functions = &.{.{
+            .sql_name = "extension_uuid",
+            .native_expression_kind = .uuid_v4,
+            .arity = 0,
+        }} },
+    );
+    defer projected_extension.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), projected_extension.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("request_id", projected_extension.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.uuid_v4, projected_extension.plan.query.expressions[0].expression.kind);
+}
+
 test "sql adapter lower expr assembles boolean predicate groups" {
     const alloc = std.testing.allocator;
 

@@ -15,15 +15,18 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const corpus = @import("corpus.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
+const lowering_context = @import("lowering_context.zig");
 const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
+const table_catalog = @import("../table_catalog.zig");
 const sql_value = @import("value.zig");
 
 const Token = lower_expr.Token;
@@ -11545,6 +11548,203 @@ fn lowerTruncateMutationSourceForTestAlloc(
     };
 }
 
+fn lowerInsertSourceWithResolverForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !plan_mod.LoweredInsertSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parseInsertSourceAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
+fn lowerInsertSourceWithSchemasForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !plan_mod.LoweredInsertSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .insert_source_allows_different_table = true,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parseInsertSourceAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
+fn lowerMergeMutationPlanForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+) !plan_mod.LoweredMergeMutationPlan {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    return try parseMergeMutationPlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
+    );
+}
+
+fn lowerWritePlanForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    var context = lowering_context.WritePlanLoweringContext{
+        .alloc = alloc,
+        .sql = sql,
+        .schema = schema,
+        .params = params,
+        .callbacks = .{
+            .lower_recursive_insert_source_with_schemas = unsupportedRecursiveInsertSourceForDmlTestAlloc,
+            .lower_recursive_update_joined_source_with_schemas = unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc,
+            .lower_recursive_delete_joined_source_with_schemas = unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc,
+            .lower_recursive_merge_mutation_with_schemas = unsupportedRecursiveMergeMutationForDmlTestAlloc,
+            .lower_insert_with_resolver = lowerInsertWithResolverForTestAlloc,
+            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverForDmlTestAlloc,
+            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasForDmlTestAlloc,
+            .lower_update_joined_source_with_schemas = unsupportedJoinedMutationSourceForDmlTestAlloc,
+            .lower_update_with_resolver = lowerUpdateForTestAlloc,
+            .lower_update_source = lowerUpdateMutationSourceForTestAlloc,
+            .lower_delete_joined_source_with_schemas = unsupportedJoinedMutationSourceForDmlTestAlloc,
+            .lower_delete_with_resolver = lowerDeleteForTestAlloc,
+            .lower_delete_source = lowerDeleteMutationSourceForTestAlloc,
+            .lower_truncate_source = lowerTruncateMutationSourceForTestAlloc,
+            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanForDmlTestAlloc,
+        },
+    };
+    return try context.lower(options);
+}
+
+fn lowerWritePlanWithCatalogForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !plan_mod.LoweredWritePlan {
+    var context = lowering_context.CatalogWritePlanLoweringContext{
+        .alloc = alloc,
+        .sql = sql,
+        .schema = schema,
+        .params = params,
+        .callbacks = .{
+            .lower_with_options = lowerWritePlanForDmlTestAlloc,
+        },
+    };
+    return try context.lower(options, catalog);
+}
+
+fn unsupportedRecursiveInsertSourceForDmlTestAlloc(
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: runtime_schema.TableSchema,
+    _: runtime_schema.TableSchema,
+    _: []const sql_value.SqlValue,
+    _: relational_rows.UniqueSelectorResolver,
+) anyerror!plan_mod.LoweredRecursiveInsertSource {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc(
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: runtime_schema.TableSchema,
+    _: runtime_schema.TableSchema,
+    _: []const sql_value.SqlValue,
+    _: db_mod.types.RowClaimRequest,
+) anyerror!plan_mod.LoweredRecursiveJoinedMutationSource {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedRecursiveMergeMutationForDmlTestAlloc(
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: runtime_schema.TableSchema,
+    _: runtime_schema.TableSchema,
+    _: []const sql_value.SqlValue,
+) anyerror!plan_mod.LoweredRecursiveMergeMutation {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedJoinedMutationSourceForDmlTestAlloc(
+    _: std.mem.Allocator,
+    _: []const u8,
+    _: runtime_schema.TableSchema,
+    _: runtime_schema.TableSchema,
+    _: []const sql_value.SqlValue,
+    _: db_mod.types.RowClaimRequest,
+) anyerror!plan_mod.LoweredJoinedMutationSource {
+    return error.UnsupportedSqlShape;
+}
+
 const TestPrimaryResolver = struct {
     row_json: []const u8,
     version: u64,
@@ -13610,6 +13810,501 @@ test "sql adapter lower dml lowers uuid generation insert values" {
     defer returned.deinit();
     const request_id = returned.value.object.get("request_id") orelse return error.TestUnexpectedResult;
     try expectSqlUuidV4StringForDmlTest(request_id);
+}
+
+test "sql adapter lower dml lowers insert source write plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"amount":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"archive_id":{"type":"keyword"},"archive_status":{"type":"keyword"},"archive_amount":{"type":"numeric"}},"required":["archive_id"],"additionalProperties":false}}},"primary_key":{"columns":["archive_id"]}}
+    ;
+    const source_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, source_schema_json);
+    defer runtime_schema.freeSchema(alloc, source_schema);
+
+    var multi_conflict_resolver = TestPrimaryResolver{ .row_json = "{\"id\":\"u_multi_1\",\"status\":\"open\"}", .version = 1 };
+    var insert_source_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO NOTHING RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_plan.deinit(alloc);
+    switch (insert_source_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.predicates.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+            try std.testing.expect(insert_source.insert_source.req.on_conflict != null);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.nothing, insert_source.insert_source.req.on_conflict.?.action);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_computed_pattern_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE ANY(ARRAY['ready%', 'queued%']) RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_computed_pattern_plan.deinit(alloc);
+    switch (insert_source_computed_pattern_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.expression_predicates.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, insert_source.insert_source.req.source.expression_predicates[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.source.expression_predicates[0].lhs.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].operands[0].kind);
+            try std.testing.expectEqualStrings("\"ready%\"", insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_computed_pattern_some_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE lower(status) LIKE SOME(ARRAY['ready%', 'queued%']) RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_computed_pattern_some_plan.deinit(alloc);
+    switch (insert_source_computed_pattern_some_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.expression_predicates.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, insert_source.insert_source.req.source.expression_predicates[0].lhs.kind);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.source.expression_predicates[0].lhs.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].operands[0].kind);
+            try std.testing.expectEqualStrings("\"ready%\"", insert_source.insert_source.req.source.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_expression_or_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_expression_or_plan.deinit(alloc);
+    switch (insert_source_expression_or_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 0), insert_source.insert_source.req.source.expression_predicates.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.source.expression_or_predicates.len);
+            try std.testing.expectEqual(@as(usize, 0), insert_source.insert_source.req.source.expression_not_predicates.len);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, insert_source.insert_source.req.source.expression_or_predicates[0].conditions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, insert_source.insert_source.req.source.expression_or_predicates[0].conditions[0].lhs.kind);
+            try std.testing.expectEqualStrings("1", insert_source.insert_source.req.source.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, insert_source.insert_source.req.source.expression_or_predicates[1].conditions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, insert_source.insert_source.req.source.expression_or_predicates[1].conditions[0].lhs.kind);
+            try std.testing.expectEqualStrings("3", insert_source.insert_source.req.source.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_expression_not_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3) RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_expression_not_plan.deinit(alloc);
+    switch (insert_source_expression_not_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqual(@as(usize, 0), insert_source.insert_source.req.source.expression_predicates.len);
+            try std.testing.expectEqual(@as(usize, 0), insert_source.insert_source.req.source.expression_or_predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.expression_not_predicates.len);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.source.expression_not_predicates[0].conditions.len);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, insert_source.insert_source.req.source.expression_not_predicates[0].conditions[0].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, insert_source.insert_source.req.source.expression_not_predicates[0].conditions[0].lhs.kind);
+            try std.testing.expectEqualStrings("1", insert_source.insert_source.req.source.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, insert_source.insert_source.req.source.expression_not_predicates[0].conditions[1].op);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, insert_source.insert_source.req.source.expression_not_predicates[0].conditions[1].lhs.kind);
+            try std.testing.expectEqualStrings("3", insert_source.insert_source.req.source.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_expression_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, lower(status) AS status, amount + 1 AS amount FROM usage_records WHERE status = 'ready' ORDER BY amount DESC LIMIT 5 OFFSET 2 RETURNING id, lower(status) AS returned_status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_expression_plan.deinit(alloc);
+    switch (insert_source_expression_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("id", insert_source.insert_source.req.assignments[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, insert_source.insert_source.req.assignments[0].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, insert_source.insert_source.req.assignments[0].expression.field_source);
+            try std.testing.expectEqualStrings("status", insert_source.insert_source.req.assignments[1].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.assignments[1].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, insert_source.insert_source.req.assignments[1].expression.operands[0].field_source);
+            try std.testing.expectEqualStrings("amount", insert_source.insert_source.req.assignments[2].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, insert_source.insert_source.req.assignments[2].expression.kind);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, insert_source.insert_source.req.assignments[2].expression.operands[0].field_source);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 5), insert_source.insert_source.req.source.limit);
+            try std.testing.expectEqual(@as(u32, 2), insert_source.insert_source.req.source.offset);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.returning_expressions[0].expression.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_array_expression_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, tags) SELECT id, status, string_to_array(status, ' ') AS tags FROM usage_records WHERE status = 'ready' RETURNING id, tags, array_to_string(tags, ' ') AS tag_text",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_array_expression_plan.deinit(alloc);
+    switch (insert_source_array_expression_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("tags", insert_source.insert_source.req.assignments[2].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, insert_source.insert_source.req.assignments[2].expression.kind);
+            try std.testing.expectEqualStrings("status", insert_source.insert_source.req.assignments[2].expression.operands[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, insert_source.insert_source.req.assignments[2].expression.operands[0].field_source);
+            try std.testing.expectEqualStrings("\" \"", insert_source.insert_source.req.assignments[2].expression.operands[1].value_json);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_to_string, insert_source.insert_source.req.returning_expressions[0].expression.kind);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_returning_all_expression_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' RETURNING *, lower(status) AS status_key",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_returning_all_expression_plan.deinit(alloc);
+    switch (insert_source_returning_all_expression_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expect(insert_source.insert_source.req.returning_all);
+            try std.testing.expectEqual(@as(usize, 0), insert_source.insert_source.req.returning.len);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.returning_expressions.len);
+            try std.testing.expectEqualStrings("status_key", insert_source.insert_source.req.returning_expressions[0].output);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, insert_source.insert_source.req.returning_expressions[0].expression.kind);
+            try std.testing.expectEqualStrings("status", insert_source.insert_source.req.returning_expressions[0].expression.operands[0].field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_cte_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH ready_sources AS (SELECT id, lower(status) AS status_key, amount + 1 AS next_amount FROM usage_records WHERE status = 'READY') INSERT INTO usage_records (id, status, amount) SELECT id, status_key, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_cte_plan.deinit(alloc);
+    switch (insert_source_cte_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_sources", insert_source.ctes[0].name);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqualStrings("ready_sources", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("status_key", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expectEqualStrings("next_amount", insert_source.insert_source.req.assignments[2].expression.field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 3), insert_source.insert_source.req.source.limit);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_aliased_cte_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH ready_sources(source_id, source_status, next_amount) AS (SELECT id, lower(status), amount + 1 FROM usage_records WHERE lower(status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_sources ORDER BY next_amount DESC LIMIT 3 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_aliased_cte_plan.deinit(alloc);
+    switch (insert_source_aliased_cte_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_sources", insert_source.ctes[0].name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes[0].query.field_aliases.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.ctes[0].query.field_aliases[0].output);
+            try std.testing.expectEqualStrings("id", insert_source.ctes[0].query.field_aliases[0].field);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.ctes[0].query.expressions.len);
+            try std.testing.expectEqualStrings("source_status", insert_source.ctes[0].query.expressions[0].output);
+            try std.testing.expectEqualStrings("next_amount", insert_source.ctes[0].query.expressions[1].output);
+            try std.testing.expectEqualStrings("usage_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqualStrings("ready_sources", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.insert_source.req.assignments[0].expression.field);
+            try std.testing.expectEqualStrings("source_status", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expectEqualStrings("next_amount", insert_source.insert_source.req.assignments[2].expression.field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 3), insert_source.insert_source.req.source.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var source_catalog = corpus.AppParitySourceSchemaCatalog.init("archived_records", source_schema_json);
+    var cross_table_cte_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "WITH ready_archives AS (SELECT archive_id, lower(archive_status) AS status_key, archive_amount + 1 AS next_amount FROM archived_records WHERE archive_status = 'READY') INSERT INTO usage_records (id, status, amount) SELECT archive_id, status_key, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+        source_catalog.iface(),
+    );
+    defer cross_table_cte_plan.deinit(alloc);
+    switch (cross_table_cte_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("archived_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.ctes[0].name);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("archive_id", insert_source.insert_source.req.assignments[0].expression.field);
+            try std.testing.expectEqualStrings("status_key", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expectEqualStrings("next_amount", insert_source.insert_source.req.assignments[2].expression.field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 2), insert_source.insert_source.req.source.limit);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cross_table_aliased_cte_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "WITH ready_archives(source_id, source_status, next_amount) AS (SELECT archive_id, lower(archive_status), archive_amount + 1 FROM archived_records WHERE lower(archive_status) = 'ready') INSERT INTO usage_records (id, status, amount) SELECT source_id, source_status, next_amount FROM ready_archives ORDER BY next_amount DESC LIMIT 2 RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+        source_catalog.iface(),
+    );
+    defer cross_table_aliased_cte_plan.deinit(alloc);
+    switch (cross_table_aliased_cte_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("archived_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes.len);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.ctes[0].name);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.ctes[0].query.field_aliases.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.ctes[0].query.field_aliases[0].output);
+            try std.testing.expectEqualStrings("archive_id", insert_source.ctes[0].query.field_aliases[0].field);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.ctes[0].query.expressions.len);
+            try std.testing.expectEqualStrings("source_status", insert_source.ctes[0].query.expressions[0].output);
+            try std.testing.expectEqualStrings("next_amount", insert_source.ctes[0].query.expressions[1].output);
+            try std.testing.expectEqualStrings("ready_archives", insert_source.insert_source.req.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("source_id", insert_source.insert_source.req.assignments[0].expression.field);
+            try std.testing.expectEqualStrings("source_status", insert_source.insert_source.req.assignments[1].expression.field);
+            try std.testing.expectEqualStrings("next_amount", insert_source.insert_source.req.assignments[2].expression.field);
+            try std.testing.expectEqual(@as(usize, 1), insert_source.insert_source.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 2), insert_source.insert_source.req.source.limit);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE excluded.amount > amount RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_update_plan.deinit(alloc);
+    switch (insert_source_update_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 0), conflict.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, conflict.patch_expressions[0].expression.kind);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].expression.field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, conflict.patch_expressions[0].expression.field_source);
+            const where_expression = conflict.where_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, where_expression.op);
+            try std.testing.expectEqualStrings("amount", where_expression.lhs.field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, where_expression.lhs.field_source);
+            try std.testing.expectEqual(@as(usize, 1), where_expression.rhs.len);
+            try std.testing.expectEqualStrings("amount", where_expression.rhs[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.existing, where_expression.rhs[0].field_source);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_default_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET status = DEFAULT RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_default_update_plan.deinit(alloc);
+    switch (insert_source_default_update_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 1), conflict.operations.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set, conflict.operations[0].op);
+            try std.testing.expectEqualStrings("status", conflict.operations[0].path);
+            try std.testing.expectEqualStrings("\"active\"", conflict.operations[0].value_json.?);
+            try std.testing.expectEqual(@as(usize, 0), conflict.patch_expressions.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var insert_source_array_conflict_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, tags) SELECT id, status, string_to_array(status, ' ') AS tags FROM usage_records WHERE status = 'ready' ON CONFLICT (id) DO UPDATE SET tags = array_append((tags), excluded.status) RETURNING id, tags",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+    );
+    defer insert_source_array_conflict_plan.deinit(alloc);
+    switch (insert_source_array_conflict_plan) {
+        .insert_source => |insert_source| {
+            const conflict = insert_source.insert_source.req.on_conflict orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(db_mod.types.RelationalRowsConflictAction.update, conflict.action);
+            try std.testing.expectEqual(@as(usize, 0), conflict.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), conflict.patch_expressions.len);
+            try std.testing.expectEqualStrings("tags", conflict.patch_expressions[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_append, conflict.patch_expressions[0].expression.kind);
+            try std.testing.expectEqual(@as(usize, 2), conflict.patch_expressions[0].expression.operands.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, conflict.patch_expressions[0].expression.operands[0].kind);
+            try std.testing.expectEqualStrings("tags", conflict.patch_expressions[0].expression.operands[0].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.existing, conflict.patch_expressions[0].expression.operands[0].field_source);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, conflict.patch_expressions[0].expression.operands[1].kind);
+            try std.testing.expectEqualStrings("status", conflict.patch_expressions[0].expression.operands[1].field);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.proposed, conflict.patch_expressions[0].expression.operands[1].field_source);
+            try std.testing.expectEqual(@as(usize, 2), insert_source.insert_source.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertSourceWithResolverForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT id, status, amount FROM archived_records WHERE status = 'ready' RETURNING id, status",
+        schema,
+        &.{},
+        multi_conflict_resolver.resolver(),
+    ));
+
+    var cross_table_insert_source = try lowerInsertSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT archive_id, archive_status, archive_amount FROM archived_records WHERE archive_status = 'ready' RETURNING id, status",
+        schema,
+        source_schema,
+        &.{},
+        multi_conflict_resolver.resolver(),
+    );
+    defer cross_table_insert_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cross_table_insert_source.table_name);
+    try std.testing.expectEqualStrings("archived_records", cross_table_insert_source.insert_source.req.source_table);
+    try std.testing.expectEqual(@as(usize, 3), cross_table_insert_source.insert_source.req.assignments.len);
+    try std.testing.expectEqualStrings("id", cross_table_insert_source.insert_source.req.assignments[0].field);
+    try std.testing.expectEqualStrings("archive_id", cross_table_insert_source.insert_source.req.assignments[0].expression.field);
+    try std.testing.expectEqual(@as(usize, 1), cross_table_insert_source.insert_source.req.source.predicates.len);
+    try std.testing.expectEqualStrings("archive_status", cross_table_insert_source.insert_source.req.source.predicates[0].field);
+
+    var cross_table_write_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) SELECT archive_id, archive_status, archive_amount FROM archived_records WHERE archive_status = 'ready' RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver(), .insert_source_schema = source_schema },
+    );
+    defer cross_table_write_plan.deinit(alloc);
+    switch (cross_table_write_plan) {
+        .insert_source => |insert_source| try std.testing.expectEqualStrings("archived_records", insert_source.insert_source.req.source_table),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var full_catalog = try corpus.AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, &.{
+        .{ .name = "usage_records", .schema_json = schema_json },
+        .{ .name = "archived_records", .schema_json = source_schema_json },
+    });
+    defer full_catalog.deinit(alloc);
+
+    var catalog_cross_table_write_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO ONLY public.usage_records (id, status, amount) SELECT archive_id, archive_status, archive_amount FROM ONLY public.archived_records WHERE archive_status = 'ready' RETURNING id, status",
+        schema,
+        &.{},
+        .{ .unique_resolver = multi_conflict_resolver.resolver() },
+        full_catalog.iface(),
+    );
+    defer catalog_cross_table_write_plan.deinit(alloc);
+    switch (catalog_cross_table_write_plan) {
+        .insert_source => |insert_source| {
+            try std.testing.expectEqualStrings("usage_records", insert_source.table_name);
+            try std.testing.expectEqualStrings("archived_records", insert_source.insert_source.req.source_table);
+            try std.testing.expectEqual(@as(usize, 3), insert_source.insert_source.req.assignments.len);
+            try std.testing.expectEqualStrings("archive_status", insert_source.insert_source.req.source.predicates[0].field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var catalog_cross_table_merge_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "MERGE INTO ONLY public.usage_records AS target USING ONLY public.archived_records AS source ON target.id = source.archive_id WHEN MATCHED THEN UPDATE SET status = source.archive_status WHEN NOT MATCHED THEN INSERT (id, status, amount) VALUES (source.archive_id, source.archive_status, source.archive_amount) RETURNING target.id, target.status",
+        schema,
+        &.{},
+        .{},
+        full_catalog.iface(),
+    );
+    defer catalog_cross_table_merge_plan.deinit(alloc);
+    switch (catalog_cross_table_merge_plan) {
+        .merge_mutation => |merge| {
+            try std.testing.expectEqualStrings("usage_records", merge.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", merge.source_table_name);
+            try std.testing.expectEqual(@as(usize, 1), merge.match_fields.len);
+            try std.testing.expectEqualStrings("id", merge.match_fields[0].target_field);
+            try std.testing.expectEqualStrings("archive_id", merge.match_fields[0].source_field);
+            try std.testing.expectEqual(@as(usize, 1), merge.matched_arms.len);
+            try std.testing.expectEqual(@as(usize, 1), merge.matched_arms[0].update.len);
+            try std.testing.expectEqualStrings("archive_status", merge.matched_arms[0].update[0].source_field);
+            try std.testing.expectEqual(@as(usize, 1), merge.not_matched_arms.len);
+            try std.testing.expectEqual(@as(usize, 3), merge.not_matched_arms[0].insert.len);
+            try std.testing.expectEqual(@as(usize, 2), merge.returning.fields.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lower dml lowers insert values returning into row batch" {
