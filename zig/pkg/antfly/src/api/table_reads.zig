@@ -5127,7 +5127,7 @@ fn documentSqlProjectedParsedRowJsonAlloc(
                 try writer.writeAll(doc_json);
             },
             .field => {
-                if (row.object.get(item.field)) |value| {
+                if (documentSqlProjectedValue(row, item.field)) |value| {
                     const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
                     defer alloc.free(value_json);
                     try writer.writeAll(value_json);
@@ -5139,6 +5139,20 @@ fn documentSqlProjectedParsedRowJsonAlloc(
     }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+fn documentSqlProjectedValue(row: std.json.Value, field: []const u8) ?std.json.Value {
+    if (row != .object) return null;
+    if (field.len == 0) return null;
+    if (field[0] != '/') return row.object.get(field);
+
+    var current = row;
+    var parts = std.mem.splitScalar(u8, field[1..], '/');
+    while (parts.next()) |part| {
+        if (part.len == 0 or current != .object) return null;
+        current = current.object.get(part) orelse return null;
+    }
+    return current;
 }
 
 pub fn executeLoweredRelationPopulationPlanAlloc(

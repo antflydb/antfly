@@ -416,7 +416,19 @@ pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered
 
 pub fn expectAppParityExplainSummary(summary: corpus.AppParityPlanSummary, lowered: plan_mod.LoweredExplainPlan) !void {
     switch (lowered.subject) {
-        .read => |read| try expectAppParityReadSummary(summary, read),
-        .write => |write| try expectAppParityWriteSummary(summary, write),
+        .read => |read| {
+            try expectOptionalString(summary.explain_subject, "read");
+            try expectOptionalString(summary.explain_inner_kind, @tagName(std.meta.activeTag(read)));
+            try expectAppParityReadSummary(summary, read);
+        },
+        .write => |write| {
+            try expectOptionalString(summary.explain_subject, "write");
+            try expectOptionalString(summary.explain_inner_kind, @tagName(std.meta.activeTag(write)));
+            try expectAppParityWriteSummary(summary, write);
+        },
     }
+}
+
+fn expectOptionalString(expected: ?[]const u8, actual: []const u8) !void {
+    if (expected) |value| try std.testing.expectEqualStrings(value, actual);
 }

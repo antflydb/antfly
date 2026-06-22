@@ -589,6 +589,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "read",
+        "explain_inner_kind": "query",
         "predicates": 1,
         "select": 1
       },
@@ -600,6 +602,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "read",
+        "explain_inner_kind": "query",
         "predicates": 1,
         "select": 1
       },
@@ -611,6 +615,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "write",
+        "explain_inner_kind": "insert",
         "returning": 1
       },
       "plan": "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
@@ -621,6 +627,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "write",
+        "explain_inner_kind": "update_source",
         "predicates": 1,
         "returning": 1
       },
@@ -632,6 +640,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "write",
+        "explain_inner_kind": "update_joined_source",
         "join_on": 1,
         "returning": 1
       },
@@ -643,6 +653,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "write",
+        "explain_inner_kind": "merge_mutation",
         "select": 2,
         "operations": 1,
         "returning": 1,
@@ -656,6 +668,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "read",
+        "explain_inner_kind": "query",
         "predicates": 1,
         "select": 1
       },
@@ -667,6 +681,8 @@
       "family": "explain",
       "summary": {
         "table_name": "usage_records",
+        "explain_subject": "read",
+        "explain_inner_kind": "query",
         "predicates": 1,
         "select": 1
       },

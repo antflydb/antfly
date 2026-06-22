@@ -19482,7 +19482,7 @@ pub const DB = struct {
                 }
             }
             const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedQueryRequest;
-            try admitRelationalRowsCteMaterializationWithPolicy(cte, result.rows.len, materialized_bytes, .allow_spill);
+            try admitRelationalRowsCteMaterialization(cte, result.rows.len, materialized_bytes);
             const output_fields = if (cte.table_function) |table_function|
                 try relationalRowsTableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
             else
@@ -90901,16 +90901,14 @@ test "relational rows query plan composes non-recursive ctes" {
         },
         .spill_after_bytes = 8,
     }};
-    var spill_result = try db.queryRelationalRowsPlan(alloc, runtime_schema, .{
+    try std.testing.expectError(error.RelationalRowsCteSpillRequired, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
         .ctes = spill_ctes[0..],
         .query = .{
             .source_cte = "open_orders",
             .select = select[0..],
             .select_all = false,
         },
-    });
-    defer spill_result.deinit(alloc);
-    try std.testing.expectEqual(@as(u32, 3), spill_result.total);
+    }));
 
     try std.testing.expectError(error.UnsupportedQueryRequest, db.queryRelationalRowsPlan(alloc, runtime_schema, .{
         .query = .{

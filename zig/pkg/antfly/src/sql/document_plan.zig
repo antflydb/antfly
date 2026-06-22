@@ -202,31 +202,86 @@ fn parseProjectionItemAlloc(
     tokens: []const Token,
     schema: runtime_schema.TableSchema,
 ) !DocumentProjection {
-    if (tokens.len == 0 or tokens[0].kind != .identifier) return error.UnsupportedSqlShape;
-    var output: ?[]const u8 = null;
-    if (tokens.len > 1) {
-        if (tokens.len == 3 and tokens[1].matchesKeywordTag(.as) and tokens[2].kind == .identifier) {
-            output = tokens[2].text;
-        } else if (tokens.len == 2 and tokens[1].kind == .identifier) {
-            output = tokens[1].text;
-        } else {
-            return error.UnsupportedSqlShape;
-        }
-    }
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+    const aliased = try splitProjectionAlias(tokens);
+    const expression = aliased.expression;
+    if (expression.len == 0 or expression[0].kind != .identifier) return error.UnsupportedSqlShape;
 
-    const field = tokens[0].text;
+    if (try parseJsonPathProjectionItemAlloc(alloc, expression, aliased.output, schema)) |projection| return projection;
+
+    var output: ?[]const u8 = null;
+    if (expression.len != 1) return error.UnsupportedSqlShape;
+    output = aliased.output;
+
+    const field = expression[0].text;
     if (std.mem.eql(u8, field, "_id")) {
         return .{ .kind = .id, .output = try alloc.dupe(u8, output orelse "_id") };
     }
     if (std.mem.eql(u8, field, "_doc")) {
         return .{ .kind = .doc, .output = try alloc.dupe(u8, output orelse "_doc") };
     }
-    if (!documentFieldExists(schema, field)) return error.InvalidSqlCatalog;
+    const column = documentFieldColumn(schema, field) orelse return error.InvalidSqlCatalog;
     return .{
         .kind = .field,
-        .field = try alloc.dupe(u8, field),
+        .field = try alloc.dupe(u8, column.name),
         .output = try alloc.dupe(u8, output orelse field),
     };
+}
+
+const ProjectionAliasSplit = struct {
+    expression: []const Token,
+    output: ?[]const u8 = null,
+};
+
+fn splitProjectionAlias(tokens: []const Token) !ProjectionAliasSplit {
+    if (tokens.len >= 3 and tokens[tokens.len - 2].matchesKeywordTag(.as) and tokens[tokens.len - 1].kind == .identifier) {
+        return .{ .expression = tokens[0 .. tokens.len - 2], .output = tokens[tokens.len - 1].text };
+    }
+    if (tokens.len == 2 and tokens[0].kind == .identifier and tokens[1].kind == .identifier) {
+        return .{ .expression = tokens[0..1], .output = tokens[1].text };
+    }
+    if (tokens.len >= 4 and tokens[tokens.len - 1].kind == .identifier and !documentJsonArrowKind(tokens[tokens.len - 2].kind)) {
+        return .{ .expression = tokens[0 .. tokens.len - 1], .output = tokens[tokens.len - 1].text };
+    }
+    return .{ .expression = tokens };
+}
+
+fn parseJsonPathProjectionItemAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    output: ?[]const u8,
+    schema: runtime_schema.TableSchema,
+) !?DocumentProjection {
+    if (tokens.len < 3 or tokens[0].kind != .identifier or !documentJsonArrowKind(tokens[1].kind)) return null;
+    const root = tokens[0].text;
+    if (std.mem.eql(u8, root, "_id") or std.mem.eql(u8, root, "_doc")) return error.UnsupportedSqlShape;
+    const column = documentFieldColumn(schema, root) orelse return error.InvalidSqlCatalog;
+    var path = try documentFilterPathAlloc(alloc, column.path);
+    errdefer alloc.free(path);
+    var last_segment: []const u8 = root;
+    var pos: usize = 1;
+    while (pos < tokens.len) {
+        if (pos + 1 >= tokens.len or !documentJsonArrowKind(tokens[pos].kind)) return error.UnsupportedSqlShape;
+        const segment_token = tokens[pos + 1];
+        if (segment_token.kind != .string and segment_token.kind != .identifier) return error.UnsupportedSqlShape;
+        if (segment_token.text.len == 0 or std.mem.indexOfScalar(u8, segment_token.text, '/') != null) return error.UnsupportedSqlShape;
+        const next = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, segment_token.text });
+        alloc.free(path);
+        path = next;
+        last_segment = segment_token.text;
+        pos += 2;
+    }
+    const owned_output = try alloc.dupe(u8, output orelse last_segment);
+    errdefer alloc.free(owned_output);
+    return .{
+        .kind = .field,
+        .field = path,
+        .output = owned_output,
+    };
+}
+
+fn documentJsonArrowKind(kind: token_mod.TokenKind) bool {
+    return kind == .arrow_json or kind == .arrow_text;
 }
 
 fn parseWhereProducerAlloc(
