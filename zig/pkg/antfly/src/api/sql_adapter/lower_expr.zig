@@ -25467,6 +25467,956 @@ test "sql adapter lower expr lowers array length predicates" {
     try std.testing.expectEqualStrings("3", negated_condition.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
 }
 
+test "sql adapter lower expr lowers scalar expression order keys" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users ORDER BY lower(email) ASC, upper(status) DESC, amount - discount DESC, coalesce(status, 'pending') ASC, array_length(tags, 1) DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 5), lowered.plan.query.order_by.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.order_by[0].field.len);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.plan.query.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, lowered.plan.query.order_by[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[1].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.plan.query.order_by[2].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[2].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.plan.query.order_by[3].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.plan.query.order_by[3].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.plan.query.order_by[4].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[4].direction);
+
+    var explicit_nulls = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users ORDER BY lower(email) ASC NULLS LAST LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer explicit_nulls.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), explicit_nulls.plan.query.order_by.len);
+    try std.testing.expect(explicit_nulls.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, explicit_nulls.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, explicit_nulls.plan.query.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, explicit_nulls.plan.query.order_by[0].direction);
+    try std.testing.expect(explicit_nulls.plan.query.order_by[1].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, explicit_nulls.plan.query.order_by[1].expression.?.kind);
+    try std.testing.expect(explicit_nulls.plan.query.order_by[1].null_test == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, explicit_nulls.plan.query.order_by[1].direction);
+}
+
+test "sql adapter lower expr lowers row query output order ordinals" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, status, amount + 1 AS amount_plus_one FROM usage_records WHERE status = 'open' ORDER BY 2 DESC, 3 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.select[0]);
+    try std.testing.expectEqualStrings("status", lowered.plan.query.select[1]);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("status", lowered.plan.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[0].direction);
+    try std.testing.expect(lowered.plan.query.order_by[1].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, lowered.plan.query.order_by[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.plan.query.order_by[1].direction);
+
+    var select_all = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT *, lower(status) AS status_key FROM usage_records ORDER BY 1 ASC",
+        schema,
+        &.{},
+    );
+    defer select_all.deinit(alloc);
+    try std.testing.expect(select_all.plan.query.select_all);
+    try std.testing.expectEqual(@as(usize, 1), select_all.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("id", select_all.plan.query.order_by[0].field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY 2",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers row query output order aliases" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(email) AS email_key, id AS user_id, metadata->>'source' AS source FROM users ORDER BY email_key ASC, user_id DESC, source ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 3), lowered.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.field_aliases.len);
+    try std.testing.expectEqual(@as(usize, 3), lowered.plan.query.order_by.len);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.plan.query.order_by[0].direction);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.order_by[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[1].direction);
+    try std.testing.expect(lowered.plan.query.order_by[2].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.plan.query.order_by[2].expression.?.kind);
+    try std.testing.expect(lowered.plan.query.order_by[2].expression.?.json_as_text);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id AS dup, status AS dup FROM users ORDER BY dup",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers generated case-fold query pushdown" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"email_upper_key":{"type":"keyword","generated":{"op":"upper","field":"email"}},"email_md5_key":{"type":"keyword","generated":{"op":"md5","field":"email"}}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(email) AS email_key FROM users WHERE lower(email) = $1 ORDER BY lower(email) ASC",
+        schema,
+        &.{.{ .string = "ada@example.test" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("email_key", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("email", lowered.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("email_key", lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.plan.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"ada@example.test\"", lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("email_key", lowered.plan.query.order_by[0].field);
+
+    var upper_lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT upper(email) AS email_upper_key FROM users WHERE upper(email) = $1 ORDER BY upper(email) ASC",
+        schema,
+        &.{.{ .string = "ADA@EXAMPLE.TEST" }},
+    );
+    defer upper_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), upper_lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), upper_lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("email_upper_key", upper_lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, upper_lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), upper_lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("email_upper_key", upper_lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, upper_lowered.plan.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"ADA@EXAMPLE.TEST\"", upper_lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), upper_lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("email_upper_key", upper_lowered.plan.query.order_by[0].field);
+
+    var md5_lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT md5(email) AS email_digest FROM users WHERE md5(email) = $1 ORDER BY md5(email) ASC",
+        schema,
+        &.{.{ .string = "39e690cc3bb45815234c7614137708d1" }},
+    );
+    defer md5_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), md5_lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), md5_lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("email_digest", md5_lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.md5, md5_lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), md5_lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("email_md5_key", md5_lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, md5_lowered.plan.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"39e690cc3bb45815234c7614137708d1\"", md5_lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), md5_lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("email_md5_key", md5_lowered.plan.query.order_by[0].field);
+}
+
+test "sql adapter lower expr lowers generated concat query pushdown" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_status_key":{"type":"keyword","generated":{"op":"concat","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE concat(tenant_id, ':', status) = $1 ORDER BY concat(tenant_id, ':', status) DESC",
+        schema,
+        &.{.{ .string = "t1:active" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("tenant_status_key", lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.plan.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"t1:active\"", lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("tenant_status_key", lowered.plan.query.order_by[0].field);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[0].direction);
+
+    var residual = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE concat(status, ':', tenant_id) = $1",
+        schema,
+        &.{.{ .string = "active:t1" }},
+    );
+    defer residual.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), residual.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), residual.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, residual.plan.query.expression_predicates[0].lhs.kind);
+
+    const concat_ws_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"tenant_status_key":{"type":"keyword","generated":{"op":"concat_ws","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const concat_ws_schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, concat_ws_schema_json);
+    defer runtime_schema.freeSchema(alloc, concat_ws_schema);
+
+    var concat_ws_lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE concat_ws(':', tenant_id, status) = $1 ORDER BY concat_ws(':', tenant_id, status) DESC",
+        concat_ws_schema,
+        &.{.{ .string = "t1:active" }},
+    );
+    defer concat_ws_lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), concat_ws_lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("tenant_status_key", concat_ws_lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, concat_ws_lowered.plan.query.predicates[0].op);
+    try std.testing.expectEqualStrings("\"t1:active\"", concat_ws_lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 0), concat_ws_lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), concat_ws_lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("tenant_status_key", concat_ws_lowered.plan.query.order_by[0].field);
+    try std.testing.expect(concat_ws_lowered.plan.query.order_by[0].expression == null);
+}
+
+test "sql adapter lower expr lowers qualified generated read-source predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"tenant_status_key":{"type":"keyword","generated":{"op":"concat","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","email","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users AS u WHERE lower(u.email) = $1 ORDER BY concat(u.tenant_id, ':', u.status) DESC LIMIT 2",
+        schema,
+        &.{.{ .string = "ada@example.test" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("users", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("email_key", lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("tenant_status_key", lowered.plan.query.order_by[0].field);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 2), lowered.plan.query.limit.?);
+}
+
+test "sql adapter lower expr lowers scalar function expressions" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT char_length(status) AS status_len FROM usage_records WHERE character_length(status) > $1 ORDER BY char_length(status) DESC LIMIT 5",
+        schema,
+        &.{.{ .integer = 3 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_len", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, lowered.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, lowered.plan.query.order_by[0].expression.?.kind);
+
+    var aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT SUM(character_length(status)) AS status_chars FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.aggregate.aggregations.len);
+    try std.testing.expect(aggregate.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.length, aggregate.aggregate.aggregations[0].expression.?.kind);
+
+    var octets = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT octet_length(status) AS status_bytes FROM usage_records WHERE octet_length(status) > $1 ORDER BY octet_length(status) DESC LIMIT 5",
+        schema,
+        &.{.{ .integer = 3 }},
+    );
+    defer octets.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), octets.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_bytes", octets.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, octets.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), octets.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, octets.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), octets.plan.query.order_by.len);
+    try std.testing.expect(octets.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, octets.plan.query.order_by[0].expression.?.kind);
+
+    var bits = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT bit_length(status) AS status_bits FROM usage_records WHERE bit_length(status) > $1 ORDER BY bit_length(status) DESC LIMIT 5",
+        schema,
+        &.{.{ .integer = 16 }},
+    );
+    defer bits.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), bits.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_bits", bits.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, bits.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), bits.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, bits.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), bits.plan.query.order_by.len);
+    try std.testing.expect(bits.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, bits.plan.query.order_by[0].expression.?.kind);
+
+    var ascii_chr = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT ascii(status) AS first_code, chr(amount) AS amount_char FROM usage_records WHERE ascii(status) > $1 ORDER BY chr(amount) ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 64 }},
+    );
+    defer ascii_chr.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), ascii_chr.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("first_code", ascii_chr.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ascii, ascii_chr.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("amount_char", ascii_chr.plan.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.chr, ascii_chr.plan.query.expressions[1].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), ascii_chr.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ascii, ascii_chr.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), ascii_chr.plan.query.order_by.len);
+    try std.testing.expect(ascii_chr.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.chr, ascii_chr.plan.query.order_by[0].expression.?.kind);
+
+    var trimmed = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT trim(status) AS status_trimmed FROM usage_records WHERE trim(status) = $1 ORDER BY trim(status) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active" }},
+    );
+    defer trimmed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), trimmed.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_trimmed", trimmed.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trim, trimmed.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), trimmed.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trim, trimmed.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), trimmed.plan.query.order_by.len);
+    try std.testing.expect(trimmed.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trim, trimmed.plan.query.order_by[0].expression.?.kind);
+
+    var trim_variants = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT btrim(status, '-') AS status_clean FROM usage_records WHERE ltrim(status, '-') = $1 ORDER BY rtrim(status, '-') ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active-" }},
+    );
+    defer trim_variants.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), trim_variants.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_clean", trim_variants.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trim, trim_variants.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), trim_variants.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), trim_variants.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ltrim, trim_variants.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), trim_variants.plan.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), trim_variants.plan.query.order_by.len);
+    try std.testing.expect(trim_variants.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.rtrim, trim_variants.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 2), trim_variants.plan.query.order_by[0].expression.?.operands.len);
+
+    var replaced = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT replace(status, '-', ' ') AS status_words FROM usage_records WHERE replace(status, '-', ' ') = $1 ORDER BY replace(status, '-', ' ') ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active user" }},
+    );
+    defer replaced.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), replaced.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_words", replaced.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replaced.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), replaced.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), replaced.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replaced.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), replaced.plan.query.order_by.len);
+    try std.testing.expect(replaced.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, replaced.plan.query.order_by[0].expression.?.kind);
+
+    var translated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT translate(status, 'abc', 'xyz') AS status_translated FROM usage_records WHERE translate(status, 'ho', 'HO') = $1 ORDER BY translate(status, 'abc', 'xyz') ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "HellO" }},
+    );
+    defer translated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), translated.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_translated", translated.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.translate, translated.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), translated.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), translated.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.translate, translated.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), translated.plan.query.order_by.len);
+    try std.testing.expect(translated.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.translate, translated.plan.query.order_by[0].expression.?.kind);
+
+    var regexp_replaced = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT regexp_replace(status, '[0-9]+', '#', 'g') AS status_key FROM usage_records WHERE regexp_replace(status, '[0-9]+', '#', 'g') = $1 ORDER BY regexp_replace(status, '[0-9]+', '#') ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active-#" }},
+    );
+    defer regexp_replaced.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), regexp_replaced.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_key", regexp_replaced.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_replace, regexp_replaced.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 4), regexp_replaced.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_replaced.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_replace, regexp_replaced.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 4), regexp_replaced.plan.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_replaced.plan.query.order_by.len);
+    try std.testing.expect(regexp_replaced.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_replace, regexp_replaced.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 3), regexp_replaced.plan.query.order_by[0].expression.?.operands.len);
+
+    var regexp_substring = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT regexp_substr(status, '[A-Z]+') AS status_token FROM usage_records WHERE regexp_substr(status, $1) = 'ACTIVE' ORDER BY regexp_substr(status, '[0-9]+') ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "[A-Z]+" }},
+    );
+    defer regexp_substring.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), regexp_substring.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_token", regexp_substring.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_substr, regexp_substring.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), regexp_substring.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_substring.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_substr, regexp_substring.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), regexp_substring.plan.query.order_by.len);
+    try std.testing.expect(regexp_substring.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_substr, regexp_substring.plan.query.order_by[0].expression.?.kind);
+
+    var regexp_counted = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT regexp_count(status, '[0-9]+') AS status_digits FROM usage_records WHERE regexp_count(status, $1) > 0 ORDER BY regexp_count(status, '[A-Z]+') DESC LIMIT 5",
+        schema,
+        &.{.{ .string = "[0-9]+" }},
+    );
+    defer regexp_counted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), regexp_counted.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_digits", regexp_counted.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, regexp_counted.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), regexp_counted.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_counted.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, regexp_counted.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), regexp_counted.plan.query.order_by.len);
+    try std.testing.expect(regexp_counted.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, regexp_counted.plan.query.order_by[0].expression.?.kind);
+
+    var regexp_positioned = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT regexp_instr(status, '[0-9]+') AS status_digit_pos FROM usage_records WHERE regexp_instr(status, $1) > 0 ORDER BY regexp_instr(status, '[A-Z]+') DESC LIMIT 5",
+        schema,
+        &.{.{ .string = "[0-9]+" }},
+    );
+    defer regexp_positioned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), regexp_positioned.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_digit_pos", regexp_positioned.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, regexp_positioned.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), regexp_positioned.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), regexp_positioned.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, regexp_positioned.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), regexp_positioned.plan.query.order_by.len);
+    try std.testing.expect(regexp_positioned.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, regexp_positioned.plan.query.order_by[0].expression.?.kind);
+
+    var substring = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT substring(status FROM 2 FOR 3) AS status_mid FROM usage_records WHERE substr(status, 1, 2) = $1 ORDER BY substring(status FROM 2) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "ac" }},
+    );
+    defer substring.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), substring.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_mid", substring.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.substring, substring.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), substring.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), substring.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.substring, substring.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), substring.plan.query.order_by.len);
+    try std.testing.expect(substring.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.substring, substring.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 2), substring.plan.query.order_by[0].expression.?.operands.len);
+
+    var overlay = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT overlay(status placing 'X' from 2 for 3) AS status_overlay FROM usage_records WHERE overlay(status placing 'X' from 2) = $1 ORDER BY overlay(status placing 'Y' from 2 for 1) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "aXtive" }},
+    );
+    defer overlay.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), overlay.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_overlay", overlay.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.overlay, overlay.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 4), overlay.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), overlay.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.overlay, overlay.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 3), overlay.plan.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), overlay.plan.query.order_by.len);
+    try std.testing.expect(overlay.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.overlay, overlay.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 4), overlay.plan.query.order_by[0].expression.?.operands.len);
+
+    var split_part = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT split_part(status, '-', 2) AS status_part FROM usage_records WHERE split_part(status, '-', 1) = $1 ORDER BY split_part(status, '-', -1) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active" }},
+    );
+    defer split_part.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), split_part.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_part", split_part.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, split_part.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), split_part.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), split_part.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, split_part.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), split_part.plan.query.order_by.len);
+    try std.testing.expect(split_part.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.split_part, split_part.plan.query.order_by[0].expression.?.kind);
+
+    var strpos = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT strpos(status, '-') AS dash_pos FROM usage_records WHERE position('-' in status) > $1 ORDER BY strpos(status, '-') ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 0 }},
+    );
+    defer strpos.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), strpos.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("dash_pos", strpos.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.strpos, strpos.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), strpos.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), strpos.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.strpos, strpos.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), strpos.plan.query.order_by.len);
+    try std.testing.expect(strpos.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.strpos, strpos.plan.query.order_by[0].expression.?.kind);
+
+    var left_right = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT left(status, 3) AS status_prefix FROM usage_records WHERE right(status, 4) = $1 ORDER BY left(status, 2) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "test" }},
+    );
+    defer left_right.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), left_right.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_prefix", left_right.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.left, left_right.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), left_right.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), left_right.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.right, left_right.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), left_right.plan.query.order_by.len);
+    try std.testing.expect(left_right.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.left, left_right.plan.query.order_by[0].expression.?.kind);
+
+    var padded = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lpad(status, 8, '0') AS status_padded FROM usage_records WHERE rpad(status, 8, '-') = $1 ORDER BY lpad(status, 8) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active--" }},
+    );
+    defer padded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), padded.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_padded", padded.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lpad, padded.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), padded.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), padded.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.rpad, padded.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 3), padded.plan.query.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), padded.plan.query.order_by.len);
+    try std.testing.expect(padded.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lpad, padded.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 2), padded.plan.query.order_by[0].expression.?.operands.len);
+
+    var repeated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT repeat(status, 2) AS status_twice FROM usage_records WHERE repeat(status, 3) = $1 ORDER BY repeat(status, 1) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "activeactiveactive" }},
+    );
+    defer repeated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), repeated.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_twice", repeated.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.repeat, repeated.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), repeated.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), repeated.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.repeat, repeated.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), repeated.plan.query.order_by.len);
+    try std.testing.expect(repeated.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.repeat, repeated.plan.query.order_by[0].expression.?.kind);
+
+    var reversed = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT reverse(status) AS status_reversed FROM usage_records WHERE reverse(status) = $1 ORDER BY reverse(status) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "evitca" }},
+    );
+    defer reversed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), reversed.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_reversed", reversed.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.reverse, reversed.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), reversed.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), reversed.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.reverse, reversed.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), reversed.plan.query.order_by.len);
+    try std.testing.expect(reversed.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.reverse, reversed.plan.query.order_by[0].expression.?.kind);
+
+    var titled = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT initcap(status) AS status_title FROM usage_records WHERE initcap(status) = $1 ORDER BY initcap(status) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "Active Ready" }},
+    );
+    defer titled.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), titled.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_title", titled.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.initcap, titled.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), titled.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.initcap, titled.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), titled.plan.query.order_by.len);
+    try std.testing.expect(titled.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.initcap, titled.plan.query.order_by[0].expression.?.kind);
+
+    var md5 = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT md5(status) AS status_md5 FROM usage_records WHERE md5(status) = $1 ORDER BY md5(status) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "18ff74f43da410c5529f7d6fca84f115" }},
+    );
+    defer md5.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), md5.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_md5", md5.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.md5, md5.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), md5.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.md5, md5.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), md5.plan.query.order_by.len);
+    try std.testing.expect(md5.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.md5, md5.plan.query.order_by[0].expression.?.kind);
+
+    var concat_ws = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT concat_ws(':', status, id) AS status_label FROM usage_records WHERE concat_ws(':', status, id) = $1 ORDER BY concat_ws(':', status, id) ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active:u1" }},
+    );
+    defer concat_ws.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), concat_ws.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_label", concat_ws.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, concat_ws.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), concat_ws.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), concat_ws.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, concat_ws.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), concat_ws.plan.query.order_by.len);
+    try std.testing.expect(concat_ws.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, concat_ws.plan.query.order_by[0].expression.?.kind);
+
+    var parenthesized_text_order = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY (lower(status)) ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer parenthesized_text_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parenthesized_text_order.plan.query.order_by.len);
+    try std.testing.expect(parenthesized_text_order.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, parenthesized_text_order.plan.query.order_by[0].expression.?.kind);
+
+    var starts = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT starts_with(status, 'act') AS status_has_prefix FROM usage_records WHERE starts_with(status, $1) = true ORDER BY starts_with(status, 'a') DESC LIMIT 5",
+        schema,
+        &.{.{ .string = "act" }},
+    );
+    defer starts.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), starts.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_has_prefix", starts.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, starts.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), starts.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), starts.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, starts.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), starts.plan.query.order_by.len);
+    try std.testing.expect(starts.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, starts.plan.query.order_by[0].expression.?.kind);
+
+    var parenthesized_boolean_order = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY (starts_with(status, 'a')) DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer parenthesized_boolean_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parenthesized_boolean_order.plan.query.order_by.len);
+    try std.testing.expect(parenthesized_boolean_order.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, parenthesized_boolean_order.plan.query.order_by[0].expression.?.kind);
+
+    var json_object_order = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY jsonb_build_object('id', id) ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer json_object_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), json_object_order.plan.query.order_by.len);
+    try std.testing.expect(json_object_order.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_build_object, json_object_order.plan.query.order_by[0].expression.?.kind);
+
+    var to_jsonb_status_order = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY to_jsonb(status) ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer to_jsonb_status_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), to_jsonb_status_order.plan.query.order_by.len);
+    try std.testing.expect(to_jsonb_status_order.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.to_jsonb, to_jsonb_status_order.plan.query.order_by[0].expression.?.kind);
+
+    var array_order = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records ORDER BY (string_to_array(status, '-')) ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer array_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), array_order.plan.query.order_by.len);
+    try std.testing.expect(array_order.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, array_order.plan.query.order_by[0].expression.?.kind);
+
+    var ends = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT ends_with(status, 'ive') AS status_has_suffix FROM usage_records WHERE ends_with(status, $1) = true ORDER BY ends_with(status, 'e') DESC LIMIT 5",
+        schema,
+        &.{.{ .string = "ive" }},
+    );
+    defer ends.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ends.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_has_suffix", ends.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ends_with, ends.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), ends.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), ends.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ends_with, ends.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), ends.plan.query.order_by.len);
+    try std.testing.expect(ends.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ends_with, ends.plan.query.order_by[0].expression.?.kind);
+
+    var computed_like_prefix = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) LIKE $1 ESCAPE $2 ORDER BY id",
+        schema,
+        &.{ .{ .string = "act!%%" }, .{ .string = "!" } },
+    );
+    defer computed_like_prefix.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), computed_like_prefix.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_like_prefix.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_like_prefix.plan.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("\"act\\\\%%\"", computed_like_prefix.plan.query.expression_predicates[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_like_prefix.plan.query.expression_predicates[0].rhs[0].value_json);
+
+    var computed_not_ilike_prefix = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE upper(status) NOT ILIKE 'BOT!_%' ESCAPE '!' ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer computed_not_ilike_prefix.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), computed_not_ilike_prefix.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ilike, computed_not_ilike_prefix.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, computed_not_ilike_prefix.plan.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("\"BOT\\\\_%\"", computed_not_ilike_prefix.plan.query.expression_predicates[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("false", computed_not_ilike_prefix.plan.query.expression_predicates[0].rhs[0].value_json);
+
+    var computed_like_or = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) LIKE 'act%' OR upper(status) NOT LIKE 'BOT%' ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer computed_like_or.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), computed_like_or.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_like_or.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"act%\"", computed_like_or.plan.query.expression_or_predicates[0].conditions[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_like_or.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_like_or.plan.query.expression_or_predicates[1].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"BOT%\"", computed_like_or.plan.query.expression_or_predicates[1].conditions[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("false", computed_like_or.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+
+    var computed_suffix_like = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) LIKE '%act' ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer computed_suffix_like.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_suffix_like.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"%act\"", computed_suffix_like.plan.query.expression_predicates[0].lhs.operands[1].value_json);
+
+    var computed_single_wildcard_like = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) LIKE 'a_t%' ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer computed_single_wildcard_like.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_single_wildcard_like.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"a_t%\"", computed_single_wildcard_like.plan.query.expression_predicates[0].lhs.operands[1].value_json);
+
+    var truncated = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT date_trunc('hour', amount) AS amount_hour FROM usage_records WHERE date_trunc('day', amount) = $1 ORDER BY date_trunc('month', amount) ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 86400000000000 }},
+    );
+    defer truncated.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), truncated.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("amount_hour", truncated.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_trunc, truncated.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), truncated.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), truncated.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_trunc, truncated.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), truncated.plan.query.order_by.len);
+    try std.testing.expect(truncated.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_trunc, truncated.plan.query.order_by[0].expression.?.kind);
+
+    var date_bin = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT date_bin(3600000000000, amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(86400000000000, amount, 0) = $1 ORDER BY date_bin(60000000000, amount, 0) ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 86400000000000 }},
+    );
+    defer date_bin.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), date_bin.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("amount_bucket", date_bin.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, date_bin.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), date_bin.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(@as(usize, 1), date_bin.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, date_bin.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), date_bin.plan.query.order_by.len);
+    try std.testing.expect(date_bin.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, date_bin.plan.query.order_by[0].expression.?.kind);
+
+    var interval_date_bin = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT date_bin(INTERVAL '1 hour', amount, 0) AS amount_bucket FROM usage_records WHERE date_bin(INTERVAL '1 day', amount, 0) = $1 ORDER BY date_bin(INTERVAL '1 minute', amount, 0) ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 86400000000000 }},
+    );
+    defer interval_date_bin.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), interval_date_bin.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("amount_bucket", interval_date_bin.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, interval_date_bin.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, interval_date_bin.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, interval_date_bin.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, interval_date_bin.plan.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expect(interval_date_bin.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, interval_date_bin.plan.query.order_by[0].expression.?.operands[0].kind);
+
+    var typed_literal_date_bin = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT date_bin(INTERVAL '1 hour', TIMESTAMPTZ '2025-01-01T01:30:00+01:30', TIMESTAMPTZ '2025-01-01T00:00:00Z') AS planned_bucket FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer typed_literal_date_bin.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), typed_literal_date_bin.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("planned_bucket", typed_literal_date_bin.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_bin, typed_literal_date_bin.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("1735689600000000000", typed_literal_date_bin.plan.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("1735689600000000000", typed_literal_date_bin.plan.query.expressions[0].expression.operands[2].value_json);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT date_bin(INTERVAL '1 month', amount, 0) AS amount_bucket FROM usage_records",
+        schema,
+        &.{},
+    ));
+
+    var date_part = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT date_part('hour', amount) AS amount_hour, EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE EXTRACT(dow FROM amount) = $1 ORDER BY date_part('month', amount) ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 5 }},
+    );
+    defer date_part.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), date_part.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("amount_hour", date_part.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_part, date_part.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("amount_dow", date_part.plan.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_part, date_part.plan.query.expressions[1].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), date_part.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_part, date_part.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), date_part.plan.query.order_by.len);
+    try std.testing.expect(date_part.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_part, date_part.plan.query.order_by[0].expression.?.kind);
+}
+
 test "sql adapter lower expr lowers case-fold expression predicates" {
     const alloc = std.testing.allocator;
     const schema_json =

@@ -572,6 +572,7 @@
     "read_cte_aggregate_expression",
     "read_cte_query_expression",
     "read_cte_window_expression",
+    "read_graph_table_function_cte_join",
     "read_join",
     "read_join_cross_table_source_schema",
     "read_join_cross_table_source_schema_classifier",
