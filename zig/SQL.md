@@ -561,6 +561,9 @@ Current implementation status:
   calls, and string tokens for external security, named argument expressions,
   interval updates, `TIMESTAMPTZ` literals, and resolver-hint `ON CONFLICT`
   validation instead of raw SQL scans.
+- Relation-population syntax parsing has a `ParsedSql` entrypoint; the raw SQL
+  parser is now a leaf wrapper that parses once before delegating, and planning
+  consumes the parsed entrypoint directly.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

@@ -2181,11 +2181,7 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     hooks: RelationPopulationLoweringHooks,
 ) !LoweredRelationPopulationPlan {
-    var parsed = try grammar.parseRelationPopulationTokensAlloc(
-        alloc,
-        parsed_sql.sql(),
-        parsed_sql.items()[parsed_sql.raw_statement.token_start..parsed_sql.raw_statement.token_end],
-    );
+    var parsed = try grammar.parseRelationPopulationParsedSqlAlloc(alloc, parsed_sql);
     defer parsed.deinit(alloc);
     var parsed_source = try relationPopulationSourceParsedSqlAlloc(alloc, parsed_sql, parsed);
     defer parsed_source.deinit(alloc);

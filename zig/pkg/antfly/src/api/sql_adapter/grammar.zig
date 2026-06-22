@@ -23,6 +23,7 @@ const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
 const sql_value = @import("value.zig");
 
 pub const Token = token_mod.Token;
@@ -7649,9 +7650,21 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
 }
 
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try parseRelationPopulationTokensAlloc(alloc, sql, tokens.items);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try parseRelationPopulationParsedSqlAlloc(alloc, &parsed_sql);
+}
+
+pub fn parseRelationPopulationParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) !RelationPopulationSyntax {
+    const raw = parsed_sql.raw_statement;
+    return try parseRelationPopulationTokensAlloc(
+        alloc,
+        parsed_sql.sql(),
+        parsed_sql.items()[raw.token_start..raw.token_end],
+    );
 }
 
 pub fn parseRelationPopulationTokensAlloc(

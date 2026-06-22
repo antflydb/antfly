@@ -2166,6 +2166,7 @@ pub const parseNotifyNotificationTailAlloc = grammar.parseNotifyNotificationTail
 pub const parseNotifyNotificationPlanTailAlloc = ddl_plan.parseNotifyNotificationPlanTailAlloc;
 pub const parseReleaseSavepointTail = grammar.parseReleaseSavepointTail;
 pub const parseReleaseSavepointPlanTailAlloc = ddl_plan.parseReleaseSavepointPlanTailAlloc;
+pub const parseRelationPopulationParsedSqlAlloc = grammar.parseRelationPopulationParsedSqlAlloc;
 pub const parseRelationPopulationSqlAlloc = grammar.parseRelationPopulationSqlAlloc;
 pub const parseRenameSchemaNamespacePlanTailAlloc = ddl_plan.parseRenameSchemaNamespacePlanTailAlloc;
 pub const parseRenameTablespacePlanTailAlloc = ddl_plan.parseRenameTablespacePlanTailAlloc;
