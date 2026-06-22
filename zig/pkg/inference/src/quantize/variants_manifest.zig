@@ -93,6 +93,17 @@ pub fn gliner2GgufName(
     return std.fmt.allocPrint(allocator, "gliner2-{s}.{s}.gguf", .{ component, suffix });
 }
 
+pub fn florence2GgufName(
+    allocator: Allocator,
+    format: []const u8,
+) ![]u8 {
+    const suffix = canonicalFormatSuffix(format);
+    if (suffix.len == 0) {
+        return allocator.dupe(u8, "florence-2-base.gguf");
+    }
+    return std.fmt.allocPrint(allocator, "florence-2-base.{s}.gguf", .{suffix});
+}
+
 pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir: []const u8) !void {
     var names = try listFileNames(allocator, io, model_dir);
     defer {
@@ -311,6 +322,78 @@ pub fn writeGliner2VariantsManifest(allocator: Allocator, io: std.Io, model_dir:
     try compat.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
 }
 
+pub fn writeFlorence2VariantsManifest(allocator: Allocator, io: std.Io, model_dir: []const u8) !void {
+    var names = try listFileNames(allocator, io, model_dir);
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    if (!looksLikeFlorence2Repo(names.items)) return;
+
+    var gguf_suffixes = std.ArrayListUnmanaged([]const u8).empty;
+    defer gguf_suffixes.deinit(allocator);
+    if (hasFile(names.items, "florence-2-base.gguf")) {
+        try gguf_suffixes.append(allocator, "");
+    }
+    for (names.items) |name| {
+        const prefix = "florence-2-base.";
+        const ext = ".gguf";
+        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, ext)) continue;
+        if (name.len <= prefix.len + ext.len) continue;
+        const suffix = name[prefix.len .. name.len - ext.len];
+        if (suffix.len == 0 or containsSuffix(gguf_suffixes.items, suffix)) continue;
+        try gguf_suffixes.append(allocator, suffix);
+    }
+    if (gguf_suffixes.items.len == 0) return;
+
+    var text: std.Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    const writer = &text.writer;
+    try writer.writeAll(
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "defaults": {},
+        \\  "variants": [
+        \\
+    );
+
+    var wrote_any = false;
+    for (gguf_suffixes.items) |suffix| {
+        if (wrote_any) try writer.writeAll(",\n");
+        wrote_any = true;
+        if (suffix.len == 0) {
+            try writer.writeAll(
+                \\    {
+                \\      "id": "gguf-f32",
+                \\      "target": "gguf",
+                \\      "format": "F32",
+                \\      "model": "florence-2-base.gguf"
+                \\    }
+            );
+        } else {
+            try writer.print(
+                \\    {{
+                \\      "id": "gguf-{s}",
+                \\      "target": "gguf",
+                \\      "format": "{s}",
+                \\      "model": "florence-2-base.{s}.gguf"
+                \\    }}
+            , .{ suffix, suffix, suffix });
+        }
+    }
+
+    try writer.writeAll(
+        \\
+        \\  ]
+        \\}
+        \\
+    );
+
+    const path = try std.fs.path.join(allocator, &.{ model_dir, "antfly_inference_variants.json" });
+    defer allocator.free(path);
+    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
+}
+
 fn listFileNames(allocator: Allocator, io: std.Io, model_dir: []const u8) !std.ArrayListUnmanaged([]u8) {
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
@@ -387,6 +470,14 @@ fn looksLikeGliner2Repo(names: []const []const u8) bool {
     return false;
 }
 
+fn looksLikeFlorence2Repo(names: []const []const u8) bool {
+    if (hasFile(names, "florence-2-base.gguf")) return true;
+    for (names) |name| {
+        if (std.mem.startsWith(u8, name, "florence-2-base.") and std.mem.endsWith(u8, name, ".gguf")) return true;
+    }
+    return false;
+}
+
 fn hasFile(names: []const []const u8, needle: []const u8) bool {
     for (names) |name| {
         if (std.mem.eql(u8, name, needle)) return true;
@@ -425,6 +516,16 @@ test "GLiNER2 GGUF names leave F32 unsuffixed" {
     const q4_name = try gliner2GgufName(std.testing.allocator, "head", "q4_k");
     defer std.testing.allocator.free(q4_name);
     try std.testing.expectEqualStrings("gliner2-head.Q4_K.gguf", q4_name);
+}
+
+test "Florence2 GGUF names leave F32 unsuffixed" {
+    const f32_name = try florence2GgufName(std.testing.allocator, "none");
+    defer std.testing.allocator.free(f32_name);
+    try std.testing.expectEqualStrings("florence-2-base.gguf", f32_name);
+
+    const q4_name = try florence2GgufName(std.testing.allocator, "q4_k");
+    defer std.testing.allocator.free(q4_name);
+    try std.testing.expectEqualStrings("florence-2-base.Q4_K.gguf", q4_name);
 }
 
 test "ClipClap variants manifest indexes complete GGUF and ONNX variants" {
@@ -514,4 +615,34 @@ test "GLiNER2 variants manifest indexes complete GGUF pairs and ONNX default" {
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"head\": \"gliner2-head.Q4_K.gguf\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"gguf-Q8_0\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"model\": \"model.onnx\"") != null);
+}
+
+test "Florence2 variants manifest indexes available GGUF models" {
+    const allocator = std.testing.allocator;
+    const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/florence2-variants-manifest-{d}", .{std.posix.system.getpid()});
+    defer allocator.free(dir_path);
+    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    try compat.cwd().createDirPath(compat.io(), dir_path);
+
+    const files = [_][]const u8{
+        "florence-2-base.gguf",
+        "florence-2-base.Q4_K.gguf",
+        "florence-2-base.Q8_0.gguf",
+    };
+    for (files) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
+        defer allocator.free(path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+    }
+
+    try writeFlorence2VariantsManifest(allocator, compat.io(), dir_path);
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(manifest_path);
+    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    defer allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"family\": \"florence2_variants/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-f32\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"model\": \"florence-2-base.Q4_K.gguf\"") != null);
 }

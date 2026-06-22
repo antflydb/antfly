@@ -20,7 +20,7 @@
 // Supported model layouts:
 //   - vision_encoder.onnx (or encoder_model.onnx)
 //   - decoder_model.onnx
-//   - or a native Florence safetensors directory
+//   - or a native Florence safetensors/GGUF directory
 //   - preprocessor_config.json (image size, normalization)
 //   - tokenizer.json
 //   - config.json (model_type: florence2, etc.)
@@ -134,6 +134,8 @@ pub const ReadingPipeline = struct {
         // 1. Preprocess image: decode/resize/normalize → [1, 3, H, W] f32
         // 2. Run vision encoder
         const img_sz: i64 = @intCast(img_size);
+        if (try self.readPixelValuesFlorenceResident(pixel_values)) |result| return result;
+
         const pv_shape = [_]i64{ 1, 3, img_sz, img_sz };
         var pv_tensor = try backends.Tensor.initFloat32(allocator, "pixel_values", &pv_shape, pixel_values);
         defer pv_tensor.deinit();
@@ -143,6 +145,10 @@ pub const ReadingPipeline = struct {
         defer if (prompt_ids_i64) |ids| allocator.free(ids);
         var prompt_tensor: ?backends.Tensor = null;
         defer if (prompt_tensor) |*t| t.deinit();
+
+        if (is_native_florence and self.vision_encoder.backend() == .metal) {
+            return error.UnsupportedFlorence2ResidentMetal;
+        }
 
         const encoder_outputs = if (is_native_florence) blk: {
             const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder).?;
@@ -178,6 +184,104 @@ pub const ReadingPipeline = struct {
 
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
         return self.decodeFromEncoderOutputs(encoder_outputs, null);
+    }
+
+    fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32) !?ReadResult {
+        if (self.vision_encoder.backend() != .metal) return null;
+        if (self.vision_encoder.vtable != self.decoder.vtable or self.vision_encoder.ptr != self.decoder.ptr) return null;
+
+        const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return null;
+        const allocator = self.allocator;
+        var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
+        defer cb.deinit();
+
+        const prompt_text = self.config.prompt orelse "<OCR>";
+        const prompt_i32 = try buildFlorencePromptIds(
+            allocator,
+            self.tokenizer,
+            florence_cfg,
+            prompt_text,
+        );
+        defer allocator.free(prompt_i32);
+
+        const prompt_i64 = try allocator.alloc(i64, prompt_i32.len);
+        defer allocator.free(prompt_i64);
+        for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
+
+        const encoder = (try session_factory.runFlorenceEncoderResident(
+            self.vision_encoder,
+            &cb,
+            allocator,
+            pixel_values,
+            1,
+            prompt_i64,
+            prompt_i64.len,
+        )) orelse return null;
+        defer cb.free(encoder.hidden);
+
+        const encoder_attention_mask = try allocator.alloc(i64, encoder.seq_len);
+        defer allocator.free(encoder_attention_mask);
+        @memset(encoder_attention_mask, 1);
+
+        const max_len = self.config.max_length;
+        var dec_ids = try allocator.alloc(i64, max_len);
+        defer allocator.free(dec_ids);
+        dec_ids[0] = self.config.decoder_start_token_id;
+        var dec_len: usize = 1;
+        if (self.config.forced_bos_token_id) |forced_bos| {
+            if (max_len > 1) {
+                dec_ids[1] = forced_bos;
+                dec_len = 2;
+            }
+        }
+
+        while (dec_len < max_len) {
+            const logits = (try session_factory.runFlorenceDecoderResident(
+                self.decoder,
+                &cb,
+                allocator,
+                dec_ids[0..dec_len],
+                encoder.hidden,
+                encoder_attention_mask,
+                1,
+                dec_len,
+                encoder.seq_len,
+            )) orelse return null;
+            defer cb.free(logits);
+
+            const suppress_tokens = try buildNoRepeatSuppressTokens(
+                allocator,
+                dec_ids[0..dec_len],
+                self.config.no_repeat_ngram_size,
+            );
+            defer allocator.free(suppress_tokens);
+
+            const best_id = if (suppress_tokens.len == 0) blk: {
+                break :blk (try cb.argmaxLastRow(logits, dec_len, florence_cfg.vocab_size)) orelse return error.UnsupportedOperation;
+            } else blk: {
+                if (try cb.argmaxRowsSuppress(logits, dec_len - 1, 1, florence_cfg.vocab_size, suppress_tokens, allocator)) |tokens| {
+                    defer allocator.free(tokens);
+                    if (tokens.len != 1) return error.InvalidTensorShape;
+                    break :blk tokens[0];
+                }
+
+                if (try cb.argmaxLastRowSuppressTensor(logits, dec_len, florence_cfg.vocab_size, suppress_tokens)) |token_tensor| {
+                    defer cb.free(token_tensor);
+                    const token_ids = try cb.toFloat32(token_tensor, allocator);
+                    defer allocator.free(token_ids);
+                    if (token_ids.len != 1 or token_ids[0] < 0) return error.InvalidTensorShape;
+                    break :blk @as(u32, @intFromFloat(token_ids[0]));
+                }
+
+                return error.UnsupportedFlorence2NoRepeatMetal;
+            };
+            if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
+
+            dec_ids[dec_len] = @intCast(best_id);
+            dec_len += 1;
+        }
+
+        return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
     }
 
     fn readPix2StructDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
@@ -325,8 +429,11 @@ pub const ReadingPipeline = struct {
             dec_len += 1;
         }
 
-        // 4. Decode token IDs to text
-        // Convert i64 to i32 for tokenizer
+        return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+    }
+
+    fn decodeGeneratedIds(self: *ReadingPipeline, dec_ids: []const i64, dec_len: usize) !ReadResult {
+        const allocator = self.allocator;
         const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
         const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
         const token_ids = try allocator.alloc(i32, text_len);
@@ -431,6 +538,44 @@ fn selectGreedyToken(logits: []const f32, prefix: []const i64, no_repeat_ngram_s
     return best_id;
 }
 
+fn buildNoRepeatSuppressTokens(
+    allocator: std.mem.Allocator,
+    prefix: []const i64,
+    no_repeat_ngram_size: usize,
+) ![]i32 {
+    if (no_repeat_ngram_size <= 1 or prefix.len < no_repeat_ngram_size) {
+        return allocator.alloc(i32, 0);
+    }
+
+    const context_len = no_repeat_ngram_size - 1;
+    const context_start = prefix.len - context_len;
+    const context = prefix[context_start..];
+    const search_end = prefix.len - no_repeat_ngram_size + 1;
+
+    var suppress_tokens = std.ArrayListUnmanaged(i32).empty;
+    errdefer suppress_tokens.deinit(allocator);
+
+    for (0..search_end) |start| {
+        if (!std.mem.eql(i64, prefix[start .. start + context_len], context)) continue;
+        const candidate = prefix[start + context_len];
+        if (candidate < 0 or candidate > std.math.maxInt(i32)) continue;
+        try appendUniqueSuppressToken(allocator, &suppress_tokens, @intCast(candidate));
+    }
+
+    return suppress_tokens.toOwnedSlice(allocator);
+}
+
+fn appendUniqueSuppressToken(
+    allocator: std.mem.Allocator,
+    suppress_tokens: *std.ArrayListUnmanaged(i32),
+    token_id: i32,
+) !void {
+    for (suppress_tokens.items) |existing| {
+        if (existing == token_id) return;
+    }
+    try suppress_tokens.append(allocator, token_id);
+}
+
 fn wouldRepeatNgram(prefix: []const i64, candidate: i64, no_repeat_ngram_size: usize) bool {
     if (no_repeat_ngram_size <= 1) return false;
     if (prefix.len < no_repeat_ngram_size) return false;
@@ -458,4 +603,20 @@ test "selectGreedyToken skips repeated ngrams when configured" {
     const prefix = [_]i64{ 2, 0, 1, 3, 4, 1, 3 };
     try std.testing.expectEqual(@as(usize, 3), selectGreedyToken(&logits, &prefix, 3));
     try std.testing.expectEqual(@as(usize, 4), selectGreedyToken(&logits, &prefix, 0));
+}
+
+test "buildNoRepeatSuppressTokens returns repeated continuations" {
+    const allocator = std.testing.allocator;
+    const prefix = [_]i64{ 2, 0, 42, 77, 9, 42, 77 };
+    const suppress_tokens = try buildNoRepeatSuppressTokens(allocator, &prefix, 3);
+    defer allocator.free(suppress_tokens);
+    try std.testing.expectEqualSlices(i32, &.{9}, suppress_tokens);
+}
+
+test "buildNoRepeatSuppressTokens deduplicates continuations" {
+    const allocator = std.testing.allocator;
+    const prefix = [_]i64{ 2, 4, 5, 9, 4, 5, 9, 4, 5 };
+    const suppress_tokens = try buildNoRepeatSuppressTokens(allocator, &prefix, 3);
+    defer allocator.free(suppress_tokens);
+    try std.testing.expectEqualSlices(i32, &.{9}, suppress_tokens);
 }

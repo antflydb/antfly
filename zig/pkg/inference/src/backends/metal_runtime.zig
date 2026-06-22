@@ -2072,6 +2072,30 @@ pub fn argmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !?u
     return token_id;
 }
 
+pub fn argmaxLogitsSuppressDevice(self: anytype, input: MetalTensor, out_dim: usize, suppress_token_ids: []const i32) !?usize {
+    if (suppress_token_ids.len == 0) return argmaxLogitsDevice(self, input, out_dim);
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice()) return null;
+    if (out_dim == 0) return null;
+    if (input.ndim() != 2) return null;
+    if (@as(usize, @intCast(input.dim(0))) != 1) return null;
+    if (@as(usize, @intCast(input.dim(1))) != out_dim) return null;
+
+    var token_id: u32 = 0;
+    const rc = termite_metal_decode_runtime_argmax_from_logits_suppress_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        out_dim,
+        suppress_token_ids.ptr,
+        suppress_token_ids.len,
+        &token_id,
+    );
+    if (rc != 0) return null;
+    return token_id;
+}
+
 pub fn encodeArgmaxLogitsDevice(self: anytype, input: MetalTensor, out_dim: usize) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
@@ -3692,6 +3716,122 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         if (mask_tensor != null) 1 else 0,
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
+pub fn decoderRuntimeFlorenceWindowPackF32Device(
+    self: anytype,
+    input: MetalTensor,
+    batch: usize,
+    height: usize,
+    width: usize,
+    dim: usize,
+    window_size: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice()) return null;
+    if (batch == 0 or height == 0 or width == 0 or dim == 0 or window_size == 0) return null;
+    if (input.elemCount() != batch * height * width * dim) return null;
+    const pad_h = (window_size - (height % window_size)) % window_size;
+    const pad_w = (window_size - (width % window_size)) % window_size;
+    const padded_h = height + pad_h;
+    const padded_w = width + pad_w;
+    const windows_h = padded_h / window_size;
+    const windows_w = padded_w / window_size;
+    const window_area = window_size * window_size;
+    const window_count = batch * windows_h * windows_w;
+    const out_rows = window_count * window_area;
+    const output_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, out_rows * dim * @sizeOf(f32), .private, &output_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_florence_window_pack_f32_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+        batch,
+        height,
+        width,
+        dim,
+        window_size,
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
+pub fn decoderRuntimeFlorenceWindowUnpackF32Device(
+    self: anytype,
+    input: MetalTensor,
+    batch: usize,
+    height: usize,
+    width: usize,
+    dim: usize,
+    window_size: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!input.isDevice()) return null;
+    if (batch == 0 or height == 0 or width == 0 or dim == 0 or window_size == 0) return null;
+    const pad_h = (window_size - (height % window_size)) % window_size;
+    const pad_w = (window_size - (width % window_size)) % window_size;
+    const padded_h = height + pad_h;
+    const padded_w = width + pad_w;
+    const windows_h = padded_h / window_size;
+    const windows_w = padded_w / window_size;
+    const window_area = window_size * window_size;
+    const window_count = batch * windows_h * windows_w;
+    if (input.elemCount() != window_count * window_area * dim) return null;
+    const out_rows = batch * height * width;
+    const output_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, out_rows * dim * @sizeOf(f32), .private, &output_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_florence_window_unpack_f32_device(
+        runtime,
+        input.deviceHandle(),
+        input.deviceByteOffset(),
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+        batch,
+        height,
+        width,
+        dim,
+        window_size,
+    );
+    if (rc != 0) return null;
+    return output_device;
+}
+
+pub fn decoderRuntimeFlorenceChannelAttentionF32Device(
+    self: anytype,
+    qkv: MetalTensor,
+    batch: usize,
+    seq_len: usize,
+    dim: usize,
+    groups: usize,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (!qkv.isDevice()) return null;
+    if (batch == 0 or seq_len == 0 or dim == 0 or groups == 0 or dim % groups != 0) return null;
+    if (qkv.elemCount() != batch * seq_len * dim * 3) return null;
+    const out_rows = batch * seq_len;
+    const output_shape = [_]i32{ @intCast(out_rows), @intCast(dim) };
+    var output_device = try MetalTensor.deviceAllocate(runtime, out_rows * dim * @sizeOf(f32), .private, &output_shape);
+    errdefer output_device.deinit();
+    const rc = termite_metal_decode_runtime_florence_channel_attention_f32_device(
+        runtime,
+        qkv.deviceHandle(),
+        qkv.deviceByteOffset(),
+        output_device.deviceHandle(),
+        output_device.deviceByteOffset(),
+        batch,
+        seq_len,
+        dim,
+        groups,
     );
     if (rc != 0) return null;
     return output_device;
@@ -7347,6 +7487,15 @@ pub extern fn termite_metal_decode_runtime_argmax_from_logits_device(
     out_dim: usize,
     output_token_id: [*c]u32,
 ) c_int;
+pub extern fn termite_metal_decode_runtime_argmax_from_logits_suppress_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    logits_handle: ?*anyopaque,
+    logits_offset: usize,
+    out_dim: usize,
+    suppress_token_ids: [*c]const i32,
+    suppress_count: usize,
+    output_token_id: [*c]u32,
+) c_int;
 pub extern fn termite_metal_decode_runtime_encode_argmax_from_logits_device(
     runtime: ?*RawMetalDecodeRuntime,
     logits_handle: ?*anyopaque,
@@ -7721,6 +7870,41 @@ pub extern fn termite_metal_decode_runtime_sdpa_f32_device(
     has_mask: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_florence_window_pack_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    batch: usize,
+    height: usize,
+    width: usize,
+    dim: usize,
+    window_size: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_florence_window_unpack_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    input_handle: ?*anyopaque,
+    input_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    batch: usize,
+    height: usize,
+    width: usize,
+    dim: usize,
+    window_size: usize,
+) c_int;
+pub extern fn termite_metal_decode_runtime_florence_channel_attention_f32_device(
+    runtime: ?*RawMetalDecodeRuntime,
+    qkv_handle: ?*anyopaque,
+    qkv_offset: usize,
+    output_handle: ?*anyopaque,
+    output_offset: usize,
+    batch: usize,
+    seq_len: usize,
+    dim: usize,
+    groups: usize,
 ) c_int;
 pub extern fn termite_metal_decode_runtime_disentangled_relative_attention_f32_device(
     runtime: ?*RawMetalDecodeRuntime,
@@ -21391,6 +21575,36 @@ test "metal native decoder runtime dense linear and rms-linear preserve device t
         .out_dim = out_dim,
     })) orelse return error.UnexpectedNull;
     try std.testing.expect(token_id < out_dim);
+}
+
+test "metal native decoder runtime argmax suppress stays device resident" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const out_dim: usize = 4096;
+    const logits = try std.testing.allocator.alloc(f32, out_dim);
+    defer std.testing.allocator.free(logits);
+    @memset(logits, -100.0);
+    logits[17] = 11.0;
+    logits[1025] = 10.0;
+    logits[3001] = 12.0;
+
+    var logits_tensor = try testDeviceTensorFromSlice(runtime, logits, &[_]i32{ 1, @intCast(out_dim) });
+    defer logits_tensor.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3001), (try argmaxLogitsDevice(&provider, logits_tensor, out_dim)) orelse return error.UnexpectedNull);
+
+    const suppress_best = [_]i32{3001};
+    try std.testing.expectEqual(@as(usize, 17), (try argmaxLogitsSuppressDevice(&provider, logits_tensor, out_dim, &suppress_best)) orelse return error.UnexpectedNull);
+
+    const suppress_two = [_]i32{ 3001, 17 };
+    try std.testing.expectEqual(@as(usize, 1025), (try argmaxLogitsSuppressDevice(&provider, logits_tensor, out_dim, &suppress_two)) orelse return error.UnexpectedNull);
 }
 
 test "metal native decoder runtime can prepare bf16 linear without copying model-owned bytes" {
