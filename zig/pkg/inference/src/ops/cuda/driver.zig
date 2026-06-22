@@ -184,7 +184,7 @@ pub const CudaDriver = struct {
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiateWithFlags") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiateWithParams = lookupOptional(&lib, *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult, "cuGraphInstantiateWithParams"),
-                .cuGraphExecUpdate = lib.lookup(CUgraphExecUpdateFn, "cuGraphExecUpdate_v2"),
+                .cuGraphExecUpdate = lookupGraphExecUpdate(&lib),
                 .cuGraphLaunch = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphLaunch), "cuGraphLaunch") catch return error.CudaSymbolMissing,
                 .cuGraphExecDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphExecDestroy), "cuGraphExecDestroy") catch return error.CudaSymbolMissing,
                 .cuGraphDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphDestroy), "cuGraphDestroy") catch return error.CudaSymbolMissing,
@@ -228,6 +228,13 @@ fn lookup(lib: *std.DynLib, comptime T: type, name: [:0]const u8) Error!T {
 
 fn lookupOptional(lib: *std.DynLib, comptime T: type, name: [:0]const u8) ?T {
     return lib.lookup(T, name);
+}
+
+// Some CUDA 12 drivers expose the unversioned dlsym entry with the legacy
+// four-argument ABI. Prefer the explicit three-argument symbol we bind here.
+fn lookupGraphExecUpdate(lib: *std.DynLib) ?CUgraphExecUpdateFn {
+    return lookupOptional(lib, CUgraphExecUpdateFn, "cuGraphExecUpdate_v2") orelse
+        lookupOptional(lib, CUgraphExecUpdateFn, "cuGraphExecUpdate");
 }
 
 test "cuda driver unavailable probe does not crash" {
