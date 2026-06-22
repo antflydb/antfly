@@ -162,6 +162,8 @@
         "sql": "EXPLAIN MERGE INTO usage_records USING staged_records ON usage_records.id = staged_records.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN DO NOTHING",
         "family": "explain",
         "summary": {
+          "explain_subject": "write",
+          "explain_inner_kind": "merge_mutation",
           "matched_predicates": 1,
           "matched_delete": true,
           "not_matched_predicates": 0,

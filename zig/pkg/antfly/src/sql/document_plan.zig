@@ -20,6 +20,21 @@ const tokenized = @import("tokenized.zig");
 
 const Token = token_mod.Token;
 
+const ParsedDocumentWhere = struct {
+    ids: std.ArrayListUnmanaged([]const u8) = .empty,
+    filter_clauses: std.ArrayListUnmanaged([]const u8) = .empty,
+    full_text_query: ?[]const u8 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.ids.items) |id| alloc.free(@constCast(id));
+        self.ids.deinit(alloc);
+        for (self.filter_clauses.items) |clause| alloc.free(@constCast(clause));
+        self.filter_clauses.deinit(alloc);
+        if (self.full_text_query) |query| alloc.free(@constCast(query));
+        self.* = undefined;
+    }
+};
+
 pub const DocumentProjectionKind = enum {
     id,
     doc,
@@ -222,20 +237,74 @@ fn parseWhereProducerAlloc(
     schema: runtime_schema.TableSchema,
 ) !DocumentProducer {
     const where_tokens = tokens[where_index + 1 .. end_index];
-    if (try parseFullTextProducerAlloc(alloc, where_tokens)) |producer| return producer;
-    if (try parseScalarFilterProducerAlloc(alloc, where_tokens, schema)) |producer| return producer;
-    if (where_tokens.len != 3) return error.UnsupportedSqlShape;
-    if (where_tokens[0].kind != .identifier or !std.mem.eql(u8, where_tokens[0].text, "_id")) return error.UnsupportedSqlShape;
-    if (where_tokens[1].kind != .eq) return error.UnsupportedSqlShape;
-    if (where_tokens[2].kind != .string and where_tokens[2].kind != .identifier and where_tokens[2].kind != .number) return error.UnsupportedSqlShape;
+    if (where_tokens.len == 0) return error.UnsupportedSqlShape;
 
-    const ids = try alloc.alloc([]const u8, 1);
-    errdefer alloc.free(ids);
-    ids[0] = try alloc.dupe(u8, where_tokens[2].text);
-    return .{ .id_lookup = ids };
+    var parsed = ParsedDocumentWhere{};
+    errdefer parsed.deinit(alloc);
+
+    var start: usize = 0;
+    while (start < where_tokens.len) {
+        const end = findTopLevelAnd(where_tokens, start) orelse where_tokens.len;
+        if (end == start) return error.UnsupportedSqlShape;
+        try parseWhereClauseIntoAlloc(alloc, where_tokens[start..end], schema, &parsed);
+        start = end + 1;
+    }
+
+    if (parsed.ids.items.len > 0 and (parsed.full_text_query != null or parsed.filter_clauses.items.len > 0)) {
+        return error.UnsupportedSqlShape;
+    }
+    if (parsed.ids.items.len > 0) {
+        const ids = try parsed.ids.toOwnedSlice(alloc);
+        parsed.ids = .empty;
+        return .{ .id_lookup = ids };
+    }
+    if (parsed.full_text_query != null or parsed.filter_clauses.items.len > 0) {
+        const filter_query_json = try buildConjunctiveFilterJsonAlloc(alloc, parsed.filter_clauses.items);
+        const full_text_query = parsed.full_text_query;
+        parsed.full_text_query = null;
+        parsed.deinit(alloc);
+        return .{ .indexed_query = .{
+            .full_text_query = full_text_query,
+            .filter_query_json = filter_query_json,
+        } };
+    }
+
+    return error.UnsupportedSqlShape;
 }
 
-fn parseFullTextProducerAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?DocumentProducer {
+fn parseWhereClauseIntoAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    out: *ParsedDocumentWhere,
+) !void {
+    if (try parseFullTextQueryAlloc(alloc, tokens)) |query| {
+        if (out.full_text_query != null) {
+            alloc.free(query);
+            return error.UnsupportedSqlShape;
+        }
+        out.full_text_query = query;
+        return;
+    }
+    if (try parseScalarFilterClauseAlloc(alloc, tokens, schema)) |clause| {
+        errdefer alloc.free(clause);
+        try out.filter_clauses.append(alloc, clause);
+        return;
+    }
+    if (tokens.len == 3 and tokens[0].kind == .identifier and std.mem.eql(u8, tokens[0].text, "_id") and tokens[1].kind == .eq) {
+        const id = try documentIdLiteralAlloc(alloc, tokens[2]);
+        errdefer alloc.free(id);
+        try out.ids.append(alloc, id);
+        return;
+    }
+    if (tokens.len >= 5 and tokens[0].kind == .identifier and std.mem.eql(u8, tokens[0].text, "_id") and tokens[1].matchesKeywordTag(.in)) {
+        try parseDocumentIdInListIntoAlloc(alloc, tokens[2..], out);
+        return;
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn parseFullTextQueryAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?[]const u8 {
     if (tokens.len != 4) return null;
     if (tokens[0].kind != .identifier or
         (!std.ascii.eqlIgnoreCase(tokens[0].text, "full_text_search") and
@@ -244,29 +313,40 @@ fn parseFullTextProducerAlloc(alloc: std.mem.Allocator, tokens: []const Token) !
         return null;
     }
     if (tokens[1].kind != .lparen or tokens[2].kind != .string or tokens[3].kind != .rparen) return error.UnsupportedSqlShape;
-    return .{ .indexed_query = .{ .full_text_query = try alloc.dupe(u8, tokens[2].text) } };
+    return try alloc.dupe(u8, tokens[2].text);
 }
 
-fn parseScalarFilterProducerAlloc(
+fn parseScalarFilterClauseAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     schema: runtime_schema.TableSchema,
-) !?DocumentProducer {
-    if (tokens.len != 3) return null;
-    if (tokens[0].kind != .identifier or tokens[1].kind != .eq) return null;
+) !?[]const u8 {
+    if (tokens.len < 3) return null;
+    if (tokens[0].kind != .identifier) return null;
     if (std.mem.eql(u8, tokens[0].text, "_id")) return null;
     const column = documentFieldColumn(schema, tokens[0].text) orelse return error.InvalidSqlCatalog;
     if (!column.indexed or column.index_lifecycle != .ready) return error.DocumentSqlIndexUnavailable;
-    const value_json = try tokenLiteralJsonAlloc(alloc, tokens[2]);
-    defer alloc.free(value_json);
     const path = try documentFilterPathAlloc(alloc, column.path);
     defer alloc.free(path);
-    const filter_query_json = try std.fmt.allocPrint(
-        alloc,
-        "{{\"term\":{{\"path\":{f},\"value\":{s}}}}}",
-        .{ std.json.fmt(path, .{}), value_json },
-    );
-    return .{ .indexed_query = .{ .filter_query_json = filter_query_json } };
+    if (tokens.len == 3 and tokens[1].kind == .eq) {
+        const value_json = try tokenLiteralJsonAlloc(alloc, tokens[2]);
+        defer alloc.free(value_json);
+        return try std.fmt.allocPrint(
+            alloc,
+            "{{\"term\":{{\"path\":{f},\"value\":{s}}}}}",
+            .{ std.json.fmt(path, .{}), value_json },
+        );
+    }
+    if (tokens.len >= 5 and tokens[1].matchesKeywordTag(.in)) {
+        const values_json = try tokenLiteralListJsonAlloc(alloc, tokens[2..]);
+        defer alloc.free(values_json);
+        return try std.fmt.allocPrint(
+            alloc,
+            "{{\"terms\":{{\"path\":{f},\"values\":{s}}}}}",
+            .{ std.json.fmt(path, .{}), values_json },
+        );
+    }
+    return null;
 }
 
 fn tokenLiteralJsonAlloc(alloc: std.mem.Allocator, token: Token) ![]u8 {
@@ -281,6 +361,75 @@ fn tokenLiteralJsonAlloc(alloc: std.mem.Allocator, token: Token) ![]u8 {
         },
         else => error.UnsupportedSqlShape,
     };
+}
+
+fn tokenLiteralListJsonAlloc(alloc: std.mem.Allocator, tokens: []const Token) ![]u8 {
+    if (tokens.len < 3 or tokens[0].kind != .lparen or tokens[tokens.len - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('[');
+    var pos: usize = 1;
+    var count: usize = 0;
+    while (pos + 1 < tokens.len) {
+        if (count > 0) {
+            if (tokens[pos].kind != .comma) return error.UnsupportedSqlShape;
+            pos += 1;
+            if (pos + 1 >= tokens.len) return error.UnsupportedSqlShape;
+            try writer.writeByte(',');
+        }
+        const value_json = try tokenLiteralJsonAlloc(alloc, tokens[pos]);
+        defer alloc.free(value_json);
+        try writer.writeAll(value_json);
+        count += 1;
+        pos += 1;
+    }
+    if (count == 0 or pos != tokens.len - 1) return error.UnsupportedSqlShape;
+    try writer.writeByte(']');
+    return try out.toOwnedSlice();
+}
+
+fn documentIdLiteralAlloc(alloc: std.mem.Allocator, token: Token) ![]const u8 {
+    if (token.kind != .string and token.kind != .identifier and token.kind != .number) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, token.text);
+}
+
+fn parseDocumentIdInListIntoAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    out: *ParsedDocumentWhere,
+) !void {
+    if (tokens.len < 3 or tokens[0].kind != .lparen or tokens[tokens.len - 1].kind != .rparen) return error.UnsupportedSqlShape;
+    var pos: usize = 1;
+    var count: usize = 0;
+    while (pos + 1 < tokens.len) {
+        if (count > 0) {
+            if (tokens[pos].kind != .comma) return error.UnsupportedSqlShape;
+            pos += 1;
+            if (pos + 1 >= tokens.len) return error.UnsupportedSqlShape;
+        }
+        const id = try documentIdLiteralAlloc(alloc, tokens[pos]);
+        errdefer alloc.free(id);
+        try out.ids.append(alloc, id);
+        count += 1;
+        pos += 1;
+    }
+    if (count == 0 or pos != tokens.len - 1) return error.UnsupportedSqlShape;
+}
+
+fn buildConjunctiveFilterJsonAlloc(alloc: std.mem.Allocator, clauses: []const []const u8) !?[]const u8 {
+    if (clauses.len == 0) return null;
+    if (clauses.len == 1) return try alloc.dupe(u8, clauses[0]);
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll("{\"bool\":{\"filter\":[");
+    for (clauses, 0..) |clause, i| {
+        if (i > 0) try writer.writeByte(',');
+        try writer.writeAll(clause);
+    }
+    try writer.writeAll("]}}");
+    return try out.toOwnedSlice();
 }
 
 fn documentFilterPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -352,6 +501,22 @@ fn findTopLevelKeyword(tokens: []const Token, keyword: token_mod.TokenKeyword) ?
     return null;
 }
 
+fn findTopLevelAnd(tokens: []const Token, start: usize) ?usize {
+    var depth: usize = 0;
+    var i = start;
+    while (i < tokens.len) : (i += 1) {
+        switch (tokens[i].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0 and tokens[i].matchesKeywordTag(.@"and")) return i,
+            else => {},
+        }
+    }
+    return null;
+}
+
 test "document SQL lowers id lookup projection" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
@@ -369,6 +534,23 @@ test "document SQL lowers id lookup projection" {
     try std.testing.expectEqual(DocumentProjectionKind.id, lowered.projection[0].kind);
     try std.testing.expectEqualStrings("title", lowered.projection[1].field);
     try std.testing.expectEqualStrings("doc:a", lowered.producer.id_lookup[0]);
+}
+
+test "document SQL lowers id in lookup projection" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE _id IN ('doc:a', 'doc:b')");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), lowered.producer.id_lookup.len);
+    try std.testing.expectEqualStrings("doc:a", lowered.producer.id_lookup[0]);
+    try std.testing.expectEqualStrings("doc:b", lowered.producer.id_lookup[1]);
 }
 
 test "document SQL lowers full text producer" {
@@ -401,6 +583,41 @@ test "document SQL lowers scalar equality to indexed filter producer" {
     defer lowered.deinit(alloc);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.filter_query_json.?);
     try std.testing.expectEqual(@as(?u32, 10), lowered.limit);
+}
+
+test "document SQL lowers scalar in and conjunction to indexed filter producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+            .{ .name = "published", .path = "published", .field_type = .boolean },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE status IN ('active', 'pending') AND published = true LIMIT 10");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"filter\":[{\"terms\":{\"path\":\"/status\",\"values\":[\"active\",\"pending\"]}},{\"term\":{\"path\":\"/published\",\"value\":true}}]}}",
+        lowered.producer.indexed_query.filter_query_json.?,
+    );
+}
+
+test "document SQL lowers full text and scalar conjunction to indexed producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 10");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.filter_query_json.?);
 }
 
 test "document SQL requires bounded scan without id predicate" {

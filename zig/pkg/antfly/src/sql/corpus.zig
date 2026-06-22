@@ -285,6 +285,8 @@ pub const AppParityPlanSummary = struct {
     temporal_primary_key: ?bool = null,
     temporal_unique: ?usize = null,
     temporal_foreign_keys: ?usize = null,
+    explain_subject: ?[]const u8 = null,
+    explain_inner_kind: ?[]const u8 = null,
 };
 
 pub fn summaryHasFields(summary: AppParityPlanSummary) bool {
@@ -342,7 +344,9 @@ pub fn summaryHasFields(summary: AppParityPlanSummary) bool {
         summary.temporal_periods != null or
         summary.temporal_primary_key != null or
         summary.temporal_unique != null or
-        summary.temporal_foreign_keys != null;
+        summary.temporal_foreign_keys != null or
+        summary.explain_subject != null or
+        summary.explain_inner_kind != null;
 }
 
 pub fn summaryHasNonTableFields(summary: AppParityPlanSummary) bool {
@@ -1188,6 +1192,8 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         "temporal_primary_key",
         "temporal_unique",
         "temporal_foreign_keys",
+        "explain_subject",
+        "explain_inner_kind",
     });
     return .{
         .ddl_tag = if (object.get("ddl_tag")) |tag_value| std.meta.stringToEnum(AppParityDdlTag, try fixtureJsonString(tag_value)) orelse return error.TestUnexpectedResult else null,
@@ -1245,6 +1251,8 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         .temporal_primary_key = try fixtureJsonOptionalBool(object, "temporal_primary_key"),
         .temporal_unique = try fixtureJsonOptionalUsize(object, "temporal_unique"),
         .temporal_foreign_keys = try fixtureJsonOptionalUsize(object, "temporal_foreign_keys"),
+        .explain_subject = try fixtureJsonOptionalStringField(object, "explain_subject"),
+        .explain_inner_kind = try fixtureJsonOptionalStringField(object, "explain_inner_kind"),
     };
 }
 
@@ -1954,10 +1962,10 @@ fn checkSummaryRegressionCase(
 }
 
 fn appParitySummaryRegressionAssertion(entry: AppParityCorpusEntry, name: []const u8) !bool {
-    if (std.mem.eql(u8, name, "explain_plan_has_write_kind")) return explainPlanHasKind(entry.plan, "write");
-    if (std.mem.eql(u8, name, "explain_plan_has_read_kind")) return explainPlanHasKind(entry.plan, "read");
-    if (std.mem.eql(u8, name, "explain_write_inner_insert")) return corpusExplainWriteInnerHasPrefix(entry, ":inner=insert:");
-    if (std.mem.eql(u8, name, "explain_write_inner_merge")) return corpusExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:");
+    if (std.mem.eql(u8, name, "explain_plan_has_write_kind")) return corpusExplainSubjectMatches(entry, "write");
+    if (std.mem.eql(u8, name, "explain_plan_has_read_kind")) return corpusExplainSubjectMatches(entry, "read");
+    if (std.mem.eql(u8, name, "explain_write_inner_insert")) return corpusExplainInnerKindMatches(entry, "write", "insert");
+    if (std.mem.eql(u8, name, "explain_write_inner_merge")) return corpusExplainInnerKindMatches(entry, "write", "merge_mutation");
     if (std.mem.eql(u8, name, "read_plan_has_query_prefix")) return corpusReadPlanHasPrefix(entry, "read:query:");
     if (std.mem.eql(u8, name, "plan_analyze_true_token")) return planHasExactBoolToken(entry.plan, ":analyze=", true);
     if (std.mem.eql(u8, name, "plan_format_present")) return planHasStringToken(entry.plan, ":format=");
@@ -2003,6 +2011,29 @@ fn appParitySummaryRegressionAssertion(entry: AppParityCorpusEntry, name: []cons
     if (std.mem.eql(u8, name, "lateral_matches")) return corpusFixtureLateralSummaryMatchesPlan(entry);
 
     return error.TestUnexpectedResult;
+}
+
+fn corpusExplainSubjectMatches(entry: AppParityCorpusEntry, expected: []const u8) bool {
+    if (entry.summary.explain_subject) |subject| {
+        return std.mem.eql(u8, subject, expected);
+    }
+    return explainPlanHasKind(entry.plan, expected);
+}
+
+fn corpusExplainInnerKindMatches(entry: AppParityCorpusEntry, expected_subject: []const u8, expected_inner_kind: []const u8) bool {
+    if (entry.summary.explain_subject) |subject| {
+        if (!std.mem.eql(u8, subject, expected_subject)) return false;
+        const inner_kind = entry.summary.explain_inner_kind orelse return false;
+        return std.mem.eql(u8, inner_kind, expected_inner_kind);
+    }
+    if (!std.mem.eql(u8, expected_subject, "write")) return false;
+    if (std.mem.eql(u8, expected_inner_kind, "insert")) {
+        return corpusExplainWriteInnerHasPrefix(entry, ":inner=insert:");
+    }
+    if (std.mem.eql(u8, expected_inner_kind, "merge_mutation")) {
+        return corpusExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:");
+    }
+    return false;
 }
 
 fn fixtureWriteObjectComma(writer: anytype, first: *bool) !void {
@@ -2156,6 +2187,8 @@ fn fixtureWriteSummaryField(writer: anytype, first: *bool, summary: AppParityPla
     try fixtureWriteBoolSummaryField(writer, &summary_first, "temporal_primary_key", summary.temporal_primary_key);
     try fixtureWriteUsizeSummaryField(writer, &summary_first, "temporal_unique", summary.temporal_unique);
     try fixtureWriteUsizeSummaryField(writer, &summary_first, "temporal_foreign_keys", summary.temporal_foreign_keys);
+    if (summary.explain_subject) |subject| try fixtureWriteStringField(writer, &summary_first, "        ", "explain_subject", subject);
+    if (summary.explain_inner_kind) |kind| try fixtureWriteStringField(writer, &summary_first, "        ", "explain_inner_kind", kind);
     try writer.writeAll("\n      }");
 }
 
@@ -5663,13 +5696,16 @@ test "sql adapter corpus validates native requirement manifest" {
 fn expectSourceCorpusResolvedRequirements(
     coverage: AppParityCorpusCoverage,
     resolved: []const AppParityResolvedRequirement,
+    emit_diagnostics: bool,
 ) !void {
     if (resolved.len == 0) return error.TestUnexpectedResult;
     for (resolved) |item| {
         if (item.coverage.len == 0) return error.TestUnexpectedResult;
         for (item.coverage) |name| {
             if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
-                std.debug.print("missing resolved native requirement coverage: {s} -> {s}\n", .{ item.reason, name });
+                if (emit_diagnostics) {
+                    std.debug.print("missing resolved native requirement coverage: {s} -> {s}\n", .{ item.reason, name });
+                }
                 return error.TestUnexpectedResult;
             }
         }
@@ -5686,6 +5722,7 @@ fn resolvedRequirementContains(resolved: []const AppParityResolvedRequirement, r
 fn expectNativeRequirementPolicyComplete(
     unresolved: []const []const u8,
     resolved: []const AppParityResolvedRequirement,
+    emit_diagnostics: bool,
 ) !void {
     if (resolved.len == 0) return error.TestUnexpectedResult;
     inline for (std.meta.fields(diagnostics.SqlAdapterClassificationReason)) |field| {
@@ -5695,7 +5732,9 @@ fn expectNativeRequirementPolicyComplete(
             const is_unresolved = stringListContains(unresolved, name);
             const is_resolved = resolvedRequirementContains(resolved, name);
             if (is_unresolved == is_resolved) {
-                std.debug.print("native requirement policy must classify exactly once: {s}\n", .{name});
+                if (emit_diagnostics) {
+                    std.debug.print("native requirement policy must classify exactly once: {s}\n", .{name});
+                }
                 return error.TestUnexpectedResult;
             }
         }
@@ -5713,7 +5752,7 @@ test "sql adapter source corpus covers resolved native requirements with positiv
     for (source.root.entries) |entry| {
         try coverage.observe(alloc, entry);
     }
-    try expectSourceCorpusResolvedRequirements(coverage, resolved.root.resolved);
+    try expectSourceCorpusResolvedRequirements(coverage, resolved.root.resolved, true);
 }
 
 test "sql adapter native requirement manifests classify every stable requirement" {
@@ -5723,7 +5762,7 @@ test "sql adapter native requirement manifests classify every stable requirement
     var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
     defer resolved.deinit(alloc);
 
-    try expectNativeRequirementPolicyComplete(unresolved.root.required, resolved.root.resolved);
+    try expectNativeRequirementPolicyComplete(unresolved.root.required, resolved.root.resolved, true);
 
     const overlapping = [_]AppParityResolvedRequirement{.{
         .reason = "bulk_io_plan",
@@ -5731,7 +5770,7 @@ test "sql adapter native requirement manifests classify every stable requirement
     }};
     try std.testing.expectError(
         error.TestUnexpectedResult,
-        expectNativeRequirementPolicyComplete(unresolved.root.required, &overlapping),
+        expectNativeRequirementPolicyComplete(unresolved.root.required, &overlapping, false),
     );
 
     const missing_unresolved = [_][]const u8{"bulk_io_plan"};
@@ -5741,7 +5780,7 @@ test "sql adapter native requirement manifests classify every stable requirement
     }};
     try std.testing.expectError(
         error.TestUnexpectedResult,
-        expectNativeRequirementPolicyComplete(&missing_unresolved, &missing_resolved),
+        expectNativeRequirementPolicyComplete(&missing_unresolved, &missing_resolved, false),
     );
 }
 
@@ -5813,7 +5852,7 @@ test "sql adapter corpus validates resolved native requirement manifest" {
     defer parsed_unsorted_coverage.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseResolvedRequirementRootAlloc(alloc, parsed_unsorted_coverage.value));
 
-    try std.testing.expectError(error.TestUnexpectedResult, expectSourceCorpusResolvedRequirements(.{}, resolved.root.resolved));
+    try std.testing.expectError(error.TestUnexpectedResult, expectSourceCorpusResolvedRequirements(.{}, resolved.root.resolved, false));
 }
 
 test "sql adapter source corpus rejects duplicate entry names" {

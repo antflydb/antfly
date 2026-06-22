@@ -1333,6 +1333,13 @@ Fixture and coverage validation should inspect structured plan summaries or
 coverage bits emitted by parser, binder, and lowerer phases. They should not
 scan SQL strings or fingerprints as a second parser.
 
+Implementation note: app-parity fixture summaries now include structured
+`explain_subject` and `explain_inner_kind` fields for `EXPLAIN` coverage. The
+summary regression checks prefer those fields and keep fingerprint parsing only
+as compatibility coverage for old fixture rows, so refreshed fixtures can prove
+explain subject/inner-kind behavior without treating the fingerprint string as
+another SQL grammar.
+
 JSON and JSONB literals should stay as source spans or token references during
 lexing, classification, and raw parsing. Only semantic phases that need typed
 JSON values should pay parse/stringify costs.
