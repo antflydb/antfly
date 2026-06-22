@@ -6619,6 +6619,13 @@ fn appParityTokensHaveFunctionCallWithLiteral(tokens: []const tokenized.Token, n
     return false;
 }
 
+fn appParityTokensHaveStringLiteral(tokens: []const tokenized.Token, literal: []const u8) bool {
+    for (tokens) |token| {
+        if (token.kind == .string and std.mem.eql(u8, token.text, literal)) return true;
+    }
+    return false;
+}
+
 fn appParityTokensHaveKind(tokens: []const tokenized.Token, kind: token_mod.TokenKind) bool {
     for (tokens) |token| {
         if (token.kind == kind) return true;
@@ -8926,24 +8933,24 @@ pub const AppParityCorpusCoverage = struct {
         });
         self.boolean_is_predicate = self.boolean_is_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-                (std.mem.indexOf(u8, entry.sql, " IS TRUE") != null or
-                    std.mem.indexOf(u8, entry.sql, " IS FALSE") != null);
+                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .true }) or
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .false }));
         self.boolean_is_not_predicate = self.boolean_is_not_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
-                (std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null or
-                    std.mem.indexOf(u8, entry.sql, " IS NOT FALSE") != null);
+                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }) or
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .false }));
         self.boolean_unknown_predicate = self.boolean_unknown_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-                (std.mem.indexOf(u8, entry.sql, " IS UNKNOWN") != null or
-                    std.mem.indexOf(u8, entry.sql, " IS NOT UNKNOWN") != null);
+                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .unknown }) or
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .unknown }));
         self.postfix_null_test_predicate = self.postfix_null_test_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-                (std.mem.indexOf(u8, entry.sql, " ISNULL") != null or
-                    std.mem.indexOf(u8, entry.sql, " NOTNULL") != null);
+                (appParityTokensHaveIdentifier(sql_tokens, "isnull") or
+                    appParityTokensHaveIdentifier(sql_tokens, "notnull"));
         self.expression_postfix_null_test_predicate = self.expression_postfix_null_test_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
-                (std.mem.indexOf(u8, entry.sql, " ISNULL") != null or
-                    std.mem.indexOf(u8, entry.sql, " NOTNULL") != null);
+                (appParityTokensHaveIdentifier(sql_tokens, "isnull") or
+                    appParityTokensHaveIdentifier(sql_tokens, "notnull"));
         self.json_access_path = self.json_access_path or sql_adapter.planHasAnyNonZeroToken(entry.plan, &.{
             ":json_eq=",
             "_json_eq=",
@@ -8972,7 +8979,9 @@ pub const AppParityCorpusCoverage = struct {
             entry.family == .query and sql_adapter.planHasNonZeroToken(entry.plan, ":access_or=");
         self.query_array_overlap_access_or = self.query_array_overlap_access_or or
             entry.family == .query and
-                std.mem.indexOf(u8, entry.sql, "tags && ARRAY") != null and
+                appParityTokensHaveIdentifier(sql_tokens, "tags") and
+                appParityTokensHaveKind(sql_tokens, .range_overlap) and
+                appParityTokensHaveKeyword(sql_tokens, .array) and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":access_or=");
         self.query_access_not_predicates = self.query_access_not_predicates or
             entry.family == .query and sql_adapter.planHasNonZeroToken(entry.plan, ":access_not=");
@@ -9010,41 +9019,47 @@ pub const AppParityCorpusCoverage = struct {
         self.mixed_scalar_expression_or = self.mixed_scalar_expression_or or
             entry.family == .query and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":expr_or=") and
-                std.mem.indexOf(u8, entry.sql, "id = 'u1' OR lower(email)") != null;
+                appParityTokensHaveIdentifier(sql_tokens, "id") and
+                appParityTokensHaveKeyword(sql_tokens, .@"or") and
+                appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+                appParityTokensHaveIdentifier(sql_tokens, "email");
         self.expression_order = self.expression_order or sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr=") or sql_adapter.planHasNonZeroToken(entry.plan, "_order_expr=");
         self.query_order_using_operator = self.query_order_using_operator or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.aggregate_order_using_operator = self.aggregate_order_using_operator or (entry.family == .aggregate and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.join_order_using_operator = self.join_order_using_operator or (entry.family == .join and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.lateral_order_using_operator = self.lateral_order_using_operator or (entry.family == .lateral and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.window_order_using_operator = self.window_order_using_operator or (entry.family == .window and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.update_source_order_using_operator = self.update_source_order_using_operator or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_order="));
         self.delete_source_order_using_operator = self.delete_source_order_using_operator or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, " USING ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .using) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_order="));
         self.query_fixed_interval_expression = self.query_fixed_interval_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "INTERVAL '1 hour'") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "interval") and
+            appParityTokensHaveStringLiteral(sql_tokens, "1 hour") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_calendar_interval_expression = self.query_calendar_interval_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month'") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "interval") and
+            appParityTokensHaveStringLiteral(sql_tokens, "1 month") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_mixed_interval_expression = self.query_mixed_interval_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month 1 day'") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "interval") and
+            appParityTokensHaveStringLiteral(sql_tokens, "1 month 1 day") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_now_expression = self.query_now_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "now()") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "now") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_timestamp_expression = self.query_current_timestamp_expression or (entry.family == .query and
             appParityTokensHaveIdentifier(sql_tokens, "current_timestamp") and

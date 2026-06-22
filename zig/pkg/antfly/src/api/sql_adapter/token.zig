@@ -76,6 +76,7 @@ pub const TokenKeyword = enum {
     constraint,
     count,
     create,
+    data,
     default,
     delete,
     desc,

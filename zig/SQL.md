@@ -402,6 +402,9 @@ Current implementation status:
   for clause boundaries and join/source modifiers. Insert-source select tails,
   DML assignment tails, boolean expression operators, and `ON CONFLICT` /
   `RETURNING` delimiters now use token keyword predicates in lower-DML scans.
+  Relation-population parsing and update-source alias inference in the grammar
+  also use keyword tags for statement heads, `FROM`/`AS`, set-operation tails,
+  and `WITH [NO] DATA`.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
@@ -426,9 +429,10 @@ Current implementation status:
   mutation-source row assignments, temporal `FOR PORTION` clauses, boolean
   `IS [NOT]` predicates, aggregate expression functions, percentile ordering,
   aggregate boolean `HAVING`/`FILTER` clauses, query scalar-function expression
-  families, JSON/array expression helpers, datetime expression helpers, and
-  row-lock invalid cases, now use parsed token predicates instead of raw SQL
-  substring probes.
+  families, JSON/array expression helpers, datetime and interval expression
+  helpers, postfix null tests, `ORDER BY ... USING` tails, array-overlap access
+  predicates, and row-lock invalid cases, now use parsed token predicates
+  instead of raw SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

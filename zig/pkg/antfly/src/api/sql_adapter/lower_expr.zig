@@ -18406,6 +18406,15 @@ pub fn sqlJoinedSourceAliasTerminator(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "for");
 }
 
+pub fn sqlJoinedSourceAliasTerminatorToken(token: Token) bool {
+    return token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.@"for");
+}
+
 pub fn sqlAssignmentTailKeyword(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "where") or
         std.ascii.eqlIgnoreCase(text, "from") or

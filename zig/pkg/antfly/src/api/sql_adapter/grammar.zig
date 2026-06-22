@@ -6659,9 +6659,9 @@ pub fn parseSelectSetOperation(tokens: []const Token, pos: *usize) !ast.SelectSe
 }
 
 pub fn nextIsSelectSetOperationKeyword(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "union") or
-        parser.peekKeyword(tokens, pos, "intersect") or
-        parser.peekKeyword(tokens, pos, "except");
+    return parser.peekKeywordTag(tokens, pos, .@"union") or
+        parser.peekKeywordTag(tokens, pos, .intersect) or
+        parser.peekKeywordTag(tokens, pos, .except);
 }
 
 pub fn peekUpdateJoinedMutationSourceAlias(tokens: []const Token, pos: usize) ?[]const u8 {
@@ -6676,15 +6676,15 @@ pub fn peekUpdateJoinedMutationSourceAlias(tokens: []const Token, pos: usize) ?[
                 depth -= 1;
             },
             .identifier => {
-                if (depth != 0 or !std.ascii.eqlIgnoreCase(token.text, "from")) continue;
+                if (depth != 0 or !token.matchesKeywordTag(.from)) continue;
                 var j = i + 1;
                 if (j >= tokens.len or tokens[j].kind != .identifier) return null;
                 const table_name = tokens[j].text;
                 j += 1;
-                if (j < tokens.len and tokens[j].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[j].text, "as")) {
+                if (j < tokens.len and tokens[j].matchesKeywordTag(.as)) {
                     j += 1;
                 }
-                if (j < tokens.len and tokens[j].kind == .identifier and !lower_expr.sqlJoinedSourceAliasTerminator(tokens[j].text)) {
+                if (j < tokens.len and tokens[j].kind == .identifier and !lower_expr.sqlJoinedSourceAliasTerminatorToken(tokens[j])) {
                     return tokens[j].text;
                 }
                 return table_name;
@@ -7663,10 +7663,10 @@ pub fn parseRelationPopulationTokensAlloc(
     _ = alloc;
     _ = sql;
     if (tokens.len == 0 or tokens[0].kind != .identifier) return error.UnsupportedSqlShape;
-    if (std.ascii.eqlIgnoreCase(tokens[0].text, "select")) {
+    if (tokens[0].matchesKeywordTag(.select)) {
         return try parseSelectIntoPopulationSqlAlloc(tokens);
     }
-    if (std.ascii.eqlIgnoreCase(tokens[0].text, "create")) {
+    if (tokens[0].matchesKeywordTag(.create)) {
         return try parseCreateTableAsPopulationSqlAlloc(tokens);
     }
     return error.UnsupportedSqlShape;
@@ -7717,10 +7717,8 @@ fn parseTrailingRelationPopulationDataClause(tokens: []const Token, select_index
     if (end < select_index + 2) return null;
 
     const with_data_index = end - 2;
-    if (tokens[with_data_index].kind == .identifier and
-        tokens[with_data_index + 1].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[with_data_index].text, "with") and
-        std.ascii.eqlIgnoreCase(tokens[with_data_index + 1].text, "data") and
+    if (tokens[with_data_index].matchesKeywordTag(.with) and
+        tokens[with_data_index + 1].matchesKeywordTag(.data) and
         topLevelTokenAt(tokens, select_index, with_data_index))
     {
         return .{ .start_index = with_data_index, .populate = true };
@@ -7728,12 +7726,9 @@ fn parseTrailingRelationPopulationDataClause(tokens: []const Token, select_index
 
     if (end < select_index + 3) return null;
     const with_no_data_index = end - 3;
-    if (tokens[with_no_data_index].kind == .identifier and
-        tokens[with_no_data_index + 1].kind == .identifier and
-        tokens[with_no_data_index + 2].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[with_no_data_index].text, "with") and
-        std.ascii.eqlIgnoreCase(tokens[with_no_data_index + 1].text, "no") and
-        std.ascii.eqlIgnoreCase(tokens[with_no_data_index + 2].text, "data") and
+    if (tokens[with_no_data_index].matchesKeywordTag(.with) and
+        tokens[with_no_data_index + 1].matchesKeywordTag(.no) and
+        tokens[with_no_data_index + 2].matchesKeywordTag(.data) and
         topLevelTokenAt(tokens, select_index, with_no_data_index))
     {
         return .{ .start_index = with_no_data_index, .populate = false };
@@ -7777,7 +7772,7 @@ fn parseCreateTableAsPopulationSqlAlloc(tokens: []const Token) !RelationPopulati
     const target_identifier = tokens[index].text;
     index += 1;
     if (!parser.matchKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
-    if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
+    if (index >= tokens.len or !tokens[index].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
     const data_clause = parseTrailingRelationPopulationDataClause(tokens, index);
     var source_token_end = if (data_clause) |clause| clause.start_index else tokens.len;
     while (source_token_end > index and tokens[source_token_end - 1].kind == .semicolon) source_token_end -= 1;
