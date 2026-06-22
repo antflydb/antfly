@@ -7547,20 +7547,24 @@ SELECT *
 FROM antfly.hybrid_search(
   table_name => 'docs',
   query => 'enterprise refund policy',
-  sources => ARRAY[
-    antfly.source('docs_body_fts', weight => 0.25),
-    antfly.source('docs_body_semantic', weight => 0.60),
-    antfly.source('docs_rel_graph', metric => 'pagerank_v1', weight => 0.15)
-  ],
+  sources_json => '[
+    {"kind":"full_text","index":"docs_body_fts","field":"body","weight":0.25},
+    {"kind":"semantic","index":"docs_body_semantic","weight":0.60},
+    {"kind":"graph_metric","index":"docs_rel_graph","metric":"pagerank_v1","weight":0.15}
+  ]',
   fusion => 'rrf',
   limit => 20
 );
 ```
 
-That function should lower to the same REST/SDK fusion configuration used by
-non-SQL callers: ranked source specs, `rrf`/`rsf`, optional failover, pruning,
-and reranking. The table-valued function result can then be joined back to base
-rows for filtering, authorization, and projection.
+That function lowers to the same REST/SDK fusion configuration used by non-SQL
+callers: ranked source specs, `rrf`/`rsf`, optional failover, pruning, and
+reranking. `sources_json` is the current adapter contract because it keeps the
+backend typed around native request structs instead of passing SQL text through
+execution. A later SQL DSL helper such as `antfly.source(...)` can desugar into
+the same structured source list without changing the native plan or execution
+contract. The table-valued function result can then be joined back to base rows
+for filtering, authorization, and projection.
 
 #### Graph DSL influence
 
