@@ -620,9 +620,10 @@ Current implementation status:
   for `AS`, `bigint`/`integer`, `OWNED BY`, and `NONE` instead of raw SQL
   substring probes.
 - Routine DDL and temporal DML coverage now uses parsed identifiers, function
-  calls, and string tokens for external security, named argument expressions,
+  calls, string tokens, and token-aware plan fingerprint checks for external
+  security, named argument expressions, routine/role/row-policy options,
   interval updates, `TIMESTAMPTZ` literals, and resolver-hint `ON CONFLICT`
-  validation instead of raw SQL scans.
+  validation instead of raw SQL or raw plan substring scans.
 - Relation-population syntax parsing has a `ParsedSql` entrypoint; the raw SQL
   parser is now a leaf wrapper that parses once before delegating, and planning
   consumes and exports the parsed entrypoint directly.
