@@ -1106,7 +1106,7 @@ bridge and is intentionally allowed to depend on API and storage modules until
 the remaining storage-backed helpers have clearer owning modules. API parity,
 HTTP, app-parity, and storage execution tests stay beside the API surface in
 `api/sql_adapter_integration.zig`. Older migration notes in this section that
-refer to `api/relational_sql.zig` or `api/sql_adapter/` describe the path that
+refer to `sql/runtime.zig` or `sql/` describe the path that
 led to this split; new work should target `src/sql/` unless it is explicitly
 API/storage integration.
 
@@ -1150,7 +1150,7 @@ API/storage integration.
   surface rather than duplicated SQL facade helpers. SQL select-list,
   `ORDER BY` expression, general row-expression operand start classification,
   and binding-aware extension/routine expression starts also live here as typed
-  enum dispatch helpers; `relational_sql.zig` can still own the temporary
+  enum dispatch helpers; `sql/runtime.zig` can still own the temporary
   parser methods that build each expression, but it should no longer carry long
   PostgreSQL-token predicate chains for deciding which expression family starts
   at the current token.
@@ -1164,65 +1164,65 @@ API/storage integration.
 
 This split has already started, so new SQL semantics should extend the adapter
 package boundary even when compatibility wrappers still live in
-`api/relational_sql.zig`. Create-table and create-index DDL plan parsing now
-live in `api/sql_adapter/ddl_plan.zig`; parser-local state crosses that
+`sql/runtime.zig`. Create-table and create-index DDL plan parsing now
+live in `sql/ddl_plan.zig`; parser-local state crosses that
 boundary only through narrow hooks for row-expression/default parsing until
 those remaining expression entrypoints are fully adapter-owned. Binding-aware
-extension and routine functions follow the same rule: `relational_sql.zig` may
+extension and routine functions follow the same rule: `sql/runtime.zig` may
 expose public `lower*WithFunctionBindings` entrypoints, but function-call
 recognition, duplicate binding rejection, arity checks, and row-expression
-lowering belong to `api/sql_adapter/lower_expr.zig` or adjacent adapter
+lowering belong to `sql/lower_expr.zig` or adjacent adapter
 modules until the remaining parser code physically moves. Ready extension
 bindings passed into the adapter are typed
 `RelationalRowsExpressionKind` values, not parser-local string mappings. The
-test split follows the same boundary. `api/relational_sql.zig` should keep
+test split follows the same boundary. `sql/runtime.zig` should keep
 public API, storage execution, schema-application, app-parity, catalog-backed
 plan, and end-to-end typed-plan coverage. Pure adapter regressions such as
 PostgreSQL syntax lowering, DDL plan shapes, expression lowering, DML plan
 construction, parser grammar tails, and fail-closed adapter diagnostics should
-live beside the owning `api/sql_adapter/` module, using local test helpers that
+live beside the owning `sql/` module, using local test helpers that
 exercise the adapter contract directly instead of reaching back through the
 public facade. The second migration slice keeps parser syntax methods in
-`relational_sql.zig` but
+`sql/runtime.zig` but
 moves `SqlFunctionBindings`, routine expression binding metadata, `argN`
 substitution, duplicate/arity lookup, and null-input short-circuit helpers to
 the adapter expression layer. A follow-on cleanup routes DDL predicate literal
-parsing through `api/sql_adapter/value.zig` instead of carrying a second local
-token-slice parser in `relational_sql.zig`; the next grammar slice moves
+parsing through `sql/value.zig` instead of carrying a second local
+token-slice parser in `sql/runtime.zig`; the next grammar slice moves
 partial unique-predicate token grouping and atom parsing into
-`api/sql_adapter/grammar.zig` while keeping the runtime `UniquePredicate`
+`sql/grammar.zig` while keeping the runtime `UniquePredicate`
 contract unchanged. Parser-local forwarding wrappers for identifier lists and
 scalar JSON literals are removed as adapter facade calls replace them, with
-negative-number JSON literal parsing owned by `api/sql_adapter/value.zig`.
+negative-number JSON literal parsing owned by `sql/value.zig`.
 Default-value validation, JSON document/array shape checks, JSON literal
 validity checks, and scalar/array JSON type matching also live in
-`api/sql_adapter/value.zig`, so DDL, DML, and expression parsing share one
+`sql/value.zig`, so DDL, DML, and expression parsing share one
 adapter-owned value boundary.
 Case-insensitive identifier-list uniqueness and disjointness checks move with
-the list grammar into `api/sql_adapter/grammar.zig`. The validating DDL
+the list grammar into `sql/grammar.zig`. The validating DDL
 constraint column-list entrypoints for primary keys, unique constraints,
 temporal `WITHOUT OVERLAPS` lists, and `INCLUDE` columns also live in
-`grammar.zig`, so `relational_sql.zig` no longer needs parser-local wrappers
+`grammar.zig`, so `sql/runtime.zig` no longer needs parser-local wrappers
 that parse a list and then re-run identifier-list validation. Mutation-path
 conflict validation for insert columns, dotted field paths, JSON set paths, and
 typed JSON-set transform path construction now lives in
-`api/sql_adapter/lower_dml.zig`, with `relational_sql.zig` only adapting its
+`sql/lower_dml.zig`, with `sql/runtime.zig` only adapting its
 parser-local temporary assignment structs to that shared DML surface. MERGE
 target-row usage checks for expressions and predicate groups
 also live in `lower_dml.zig`, so source-only clauses fail closed through
 adapter-owned DML rules instead of parser-local recursion. Basic runtime-column
-lookup moves to `api/sql_adapter/binder.zig` so parser validation, DML lowering,
+lookup moves to `sql/binder.zig` so parser validation, DML lowering,
 and later catalog binding use the same column-name and type matching helper.
 Relational catalog-existence checks, DDL column lookup, declared index-name
 lookup, primary/unique/foreign-key/check constraint-name lookup, and default
 primary-key naming rules also move into `binder.zig`, leaving schema mutation
-code in `relational_sql.zig` to apply typed operations rather than own catalog
+code in `sql/runtime.zig` to apply typed operations rather than own catalog
 name-resolution primitives. Temporal period lookup/type checks, period catalog
 validation, primary-key `WITHOUT OVERLAPS` validation, and foreign-key
 column/temporal-action validation follow the same binder boundary because they
 bind typed catalog metadata to existing relational columns and periods.
 Row-expression equality and unique-expression duplicate validation move into
-`api/sql_adapter/lower_expr.zig`, so DDL index parsing, conflict-target parsing,
+`sql/lower_expr.zig`, so DDL index parsing, conflict-target parsing,
 and plan/fingerprint comparisons use one adapter-owned expression comparison
 surface. Aggregate-spec equivalence also lives in `lower_expr.zig`, so aggregate
 deduplication compares row expressions, order keys, and typed filter predicates
@@ -1236,7 +1236,7 @@ expression checks share the same definition of catalog-safe deterministic and
 type-compatible expression trees. DDL catalog validation for relational columns,
 primary keys, `CHECK`, foreign-key names, generated columns, unique constraints,
 index `INCLUDE` columns, and field-based unique predicates is adapter-owned as
-well: `relational_sql.zig` asks `lower_expr.zig` and `binder.zig` to validate
+well: `sql/runtime.zig` asks `lower_expr.zig` and `binder.zig` to validate
 the typed catalog metadata instead of retaining parallel schema-specific helpers
 beside the parser. The future larger slice can move the full row-expression
 parser once this contract is stable.
@@ -1279,7 +1279,7 @@ token predicates for golden plan assertions also live in `corpus.zig` and
 reject duplicate or malformed token occurrences, so coverage checks cannot
 accidentally pass on substring matches or ambiguous plan summaries; fixture
 validation should call those corpus exports directly rather than maintaining
-local forwarding wrappers in `relational_sql.zig`. Exact-token regression tests
+local forwarding wrappers in `sql/runtime.zig`. Exact-token regression tests
 for DDL submodes, `EXPLAIN` wrappers, and empty-catalog DDL applicability live
 with those corpus helpers. Coverage-token regression tests for DDL booleans,
 temporal DDL counts, aggregate zero-count buckets, and truncate identity tokens
@@ -1429,7 +1429,7 @@ end-of-input behavior are adapter-owned before statement-specific grammar moves
 out of the large lowerer file. Adapter-only control syntax such as `EXPLAIN`
 prefix and option parsing belongs in grammar helpers so lowerers receive typed
 wrapper intent instead of scanning raw SQL. This boundary is now partially implemented:
-`api/sql_adapter/` owns token definitions, lexer behavior, parser cursor
+`sql/` owns token definitions, lexer behavior, parser cursor
 helpers, statement classification, diagnostics, parity-corpus fingerprints,
 catalog/source-name prebinding through parsed bound statements,
 catalog-independent object identifier
@@ -1564,7 +1564,7 @@ prepared-statement subject classification for read, write, and DDL
 subjects, including CTE-backed subjects classified by their final
 non-recursive statement and `MERGE` as a write subject, and relation-population syntax
 parsing for `SELECT INTO` and
-`CREATE TABLE AS`; `api/sql_adapter/plan.zig` owns the lowered read-plan,
+`CREATE TABLE AS`; `sql/plan.zig` owns the lowered read-plan,
 write-plan, explain-plan, write-plan option, merge-arm, returning-projection,
 and relation-population containers that wrap Antfly-native typed query,
 aggregate, join, lateral, window, CTE, insert, update/delete, insert-source,
@@ -1575,7 +1575,7 @@ used across parser cleanup paths and lowered-plan ownership, plus projection
 and join deinit/conversion helpers that operate only on Antfly-native storage
 plan structs, while preserving the existing public entrypoints through facade
 aliases;
-`api/sql_adapter/ddl_plan.zig` owns the adapter-noop DDL, enum-type catalog,
+`sql/ddl_plan.zig` owns the adapter-noop DDL, enum-type catalog,
 domain catalog, identity-allocator catalog,
 schema-namespace catalog, extension catalog, function/routine catalog, and
 authorization catalog, sequence catalog, database catalog, tablespace catalog,
@@ -1586,12 +1586,12 @@ drop-index, prepared-statement, cursor/portal, savepoint transaction, comment
 metadata, and transaction-control plan containers, with the remaining DDL
 families scheduled to move through the same facade as their lowerers are
 extracted;
-`api/sql_adapter/lower_expr.zig` owns the expression keyword, function-name, and
+`sql/lower_expr.zig` owns the expression keyword, function-name, and
 tail-boundary predicates that the shared expression lowerer uses, plus the
 token-level rule that distinguishes a parenthesized boolean predicate group
 from a parenthesized scalar expression followed by comparison, pattern, range,
 membership, or JSON/path operators;
-`api/relational_sql.zig` keeps the public lowering entrypoints and maps adapter
+`sql/runtime.zig` keeps the public lowering entrypoints and maps adapter
 syntax into Antfly-native typed plans. Row-lock target
 validation remains in the lowerer/binder boundary because it depends on table
 aliases and catalog-normalized object names, but the SQL grammar emits only the
@@ -4894,9 +4894,9 @@ Adapter-only transaction-control coverage includes `BEGIN`, `BEGIN WORK`, bare
 WORK` as explicit no-op classifications, so migration wrappers and client
 protocol boundary statements stay out of storage while still remaining visible in
 the golden corpus. The boundary tail matcher lives in
-`api/sql_adapter/grammar.zig`, including statement-end validation plus `WORK`
+`sql/grammar.zig`, including statement-end validation plus `WORK`
 and `TRANSACTION` aliases. `SAVEPOINT`, `RELEASE [SAVEPOINT]`, and `ROLLBACK TO
-[SAVEPOINT]` syntax is also parsed in `api/sql_adapter/grammar.zig` and lowers
+[SAVEPOINT]` syntax is also parsed in `sql/grammar.zig` and lowers
 to typed savepoint transaction-control intents that capture the savepoint name
 and fail closed at schema/storage application until native nested transaction
 rollback/release semantics exist. Prepared transaction commands are not boundary
@@ -4946,7 +4946,7 @@ Role/session
 authorization changes, arbitrary settings, timeout settings, default storage
 settings, unsupported values for otherwise inert settings, `SHOW ALL`, and
 partial `DISCARD` variants still fail closed. The allowlist lives in
-`api/sql_adapter/grammar.zig` so new accepted session syntax must be explicit
+`sql/grammar.zig` so new accepted session syntax must be explicit
 adapter grammar, not another raw token scan in the SQL lowerer. If Antfly later
 owns long-lived server-side prepared
 statements, cursors, temporary objects, or session-local variables, `DISCARD`
@@ -4956,7 +4956,7 @@ native objects.
 Prepared statement, cursor, and explain syntax is protocol/query-control
 surface over typed plans rather than storage syntax. `PREPARE`, `EXECUTE`, and
 `DEALLOCATE [PREPARE] name|ALL` cleanup tails are parsed in
-`api/sql_adapter/grammar.zig`; the resulting typed prepared-statement syntax
+`sql/grammar.zig`; the resulting typed prepared-statement syntax
 captures statement name, parameter or argument count, the broad subject
 (`read`, `write`, or `ddl`), and the final native statement family (`read`,
 `insert`, `insert_source`, `update`, `delete`, `truncate`, `merge`, or `ddl`)
@@ -4983,7 +4983,7 @@ cursor|ALL` lower to typed cursor-portal intents that capture portal name,
 scroll/hold/binary metadata, fetch direction/count, and close scope. Fetch
 directions are explicit metadata for `NEXT`, `PRIOR`, `FIRST`, `LAST`,
 `ABSOLUTE n`, `RELATIVE n`, `FORWARD [n|ALL]`, `BACKWARD [n]`, and `ALL`. The
-`CLOSE` cleanup tail also lives in `api/sql_adapter/grammar.zig`, so protocol
+`CLOSE` cleanup tail also lives in `sql/grammar.zig`, so protocol
 cleanup syntax stays adapter-owned while the lowerer allocates the typed plan.
 They still fail closed when applied to storage until there is a typed portal
 contract with snapshot lifetime, range ownership, ordering, backpressure, resume
@@ -5006,7 +5006,7 @@ can report executed work instead of just the typed plan it would execute.
 
 Maintenance and transaction-mode SQL also stays out of storage until it maps to
 native typed work. Table-targeted `VACUUM`, `ANALYZE`, `REINDEX`, and `CLUSTER`
-syntax parses in `api/sql_adapter/grammar.zig` before `relational_sql.zig`
+syntax parses in `sql/grammar.zig` before `sql/runtime.zig`
 allocates typed maintenance-job intents that capture target table, index, or
 catalog scope and supported options, then fail closed when applied to table
 schema or runtime storage. The production shape is a durable maintenance-job model with
@@ -5014,11 +5014,11 @@ table/index generations, range ownership, leases, throttling, resumable
 progress, repair/rebuild integration, stats output, and catalog promotion
 semantics. `LOCK TABLE`, `SET CONSTRAINTS`, `SET TRANSACTION`, `START
 TRANSACTION ... ISOLATION LEVEL ...`, and `BEGIN ... ISOLATION LEVEL ...`
-clauses parse in `api/sql_adapter/grammar.zig` before the lowerer allocates
+clauses parse in `sql/grammar.zig` before the lowerer allocates
 typed transaction-control intents that capture normalized table and constraint
 names, table-lock mode, constraint scope/check mode, transaction starter,
 isolation level, read-only/read-write mode, and deferrability. `pg_advisory_lock`
-and `pg_advisory_unlock` call tails parse in `api/sql_adapter/grammar.zig` and
+and `pg_advisory_unlock` call tails parse in `sql/grammar.zig` and
 lower to typed transaction-control intents with advisory-lock action and
 advisory key values. All of these fail closed when
 applied to table schema or runtime storage. The production shape is
@@ -5036,9 +5036,9 @@ effect is coordinator recovery state, not table schema.
 
 Notification-channel SQL is also adapter grammar over typed native intent, not
 backend SQL text. `LISTEN`, `NOTIFY`, and `UNLISTEN` tails parse in
-`api/sql_adapter/grammar.zig`; `NOTIFY` payload literals use the shared
-`api/sql_adapter/value.zig` untyped literal-to-JSON helper; and
-`relational_sql.zig` only maps the resulting channel name, optional payload JSON,
+`sql/grammar.zig`; `NOTIFY` payload literals use the shared
+`sql/value.zig` untyped literal-to-JSON helper; and
+`sql/runtime.zig` only maps the resulting channel name, optional payload JSON,
 or `UNLISTEN *` flag into typed notification-channel plans. `ApiHttpServer`
 executes those plans through `api/sql_notifications.zig`, an Antfly-owned
 notification runtime that assigns stable SQL notification session ids to owned
@@ -5054,7 +5054,7 @@ native channel events.
 Schema namespace syntax is only adapter-only when it is proven boilerplate for
 the default `public` namespace, such as `CREATE SCHEMA IF NOT EXISTS public`.
 Non-public `CREATE SCHEMA`, `ALTER SCHEMA ... RENAME TO`, and `DROP SCHEMA`
-tails parse in `api/sql_adapter/grammar.zig` and lower to typed
+tails parse in `sql/grammar.zig` and lower to typed
 schema-namespace catalog intents that record the namespace name, idempotence
 flag, rename target, and cascade/drop metadata. Metadata now has
 first-class database and namespace records, table records carry
@@ -5082,7 +5082,7 @@ flattening them into table names or schema JSON. Basic `CREATE TABLESPACE ...
 LOCATION`, `ALTER TABLESPACE ... RENAME TO`, and `DROP TABLESPACE` statements
 produce tablespace catalog plans so placement/storage-class intent is explicit
 but cannot silently change table storage paths. These database/tablespace SQL
-tails parse in `api/sql_adapter/grammar.zig`; `relational_sql.zig` maps the
+tails parse in `sql/grammar.zig`; `sql/runtime.zig` maps the
 syntax into typed catalog plans and owns only plan allocation/ownership transfer.
 Database catalog DDL now applies
 basic create, alter-settings, and empty-drop operations through durable typed
@@ -5107,7 +5107,7 @@ applied to table schema or runtime storage. Production execution still requires
 native changefeed or replication catalog objects with table/partition selection,
 schema-version binding, durable resume positions, authorization, backfill
 policy, delivery acknowledgements, and topology-aware range ownership.
-Publication/subscription tails parse in `api/sql_adapter/grammar.zig` before
+Publication/subscription tails parse in `sql/grammar.zig` before
 the SQL lowerer maps owned syntax into typed logical-replication catalog plans,
 so future accepted options must become explicit native fields rather than raw
 SQL carried through storage.
@@ -5135,7 +5135,7 @@ rebuild/validation jobs, and result-type metadata. Unsupported user-defined
 functions or opaque SQL bodies must not become hidden expression behavior; every
 accepted object needs deterministic execution semantics that are visible to
 REST/SDK typed plans before PostgreSQL syntax can execute it. These custom
-type-system tails parse in `api/sql_adapter/grammar.zig`; the SQL lowerer only
+type-system tails parse in `sql/grammar.zig`; the SQL lowerer only
 transfers owned grammar syntax into typed catalog plans, so future syntax growth
 must become explicit native catalog metadata instead of lowerer-local token
 scans.
@@ -5147,7 +5147,7 @@ comment is set or cleared. Schema application stores comments under typed
 public schema JSON metadata such as `comments.table`, `comments.columns`,
 `comments.indexes`, and `comments.constraints` after validating referenced
 columns, indexes, and constraints against the current relational schema. The
-`COMMENT ON` tails parse in `api/sql_adapter/grammar.zig`; the SQL lowerer only
+`COMMENT ON` tails parse in `sql/grammar.zig`; the SQL lowerer only
 transfers owned grammar syntax into typed comment metadata plans. The
 runtime row-schema parser ignores that metadata, and direct runtime-schema DDL
 application validates comment targets before returning an unchanged relational
@@ -5174,7 +5174,7 @@ arity; selected source fields remain separate typed metadata so aliases do not
 erase the view's source-to-output mapping. Simple select-list aliases such as
 `SELECT field AS alias` and `SELECT field alias` use the same mapping: the
 selected source field remains durable metadata and the alias becomes the exposed
-output field. `CREATE VIEW` tails parse in `api/sql_adapter/grammar.zig`, so the
+output field. `CREATE VIEW` tails parse in `sql/grammar.zig`, so the
 SQL lowerer only transfers owned grammar syntax into typed view catalog plans;
 `ALTER VIEW ... RENAME TO ...` and `DROP VIEW ...` record typed catalog rename
 and removal intents. The remaining production shape is the durable view catalog
@@ -5195,7 +5195,7 @@ same typed definition with both flags preserved: catalog execution creates the
 materialized view when it is absent and replaces the existing definition when it
 is present, while still keeping population/refresh work in the materialized-view
 job family instead of applying SQL text directly.
-`CREATE MATERIALIZED VIEW` tails parse in `api/sql_adapter/grammar.zig`, so the
+`CREATE MATERIALIZED VIEW` tails parse in `sql/grammar.zig`, so the
 SQL lowerer only transfers owned grammar syntax into typed materialized-view
 catalog plans.
 `REFRESH MATERIALIZED VIEW` records the target view plus `CONCURRENTLY` and
@@ -5212,7 +5212,7 @@ contracts by recording an opaque SQL definition.
 Temporary and unlogged relation DDL lowers to a native `relation_lifetime`
 intent instead of normal durable `CREATE TABLE` storage. `CREATE TEMP TABLE`,
 `CREATE TEMPORARY TABLE`, `CREATE UNLOGGED TABLE`, and their `IF NOT EXISTS`
-forms parse the lifetime prefix in `api/sql_adapter/grammar.zig`, then reuse the
+forms parse the lifetime prefix in `sql/grammar.zig`, then reuse the
 typed `CreateTablePlan` column, primary-key, constraint, period, check, and
 idempotent-creation metadata before attaching an explicit lifetime kind.
 The remaining production shape is the executor for that intent: session-scoped
@@ -5263,7 +5263,7 @@ PostgreSQL enum type DDL now lowers to a typed enum catalog intent.
 set, `ALTER TYPE ... ADD VALUE [IF NOT EXISTS] ... [BEFORE|AFTER ...]` records
 the append/positioning intent, and `DROP TYPE [IF EXISTS] ... [CASCADE]`
 records typed removal metadata. Enum-type tails parse in
-`api/sql_adapter/grammar.zig`; the SQL lowerer only transfers owned grammar
+`sql/grammar.zig`; the SQL lowerer only transfers owned grammar
 syntax into typed enum catalog plans. Schema application remains fail-closed until
 the durable type catalog exists: enum-typed columns must validate labels
 through catalog metadata, record dependencies from tables/checks/defaults, and
@@ -5274,7 +5274,7 @@ SQL text. PostgreSQL domain DDL lowers to a typed domain catalog intent:
 type, default, nullability, and `VALUE` checks; `ALTER DOMAIN` records typed
 nullability/default operations; and `DROP DOMAIN [IF EXISTS] ... [CASCADE]`
 records typed removal metadata. Domain headers and drop tails parse in
-`api/sql_adapter/grammar.zig`; the SQL lowerer keeps base type, default, and
+`sql/grammar.zig`; the SQL lowerer keeps base type, default, and
 check-expression semantics in typed catalog planning. Schema application remains fail-closed until
 the durable domain catalog exists: domain-typed columns must validate through
 catalog metadata, inherit defaults/nullability/checks through a typed expansion
@@ -5289,7 +5289,7 @@ and `CYCLE`), and `OWNED BY` dependency metadata including `OWNED BY NONE`;
 `DROP SEQUENCE [IF EXISTS] ... [CASCADE]` records typed removal metadata.
 Standalone sequence tails, generated-identity sequence option clauses, and the
 identity-allocator `CREATE TABLE name (identity_column ...` header parse in
-`api/sql_adapter/grammar.zig`; the SQL lowerer only transfers owned grammar
+`sql/grammar.zig`; the SQL lowerer only transfers owned grammar
 syntax into typed sequence and identity-allocator plans. Schema application
 remains fail-closed until the durable sequence catalog and
 allocator exist: sequences must allocate transactionally through owner/range
@@ -5311,7 +5311,7 @@ OF ... FOR VALUES FROM ... TO ...`, `ALTER TABLE ... ATTACH PARTITION`, and
 `ALTER TABLE ... DETACH PARTITION` lower to typed fail-closed partition catalog
 plans that preserve parent table identity, child partition identity, partition
 method, key count, and range bounds. Partition metadata tails parse in
-`api/sql_adapter/grammar.zig`; partitioned table definitions still reuse the
+`sql/grammar.zig`; partitioned table definitions still reuse the
 typed `CreateTablePlan` lowerer for column and constraint parsing before
 attaching grammar-owned partition metadata. Schema application remains
 fail-closed until native partition metadata owns placement and routing. The production shape
@@ -5336,7 +5336,7 @@ beside the read-side `USING` predicate. If a policy omits `WITH CHECK`, the
 write predicate defaults to the read predicate when applied to native auth
 state, matching PostgreSQL's insert/update behavior without storing raw SQL.
 `CREATE POLICY` tails parse in
-`api/sql_adapter/grammar.zig`, so the SQL lowerer only transfers owned grammar
+`sql/grammar.zig`, so the SQL lowerer only transfers owned grammar
 syntax into typed row-security catalog plans. Public API execution maps each
 supported policy to a hidden native row-filter policy subject, converts
 `current_setting('app.<key>')` to `{"$auth":"settings.app.<key>"}`, stores
@@ -5372,8 +5372,8 @@ PostgreSQL privilege and role DDL is also not adapter-only syntax. `GRANT`,
 `REVOKE`, and role lifecycle statements lower to typed authorization-catalog
 intent that captures role names, privilege counts, object kind/name, principal
 identity, and role setting names, then fail closed when applied to table schema
-storage. Those role and privilege tails parse in `api/sql_adapter/grammar.zig`;
-`relational_sql.zig` only maps the owned authorization syntax into typed plan
+storage. Those role and privilege tails parse in `sql/grammar.zig`;
+`sql/runtime.zig` only maps the owned authorization syntax into typed plan
 fields and validation-owned allocation. Public API execution routes
 authorization-catalog SQL through the
 native user-management surface instead: `CREATE ROLE app_writer` creates the
@@ -5421,7 +5421,7 @@ native semantics. SQL DDL and `COPY` execution read the effective
 `statement_timeout` once at statement start, fail expired statements before
 dispatch, and re-check after typed execution before returning owned results.
 
-`COPY FROM` and `COPY TO` tails parse in `api/sql_adapter/grammar.zig` and lower
+`COPY FROM` and `COPY TO` tails parse in `sql/grammar.zig` and lower
 to typed bulk import/export intent that captures table identity, selected
 columns, stream endpoint, direction, format, CSV header intent, import-freeze
 intent, export force-quote column policy, import force-null/not-null column
@@ -5522,7 +5522,7 @@ metadata, and other `FROM CURRENT` routine settings freeze the current value
 only when it exists in the typed SQL session setting map; absent or unsupported
 settings fail closed before the routine record is stored. Routine lifecycle
 tails parse in
-`api/sql_adapter/grammar.zig`; `relational_sql.zig` only maps that owned syntax
+`sql/grammar.zig`; `sql/runtime.zig` only maps that owned syntax
 into typed routine-catalog plans, so accepted function/procedure options must
 become native metadata before they can execute. The known updated-at helper
 definition uses that same typed routine-catalog boundary; the native behavior
@@ -5904,7 +5904,7 @@ DDL target flag: catalog application first removes child-table foreign-key
 metadata that references the dropped parent through ordinary schema-update
 validation, then drops the parent table.
 `DROP TABLE`, `DROP INDEX`, and table-emptying `TRUNCATE` syntax parse in
-`api/sql_adapter/grammar.zig`; the SQL lowerer only transfers owned grammar
+`sql/grammar.zig`; the SQL lowerer only transfers owned grammar
 syntax into typed drop catalog plans or constructs the typed table-emptying
 mutation-source request from normalized truncate syntax plus the caller's row
 claim.
@@ -5974,10 +5974,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    unique, FK, check, temporal, and replacement metadata, so materially different
    schema plans cannot collapse to the same golden plan. `CREATE TABLE` headers,
    table-element prefixes, and inline column constraint prefixes parse through
-   `api/sql_adapter/grammar.zig`; column definitions and inline/table
+   `sql/grammar.zig`; column definitions and inline/table
    constraint bodies remain in the typed lowerer because they construct
    Antfly-native schema, key, period, check, and FK metadata. Supported `CREATE INDEX`
-   DDL parses its relation header through `api/sql_adapter/grammar.zig` and keeps
+   DDL parses its relation header through `sql/grammar.zig` and keeps
    element lists, generated expressions, include columns, and partial predicates
    in the typed DDL lowerer. `CREATE INDEX`, including `CONCURRENTLY`, now lowers to
    typed index plans for ordinary columns, btree `ASC`/`DESC` and `NULLS`
@@ -5998,12 +5998,12 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    typed plan and checks stable named index identity before mutating catalog
    metadata; existing named indexes no-op without rebuild/validation work.
    Top-level `ALTER TABLE IF EXISTS` parses through
-   `api/sql_adapter/grammar.zig`, is represented in the typed plan, and no-ops
+   `sql/grammar.zig`, is represented in the typed plan, and no-ops
    when the table catalog is absent instead of relying on parse-only parity.
    `VALIDATE CONSTRAINT`, rename, drop column/constraint, nullability, default,
    type-rewrite headers, the `ADD COLUMN [IF NOT EXISTS]` prefix, and
    `ADD PERIOD` / `ADD [CONSTRAINT name]` operation prefixes also parse through
-   `api/sql_adapter/grammar.zig` before the lowerer transfers the constraint
+   `sql/grammar.zig` before the lowerer transfers the constraint
    or column names into typed validation, rename, drop, nullability, default,
    period, and add-constraint operations. Default values, rewritten column
    types, column definitions, period bodies, and inline/table constraint bodies
@@ -6101,7 +6101,7 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public`, is an
    adapter-only no-op with a stable `extension` reason. Other supported
    `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE`, and `DROP EXTENSION`
-   tails parse in `api/sql_adapter/grammar.zig`, lower to typed extension
+   tails parse in `sql/grammar.zig`, lower to typed extension
    catalog intent with version, idempotence, update-target, and dependency
    metadata, and execute through the
    canonical extension lifecycle described in `EXTENSIONS.md`. The SQL
