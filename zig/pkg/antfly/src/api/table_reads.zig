@@ -140,6 +140,7 @@ pub const BackgroundTextStatsResponse = struct {
 
 pub const LoweredSqlReadPlanResult = union(enum) {
     query: db_mod.types.RelationalRowsQueryResult,
+    document_query: db_mod.types.RelationalRowsQueryResult,
     set_operation: db_mod.types.RelationalRowsQueryResult,
     recursive_cte: db_mod.types.RelationalRowsQueryResult,
     aggregate: db_mod.types.RelationalRowsAggregateResult,
@@ -150,6 +151,7 @@ pub const LoweredSqlReadPlanResult = union(enum) {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .query => |*result| result.deinit(alloc),
+            .document_query => |*result| result.deinit(alloc),
             .set_operation => |*result| result.deinit(alloc),
             .recursive_cte => |*result| result.deinit(alloc),
             .aggregate => |*result| result.deinit(alloc),
@@ -4836,6 +4838,19 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
             errdefer result.deinit(alloc);
             break :blk .{ .query = result };
         },
+        .document_query => |lowered| blk: {
+            var result = (try executeLoweredDocumentSqlReadPlanAlloc(
+                alloc,
+                source,
+                catalog,
+                session,
+                default_table_name,
+                lowered,
+                consistency,
+            )) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .document_query = result };
+        },
         .set_operation => |lowered| blk: {
             var result = (try executeLoweredSqlSetOperationPlanAlloc(
                 alloc,
@@ -4940,6 +4955,117 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
     };
 }
 
+fn executeLoweredDocumentSqlReadPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    lowered: sql_adapter_runtime.DocumentReadPlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    const target = try catalogTargetForLoweredSqlTable(session, default_table_name, lowered.table_name);
+    const native_table_name = try nativeCatalogTableNameAlloc(alloc, catalog, target);
+    defer alloc.free(native_table_name);
+
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    switch (lowered.producer) {
+        .id_lookup => |ids| {
+            for (ids) |id| {
+                var lookup = (try source.lookup(alloc, native_table_name, id, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, id, lookup.json, lowered.projection));
+                if (lowered.limit) |limit| {
+                    if (rows.items.len >= limit) break;
+                }
+            }
+        },
+        .full_text => return error.UnsupportedSqlShape,
+        .bounded_scan => |limit| {
+            var scan = (try source.scan(alloc, native_table_name, "", "", .{
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = limit,
+            }, consistency)) orelse return null;
+            defer scan.deinit(alloc);
+
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try source.lookup(alloc, native_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, key_value.string, lookup.json, lowered.projection));
+                if (rows.items.len >= limit) break;
+            }
+        },
+    }
+
+    const total: u32 = @intCast(rows.items.len);
+    return .{
+        .rows = try rows.toOwnedSlice(alloc),
+        .total = total,
+    };
+}
+
+fn documentSqlProjectedRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    doc_json: []const u8,
+    projection: []const sql_adapter_runtime.DocumentProjection,
+) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    return try documentSqlProjectedParsedRowJsonAlloc(alloc, key, parsed.value, doc_json, projection);
+}
+
+fn documentSqlProjectedParsedRowJsonAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    row: std.json.Value,
+    full_doc_json: ?[]const u8,
+    projection: []const sql_adapter_runtime.DocumentProjection,
+) ![]const u8 {
+    if (row != .object) return error.InvalidRowsRequest;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeByte('{');
+    for (projection, 0..) |item, i| {
+        if (i != 0) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(item.output, .{})});
+        switch (item.kind) {
+            .id => try writer.print("{f}", .{std.json.fmt(key, .{})}),
+            .doc => {
+                const doc_json = full_doc_json orelse return error.InvalidRowsRequest;
+                try writer.writeAll(doc_json);
+            },
+            .field => {
+                if (row.object.get(item.field)) |value| {
+                    const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+                    defer alloc.free(value_json);
+                    try writer.writeAll(value_json);
+                } else {
+                    try writer.writeAll("null");
+                }
+            },
+        }
+    }
+    try writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
 pub fn executeLoweredRelationPopulationPlanAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
@@ -4990,6 +5116,11 @@ const TakenLoweredSqlReadRows = struct {
 fn takeLoweredSqlReadRows(result: *LoweredSqlReadPlanResult) TakenLoweredSqlReadRows {
     return switch (result.*) {
         .query => |*query| blk: {
+            const rows = query.rows;
+            query.rows = &.{};
+            break :blk .{ .rows = rows, .total = query.total };
+        },
+        .document_query => |*query| blk: {
             const rows = query.rows;
             query.rows = &.{};
             break :blk .{ .rows = rows, .total = query.total };
@@ -22776,6 +22907,112 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
         error.UnsupportedSqlShape,
         sql_adapter_runtime.lowerReadPlanAlloc(alloc, "SELECT id FROM docs FOR SYSTEM_TIME AS OF '2026-01-01T00:00:00Z'", versioned_schema, &.{}),
     );
+}
+
+test "lowered document sql read plans execute native lookup and bounded scan" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-document-sql-read";
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"key\":\"document-key-field\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
+        },
+    });
+
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"key":{"type":"keyword"}},"additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const FakeCatalog = struct {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog = FakeCatalog{};
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+
+    var lookup_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id, title, key FROM docs WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+    );
+    defer lookup_plan.deinit(alloc);
+    var lookup_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        lookup_plan,
+        .read_index,
+    )).?;
+    defer lookup_result.deinit(alloc);
+    switch (lookup_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\",\"key\":\"document-key-field\"}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var scan_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id, title FROM docs LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer scan_plan.deinit(alloc);
+    var scan_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        scan_plan,
+        .read_index,
+    )).?;
+    defer scan_result.deinit(alloc);
+    switch (scan_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 2), query.total);
+            try std.testing.expectEqual(@as(usize, 2), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\"}", query.rows[0]);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:b\",\"title\":\"beta\"}", query.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "bound table read source scans keys as ndjson" {

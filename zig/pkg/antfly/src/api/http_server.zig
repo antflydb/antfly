@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const api_http_server = @This();
 const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
 const platform_sync = @import("antfly_platform").sync;
@@ -569,6 +570,7 @@ pub const StatusSource = struct {
         apply_relational_sql_ddl: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_relational_sql_ddl_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         apply_relational_sql_ddl_with_session_and_function_bindings: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, sql: []const u8, session: catalog_resources.SqlCatalogSession, function_bindings: sql_adapter.SqlFunctionBindings) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
+        apply_relational_sql_ddl_plan_with_session: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: *sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
         compare_and_swap_table_schema: ?*const fn (ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) anyerror!void = null,
         apply_prepared_transaction_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.PreparedTransactionPlan, timestamp_ns: u64) anyerror!sql_adapter.PreparedTransactionCoordinatorResult = null,
         apply_database_catalog_plan: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, plan: sql_adapter.DatabaseCatalogPlan) anyerror!tables_api.AppliedRelationalSqlDdlRecord = null,
@@ -693,6 +695,20 @@ pub const StatusSource = struct {
         }
         const fn_ptr = self.vtable.apply_relational_sql_ddl orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, sql);
+    }
+
+    pub fn applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(
+        self: StatusSource,
+        alloc: std.mem.Allocator,
+        sql: []const u8,
+        plan: *sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+        function_bindings: sql_adapter.SqlFunctionBindings,
+    ) !tables_api.AppliedRelationalSqlDdlRecord {
+        if (self.vtable.apply_relational_sql_ddl_plan_with_session) |fn_ptr| {
+            return try fn_ptr(self.ptr, alloc, plan, session);
+        }
+        return try self.applyRelationalSqlDdlWithSessionAndFunctionBindings(alloc, sql, session, function_bindings);
     }
 
     pub fn compareAndSwapTableSchema(
@@ -923,6 +939,15 @@ pub const StatusSource = struct {
                 return try applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(cast(ptr), alloc, sql, session, function_bindings);
             }
 
+            fn applyRelationalSqlDdlPlanWithSession(
+                ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                plan: *sql_adapter.LoweredDdlPlan,
+                session: catalog_resources.SqlCatalogSession,
+            ) anyerror!tables_api.AppliedRelationalSqlDdlRecord {
+                return try api_http_server.applyRelationalSqlDdlPlanOnServiceWithSession(cast(ptr), alloc, plan, session);
+            }
+
             fn compareAndSwapTableSchema(
                 ptr: *anyopaque,
                 request: metadata_table_manager.TableSchemaCompareAndSwapRequest,
@@ -1069,6 +1094,7 @@ pub const StatusSource = struct {
             .apply_relational_sql_ddl = Gen.applyRelationalSqlDdl,
             .apply_relational_sql_ddl_with_session = Gen.applyRelationalSqlDdlWithSession,
             .apply_relational_sql_ddl_with_session_and_function_bindings = Gen.applyRelationalSqlDdlWithSessionAndFunctionBindings,
+            .apply_relational_sql_ddl_plan_with_session = Gen.applyRelationalSqlDdlPlanWithSession,
             .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
             .apply_prepared_transaction_plan = Gen.applyPreparedTransactionPlan,
             .apply_database_catalog_plan = Gen.applyDatabaseCatalogPlan,
@@ -1334,8 +1360,16 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     defer parsed_sql.deinit(alloc);
     var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
     defer plan.deinit(alloc);
+    return try applyRelationalSqlDdlPlanOnServiceWithSession(svc, alloc, &plan, session);
+}
 
-    if (try extension_domain.sql_adapter.executeRelationalSqlDdlPlanOnService(svc, alloc, plan)) |applied| {
+fn applyRelationalSqlDdlPlanOnServiceWithSession(
+    svc: anytype,
+    alloc: std.mem.Allocator,
+    plan: *sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !tables_api.AppliedRelationalSqlDdlRecord {
+    if (try extension_domain.sql_adapter.executeRelationalSqlDdlPlanOnService(svc, alloc, plan.*)) |applied| {
         try svc.runRound();
         return applied;
     }
@@ -1343,18 +1377,18 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
 
-    if (try tables_api.applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
+    if (try tables_api.applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan.*, session)) |applied| {
         try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
         try svc.runRound();
         return applied;
     }
 
-    if (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, &plan, session)) |applied| {
+    if (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
         try svc.runRound();
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan, session);
+    var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan.*, session);
     defer target.deinit(alloc);
 
     if (target.createsTable()) {
@@ -1367,7 +1401,7 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
             policy_table = try tables_api.applyTablespacePlacementPolicyAlloc(alloc, base_table, tablespace);
             break :blk policy_table.?;
         } else base_table;
-        var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, &resolved_table, &plan, session);
+        var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, &resolved_table, plan, session);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
 
@@ -1404,11 +1438,11 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
         try svc.runRound();
         return dropped;
     }
-    if (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, svc, table, target, plan)) |derived_applied| {
+    if (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, svc, table, target, plan.*)) |derived_applied| {
         try svc.runRound();
         return derived_applied;
     }
-    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, &plan, session);
+    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, plan, session);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
     try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
@@ -4354,7 +4388,7 @@ pub const ApiHttpServer = struct {
                 return applied;
             },
             .extension_catalog => {
-                var applied = try self.source.applyRelationalSqlDdlWithSession(self.alloc, sql, session.session());
+                var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, sql, &plan, session.session(), function_bindings);
                 errdefer applied.deinit(self.alloc);
                 try self.refreshSqlExtensionQueryFunctions();
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -4377,7 +4411,7 @@ pub const ApiHttpServer = struct {
                 return applied;
             }
         }
-        var applied = try self.source.applyRelationalSqlDdlWithSessionAndFunctionBindings(self.alloc, sql, session.session(), function_bindings);
+        var applied = try self.source.applyRelationalSqlDdlPlanWithSessionAndFunctionBindings(self.alloc, sql, &plan, session.session(), function_bindings);
         errdefer applied.deinit(self.alloc);
         try self.scheduleSchemaRewriteWakeForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -4427,6 +4461,7 @@ pub const ApiHttpServer = struct {
     ) ![]u8 {
         const result_body = switch (result) {
             .query => |query| try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, query),
+            .document_query => |query| try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, query),
             .set_operation => |query| try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, query),
             .recursive_cte => |query| try relational_rows_api.encodeRowsQueryResponseAlloc(self.alloc, query),
             .aggregate => |aggregate| try relational_rows_api.encodeRowsAggregateResponseAlloc(self.alloc, aggregate),
@@ -5518,7 +5553,7 @@ pub const ApiHttpServer = struct {
             function_bindings,
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+            error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             else => return err,
         };
@@ -5536,7 +5571,7 @@ pub const ApiHttpServer = struct {
             .read_index,
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid sql request"),
+            error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid sql request"),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "sql read backpressured"),
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),

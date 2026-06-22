@@ -26,6 +26,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const strings = @import("strings.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
+const document_plan = @import("document_plan.zig");
 
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
 pub const RelationPopulationMode = grammar.RelationPopulationMode;
@@ -2047,6 +2048,7 @@ pub const LateralSubquery = struct {
 
 pub const LoweredReadPlan = union(enum) {
     query: LoweredQueryPlan,
+    document_query: document_plan.DocumentReadPlan,
     set_operation: LoweredSetOperationPlan,
     recursive_cte: LoweredRecursiveCtePlan,
     aggregate: LoweredAggregatePlan,
@@ -2057,6 +2059,7 @@ pub const LoweredReadPlan = union(enum) {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .query => |*query| query.deinit(alloc),
+            .document_query => |*document_query| document_query.deinit(alloc),
             .set_operation => |*set_operation| set_operation.deinit(alloc),
             .recursive_cte => |*recursive_cte| recursive_cte.deinit(alloc),
             .aggregate => |*aggregate| aggregate.deinit(alloc),

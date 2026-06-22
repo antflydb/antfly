@@ -31,6 +31,8 @@ const usermgr = @import("../usermgr/mod.zig");
 // storage-backed execution helpers keep their current owning modules.
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
+pub const DocumentProjection = sql_adapter.DocumentProjection;
+pub const DocumentReadPlan = sql_adapter.DocumentReadPlan;
 pub const SqlValue = sql_adapter.SqlValue;
 const AggregateFilter = sql_adapter.AggregateFilter;
 pub const ExtensionFunctionBinding = sql_adapter.ExtensionFunctionBinding;
@@ -831,6 +833,10 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
     params: []const SqlValue,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
+    if (schema.storage_mode == .document) {
+        if (source_schema != null) return error.UnsupportedSqlShape;
+        return .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) };
+    }
     var context = sql_adapter.ReadPlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -1009,6 +1015,9 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
     catalog: table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
+    if (schema.storage_mode == .document) {
+        return .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) };
+    }
     var context = sql_adapter.CatalogReadPlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
