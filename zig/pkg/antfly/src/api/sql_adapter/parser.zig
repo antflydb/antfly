@@ -327,6 +327,31 @@ pub fn hasTopLevelOrBeforeTail(
     return false;
 }
 
+pub fn hasTopLevelOrBeforeTailToken(
+    tokens: []const Token,
+    start: usize,
+    comptime tail_clause_keyword: fn (Token) bool,
+) bool {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => if (depth > 0) {
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) return false,
+            .identifier => if (depth == 0) {
+                if (token.matchesKeywordTag(.@"or")) return true;
+                if (tail_clause_keyword(token)) return false;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
 pub fn hasTopLevelOrBeforeCloseParen(tokens: []const Token, start: usize) bool {
     var depth: usize = 0;
     var index = start;
@@ -366,6 +391,28 @@ pub fn findTopLevelTailIndex(
                 depth -= 1;
             },
             .identifier => if (depth == 0 and tail_clause_keyword(token.text)) return index,
+            .semicolon => if (depth == 0) return index,
+            else => {},
+        }
+    }
+    return tokens.len;
+}
+
+pub fn findTopLevelTailIndexToken(
+    tokens: []const Token,
+    start: usize,
+    comptime tail_clause_keyword: fn (Token) bool,
+) usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < tokens.len) : (index += 1) {
+        const token = tokens[index];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => if (depth > 0) {
+                depth -= 1;
+            },
+            .identifier => if (depth == 0 and tail_clause_keyword(token)) return index,
             .semicolon => if (depth == 0) return index,
             else => {},
         }
@@ -476,7 +523,7 @@ test "sql adapter parser detects top-level OR before tail clauses" {
         .{ .kind = .string, .text = "'pending'" },
         .{ .kind = .identifier, .text = "order" },
     };
-    try std.testing.expect(hasTopLevelOrBeforeTail(tokens[0..], 0, testWhereTailKeyword));
+    try std.testing.expect(hasTopLevelOrBeforeTailToken(tokens[0..], 0, testWhereTailKeywordToken));
 
     const nested_tokens = [_]Token{
         .{ .kind = .lparen, .text = "(" },
@@ -486,7 +533,7 @@ test "sql adapter parser detects top-level OR before tail clauses" {
         .{ .kind = .rparen, .text = ")" },
         .{ .kind = .identifier, .text = "order" },
     };
-    try std.testing.expect(!hasTopLevelOrBeforeTail(nested_tokens[0..], 0, testWhereTailKeyword));
+    try std.testing.expect(!hasTopLevelOrBeforeTailToken(nested_tokens[0..], 0, testWhereTailKeywordToken));
 
     const before_close_tokens = [_]Token{
         .{ .kind = .identifier, .text = "a" },
@@ -513,8 +560,8 @@ test "sql adapter parser detects top-level OR before tail clauses" {
     try std.testing.expectEqual(@as(usize, 2), predicateStartIndexAfterOpenParens(wrapped_tokens[0..], 2));
 }
 
-fn testWhereTailKeyword(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "order");
+fn testWhereTailKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.order);
 }
 
 test "sql adapter parser finds top-level tail clause index" {
@@ -530,7 +577,7 @@ test "sql adapter parser finds top-level tail clause index" {
         .{ .kind = .identifier, .text = "order" },
         .{ .kind = .identifier, .text = "by" },
     };
-    try std.testing.expectEqual(@as(usize, 8), findTopLevelTailIndex(tokens[0..], 0, testWhereTailKeyword));
+    try std.testing.expectEqual(@as(usize, 8), findTopLevelTailIndexToken(tokens[0..], 0, testWhereTailKeywordToken));
 
     const semicolon_tokens = [_]Token{
         .{ .kind = .identifier, .text = "window" },
@@ -544,5 +591,5 @@ test "sql adapter parser finds top-level tail clause index" {
         .{ .kind = .semicolon, .text = ";" },
         .{ .kind = .identifier, .text = "order" },
     };
-    try std.testing.expectEqual(@as(usize, 8), findTopLevelTailIndex(semicolon_tokens[0..], 0, testWhereTailKeyword));
+    try std.testing.expectEqual(@as(usize, 8), findTopLevelTailIndexToken(semicolon_tokens[0..], 0, testWhereTailKeywordToken));
 }

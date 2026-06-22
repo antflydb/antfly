@@ -1474,7 +1474,7 @@ pub fn parseWhereAlloc(
         try parseBareBooleanWhereExpressionAlloc(alloc, tokens, pos, type_context, expression_predicates, bare_boolean_hooks);
         return;
     }
-    if (parser.hasTopLevelOrBeforeTail(tokens, pos.*, sqlWhereTailClauseKeyword)) {
+    if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, sqlWhereTailClauseKeywordToken)) {
         if (whereTopLevelOrHasExpressionPredicateStart(tokens, pos.*)) {
             try parseExpressionOrWhereAlloc(alloc, tokens, pos, params, type_context, defer_row_expression_field_validation, expression_or_predicates, expression_alternatives_hooks);
         } else if (whereTopLevelOrHasAccessPredicate(tokens, pos.*)) {
@@ -1629,7 +1629,7 @@ pub fn whereTopLevelOrHasExpressionPredicateStart(tokens: []const Token, pos: us
             },
             .semicolon => if (depth == 0) return false,
             .identifier => if (depth == 0) {
-                if (sqlWhereTailClauseKeyword(token.text)) return false;
+                if (sqlWhereTailClauseKeywordToken(token)) return false;
                 if (std.ascii.eqlIgnoreCase(token.text, "and") or std.ascii.eqlIgnoreCase(token.text, "or")) {
                     expect_predicate_start = true;
                     continue;
@@ -1676,7 +1676,7 @@ pub fn whereTopLevelOrHasAccessPredicate(tokens: []const Token, pos: usize) bool
             .semicolon => if (depth == 0) return false,
             .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question => return true,
             .identifier => {
-                if (depth == 0 and sqlWhereTailClauseKeyword(token.text)) return false;
+                if (depth == 0 and sqlWhereTailClauseKeywordToken(token)) return false;
                 if (std.ascii.eqlIgnoreCase(token.text, "like") or
                     std.ascii.eqlIgnoreCase(token.text, "ilike"))
                 {
@@ -1768,7 +1768,7 @@ pub fn whereHasArrayOverlapPredicateAlloc(
             },
             .semicolon => if (depth == 0) return false,
             .identifier => {
-                if (depth == 0 and sqlWhereTailClauseKeyword(token.text)) return false;
+                if (depth == 0 and sqlWhereTailClauseKeywordToken(token)) return false;
                 if (try arrayOverlapPredicateCanStartAtAlloc(
                     alloc,
                     tokens,
@@ -6670,7 +6670,7 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
         return;
     }
 
-    if (parser.hasTopLevelOrBeforeTail(tokens, pos.*, sqlWhereTailClauseKeyword) or parenthesizedExpressionOrWhereCanStartAt(tokens, pos.*)) {
+    if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, sqlWhereTailClauseKeywordToken) or parenthesizedExpressionOrWhereCanStartAt(tokens, pos.*)) {
         try parseExpressionOrWhereAlloc(
             alloc,
             tokens,
@@ -10154,7 +10154,7 @@ pub fn parseAggregateHavingAlloc(
         try parseBareBooleanAggregateHavingExpression(alloc, tokens, pos, schema, type_context, expressions, group_fields, group_expressions, aggregations, bare_boolean_options);
         return;
     }
-    if (parser.hasTopLevelOrBeforeTail(tokens, pos.*, sqlWhereTailClauseKeyword) or aggregateHavingHasBooleanIsNot(tokens, pos.*)) {
+    if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, sqlWhereTailClauseKeywordToken) or aggregateHavingHasBooleanIsNot(tokens, pos.*)) {
         try parseAggregateHavingOrGroupsAlloc(alloc, tokens, pos, schema, type_context, any_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options);
         return;
     }
@@ -11580,7 +11580,7 @@ pub fn topLevelWindowClauseStart(tokens: []const Token, pos: usize) ?usize {
 }
 
 pub fn topLevelWindowClauseEnd(tokens: []const Token, start: usize) usize {
-    return parser.findTopLevelTailIndex(tokens, start, sqlWindowTailClauseKeyword);
+    return parser.findTopLevelTailIndexToken(tokens, start, sqlWindowTailClauseKeywordToken);
 }
 
 pub fn parseWindowSpecAlloc(
@@ -23043,7 +23043,7 @@ pub fn joinedMutationExpressionSideAt(
             .identifier => {
                 if (depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "and") or
                     std.ascii.eqlIgnoreCase(token.text, "or") or
-                    sqlWhereTailClauseKeyword(token.text)))
+                    sqlWhereTailClauseKeywordToken(token)))
                 {
                     break;
                 }
@@ -23369,7 +23369,7 @@ pub fn canParseBareBooleanWhereExpression(tokens: []const Token, pos: usize, sch
             },
             .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return false,
             .identifier => {
-                if (depth == 0 and sqlWhereTailClauseKeyword(token.text)) break;
+                if (depth == 0 and sqlWhereTailClauseKeywordToken(token)) break;
                 if (sqlKeywordStartsScalarPredicate(token.text)) return false;
                 if (std.ascii.eqlIgnoreCase(token.text, "and") or
                     std.ascii.eqlIgnoreCase(token.text, "or") or
@@ -23857,12 +23857,36 @@ pub fn sqlWhereTailClauseKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "lateral");
 }
 
+pub fn sqlWhereTailClauseKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.having) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.join) or
+        token.matchesKeywordTag(.left) or
+        token.matchesKeywordTag(.inner) or
+        token.matchesKeywordTag(.with) or
+        token.matchesKeywordTag(.over) or
+        token.matchesKeywordTag(.lateral);
+}
+
 pub fn sqlWindowTailClauseKeyword(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "order") or
         std.ascii.eqlIgnoreCase(text, "limit") or
         std.ascii.eqlIgnoreCase(text, "offset") or
         std.ascii.eqlIgnoreCase(text, "fetch") or
         std.ascii.eqlIgnoreCase(text, "for");
+}
+
+pub fn sqlWindowTailClauseKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch) or
+        token.matchesKeywordTag(.@"for");
 }
 
 pub fn parenthesizedPredicateGroupCanStartAt(tokens: []const Token, index: usize) bool {

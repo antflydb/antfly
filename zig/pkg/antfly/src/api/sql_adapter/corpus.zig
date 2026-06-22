@@ -6601,6 +6601,24 @@ fn appParityTokensHaveFunctionCallWithKeyword(tokens: []const tokenized.Token, n
     return false;
 }
 
+fn appParityTokensHaveFunctionCallWithLiteral(tokens: []const tokenized.Token, name: []const u8, literal: []const u8) bool {
+    if (tokens.len < 4) return false;
+    var index: usize = 0;
+    while (index + 1 < tokens.len) : (index += 1) {
+        if (tokens[index + 1].kind != .lparen or
+            tokens[index].kind != .identifier or
+            !std.ascii.eqlIgnoreCase(tokens[index].text, name))
+        {
+            continue;
+        }
+        const close_index = parser.findMatchingRParenIndex(tokens, index + 1) orelse return false;
+        for (tokens[index + 2 .. close_index]) |token| {
+            if (token.kind == .string and std.mem.eql(u8, token.text, literal)) return true;
+        }
+    }
+    return false;
+}
+
 fn appParityTokensHaveKind(tokens: []const tokenized.Token, kind: token_mod.TokenKind) bool {
     for (tokens) |token| {
         if (token.kind == kind) return true;
@@ -9029,204 +9047,204 @@ pub const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "now()") != null and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_timestamp_expression = self.query_current_timestamp_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "CURRENT_TIMESTAMP AS") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "current_timestamp") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_timestamp_precision_expression = self.query_current_timestamp_precision_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "CURRENT_TIMESTAMP(6)") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "current_timestamp") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_date_expression = self.query_current_date_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "CURRENT_DATE") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "current_date") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_uuid_generation_expression = self.query_uuid_generation_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "gen_random_uuid") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_uuid_generate_v4_expression = self.query_uuid_generate_v4_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "uuid_generate_v4()") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "uuid_generate_v4") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_substring_expression = self.query_substring_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "substring(status") != null and
-            std.mem.indexOf(u8, entry.sql, "substr(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "substring") and
+            appParityTokensHaveFunctionCall(sql_tokens, "substr") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_overlay_expression = self.query_overlay_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "overlay(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "overlay") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_translate_expression = self.query_translate_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "translate(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "translate") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_split_part_expression = self.query_split_part_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "split_part(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "split_part") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_strpos_expression = self.query_strpos_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "strpos(status") != null and
-            std.mem.indexOf(u8, entry.sql, "position(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "strpos") and
+            appParityTokensHaveFunctionCall(sql_tokens, "position") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_left_right_expression = self.query_left_right_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "left(status") != null and
-            std.mem.indexOf(u8, entry.sql, "right(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "left") and
+            appParityTokensHaveFunctionCall(sql_tokens, "right") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_trim_variant_expression = self.query_trim_variant_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "btrim(status") != null and
-            std.mem.indexOf(u8, entry.sql, "ltrim(status") != null and
-            std.mem.indexOf(u8, entry.sql, "rtrim(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "btrim") and
+            appParityTokensHaveFunctionCall(sql_tokens, "ltrim") and
+            appParityTokensHaveFunctionCall(sql_tokens, "rtrim") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_replace_expression = self.query_regexp_replace_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_replace(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_substr_expression = self.query_regexp_substr_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_match_expression = self.query_regexp_match_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "status ~") != null and
-            std.mem.indexOf(u8, entry.sql, "email !~*") != null and
+            appParityTokensHaveKind(sql_tokens, .regex_match) and
+            appParityTokensHaveKind(sql_tokens, .regex_not_imatch) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_regexp_count_expression = self.query_regexp_count_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_instr_expression = self.query_regexp_instr_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_pad_expression = self.query_pad_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "lpad(status") != null and
-            std.mem.indexOf(u8, entry.sql, "rpad(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "lpad") and
+            appParityTokensHaveFunctionCall(sql_tokens, "rpad") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_repeat_expression = self.query_repeat_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "repeat(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "repeat") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_reverse_expression = self.query_reverse_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "reverse(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "reverse") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_initcap_expression = self.query_initcap_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "initcap(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "initcap") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_text_length_expression = self.query_text_length_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "char_length(status") != null and
-            std.mem.indexOf(u8, entry.sql, "character_length(status") != null and
-            std.mem.indexOf(u8, entry.sql, "octet_length(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "char_length") and
+            appParityTokensHaveFunctionCall(sql_tokens, "character_length") and
+            appParityTokensHaveFunctionCall(sql_tokens, "octet_length") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_bit_length_expression = self.query_bit_length_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "bit_length(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "bit_length") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_md5_expression = self.query_md5_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "md5(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "md5") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_concat_ws_expression = self.query_concat_ws_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "concat_ws(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "concat_ws") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_nullif_expression = self.query_nullif_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "nullif(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "nullif") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_extremum_expression = self.query_extremum_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "greatest(") != null and
-            std.mem.indexOf(u8, entry.sql, "least(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "greatest") and
+            appParityTokensHaveFunctionCall(sql_tokens, "least") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_nullable_pagination = self.query_nullable_pagination or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
-            std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
             sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "none") and
             sql_adapter.planTokenAbsent(entry.plan, ":offset="));
         self.query_json_build_object_expression = self.query_json_build_object_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "jsonb_build_object(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_to_jsonb_expression = self.query_to_jsonb_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_convert_from_jsonb_expression = self.query_convert_from_jsonb_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "convert_from(") != null and
-            std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
+            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "convert_from", "UTF8") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_cardinality_expression = self.query_cardinality_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "cardinality(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "cardinality") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_array_position_expression = self.query_array_position_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_position(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_position") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_array_positions_expression = self.query_array_positions_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_positions(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_positions") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_array_element_transform_expression = self.query_array_element_transform_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_append(") != null and
-            std.mem.indexOf(u8, entry.sql, "array_cat(") != null and
-            std.mem.indexOf(u8, entry.sql, "array_remove(") != null and
-            std.mem.indexOf(u8, entry.sql, "array_replace(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_append") and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_cat") and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_remove") and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_replace") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_array_to_string_expression = self.query_array_to_string_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "array_to_string(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_to_string") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_string_to_array_expression = self.query_string_to_array_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "string_to_array(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "string_to_array") and
             (sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") or sql_adapter.planHasNonZeroToken(entry.plan, ":expr_arr=")));
         self.query_starts_with_expression = self.query_starts_with_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "starts_with(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "starts_with") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_ends_with_expression = self.query_ends_with_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "ends_with(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "ends_with") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_ascii_chr_expression = self.query_ascii_chr_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "ascii(status") != null and
-            std.mem.indexOf(u8, entry.sql, "chr(amount") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "ascii") and
+            appParityTokensHaveFunctionCall(sql_tokens, "chr") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_modulo_expression = self.query_modulo_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "amount % quantity") != null and
-            std.mem.indexOf(u8, entry.sql, "MOD(amount + quantity") != null and
+            appParityTokensHaveKind(sql_tokens, .percent) and
+            appParityTokensHaveFunctionCall(sql_tokens, "mod") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_date_trunc_expression = self.query_date_trunc_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_trunc('hour'") != null and
+            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_trunc", "hour") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_date_bin_expression = self.query_date_bin_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_bin(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "date_bin") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_typed_datetime_literal_expression = self.query_typed_datetime_literal_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "TIMESTAMPTZ ") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "timestamptz") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_date_part_expression = self.query_date_part_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_part('hour'") != null and
-            std.mem.indexOf(u8, entry.sql, "EXTRACT(dow") != null and
+            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_part", "hour") and
+            appParityTokensHaveFunctionCall(sql_tokens, "extract") and
+            appParityTokensHaveIdentifier(sql_tokens, "dow") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_date_part_epoch_expression = self.query_date_part_epoch_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "date_part('epoch'") != null and
-            std.mem.indexOf(u8, entry.sql, "EXTRACT(epoch") != null and
+            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_part", "epoch") and
+            appParityTokensHaveFunctionCall(sql_tokens, "extract") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_nested_case_fold_text_expression = self.query_nested_case_fold_text_expression or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "lower(status || ':' || id)") != null and
-            std.mem.indexOf(u8, entry.sql, "upper(status || ':' || id)") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveFunctionCall(sql_tokens, "upper") and
+            appParityTokensHaveKind(sql_tokens, .pipe_concat) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.cte_stream = self.cte_stream or uses_cte_stream;

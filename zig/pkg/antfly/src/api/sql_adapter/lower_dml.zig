@@ -6188,7 +6188,7 @@ pub fn parseMergeArmExpressionPredicatesAlloc(
 
     if (mergeCanParseExpressionNotWhere(tokens, pos.*)) {
         try lower_expr.parseExpressionNotWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &not_groups, options.not_where_options);
-    } else if (parser.hasTopLevelOrBeforeTail(tokens, pos.*, lower_expr.sqlWhereTailClauseKeyword) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos.*)) {
+    } else if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, lower_expr.sqlWhereTailClauseKeywordToken) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos.*)) {
         try lower_expr.parseExpressionOrWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &or_groups, options.or_where_options);
     } else {
         try lower_expr.parseExpressionWhereConditionsWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &conditions, &or_groups, &not_groups, options.where_condition_options);
@@ -10853,7 +10853,7 @@ fn scanBareBooleanExpressionTail(tokens: []const Token, pos: usize) BareBooleanS
                 .saw_token = false,
             },
             .identifier => {
-                if (depth == 0 and lower_expr.sqlWhereTailClauseKeyword(token.text)) break;
+                if (depth == 0 and lower_expr.sqlWhereTailClauseKeywordToken(token)) break;
                 if (lower_expr.sqlKeywordStartsScalarPredicate(token.text)) return .{
                     .saw_boolean_syntax = false,
                     .saw_token = false,

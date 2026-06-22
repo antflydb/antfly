@@ -423,8 +423,10 @@ Current implementation status:
   operation tails, joined-source returning expressions, CTE mutation markers,
   mutation-source row assignments, temporal `FOR PORTION` clauses, boolean
   `IS [NOT]` predicates, aggregate expression functions, percentile ordering,
-  aggregate boolean `HAVING`/`FILTER` clauses, and row-lock invalid cases, now
-  use parsed token predicates instead of raw SQL substring probes.
+  aggregate boolean `HAVING`/`FILTER` clauses, query scalar-function expression
+  families, JSON/array expression helpers, datetime expression helpers, and
+  row-lock invalid cases, now use parsed token predicates instead of raw SQL
+  substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
