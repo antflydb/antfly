@@ -224,6 +224,7 @@ pub const ReadingPipeline = struct {
         @memset(encoder_attention_mask, 1);
 
         const max_len = self.config.max_length;
+        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
         var dec_ids = try allocator.alloc(i64, max_len);
         defer allocator.free(dec_ids);
         dec_ids[0] = self.config.decoder_start_token_id;
@@ -348,6 +349,7 @@ pub const ReadingPipeline = struct {
 
         // 3. Autoregressive decode
         const max_len = self.config.max_length;
+        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
         var dec_ids = try allocator.alloc(i64, max_len);
         defer allocator.free(dec_ids);
         dec_ids[0] = self.config.decoder_start_token_id;

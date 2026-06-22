@@ -285,11 +285,23 @@ fn logitsBiasSlice(
         element_count *= @intCast(dim);
     }
     if (element_count < vocab_size) return error.InvalidTensorShape;
-    if (element_count == vocab_size) return .{ .tensor = logits_bias, .owned = false };
+    if (element_count == vocab_size) {
+        if (shape.len == 1 and @as(usize, @intCast(shape[0])) == vocab_size) {
+            return .{ .tensor = logits_bias, .owned = false };
+        }
+        if (shape.len == 2 and shape[0] == 1 and @as(usize, @intCast(shape[1])) == vocab_size) {
+            return .{ .tensor = logits_bias, .owned = false };
+        }
+        const row_shape = [_]i64{@intCast(vocab_size)};
+        return .{ .tensor = try cb.primReshape(logits_bias, &row_shape), .owned = true };
+    }
 
     const start: usize = if (element_count == vocab_size + 1) 1 else 0;
+    const flat_shape = [_]i64{ 1, @intCast(element_count) };
+    const flat_bias = try cb.primReshape(logits_bias, &flat_shape);
+    defer cb.free(flat_bias);
     return .{
-        .tensor = try cb.sliceLastDim(logits_bias, start, start + vocab_size),
+        .tensor = try cb.sliceLastDim(flat_bias, start, start + vocab_size),
         .owned = true,
     };
 }

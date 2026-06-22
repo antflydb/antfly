@@ -611,7 +611,7 @@ fn exportFlorence2BundleSidecars(
     try compat.cwd().writeFile(io, .{ .sub_path = model_manifest_out, .data = manifest_json });
 
     try writeFlorence2BundleMarker(allocator, out_dir, output_path);
-    try variants_manifest.writeFlorence2VariantsManifest(allocator, io, out_dir);
+    try variants_manifest.writeFlorence2VariantsManifestForModel(allocator, io, out_dir, std.fs.path.basename(output_path));
 }
 
 fn copyRequiredFlorence2Sidecar(

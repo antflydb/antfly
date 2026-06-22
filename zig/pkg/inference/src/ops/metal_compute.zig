@@ -4194,6 +4194,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    fn isRowVectorForColumns(buf: *const Buf, cols: usize) bool {
+        if (buf.logical_shape) |shape| {
+            if (shape.len == 1) return shape[0] > 0 and @as(usize, @intCast(shape[0])) == cols;
+            if (shape.len == 2) {
+                return shape[0] == 1 and shape[1] > 0 and @as(usize, @intCast(shape[1])) == cols;
+            }
+            return false;
+        }
+        if (buf.metal_tensor) |*metal_tensor| {
+            if (metal_tensor.ndim() == 1) return metal_tensor.dim(0) > 0 and @as(usize, @intCast(metal_tensor.dim(0))) == cols;
+            if (metal_tensor.ndim() == 2) {
+                return metal_tensor.dim(0) == 1 and metal_tensor.dim(1) > 0 and @as(usize, @intCast(metal_tensor.dim(1))) == cols;
+            }
+        }
+        return false;
+    }
+
     fn tryDeviceRowBroadcastAdd(
         self: *MetalCompute,
         row_ct: CT,
@@ -4203,6 +4220,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const matrix_shape = concreteMatrix2DShape(matrix_buf) orelse return null;
         const row_len = bufElemCount(row_buf);
         if (matrix_shape.rows == 0 or matrix_shape.cols == 0 or row_len != matrix_shape.cols) return null;
+        if (!isRowVectorForColumns(row_buf, matrix_shape.cols)) return null;
         const matrix_metal = matrix_buf.metal_tensor orelse return null;
         if (!matrix_metal.isDevice()) return null;
 
@@ -21218,6 +21236,29 @@ test "metal_compute: add keeps row-wise rhs broadcast resident" {
     const out_data = try metal_cb.toFloat32(out, allocator);
     defer allocator.free(out_data);
     try std.testing.expectEqualSlices(f32, &.{ 11, 22, 33, 14, 25, 36 }, out_data);
+}
+
+test "metal_compute: add rejects column-shaped rhs with row-sized flat length" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const lhs_host = try metal_cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6 }, &.{ 2, 3 });
+    defer metal_cb.free(lhs_host);
+    const rhs = try metal_cb.fromFloat32Shape(&.{ 10, 20, 30 }, &.{ 3, 1 });
+    defer metal_cb.free(rhs);
+    const lhs_mt = try metal_compute.ownedDeviceMetalTensorFromCt(lhs_host);
+    const lhs = try metal_compute.ctFromOwnedMetalTensor(lhs_mt);
+    defer metal_cb.free(lhs);
+
+    try std.testing.expectError(error.UnsupportedShape, metal_cb.add(lhs, rhs));
 }
 
 test "metal_compute: multiply uploads equal-size host peer instead of downloading device operand" {
