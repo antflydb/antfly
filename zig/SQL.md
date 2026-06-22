@@ -911,6 +911,48 @@ semantics, bypasses `BoundSqlStatement` for catalog-aware work, schedules jobs
 outside the metadata owner, or adds fixture scans that reconstruct parser
 behavior.
 
+### Production Cutover Gates
+
+The best long-term shape should be enforced by cutover gates instead of a
+single large rewrite. Each gate removes one class of SQL-adapter debt and
+should be complete for a statement family before that family is considered
+production-supported.
+
+1. **Ingress normalization gate.** Every external SQL surface constructs
+   `ParsedSql` exactly once, including HTTP SQL execution, SQL wire protocol,
+   CLI, MCP, A2A, fixture loading, and test helpers. Any compatibility facade
+   that still accepts raw SQL must be a leaf wrapper whose first real operation
+   is parse.
+2. **Raw AST gate.** The parser owns the statement's structural shape, nested
+   statements, source ranges, statement family, and statement kind. Lowerers
+   are not allowed to rediscover statement shape by scanning SQL text.
+3. **Binding gate.** Catalog-aware statements require `BoundSqlStatement`
+   before planning. This includes reads and writes with table targets, DDL,
+   roles, extensions, databases, namespaces, tablespaces, indexes, lakes,
+   foreign sources, backup/restore, and asynchronous lifecycle work.
+4. **Native plan gate.** Planning emits Antfly-native typed plans only. Durable
+   jobs, metadata records, index definitions, role mutations, extension
+   lifecycle changes, storage targets, backup scopes, and foreign-source
+   dispatch payloads must not store SQL text as their semantic source.
+5. **Owner handoff gate.** Execution hands native plans to the shared Antfly
+   owner for the behavior: row/query services for reads, write/storage vtables
+   for mutations, catalog metadata ownership for lifecycle transitions, durable
+   jobs for long-running work, role management for authorization state,
+   extension services for package lifecycle, and lake/backup/storage services
+   for their domains.
+6. **Diagnostic gate.** Parse, bind, plan, and execute failures return stable
+   diagnostics with phase, code, span, message, and optional hint. Unsupported
+   SQL must fail at the earliest phase that can name the missing native model.
+7. **Parity gate.** SQL, REST, SDK, MCP, A2A, CLI, and internal automation
+   exercise the same native service path. Fixtures assert structured summaries
+   and coverage bits rather than SQL substrings or plan fingerprints that act
+   like another parser.
+
+After these gates are in place, feature review should be simple: syntax support
+is not enough. A statement family is complete only when it has a raw AST node,
+binding coverage, native planning, service-owned execution, span-aware
+diagnostics, and cross-surface parity evidence.
+
 ## Parity and Test Strategy
 
 SQL compatibility is proven by typed outcomes, not by accepting more syntax than
