@@ -38,6 +38,23 @@ pub const AntflyQueryFunction = enum {
     hybrid_search,
 };
 
+fn antflyQueryFunctionFromKeyword(keyword: TokenKeyword) ?AntflyQueryFunction {
+    return switch (keyword) {
+        .full_text_search => .full_text_search,
+        .semantic_search => .semantic_search,
+        .vector_search => .vector_search,
+        .graph_traverse => .graph_traverse,
+        .graph_neighbors => .graph_neighbors,
+        .graph_shortest_path => .graph_shortest_path,
+        .graph_k_shortest_paths => .graph_k_shortest_paths,
+        .graph_match => .graph_match,
+        .graph_metric => .graph_metric,
+        .graph_metric_rerank => .graph_metric_rerank,
+        .hybrid_search => .hybrid_search,
+        else => null,
+    };
+}
+
 pub const SqlQueryFunctionArgValue = union(enum) {
     string: []const u8,
     number: []const u8,
@@ -235,49 +252,24 @@ fn parseAntflySourceNumberValue(tokens: []const Token, pos: *usize) ![]const u8 
 }
 
 pub fn antflyQueryFunctionFromSqlName(name: []const u8) ?AntflyQueryFunction {
-    const prefix = "antfly.";
-    const local = if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
-    if (std.ascii.eqlIgnoreCase(local, "full_text_search")) return .full_text_search;
-    if (std.ascii.eqlIgnoreCase(local, "semantic_search")) return .semantic_search;
-    if (std.ascii.eqlIgnoreCase(local, "vector_search")) return .vector_search;
-    if (std.ascii.eqlIgnoreCase(local, "graph_traverse")) return .graph_traverse;
-    if (std.ascii.eqlIgnoreCase(local, "graph_neighbors")) return .graph_neighbors;
-    if (std.ascii.eqlIgnoreCase(local, "graph_shortest_path")) return .graph_shortest_path;
-    if (std.ascii.eqlIgnoreCase(local, "graph_k_shortest_paths")) return .graph_k_shortest_paths;
-    if (std.ascii.eqlIgnoreCase(local, "graph_match")) return .graph_match;
-    if (std.ascii.eqlIgnoreCase(local, "graph_metric")) return .graph_metric;
-    if (std.ascii.eqlIgnoreCase(local, "graph_metric_rerank")) return .graph_metric_rerank;
-    if (std.ascii.eqlIgnoreCase(local, "hybrid_search")) return .hybrid_search;
-    return null;
+    const dot = std.mem.indexOfScalar(u8, name, '.');
+    const local = if (dot) |idx| blk: {
+        if (std.mem.indexOfScalar(u8, name[idx + 1 ..], '.') != null) return null;
+        if (!std.ascii.eqlIgnoreCase(name[0..idx], "antfly")) return null;
+        break :blk name[idx + 1 ..];
+    } else name;
+    const keyword = token_mod.keywordFromIdentifier(local) orelse return null;
+    return antflyQueryFunctionFromKeyword(keyword);
 }
 
 pub fn antflyQueryFunctionFromSqlToken(token: Token) ?AntflyQueryFunction {
     if (token.kind != .identifier) return null;
-    if (token.keyword) |keyword| {
-        switch (keyword) {
-            .full_text_search => return .full_text_search,
-            .semantic_search => return .semantic_search,
-            .vector_search => return .vector_search,
-            .graph_traverse => return .graph_traverse,
-            .graph_neighbors => return .graph_neighbors,
-            .graph_shortest_path => return .graph_shortest_path,
-            .graph_k_shortest_paths => return .graph_k_shortest_paths,
-            .graph_match => return .graph_match,
-            .graph_metric => return .graph_metric,
-            .graph_metric_rerank => return .graph_metric_rerank,
-            .hybrid_search => return .hybrid_search,
-            else => {},
-        }
-    }
+    if (token.keyword) |keyword| if (antflyQueryFunctionFromKeyword(keyword)) |function| return function;
     return antflyQueryFunctionFromSqlName(token.text);
 }
 
 fn antflySourceFunctionToken(token: Token) bool {
-    if (token.matchesKeywordTag(.source)) return true;
-    const prefix = "antfly.";
-    if (!std.mem.startsWith(u8, token.text, prefix)) return false;
-    const local = token.text[prefix.len..];
-    return token_mod.keywordFromIdentifier(local) == .source;
+    return token.matchesQualifiedKeywordTag("antfly", .source);
 }
 
 const AntflySourceField = enum {
@@ -1463,6 +1455,31 @@ fn appendCommonAntflyQueryFunctionOptions(
     if (antflyQueryFunctionNumberArg(args, "offset")) |offset| try appendAntflySqlJsonNumberField(alloc, out, first, "offset", offset);
     if (antflyQueryFunctionBoolArg(args, "profile")) |profile| try appendAntflySqlJsonBoolField(alloc, out, first, "profile", profile);
     if (antflyQueryFunctionBoolArg(args, "include_stored")) |include_stored| try appendAntflySqlJsonBoolField(alloc, out, first, "include_stored", include_stored);
+}
+
+test "sql adapter query function dispatch uses token keyword metadata" {
+    try std.testing.expectEqual(AntflyQueryFunction.full_text_search, antflyQueryFunctionFromSqlName("full_text_search").?);
+    try std.testing.expectEqual(AntflyQueryFunction.full_text_search, antflyQueryFunctionFromSqlName("ANTFLY.FULL_TEXT_SEARCH").?);
+    try std.testing.expect(antflyQueryFunctionFromSqlName("public.full_text_search") == null);
+    try std.testing.expect(antflyQueryFunctionFromSqlName("antfly.public.full_text_search") == null);
+
+    const keyword_token = Token{
+        .kind = .identifier,
+        .text = "FULL_TEXT_SEARCH",
+        .keyword = token_mod.keywordFromIdentifier("FULL_TEXT_SEARCH"),
+    };
+    try std.testing.expectEqual(AntflyQueryFunction.full_text_search, antflyQueryFunctionFromSqlToken(keyword_token).?);
+
+    const qualified_token = Token{
+        .kind = .identifier,
+        .text = "ANTFLY.HYBRID_SEARCH",
+    };
+    try std.testing.expectEqual(AntflyQueryFunction.hybrid_search, antflyQueryFunctionFromSqlToken(qualified_token).?);
+
+    try std.testing.expect(antflySourceFunctionToken(.{
+        .kind = .identifier,
+        .text = "ANTFLY.SOURCE",
+    }));
 }
 
 test "sql adapter query function lowers antfly query functions into native search requests" {

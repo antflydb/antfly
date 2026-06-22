@@ -4032,6 +4032,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter plan clones query check without catalog name",
             "sql adapter lower expr lowers recursive cte stream contract",
             "sql adapter ddl plan lowers create index ddl",
+            "sql adapter query function dispatch uses token keyword metadata",
             "sql adapter query function lowers antfly query functions into native search requests",
             "sql adapter ddl plan lowers alter table ddl",
             "sql adapter ddl plan lowers alter table constraint validation ddl",
