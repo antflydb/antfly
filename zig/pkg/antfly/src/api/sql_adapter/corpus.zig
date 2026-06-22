@@ -8575,13 +8575,13 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_extension_create = true;
                     self.ddl_extension_create_if_not_exists = self.ddl_extension_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
                     self.ddl_extension_create_quoted_sql_name = self.ddl_extension_create_quoted_sql_name or sql_adapter.planHasExactStringToken(entry.plan, ":extension=", "uuid-ossp");
-                    self.ddl_extension_create_version = self.ddl_extension_create_version or std.mem.indexOf(u8, entry.plan, ":version=") != null;
+                    self.ddl_extension_create_version = self.ddl_extension_create_version or sql_adapter.planHasStringToken(entry.plan, ":version=");
                 },
                 .alter_extension_update => {
                     self.ddl_extension_update = true;
                     self.ddl_extension_update_latest = self.ddl_extension_update_latest or sql_adapter.planHasExactStringToken(entry.plan, ":version=", "latest");
                     self.ddl_extension_update_version = self.ddl_extension_update_version or
-                        (std.mem.indexOf(u8, entry.plan, ":version=") != null and
+                        (sql_adapter.planHasStringToken(entry.plan, ":version=") and
                             !sql_adapter.planHasExactStringToken(entry.plan, ":version=", "latest"));
                 },
                 .drop_extension => {
@@ -8591,53 +8591,63 @@ pub const AppParityCorpusCoverage = struct {
                 .create_function => {
                     self.ddl_function_create = true;
                     self.ddl_function_replace = self.ddl_function_replace or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
-                    self.ddl_function_volatility = self.ddl_function_volatility or std.mem.indexOf(u8, entry.plan, ":volatility=") != null;
-                    self.ddl_function_security = self.ddl_function_security or std.mem.indexOf(u8, entry.plan, ":security=") != null;
+                    self.ddl_function_volatility = self.ddl_function_volatility or sql_adapter.planHasStringToken(entry.plan, ":volatility=");
+                    self.ddl_function_security = self.ddl_function_security or sql_adapter.planHasStringToken(entry.plan, ":security=");
                     self.ddl_function_external_security = self.ddl_function_external_security or
-                        (std.mem.indexOf(u8, entry.plan, ":security=") != null and
+                        (sql_adapter.planHasStringToken(entry.plan, ":security=") and
                             appParityTokensHaveIdentifier(sql_tokens, "external") and
                             appParityTokensHaveIdentifier(sql_tokens, "security"));
-                    self.ddl_function_null_input = self.ddl_function_null_input or std.mem.indexOf(u8, entry.plan, ":null_input=") != null;
-                    self.ddl_function_cost = self.ddl_function_cost or std.mem.indexOf(u8, entry.plan, ":cost=") != null;
-                    self.ddl_function_rows = self.ddl_function_rows or std.mem.indexOf(u8, entry.plan, ":rows=") != null;
-                    self.ddl_function_parallel = self.ddl_function_parallel or std.mem.indexOf(u8, entry.plan, ":parallel=") != null;
-                    self.ddl_function_leakproof = self.ddl_function_leakproof or std.mem.indexOf(u8, entry.plan, ":leakproof=") != null;
-                    self.ddl_function_window = self.ddl_function_window or std.mem.indexOf(u8, entry.plan, ":window=") != null;
-                    self.ddl_function_support = self.ddl_function_support or std.mem.indexOf(u8, entry.plan, ":support=") != null;
-                    self.ddl_function_transform = self.ddl_function_transform or std.mem.indexOf(u8, entry.plan, ":transforms=") != null;
-                    self.ddl_function_setting = self.ddl_function_setting or std.mem.indexOf(u8, entry.plan, ":settings=") != null;
+                    self.ddl_function_null_input = self.ddl_function_null_input or sql_adapter.planHasStringToken(entry.plan, ":null_input=");
+                    self.ddl_function_cost = self.ddl_function_cost or sql_adapter.planHasStringToken(entry.plan, ":cost=");
+                    self.ddl_function_rows = self.ddl_function_rows or sql_adapter.planHasStringToken(entry.plan, ":rows=");
+                    self.ddl_function_parallel = self.ddl_function_parallel or sql_adapter.planHasStringToken(entry.plan, ":parallel=");
+                    self.ddl_function_leakproof = self.ddl_function_leakproof or sql_adapter.planHasExactBoolToken(entry.plan, ":leakproof=", true);
+                    self.ddl_function_window = self.ddl_function_window or sql_adapter.planHasExactBoolToken(entry.plan, ":window=", true);
+                    self.ddl_function_support = self.ddl_function_support or sql_adapter.planHasStringToken(entry.plan, ":support=");
+                    self.ddl_function_transform = self.ddl_function_transform or sql_adapter.planHasNonZeroToken(entry.plan, ":transforms=");
+                    self.ddl_function_setting = self.ddl_function_setting or sql_adapter.planHasNonZeroToken(entry.plan, ":settings=");
                     self.ddl_function_sql_expression_body = self.ddl_function_sql_expression_body or
-                        std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null;
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression"));
                     self.ddl_function_sql_expression_concat_body = self.ddl_function_sql_expression_concat_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
                             std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null);
                     self.ddl_function_sql_expression_multi_arg_body = self.ddl_function_sql_expression_multi_arg_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
                             std.mem.indexOf(u8, entry.plan, "arg2") != null);
                     self.ddl_function_sql_expression_named_arg_body = self.ddl_function_sql_expression_named_arg_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
                             std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
                             appParityTokensHaveIdentifier(sql_tokens, "status_text") and
                             appParityTokensHaveIdentifier(sql_tokens, "text") and
                             appParityTokensHaveStringLiteralContaining(sql_tokens, "lower(status_text)"));
                     self.ddl_function_sql_expression_nested_body = self.ddl_function_sql_expression_nested_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
                             std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null and
                             std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
                             std.mem.indexOf(u8, entry.plan, "coalesce[field[source:arg2]+") != null);
                     self.ddl_function_sql_expression_minmax_body = self.ddl_function_sql_expression_minmax_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
                             std.mem.indexOf(u8, entry.plan, "greatest[") != null and
                             std.mem.indexOf(u8, entry.plan, "least[") != null);
                     self.ddl_function_trigger_return_new = self.ddl_function_trigger_return_new or
-                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_new") != null;
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_trigger") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "trigger_return_new"));
                     self.ddl_function_trigger_perform_body = self.ddl_function_trigger_perform_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_new") != null and
-                            std.mem.indexOf(u8, entry.plan, ":perform=1:perform=") != null);
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_trigger") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "trigger_return_new") and
+                            sql_adapter.planHasStringToken(entry.plan, ":perform_args="));
                     self.ddl_function_trigger_return_null = self.ddl_function_trigger_return_null or
-                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_null") != null;
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_trigger") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "trigger_return_null"));
                     self.ddl_function_trigger_return_old = self.ddl_function_trigger_return_old or
-                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_trigger:hook=trigger_return_old") != null;
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_trigger") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "trigger_return_old"));
                 },
                 .drop_function => {
                     self.ddl_function_drop = true;
@@ -8646,10 +8656,12 @@ pub const AppParityCorpusCoverage = struct {
                 .create_procedure => {
                     self.ddl_procedure_create = true;
                     self.ddl_procedure_noop_body = self.ddl_procedure_noop_body or
-                        std.mem.indexOf(u8, entry.plan, ":body=plpgsql_procedure:hook=procedure_noop") != null;
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_procedure") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "procedure_noop"));
                     self.ddl_procedure_perform_body = self.ddl_procedure_perform_body or
-                        (std.mem.indexOf(u8, entry.plan, ":body=plpgsql_procedure:hook=procedure_noop") != null and
-                            std.mem.indexOf(u8, entry.plan, ":perform=1:perform=") != null);
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_procedure") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "procedure_noop") and
+                            sql_adapter.planHasStringToken(entry.plan, ":perform_args="));
                 },
                 .drop_procedure => {
                     self.ddl_procedure_drop = true;
@@ -8659,16 +8671,16 @@ pub const AppParityCorpusCoverage = struct {
                 .create_role => self.ddl_role_create = true,
                 .alter_role => {
                     self.ddl_role_alter = true;
-                    self.ddl_role_alter_database_scope = self.ddl_role_alter_database_scope or std.mem.indexOf(u8, entry.plan, ":database=") != null;
-                    self.ddl_role_alter_reset = self.ddl_role_alter_reset or std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
+                    self.ddl_role_alter_database_scope = self.ddl_role_alter_database_scope or sql_adapter.planHasStringToken(entry.plan, ":database=");
+                    self.ddl_role_alter_reset = self.ddl_role_alter_reset or sql_adapter.planHasExactStringToken(entry.plan, ":operation=", "reset");
                     self.ddl_role_alter_current_setting = self.ddl_role_alter_current_setting or
-                        std.mem.indexOf(u8, entry.plan, ":value_source=current_setting") != null;
+                        sql_adapter.planHasExactStringToken(entry.plan, ":value_source=", "current_setting");
                     self.ddl_role_alter_runtime_setting = self.ddl_role_alter_runtime_setting or
-                        std.mem.indexOf(u8, entry.plan, ":setting_kind=runtime") != null and
-                            std.mem.indexOf(u8, entry.plan, ":operation=set:") != null;
+                        sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "runtime") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":operation=", "set");
                     self.ddl_role_alter_runtime_reset = self.ddl_role_alter_runtime_reset or
-                        std.mem.indexOf(u8, entry.plan, ":setting_kind=runtime") != null and
-                            std.mem.indexOf(u8, entry.plan, ":operation=reset:") != null;
+                        sql_adapter.planHasExactStringToken(entry.plan, ":setting_kind=", "runtime") and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":operation=", "reset");
                 },
                 .drop_role => self.ddl_role_drop = true,
                 .grant_privilege => self.ddl_privilege_grant = true,
@@ -8732,16 +8744,16 @@ pub const AppParityCorpusCoverage = struct {
                 .disable_row_security => self.ddl_row_security_disable = true,
                 .create_row_policy => {
                     self.ddl_row_security_create_policy = true;
-                    self.ddl_row_security_conjunction_policy = self.ddl_row_security_conjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=and:") != null;
-                    self.ddl_row_security_disjunction_policy = self.ddl_row_security_disjunction_policy or std.mem.indexOf(u8, entry.plan, ":kind=or:") != null;
-                    self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or std.mem.indexOf(u8, entry.plan, ":check=") != null;
-                    self.ddl_row_security_expression_policy = self.ddl_row_security_expression_policy or std.mem.indexOf(u8, entry.plan, ":kind=expression:") != null;
-                    self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or std.mem.indexOf(u8, entry.plan, ":kind=literal_eq:") != null;
-                    self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or std.mem.indexOf(u8, entry.plan, ":roles=") != null;
+                    self.ddl_row_security_conjunction_policy = self.ddl_row_security_conjunction_policy or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "and");
+                    self.ddl_row_security_disjunction_policy = self.ddl_row_security_disjunction_policy or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "or");
+                    self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or sql_adapter.planHasStringToken(entry.plan, ":check=");
+                    self.ddl_row_security_expression_policy = self.ddl_row_security_expression_policy or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "expression");
+                    self.ddl_row_security_literal_policy = self.ddl_row_security_literal_policy or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "literal_eq");
+                    self.ddl_row_security_targeted_policy = self.ddl_row_security_targeted_policy or sql_adapter.planHasStringToken(entry.plan, ":roles=");
                 },
                 .alter_row_policy => {
                     self.ddl_row_security_alter_policy = true;
-                    self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or std.mem.indexOf(u8, entry.plan, ":check=") != null;
+                    self.ddl_row_security_check_policy = self.ddl_row_security_check_policy or sql_adapter.planHasStringToken(entry.plan, ":check=");
                 },
                 .drop_row_policy => self.ddl_row_security_drop_policy = true,
                 .create_database => self.ddl_database_create = true,
@@ -8822,7 +8834,7 @@ pub const AppParityCorpusCoverage = struct {
                 .create_cast => {
                     self.ddl_cast_create = true;
                     self.ddl_cast_create_assignment = self.ddl_cast_create_assignment or sql_adapter.planHasExactBoolToken(entry.plan, ":assignment=", true);
-                    self.ddl_cast_create_function = self.ddl_cast_create_function or std.mem.indexOf(u8, entry.plan, ":function=") != null;
+                    self.ddl_cast_create_function = self.ddl_cast_create_function or sql_adapter.planHasStringToken(entry.plan, ":function=");
                 },
                 .drop_cast => self.ddl_cast_drop = true,
                 .vacuum_maintenance => {
@@ -8960,8 +8972,7 @@ pub const AppParityCorpusCoverage = struct {
                 },
                 .set_search_path => {
                     self.session_set_search_path = true;
-                    self.session_set_search_path_local = self.session_set_search_path_local or
-                        std.mem.indexOf(u8, entry.plan, ":local=true") != null;
+                    self.session_set_search_path_local = self.session_set_search_path_local or sql_adapter.planHasExactBoolToken(entry.plan, ":local=", true);
                     self.session_set_search_path_multi_namespace = self.session_set_search_path_multi_namespace or
                         (sql_adapter.planUsizeTokenValue(entry.plan, ":namespaces=") orelse 0) > 1;
                 },

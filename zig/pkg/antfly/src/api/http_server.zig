@@ -4561,10 +4561,12 @@ pub const ApiHttpServer = struct {
         const function_bindings: relational_sql.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
         if (catalog) |source_catalog| {
-            return try relational_sql.lowerReadPlanWithCatalogAndFunctionBindingsAlloc(alloc, sql, schema, params, source_catalog, function_bindings);
+            return try relational_sql.lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, source_catalog, function_bindings);
         }
-        return try relational_sql.lowerReadPlanWithFunctionBindingsAlloc(alloc, sql, schema, params, function_bindings);
+        return try relational_sql.lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, function_bindings);
     }
 
     pub fn executeBulkSqlCopyFromStdinWithSession(

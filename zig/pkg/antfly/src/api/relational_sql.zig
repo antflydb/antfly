@@ -751,7 +751,7 @@ pub fn lowerReadPlanWithFunctionBindingsAlloc(
     return try lowerReadPlanWithOptionalSourceSchemaAlloc(alloc, sql, schema, null, params, function_bindings);
 }
 
-fn lowerReadPlanWithFunctionBindingsParsedSqlAlloc(
+pub fn lowerReadPlanWithFunctionBindingsParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -995,7 +995,7 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsAlloc(
     return try lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, schema, params, catalog, function_bindings);
 }
 
-fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -2017,7 +2017,7 @@ pub fn lowerWritePlanWithCatalogAlloc(
     return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, &parsed_sql, schema, params, options, catalog);
 }
 
-fn lowerWritePlanWithCatalogParsedSqlAlloc(
+pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
