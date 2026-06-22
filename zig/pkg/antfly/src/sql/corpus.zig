@@ -19,6 +19,7 @@ const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
+const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -6086,7 +6087,11 @@ test "sql adapter corpus owns fixture family policies" {
         },
         .resolver_row_json = "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
         .sql = parsed_expression_selector.sql(),
-    }, parsed_expression_selector.items(), .update));
+    }, parsed_expression_selector.items(), try appParitySetupSqlSummaryAlloc(std.testing.allocator, &.{
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, status text);",
+        "CREATE UNIQUE INDEX usage_records_active_tenant_email_key ON usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';",
+        "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_tenant_email_key;",
+    }), .update));
     try std.testing.expect(!appParityPointWriteHasExpressionPartialUniqueSelector(.{
         .name = "field partial selector does not prove expression selector coverage",
         .family = .update,
@@ -6098,7 +6103,18 @@ test "sql adapter corpus owns fixture family policies" {
         },
         .resolver_row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
         .sql = parsed_expression_selector.sql(),
-    }, parsed_expression_selector.items(), .update));
+    }, parsed_expression_selector.items(), try appParitySetupSqlSummaryAlloc(std.testing.allocator, &.{
+        "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
+        "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';",
+        "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_email_key;",
+    }), .update));
+
+    var parsed_expression_assignment = try tokenized.ParsedSql.initAlloc(std.testing.allocator, "UPDATE usage_records SET status = lower(status) WHERE id = 'u1' RETURNING status");
+    defer parsed_expression_assignment.deinit(std.testing.allocator);
+    try std.testing.expect(appParityTokensHaveSetFunctionAssignment(parsed_expression_assignment.items(), "status", "lower"));
+    var parsed_returning_expression_only = try tokenized.ParsedSql.initAlloc(std.testing.allocator, "UPDATE usage_records SET status = 'active' WHERE id = 'u1' RETURNING lower(status)");
+    defer parsed_returning_expression_only.deinit(std.testing.allocator);
+    try std.testing.expect(!appParityTokensHaveSetFunctionAssignment(parsed_returning_expression_only.items(), "status", "lower"));
 
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records", ":having_expr=", 0));
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records:having_expr=2", ":having_expr=", 2));
@@ -6800,6 +6816,24 @@ fn appParityTokensHaveFunctionCall(tokens: []const tokenized.Token, name: []cons
     return false;
 }
 
+fn appParityTokensHaveSetFunctionAssignment(tokens: []const tokenized.Token, field: []const u8, function_name: []const u8) bool {
+    if (tokens.len < 6) return false;
+    var index: usize = 0;
+    while (index + 5 < tokens.len) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.set) and
+            tokens[index + 1].kind == .identifier and
+            std.ascii.eqlIgnoreCase(tokens[index + 1].text, field) and
+            tokens[index + 2].kind == .eq and
+            tokens[index + 3].kind == .identifier and
+            std.ascii.eqlIgnoreCase(tokens[index + 3].text, function_name) and
+            tokens[index + 4].kind == .lparen)
+        {
+            return parser.findMatchingRParenIndex(tokens, index + 4) != null;
+        }
+    }
+    return false;
+}
+
 fn appParityTokensHaveFunctionCallWithKeyword(tokens: []const tokenized.Token, name: []const u8, keyword: token_mod.TokenKeyword) bool {
     if (tokens.len < 4) return false;
     var index: usize = 0;
@@ -6875,9 +6909,186 @@ fn appParityParsedSqlHasComputedPattern(parsed_sql: *const tokenized.ParsedSql) 
         (appParityTokensHaveKeyword(tokens, .like) or appParityTokensHaveKeyword(tokens, .ilike));
 }
 
-fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bool {
-    for (values) |value| {
-        if (std.mem.indexOf(u8, value, needle) != null) return true;
+const AppParitySetupSqlSummary = struct {
+    create_table_email_unique_constraint: bool = false,
+    alter_add_email_unique_constraint: bool = false,
+    create_unique_index: bool = false,
+    partial_unique_index: bool = false,
+    validated_constraint: bool = false,
+    renamed_usage_records_primary_constraint: bool = false,
+    expression_unique_lower_upper: bool = false,
+    mixed_expression_unique_tenant_lower: bool = false,
+    partial_expression_unique_concat_ws: bool = false,
+    partial_expression_unique_amount_inequality: bool = false,
+
+    fn observePlan(self: *@This(), plan: ddl_plan.LoweredDdlPlan) void {
+        switch (plan) {
+            .create_table => |create| {
+                for (create.unique_constraints) |constraint| self.observeCreateTableUniqueConstraint(constraint);
+            },
+            .create_index => |create| self.observeCreateIndex(create),
+            .alter_table => |alter| {
+                for (alter.operations) |operation| switch (operation) {
+                    .add_unique_constraint => |constraint| self.observeAlterUniqueConstraint(constraint),
+                    .rename_constraint => |rename| {
+                        if (std.ascii.eqlIgnoreCase(rename.old_name, "usage_records_pkey") and
+                            std.ascii.eqlIgnoreCase(rename.new_name, "usage_records_id_pk"))
+                        {
+                            self.renamed_usage_records_primary_constraint = true;
+                        }
+                    },
+                    .validate_constraint => self.validated_constraint = true,
+                    else => {},
+                };
+            },
+            else => {},
+        }
+    }
+
+    fn observeCreateTableUniqueConstraint(self: *@This(), constraint: runtime_schema.UniqueConstraint) void {
+        if (appParityStringSliceContainsIdentifier(constraint.columns, "email")) {
+            self.create_table_email_unique_constraint = true;
+        }
+    }
+
+    fn observeAlterUniqueConstraint(self: *@This(), constraint: runtime_schema.UniqueConstraint) void {
+        if (appParityStringSliceContainsIdentifier(constraint.columns, "email")) {
+            self.alter_add_email_unique_constraint = true;
+        }
+    }
+
+    fn observeCreateIndex(self: *@This(), create: ddl_plan.CreateIndexPlan) void {
+        if (!create.unique) return;
+        self.create_unique_index = true;
+        const partial = create.where.len > 0 or create.where_expressions.len > 0;
+        self.partial_unique_index = self.partial_unique_index or partial;
+
+        for (create.expressions) |expression| {
+            switch (expression.op) {
+                .lower, .upper => {
+                    self.expression_unique_lower_upper = true;
+                    if (expression.op == .lower and appParityStringSliceContainsIdentifier(create.columns, "tenant_id")) {
+                        self.mixed_expression_unique_tenant_lower = true;
+                    }
+                },
+                .expression => if (expression.expression) |row_expression| {
+                    self.expression_unique_lower_upper = self.expression_unique_lower_upper or
+                        appParityExpressionContainsKind(row_expression, .lower) or
+                        appParityExpressionContainsKind(row_expression, .upper);
+                    self.mixed_expression_unique_tenant_lower = self.mixed_expression_unique_tenant_lower or
+                        (appParityStringSliceContainsIdentifier(create.columns, "tenant_id") and appParityExpressionContainsKind(row_expression, .lower));
+                },
+                else => {},
+            }
+        }
+        if (create.generated_expression) |generated| {
+            self.expression_unique_lower_upper = self.expression_unique_lower_upper or
+                generated.op == .lower or generated.op == .upper or
+                (generated.expression != null and
+                    (appParityExpressionContainsKind(generated.expression.?, .lower) or
+                        appParityExpressionContainsKind(generated.expression.?, .upper)));
+            self.mixed_expression_unique_tenant_lower = self.mixed_expression_unique_tenant_lower or
+                (appParityStringSliceContainsIdentifier(create.columns, "tenant_id") and
+                    (generated.op == .lower or
+                        (generated.expression != null and appParityExpressionContainsKind(generated.expression.?, .lower))));
+        }
+
+        if (partial) {
+            for (create.where_expressions) |condition| {
+                self.partial_expression_unique_concat_ws = self.partial_expression_unique_concat_ws or
+                    appParityExpressionConditionContainsKind(condition, .concat_ws);
+                self.partial_expression_unique_amount_inequality = self.partial_expression_unique_amount_inequality or
+                    appParityExpressionConditionHasFieldComparison(condition, "amount", &.{ .gt, .gte, .lt, .lte });
+            }
+        }
+    }
+};
+
+fn appParitySetupSqlSummaryAlloc(alloc: std.mem.Allocator, setup_sql: []const []const u8) !AppParitySetupSqlSummary {
+    var summary: AppParitySetupSqlSummary = .{};
+    for (setup_sql) |sql| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        var plan = try ddl_plan.lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+        defer plan.deinit(alloc);
+        summary.observePlan(plan);
+    }
+    return summary;
+}
+
+fn appParityStringSliceContainsIdentifier(values: []const []const u8, value: []const u8) bool {
+    for (values) |item| {
+        if (std.ascii.eqlIgnoreCase(item, value)) return true;
+    }
+    return false;
+}
+
+fn appParityExpressionConditionContainsKind(
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) bool {
+    if (appParityExpressionContainsKind(condition.lhs, kind)) return true;
+    for (condition.rhs) |rhs| {
+        if (appParityExpressionContainsKind(rhs, kind)) return true;
+    }
+    return false;
+}
+
+fn appParityExpressionContainsKind(
+    expression: db_mod.types.RelationalRowsExpression,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) bool {
+    if (expression.kind == kind) return true;
+    for (expression.operands) |operand| {
+        if (appParityExpressionContainsKind(operand, kind)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (appParityExpressionConditionContainsKind(branch.when, kind) or
+            appParityExpressionContainsKind(branch.then, kind))
+        {
+            return true;
+        }
+    }
+    for (expression.case_else) |fallback| {
+        if (appParityExpressionContainsKind(fallback, kind)) return true;
+    }
+    return false;
+}
+
+fn appParityExpressionConditionHasFieldComparison(
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+    field: []const u8,
+    ops: []const runtime_schema.RelationalCheckOp,
+) bool {
+    if (!appParityExpressionContainsField(condition.lhs, field)) return false;
+    for (ops) |op| {
+        if (condition.op == op) return true;
+    }
+    return false;
+}
+
+fn appParityExpressionContainsField(expression: db_mod.types.RelationalRowsExpression, field: []const u8) bool {
+    if (expression.kind == .field and std.ascii.eqlIgnoreCase(expression.field, field)) return true;
+    for (expression.operands) |operand| {
+        if (appParityExpressionContainsField(operand, field)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (appParityExpressionConditionHasField(branch.when, field) or
+            appParityExpressionContainsField(branch.then, field))
+        {
+            return true;
+        }
+    }
+    for (expression.case_else) |fallback| {
+        if (appParityExpressionContainsField(fallback, field)) return true;
+    }
+    return false;
+}
+
+fn appParityExpressionConditionHasField(condition: db_mod.types.RelationalRowsExpressionCondition, field: []const u8) bool {
+    if (appParityExpressionContainsField(condition.lhs, field)) return true;
+    for (condition.rhs) |rhs| {
+        if (appParityExpressionContainsField(rhs, field)) return true;
     }
     return false;
 }
@@ -6885,15 +7096,11 @@ fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bo
 fn appParityPointWriteHasExpressionPartialUniqueSelector(
     entry: AppParityCorpusEntry,
     sql_tokens: []const tokenized.Token,
+    setup_summary: AppParitySetupSqlSummary,
     family: AppParityCorpusPlanFamily,
 ) bool {
     if (entry.family != family or entry.apply_setup_sql.len == 0 or entry.resolver_row_json.len == 0) return false;
-    if (!appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") or
-        !appParityAnyStringContains(entry.apply_setup_sql, " WHERE ") or
-        !appParityAnyStringContains(entry.apply_setup_sql, "VALIDATE CONSTRAINT"))
-    {
-        return false;
-    }
+    if (!setup_summary.create_unique_index or !setup_summary.partial_unique_index or !setup_summary.validated_constraint) return false;
     if (!appParityTokensHaveIdentifier(sql_tokens, "email")) return false;
 
     const point_write_matches = switch (family) {
@@ -6907,10 +7114,10 @@ fn appParityPointWriteHasExpressionPartialUniqueSelector(
     };
     if (!point_write_matches) return false;
 
-    const concat_ws_partial = appParityAnyStringContains(entry.apply_setup_sql, "concat_ws(") and
+    const concat_ws_partial = setup_summary.partial_expression_unique_concat_ws and
         appParityTokensHaveIdentifier(sql_tokens, "tenant_id") and
         appParityTokensHaveIdentifier(sql_tokens, "status");
-    const inequality_partial = appParityAnyStringContains(entry.apply_setup_sql, " > ") and
+    const inequality_partial = setup_summary.partial_expression_unique_amount_inequality and
         appParityTokensHaveIdentifier(sql_tokens, "amount");
     return concat_ws_partial or inequality_partial;
 }
@@ -7709,6 +7916,7 @@ pub const AppParityCorpusCoverage = struct {
         const applied_rebuild = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true);
         const applied_validation = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
         const applied_rewrite = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
+        const setup_summary = try appParitySetupSqlSummaryAlloc(alloc, entry.apply_setup_sql);
         if (entry.params.len > 0) {
             switch (entry.family) {
                 .query => self.parameterized_query = true,
@@ -7784,7 +7992,10 @@ pub const AppParityCorpusCoverage = struct {
         self.write_plan_update_op_pull = self.write_plan_update_op_pull or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_pull="));
         self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and appParityTokensHaveIdentifier(sql_tokens, "gen_random_uuid"));
         self.point_update_patch_expression = self.point_update_patch_expression or
-            (entry.family == .update and std.mem.eql(u8, entry.name, "point update expression assignment"));
+            (entry.family == .update and
+                planHasExactStringToken(entry.plan, "update:table=", "usage_records") and
+                planHasNonZeroToken(entry.plan, ":op_set=") and
+                appParityTokensHaveSetFunctionAssignment(sql_tokens, "status", "lower"));
         self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and
             sql_adapter.planHasAnyExactStringToken(entry.plan, ":claim=", &.{ "skip_locked", "no_key_update_skip_locked" }));
         self.update_source_claim_nowait = self.update_source_claim_nowait or (entry.family == .update_source and
@@ -9750,22 +9961,19 @@ pub const AppParityCorpusCoverage = struct {
             self.schema_default_primary_named_conflict_target = self.schema_default_primary_named_conflict_target or
                 appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_pkey");
             self.schema_custom_primary_named_conflict_target = self.schema_custom_primary_named_conflict_target or
-                (appParityAnyStringContains(entry.apply_setup_sql, "RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk") and
+                (setup_summary.renamed_usage_records_primary_constraint and
                     appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_id_pk"));
-            self.schema_unique_conflict_target = self.schema_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "email text UNIQUE") and
+            self.schema_unique_conflict_target = self.schema_unique_conflict_target or (setup_summary.create_table_email_unique_constraint and
                 appParityConflictTargetHasIdentifier(sql_tokens, "email"));
-            self.schema_additive_unique_conflict_target = self.schema_additive_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "ADD CONSTRAINT usage_records_email_key UNIQUE") and
+            self.schema_additive_unique_conflict_target = self.schema_additive_unique_conflict_target or (setup_summary.alter_add_email_unique_constraint and
                 appParityConflictTargetHasIdentifier(sql_tokens, "email"));
-            self.schema_partial_unique_conflict_target = self.schema_partial_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
-                appParityAnyStringContains(entry.apply_setup_sql, " WHERE ") and
+            self.schema_partial_unique_conflict_target = self.schema_partial_unique_conflict_target or (setup_summary.partial_unique_index and
                 appParityConflictTargetHasIdentifier(sql_tokens, "email") and
                 appParityConflictTargetHasWhere(sql_tokens));
-            self.schema_expression_unique_conflict_target = self.schema_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
-                (appParityAnyStringContains(entry.apply_setup_sql, "lower(") or appParityAnyStringContains(entry.apply_setup_sql, "upper(")) and
+            self.schema_expression_unique_conflict_target = self.schema_expression_unique_conflict_target or (setup_summary.expression_unique_lower_upper and
                 (appParityConflictTargetHasFunctionCall(sql_tokens, "lower") or
                     appParityConflictTargetHasFunctionCall(sql_tokens, "upper")));
-            self.schema_mixed_expression_unique_conflict_target = self.schema_mixed_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
-                appParityAnyStringContains(entry.apply_setup_sql, "tenant_id, lower(") and
+            self.schema_mixed_expression_unique_conflict_target = self.schema_mixed_expression_unique_conflict_target or (setup_summary.mixed_expression_unique_tenant_lower and
                 appParityConflictTargetHasIdentifier(sql_tokens, "tenant_id") and
                 appParityConflictTargetHasFunctionCall(sql_tokens, "lower"));
         }
@@ -9775,9 +9983,9 @@ pub const AppParityCorpusCoverage = struct {
                 appParityTokensHaveIdentifier(sql_tokens, "timestamptz");
         }
         self.point_update_expression_partial_unique_selector = self.point_update_expression_partial_unique_selector or
-            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, .update);
+            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, setup_summary, .update);
         self.point_delete_expression_partial_unique_selector = self.point_delete_expression_partial_unique_selector or
-            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, .delete);
+            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, setup_summary, .delete);
         self.insert_source_cross_table_source_schema = self.insert_source_cross_table_source_schema or
             (entry.family == .insert_source and
                 appParityEntryHasCatalogSchemas(entry) and

@@ -1332,7 +1332,13 @@ source-table and assignment tokens, update-source plans must carry mutation
 operation tokens, joined update/delete plans must carry exact source/join
 tokens, and delete-source plans must carry the lock/returning tokens that prove
 the statement reached the source-driven mutation lowerer. A fixture family label
-alone is not coverage. Required unsupported/invalid native-requirement labels
+alone is not coverage. Point update/delete coverage for expression-partial
+unique selectors is also derived from validated unique-index setup metadata,
+point-write plan tokens, resolver row evidence, and predicate field tokens,
+not fixture names. Point update expression-assignment coverage is derived from
+exact point-write plan tokens plus parsed `SET field = function(...)`
+assignment tokens, not fixture names. Required unsupported/invalid
+native-requirement labels
 live in `api/fixtures/sql_api_required_native_requirements.json`, must stay
 sorted, and must match every non-noop `classification_reason` used by the
 source corpus. That turns remaining native model gaps into explicit reviewable
