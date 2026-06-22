@@ -593,6 +593,7 @@
         "table_name": "usage_records",
         "explain_subject": "read",
         "explain_inner_kind": "query",
+        "explain_options": true,
         "predicates": 1,
         "select": 1
       },
@@ -606,6 +607,7 @@
         "table_name": "usage_records",
         "explain_subject": "read",
         "explain_inner_kind": "query",
+        "explain_analyze": true,
         "predicates": 1,
         "select": 1
       },
@@ -657,6 +659,13 @@
         "table_name": "usage_records",
         "explain_subject": "read",
         "explain_inner_kind": "query",
+        "explain_options": true,
+        "explain_analyze": true,
+        "explain_buffers": true,
+        "explain_timing": false,
+        "explain_summary": false,
+        "explain_settings": true,
+        "explain_wal": true,
         "predicates": 1,
         "select": 1
       },

@@ -4968,6 +4968,10 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
     const native_table_name = try nativeCatalogTableNameAlloc(alloc, catalog, target);
     defer alloc.free(native_table_name);
 
+    if (lowered.order_by) |order_by| {
+        return try executeOrderedLoweredDocumentSqlReadPlanAlloc(alloc, source, native_table_name, lowered, order_by, consistency);
+    }
+
     var rows = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (rows.items) |row| alloc.free(@constCast(row));
@@ -5021,6 +5025,214 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
     return .{
         .rows = try rows.toOwnedSlice(alloc),
         .total = total,
+    };
+}
+
+const DocumentSqlSortKey = union(enum) {
+    null,
+    string: []u8,
+    number: f64,
+    boolean: bool,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .string => |value| alloc.free(value),
+            else => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const OrderedDocumentSqlCandidate = struct {
+    id: []u8,
+    doc_json: []u8,
+    sort_key: DocumentSqlSortKey,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.doc_json);
+        self.sort_key.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const DocumentSqlSortContext = struct {
+    direction: sql_adapter_runtime.DocumentOrderDirection,
+};
+
+fn documentSqlCandidateLessThan(ctx: DocumentSqlSortContext, lhs: OrderedDocumentSqlCandidate, rhs: OrderedDocumentSqlCandidate) bool {
+    const order = documentSqlSortKeyOrder(lhs.sort_key, rhs.sort_key);
+    if (order == .eq) {
+        return switch (ctx.direction) {
+            .asc => std.mem.order(u8, lhs.id, rhs.id) == .lt,
+            .desc => std.mem.order(u8, lhs.id, rhs.id) == .gt,
+        };
+    }
+    return switch (ctx.direction) {
+        .asc => order == .lt,
+        .desc => order == .gt,
+    };
+}
+
+fn documentSqlSortKeyOrder(lhs: DocumentSqlSortKey, rhs: DocumentSqlSortKey) std.math.Order {
+    switch (lhs) {
+        .null => return if (rhs == .null) .eq else .gt,
+        .string => |left| switch (rhs) {
+            .null => return .lt,
+            .string => |right| return std.mem.order(u8, left, right),
+            else => return .lt,
+        },
+        .number => |left| switch (rhs) {
+            .null => return .lt,
+            .number => |right| return std.math.order(left, right),
+            .string => return .gt,
+            .boolean => return .lt,
+        },
+        .boolean => |left| switch (rhs) {
+            .null => return .lt,
+            .boolean => |right| return std.math.order(@intFromBool(left), @intFromBool(right)),
+            else => return .gt,
+        },
+    }
+}
+
+fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    native_table_name: []const u8,
+    lowered: sql_adapter_runtime.DocumentReadPlan,
+    order_by: sql_adapter_runtime.DocumentOrderBy,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var candidates = std.ArrayListUnmanaged(OrderedDocumentSqlCandidate).empty;
+    errdefer {
+        for (candidates.items) |*candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+
+    switch (lowered.producer) {
+        .id_lookup => |ids| {
+            for (ids) |id| {
+                var lookup = (try source.lookup(alloc, native_table_name, id, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, id, lookup.json, order_by);
+            }
+        },
+        .bounded_scan => |limit| {
+            var scan = (try source.scan(alloc, native_table_name, "", "", .{
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = limit,
+            }, consistency)) orelse return null;
+            defer scan.deinit(alloc);
+
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try source.lookup(alloc, native_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, &candidates, key_value.string, lookup.json, order_by);
+            }
+        },
+        .indexed_query => return error.UnsupportedSqlShape,
+    }
+
+    std.mem.sort(OrderedDocumentSqlCandidate, candidates.items, DocumentSqlSortContext{ .direction = order_by.direction }, documentSqlCandidateLessThan);
+
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+    const row_limit = lowered.limit orelse @as(u32, @intCast(candidates.items.len));
+    for (candidates.items) |candidate| {
+        if (rows.items.len >= row_limit) break;
+        try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, candidate.id, candidate.doc_json, lowered.projection));
+    }
+
+    for (candidates.items) |*candidate| candidate.deinit(alloc);
+    candidates.deinit(alloc);
+
+    const total: u32 = @intCast(rows.items.len);
+    return .{
+        .rows = try rows.toOwnedSlice(alloc),
+        .total = total,
+    };
+}
+
+fn appendOrderedDocumentSqlCandidateAlloc(
+    alloc: std.mem.Allocator,
+    candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlCandidate),
+    id: []const u8,
+    doc_json: []const u8,
+    order_by: sql_adapter_runtime.DocumentOrderBy,
+) !void {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    const owned_doc = try alloc.dupe(u8, doc_json);
+    errdefer alloc.free(owned_doc);
+    var sort_key = try documentSqlSortKeyAlloc(alloc, id, doc_json, order_by);
+    errdefer sort_key.deinit(alloc);
+    try candidates.append(alloc, .{
+        .id = owned_id,
+        .doc_json = owned_doc,
+        .sort_key = sort_key,
+    });
+}
+
+fn documentSqlSortKeyAlloc(
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    doc_json: []const u8,
+    order_by: sql_adapter_runtime.DocumentOrderBy,
+) !DocumentSqlSortKey {
+    if (std.mem.eql(u8, order_by.field, "_id")) return .{ .string = try alloc.dupe(u8, id) };
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const value = documentSqlProjectedValue(parsed.value, order_by.field) orelse return .null;
+    return try documentSqlSortKeyFromValueAlloc(alloc, value, order_by.field_type);
+}
+
+fn documentSqlSortKeyFromValueAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+    field_type: storage_schema.AntflyType,
+) !DocumentSqlSortKey {
+    if (value == .null) return .null;
+    return switch (field_type) {
+        .numeric => .{ .number = try documentSqlSortNumber(value) },
+        .datetime => switch (value) {
+            .integer, .float, .number_string => .{ .number = try documentSqlSortNumber(value) },
+            .string => |text| .{ .string = try alloc.dupe(u8, text) },
+            else => error.InvalidRowsRequest,
+        },
+        .boolean => switch (value) {
+            .bool => |item| .{ .boolean = item },
+            else => error.InvalidRowsRequest,
+        },
+        .keyword, .text, .search_as_you_type => switch (value) {
+            .string => |text| .{ .string = try alloc.dupe(u8, text) },
+            .integer, .float, .number_string => .{ .number = try documentSqlSortNumber(value) },
+            .bool => |item| .{ .boolean = item },
+            else => error.InvalidRowsRequest,
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn documentSqlSortNumber(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer => |item| @floatFromInt(item),
+        .float => |item| item,
+        .number_string => |text| try std.fmt.parseFloat(f64, text),
+        else => error.InvalidRowsRequest,
     };
 }
 
@@ -23109,6 +23321,33 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
             try std.testing.expectEqual(@as(usize, 2), query.rows.len);
             try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\"}", query.rows[0]);
             try std.testing.expectEqualStrings("{\"_id\":\"doc:b\",\"title\":\"beta\"}", query.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var ordered_scan_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id, title FROM docs ORDER BY title DESC LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer ordered_scan_plan.deinit(alloc);
+    var ordered_scan_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        ordered_scan_plan,
+        .read_index,
+    )).?;
+    defer ordered_scan_result.deinit(alloc);
+    switch (ordered_scan_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 2), query.total);
+            try std.testing.expectEqual(@as(usize, 2), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:b\",\"title\":\"beta\"}", query.rows[0]);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\"}", query.rows[1]);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -287,6 +287,13 @@ pub const AppParityPlanSummary = struct {
     temporal_foreign_keys: ?usize = null,
     explain_subject: ?[]const u8 = null,
     explain_inner_kind: ?[]const u8 = null,
+    explain_options: ?bool = null,
+    explain_analyze: ?bool = null,
+    explain_buffers: ?bool = null,
+    explain_timing: ?bool = null,
+    explain_summary: ?bool = null,
+    explain_settings: ?bool = null,
+    explain_wal: ?bool = null,
 };
 
 pub fn summaryHasFields(summary: AppParityPlanSummary) bool {
@@ -346,7 +353,14 @@ pub fn summaryHasFields(summary: AppParityPlanSummary) bool {
         summary.temporal_unique != null or
         summary.temporal_foreign_keys != null or
         summary.explain_subject != null or
-        summary.explain_inner_kind != null;
+        summary.explain_inner_kind != null or
+        summary.explain_options != null or
+        summary.explain_analyze != null or
+        summary.explain_buffers != null or
+        summary.explain_timing != null or
+        summary.explain_summary != null or
+        summary.explain_settings != null or
+        summary.explain_wal != null;
 }
 
 pub fn summaryHasNonTableFields(summary: AppParityPlanSummary) bool {
@@ -1194,6 +1208,13 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         "temporal_foreign_keys",
         "explain_subject",
         "explain_inner_kind",
+        "explain_options",
+        "explain_analyze",
+        "explain_buffers",
+        "explain_timing",
+        "explain_summary",
+        "explain_settings",
+        "explain_wal",
     });
     return .{
         .ddl_tag = if (object.get("ddl_tag")) |tag_value| std.meta.stringToEnum(AppParityDdlTag, try fixtureJsonString(tag_value)) orelse return error.TestUnexpectedResult else null,
@@ -1253,6 +1274,13 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         .temporal_foreign_keys = try fixtureJsonOptionalUsize(object, "temporal_foreign_keys"),
         .explain_subject = try fixtureJsonOptionalStringField(object, "explain_subject"),
         .explain_inner_kind = try fixtureJsonOptionalStringField(object, "explain_inner_kind"),
+        .explain_options = try fixtureJsonOptionalBool(object, "explain_options"),
+        .explain_analyze = try fixtureJsonOptionalBool(object, "explain_analyze"),
+        .explain_buffers = try fixtureJsonOptionalBool(object, "explain_buffers"),
+        .explain_timing = try fixtureJsonOptionalBool(object, "explain_timing"),
+        .explain_summary = try fixtureJsonOptionalBool(object, "explain_summary"),
+        .explain_settings = try fixtureJsonOptionalBool(object, "explain_settings"),
+        .explain_wal = try fixtureJsonOptionalBool(object, "explain_wal"),
     };
 }
 
@@ -2020,6 +2048,18 @@ fn corpusExplainSubjectMatches(entry: AppParityCorpusEntry, expected: []const u8
     return explainPlanHasKind(entry.plan, expected);
 }
 
+fn corpusExplainOptionsEnabled(entry: AppParityCorpusEntry) bool {
+    if (entry.summary.explain_options) |enabled| return enabled;
+    return planHasStringToken(entry.plan, ":format=") or
+        planUsizeTokenValue(entry.plan, ":verbose=") != null or
+        planUsizeTokenValue(entry.plan, ":costs=") != null;
+}
+
+fn corpusExplainBoolValue(entry: AppParityCorpusEntry, summary_value: ?bool, token: []const u8, default: bool) bool {
+    if (summary_value) |value| return value;
+    return (planUsizeTokenValue(entry.plan, token) orelse @intFromBool(default)) == 1;
+}
+
 fn corpusExplainInnerKindMatches(entry: AppParityCorpusEntry, expected_subject: []const u8, expected_inner_kind: []const u8) bool {
     if (entry.summary.explain_subject) |subject| {
         if (!std.mem.eql(u8, subject, expected_subject)) return false;
@@ -2189,6 +2229,13 @@ fn fixtureWriteSummaryField(writer: anytype, first: *bool, summary: AppParityPla
     try fixtureWriteUsizeSummaryField(writer, &summary_first, "temporal_foreign_keys", summary.temporal_foreign_keys);
     if (summary.explain_subject) |subject| try fixtureWriteStringField(writer, &summary_first, "        ", "explain_subject", subject);
     if (summary.explain_inner_kind) |kind| try fixtureWriteStringField(writer, &summary_first, "        ", "explain_inner_kind", kind);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_options", summary.explain_options);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_analyze", summary.explain_analyze);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_buffers", summary.explain_buffers);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_timing", summary.explain_timing);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_summary", summary.explain_summary);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_settings", summary.explain_settings);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_wal", summary.explain_wal);
     try writer.writeAll("\n      }");
 }
 
@@ -8753,16 +8800,13 @@ pub const AppParityCorpusCoverage = struct {
             .explain => {
                 self.explain = true;
                 self.explain_write = self.explain_write or corpusExplainSubjectMatches(entry, "write");
-                self.explain_options = self.explain_options or
-                    sql_adapter.planHasStringToken(entry.plan, ":format=") or
-                    sql_adapter.planUsizeTokenValue(entry.plan, ":verbose=") != null or
-                    sql_adapter.planUsizeTokenValue(entry.plan, ":costs=") != null;
-                self.explain_analyze = self.explain_analyze or sql_adapter.planHasExactBoolToken(entry.plan, ":analyze=", true);
-                self.explain_buffers = self.explain_buffers or (sql_adapter.planUsizeTokenValue(entry.plan, ":buffers=") orelse 0) == 1;
-                self.explain_timing_disabled = self.explain_timing_disabled or (sql_adapter.planUsizeTokenValue(entry.plan, ":timing=") orelse 1) == 0;
-                self.explain_summary_disabled = self.explain_summary_disabled or (sql_adapter.planUsizeTokenValue(entry.plan, ":summary=") orelse 1) == 0;
-                self.explain_settings = self.explain_settings or (sql_adapter.planUsizeTokenValue(entry.plan, ":settings=") orelse 0) == 1;
-                self.explain_wal = self.explain_wal or (sql_adapter.planUsizeTokenValue(entry.plan, ":wal=") orelse 0) == 1;
+                self.explain_options = self.explain_options or corpusExplainOptionsEnabled(entry);
+                self.explain_analyze = self.explain_analyze or corpusExplainBoolValue(entry, entry.summary.explain_analyze, ":analyze=", false);
+                self.explain_buffers = self.explain_buffers or corpusExplainBoolValue(entry, entry.summary.explain_buffers, ":buffers=", false);
+                self.explain_timing_disabled = self.explain_timing_disabled or !corpusExplainBoolValue(entry, entry.summary.explain_timing, ":timing=", true);
+                self.explain_summary_disabled = self.explain_summary_disabled or !corpusExplainBoolValue(entry, entry.summary.explain_summary, ":summary=", true);
+                self.explain_settings = self.explain_settings or corpusExplainBoolValue(entry, entry.summary.explain_settings, ":settings=", false);
+                self.explain_wal = self.explain_wal or corpusExplainBoolValue(entry, entry.summary.explain_wal, ":wal=", false);
             },
             .relation_population => {
                 self.relation_population_select_into = self.relation_population_select_into or

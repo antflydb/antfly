@@ -415,6 +415,13 @@ pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered
 }
 
 pub fn expectAppParityExplainSummary(summary: corpus.AppParityPlanSummary, lowered: plan_mod.LoweredExplainPlan) !void {
+    try expectOptionalBool(summary.explain_options, lowered.format != .text or lowered.verbose or !lowered.costs);
+    try expectOptionalBool(summary.explain_analyze, lowered.analyze);
+    try expectOptionalBool(summary.explain_buffers, lowered.buffers);
+    try expectOptionalBool(summary.explain_timing, lowered.timing);
+    try expectOptionalBool(summary.explain_summary, lowered.summary);
+    try expectOptionalBool(summary.explain_settings, lowered.settings);
+    try expectOptionalBool(summary.explain_wal, lowered.wal);
     switch (lowered.subject) {
         .read => |read| {
             try expectOptionalString(summary.explain_subject, "read");
@@ -431,4 +438,8 @@ pub fn expectAppParityExplainSummary(summary: corpus.AppParityPlanSummary, lower
 
 fn expectOptionalString(expected: ?[]const u8, actual: []const u8) !void {
     if (expected) |value| try std.testing.expectEqualStrings(value, actual);
+}
+
+fn expectOptionalBool(expected: ?bool, actual: bool) !void {
+    if (expected) |value| try std.testing.expectEqual(value, actual);
 }

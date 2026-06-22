@@ -64,6 +64,22 @@ pub const DocumentIndexQuery = struct {
     }
 };
 
+pub const DocumentOrderDirection = enum {
+    asc,
+    desc,
+};
+
+pub const DocumentOrderBy = struct {
+    field: []const u8,
+    field_type: runtime_schema.AntflyType,
+    direction: DocumentOrderDirection = .asc,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.field.len > 0) alloc.free(@constCast(self.field));
+        self.* = undefined;
+    }
+};
+
 pub const DocumentProducer = union(enum) {
     id_lookup: []const []const u8,
     indexed_query: DocumentIndexQuery,
@@ -86,6 +102,7 @@ pub const DocumentReadPlan = struct {
     table_name: []const u8,
     projection: []DocumentProjection,
     producer: DocumentProducer,
+    order_by: ?DocumentOrderBy = null,
     limit: ?u32 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -93,6 +110,7 @@ pub const DocumentReadPlan = struct {
         for (self.projection) |*projection| projection.deinit(alloc);
         if (self.projection.len > 0) alloc.free(self.projection);
         self.producer.deinit(alloc);
+        if (self.order_by) |*order_by| order_by.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -110,12 +128,12 @@ pub fn lowerDocumentReadPlanParsedSqlAlloc(
 
     const from_index = findTopLevelKeyword(tokens, .from) orelse return error.UnsupportedSqlShape;
     const where_index = findTopLevelKeyword(tokens, .where);
+    const order_index = findTopLevelKeyword(tokens, .order);
     const limit_index = findTopLevelKeyword(tokens, .limit);
     if (findTopLevelKeyword(tokens, .join) != null or
         findTopLevelKeyword(tokens, .group) != null or
         findTopLevelKeyword(tokens, .having) != null or
-        findTopLevelKeyword(tokens, .window) != null or
-        findTopLevelKeyword(tokens, .order) != null)
+        findTopLevelKeyword(tokens, .window) != null)
     {
         return error.UnsupportedSqlShape;
     }
@@ -124,15 +142,23 @@ pub fn lowerDocumentReadPlanParsedSqlAlloc(
     const table_name = try alloc.dupe(u8, tokens[from_index + 1].text);
     errdefer alloc.free(table_name);
 
-    const tail_start = where_index orelse limit_index orelse tokens.len;
+    const tail_start = minOptionalIndex(where_index, order_index, limit_index) orelse tokens.len;
     try validateFromTail(tokens[from_index + 2 .. tail_start]);
 
     const projection = try parseProjectionAlloc(alloc, tokens[1..from_index], schema);
     errdefer freeProjection(alloc, projection);
 
     const limit = if (limit_index) |idx| try parseLimit(tokens, idx) else null;
+    const order_by = if (order_index) |idx|
+        try parseOrderByAlloc(alloc, tokens, idx, limit_index orelse tokens.len, schema)
+    else
+        null;
+    errdefer if (order_by) |*order| {
+        var mutable = order.*;
+        mutable.deinit(alloc);
+    };
     const producer = if (where_index) |idx|
-        try parseWhereProducerAlloc(alloc, tokens, idx, limit_index orelse tokens.len, schema)
+        try parseWhereProducerAlloc(alloc, tokens, idx, order_index orelse limit_index orelse tokens.len, schema)
     else blk: {
         const bounded = limit orelse return error.DocumentSqlRequiresBoundedScan;
         break :blk DocumentProducer{ .bounded_scan = bounded };
@@ -141,11 +167,16 @@ pub fn lowerDocumentReadPlanParsedSqlAlloc(
         var mutable = producer;
         mutable.deinit(alloc);
     }
+    if (order_by != null) switch (producer) {
+        .indexed_query => return error.UnsupportedSqlShape,
+        else => {},
+    };
 
     return .{
         .table_name = table_name,
         .projection = projection,
         .producer = producer,
+        .order_by = order_by,
         .limit = limit,
     };
 }
@@ -390,6 +421,47 @@ fn parseWhereProducerAlloc(
     return error.UnsupportedSqlShape;
 }
 
+fn parseOrderByAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    order_index: usize,
+    end_index: usize,
+    schema: runtime_schema.TableSchema,
+) !DocumentOrderBy {
+    if (order_index + 2 >= end_index) return error.UnsupportedSqlShape;
+    if (!tokens[order_index + 1].matchesKeywordTag(.by)) return error.UnsupportedSqlShape;
+    const order_tokens = tokens[order_index + 2 .. end_index];
+    if (order_tokens.len == 0) return error.UnsupportedSqlShape;
+    if (findComma(order_tokens, 0) != null) return error.UnsupportedSqlShape;
+
+    const direction: DocumentOrderDirection = if (order_tokens[order_tokens.len - 1].matchesKeywordTag(.desc))
+        .desc
+    else if (order_tokens[order_tokens.len - 1].matchesKeywordTag(.asc))
+        .asc
+    else
+        .asc;
+    const expression = if (order_tokens[order_tokens.len - 1].matchesKeywordTag(.desc) or order_tokens[order_tokens.len - 1].matchesKeywordTag(.asc))
+        order_tokens[0 .. order_tokens.len - 1]
+    else
+        order_tokens;
+    if (expression.len == 0) return error.UnsupportedSqlShape;
+    if (expression.len == 1 and expression[0].kind == .identifier and std.mem.eql(u8, expression[0].text, "_id")) {
+        return .{
+            .field = try alloc.dupe(u8, "_id"),
+            .field_type = .keyword,
+            .direction = direction,
+        };
+    }
+
+    var field = (try documentOrderFieldForExpressionAlloc(alloc, expression, schema)) orelse return error.UnsupportedSqlShape;
+    errdefer field.deinit(alloc);
+    return .{
+        .field = field.takePath(),
+        .field_type = field.field_type,
+        .direction = direction,
+    };
+}
+
 fn parseWhereClauseIntoAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -562,6 +634,12 @@ const DocumentFilterField = struct {
         if (self.path.len > 0) alloc.free(self.path);
         self.* = undefined;
     }
+
+    fn takePath(self: *@This()) []u8 {
+        const path = self.path;
+        self.path = "";
+        return path;
+    }
 };
 
 fn documentFilterFieldForExpressionAlloc(
@@ -594,6 +672,28 @@ fn documentFilterFieldForExpressionAlloc(
         .path = try alloc.dupe(u8, expression.path),
         .field_type = expression.root_column.field_type,
         .exact_declared_path = false,
+    };
+}
+
+fn documentOrderFieldForExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+) !?DocumentFilterField {
+    if (tokens.len == 1 and tokens[0].kind == .identifier) {
+        const column = documentFieldColumn(schema, tokens[0].text) orelse return error.InvalidSqlCatalog;
+        return .{
+            .path = try documentFilterPathAlloc(alloc, column.path),
+            .field_type = column.field_type,
+        };
+    }
+
+    var expression = (try parseDocumentJsonPathExpressionAlloc(alloc, tokens, schema)) orelse return null;
+    defer expression.deinit(alloc);
+    const exact_column = documentColumnForPath(schema, expression.path) orelse return error.UnsupportedSqlShape;
+    return .{
+        .path = try alloc.dupe(u8, expression.path),
+        .field_type = exact_column.field_type,
     };
 }
 
@@ -754,6 +854,16 @@ fn validateFromTail(tokens: []const Token) !void {
     return error.UnsupportedSqlShape;
 }
 
+fn minOptionalIndex(a: ?usize, b: ?usize, c: ?usize) ?usize {
+    var out: ?usize = null;
+    inline for (.{ a, b, c }) |maybe| {
+        if (maybe) |value| {
+            out = if (out) |current| @min(current, value) else value;
+        }
+    }
+    return out;
+}
+
 fn documentFieldExists(schema: runtime_schema.TableSchema, field: []const u8) bool {
     return documentFieldColumn(schema, field) != null;
 }
@@ -852,6 +962,38 @@ test "document SQL lowers id in lookup projection" {
     try std.testing.expectEqual(@as(usize, 2), lowered.producer.id_lookup.len);
     try std.testing.expectEqualStrings("doc:a", lowered.producer.id_lookup[0]);
     try std.testing.expectEqualStrings("doc:b", lowered.producer.id_lookup[1]);
+}
+
+test "document SQL lowers bounded order by over id lookup" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE _id IN ('doc:a', 'doc:b') ORDER BY title DESC LIMIT 1");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), lowered.producer.id_lookup.len);
+    try std.testing.expectEqualStrings("/title", lowered.order_by.?.field);
+    try std.testing.expectEqual(runtime_schema.AntflyType.text, lowered.order_by.?.field_type);
+    try std.testing.expectEqual(DocumentOrderDirection.desc, lowered.order_by.?.direction);
+    try std.testing.expectEqual(@as(?u32, 1), lowered.limit);
+}
+
+test "document SQL rejects order by over indexed query until native ordering exists" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE status = 'active' ORDER BY status ASC LIMIT 10");
+    defer parsed.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
 }
 
 test "document SQL lowers json path projection" {
