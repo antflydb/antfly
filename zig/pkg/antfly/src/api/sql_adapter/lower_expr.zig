@@ -24372,6 +24372,30 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     return lowered;
 }
 
+fn lowerWindowPlanForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredWindowPlan {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+    };
+    return parser_context.ParserState.ContextAccessors.parseWindowSelect(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
 fn lowerAggregateForLowerExprTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -26959,6 +26983,75 @@ test "sql adapter lower expr lowers global aggregate queries" {
         schema,
         &.{},
     ));
+}
+
+test "sql adapter lower expr lowers pagination limit all and fetch forms" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY created_at DESC LIMIT ALL OFFSET 2",
+        schema,
+        &.{},
+    );
+    defer query.deinit(alloc);
+    try std.testing.expect(query.plan.query.limit == null);
+    try std.testing.expectEqual(@as(u32, 2), query.plan.query.offset);
+
+    var null_pagination_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY created_at DESC LIMIT NULL OFFSET NULL",
+        schema,
+        &.{},
+    );
+    defer null_pagination_query.deinit(alloc);
+    try std.testing.expect(null_pagination_query.plan.query.limit == null);
+    try std.testing.expectEqual(@as(u32, 0), null_pagination_query.plan.query.offset);
+
+    var bound_null_pagination_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+        schema,
+        &.{ .null, .null },
+    );
+    defer bound_null_pagination_query.deinit(alloc);
+    try std.testing.expect(bound_null_pagination_query.plan.query.limit == null);
+    try std.testing.expectEqual(@as(u32, 0), bound_null_pagination_query.plan.query.offset);
+
+    var fetch_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' ORDER BY created_at DESC OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY",
+        schema,
+        &.{},
+    );
+    defer fetch_query.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), fetch_query.plan.query.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), fetch_query.plan.query.offset);
+
+    var aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records GROUP BY status ORDER BY total DESC LIMIT ALL OFFSET 3 ROWS",
+        schema,
+        &.{},
+    );
+    defer aggregate.deinit(alloc);
+    try std.testing.expect(aggregate.aggregate.limit == null);
+    try std.testing.expectEqual(@as(u32, 3), aggregate.aggregate.offset);
+
+    var window = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS rn FROM usage_records WHERE status = 'open' ORDER BY rn ASC OFFSET 4 ROWS FETCH FIRST 2 ROWS ONLY",
+        schema,
+        &.{},
+    );
+    defer window.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), window.plan.window.limit.?);
+    try std.testing.expectEqual(@as(u32, 4), window.plan.window.offset);
 }
 
 test "sql adapter lower expr lowers select all with named extra projections" {

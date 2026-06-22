@@ -15903,6 +15903,32 @@ test "sql adapter lower dml lowers truncate into claimed table-emptying mutation
     ));
 }
 
+test "sql adapter lower dml lowers mutation source pagination fetch forms" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const txn_id = [_]u8{ 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "worker-limit-all",
+        .txn_id = txn_id,
+    };
+    var mutation = try lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET 1 ROW FETCH FIRST ROW ONLY FOR UPDATE RETURNING id",
+        schema,
+        &.{},
+        claim,
+    );
+    defer mutation.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), mutation.mutation.req.source.limit.?);
+    try std.testing.expectEqual(@as(u32, 1), mutation.mutation.req.source.offset);
+}
+
 test "sql adapter lower dml lowers temporal portion mutation sources" {
     const alloc = std.testing.allocator;
     const schema_json =
