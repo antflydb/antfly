@@ -1059,8 +1059,6 @@ fn expectAppParityInvalidPlanEntry(
     try expectAppParityPlan(entry.plan, fingerprint);
 }
 
-const expectAppParityQueryFunctionEntry = sql_adapter.expectAppParityQueryFunctionEntry;
-
 fn expectAppParityCorpusEntry(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
@@ -1103,7 +1101,9 @@ fn expectAppParityCorpusEntry(
         return try expectAppParityInvalidPlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
     }
     if (entry.family == .query_function) {
-        return try expectAppParityQueryFunctionEntry(alloc, entry);
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+        defer parsed_sql.deinit(alloc);
+        return try sql_adapter.expectAppParityQueryFunctionParsedSqlEntry(alloc, entry, &parsed_sql);
     }
 
     switch (entry.family) {

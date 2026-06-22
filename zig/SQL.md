@@ -666,7 +666,9 @@ Current implementation status:
   `TRUE`, and `FALSE`.
 - DML conflict, assignment, and merge expression-start helpers share the same
   keyword metadata for boolean atoms, `DEFAULT`, `NOT`, `OR`, and
-  parenthesized conjunction/disjunction probes.
+  parenthesized conjunction/disjunction probes. Joined mutation text-pattern
+  detection and DML expression-start keyword helpers now read parsed token
+  keyword metadata instead of rechecking matched token text.
 - Row-expression boundary detection and unsupported read-tail detection use
   keyword metadata, including CASE branch delimiters, so expression scanners
   stop on parsed token facts instead of reinterpreting identifier text.
@@ -730,6 +732,9 @@ Current implementation status:
 - Relational SQL catalog/read parsed lowering helpers are public typed adapter
   APIs, and the HTTP routine-binding read path constructs `ParsedSql` once
   before dispatching to catalog or non-catalog lowering.
+- Query-function app-parity assertions expose a parsed entrypoint, and the
+  integration corpus runner uses that parsed route instead of reparsing fixture
+  SQL inside the assertion helper.
 - HTTP relational SQL DDL execution, source-backed DDL application, bulk SQL,
   and auth-catalog DDL helpers construct `ParsedSql` once at ingress before
   lowering DDL/session control plans, and transaction-boundary session cleanup

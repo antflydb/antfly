@@ -103,14 +103,22 @@ pub fn expectAppParityQueryFunctionEntry(
     alloc: std.mem.Allocator,
     entry: corpus.AppParityCorpusEntry,
 ) !void {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    return try expectAppParityQueryFunctionParsedSqlEntry(alloc, entry, &parsed_sql);
+}
+
+pub fn expectAppParityQueryFunctionParsedSqlEntry(
+    alloc: std.mem.Allocator,
+    entry: corpus.AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !void {
     var resolver_state: u8 = 0;
     const semantic_resolver = query_contract.SemanticResolver{
         .ptr = &resolver_state,
         .vtable = &.{ .resolve_dense_query = appParityResolveDenseQuery },
     };
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-    var lowered = try query_function.lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
+    var lowered = try query_function.lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, parsed_sql);
     defer lowered.deinit(alloc);
     const fingerprint = try corpus.queryFunctionFingerprintAlloc(alloc, lowered);
     defer alloc.free(fingerprint);

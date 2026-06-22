@@ -82,6 +82,8 @@ pub const TokenKeyword = enum {
     copy,
     count,
     create,
+    current_date,
+    current_timestamp,
     data,
     default,
     delete,
@@ -286,4 +288,6 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.then, keywordFromIdentifier("THEN").?);
     try std.testing.expectEqual(TokenKeyword.@"else", keywordFromIdentifier("ELSE").?);
     try std.testing.expectEqual(TokenKeyword.end, keywordFromIdentifier("END").?);
+    try std.testing.expectEqual(TokenKeyword.current_date, keywordFromIdentifier("CURRENT_DATE").?);
+    try std.testing.expectEqual(TokenKeyword.current_timestamp, keywordFromIdentifier("CURRENT_TIMESTAMP").?);
 }

@@ -6604,14 +6604,14 @@ pub fn parseJoinedMutationWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-            const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+            const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "not")) {
             if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-                const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+                const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
@@ -10888,7 +10888,7 @@ fn keywordTagAt(tokens: []const Token, pos: usize, keyword: parser.TokenKeyword)
 }
 
 fn keywordAt(tokens: []const Token, pos: usize, keyword: []const u8) bool {
-    return pos < tokens.len and tokens[pos].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[pos].text, keyword);
+    return pos < tokens.len and tokens[pos].matchesKeyword(keyword);
 }
 
 pub fn conflictParenthesizedConjunctionCanStart(tokens: []const Token, pos: usize) bool {
@@ -13117,6 +13117,13 @@ test "sql adapter lower dml detects json set path conflicts" {
     };
     try std.testing.expect(conflictParenthesizedConjunctionCanStart(&conjunction_tokens, 0));
     try std.testing.expect(!conflictParenthesizedDisjunctionCanStart(&conjunction_tokens, 0));
+    const keyword_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "CURRENT_DATE", .keyword = .current_date },
+        .{ .kind = .identifier, .text = "array_append" },
+    };
+    try std.testing.expect(keywordAt(keyword_tokens[0..], 0, "current_date"));
+    try std.testing.expect(keywordAt(keyword_tokens[0..], 1, "array_append"));
+    try std.testing.expect(!keywordAt(keyword_tokens[0..], 0, "current_timestamp"));
     const existing_qualifiers = [_][]const u8{ "usage_records", "public.usage_records" };
     try std.testing.expect(conflictQualifierMatches(alloc, &existing_qualifiers, "usage_records"));
     try std.testing.expect(conflictQualifierMatches(alloc, &existing_qualifiers, "public.usage_records"));

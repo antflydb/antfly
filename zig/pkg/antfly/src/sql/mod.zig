@@ -233,6 +233,7 @@ pub const expectCombinedQuerySourceSummary = app_parity_assertions.expectCombine
 pub const expectAppParityPlan = app_parity_assertions.expectAppParityPlan;
 pub const expectAppParityExplainSummary = app_parity_assertions.expectAppParityExplainSummary;
 pub const expectAppParityQueryFunctionEntry = app_parity_assertions.expectAppParityQueryFunctionEntry;
+pub const expectAppParityQueryFunctionParsedSqlEntry = app_parity_assertions.expectAppParityQueryFunctionParsedSqlEntry;
 pub const expectAppParityReadSummary = app_parity_assertions.expectAppParityReadSummary;
 pub const expectAppParityReturningRows = app_parity_assertions.expectAppParityReturningRows;
 pub const expectAppParityWriteSummary = app_parity_assertions.expectAppParityWriteSummary;
