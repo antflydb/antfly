@@ -99,6 +99,9 @@ pub const Provider = enum {
     }
 };
 
+/// Antfly safety cap for generation requests that omit an explicit limit.
+/// This is intentionally not provider parity: OpenAI leaves the response cap
+/// optional, and Ollama's native num_predict default is unbounded.
 pub const default_max_tokens: i64 = 256;
 
 pub const OpenAIConfig = struct {

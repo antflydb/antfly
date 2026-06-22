@@ -97,12 +97,26 @@ pub const Config = struct {
     };
 
     pub const InferenceConfig = struct {
+        pub const WarmModelConfig = struct {
+            kind: []u8,
+            name: []u8,
+            backend: ?[]u8 = null,
+
+            fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
+                alloc.free(self.kind);
+                alloc.free(self.name);
+                if (self.backend) |value| alloc.free(value);
+                self.* = undefined;
+            }
+        };
+
         api_url: ?[]u8 = null,
         api_key: ?[]u8 = null,
         models_dir: ?[]u8 = null,
         ml_dir: ?[]u8 = null,
         content_security: ?ContentSecurityConfig = null,
         s3_credentials: ?S3CredentialsConfig = null,
+        warm_models: []WarmModelConfig = &.{},
         warm_generators: []const []u8 = &.{},
         warm_generator_backend: ?[]u8 = null,
 
@@ -113,6 +127,8 @@ pub const Config = struct {
             if (self.ml_dir) |value| alloc.free(value);
             if (self.content_security) |*security| security.deinit(alloc);
             if (self.s3_credentials) |*credentials| credentials.deinit(alloc);
+            for (self.warm_models) |*model| model.deinit(alloc);
+            if (self.warm_models.len > 0) alloc.free(self.warm_models);
             freeOwnedStringSlice(alloc, self.warm_generators);
             if (self.warm_generator_backend) |value| alloc.free(value);
             self.* = undefined;
@@ -395,6 +411,7 @@ pub const Config = struct {
                 .ml_dir = if (inference.ml_dir) |value| try alloc.dupe(u8, value) else null,
                 .content_security = if (inference.content_security) |security| try contentSecurityFromOpenApi(alloc, security) else null,
                 .s3_credentials = try parseRawInferenceS3Credentials(alloc, raw_root, inference.s3_credentials),
+                .warm_models = try parseInferenceWarmModels(alloc, raw_root.get("inference")),
                 .warm_generators = try parseInferenceWarmGenerators(alloc, raw_root.get("inference"), inference.preload),
                 .warm_generator_backend = try rawOptionalStringField(alloc, raw_root.get("inference"), "warm_generator_backend"),
             } else .{},
@@ -1002,6 +1019,40 @@ fn parseInferenceWarmGenerators(
     return try optionalStringArrayField(alloc, object, "warm_generators") orelse &.{};
 }
 
+fn parseInferenceWarmModels(
+    alloc: std.mem.Allocator,
+    raw_inference: ?std.json.Value,
+) ![]Config.InferenceConfig.WarmModelConfig {
+    const value = raw_inference orelse return &.{};
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidConfig,
+    };
+    const warm_models_value = object.get("warm_models") orelse return &.{};
+    if (warm_models_value != .array) return error.InvalidConfig;
+
+    const out = try alloc.alloc(Config.InferenceConfig.WarmModelConfig, warm_models_value.array.items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |*model| model.deinit(alloc);
+        alloc.free(out);
+    }
+
+    for (warm_models_value.array.items, 0..) |item, i| {
+        const model_object = switch (item) {
+            .object => |entry| entry,
+            else => return error.InvalidConfig,
+        };
+        out[i] = .{
+            .kind = try requiredStringFieldDup(alloc, model_object, "kind"),
+            .name = try requiredStringFieldDup(alloc, model_object, "name"),
+            .backend = try optionalStringFieldDup(alloc, model_object, "backend"),
+        };
+        filled = i + 1;
+    }
+    return out;
+}
+
 fn contentSecurityFromOpenApi(
     alloc: std.mem.Allocator,
     value: scraping_openapi.ContentSecurityConfig,
@@ -1176,6 +1227,9 @@ test "common config extracts antfly settings" {
         \\    "api_url": "http://127.0.0.1:8083",
         \\    "models_dir": "/tmp/models",
         \\    "ml_dir": "/tmp/ml",
+        \\    "warm_models": [
+        \\      { "kind": "generator", "name": "gemma-e2b", "backend": "metal" }
+        \\    ],
         \\    "preload": ["gemma-e2b"],
         \\    "warm_generator_backend": "metal",
         \\    "content_security": {
@@ -1200,6 +1254,10 @@ test "common config extracts antfly settings" {
     try std.testing.expectEqualStrings("http://127.0.0.1:8083", cfg.inference.api_url.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference.models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference.ml_dir.?);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference.warm_models.len);
+    try std.testing.expectEqualStrings("generator", cfg.inference.warm_models[0].kind);
+    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference.warm_models[0].name);
+    try std.testing.expectEqualStrings("metal", cfg.inference.warm_models[0].backend.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference.warm_generators.len);
     try std.testing.expectEqualStrings("gemma-e2b", cfg.inference.warm_generators[0]);
     try std.testing.expectEqualStrings("metal", cfg.inference.warm_generator_backend.?);

@@ -371,6 +371,12 @@ pub const ToolCallFunctionDelta = struct {
     arguments: ?[]const u8 = null,
 };
 
+pub const WarmModel = struct {
+    kind: []const u8,
+    name: []const u8,
+    backend: ?[]const u8 = null,
+};
+
 /// Runtime backends compiled into this inference server.
 pub const BackendRuntimes = struct {
     /// Whether the native CPU backend is built into this runtime
@@ -1015,7 +1021,9 @@ pub const Config = struct {
     max_queue_size: ?i64 = null,
     /// Maximum time to wait for a request to complete, including queue wait time. Use Go duration format: "30s", "1m", "0" (no timeout, default). Requests exceeding this timeout receive 504 Gateway Timeout.
     request_timeout: ?[]const u8 = null,
-    /// List of model names to preload at startup (Ollama-compatible). These models are loaded immediately when inference starts, avoiding first-request latency. Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5"). Only effective when keep_alive is non-zero (lazy loading mode).
+    /// Typed models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
+    warm_models: ?[]const WarmModel = null,
+    /// Legacy list of generator model names to preload at startup. These models are loaded immediately when inference starts, avoiding first-request latency. Prefer warm_models for new config because it records the model kind and optional backend.
     preload: ?[]const []const u8 = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,

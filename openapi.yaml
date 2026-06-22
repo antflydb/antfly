@@ -18278,6 +18278,35 @@ components:
         arguments:
           type: string
           description: Incremental arguments JSON string
+    InferenceWarmModel:
+      type: object
+      required:
+        - kind
+        - name
+      properties:
+        kind:
+          type: string
+          enum:
+            - generator
+            - embedder
+            - reranker
+            - chunker
+            - classifier
+            - recognizer
+            - rewriter
+            - reader
+            - transcriber
+            - extractor
+        name:
+          type: string
+        backend:
+          type: string
+          enum:
+            - native
+            - onnx
+            - metal
+            - cuda
+            - wasm
     InferenceConfig:
       type: object
       required:
@@ -18436,21 +18465,34 @@ components:
             Requests exceeding this timeout receive 504 Gateway Timeout.
           default: '0'
           example: 30s
+        warm_models:
+          type: array
+          description: >
+            Typed models to preload and warm at startup. Generators run a tiny
+
+            generation request so native/Metal weights, KV setup, and kernels use
+
+            the same budgeted path as request-time generation. Other model kinds
+
+            use the best available warm path for that kind.
+          items:
+            $ref: '#/components/schemas/InferenceWarmModel'
+          example:
+            - kind: generator
+              name: gemma-e2b
+              backend: metal
         preload:
           type: array
           items:
             type: string
           description: >
-            List of model names to preload at startup (Ollama-compatible).
+            Legacy list of generator model names to preload at startup.
 
             These models are loaded immediately when inference starts, avoiding first-request latency.
 
-            Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
-
-            Only effective when keep_alive is non-zero (lazy loading mode).
+            Prefer warm_models for new config because it records the model kind and optional backend.
           example:
-            - BAAI/bge-small-en-v1.5
-            - openai/clip-vit-base-patch32
+            - gemma-e2b
         max_memory_mb:
           type: integer
           description: >

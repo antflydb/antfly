@@ -389,6 +389,7 @@ pub const InferenceGenerateChunkChoice = types.InferenceGenerateChunkChoice;
 pub const InferenceGenerateDelta = types.InferenceGenerateDelta;
 pub const InferenceToolCallDelta = types.InferenceToolCallDelta;
 pub const InferenceToolCallFunctionDelta = types.InferenceToolCallFunctionDelta;
+pub const InferenceWarmModel = types.InferenceWarmModel;
 pub const InferenceConfig = types.InferenceConfig;
 pub const InferenceBackendRuntimes = types.InferenceBackendRuntimes;
 pub const InferenceTextChunkOptions = types.InferenceTextChunkOptions;

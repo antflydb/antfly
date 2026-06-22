@@ -98,6 +98,7 @@ pub const NodeConfig = struct {
     ml_dir: []const u8 = "./ml",
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
+    warm_models: []const WarmModel = &.{},
     warm_generators: []const []const u8 = &.{},
     warm_generator_backend: ?backends_mod.BackendType = null,
     keep_alive_ms: u64 = 300_000,
@@ -105,6 +106,25 @@ pub const NodeConfig = struct {
     max_concurrent_requests: usize = 32,
     pool_size: usize = 2,
     generation_budget_overrides: BudgetOverrides = .{},
+};
+
+pub const WarmModelKind = enum {
+    generator,
+    embedder,
+    reranker,
+    chunker,
+    classifier,
+    recognizer,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+};
+
+pub const WarmModel = struct {
+    kind: WarmModelKind = .generator,
+    name: []const u8,
+    backend: ?backends_mod.BackendType = null,
 };
 
 pub const ai_api_prefix = "/ai/v1";
@@ -617,6 +637,33 @@ pub const Node = struct {
         total_ms: u64 = 0,
     };
 
+    fn countPromptTokens(
+        allocator: std.mem.Allocator,
+        model: *model_manager_mod.LoadedModel,
+        messages: []const generation.Message,
+    ) !usize {
+        const prompt = if (model.chat_tmpl) |ct|
+            try ct.apply(allocator, messages, true)
+        else
+            try generation.formatMessages(allocator, messages);
+        defer allocator.free(prompt);
+
+        var encoded = try generation.encodePromptForGeneration(
+            model.getTokenizer(),
+            allocator,
+            prompt,
+            2048,
+            model.manifest.add_bos_token,
+            model.manifest.bos_token,
+        );
+        defer encoded.deinit();
+
+        var prompt_tokens: usize = 0;
+        while (prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[prompt_tokens] != 0) : (prompt_tokens += 1) {}
+        if (prompt_tokens == 0) return error.EmptyPrompt;
+        return prompt_tokens;
+    }
+
     fn generateMessagesDirectMaxTokens(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -656,10 +703,46 @@ pub const Node = struct {
             .pjrt, .onnx, .wasm => return error.UnsupportedGeneratorProvider,
         };
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, backend_kind);
+        const budget_backend_class: runtime.tier.memory.BackendClass = switch (backend_kind) {
+            .native => .cpu,
+            .metal, .cuda => .gpu,
+        };
+        const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
+            model.session,
+            runtime.tier.memory.defaultLimitsForBackend(budget_backend_class),
+        ));
+        var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
+        const prompt_tokens = try countPromptTokens(allocator, model, messages);
+        run_budget.reserveEstimate(runtime.tier.memory.estimateGptGeneration(
+            backend_kind,
+            kv_dtype,
+            gpt_config,
+            prompt_tokens,
+            @intCast(@max(max_tokens, 1)),
+            256,
+        )) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                var buf: [512]u8 = undefined;
+                std.log.warn("{s}", .{
+                    session_factory.memoryBudgetExceededDetail(model.session, &run_budget, &buf) catch
+                        "request exceeds native generation memory budget",
+                });
+            }
+            return err;
+        };
 
         var kv_manager = runtime.kv.manager.KvManager.init(allocator);
         defer kv_manager.deinit();
-        var cb = try session_factory.getComputeBackend(model.session, allocator);
+        var cb = session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget) catch |err| {
+            if (err == error.MemoryBudgetExceeded) {
+                var buf: [512]u8 = undefined;
+                std.log.warn("{s}", .{
+                    session_factory.memoryBudgetExceededDetail(model.session, &run_budget, &buf) catch
+                        "request exceeds native generation memory budget",
+                });
+            }
+            return err;
+        };
         defer cb.deinit();
 
         const sliding_window_size: ?u32 = if (gpt_config.position_encoding == .absolute)
@@ -729,15 +812,33 @@ pub const Node = struct {
         return try allocator.dupe(u8, result.text);
     }
 
-    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+    pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
+        for (self.config.warm_models) |model| try self.warmModel(allocator, model);
         for (self.config.warm_generators) |model_name| try self.warmGenerator(allocator, model_name);
     }
 
+    pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
+        try self.warmConfiguredModels(allocator);
+    }
+
+    pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        switch (model.kind) {
+            .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend),
+            .embedder => try self.warmEmbedder(allocator, model.name, model.backend),
+            .reranker => try self.warmReranker(allocator, model.name, model.backend),
+            .chunker, .classifier, .recognizer, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
+        }
+    }
+
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
+        try self.warmGeneratorWithBackend(allocator, model_name, self.config.warm_generator_backend);
+    }
+
+    fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
         if (model_name.len == 0) return error.InvalidGenerationRequest;
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference generator model={s}", .{model_name});
-        const preferred_backends = if (self.config.warm_generator_backend) |backend| singleBackendPreference(backend) else null;
+        const preferred_backends = if (backend) |value| singleBackendPreference(value) else null;
         const messages = [_]generation.Message{.{
             .role = "user",
             .content = "ping",
@@ -757,6 +858,86 @@ pub const Node = struct {
                 timing.generate_ms,
             },
         );
+    }
+
+    fn warmEmbedder(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+        if (model_name.len == 0) return error.InvalidGenerationRequest;
+        const started_at_ns = embedTimingNowNs();
+        std.log.info("warming inference embedder model={s}", .{model_name});
+        const texts = [_][]const u8{"ping"};
+
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model_name, "embedders");
+        const model = if (backend) |value|
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+        else
+            try self.model_manager.loadFromDir(model_path);
+
+        if (model.manifest.hasCapability("sparse")) {
+            var pipeline = sparse_embedding_mod.SparseEmbeddingPipeline{
+                .allocator = allocator,
+                .session = model.session,
+                .tok = model.getTokenizer(),
+                .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&model.manifest),
+            };
+            const sparse = try pipeline.embed(&texts);
+            defer {
+                for (sparse) |*item| item.deinit(allocator);
+                allocator.free(sparse);
+            }
+        } else {
+            try model.ensureEmbeddingAssets(true, false, false);
+            var pipeline = model.embeddingPipeline(allocator);
+            const embeddings = try pipeline.embed(&texts);
+            defer {
+                for (embeddings) |embedding| allocator.free(embedding);
+                allocator.free(embeddings);
+            }
+        }
+        std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
+    }
+
+    fn warmReranker(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {
+        if (model_name.len == 0) return error.InvalidGenerationRequest;
+        const started_at_ns = embedTimingNowNs();
+        std.log.info("warming inference reranker model={s}", .{model_name});
+        const documents = [_][]const u8{"pong"};
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model_name, "rerankers");
+        const model = if (backend) |value|
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(value), false)
+        else
+            try self.model_manager.loadFromDir(model_path);
+        var pipeline = model.rerankingPipeline(allocator);
+        const scores = try pipeline.rerank("ping", &documents);
+        defer allocator.free(scores);
+        std.log.info("warmed inference reranker model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
+    }
+
+    fn warmLoadOnlyModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.name.len == 0) return error.InvalidGenerationRequest;
+        const task_dir = switch (model.kind) {
+            .chunker => "chunkers",
+            .classifier => "classifiers",
+            .recognizer => "recognizers",
+            .rewriter => "rewriters",
+            .reader => "readers",
+            .transcriber => "transcribers",
+            .extractor => "extractors",
+            else => return error.UnsupportedWarmModelKind,
+        };
+        const started_at_ns = embedTimingNowNs();
+        std.log.info("loading inference {s} model={s}", .{ @tagName(model.kind), model.name });
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model.name, task_dir);
+        _ = if (model.backend) |backend|
+            try self.model_manager.loadFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
+        else
+            try self.model_manager.loadFromDir(model_path);
+        std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
 
     pub fn embedDenseJsonInputDirect(
