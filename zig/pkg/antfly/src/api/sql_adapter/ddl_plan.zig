@@ -10332,6 +10332,118 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CALL rotate_usage(1);"));
 }
 
+test "sql adapter ddl plan lowers authorization catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var grant_privilege = try lowerDdlPlanForTestAlloc(alloc, "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;");
+    defer grant_privilege.deinit(alloc);
+    switch (grant_privilege) {
+        .authorization_catalog => |plan| switch (plan) {
+            .grant_privilege => |grant| {
+                try std.testing.expectEqual(@as(usize, 2), grant.privileges.len);
+                try std.testing.expectEqualStrings("SELECT", grant.privileges[0]);
+                try std.testing.expectEqualStrings("INSERT", grant.privileges[1]);
+                try std.testing.expectEqualStrings("TABLE", grant.object_kind);
+                try std.testing.expectEqualStrings("usage_records", grant.object_name);
+                try std.testing.expectEqualStrings("app_writer", grant.principal_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var grant_all_tables = try lowerDdlPlanForTestAlloc(alloc, "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_writer;");
+    defer grant_all_tables.deinit(alloc);
+    switch (grant_all_tables) {
+        .authorization_catalog => |plan| switch (plan) {
+            .grant_privilege => |grant| {
+                try std.testing.expectEqual(@as(usize, 1), grant.privileges.len);
+                try std.testing.expectEqualStrings("ALL", grant.privileges[0]);
+                try std.testing.expectEqualStrings("ALL_TABLES_IN_SCHEMA", grant.object_kind);
+                try std.testing.expectEqualStrings("public", grant.object_name);
+                try std.testing.expectEqualStrings("app_writer", grant.principal_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var revoke_privilege = try lowerDdlPlanForTestAlloc(alloc, "REVOKE INSERT ON TABLE usage_records FROM app_writer;");
+    defer revoke_privilege.deinit(alloc);
+    switch (revoke_privilege) {
+        .authorization_catalog => |plan| switch (plan) {
+            .revoke_privilege => |revoke| {
+                try std.testing.expectEqual(@as(usize, 1), revoke.privileges.len);
+                try std.testing.expectEqualStrings("INSERT", revoke.privileges[0]);
+                try std.testing.expectEqualStrings("TABLE", revoke.object_kind);
+                try std.testing.expectEqualStrings("usage_records", revoke.object_name);
+                try std.testing.expectEqualStrings("app_writer", revoke.principal_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_role = try lowerDdlPlanForTestAlloc(alloc, "CREATE ROLE app_writer;");
+    defer create_role.deinit(alloc);
+    switch (create_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .create_role => |create| try std.testing.expectEqualStrings("app_writer", create.role_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_role = try lowerDdlPlanForTestAlloc(alloc, "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = current_setting('app.tenant_id');");
+    defer alter_role.deinit(alloc);
+    switch (alter_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter| {
+                try std.testing.expectEqualStrings("app_writer", alter.role_name);
+                try std.testing.expectEqualStrings("appdb", alter.database_name.?);
+                try std.testing.expectEqual(AlterRolePlan.Operation.set, alter.operation);
+                try std.testing.expectEqual(AlterRolePlan.SettingKind.app, alter.setting_kind);
+                try std.testing.expectEqualStrings("app.tenant_id", alter.setting_name);
+                switch (alter.setting_value orelse return error.TestUnexpectedResult) {
+                    .current_setting => |name| try std.testing.expectEqualStrings("app.tenant_id", name),
+                    .literal => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var reset_role = try lowerDdlPlanForTestAlloc(alloc, "ALTER ROLE app_writer RESET statement_timeout;");
+    defer reset_role.deinit(alloc);
+    switch (reset_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .alter_role => |alter| {
+                try std.testing.expectEqualStrings("app_writer", alter.role_name);
+                try std.testing.expectEqual(AlterRolePlan.Operation.reset, alter.operation);
+                try std.testing.expectEqual(AlterRolePlan.SettingKind.runtime, alter.setting_kind);
+                try std.testing.expectEqualStrings("statement_timeout", alter.setting_name);
+                try std.testing.expect(alter.setting_value == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_role = try lowerDdlPlanForTestAlloc(alloc, "DROP ROLE IF EXISTS app_writer;");
+    defer drop_role.deinit(alloc);
+    switch (drop_role) {
+        .authorization_catalog => |plan| switch (plan) {
+            .drop_role => |drop| {
+                try std.testing.expectEqualStrings("app_writer", drop.role_name);
+                try std.testing.expect(drop.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     const alloc = std.testing.allocator;
 

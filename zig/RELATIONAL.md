@@ -5454,15 +5454,14 @@ but it must not bypass row-batch, mutation-source, or routed read semantics.
 Legacy `COPY ... WITH (OIDS false)` is accepted as an explicit compatibility
 no-op and lowers to the same typed bulk-I/O plan as ordinary `COPY`; requesting
 row OIDs with `OIDS true` still fails closed because Antfly has no native row OID
-model. Until alternate stream endpoints, binary format, legacy OID-producing
-options, and broader row-filtered `COPY FROM ... WHERE` predicate families have
-native bulk-I/O endpoint and validation contracts, the source parity corpus
-requires them to fail closed under `bulk_io_plan` or at the execution-bridge
-boundary. The generated fixture can pin either a concrete `bulk_sql_io`
-execution fingerprint or an execution-stage unsupported fingerprint, so parseable
-PostgreSQL syntax such as `COPY ... WITH (FORMAT binary)` remains visible as
-typed bulk-I/O intent while the bridge rejects it before storage can receive
-bytes.
+model. The source parity corpus pins concrete `bulk_sql_io` execution
+fingerprints for `STDIN` / `STDOUT`, file, and program endpoints, text/CSV and
+binary codecs, copy option validation, and row-filtered `COPY FROM ... WHERE`
+intent. Invalid stream direction such as `COPY ... TO STDIN` and OID-producing
+legacy options remain explicit fail-closed `bulk_io_plan` classifications, while
+runtime endpoint authorization, protocol backpressure, and environment-specific
+stream availability stay in the execution bridge before storage can receive or
+emit bytes.
 
 PostgreSQL function and procedure lifecycle DDL lowers to typed routine-catalog
 intent that captures routine kind, name, arity, replacement, return type,

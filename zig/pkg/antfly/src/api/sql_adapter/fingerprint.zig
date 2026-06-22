@@ -2104,3 +2104,76 @@ test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CALL rotate_usage(1);"));
 }
+
+test "sql adapter ddl fingerprint owns authorization catalog ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;",
+            .fingerprint = "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=2",
+        },
+        .{
+            .sql = "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;",
+            .fingerprint = "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
+        },
+        .{
+            .sql = "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;",
+            .fingerprint = "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+        },
+        .{
+            .sql = "REVOKE INSERT ON TABLE usage_records FROM app_writer;",
+            .fingerprint = "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
+        },
+        .{
+            .sql = "CREATE ROLE app_writer;",
+            .fingerprint = "ddl:create_role:role=app_writer",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer SET app.tenant_id = 'acme';",
+            .fingerprint = "ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer IN DATABASE appdb SET app.tenant_id = 'acme';",
+            .fingerprint = "ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=app.tenant_id",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer RESET app.tenant_id;",
+            .fingerprint = "ddl:alter_role:role=app_writer:operation=reset:setting=app.tenant_id",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer IN DATABASE appdb RESET app.tenant_id;",
+            .fingerprint = "ddl:alter_role:role=app_writer:database=appdb:operation=reset:setting=app.tenant_id",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer SET statement_timeout = '1ms';",
+            .fingerprint = "ddl:alter_role:role=app_writer:operation=set:setting=statement_timeout:setting_kind=runtime",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer IN DATABASE appdb SET statement_timeout = '1ms';",
+            .fingerprint = "ddl:alter_role:role=app_writer:database=appdb:operation=set:setting=statement_timeout:setting_kind=runtime",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer RESET statement_timeout;",
+            .fingerprint = "ddl:alter_role:role=app_writer:operation=reset:setting=statement_timeout:setting_kind=runtime",
+        },
+        .{
+            .sql = "ALTER ROLE app_writer SET app.tenant_id = current_setting('app.tenant_id');",
+            .fingerprint = "ddl:alter_role:role=app_writer:operation=set:setting=app.tenant_id:value_source=current_setting",
+        },
+        .{
+            .sql = "DROP ROLE IF EXISTS app_writer;",
+            .fingerprint = "ddl:drop_role:role=app_writer:if_exists=true",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}

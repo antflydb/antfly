@@ -1,7 +1,6 @@
 {
   "requirement_format": 1,
   "required": [
-    "bulk_io_plan",
     "cte_mutation_source_plan",
     "multi_table_generation_barrier",
     "routine_body_plan",

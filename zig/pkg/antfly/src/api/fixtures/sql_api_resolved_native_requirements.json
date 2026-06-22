@@ -2,6 +2,21 @@
   "resolution_format": 1,
   "resolved": [
     {
+      "reason": "bulk_io_plan",
+      "coverage": [
+        "ddl_copy_binary_execution_contract",
+        "ddl_copy_file_endpoint",
+        "ddl_copy_from_execution_contract",
+        "ddl_copy_from_text_execution_contract",
+        "ddl_copy_program_endpoint",
+        "ddl_copy_to_execution_contract",
+        "ddl_copy_to_text_execution_contract",
+        "ddl_copy_where_expression",
+        "unsupported_ddl_copy_unsupported_options",
+        "unsupported_ddl_copy_wrong_stream_endpoint"
+      ]
+    },
+    {
       "reason": "duplicate_conflict_update_target",
       "coverage": [
         "invalid_duplicate_conflict_update_target"
