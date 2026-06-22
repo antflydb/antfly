@@ -3915,6 +3915,41 @@ pub fn appendStringFingerprintAlloc(
     return out;
 }
 
+fn appendSelectAllExtraOutputsFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]u8 {
+    if (!query.select_all) return owned_base;
+    var fingerprint = owned_base;
+    for (query.json_extract, 0..) |projection, index| {
+        const label = try std.fmt.allocPrint(alloc, "select_all_json{d}", .{index});
+        defer alloc.free(label);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, label, projection.output);
+    }
+    for (query.array_length, 0..) |projection, index| {
+        const label = try std.fmt.allocPrint(alloc, "select_all_array_len{d}", .{index});
+        defer alloc.free(label);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, label, projection.output);
+    }
+    for (query.coalesce, 0..) |projection, index| {
+        const label = try std.fmt.allocPrint(alloc, "select_all_coalesce{d}", .{index});
+        defer alloc.free(label);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, label, projection.output);
+    }
+    for (query.field_aliases, 0..) |projection, index| {
+        const label = try std.fmt.allocPrint(alloc, "select_all_alias{d}", .{index});
+        defer alloc.free(label);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, label, projection.output);
+    }
+    for (query.expressions, 0..) |projection, index| {
+        const label = try std.fmt.allocPrint(alloc, "select_all_expr{d}", .{index});
+        defer alloc.free(label);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, label, projection.output);
+    }
+    return fingerprint;
+}
+
 pub fn appParityLimitValue(limit: ?u32) i64 {
     return if (limit) |value| @intCast(value) else -1;
 }
@@ -3935,7 +3970,7 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
     const order_expr = expressionOrderCount(query.order_by);
     const distinct_on_count = query.distinct_on.len + query.distinct_on_expressions.len;
     if (distinct_on_count > 0) {
-        return try std.fmt.allocPrint(
+        return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
             alloc,
             "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:distinct_on={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
             .{
@@ -3956,10 +3991,10 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                 appParityLimitValue(query.limit),
                 claim,
             },
-        );
+        ), query);
     }
     if (ctes > 0 or query.source_cte.len > 0) {
-        return try std.fmt.allocPrint(
+        return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
             alloc,
             "{s}:table={s}:ctes={d}:source_cte={d}:pred={d}:array_any={d}:expr_pred={d}:expr_or={d}:expr_not={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
             .{
@@ -3984,10 +4019,10 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                 appParityLimitValue(query.limit),
                 claim,
             },
-        );
+        ), query);
     }
     if (query.array_any.len > 0 or query.expression_or_predicates.len > 0 or query.expression_not_predicates.len > 0) {
-        return try std.fmt.allocPrint(
+        return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
             alloc,
             "{s}:table={s}:ctes={d}:pred={d}:array_any={d}:expr_pred={d}:expr_or={d}:expr_not={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
             .{
@@ -4011,11 +4046,11 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                 appParityLimitValue(query.limit),
                 claim,
             },
-        );
+        ), query);
     }
     if (query.expression_array_contains.len > 0) {
         if (query.limit) |limit| {
-            return try std.fmt.allocPrint(
+            return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
                 alloc,
                 "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
                 .{
@@ -4036,9 +4071,9 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                     limit,
                     claim,
                 },
-            );
+            ), query);
         }
-        return try std.fmt.allocPrint(
+        return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
             alloc,
             "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
             .{
@@ -4058,11 +4093,11 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                 order_expr,
                 claim,
             },
-        );
+        ), query);
     }
     if (query.text_patterns.len > 0) {
         if (query.limit) |limit| {
-            return try std.fmt.allocPrint(
+            return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
                 alloc,
                 "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:text_pattern={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
                 .{
@@ -4083,9 +4118,9 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                     limit,
                     claim,
                 },
-            );
+            ), query);
         }
-        return try std.fmt.allocPrint(
+        return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
             alloc,
             "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:text_pattern={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
             .{
@@ -4105,10 +4140,10 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                 order_expr,
                 claim,
             },
-        );
+        ), query);
     }
     if (query.limit) |limit| {
-        return try std.fmt.allocPrint(
+        return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
             alloc,
             "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
             .{
@@ -4128,9 +4163,9 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
                 limit,
                 claim,
             },
-        );
+        ), query);
     }
-    return try std.fmt.allocPrint(
+    return try appendSelectAllExtraOutputsFingerprintAlloc(alloc, try std.fmt.allocPrint(
         alloc,
         "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
         .{
@@ -4149,7 +4184,7 @@ pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table
             order_expr,
             claim,
         },
-    );
+    ), query);
 }
 
 pub fn appendQueryAccessPathFingerprintAlloc(
@@ -6269,6 +6304,35 @@ test "sql adapter corpus appends owned fingerprint fields" {
     try std.testing.expectEqualStrings("query:table=usage_records", unchanged);
 }
 
+test "sql adapter corpus fingerprints select all extra output labels from plan structure" {
+    const alloc = std.testing.allocator;
+
+    var query: db_mod.types.RelationalRowsQueryRequest = .{
+        .select_all = true,
+        .field_aliases = &.{.{ .field = "status", .output = "status_2" }},
+        .expressions = &.{.{
+            .output = "status_3",
+            .expression = .{ .kind = .lower, .field = "status" },
+        }},
+        .limit = 10,
+    };
+    const limited = try queryFingerprintAlloc(alloc, "query", "usage_records", query, 0);
+    defer alloc.free(limited);
+    try std.testing.expect(planHasExactStringToken(limited, ":select_all_alias0=", "status_2"));
+    try std.testing.expect(planHasExactStringToken(limited, ":select_all_expr0=", "status_3"));
+
+    query.limit = null;
+    query.text_patterns = &.{.{
+        .field = "status",
+        .op = .like,
+        .pattern = "active%",
+    }};
+    const text_pattern = try queryFingerprintAlloc(alloc, "query", "usage_records", query, 0);
+    defer alloc.free(text_pattern);
+    try std.testing.expect(planHasExactStringToken(text_pattern, ":select_all_alias0=", "status_2"));
+    try std.testing.expect(planHasExactStringToken(text_pattern, ":select_all_expr0=", "status_3"));
+}
+
 test "sql adapter corpus string token matching is exact and unique" {
     const plan = "query:table=usage_records:claim=no_key_update_nowait:limit=none";
     try std.testing.expect(planHasExactStringToken(plan, ":claim=", "no_key_update_nowait"));
@@ -7401,6 +7465,7 @@ pub const AppParityCorpusCoverage = struct {
     read_set_operation_cross_table_source_schema_classifier: bool = false,
     read_window_duplicate_output_label: bool = false,
     query: bool = false,
+    query_select_all_disambiguated_outputs: bool = false,
     aggregate: bool = false,
     join: bool = false,
     lateral: bool = false,
@@ -9520,6 +9585,11 @@ pub const AppParityCorpusCoverage = struct {
             "_text_pattern=",
             ":source_text_pattern=",
         });
+        self.query_select_all_disambiguated_outputs = self.query_select_all_disambiguated_outputs or
+            (entry.family == .query and
+                sql_adapter.planHasExactBoolToken(entry.plan, "select_all=", true) and
+                planHasExactStringToken(entry.plan, ":select_all_alias0=", "status_3") and
+                planHasExactStringToken(entry.plan, ":select_all_expr0=", "status_2"));
         self.query_access_or_predicates = self.query_access_or_predicates or
             entry.family == .query and sql_adapter.planHasNonZeroToken(entry.plan, ":access_or=");
         self.query_array_overlap_access_or = self.query_array_overlap_access_or or

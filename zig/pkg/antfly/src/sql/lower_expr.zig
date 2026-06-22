@@ -8564,6 +8564,72 @@ pub fn selectListOutputCount(
     return count;
 }
 
+fn selectProjectionOutputCollision(
+    schema: runtime_schema.TableSchema,
+    select_all: bool,
+    fields: []const []const u8,
+    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
+    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
+    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
+    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
+    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    output: []const u8,
+) bool {
+    if (select_all and binder.relationalColumnForField(schema, output, null) != null) return true;
+    return selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, output) > 0;
+}
+
+fn allocateDisambiguatedSelectProjectionOutputAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    select_all: bool,
+    fields: []const []const u8,
+    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
+    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
+    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
+    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
+    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    output: []const u8,
+) !?[]const u8 {
+    if (!select_all) return null;
+    if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, output)) return null;
+
+    var suffix: usize = 2;
+    while (true) : (suffix += 1) {
+        const candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ output, suffix });
+        if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, candidate)) return candidate;
+        alloc.free(candidate);
+    }
+}
+
+fn disambiguateSelectProjectionOutputIfNeededAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    select_all: bool,
+    fields: []const []const u8,
+    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
+    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
+    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
+    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
+    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+    output: *[]const u8,
+) !void {
+    const disambiguated = try allocateDisambiguatedSelectProjectionOutputAlloc(
+        alloc,
+        schema,
+        select_all,
+        fields,
+        json_extract,
+        array_length,
+        coalesce,
+        field_aliases,
+        expressions,
+        output.*,
+    ) orelse return;
+    alloc.free(output.*);
+    output.* = disambiguated;
+}
+
 pub fn validateSelectListOutputs(
     schema: runtime_schema.TableSchema,
     select_all: bool,
@@ -20218,44 +20284,101 @@ pub fn parseSelectListAlloc(
         errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
         switch (item) {
             .field => |field| {
-                if (select_all) return error.UnsupportedSqlShape;
                 item_transferred = true;
                 var field_transferred = false;
                 errdefer if (!field_transferred) alloc.free(field);
-                try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });
-                try fields.append(alloc, field);
-                field_transferred = true;
+                if (select_all) {
+                    var output: []const u8 = try alloc.dupe(u8, field);
+                    var output_transferred = false;
+                    errdefer if (!output_transferred) alloc.free(output);
+                    try disambiguateSelectProjectionOutputIfNeededAlloc(
+                        alloc,
+                        options.output_schema,
+                        select_all,
+                        fields.items,
+                        json_extract.items,
+                        array_length.items,
+                        coalesce.items,
+                        field_aliases.items,
+                        expressions.items,
+                        &output,
+                    );
+                    try outputs.append(alloc, .{ .kind = .field_alias, .index = field_aliases.items.len });
+                    try field_aliases.append(alloc, .{ .field = field, .output = output });
+                    field_transferred = true;
+                    output_transferred = true;
+                } else {
+                    try outputs.append(alloc, .{ .kind = .field, .index = fields.items.len });
+                    try fields.append(alloc, field);
+                    field_transferred = true;
+                }
             },
             .json_extract => |projection_value| {
                 item_transferred = true;
-                const projection = projection_value;
+                var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) {
                     alloc.free(projection.output);
                     alloc.free(projection.field);
                     alloc.free(projection.path);
                 };
+                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    alloc,
+                    options.output_schema,
+                    select_all,
+                    fields.items,
+                    json_extract.items,
+                    array_length.items,
+                    coalesce.items,
+                    field_aliases.items,
+                    expressions.items,
+                    &projection.output,
+                );
                 try outputs.append(alloc, .{ .kind = .json_extract, .index = json_extract.items.len });
                 try json_extract.append(alloc, projection);
                 projection_transferred = true;
             },
             .array_length => |projection_value| {
                 item_transferred = true;
-                const projection = projection_value;
+                var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) {
                     alloc.free(projection.output);
                     alloc.free(projection.field);
                 };
+                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    alloc,
+                    options.output_schema,
+                    select_all,
+                    fields.items,
+                    json_extract.items,
+                    array_length.items,
+                    coalesce.items,
+                    field_aliases.items,
+                    expressions.items,
+                    &projection.output,
+                );
                 try outputs.append(alloc, .{ .kind = .array_length, .index = array_length.items.len });
                 try array_length.append(alloc, projection);
                 projection_transferred = true;
             },
             .coalesce => |projection_value| {
                 item_transferred = true;
-                const projection = projection_value;
+                var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) plan_mod.freeCoalesceProjection(alloc, projection);
+                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    alloc,
+                    options.output_schema,
+                    select_all,
+                    fields.items,
+                    json_extract.items,
+                    array_length.items,
+                    coalesce.items,
+                    field_aliases.items,
+                    expressions.items,
+                    &projection.output,
+                );
                 const expression_projection = try plan_mod.expressionProjectionFromCoalesceAlloc(alloc, projection);
                 var expression_projection_transferred = false;
                 errdefer if (!expression_projection_transferred) freeExpressionProjection(alloc, expression_projection);
@@ -20267,21 +20390,45 @@ pub fn parseSelectListAlloc(
             },
             .expression => |projection_value| {
                 item_transferred = true;
-                const projection = projection_value;
+                var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) freeExpressionProjection(alloc, projection);
+                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    alloc,
+                    options.output_schema,
+                    select_all,
+                    fields.items,
+                    json_extract.items,
+                    array_length.items,
+                    coalesce.items,
+                    field_aliases.items,
+                    expressions.items,
+                    &projection.output,
+                );
                 try outputs.append(alloc, .{ .kind = .expression, .index = expressions.items.len });
                 try expressions.append(alloc, projection);
                 projection_transferred = true;
             },
             .field_alias => |projection_value| {
                 item_transferred = true;
-                const projection = projection_value;
+                var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) {
                     alloc.free(projection.output);
                     alloc.free(projection.field);
                 };
+                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    alloc,
+                    options.output_schema,
+                    select_all,
+                    fields.items,
+                    json_extract.items,
+                    array_length.items,
+                    coalesce.items,
+                    field_aliases.items,
+                    expressions.items,
+                    &projection.output,
+                );
                 try outputs.append(alloc, .{ .kind = .field_alias, .index = field_aliases.items.len });
                 try field_aliases.append(alloc, projection);
                 projection_transferred = true;
@@ -30503,6 +30650,34 @@ test "sql adapter lower expr lowers string_to_array equality predicates" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, not_lowered.plan.query.expression_predicates[0].lhs.kind);
 }
 
+test "sql adapter lower expr disambiguates select all extra outputs" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT *, lower(status) AS status, status FROM usage_records ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expect(lowered.plan.query.select_all);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_2", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.field_aliases.len);
+    try std.testing.expectEqualStrings("status", lowered.plan.query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("status_3", lowered.plan.query.field_aliases[0].output);
+    try std.testing.expectEqual(@as(usize, 2), lowered.select_outputs.len);
+    try std.testing.expectEqual(ast.SelectOutputKind.expression, lowered.select_outputs[0].kind);
+    try std.testing.expectEqual(ast.SelectOutputKind.field_alias, lowered.select_outputs[1].kind);
+}
+
 test "sql adapter lower expr lowers coalesce projections" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -32465,12 +32640,31 @@ test "sql adapter lower expr compares aggregate specs" {
         .as_text = true,
     }}, &.{}, &.{}, &.{}, &.{});
     try std.testing.expectError(error.UnsupportedSqlShape, validateSelectListOutputs(select_schema, false, &.{"status"}, &.{}, &.{}, &.{}, &.{field_alias_projection}, &.{}));
+    var disambiguated_status: []const u8 = try alloc.dupe(u8, "status");
+    defer alloc.free(disambiguated_status);
+    try disambiguateSelectProjectionOutputIfNeededAlloc(alloc, select_schema, true, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &disambiguated_status);
+    try std.testing.expectEqualStrings("status_2", disambiguated_status);
+    var disambiguated_status_again: []const u8 = try alloc.dupe(u8, "status");
+    defer alloc.free(disambiguated_status_again);
+    try disambiguateSelectProjectionOutputIfNeededAlloc(alloc, select_schema, true, &.{}, &.{.{
+        .output = "status_2",
+        .field = "payload",
+        .path = "$.status",
+        .as_text = true,
+    }}, &.{}, &.{}, &.{}, &.{}, &disambiguated_status_again);
+    try std.testing.expectEqualStrings("status_3", disambiguated_status_again);
     try std.testing.expectError(error.UnsupportedSqlShape, validateSelectListOutputs(select_schema, true, &.{}, &.{.{
         .output = "status",
         .field = "payload",
         .path = "$.status",
         .as_text = true,
     }}, &.{}, &.{}, &.{}, &.{}));
+    try validateSelectListOutputs(select_schema, true, &.{}, &.{.{
+        .output = "status_2",
+        .field = "payload",
+        .path = "$.status",
+        .as_text = true,
+    }}, &.{}, &.{}, &.{}, &.{});
     const select_columns = try selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = select_schema }, .{
         .fields = &.{"status"},
         .json_extract = &.{.{ .output = "status_json", .field = "payload", .path = "$.status", .as_text = true }},

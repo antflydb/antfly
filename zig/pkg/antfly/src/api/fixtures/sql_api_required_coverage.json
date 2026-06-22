@@ -573,6 +573,7 @@
     "query_repeat_expression",
     "query_reverse_expression",
     "query_row_lock_no_key_update",
+    "query_select_all_disambiguated_outputs",
     "query_set_operation_order_limit",
     "query_split_part_expression",
     "query_starts_with_expression",

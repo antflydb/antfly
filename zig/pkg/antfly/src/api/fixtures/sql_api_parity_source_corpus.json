@@ -1769,7 +1769,7 @@
       "sql": "SELECT id FROM usage_records WHERE false OR status = 'ready' ORDER BY created_at DESC LIMIT 5"
     },
     {
-      "name": "single table select all with named extras query",
+      "name": "single table select all disambiguated extras query",
       "family": "query",
       "summary": {
         "table_name": "usage_records",
@@ -1778,8 +1778,8 @@
         "order_by": 1,
         "limit": 5
       },
-      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none:select_all=1",
-      "sql": "SELECT *, lower(status) AS status_key, metadata->>'source' AS source FROM usage_records ORDER BY id ASC LIMIT 5"
+      "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=1:order=1:order_expr=0:limit=5:claim=none:select_all_alias0=status_3:select_all_expr0=status_2:select_all=1",
+      "sql": "SELECT *, lower(status) AS status, status FROM usage_records ORDER BY id ASC LIMIT 5"
     },
     {
       "name": "single table scalar membership query",

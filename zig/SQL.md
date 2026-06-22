@@ -722,6 +722,11 @@ Current implementation status:
 - Relational SQL catalog/read parsed lowering helpers are public typed adapter
   APIs, and the HTTP routine-binding read path constructs `ParsedSql` once
   before dispatching to catalog or non-catalog lowering.
+- HTTP relational SQL DDL execution, source-backed DDL application, bulk SQL,
+  and auth-catalog DDL helpers construct `ParsedSql` once at ingress before
+  lowering DDL/session control plans, and transaction-boundary session cleanup
+  now uses parsed statement-start keyword tags instead of a raw SQL prefix
+  probe.
 - DDL plan lowering now lives behind `sql_adapter` exports; auth role/row
   security execution, catalog jobs, notifications, and extension lifecycle use
   adapter-native plan types instead of importing the broader relational SQL

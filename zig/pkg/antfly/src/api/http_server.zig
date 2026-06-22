@@ -1329,7 +1329,9 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     session: catalog_resources.SqlCatalogSession,
     function_bindings: sql_adapter.SqlFunctionBindings,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
     defer plan.deinit(alloc);
 
     if (try extension_domain.sql_adapter.executeRelationalSqlDdlPlanOnService(svc, alloc, plan)) |applied| {
@@ -4239,17 +4241,22 @@ pub const ApiHttpServer = struct {
         if (sql_adapter.sqlStatementTimeoutExpired(statement_timeout_ns, statement_start_ns, platform_time.monotonicNs())) return error.StatementTimeout;
     }
 
-    fn sqlTransactionBoundaryClearsLocalSession(sql: []const u8) bool {
-        const trimmed = std.mem.trim(u8, sql, " \t\r\n");
-        return sqlFirstKeywordEquals(trimmed, "commit") or sqlFirstKeywordEquals(trimmed, "rollback");
-    }
-
-    fn sqlFirstKeywordEquals(sql: []const u8, expected: []const u8) bool {
-        if (sql.len < expected.len) return false;
-        if (!std.ascii.eqlIgnoreCase(sql[0..expected.len], expected)) return false;
-        if (sql.len == expected.len) return true;
-        const next = sql[expected.len];
-        return next == ';' or next == ' ' or next == '\t' or next == '\r' or next == '\n';
+    fn parsedSqlTransactionBoundaryClearsLocalSession(parsed_sql: *const sql_adapter.ParsedSql) bool {
+        const tokens = parsed_sql.items();
+        const raw = parsed_sql.statement.raw();
+        if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return false;
+        const first = tokens[raw.token_start];
+        const next = raw.token_start + 1;
+        if (first.matchesKeywordTag(.commit)) {
+            return next >= raw.token_end or !tokens[next].matchesKeywordTag(.prepared);
+        }
+        if (first.matchesKeywordTag(.rollback)) {
+            return next >= raw.token_end or
+                (!tokens[next].matchesKeywordTag(.prepared) and
+                    !tokens[next].matchesKeywordTag(.to) and
+                    !tokens[next].matchesKeywordTag(.savepoint));
+        }
+        return false;
     }
 
     pub fn applyRelationalSqlDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -4261,7 +4268,9 @@ pub const ApiHttpServer = struct {
         const function_bindings: sql_adapter.SqlFunctionBindings = .{
             .routine_expressions = routine_bindings,
         };
-        var plan = sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(self.alloc, sql, function_bindings) catch |err| switch (err) {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        var plan = sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, &parsed_sql, function_bindings) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
                 if (try self.applySqlRoutineTriggerDdlAlloc(sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
                 return err;
@@ -4272,7 +4281,7 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         switch (plan) {
             .adapter_noop => |noop| {
-                if (noop.reason == .transaction_control and sqlTransactionBoundaryClearsLocalSession(sql)) {
+                if (noop.reason == .transaction_control and parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql)) {
                     try session.clearTransactionLocalState(self.alloc);
                     var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
                     applied.noop = true;
@@ -4576,7 +4585,9 @@ pub const ApiHttpServer = struct {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
-        var ddl_plan = try sql_adapter.lowerDdlPlanAlloc(self.alloc, sql);
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        var ddl_plan = try sql_adapter.lowerDdlPlanParsedSqlAlloc(self.alloc, &parsed_sql);
         defer ddl_plan.deinit(self.alloc);
         const bulk_plan = switch (ddl_plan) {
             .bulk_io => |plan| plan,
@@ -4606,7 +4617,9 @@ pub const ApiHttpServer = struct {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
-        var ddl_plan = try sql_adapter.lowerDdlPlanAlloc(self.alloc, sql);
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        var ddl_plan = try sql_adapter.lowerDdlPlanParsedSqlAlloc(self.alloc, &parsed_sql);
         defer ddl_plan.deinit(self.alloc);
         const bulk_plan = switch (ddl_plan) {
             .bulk_io => |plan| plan,
@@ -4671,7 +4684,9 @@ pub const ApiHttpServer = struct {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
-        var ddl_plan = try sql_adapter.lowerDdlPlanAlloc(self.alloc, sql);
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        var ddl_plan = try sql_adapter.lowerDdlPlanParsedSqlAlloc(self.alloc, &parsed_sql);
         defer ddl_plan.deinit(self.alloc);
         const bulk_plan = switch (ddl_plan) {
             .bulk_io => |plan| plan,
@@ -5114,7 +5129,12 @@ pub const ApiHttpServer = struct {
     }
 
     fn sqlAuthCatalogForDdlWithSession(self: *ApiHttpServer, sql: []const u8, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
-        var plan = sql_adapter.lowerDdlPlanAlloc(self.alloc, sql) catch |err| switch (err) {
+        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return .{},
+            else => return err,
+        };
+        defer parsed_sql.deinit(self.alloc);
+        var plan = sql_adapter.lowerDdlPlanParsedSqlAlloc(self.alloc, &parsed_sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return .{},
             else => return err,
         };
@@ -22660,6 +22680,30 @@ test "api http server applies SQL DDL with explicit catalog session" {
     try std.testing.expectEqualStrings("tenant-a", session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 }
 
+test "api http server classifies SQL transaction session cleanup from parsed statements" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        clears: bool,
+    }{
+        .{ .sql = "COMMIT;", .clears = true },
+        .{ .sql = "COMMIT WORK;", .clears = true },
+        .{ .sql = "ROLLBACK;", .clears = true },
+        .{ .sql = "ROLLBACK WORK;", .clears = true },
+        .{ .sql = "COMMIT PREPARED 'usage_batch';", .clears = false },
+        .{ .sql = "ROLLBACK PREPARED 'usage_batch';", .clears = false },
+        .{ .sql = "ROLLBACK TO SAVEPOINT before_retry;", .clears = false },
+        .{ .sql = "ROLLBACK TO before_retry;", .clears = false },
+        .{ .sql = "BEGIN;", .clears = false },
+        .{ .sql = "START TRANSACTION;", .clears = false },
+    };
+    for (cases) |case| {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqual(case.clears, ApiHttpServer.parsedSqlTransactionBoundaryClearsLocalSession(&parsed_sql));
+    }
+}
+
 test "api http server enforces SQL statement timeout on session-backed DDL" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -23749,7 +23793,9 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
             self.binding_aware_calls += 1;
             try std.testing.expectEqual(@as(usize, 1), function_bindings.routine_expressions.len);
 
-            var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(allocator, sql, function_bindings);
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(allocator, sql);
+            defer parsed_sql.deinit(allocator);
+            var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(allocator, &parsed_sql, function_bindings);
             defer plan.deinit(allocator);
 
             var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, plan, session);
