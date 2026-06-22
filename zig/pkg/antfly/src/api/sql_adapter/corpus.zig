@@ -6684,6 +6684,13 @@ fn appParityTokensHaveStringLiteral(tokens: []const tokenized.Token, literal: []
     return false;
 }
 
+fn appParityTokensHaveStringLiteralContaining(tokens: []const tokenized.Token, needle: []const u8) bool {
+    for (tokens) |token| {
+        if (token.kind == .string and std.mem.indexOf(u8, token.text, needle) != null) return true;
+    }
+    return false;
+}
+
 fn appParityTokensHaveKind(tokens: []const tokenized.Token, kind: token_mod.TokenKind) bool {
     for (tokens) |token| {
         if (token.kind == kind) return true;
@@ -7599,23 +7606,20 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planTokenAbsent(entry.plan, ":source_offset="));
         self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.schema_temporal_numrange_insert = self.schema_temporal_numrange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::numrange") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[1,10)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_daterange_insert = self.schema_temporal_daterange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01,2025-07-01)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
-            std.mem.indexOf(u8, entry.sql, ",)'") == null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_open_daterange_insert = self.schema_temporal_open_daterange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2026-01-01,)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
-            std.mem.indexOf(u8, entry.sql, ",)'") != null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_open_daterange_insert = self.schema_temporal_lower_open_daterange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "(,2026-01-01)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
-            std.mem.indexOf(u8, entry.sql, "'(,") != null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_numrange_constructor_insert = self.schema_temporal_numrange_constructor_insert or (entry.family == .insert and
             appParityTokensHaveFunctionCall(sql_tokens, "numrange") and
@@ -7627,26 +7631,24 @@ pub const AppParityCorpusCoverage = struct {
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_constructor_insert = self.schema_temporal_inclusive_daterange_constructor_insert or (entry.family == .insert and
             appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
-            std.mem.indexOf(u8, entry.sql, "'[]'") != null and
+            appParityTokensHaveStringLiteral(sql_tokens, "[]") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_literal_insert = self.schema_temporal_inclusive_daterange_literal_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.sql, "2025-02-01]'") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "2025-02-01]") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_constructor_insert = self.schema_temporal_lower_exclusive_daterange_constructor_insert or (entry.family == .insert and
             appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
-            std.mem.indexOf(u8, entry.sql, "'(]'") != null and
+            appParityTokensHaveStringLiteral(sql_tokens, "(]") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_literal_insert = self.schema_temporal_lower_exclusive_daterange_literal_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::daterange") != null and
-            std.mem.indexOf(u8, entry.sql, "(2025-01-01,") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "(2025-01-01,") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_insert = self.schema_temporal_tsrange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::tsrange") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01 09:00,2025-01-01 17:00)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_constructor_insert = self.schema_temporal_tsrange_constructor_insert or (entry.family == .insert and
@@ -7654,7 +7656,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_insert = self.schema_temporal_tstzrange_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "::tstzrange") != null and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01T09:00:00Z,2025-01-01T17:00:00Z)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_constructor_insert = self.schema_temporal_tstzrange_constructor_insert or (entry.family == .insert and
@@ -7678,7 +7680,7 @@ pub const AppParityCorpusCoverage = struct {
         self.schema_temporal_inclusive_daterange_overlap_query = self.schema_temporal_inclusive_daterange_overlap_query or (entry.family == .query and
             appParityTokensHaveKind(sql_tokens, .range_overlap) and
             appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
-            std.mem.indexOf(u8, entry.sql, "'[]'") != null and
+            appParityTokensHaveStringLiteral(sql_tokens, "[]") and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_unique_conflict_upsert = self.schema_temporal_unique_conflict_upsert or (entry.family == .insert and
@@ -7739,14 +7741,14 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasNonZeroToken(entry.plan, ":expr_or="));
         self.schema_temporal_fk_ddl = self.schema_temporal_fk_ddl or (entry.family == .ddl and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal_fk=") and
-            std.mem.indexOf(u8, entry.sql, "PERIOD ") != null and
-            std.mem.indexOf(u8, entry.sql, "FOREIGN KEY") != null);
+            appParityTokensHaveKeyword(sql_tokens, .period) and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .foreign, .key }));
         self.schema_system_versioned_table = self.schema_system_versioned_table or (entry.family == .ddl and
             sql_adapter.planHasExactUsizeToken(entry.plan, ":system_versioned=", 1) and
-            std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .system, .versioning }));
         self.schema_nulls_not_distinct_unique = self.schema_nulls_not_distinct_unique or (entry.family == .ddl and
-            std.mem.indexOf(u8, entry.sql, "UNIQUE ") != null and
-            std.mem.indexOf(u8, entry.sql, "NULLS NOT DISTINCT") != null);
+            appParityTokensHaveKeyword(sql_tokens, .unique) and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .nulls, .not, .distinct }));
         self.schema_rich_expression_secondary_index = self.schema_rich_expression_secondary_index or (entry.family == .ddl and
             entry.summary.ddl_tag == .create_index and
             sql_adapter.planHasExactStringToken(entry.plan, ":generated_op=", "expression"));
@@ -8453,16 +8455,16 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_temporal_table = self.ddl_temporal_table or sql_adapter.planHasNonZeroToken(entry.plan, ":periods=");
                     self.ddl_system_versioned_table = self.ddl_system_versioned_table or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":system_versioned=", 1) and
-                            std.mem.indexOf(u8, entry.sql, "SYSTEM VERSIONING") != null);
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .system, .versioning }));
                     self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            std.mem.indexOf(u8, entry.sql, " ON DELETE SET NULL") != null);
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .delete, .set, .null }));
                     self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            std.mem.indexOf(u8, entry.sql, " ON DELETE CASCADE") != null);
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .delete, .cascade }));
                     self.ddl_temporal_fk_update_cascade_action = self.ddl_temporal_fk_update_cascade_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            std.mem.indexOf(u8, entry.sql, " ON UPDATE CASCADE") != null);
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .update, .cascade }));
                     self.ddl_replace_table = self.ddl_replace_table or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
                 },
                 .table_clone => self.ddl_table_clone = true,

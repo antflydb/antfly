@@ -545,6 +545,9 @@ Current implementation status:
 - Prepared-statement CTE coverage now uses parsed `PREPARE ... AS WITH`
   keyword sequences plus plan subject/family tokens instead of raw SQL prefix
   and substring checks.
+- Temporal/schema DDL coverage now uses parsed keyword sequences for
+  `PERIOD`, `FOREIGN KEY`, `SYSTEM VERSIONING`, temporal foreign-key actions,
+  and `UNIQUE NULLS NOT DISTINCT` instead of raw SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
