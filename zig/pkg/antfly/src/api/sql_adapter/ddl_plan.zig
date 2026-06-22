@@ -478,6 +478,7 @@ pub fn parseDdlPlanAlloc(
         return .{ .create_table = try parseCreateTablePlanAlloc(alloc, tokens, pos, options.column_definition_options) };
     }
     if (cursor.matchKeyword("alter")) {
+        if (cursor.peekKeyword("graph")) return .{ .create_index = try parseAlterGraphIndexAddMetricPlanAlloc(alloc, tokens, pos) };
         if (cursor.peekKeyword("domain")) return .{ .domain_catalog = .{ .alter = try parseAlterDomainPlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("sequence")) return .{ .sequence_catalog = .{ .alter = try parseAlterSequencePlanTailAlloc(alloc, tokens, pos) } };
         if (cursor.peekKeyword("type")) return .{ .enum_type_catalog = .{ .add_value = try parseAlterEnumTypePlanTailAlloc(alloc, tokens, pos) } };
@@ -4678,6 +4679,47 @@ pub fn parseCreateGraphIndexPlanAlloc(
     };
 }
 
+pub fn parseAlterGraphIndexAddMetricPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+) !CreateIndexPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("graph");
+    try cursor.expectKeyword("index");
+    const graph_index = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(graph_index);
+    try cursor.expectKeyword("add");
+    try cursor.expectKeyword("metric");
+    const metric_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var metric_transferred = false;
+    errdefer if (!metric_transferred) alloc.free(metric_name);
+    try cursor.expectKeyword("using");
+    const algorithm_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+
+    const config_json = try graphMetricIndexConfigJsonAlloc(alloc, tokens, pos, graph_index, metric_name, algorithm_token.text);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const table_name = try alloc.dupe(u8, "");
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(table_name);
+
+    metric_transferred = true;
+    config_transferred = true;
+    table_transferred = true;
+    return .{
+        .index_name = metric_name,
+        .table_name = table_name,
+        .if_not_exists = false,
+        .unique = false,
+        .method = .antfly_graph_metric,
+        .columns = &.{},
+        .derived_index_config_json = config_json,
+    };
+}
+
 pub fn parseCreateIndexPlanAlloc(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -5179,6 +5221,47 @@ fn graphIndexConfigJsonAlloc(
         if (std.ascii.eqlIgnoreCase(option.name, "edge_policy")) continue;
         try appendJsonOptionField(alloc, &out, &first, option);
     }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn graphMetricIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    graph_index: []const u8,
+    metric_name: []const u8,
+    algorithm: []const u8,
+) ![]u8 {
+    const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, pos);
+    defer freeDerivedIndexOptions(alloc, options);
+    if (derivedIndexOption(options, "graph_index") != null or
+        derivedIndexOption(options, "metric") != null or
+        derivedIndexOption(options, "algorithm") != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    try appendJsonStringField(alloc, &out, &first, "type", "graph_metric");
+    try appendJsonStringField(alloc, &out, &first, "graph_index", graph_index);
+    try appendJsonStringField(alloc, &out, &first, "metric", metric_name);
+    try appendJsonStringField(alloc, &out, &first, "algorithm", algorithm);
+    try appendJsonStringField(alloc, &out, &first, "metric_freshness", derivedIndexOptionString(options, "metric_freshness") orelse "published");
+    try appendJsonStringField(alloc, &out, &first, "publish", derivedIndexOptionString(options, "publish") orelse "after_max_iterations");
+
+    for (options) |option| {
+        if (std.ascii.eqlIgnoreCase(option.name, "metric_freshness") or
+            std.ascii.eqlIgnoreCase(option.name, "publish"))
+        {
+            continue;
+        }
+        try appendJsonOptionField(alloc, &out, &first, option);
+    }
+
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
 }
@@ -7848,6 +7931,30 @@ test "sql adapter ddl plan lowers create index ddl" {
             try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph_metric\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"pagerank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"publish\":\"after_max_iterations\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var graph_metric_syntax = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER GRAPH INDEX docs_edge_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40);",
+    );
+    defer graph_metric_syntax.deinit(alloc);
+    switch (graph_metric_syntax) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph_metric, plan.method);
+            try std.testing.expectEqualStrings("pagerank_v1", plan.index_name);
+            try std.testing.expectEqualStrings("", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph_metric\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"graph_index\":\"docs_edge_graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric\":\"pagerank_v1\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"algorithm\":\"pagerank\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"metric_freshness\":\"published\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"publish\":\"after_max_iterations\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"damping\":0.85") != null);
             try std.testing.expect(std.mem.indexOf(u8, config, "\"max_iterations\":40") != null);

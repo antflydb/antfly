@@ -11705,6 +11705,605 @@ test "sql adapter lower dml detects json set path conflicts" {
     try std.testing.expectError(error.UnsupportedSqlShape, normalizedIncrementJsonAlloc(alloc, "\"3\"", false));
 }
 
+test "sql adapter lower dml lowers on conflict date_bin expression update" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"updated_at_ns":{"type":"datetime"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"updated_at_ns\":1}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 3700000000000) ON CONFLICT (email) DO UPDATE SET updated_at_ns = date_bin(INTERVAL '1 hour', excluded.updated_at_ns, 0) RETURNING updated_at_ns",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, lowered.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("updated_at_ns", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("3600000000000", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"updated_at_ns\":3600000000000}", lowered.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, updated_at_ns) VALUES ('u2', 'a@example.test', 3700000000000) ON CONFLICT (email) DO UPDATE SET updated_at_ns = date_bin(INTERVAL '1 month', excluded.updated_at_ns, 0) RETURNING updated_at_ns",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
+test "sql adapter lower dml lowers on conflict array transforms from excluded scalar" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"tag":{"type":"keyword"},"status":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}},"amount":{"type":"numeric"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"tag\":\"old\",\"tags\":[\"old\"],\"amount\":4}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, tag) VALUES ('u2', 'a@example.test', 'new') ON CONFLICT (email) DO UPDATE SET tags = array_append(tags, excluded.tag) RETURNING tags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.push, lowered.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("tags", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"tags\":[\"old\",\"new\"]}", lowered.batch.returning_rows[0]);
+
+    var coalesced = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, tag) VALUES ('u2', 'a@example.test', null) ON CONFLICT (email) DO UPDATE SET tags = array_append(tags, coalesce(excluded.tag, 'fallback')) RETURNING tags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer coalesced.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), coalesced.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.push, coalesced.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("tags", coalesced.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"fallback\"", coalesced.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"tags\":[\"old\",\"fallback\"]}", coalesced.batch.returning_rows[0]);
+
+    var position = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, tag) VALUES ('u2', 'a@example.test', 'old') ON CONFLICT (email) DO UPDATE SET amount = array_position(tags, excluded.tag) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer position.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), position.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, position.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("amount", position.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("1", position.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"amount\":1}", position.batch.returning_rows[0]);
+
+    var joined_text = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email) VALUES ('u2', 'a@example.test') ON CONFLICT (email) DO UPDATE SET status = array_to_string(tags, ',') RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer joined_text.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), joined_text.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, joined_text.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("status", joined_text.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"old\"", joined_text.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"status\":\"old\"}", joined_text.batch.returning_rows[0]);
+
+    var expression_patch = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, tag) VALUES ('u2', 'a@example.test', 'new') ON CONFLICT (email) DO UPDATE SET tags = array_append((tags), excluded.tag) RETURNING tags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer expression_patch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), expression_patch.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), expression_patch.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, expression_patch.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("tags", expression_patch.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("[\"old\",\"new\"]", expression_patch.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"tags\":[\"old\",\"new\"]}", expression_patch.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, tag) VALUES ('u2', 'a@example.test', null) ON CONFLICT (email) DO UPDATE SET tags = array_append(tags, excluded.tag) RETURNING tags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 3) ON CONFLICT (email) DO UPDATE SET tags = array_append(tags, excluded.amount) RETURNING tags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, amount) VALUES ('u2', 'a@example.test', 3) ON CONFLICT (email) DO UPDATE SET amount = array_position(tags, excluded.amount) RETURNING amount",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
+test "sql adapter lower dml lowers on conflict jsonb concat update" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"metadata":{"type":"json"},"flag_count":{"type":"numeric"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"metadata\":{\"source\":\"old\"}}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = metadata || '{\"source\":\"conflict\",\"flags\":[\"seen\"]}'::jsonb RETURNING metadata.source, metadata.flags",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 2), lowered.batch.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("metadata.source", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"conflict\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("metadata.flags", lowered.batch.transforms[0].operations[1].path);
+    try std.testing.expectEqualStrings("[\"seen\"]", lowered.batch.transforms[0].operations[1].value_json.?);
+    try std.testing.expectEqualStrings("{\"metadata.source\":\"conflict\",\"metadata.flags\":[\"seen\"]}", lowered.batch.returning_rows[0]);
+
+    var dynamic = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status, metadata) VALUES ('u2', 'a@example.test', 'ready', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_set(metadata, '{status}', to_jsonb(excluded.status), true) RETURNING metadata.status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer dynamic.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), dynamic.batch.transformed);
+    try std.testing.expectEqualStrings("metadata.status", dynamic.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ready\"", dynamic.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"metadata.status\":\"ready\"}", dynamic.batch.returning_rows[0]);
+
+    var parameterized_path = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status, metadata) VALUES ('u2', 'a@example.test', 'ready', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_set(metadata, $1::text[], to_jsonb(excluded.status), true) RETURNING metadata.status",
+        schema,
+        &.{.{ .json = "[\"status\"]" }},
+        resolver_ctx.resolver(),
+    );
+    defer parameterized_path.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), parameterized_path.batch.transformed);
+    try std.testing.expectEqualStrings("metadata.status", parameterized_path.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ready\"", parameterized_path.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"metadata.status\":\"ready\"}", parameterized_path.batch.returning_rows[0]);
+
+    var decoded_set_value = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status, metadata) VALUES ('u2', 'a@example.test', 'ready', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_set(metadata, '{details}', convert_from($1, 'UTF8')::jsonb, true) RETURNING metadata.details",
+        schema,
+        &.{.{ .string = "{\"plan\":\"conflict\",\"seats\":2}" }},
+        resolver_ctx.resolver(),
+    );
+    defer decoded_set_value.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), decoded_set_value.batch.transformed);
+    try std.testing.expectEqualStrings("metadata.details", decoded_set_value.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("{\"plan\":\"conflict\",\"seats\":2}", decoded_set_value.batch.transforms[0].operations[0].value_json.?);
+
+    var json_length_conflict = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"flags\":[\"hot\",\"new\"]}'::jsonb) ON CONFLICT (email) DO UPDATE SET flag_count = jsonb_array_length(excluded.metadata->'flags') RETURNING flag_count",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer json_length_conflict.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), json_length_conflict.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, json_length_conflict.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("flag_count", json_length_conflict.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("2", json_length_conflict.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"flag_count\":2}", json_length_conflict.batch.returning_rows[0]);
+
+    var json_type_conflict = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"flags\":[\"hot\",\"new\"]}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = jsonb_typeof(excluded.metadata->'flags') RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer json_type_conflict.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), json_type_conflict.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, json_type_conflict.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("status", json_type_conflict.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"array\"", json_type_conflict.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"status\":\"array\"}", json_type_conflict.batch.returning_rows[0]);
+
+    var json_path_conflict = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"next_status\":\"ready\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET status = jsonb_extract_path_text(excluded.metadata, 'next_status') RETURNING status",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer json_path_conflict.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), json_path_conflict.batch.transformed);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, json_path_conflict.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("status", json_path_conflict.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ready\"", json_path_conflict.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"status\":\"ready\"}", json_path_conflict.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers on conflict jsonb_build_object update" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"metadata\":{\"source\":\"old\"}}", .version = 8 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_build_object('source', 'conflict', 'count', $1) RETURNING metadata",
+        schema,
+        &.{.{ .integer = 2 }},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("metadata", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("{\"source\":\"conflict\",\"count\":2}", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("{\"metadata\":{\"source\":\"conflict\",\"count\":2}}", lowered.batch.returning_rows[0]);
+
+    var parameterized_key = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_build_object($1::text, 'conflict', 'count', $2) RETURNING metadata",
+        schema,
+        &.{ .{ .string = "source" }, .{ .integer = 3 } },
+        resolver_ctx.resolver(),
+    );
+    defer parameterized_key.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), parameterized_key.batch.transformed);
+    try std.testing.expectEqualStrings("metadata", parameterized_key.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("{\"source\":\"conflict\",\"count\":3}", parameterized_key.batch.transforms[0].operations[0].value_json.?);
+
+    var excluded_value = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_build_object('source', 'conflict', 'email', excluded.email) RETURNING metadata",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer excluded_value.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), excluded_value.batch.transformed);
+    try std.testing.expectEqualStrings("metadata", excluded_value.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("{\"source\":\"conflict\",\"email\":\"a@example.test\"}", excluded_value.batch.transforms[0].operations[0].value_json.?);
+
+    var wrapped_excluded_value = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_build_object('email', to_jsonb(excluded.email)) RETURNING metadata",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer wrapped_excluded_value.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), wrapped_excluded_value.batch.transformed);
+    try std.testing.expectEqualStrings("metadata", wrapped_excluded_value.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("{\"email\":\"a@example.test\"}", wrapped_excluded_value.batch.transforms[0].operations[0].value_json.?);
+
+    var decoded_nested = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, metadata) VALUES ('u2', 'a@example.test', '{\"source\":\"insert\"}'::jsonb) ON CONFLICT (email) DO UPDATE SET metadata = jsonb_build_object('source', 'decoded', 'nested', convert_from($1, 'UTF8')::jsonb) RETURNING metadata",
+        schema,
+        &.{.{ .string = "{\"plan\":\"conflict\"}" }},
+        resolver_ctx.resolver(),
+    );
+    defer decoded_nested.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), decoded_nested.batch.transformed);
+    try std.testing.expectEqualStrings("metadata", decoded_nested.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("{\"source\":\"decoded\",\"nested\":{\"plan\":\"conflict\"}}", decoded_nested.batch.transforms[0].operations[0].value_json.?);
+}
+
+test "sql adapter lower dml lowers partial unique conflict target predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_active_email_key","columns":["email"],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\",\"name\":\"old\"}", .version = 11 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status, name) VALUES ('u2', 'a@example.test', 'active', 'new') ON CONFLICT (email) WHERE status = 'active' DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("name", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 11), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", lowered.batch.returning_rows[0]);
+
+    var named_partial = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status, name) VALUES ('u2', 'a@example.test', 'active', 'new') ON CONFLICT ON CONSTRAINT usage_records_active_email_key DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer named_partial.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), named_partial.batch.transformed);
+    try std.testing.expectEqualStrings("name", named_partial.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", named_partial.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 11), named_partial.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", named_partial.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers lower expression unique conflict target" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_lower_email_key","expressions":[{"op":"lower","field":"email"}]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"name\":\"old\"}", .version = 13 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, email, name) VALUES ('u2', 'A@EXAMPLE.TEST', 'new') ON CONFLICT (lower(email)) DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("name", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 13), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", lowered.batch.returning_rows[0]);
+
+    var named_expression = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, email, name) VALUES ('u2', 'A@EXAMPLE.TEST', 'new') ON CONFLICT ON CONSTRAINT users_lower_email_key DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer named_expression.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), named_expression.batch.transformed);
+    try std.testing.expectEqualStrings("name", named_expression.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", named_expression.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 13), named_expression.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", named_expression.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers upper expression unique conflict target" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_upper_email_key","expressions":[{"op":"upper","field":"email"}]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"A@EXAMPLE.TEST\",\"name\":\"old\"}", .version = 14 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, email, name) VALUES ('u2', 'a@example.test', 'new') ON CONFLICT (upper(email)) DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("name", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", lowered.batch.returning_rows[0]);
+
+    var named_expression = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, email, name) VALUES ('u2', 'a@example.test', 'new') ON CONFLICT ON CONSTRAINT users_upper_email_key DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer named_expression.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), named_expression.batch.transformed);
+    try std.testing.expectEqualStrings("name", named_expression.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", named_expression.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 14), named_expression.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", named_expression.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers md5 expression unique conflict target" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_md5_email_key","expressions":[{"op":"md5","field":"email"}]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"A@EXAMPLE.TEST\",\"name\":\"old\"}", .version = 15 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, email, name) VALUES ('u2', 'A@EXAMPLE.TEST', 'new') ON CONFLICT (md5(email)) DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("name", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 15), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", lowered.batch.returning_rows[0]);
+
+    var named_expression = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, email, name) VALUES ('u2', 'A@EXAMPLE.TEST', 'new') ON CONFLICT ON CONSTRAINT users_md5_email_key DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer named_expression.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), named_expression.batch.transformed);
+    try std.testing.expectEqualStrings("name", named_expression.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", named_expression.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 15), named_expression.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", named_expression.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers mixed column expression unique conflict targets" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant_id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_tenant_lower_email_key","columns":["tenant_id"],"expressions":[{"op":"lower","field":"email"}]},{"name":"users_active_tenant_lower_email_key","columns":["tenant_id"],"expressions":[{"op":"lower","field":"email"}],"where":{"all":[{"field":"status","op":"eq","value":"active"}]}}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"email\":\"a@example.test\",\"status\":\"active\",\"name\":\"old\"}", .version = 16 };
+
+    var lowered = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, lower(email)) DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.transformed);
+    try std.testing.expectEqualStrings("name", lowered.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", lowered.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 16), lowered.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", lowered.batch.returning_rows[0]);
+
+    var wrapped = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, (lower(email))) DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer wrapped.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), wrapped.batch.transformed);
+    try std.testing.expectEqualStrings("name", wrapped.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", wrapped.batch.transforms[0].operations[0].value_json.?);
+
+    var partial = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, lower(email)) WHERE status = 'active' DO UPDATE SET name = excluded.name RETURNING id, name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer partial.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), partial.batch.transformed);
+    try std.testing.expectEqualStrings("name", partial.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", partial.batch.transforms[0].operations[0].value_json.?);
+
+    const expression_partial_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"name":{"type":"keyword"}},"required":["id","tenant_id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"users_active_lower_email_expr_key","columns":["tenant_id"],"expressions":[{"op":"lower","field":"email"}],"where_expressions":[{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"eq","rhs":{"value":"active"}}]}]}
+    ;
+    const expression_partial_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, expression_partial_schema_json);
+    defer runtime_schema.freeSchema(alloc, expression_partial_schema);
+
+    var expression_partial = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, lower(email)) WHERE lower(status) = 'active' DO UPDATE SET name = excluded.name RETURNING id, name",
+        expression_partial_schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer expression_partial.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), expression_partial.batch.transformed);
+    try std.testing.expectEqualStrings("name", expression_partial.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", expression_partial.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 16), expression_partial.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", expression_partial.batch.returning_rows[0]);
+
+    var semantic_expression_partial = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, lower(email)) WHERE status = 'ACTIVE' DO UPDATE SET name = excluded.name RETURNING id, name",
+        expression_partial_schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer semantic_expression_partial.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), semantic_expression_partial.batch.transformed);
+    try std.testing.expectEqualStrings("name", semantic_expression_partial.batch.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"new\"", semantic_expression_partial.batch.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqual(@as(u64, 16), semantic_expression_partial.batch.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"name\":\"new\"}", semantic_expression_partial.batch.returning_rows[0]);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, lower(email)) WHERE lower(status) = 'inactive' DO UPDATE SET name = excluded.name RETURNING id, name",
+        expression_partial_schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new') ON CONFLICT (tenant_id, lower(email)) WHERE status = 'inactive' DO UPDATE SET name = excluded.name RETURNING id, name",
+        expression_partial_schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO users (id, tenant_id, email, status, name) VALUES ('u2', 't1', 'A@EXAMPLE.TEST', 'active', 'new'), ('u3', 't1', 'a@example.test', 'active', 'newer') ON CONFLICT (tenant_id, lower(email)) DO UPDATE SET name = excluded.name",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    ));
+}
+
 test "sql adapter lower dml lowers on conflict boolean expression update" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -13095,6 +13694,104 @@ test "sql adapter lower dml lowers convert_from jsonb insert values" {
 
     try std.testing.expectEqual(@as(u32, 1), lowered.batch.inserted);
     try std.testing.expectEqualStrings("{\"metadata\":{\"source\":\"converted\",\"count\":4}}", lowered.batch.returning_rows[0]);
+}
+
+test "sql adapter lower dml lowers now and current_timestamp insert values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, created_at_ns) VALUES ('u1', NOW()) RETURNING created_at_ns",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.returning_rows.len);
+    var returned = try std.json.parseFromSlice(std.json.Value, alloc, lowered.batch.returning_rows[0], .{});
+    defer returned.deinit();
+    switch (returned.value.object.get("created_at_ns").?) {
+        .integer => |value| try std.testing.expect(value > 0),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_current = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, created_at_ns) VALUES ('u2', CURRENT_TIMESTAMP) RETURNING created_at_ns",
+        schema,
+        &.{},
+    );
+    defer lowered_current.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered_current.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 1), lowered_current.batch.returning_rows.len);
+    var returned_current = try std.json.parseFromSlice(std.json.Value, alloc, lowered_current.batch.returning_rows[0], .{});
+    defer returned_current.deinit();
+    switch (returned_current.value.object.get("created_at_ns").?) {
+        .integer => |value| try std.testing.expect(value > 0),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_precision = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, created_at_ns) VALUES ('u3', CURRENT_TIMESTAMP(6)) RETURNING created_at_ns",
+        schema,
+        &.{},
+    );
+    defer lowered_precision.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered_precision.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 1), lowered_precision.batch.returning_rows.len);
+    var returned_precision = try std.json.parseFromSlice(std.json.Value, alloc, lowered_precision.batch.returning_rows[0], .{});
+    defer returned_precision.deinit();
+    switch (returned_precision.value.object.get("created_at_ns").?) {
+        .integer => |value| try std.testing.expect(value > 0),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lowered_current_date = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, created_at_ns) VALUES ('u4', CURRENT_DATE) RETURNING created_at_ns",
+        schema,
+        &.{},
+    );
+    defer lowered_current_date.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered_current_date.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 1), lowered_current_date.batch.returning_rows.len);
+    var returned_current_date = try std.json.parseFromSlice(std.json.Value, alloc, lowered_current_date.batch.returning_rows[0], .{});
+    defer returned_current_date.deinit();
+    switch (returned_current_date.value.object.get("created_at_ns").?) {
+        .integer => |value| {
+            try std.testing.expect(value > 0);
+            try std.testing.expectEqual(@as(i64, 0), @mod(value, @as(i64, 86_400 * std.time.ns_per_s)));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const typed_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const typed_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, typed_schema_json);
+    defer runtime_schema.freeSchema(alloc, typed_schema);
+
+    var lowered_typed_literal = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, created_at_ns) VALUES ('u5', TIMESTAMPTZ '2025-01-01T01:30:00+01:30') RETURNING created_at_ns",
+        typed_schema,
+        &.{},
+    );
+    defer lowered_typed_literal.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), lowered_typed_literal.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 1), lowered_typed_literal.batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"created_at_ns\":1735689600000000000}", lowered_typed_literal.batch.returning_rows[0]);
 }
 
 test "sql adapter lower dml lowers explicit default insert values" {

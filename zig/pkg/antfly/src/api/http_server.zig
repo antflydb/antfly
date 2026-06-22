@@ -1343,6 +1343,11 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
         return applied;
     }
 
+    if (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(alloc, svc, &snapshot, sql, session, function_bindings)) |applied| {
+        try svc.runRound();
+        return applied;
+    }
+
     var target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(alloc, sql, session, function_bindings);
     defer target.deinit(alloc);
 
@@ -1403,6 +1408,67 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
     try svc.runRound();
     return applied;
+}
+
+fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    sql: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+    function_bindings: relational_sql.SqlFunctionBindings,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    defer plan.deinit(alloc);
+    const create_index = switch (plan) {
+        .create_index => |value| value,
+        else => return null,
+    };
+    if (create_index.table_name.len != 0) return null;
+    const index_json = create_index.derived_index_config_json orelse return null;
+    const graph_index_name = try graphMetricGraphIndexNameFromConfigAlloc(alloc, index_json) orelse return null;
+    defer alloc.free(graph_index_name);
+    const table = (try findTableContainingIndexConfigAlloc(alloc, snapshot, graph_index_name)) orelse return error.TableNotFound;
+
+    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
+        alloc,
+        table,
+        sql,
+        session,
+        function_bindings,
+    );
+    errdefer applied.deinit(alloc);
+    try svc.upsertTable(applied.table);
+    return applied;
+}
+
+fn graphMetricGraphIndexNameFromConfigAlloc(
+    alloc: std.mem.Allocator,
+    index_json: []const u8,
+) !?[]const u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidTableIndexMetadata;
+    const type_value = parsed.value.object.get("type") orelse return null;
+    if (type_value != .string or !std.mem.eql(u8, type_value.string, "graph_metric")) return null;
+    const graph_index_value = parsed.value.object.get("graph_index") orelse return error.InvalidTableIndexMetadata;
+    if (graph_index_value != .string) return error.InvalidTableIndexMetadata;
+    return try alloc.dupe(u8, graph_index_value.string);
+}
+
+fn findTableContainingIndexConfigAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    index_name: []const u8,
+) !?*const metadata_table_manager.TableRecord {
+    var match: ?*const metadata_table_manager.TableRecord = null;
+    for (snapshot.tables) |*table| {
+        if (try indexes_api.hasIndexConfig(alloc, table.indexes_json, index_name)) {
+            if (match != null) return error.InvalidTableIndexMetadata;
+            match = table;
+        }
+    }
+    return match;
 }
 
 fn applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
@@ -1757,6 +1823,8 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
         pub fn runRound(self: *@This()) !void {
             self.run_round_count += 1;
         }
+
+        pub fn proposeTransitionCommand(_: *@This(), _: anytype) !void {}
     };
 
     var service = try FakeService.init(alloc);
@@ -1897,20 +1965,15 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, graph_syntax.table.indexes_json, "\"source_field\":\"id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, graph_syntax.table.indexes_json, "\"target_field\":\"body\"") != null);
 
-    const graph_metric_sql = "CREATE INDEX docs_pagerank ON docs USING antfly_graph_metric () WITH (graph_index = 'docs_edge_graph', metric = 'pagerank', max_iterations = 40);";
-    var graph_metric_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
-        alloc,
-        graph_metric_sql,
-        catalog_resources.SqlCatalogSession.default(),
-        .{},
-    );
-    defer graph_metric_target.deinit(alloc);
-    var graph_metric = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    const graph_metric_sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC docs_pagerank USING pagerank WITH (max_iterations = 40);";
+    var graph_metric_snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&graph_metric_snapshot);
+    var graph_metric = (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
         alloc,
         &service,
-        &service.table,
-        graph_metric_target,
+        &graph_metric_snapshot,
         graph_metric_sql,
+        catalog_resources.SqlCatalogSession.default(),
         .{},
     )).?;
     defer graph_metric.deinit(alloc);
@@ -1918,6 +1981,7 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"docs_pagerank\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"type\":\"graph_metric\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"graph_index\":\"docs_edge_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"algorithm\":\"pagerank\"") != null);
 
     const hybrid_sql = "CREATE INDEX docs_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_embedding_hnsw,docs_pagerank', fusion = 'rrf');";
     var hybrid_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(

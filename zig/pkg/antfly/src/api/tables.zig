@@ -1710,7 +1710,7 @@ fn relationalSqlDdlPlanTableRefWithSessionAlloc(
 fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u8 {
     return switch (plan) {
         .create_table => |create_table| create_table.table_name,
-        .create_index => |create_index| create_index.table_name,
+        .create_index => |create_index| if (create_index.table_name.len == 0) null else create_index.table_name,
         .drop_index => null,
         .drop_table => |drop_table| drop_table.table_name,
         .alter_table => |alter_table| alter_table.table_name,
@@ -5350,18 +5350,30 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
     try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"docs_graph_pagerank\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"type\":\"graph_metric\"") != null);
 
+    var graph_metric_alter = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &graph_metric.table,
+        "ALTER GRAPH INDEX docs_graph ADD METRIC pagerank_v1 USING pagerank WITH (damping = 0.85, max_iterations = 40);",
+    );
+    defer graph_metric_alter.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric_alter.table.indexes_json, "\"pagerank_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric_alter.table.indexes_json, "\"graph_index\":\"docs_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric_alter.table.indexes_json, "\"metric\":\"pagerank_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric_alter.table.indexes_json, "\"algorithm\":\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_metric_alter.table.indexes_json, "\"max_iterations\":40") != null);
+
     try std.testing.expectError(
         error.InvalidTableIndexMetadata,
         applyRelationalSqlDdlToTableRecordAlloc(
             std.testing.allocator,
-            &graph_metric.table,
-            "CREATE INDEX docs_missing_metric ON docs USING antfly_graph_metric () WITH (graph_index = 'missing_graph', metric = 'pagerank');",
+            &graph_metric_alter.table,
+            "ALTER GRAPH INDEX missing_graph ADD METRIC missing_pagerank USING pagerank;",
         ),
     );
 
     var hybrid = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
-        &graph_metric.table,
+        &graph_metric_alter.table,
         "CREATE INDEX docs_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_body_semantic,docs_graph_pagerank', fusion = 'rrf');",
     );
     defer hybrid.deinit(std.testing.allocator);
