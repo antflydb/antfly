@@ -1465,14 +1465,16 @@ components:
       type: object
       additionalProperties: false
       description: |
-        Synchronous SQL statement result metadata. Initial support is for
-        catalog/session/control statements routed through the typed DDL/session
-        execution path.
+        Synchronous SQL statement result metadata. Catalog/session/control
+        statements route through the typed DDL/session execution path. Read
+        statements lower through the same typed row-plan executor used by the
+        JSON relational rows APIs.
       properties:
         kind:
           type: string
           enum:
             - ddl
+            - read
         session_id:
           type: integer
           format: int64
@@ -1483,11 +1485,18 @@ components:
           type: object
           additionalProperties: true
           description: Applied DDL/session result record.
+        statement_kind:
+          type: string
+          nullable: true
+          description: Lowered read statement family for read responses.
+        result:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Typed relational row-plan response for read statements.
       required:
         - kind
         - session_id
-        - noop
-        - applied
     SortDirection:
       $ref: "indexes.yaml#/components/schemas/SortDirection"
     SortField:

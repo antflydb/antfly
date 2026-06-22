@@ -137,6 +137,15 @@ Until shared read/write execution derives table-level permissions from lowered
 typed plans, the endpoint requires database-admin permission on the default
 database when authentication is enabled.
 
+Read statements are already routed through that ingress when the adapter can
+lower them to Antfly row plans. The HTTP handler resolves the logical SQL
+session's database/search path, loads the table schema from the catalog, lowers
+`SELECT`, set-operation, recursive CTE, aggregate, window, join, and lateral
+plans into the shared typed read executor, and returns the normal JSON
+relational rows response under a SQL session envelope. Write statements remain
+fail-closed until SQL mutation lowering calls the same row batch, trigger,
+row-filter, claim, and 2PC paths as the public JSON APIs.
+
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
 expression behavior, lower it to the shared row-expression AST first.
@@ -787,6 +796,11 @@ Current implementation status:
 - `ParsedSql` EXPLAIN subject and option parsing uses token keyword tags for
   option names, formats, and boolean aliases, so parse-time statement metadata
   no longer keeps a local case-insensitive keyword scanner for EXPLAIN.
+- SQL value parsing uses token keyword tags for JSON scalar atoms, array
+  constructors, defaults, JSON helper functions, boolean predicates, pagination
+  words, datetime literal prefixes, current-time keywords, UUID functions, and
+  interval literals; semantic string values such as encodings and interval
+  units remain ordinary value comparisons.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

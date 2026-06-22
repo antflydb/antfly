@@ -46,6 +46,10 @@ pub const Cursor = struct {
         if (!self.matchKeyword(keyword)) return error.UnsupportedSqlShape;
     }
 
+    pub fn expectKeywordTag(self: Cursor, keyword: TokenKeyword) !void {
+        if (!self.matchKeywordTag(keyword)) return error.UnsupportedSqlShape;
+    }
+
     pub fn expectToken(self: Cursor, kind: TokenKind) !void {
         if (self.matchToken(kind) == null) return error.UnsupportedSqlShape;
     }
@@ -153,6 +157,10 @@ pub const Cursor = struct {
 
 pub fn expectKeyword(tokens: []const Token, pos: *usize, keyword: []const u8) !void {
     if (!matchKeyword(tokens, pos, keyword)) return error.UnsupportedSqlShape;
+}
+
+pub fn expectKeywordTag(tokens: []const Token, pos: *usize, keyword: TokenKeyword) !void {
+    if (!matchKeywordTag(tokens, pos, keyword)) return error.UnsupportedSqlShape;
 }
 
 pub fn expectToken(tokens: []const Token, pos: *usize, kind: TokenKind) !void {

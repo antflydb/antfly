@@ -73,9 +73,9 @@ pub fn parseJsonScalarValueAlloc(
     pos: *usize,
     params: []const SqlValue,
 ) !?[]const u8 {
-    if (parser.matchKeyword(tokens, pos, "null")) return try alloc.dupe(u8, "null");
-    if (parser.matchKeyword(tokens, pos, "true")) return try alloc.dupe(u8, "true");
-    if (parser.matchKeyword(tokens, pos, "false")) return try alloc.dupe(u8, "false");
+    if (parser.matchKeywordTag(tokens, pos, .null)) return try alloc.dupe(u8, "null");
+    if (parser.matchKeywordTag(tokens, pos, .true)) return try alloc.dupe(u8, "true");
+    if (parser.matchKeywordTag(tokens, pos, .false)) return try alloc.dupe(u8, "false");
     if (parser.matchToken(tokens, pos, .string)) |token| return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
     if (parser.matchToken(tokens, pos, .number)) |token| return try alloc.dupe(u8, token.text);
     if (parser.matchToken(tokens, pos, .minus) != null) return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
@@ -145,7 +145,7 @@ pub fn parseJsonArrayValueAlloc(
     pos: *usize,
     params: []const SqlValue,
 ) ![]const u8 {
-    const value_json = if (parser.peekKeyword(tokens, pos.*, "array"))
+    const value_json = if (parser.peekKeywordTag(tokens, pos.*, .array))
         try parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params)
     else
         try parseRequiredJsonDocumentValueAlloc(alloc, tokens, pos, params);
@@ -174,7 +174,7 @@ pub fn parseArrayPredicateValueAlloc(
     pos: *usize,
     params: []const SqlValue,
 ) ![]const u8 {
-    return if (parser.peekKeyword(tokens, pos.*, "array"))
+    return if (parser.peekKeywordTag(tokens, pos.*, .array))
         try parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params)
     else
         try parseRequiredJsonDocumentValueAlloc(alloc, tokens, pos, params);
@@ -186,7 +186,7 @@ pub fn parseSqlArrayConstructorJsonAlloc(
     pos: *usize,
     params: []const SqlValue,
 ) ![]const u8 {
-    try parser.expectKeyword(tokens, pos, "array");
+    try parser.expectKeywordTag(tokens, pos, .array);
     try parser.expectToken(tokens, pos, .lbracket);
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -269,7 +269,7 @@ pub fn parseSqlColumnValueAlloc(
     column: runtime_schema.RelationalColumn,
     realtime_ns: u64,
 ) ![]const u8 {
-    if (parser.matchKeyword(tokens, pos, "default")) {
+    if (parser.matchKeywordTag(tokens, pos, .default)) {
         const default_value = column.default_value orelse return error.UnsupportedSqlShape;
         return try relational_rows.relationalDefaultValueJsonAlloc(alloc, default_value);
     }
@@ -286,7 +286,7 @@ pub fn parseSqlColumnValueAlloc(
     if (column.field_type == .datetime and lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos.*)) {
         return try parseSqlTypedDatetimeLiteralValueJsonAlloc(alloc, tokens, pos);
     }
-    if (lower_expr.peekFunctionCallIf(tokens, pos.*, lower_expr.sqlKeywordIsUuidV4Function)) {
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos.*, lower_expr.sqlTokenIsUuidV4Function)) {
         if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog;
         return try parseUuidV4ValueJsonAlloc(alloc, tokens, pos);
     }
@@ -318,9 +318,9 @@ pub fn parseSqlColumnValueAlloc(
         }
         return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
     }
-    if (parser.matchKeyword(tokens, pos, "null")) return try alloc.dupe(u8, "null");
-    if (parser.matchKeyword(tokens, pos, "true")) return try alloc.dupe(u8, "true");
-    if (parser.matchKeyword(tokens, pos, "false")) return try alloc.dupe(u8, "false");
+    if (parser.matchKeywordTag(tokens, pos, .null)) return try alloc.dupe(u8, "null");
+    if (parser.matchKeywordTag(tokens, pos, .true)) return try alloc.dupe(u8, "true");
+    if (parser.matchKeywordTag(tokens, pos, .false)) return try alloc.dupe(u8, "false");
     if (parser.matchToken(tokens, pos, .number)) |token| return try alloc.dupe(u8, token.text);
     if (parser.matchToken(tokens, pos, .minus) != null) return try parseSqlNegativeNumberJsonAfterMinusAlloc(alloc, tokens, pos);
     return error.UnsupportedSqlShape;
@@ -422,35 +422,35 @@ pub fn parseJsonbBuildObjectKey(
 }
 
 pub fn peekConvertFromFunctionCall(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "convert_from") and
+    return parser.peekKeywordTag(tokens, pos, .convert_from) and
         pos + 1 < tokens.len and
         tokens[pos + 1].kind == .lparen;
 }
 
 pub fn parseConvertFromFunctionCallStart(tokens: []const Token, pos: *usize) !void {
-    try parser.expectKeyword(tokens, pos, "convert_from");
+    try parser.expectKeywordTag(tokens, pos, .convert_from);
     try parser.expectToken(tokens, pos, .lparen);
 }
 
 pub fn peekToJsonbFunctionCall(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "to_jsonb") and
+    return parser.peekKeywordTag(tokens, pos, .to_jsonb) and
         pos + 1 < tokens.len and
         tokens[pos + 1].kind == .lparen;
 }
 
 pub fn parseToJsonbFunctionCallStart(tokens: []const Token, pos: *usize) !void {
-    try parser.expectKeyword(tokens, pos, "to_jsonb");
+    try parser.expectKeywordTag(tokens, pos, .to_jsonb);
     try parser.expectToken(tokens, pos, .lparen);
 }
 
 pub fn peekJsonbBuildObjectFunctionCall(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "jsonb_build_object") and
+    return parser.peekKeywordTag(tokens, pos, .jsonb_build_object) and
         pos + 1 < tokens.len and
         tokens[pos + 1].kind == .lparen;
 }
 
 pub fn parseJsonbBuildObjectFunctionCallStart(tokens: []const Token, pos: *usize) !void {
-    try parser.expectKeyword(tokens, pos, "jsonb_build_object");
+    try parser.expectKeywordTag(tokens, pos, .jsonb_build_object);
     try parser.expectToken(tokens, pos, .lparen);
 }
 
@@ -477,11 +477,11 @@ pub fn parseSqlBooleanIsValueAlloc(
     column: runtime_schema.RelationalColumn,
     not: bool,
 ) !?[]const u8 {
-    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) return null;
+    if (!(parser.peekKeywordTag(tokens, pos.*, .true) or parser.peekKeywordTag(tokens, pos.*, .false))) return null;
     if (not) return error.UnsupportedSqlShape;
     if (column.field_type != .boolean) return error.InvalidSqlCatalog;
-    if (parser.matchKeyword(tokens, pos, "true")) return try alloc.dupe(u8, "true");
-    try parser.expectKeyword(tokens, pos, "false");
+    if (parser.matchKeywordTag(tokens, pos, .true)) return try alloc.dupe(u8, "true");
+    try parser.expectKeywordTag(tokens, pos, .false);
     return try alloc.dupe(u8, "false");
 }
 
@@ -490,10 +490,10 @@ pub fn parseSqlBooleanIsValue(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
 ) !?bool {
-    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) return null;
+    if (!(parser.peekKeywordTag(tokens, pos.*, .true) or parser.peekKeywordTag(tokens, pos.*, .false))) return null;
     if (column.field_type != .boolean) return error.InvalidSqlCatalog;
-    if (parser.matchKeyword(tokens, pos, "true")) return true;
-    try parser.expectKeyword(tokens, pos, "false");
+    if (parser.matchKeywordTag(tokens, pos, .true)) return true;
+    try parser.expectKeywordTag(tokens, pos, .false);
     return false;
 }
 
@@ -502,7 +502,7 @@ pub fn parseSqlBooleanIsUnknown(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
 ) !bool {
-    if (!parser.matchKeyword(tokens, pos, "unknown")) return false;
+    if (!parser.matchKeywordTag(tokens, pos, .unknown)) return false;
     if (column.field_type != .boolean) return error.InvalidSqlCatalog;
     return true;
 }
@@ -641,9 +641,9 @@ pub fn parseSqlStringValueAlloc(
 pub fn peekStandaloneSqlBooleanLiteral(tokens: []const Token, pos: usize) ?bool {
     const token = if (pos < tokens.len) tokens[pos] else return null;
     if (token.kind != .identifier) return null;
-    const enabled = if (std.ascii.eqlIgnoreCase(token.text, "true"))
+    const enabled = if (token.matchesKeywordTag(.true))
         true
-    else if (std.ascii.eqlIgnoreCase(token.text, "false"))
+    else if (token.matchesKeywordTag(.false))
         false
     else
         return null;
@@ -651,9 +651,9 @@ pub fn peekStandaloneSqlBooleanLiteral(tokens: []const Token, pos: usize) ?bool 
     const next = tokens[pos + 1];
     return switch (next.kind) {
         .semicolon, .rparen => enabled,
-        .identifier => if (std.ascii.eqlIgnoreCase(next.text, "and") or
-            std.ascii.eqlIgnoreCase(next.text, "or") or
-            lower_expr.sqlWhereTailClauseKeyword(next.text))
+        .identifier => if (next.matchesKeywordTag(.@"and") or
+            next.matchesKeywordTag(.@"or") or
+            lower_expr.sqlWhereTailClauseKeywordToken(next))
             enabled
         else
             null,
@@ -669,7 +669,7 @@ pub fn matchStandaloneSqlBooleanLiteral(tokens: []const Token, pos: *usize) ?boo
 
 pub fn parseNullableSqlU32Value(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.matchKeyword("null")) return null;
+    if (cursor.matchKeywordTag(.null)) return null;
     if (cursor.matchToken(.number)) |token| {
         return try std.fmt.parseInt(u32, token.text, 10);
     }
@@ -684,24 +684,24 @@ pub fn parseNullableSqlU32Value(tokens: []const Token, pos: *usize, params: []co
 }
 
 pub fn parseLimitValue(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
-    if (parser.matchKeyword(tokens, pos, "all")) return null;
+    if (parser.matchKeywordTag(tokens, pos, .all)) return null;
     return try parseNullableSqlU32Value(tokens, pos, params);
 }
 
 pub fn parseOffsetValue(tokens: []const Token, pos: *usize, params: []const SqlValue) !u32 {
     const offset = (try parseNullableSqlU32Value(tokens, pos, params)) orelse 0;
-    _ = parser.matchKeyword(tokens, pos, "row") or parser.matchKeyword(tokens, pos, "rows");
+    _ = parser.matchKeywordTag(tokens, pos, .row) or parser.matchKeywordTag(tokens, pos, .rows);
     return offset;
 }
 
 pub fn parseFetchLimitValue(tokens: []const Token, pos: *usize, params: []const SqlValue) !?u32 {
-    if (!(parser.matchKeyword(tokens, pos, "first") or parser.matchKeyword(tokens, pos, "next"))) return error.UnsupportedSqlShape;
-    const limit: ?u32 = if (parser.peekKeyword(tokens, pos.*, "row") or parser.peekKeyword(tokens, pos.*, "rows"))
+    if (!(parser.matchKeywordTag(tokens, pos, .first) or parser.matchKeywordTag(tokens, pos, .next))) return error.UnsupportedSqlShape;
+    const limit: ?u32 = if (parser.peekKeywordTag(tokens, pos.*, .row) or parser.peekKeywordTag(tokens, pos.*, .rows))
         1
     else
         try parseLimitValue(tokens, pos, params);
-    if (!(parser.matchKeyword(tokens, pos, "row") or parser.matchKeyword(tokens, pos, "rows"))) return error.UnsupportedSqlShape;
-    try parser.expectKeyword(tokens, pos, "only");
+    if (!(parser.matchKeywordTag(tokens, pos, .row) or parser.matchKeywordTag(tokens, pos, .rows))) return error.UnsupportedSqlShape;
+    try parser.expectKeywordTag(tokens, pos, .only);
     return limit;
 }
 
@@ -743,9 +743,9 @@ pub fn parseSqlTypedDatetimeLiteralValueJsonAlloc(
     tokens: []const Token,
     pos: *usize,
 ) ![]const u8 {
-    if (!parser.matchKeyword(tokens, pos, "date") and
-        !parser.matchKeyword(tokens, pos, "timestamp") and
-        !parser.matchKeyword(tokens, pos, "timestamptz")) return error.UnsupportedSqlShape;
+    if (!parser.matchKeywordTag(tokens, pos, .date) and
+        !parser.matchKeywordTag(tokens, pos, .timestamp) and
+        !parser.matchKeywordTag(tokens, pos, .timestamptz)) return error.UnsupportedSqlShape;
     const token = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
     return try parseSqlRangeEndpointJsonAlloc(alloc, token.text, .datetime);
 }
@@ -785,10 +785,10 @@ pub fn parseSqlCurrentDateValueJsonAlloc(
 
 pub fn parseSqlNowCall(tokens: []const Token, pos: *usize) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.matchKeyword("now")) {
+    if (cursor.matchKeywordTag(.now)) {
         try cursor.expectToken(.lparen);
         try cursor.expectToken(.rparen);
-    } else if (cursor.matchKeyword("current_timestamp")) {
+    } else if (cursor.matchKeywordTag(.current_timestamp)) {
         try parseOptionalCurrentTimestampPrecision(tokens, pos);
     } else {
         return error.UnsupportedSqlShape;
@@ -797,12 +797,12 @@ pub fn parseSqlNowCall(tokens: []const Token, pos: *usize) !void {
 
 pub fn parseSqlCurrentDateKeyword(tokens: []const Token, pos: *usize) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("current_date");
+    try cursor.expectKeywordTag(.current_date);
 }
 
 pub fn parseSqlUuidV4Call(tokens: []const Token, pos: *usize) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    _ = cursor.matchIdentifierIf(lower_expr.sqlKeywordIsUuidV4Function) orelse return error.UnsupportedSqlShape;
+    _ = cursor.matchIdentifierTokenIf(lower_expr.sqlTokenIsUuidV4Function) orelse return error.UnsupportedSqlShape;
     try cursor.expectToken(.lparen);
     try cursor.expectToken(.rparen);
 }
@@ -1015,9 +1015,9 @@ pub fn parseSqlUntypedValueJsonAlloc(
     pos: *usize,
 ) ![]const u8 {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.matchKeyword("true")) return try alloc.dupe(u8, "true");
-    if (cursor.matchKeyword("false")) return try alloc.dupe(u8, "false");
-    if (cursor.matchKeyword("null")) return try alloc.dupe(u8, "null");
+    if (cursor.matchKeywordTag(.true)) return try alloc.dupe(u8, "true");
+    if (cursor.matchKeywordTag(.false)) return try alloc.dupe(u8, "false");
+    if (cursor.matchKeywordTag(.null)) return try alloc.dupe(u8, "null");
     if (cursor.matchToken(.string)) |token| return try std.json.Stringify.valueAlloc(alloc, token.text, .{});
     if (cursor.matchToken(.number)) |token| return try alloc.dupe(u8, token.text);
     if (cursor.matchToken(.minus) != null) {
@@ -1189,7 +1189,7 @@ pub fn sqlIntervalLiteral(text: []const u8) !SqlIntervalLiteral {
 
 pub fn parseSqlIntervalLiteral(tokens: []const Token, pos: *usize) !SqlIntervalLiteral {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("interval");
+    try cursor.expectKeywordTag(.interval);
     const token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
     return try sqlIntervalLiteral(token.text);
 }

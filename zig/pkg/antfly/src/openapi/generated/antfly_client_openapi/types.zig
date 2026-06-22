@@ -19,13 +19,17 @@ pub const SqlStatementRequest = struct {
     namespace: ?[]const u8 = null,
 };
 
-/// Synchronous SQL statement result metadata. Initial support is for catalog/session/control statements routed through the typed DDL/session execution path.
+/// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs.
 pub const SqlStatementResponse = struct {
     kind: []const u8,
     session_id: i64,
-    noop: bool,
+    noop: ?bool = null,
     /// Applied DDL/session result record.
-    applied: std.json.Value,
+    applied: ?std.json.Value = null,
+    /// Lowered read statement family for read responses.
+    statement_kind: ?[]const u8 = null,
+    /// Typed relational row-plan response for read statements.
+    result: ?std.json.Value = null,
 };
 
 /// Sort direction for a single field. true = descending, false = ascending.
