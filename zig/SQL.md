@@ -841,6 +841,10 @@ Current implementation status:
   keyword tags for structural statement heads, CTE wrappers, match arms, action
   clauses, and returning clauses; source/target table identity stays in binder
   and plan resolution.
+- Update/delete mutation-source and point-mutation parsing use token keyword
+  tags for statement heads, query-tail clauses, recursive write guards, row
+  claim clauses, and returning clauses; selectors and assignments remain typed
+  binder/expression/value work.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

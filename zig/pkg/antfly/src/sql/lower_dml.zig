@@ -7406,7 +7406,7 @@ pub fn parseRecursiveInsertSourceAlloc(
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(alloc, tokens, pos, recursive_hooks);
     errdefer recursive.deinit(alloc);
     if (parser.matchToken(tokens, pos, .comma) != null) return error.UnsupportedSqlShape;
-    if (!parser.peekKeyword(tokens, pos.*, "insert")) return error.UnsupportedSqlShape;
+    if (!parser.peekKeywordTag(tokens, pos.*, .insert)) return error.UnsupportedSqlShape;
 
     var base_table_name: ?[]const u8 = try alloc.dupe(u8, recursive.anchor.table_name);
     defer if (base_table_name) |name| alloc.free(name);
@@ -7439,11 +7439,11 @@ pub fn parseRecursiveJoinedMutationSourceAlloc(
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(alloc, tokens, pos, recursive_hooks);
     errdefer recursive.deinit(alloc);
     if (parser.matchToken(tokens, pos, .comma) != null) return error.UnsupportedSqlShape;
-    const keyword: []const u8 = switch (kind) {
-        .update => "update",
-        .delete => "delete",
+    const keyword: parser.TokenKeyword = switch (kind) {
+        .update => .update,
+        .delete => .delete,
     };
-    if (!parser.peekKeyword(tokens, pos.*, keyword)) return error.UnsupportedSqlShape;
+    if (!parser.peekKeywordTag(tokens, pos.*, keyword)) return error.UnsupportedSqlShape;
 
     var base_table_name: ?[]const u8 = try alloc.dupe(u8, recursive.anchor.table_name);
     defer if (base_table_name) |name| alloc.free(name);
@@ -7472,7 +7472,7 @@ pub fn parseRecursiveMergeMutationAlloc(
     var recursive = try plan_mod.parseRecursiveCteProducerAlloc(alloc, tokens, pos, recursive_hooks);
     errdefer recursive.deinit(alloc);
     if (parser.matchToken(tokens, pos, .comma) != null) return error.UnsupportedSqlShape;
-    if (!parser.peekKeyword(tokens, pos.*, "merge")) return error.UnsupportedSqlShape;
+    if (!parser.peekKeywordTag(tokens, pos.*, .merge)) return error.UnsupportedSqlShape;
 
     var base_table_name: ?[]const u8 = try alloc.dupe(u8, recursive.anchor.table_name);
     defer if (base_table_name) |name| alloc.free(name);
@@ -7504,11 +7504,11 @@ pub fn parseUpdateJoinedMutationSourceWithCtesAlloc(
     var row_claim = options.row_claim;
     errdefer if (row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
 
-    try parser.expectKeyword(tokens, pos, "update");
+    try parser.expectKeywordTag(tokens, pos, .update);
     const target_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, target_table);
 
-    try parser.expectKeyword(tokens, pos, "set");
+    try parser.expectKeywordTag(tokens, pos, .set);
     var source_assignments = std.ArrayListUnmanaged(JoinedMutationSourceAssignment).empty;
     errdefer {
         freeJoinedMutationSourceAssignments(alloc, source_assignments.items);
@@ -7561,13 +7561,13 @@ pub fn parseUpdateJoinedMutationSourceWithCtesAlloc(
     if (source_assignments.items.len == 0 and patch.items.len == 0 and patch_expr.items.len == 0 and json_set.items.len == 0) return error.UnsupportedSqlShape;
     try validateSqlJoinedMutationTargetPaths(options.schema, source_assignments.items, patch.items, patch_expr.items, json_set.items);
 
-    if (parser.matchKeyword(tokens, pos, "where")) {
+    if (parser.matchKeywordTag(tokens, pos, .where)) {
         if (source_assignments.items.len != 0) return error.UnsupportedSqlShape;
         if (patch_expr.items.len != 0) return error.UnsupportedSqlShape;
         if (json_set.items.len != 0) return error.UnsupportedSqlShape;
         const transferred_row_claim = row_claim;
         row_claim.owner_id = "";
-        const lowered = if (parser.peekKeyword(tokens, pos.*, "exists"))
+        const lowered = if (parser.peekKeywordTag(tokens, pos.*, .exists))
             try parseExistsJoinedMutationSourceAlloc(alloc, tokens, pos, .{
                 .params = options.params,
                 .kind = .update,
@@ -7622,7 +7622,7 @@ pub fn parseUpdateJoinedMutationSourceWithCtesAlloc(
         return lowered;
     }
 
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .from);
     const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, source_table);
     if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.UnsupportedSqlShape;
@@ -7691,15 +7691,15 @@ pub fn parseDeleteJoinedMutationSourceWithCtesAlloc(
     var row_claim = options.row_claim;
     errdefer if (row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
 
-    try parser.expectKeyword(tokens, pos, "delete");
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .delete);
+    try parser.expectKeywordTag(tokens, pos, .from);
     const target_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, target_table);
 
-    if (parser.matchKeyword(tokens, pos, "where")) {
+    if (parser.matchKeywordTag(tokens, pos, .where)) {
         const transferred_row_claim = row_claim;
         row_claim.owner_id = "";
-        if (parser.peekKeyword(tokens, pos.*, "exists")) {
+        if (parser.peekKeywordTag(tokens, pos.*, .exists)) {
             return try parseExistsJoinedMutationSourceAlloc(alloc, tokens, pos, .{
                 .params = options.params,
                 .kind = .delete,
@@ -7744,7 +7744,7 @@ pub fn parseDeleteJoinedMutationSourceWithCtesAlloc(
         });
     }
 
-    try parser.expectKeyword(tokens, pos, "using");
+    try parser.expectKeywordTag(tokens, pos, .using);
     const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, source_table);
     if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.UnsupportedSqlShape;
@@ -8173,7 +8173,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
         on.deinit(alloc);
     }
 
-    if (parser.matchKeyword(tokens, pos, "where")) {
+    if (parser.matchKeywordTag(tokens, pos, .where)) {
         const target_qualifiers = [_][]const u8{ options.target_table.name, options.target_table.alias };
         if (lower_expr.tailMentionsAnyQualifierBeforeClose(tokens, pos.*, target_qualifiers[0..])) {
             options.context_hooks.set_context(options.context_hooks.ptr, .{
@@ -8488,7 +8488,7 @@ pub fn parseJoinedMutationTailAlloc(
     var offset: u32 = 0;
 
     while (!parser.atEnd(tokens, pos.*)) {
-        if (parser.matchKeyword(tokens, pos, "where")) {
+        if (parser.matchKeywordTag(tokens, pos, .where)) {
             if (saw_where or saw_returning) return error.UnsupportedSqlShape;
             saw_where = true;
             var targets = JoinedMutationWherePredicateTargets{
@@ -8534,23 +8534,23 @@ pub fn parseJoinedMutationTailAlloc(
                 options.expression_where_options,
                 options.realtime_ns,
             );
-        } else if (parser.matchKeyword(tokens, pos, "order")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (saw_returning) return error.UnsupportedSqlShape;
-            try parser.expectKeyword(tokens, pos, "by");
+            try parser.expectKeywordTag(tokens, pos, .by);
             try lower_expr.parseTargetOrderByAlloc(alloc, tokens, pos, options.schema, &order_by, options.target_alias);
-        } else if (parser.matchKeyword(tokens, pos, "limit")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             limit = try sql_value.parseLimitValue(tokens, pos, options.params);
-        } else if (parser.matchKeyword(tokens, pos, "offset")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             offset = try sql_value.parseOffsetValue(tokens, pos, options.params);
-        } else if (parser.matchKeyword(tokens, pos, "fetch")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             limit = try sql_value.parseFetchLimitValue(tokens, pos, options.params);
-        } else if (parser.matchKeyword(tokens, pos, "for")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .@"for")) {
             if (saw_returning) return error.UnsupportedSqlShape;
             lower_expr.setSqlRowClaimClause(&row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, options.returning_qualifiers));
-        } else if (parser.matchKeyword(tokens, pos, "returning")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             saw_returning = true;
             returning = try lower_expr.parseJoinedMutationReturningProjectionAlloc(alloc, tokens, pos, options.schema, options.joined_source_schema, options.source_alias, options.returning_qualifiers, options.returning_hooks);
@@ -8793,7 +8793,7 @@ pub fn parseMutationSourceQueryTailAlloc(
     var offset: u32 = 0;
 
     while (!parser.atEnd(tokens, pos.*)) {
-        if (parser.matchKeyword(tokens, pos, "where")) {
+        if (parser.matchKeywordTag(tokens, pos, .where)) {
             if (saw_where or saw_returning) return error.UnsupportedSqlShape;
             saw_where = true;
             try lower_expr.parseWhereAlloc(
@@ -8833,9 +8833,9 @@ pub fn parseMutationSourceQueryTailAlloc(
                 expression_alternatives_hooks,
                 expression_condition_hooks,
             );
-        } else if (parser.matchKeyword(tokens, pos, "order")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (saw_returning) return error.UnsupportedSqlShape;
-            try parser.expectKeyword(tokens, pos, "by");
+            try parser.expectKeywordTag(tokens, pos, .by);
             try lower_expr.parseOrderByAlloc(alloc, tokens, pos, &order_by, .{
                 .schema = schema,
                 .function_bindings = function_bindings,
@@ -8849,19 +8849,19 @@ pub fn parseMutationSourceQueryTailAlloc(
                 },
                 .order_expression_hooks = order_expression_hooks,
             });
-        } else if (parser.matchKeyword(tokens, pos, "limit")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             limit = try sql_value.parseLimitValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "offset")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             offset = try sql_value.parseOffsetValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "fetch")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             limit = try sql_value.parseFetchLimitValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "for")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .@"for")) {
             if (saw_returning) return error.UnsupportedSqlShape;
             lower_expr.setSqlRowClaimClause(&owned_row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, returning_qualifiers));
-        } else if (parser.matchKeyword(tokens, pos, "returning")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             saw_returning = true;
             returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
@@ -9561,7 +9561,7 @@ pub fn parseUpdateMutationSourceAlloc(
     var row_claim_transferred = false;
     errdefer if (!row_claim_transferred and row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
 
-    try parser.expectKeyword(tokens, pos, "update");
+    try parser.expectKeywordTag(tokens, pos, .update);
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, pos);
     errdefer plan_mod.freeTableAlias(alloc, target_table);
 
@@ -9575,7 +9575,7 @@ pub fn parseUpdateMutationSourceAlloc(
     );
     defer if (temporal_portion) |portion| portion.deinit(alloc);
 
-    try parser.expectKeyword(tokens, pos, "set");
+    try parser.expectKeywordTag(tokens, pos, .set);
     var patch = std.ArrayListUnmanaged(FieldJsonValue).empty;
     errdefer {
         freeFieldJsonValues(alloc, patch.items);
@@ -9697,8 +9697,8 @@ pub fn parseDeleteMutationSourceAlloc(
     var row_claim_transferred = false;
     errdefer if (!row_claim_transferred and row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
 
-    try parser.expectKeyword(tokens, pos, "delete");
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .delete);
+    try parser.expectKeywordTag(tokens, pos, .from);
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, pos);
     errdefer plan_mod.freeTableAlias(alloc, target_table);
 
@@ -9796,11 +9796,11 @@ pub fn parseUpdateAlloc(
     pos: *usize,
     options: UpdateParserOptions,
 ) !plan_mod.LoweredMutation {
-    try parser.expectKeyword(tokens, pos, "update");
+    try parser.expectKeywordTag(tokens, pos, .update);
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, pos);
     errdefer plan_mod.freeTableAlias(alloc, target_table);
 
-    try parser.expectKeyword(tokens, pos, "set");
+    try parser.expectKeywordTag(tokens, pos, .set);
     var patch = std.ArrayListUnmanaged(FieldJsonValue).empty;
     errdefer {
         freeFieldJsonValues(alloc, patch.items);
@@ -9860,7 +9860,7 @@ pub fn parseUpdateAlloc(
     if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
     try validateSqlUpdateTargetPaths(options.schema, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items);
 
-    try parser.expectKeyword(tokens, pos, "where");
+    try parser.expectKeywordTag(tokens, pos, .where);
     const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     const where_json = try parsePointWhereJsonAlloc(
         alloc,
@@ -9875,7 +9875,7 @@ pub fn parseUpdateAlloc(
 
     var returning: ReturningProjection = .{};
     errdefer returning.deinit(alloc);
-    if (parser.matchKeyword(tokens, pos, "returning")) {
+    if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
     }
@@ -9924,12 +9924,12 @@ pub fn parseDeleteAlloc(
     pos: *usize,
     options: DeleteParserOptions,
 ) !plan_mod.LoweredMutation {
-    try parser.expectKeyword(tokens, pos, "delete");
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .delete);
+    try parser.expectKeywordTag(tokens, pos, .from);
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, pos);
     errdefer plan_mod.freeTableAlias(alloc, target_table);
 
-    try parser.expectKeyword(tokens, pos, "where");
+    try parser.expectKeywordTag(tokens, pos, .where);
     const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     const where_json = try parsePointWhereJsonAlloc(
         alloc,
@@ -9944,7 +9944,7 @@ pub fn parseDeleteAlloc(
 
     var returning: ReturningProjection = .{};
     errdefer returning.deinit(alloc);
-    if (parser.matchKeyword(tokens, pos, "returning")) {
+    if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
     }
