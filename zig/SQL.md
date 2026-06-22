@@ -831,6 +831,69 @@ and disappear once the caller can use the typed API directly. New features
 should be rejected in review if they add another durable SQL-string bridge, an
 adapter-owned metadata path, or a second parser hidden inside fixture checking.
 
+### Production Migration Design
+
+The production migration should make the typed path the easy path and make
+compatibility paths visibly temporary. The stable internal API should be:
+
+```text
+parseSql(sql) -> ParsedSql
+bindSql(parsed, session, catalog_snapshot, principal) -> BoundSqlStatement
+planSql(bound) -> LogicalSqlPlan
+executeSqlPlan(plan, services) -> typed result or lifecycle job
+```
+
+Raw SQL entrypoints may remain for HTTP, SQL wire protocol, CLI, MCP, A2A, and
+tests, but they should be thin wrappers around this API. Feature code should not
+grow new `[]const u8` SQL parameters after parse unless the parameter is only
+for diagnostics or fixture provenance.
+
+The migration should converge on these concrete invariants:
+
+- Parser ownership is singular. `ParsedSql` owns the token stream, keyword
+  metadata, raw statement tree, nested statement references, and diagnostic
+  spans for one SQL input.
+- Dispatch is closed over statement variants. Read, write, DDL, session,
+  transaction, and explain planners switch on `ParsedStatement` and explicit
+  kind enums instead of trying lowerers in sequence.
+- Binding is required before any catalog-aware effect. The binder owns
+  `current_database`, `search_path`, table/schema lookup, object versions,
+  role authorization, dependency facts, extension identity, tablespace policy,
+  lake/source identity, and backup/restore scope.
+- Logical planning is Antfly-native. Plans carry row/query expressions,
+  catalog lifecycle requests, derived-index configs, role mutations, extension
+  lifecycle requests, job requests, session mutations, lake-source plans, and
+  backup/restore scopes as typed structs.
+- Durable execution is service-owned. The catalog/metadata leader or equivalent
+  owner commits metadata transitions and admits lifecycle jobs; SQL never
+  persists an alternate metadata record or schedules background work directly.
+- Fixture validation is structural. Corpus freshness and parity coverage consume
+  parser, binder, planner, or lowerer summaries and coverage bits rather than
+  substring scans over SQL or plan fingerprints.
+
+The preferred removal order is:
+
+1. Convert each remaining raw-string lowerer facade into a parsed facade that
+   immediately builds or receives `ParsedSql`.
+2. Promote token-range compatibility nodes into raw AST children when the shape
+   is contiguous; keep token ranges only for syntax that is naturally
+   non-contiguous while still preserving original spans.
+3. Move catalog, role, extension, tablespace, lake, and backup/restore
+   decisions behind binder APIs that require an explicit SQL session and
+   authenticated principal.
+4. Replace probe-based planners with `switch` dispatch over parsed statement
+   variants and kind enums.
+5. Replace durable SQL fragments in metadata or job payloads with typed native
+   plan fields.
+6. Delete the compatibility path once parity fixtures cover the equivalent
+   typed route across SQL and the native API surface.
+
+This is also the review checklist for new SQL work. A change is not production
+complete if it accepts syntax without a raw AST node, stores SQL text as durable
+semantics, bypasses `BoundSqlStatement` for catalog-aware work, schedules jobs
+outside the metadata owner, or adds fixture scans that reconstruct parser
+behavior.
+
 ## Parity and Test Strategy
 
 SQL compatibility is proven by typed outcomes, not by accepting more syntax than
