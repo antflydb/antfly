@@ -631,6 +631,9 @@ Current implementation status:
   helpers are internal to the binder; the public route is parsed, bound, or
   logical-plan based, and joined DML catalog coverage now validates
   `ParsedSql -> BoundSqlStatement -> LogicalSqlPlan` directly.
+- Catalog read/write lowering contexts now bind `ParsedSql` into
+  `BoundSqlStatement` explicitly before lowering; the exported lowerer helper
+  consumes a real bound statement rather than a parsed statement plus catalog.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

@@ -934,69 +934,22 @@ pub const WritePlanCatalogLoweringHooks = struct {
     lower_with_options: *const fn (*anyopaque, plan_mod.LowerWritePlanOptions) anyerror!plan_mod.LoweredWritePlan,
 };
 
-pub fn lowerReadPlanWithCatalogSourceSchemaParsedSqlAlloc(
+pub fn lowerReadPlanWithBoundStatementAlloc(
     alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
+    bound: *BoundSqlStatement,
     hooks: ReadPlanCatalogLoweringHooks,
 ) !plan_mod.LoweredReadPlan {
-    return try lowerReadPlanWithCatalogBoundStatementAlloc(alloc, parsed_sql, catalog, hooks);
-}
-
-pub fn lowerReadPlanWithCatalogBoundStatementAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
-    hooks: ReadPlanCatalogLoweringHooks,
-) !plan_mod.LoweredReadPlan {
-    return try lowerReadPlanWithCatalogBoundStatementWithSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default(), hooks);
-}
-
-pub fn lowerReadPlanWithCatalogBoundStatementWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    catalog: table_catalog.CatalogSource,
-    session: catalog_resources.SqlCatalogSession,
-    hooks: ReadPlanCatalogLoweringHooks,
-) !plan_mod.LoweredReadPlan {
-    var resolved = try bindReadPlanCatalogStatementWithSessionAlloc(alloc, parsed_sql, catalog, session);
-    defer resolved.deinit(alloc);
-    var logical = try logicalReadPlanFromBoundStatement(&resolved);
+    var logical = try logicalReadPlanFromBoundStatement(bound);
     defer logical.deinit(alloc);
     return try lowerReadCatalogLogicalPlan(&logical, hooks);
 }
 
-pub fn lowerWritePlanWithCatalogOptionsParsedSqlAlloc(
+pub fn lowerWritePlanWithBoundStatementAlloc(
     alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
+    bound: *BoundSqlStatement,
     hooks: WritePlanCatalogLoweringHooks,
 ) !plan_mod.LoweredWritePlan {
-    return try lowerWritePlanWithCatalogBoundStatementAlloc(alloc, parsed_sql, options, catalog, hooks);
-}
-
-pub fn lowerWritePlanWithCatalogBoundStatementAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
-    hooks: WritePlanCatalogLoweringHooks,
-) !plan_mod.LoweredWritePlan {
-    return try lowerWritePlanWithCatalogBoundStatementWithSessionAlloc(alloc, parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default(), hooks);
-}
-
-pub fn lowerWritePlanWithCatalogBoundStatementWithSessionAlloc(
-    alloc: std.mem.Allocator,
-    parsed_sql: *const tokenized.ParsedSql,
-    options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
-    session: catalog_resources.SqlCatalogSession,
-    hooks: WritePlanCatalogLoweringHooks,
-) !plan_mod.LoweredWritePlan {
-    var resolved = try bindWritePlanCatalogStatementWithSessionAlloc(alloc, parsed_sql, options, catalog, session);
-    defer resolved.deinit(alloc);
-    var logical = try logicalWritePlanFromBoundStatement(&resolved);
+    var logical = try logicalWritePlanFromBoundStatement(bound);
     defer logical.deinit(alloc);
     return try lowerWriteCatalogLogicalPlan(&logical, hooks);
 }

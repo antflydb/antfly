@@ -208,7 +208,9 @@ pub const CatalogReadPlanLoweringContext = struct {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        return try binder.lowerReadPlanWithCatalogBoundStatementAlloc(self.alloc, parsed_sql, catalog, self.hooks());
+        var bound = try binder.bindReadPlanCatalogStatementAlloc(self.alloc, parsed_sql, catalog);
+        defer bound.deinit(self.alloc);
+        return try binder.lowerReadPlanWithBoundStatementAlloc(self.alloc, &bound, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.ReadPlanCatalogLoweringHooks {
@@ -816,7 +818,9 @@ pub const CatalogWritePlanLoweringContext = struct {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        return try binder.lowerWritePlanWithCatalogBoundStatementAlloc(self.alloc, parsed_sql, options, catalog, self.hooks());
+        var bound = try binder.bindWritePlanCatalogStatementAlloc(self.alloc, parsed_sql, options, catalog);
+        defer bound.deinit(self.alloc);
+        return try binder.lowerWritePlanWithBoundStatementAlloc(self.alloc, &bound, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.WritePlanCatalogLoweringHooks {
