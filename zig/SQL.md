@@ -757,6 +757,10 @@ Current implementation status:
   substring/split/strpos, left/right, and pad parser helpers consume token tags
   directly instead of rechecking identifier text, while quoted identifiers stay
   outside keyword classification.
+- DML assignment expression-start classification uses the same token metadata
+  for scalar, text, regex, JSON, array, datetime, and generated/hash function
+  families, so write lowering no longer reinterprets those identifiers from raw
+  token text before selecting an assignment-expression parser.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

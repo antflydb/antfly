@@ -10732,41 +10732,41 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
     return keywordTagAt(tokens, pos, .case) or
         keywordTagAt(tokens, pos, .cast) or
         keywordTagAt(tokens, pos, .coalesce) or
-        keywordAt(tokens, pos, "lower") or
-        keywordAt(tokens, pos, "upper") or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsInitcapFunction) or
-        keywordAt(tokens, pos, "trim") or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTrimVariantFunction) or
-        keywordAt(tokens, pos, "replace") or
-        keywordAt(tokens, pos, "regexp_replace") or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpSubstrFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpMatchFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpCountFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpInstrFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTranslateFunction) or
-        keywordAt(tokens, pos, "concat") or
-        keywordAt(tokens, pos, "concat_ws") or
+        keywordTagAt(tokens, pos, .lower) or
+        keywordTagAt(tokens, pos, .upper) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsInitcapFunction) or
+        keywordTagAt(tokens, pos, .trim) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsTrimVariantFunction) or
+        keywordTagAt(tokens, pos, .replace) or
+        keywordTagAt(tokens, pos, .regexp_replace) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpSubstrFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpMatchFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpCountFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpInstrFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsTranslateFunction) or
+        keywordTagAt(tokens, pos, .concat) or
+        keywordTagAt(tokens, pos, .concat_ws) or
         keywordTagAt(tokens, pos, .nullif) or
         lower_expr.peekTextLengthFunctionKeyword(tokens, pos) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsAsciiFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsChrFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsAsciiFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsChrFunction) or
         lower_expr.peekSubstringFunctionKeyword(tokens, pos) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsOverlayFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsOverlayFunction) or
         lower_expr.peekSplitPartFunctionKeyword(tokens, pos) or
         lower_expr.peekStrposFunctionKeyword(tokens, pos) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsLeftRightFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsPadFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRepeatFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsReverseFunction) or
-        (include_md5 and lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsMd5Function)) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsStartsWithFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsEndsWithFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateTruncFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateBinFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDatePartFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsLeftRightFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsPadFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRepeatFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsReverseFunction) or
+        (include_md5 and lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsMd5Function)) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsStartsWithFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsEndsWithFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateTruncFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateBinFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDatePartFunction) or
         keywordAt(tokens, pos, "position") or
-        keywordAt(tokens, pos, "abs") or
-        keywordAt(tokens, pos, "round") or
+        keywordTagAt(tokens, pos, .abs) or
+        keywordTagAt(tokens, pos, .round) or
         lower_expr.peekFunctionCall(tokens, pos, "trunc") or
         lower_expr.peekFunctionCall(tokens, pos, "floor") or
         lower_expr.peekFunctionCall(tokens, pos, "ceil") or
@@ -10774,24 +10774,24 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
         lower_expr.peekFunctionCall(tokens, pos, "sign") or
         lower_expr.peekFunctionCall(tokens, pos, "mod") or
         lower_expr.peekFunctionCall(tokens, pos, "power") or
-        keywordAt(tokens, pos, "greatest") or
-        keywordAt(tokens, pos, "least") or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonExtractPathFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonTypeofFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonArrayLengthFunction) or
-        lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonBuildObjectFunction) or
-        lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayLengthFunction) or
-        lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayPositionFunction) or
-        keywordAt(tokens, pos, "array_append") or
-        keywordAt(tokens, pos, "array_prepend") or
-        keywordAt(tokens, pos, "array_cat") or
-        keywordAt(tokens, pos, "array_remove") or
-        keywordAt(tokens, pos, "array_replace") or
-        keywordAt(tokens, pos, "array_to_string") or
-        keywordAt(tokens, pos, "string_to_array") or
-        keywordAt(tokens, pos, "now") or
-        keywordAt(tokens, pos, "current_timestamp") or
-        keywordAt(tokens, pos, "current_date") or
+        keywordTagAt(tokens, pos, .greatest) or
+        keywordTagAt(tokens, pos, .least) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonTypeofFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonArrayLengthFunction) or
+        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonBuildObjectFunction) or
+        lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayLengthFunction) or
+        lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayPositionFunction) or
+        keywordTagAt(tokens, pos, .array_append) or
+        keywordTagAt(tokens, pos, .array_prepend) or
+        keywordTagAt(tokens, pos, .array_cat) or
+        keywordTagAt(tokens, pos, .array_remove) or
+        keywordTagAt(tokens, pos, .array_replace) or
+        keywordTagAt(tokens, pos, .array_to_string) or
+        keywordTagAt(tokens, pos, .string_to_array) or
+        keywordTagAt(tokens, pos, .now) or
+        keywordTagAt(tokens, pos, .current_timestamp) or
+        keywordTagAt(tokens, pos, .current_date) or
         lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos) or
         keywordAt(tokens, pos, "interval");
 }
