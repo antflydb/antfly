@@ -1967,3 +1967,140 @@ test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
 }
+
+test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql;",
+            .fingerprint = "ddl:create_function:name=audit_changes:args=0:replace=false:returns=trigger:language=plpgsql",
+        },
+        .{
+            .sql = "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql;",
+            .fingerprint = "ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql",
+        },
+        .{
+            .sql = "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql STABLE;",
+            .fingerprint = "ddl:create_function:name=stable_audit:args=0:replace=false:returns=trigger:language=plpgsql:volatility=stable",
+        },
+        .{
+            .sql = "CREATE FUNCTION secure_audit() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER;",
+            .fingerprint = "ddl:create_function:name=secure_audit:args=0:replace=false:returns=trigger:language=plpgsql:security=definer",
+        },
+        .{
+            .sql = "CREATE FUNCTION external_secure_audit() RETURNS trigger LANGUAGE plpgsql EXTERNAL SECURITY DEFINER;",
+            .fingerprint = "ddl:create_function:name=external_secure_audit:args=0:replace=false:returns=trigger:language=plpgsql:security=definer",
+        },
+        .{
+            .sql = "CREATE FUNCTION called_null_audit() RETURNS trigger LANGUAGE plpgsql CALLED ON NULL INPUT;",
+            .fingerprint = "ddl:create_function:name=called_null_audit:args=0:replace=false:returns=trigger:language=plpgsql:null_input=called",
+        },
+        .{
+            .sql = "CREATE FUNCTION returns_null_audit() RETURNS trigger LANGUAGE plpgsql RETURNS NULL ON NULL INPUT;",
+            .fingerprint = "ddl:create_function:name=returns_null_audit:args=0:replace=false:returns=trigger:language=plpgsql:null_input=returns_null",
+        },
+        .{
+            .sql = "CREATE FUNCTION costed_audit() RETURNS trigger LANGUAGE plpgsql COST 10;",
+            .fingerprint = "ddl:create_function:name=costed_audit:args=0:replace=false:returns=trigger:language=plpgsql:cost=10",
+        },
+        .{
+            .sql = "CREATE FUNCTION rows_audit() RETURNS trigger LANGUAGE plpgsql ROWS 10;",
+            .fingerprint = "ddl:create_function:name=rows_audit:args=0:replace=false:returns=trigger:language=plpgsql:rows=10",
+        },
+        .{
+            .sql = "CREATE FUNCTION parallel_audit() RETURNS trigger LANGUAGE plpgsql PARALLEL SAFE;",
+            .fingerprint = "ddl:create_function:name=parallel_audit:args=0:replace=false:returns=trigger:language=plpgsql:parallel=safe",
+        },
+        .{
+            .sql = "CREATE FUNCTION leakproof_audit() RETURNS trigger LANGUAGE plpgsql LEAKPROOF;",
+            .fingerprint = "ddl:create_function:name=leakproof_audit:args=0:replace=false:returns=trigger:language=plpgsql:leakproof=true",
+        },
+        .{
+            .sql = "CREATE FUNCTION window_audit() RETURNS trigger LANGUAGE plpgsql WINDOW;",
+            .fingerprint = "ddl:create_function:name=window_audit:args=0:replace=false:returns=trigger:language=plpgsql:window=true",
+        },
+        .{
+            .sql = "CREATE FUNCTION support_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support;",
+            .fingerprint = "ddl:create_function:name=support_audit:args=0:replace=false:returns=trigger:language=plpgsql:support=audit_support",
+        },
+        .{
+            .sql = "CREATE FUNCTION transform_audit() RETURNS trigger LANGUAGE plpgsql TRANSFORM FOR TYPE jsonb, public.hstore;",
+            .fingerprint = "ddl:create_function:name=transform_audit:args=0:replace=false:returns=trigger:language=plpgsql:transforms=2:transform=jsonb:transform=hstore",
+        },
+        .{
+            .sql = "CREATE FUNCTION setting_audit() RETURNS trigger LANGUAGE plpgsql SET search_path TO public;",
+            .fingerprint = "ddl:create_function:name=setting_audit:args=0:replace=false:returns=trigger:language=plpgsql:settings=1:setting=search_path:values=1:value=public",
+        },
+        .{
+            .sql = "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NEW; END$$;",
+            .fingerprint = "ddl:create_function:name=audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new",
+        },
+        .{
+            .sql = "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN OLD; END$$;",
+            .fingerprint = "ddl:create_function:name=old_audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_old",
+        },
+        .{
+            .sql = "CREATE FUNCTION null_audit_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$;",
+            .fingerprint = "ddl:create_function:name=null_audit_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_null",
+        },
+        .{
+            .sql = "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'audit'; RETURN NEW; END$$;",
+            .fingerprint = "ddl:create_function:name=audit_notice_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new",
+        },
+        .{
+            .sql = "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;",
+            .fingerprint = "ddl:create_function:name=audit_perform_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log",
+        },
+        .{
+            .sql = "DROP FUNCTION IF EXISTS audit_changes();",
+            .fingerprint = "ddl:drop_function:name=audit_changes:args=0:if_exists=true",
+        },
+        .{
+            .sql = "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE;",
+            .fingerprint = "ddl:drop_function:name=audit_changes:args=1:if_exists=true:cascade=true",
+        },
+        .{
+            .sql = "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql;",
+            .fingerprint = "ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql",
+        },
+        .{
+            .sql = "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS $$BEGIN NULL; END$$;",
+            .fingerprint = "ddl:create_procedure:name=rotate_usage:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop",
+        },
+        .{
+            .sql = "CREATE PROCEDURE rotate_usage_notice() LANGUAGE plpgsql AS $$BEGIN RAISE NOTICE 'rotate'; END$$;",
+            .fingerprint = "ddl:create_procedure:name=rotate_usage_notice:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop",
+        },
+        .{
+            .sql = "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;",
+            .fingerprint = "ddl:create_procedure:name=rotate_usage_perform:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now",
+        },
+        .{
+            .sql = "CALL rotate_usage();",
+            .fingerprint = "ddl:call_procedure:name=rotate_usage:args=0",
+        },
+        .{
+            .sql = "DROP PROCEDURE rotate_usage();",
+            .fingerprint = "ddl:drop_procedure:name=rotate_usage:args=0:if_exists=false",
+        },
+        .{
+            .sql = "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE;",
+            .fingerprint = "ddl:drop_procedure:name=rotate_usage:args=1:if_exists=true:cascade=true",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CALL rotate_usage(1);"));
+}

@@ -10191,6 +10191,147 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
 }
 
+test "sql adapter ddl plan lowers routine catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var create_function = try lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION audit_changes() RETURNS trigger LANGUAGE plpgsql;");
+    defer create_function.deinit(alloc);
+    switch (create_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqual(RoutineKind.function, create.kind);
+                try std.testing.expectEqualStrings("audit_changes", create.routine_name);
+                try std.testing.expectEqual(@as(usize, 0), create.argument_count);
+                try std.testing.expectEqualStrings("trigger", create.returns_type.?);
+                try std.testing.expectEqualStrings("plpgsql", create.language.?);
+                try std.testing.expect(!create.replace_existing);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var replace_function = try lowerDdlPlanForTestAlloc(alloc, "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql;");
+    defer replace_function.deinit(alloc);
+    switch (replace_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| try std.testing.expect(create.replace_existing),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var option_function = try lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION audit_options() RETURNS trigger LANGUAGE plpgsql STABLE SECURITY DEFINER CALLED ON NULL INPUT COST 10 ROWS 10 PARALLEL SAFE LEAKPROOF WINDOW SUPPORT audit_support TRANSFORM FOR TYPE jsonb, public.hstore SET search_path TO public;");
+    defer option_function.deinit(alloc);
+    switch (option_function) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqual(RoutineVolatility.stable, create.volatility.?);
+                try std.testing.expectEqual(RoutineSecurity.definer, create.security.?);
+                try std.testing.expectEqual(RoutineNullInput.called, create.null_input.?);
+                try std.testing.expectEqualStrings("10", create.cost.?);
+                try std.testing.expectEqualStrings("10", create.rows.?);
+                try std.testing.expectEqual(RoutineParallelSafety.safe, create.parallel_safety.?);
+                try std.testing.expect(create.leakproof);
+                try std.testing.expect(create.window);
+                try std.testing.expectEqualStrings("audit_support", create.support_function.?);
+                try std.testing.expectEqual(@as(usize, 2), create.transform_types.len);
+                try std.testing.expectEqualStrings("jsonb", create.transform_types[0]);
+                try std.testing.expectEqualStrings("hstore", create.transform_types[1]);
+                try std.testing.expectEqual(@as(usize, 1), create.settings.len);
+                try std.testing.expectEqualStrings("search_path", create.settings[0].name);
+                try std.testing.expectEqual(@as(usize, 1), create.settings[0].values.len);
+                try std.testing.expectEqualStrings("public", create.settings[0].values[0]);
+                try std.testing.expect(!create.settings[0].from_current);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var trigger_body = try lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;");
+    defer trigger_body.deinit(alloc);
+    switch (trigger_body) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                const body = create.body orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(RoutineBodyKind.plpgsql_trigger, body.kind);
+                try std.testing.expectEqual(RoutineExecutionHook.trigger_return_new, body.hook);
+                try std.testing.expect(body.expression == null);
+                try std.testing.expectEqual(@as(usize, 1), body.perform_routines.len);
+                try std.testing.expectEqualStrings("audit_log", body.perform_routines[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_function = try lowerDdlPlanForTestAlloc(alloc, "DROP FUNCTION IF EXISTS audit_changes(text) CASCADE;");
+    defer drop_function.deinit(alloc);
+    switch (drop_function) {
+        .function_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqual(RoutineKind.function, drop.kind);
+                try std.testing.expectEqualStrings("audit_changes", drop.routine_name);
+                try std.testing.expectEqual(@as(usize, 1), drop.argument_count);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_procedure = try lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;");
+    defer create_procedure.deinit(alloc);
+    switch (create_procedure) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqual(RoutineKind.procedure, create.kind);
+                try std.testing.expectEqualStrings("rotate_usage_perform", create.routine_name);
+                try std.testing.expect(create.returns_type == null);
+                const body = create.body orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(RoutineBodyKind.plpgsql_procedure, body.kind);
+                try std.testing.expectEqual(RoutineExecutionHook.procedure_noop, body.hook);
+                try std.testing.expectEqual(@as(usize, 1), body.perform_routines.len);
+                try std.testing.expectEqualStrings("rotate_usage_now", body.perform_routines[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var call_procedure = try lowerDdlPlanForTestAlloc(alloc, "CALL rotate_usage();");
+    defer call_procedure.deinit(alloc);
+    switch (call_procedure) {
+        .procedure_call => |call| {
+            try std.testing.expectEqualStrings("rotate_usage", call.routine_name);
+            try std.testing.expectEqual(@as(usize, 0), call.argument_count);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_procedure = try lowerDdlPlanForTestAlloc(alloc, "DROP PROCEDURE IF EXISTS rotate_usage(text) CASCADE;");
+    defer drop_procedure.deinit(alloc);
+    switch (drop_procedure) {
+        .function_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqual(RoutineKind.procedure, drop.kind);
+                try std.testing.expectEqualStrings("rotate_usage", drop.routine_name);
+                try std.testing.expectEqual(@as(usize, 1), drop.argument_count);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CALL rotate_usage(1);"));
+}
+
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     const alloc = std.testing.allocator;
 

@@ -3,7 +3,6 @@
   "required": [
     "bulk_io_plan",
     "cte_mutation_source_plan",
-    "enforced_unique_conflict_target",
     "multi_table_generation_barrier",
     "routine_body_plan",
     "routine_option_plan"
