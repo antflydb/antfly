@@ -5025,6 +5025,31 @@ pub fn planHasAnyNonZeroToken(plan: []const u8, tokens: []const []const u8) bool
     return false;
 }
 
+pub fn planHasRootKind(plan: []const u8, expected: []const u8) bool {
+    const root_end = std.mem.indexOfScalar(u8, plan, ':') orelse plan.len;
+    return std.mem.eql(u8, plan[0..root_end], expected);
+}
+
+pub fn planHasRootSubKind(plan: []const u8, root: []const u8, expected: []const u8) bool {
+    const root_end = std.mem.indexOfScalar(u8, plan, ':') orelse return false;
+    if (!std.mem.eql(u8, plan[0..root_end], root)) return false;
+    const sub_start = root_end + 1;
+    const sub_end = std.mem.indexOfScalarPos(u8, plan, sub_start, ':') orelse plan.len;
+    return std.mem.eql(u8, plan[sub_start..sub_end], expected);
+}
+
+pub fn readPlanHasKind(plan: []const u8, expected: []const u8) bool {
+    return planHasRootSubKind(plan, "read", expected);
+}
+
+pub fn mergePlanIsTyped(plan: []const u8) bool {
+    return planHasRootKind(plan, "merge_mutation") or planHasRootKind(plan, "recursive_merge_mutation");
+}
+
+pub fn mergePlanIsRecursive(plan: []const u8) bool {
+    return planHasRootKind(plan, "recursive_merge_mutation");
+}
+
 pub fn explainPlanHasKind(plan: []const u8, expected: []const u8) bool {
     return planHasExactStringToken(plan, "explain:kind=", expected);
 }
@@ -7708,7 +7733,7 @@ pub const AppParityCorpusCoverage = struct {
             (appParityTokensHaveKeyword(sql_tokens, .intersect) or
                 appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all })) and
             appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
-            (sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") or std.mem.startsWith(u8, entry.plan, "read:set_operation:")) and
+            (sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") or sql_adapter.readPlanHasKind(entry.plan, "set_operation")) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":result_order=") and
             sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "5"));
         self.set_operation_fetch_tail = self.set_operation_fetch_tail or
@@ -8274,10 +8299,8 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
             .merge_mutation => {
-                self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or
-                    std.mem.startsWith(u8, entry.plan, "merge_mutation:") or
-                    std.mem.startsWith(u8, entry.plan, "recursive_merge_mutation:");
-                const recursive_merge = std.mem.startsWith(u8, entry.plan, "recursive_merge_mutation:");
+                self.merge_mutation_typed_plan = self.merge_mutation_typed_plan or sql_adapter.mergePlanIsTyped(entry.plan);
+                const recursive_merge = sql_adapter.mergePlanIsRecursive(entry.plan);
                 self.merge_mutation_cte = self.merge_mutation_cte or
                     recursive_merge or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
@@ -8337,10 +8360,13 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported_delete_joined_source => {},
             .unsupported_merge_mutation => {},
             .read => {
-                const is_read_query = std.mem.startsWith(u8, entry.plan, "read:query:");
-                const is_read_aggregate = std.mem.startsWith(u8, entry.plan, "read:aggregate:");
-                const is_read_recursive_cte = std.mem.startsWith(u8, entry.plan, "read:recursive_cte:");
-                const is_read_window = std.mem.startsWith(u8, entry.plan, "read:window:");
+                const is_read_query = sql_adapter.readPlanHasKind(entry.plan, "query");
+                const is_read_aggregate = sql_adapter.readPlanHasKind(entry.plan, "aggregate");
+                const is_read_join = sql_adapter.readPlanHasKind(entry.plan, "join");
+                const is_read_lateral = sql_adapter.readPlanHasKind(entry.plan, "lateral");
+                const is_read_recursive_cte = sql_adapter.readPlanHasKind(entry.plan, "recursive_cte");
+                const is_read_set_operation = sql_adapter.readPlanHasKind(entry.plan, "set_operation");
+                const is_read_window = sql_adapter.readPlanHasKind(entry.plan, "window");
                 const has_cte_expression =
                     sql_adapter.planHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
                 const has_read_query_expression =
@@ -8359,8 +8385,8 @@ pub const AppParityCorpusCoverage = struct {
                 self.read_query = self.read_query or is_read_query;
                 self.read_recursive_cte_stream_plan = self.read_recursive_cte_stream_plan or is_read_recursive_cte;
                 self.read_aggregate = self.read_aggregate or is_read_aggregate;
-                self.read_join = self.read_join or std.mem.startsWith(u8, entry.plan, "read:join:");
-                self.read_lateral = self.read_lateral or std.mem.startsWith(u8, entry.plan, "read:lateral:");
+                self.read_join = self.read_join or is_read_join;
+                self.read_lateral = self.read_lateral or is_read_lateral;
                 self.read_window = self.read_window or is_read_window;
                 self.read_window_duplicate_output_label = self.read_window_duplicate_output_label or
                     (is_read_window and
@@ -8369,36 +8395,36 @@ pub const AppParityCorpusCoverage = struct {
                         appParityTokensHaveKeyword(sql_tokens, .as) and
                         appParityTokensHaveIdentifier(sql_tokens, "id"));
                 self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:join:") and
+                    (is_read_join and
                         appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "customer_records"));
                 self.read_graph_table_function_cte_join = self.read_graph_table_function_cte_join or
-                    (std.mem.startsWith(u8, entry.plan, "read:join:") and
+                    (is_read_join and
                         appParityTokensStartWithKeyword(sql_tokens, .with) and
                         appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_graph_table_function_inline_join = self.read_graph_table_function_inline_join or
-                    (std.mem.startsWith(u8, entry.plan, "read:join:") and
+                    (is_read_join and
                         appParityTokensHaveKeyword(sql_tokens, .join) and
                         appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:lateral:") and
+                    (is_read_lateral and
                         appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "balance_records"));
                 self.read_set_operation_cross_table_source_schema_classifier = self.read_set_operation_cross_table_source_schema_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
+                    (is_read_set_operation and
                         appParityEntryHasCatalogSchemas(entry) and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_set_operation_cross_table_except_classifier = self.read_set_operation_cross_table_except_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
+                    (is_read_set_operation and
                         appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "except") and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
                 self.read_set_operation_cross_table_intersect_classifier = self.read_set_operation_cross_table_intersect_classifier or
-                    (std.mem.startsWith(u8, entry.plan, "read:set_operation:") and
+                    (is_read_set_operation and
                         appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, "set_operation:op=", "intersect") and
                         setOperationPlanHasRightTable(entry.plan, "archived_records"));
@@ -8421,7 +8447,7 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
         } else if (entry.family == .recursive_insert_source) {
             self.recursive_insert_source = self.recursive_insert_source or
-                (std.mem.startsWith(u8, entry.plan, "recursive_insert_source:") and
+                (sql_adapter.planHasRootKind(entry.plan, "recursive_insert_source") and
                     appParityTokensHaveKeywordSequence(sql_tokens, &.{ .with, .recursive }) and
                     appParityTokensHaveKeywordSequence(sql_tokens, &.{ .insert, .into }));
         } else if (entry.family == .truncate_source) {

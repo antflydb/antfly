@@ -7828,6 +7828,9 @@ pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
     });
 }
 
+const lowerDdlPlanForTestAlloc = lowerDdlPlanAlloc;
+const lowerDdlPlanWithFunctionBindingsForTestAlloc = lowerDdlPlanWithFunctionBindingsAlloc;
+
 test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
     const alloc = std.testing.allocator;
     var lowered = try lowerDdlPlanForTestAlloc(

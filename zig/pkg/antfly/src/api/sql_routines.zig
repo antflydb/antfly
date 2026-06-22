@@ -16,7 +16,6 @@ const std = @import("std");
 const extension_domain = @import("../extensions/mod.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const relational_rows = @import("relational_rows.zig");
-const relational_sql = @import("relational_sql.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const sql_adapter = @import("sql_adapter/mod.zig");
 
@@ -34,23 +33,23 @@ const SpinMutex = struct {
 
 pub const RoutineRecord = struct {
     origin: RoutineOrigin = .catalog,
-    kind: relational_sql.RoutineKind,
+    kind: sql_adapter.RoutineKind,
     name: []u8,
     argument_count: usize,
     returns_type: ?[]u8 = null,
     language: ?[]u8 = null,
-    volatility: ?relational_sql.RoutineVolatility = null,
-    security: ?relational_sql.RoutineSecurity = null,
-    null_input: ?relational_sql.RoutineNullInput = null,
-    parallel_safety: ?relational_sql.RoutineParallelSafety = null,
+    volatility: ?sql_adapter.RoutineVolatility = null,
+    security: ?sql_adapter.RoutineSecurity = null,
+    null_input: ?sql_adapter.RoutineNullInput = null,
+    parallel_safety: ?sql_adapter.RoutineParallelSafety = null,
     leakproof: bool = false,
     window: bool = false,
     support_function: ?[]u8 = null,
     transform_types: [][]u8 = &.{},
-    settings: []relational_sql.RoutineSetting = &.{},
+    settings: []sql_adapter.RoutineSetting = &.{},
     cost: ?[]u8 = null,
     rows: ?[]u8 = null,
-    body: ?relational_sql.RoutineBodyPlan = null,
+    body: ?sql_adapter.RoutineBodyPlan = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -153,7 +152,7 @@ pub const Runtime = struct {
         try self.recoverPersistedTriggersLocked(opened);
     }
 
-    pub fn apply(self: *@This(), plan: relational_sql.FunctionCatalogPlan) !void {
+    pub fn apply(self: *@This(), plan: sql_adapter.FunctionCatalogPlan) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         switch (plan) {
@@ -171,10 +170,10 @@ pub const Runtime = struct {
     pub fn routineSettingsForTestAlloc(
         self: *@This(),
         alloc: std.mem.Allocator,
-        kind: relational_sql.RoutineKind,
+        kind: sql_adapter.RoutineKind,
         name: []const u8,
         argument_count: usize,
-    ) ![]relational_sql.RoutineSetting {
+    ) ![]sql_adapter.RoutineSetting {
         self.mutex.lock();
         defer self.mutex.unlock();
         const routine = self.findRoutineLocked(kind, name, argument_count) orelse return error.RoutineNotFound;
@@ -242,7 +241,7 @@ pub const Runtime = struct {
         self: *@This(),
         table_name: []const u8,
         event: TriggerEvent,
-    ) !?relational_sql.RoutineExecutionHook {
+    ) !?sql_adapter.RoutineExecutionHook {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.triggers.items) |trigger| {
@@ -335,11 +334,11 @@ pub const Runtime = struct {
     pub fn listExpressionRoutineBindingsAlloc(
         self: *@This(),
         alloc: std.mem.Allocator,
-    ) ![]relational_sql.RoutineExpressionBinding {
+    ) ![]sql_adapter.RoutineExpressionBinding {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var bindings = std.ArrayListUnmanaged(relational_sql.RoutineExpressionBinding).empty;
+        var bindings = std.ArrayListUnmanaged(sql_adapter.RoutineExpressionBinding).empty;
         errdefer {
             for (bindings.items) |binding| {
                 alloc.free(@constCast(binding.sql_name));
@@ -371,7 +370,7 @@ pub const Runtime = struct {
         return try bindings.toOwnedSlice(alloc);
     }
 
-    fn createLocked(self: *@This(), plan: relational_sql.CreateRoutinePlan) !void {
+    fn createLocked(self: *@This(), plan: sql_adapter.CreateRoutinePlan) !void {
         if (plan.body) |body| {
             try self.validateRoutineBodyPlanLocked(plan.kind, plan.returns_type, body);
         }
@@ -402,7 +401,7 @@ pub const Runtime = struct {
         try self.routines.append(self.alloc, record);
     }
 
-    fn dropLocked(self: *@This(), plan: relational_sql.DropRoutinePlan) !void {
+    fn dropLocked(self: *@This(), plan: sql_adapter.DropRoutinePlan) !void {
         if (plan.cascade) return error.UnsupportedSqlShape;
         if (self.routineReferencedByTriggerLocked(plan.kind, plan.routine_name, plan.argument_count)) return error.RoutineInUse;
         if (self.routineReferencedByPerformLocked(plan.kind, plan.routine_name, plan.argument_count)) return error.RoutineInUse;
@@ -455,7 +454,7 @@ pub const Runtime = struct {
 
     fn findRoutineLocked(
         self: *@This(),
-        kind: relational_sql.RoutineKind,
+        kind: sql_adapter.RoutineKind,
         name: []const u8,
         argument_count: usize,
     ) ?*const RoutineRecord {
@@ -465,7 +464,7 @@ pub const Runtime = struct {
 
     fn findRoutineIndexLocked(
         self: *@This(),
-        kind: relational_sql.RoutineKind,
+        kind: sql_adapter.RoutineKind,
         name: []const u8,
         argument_count: usize,
     ) ?usize {
@@ -494,9 +493,9 @@ pub const Runtime = struct {
 
     fn validateRoutineBodyPlanLocked(
         self: *@This(),
-        kind: relational_sql.RoutineKind,
+        kind: sql_adapter.RoutineKind,
         returns_type: ?[]const u8,
-        body: relational_sql.RoutineBodyPlan,
+        body: sql_adapter.RoutineBodyPlan,
     ) !void {
         switch (body.hook) {
             .expression => {
@@ -527,7 +526,7 @@ pub const Runtime = struct {
 
     fn routineReferencedByTriggerLocked(
         self: *@This(),
-        kind: relational_sql.RoutineKind,
+        kind: sql_adapter.RoutineKind,
         routine_name: []const u8,
         argument_count: usize,
     ) bool {
@@ -540,7 +539,7 @@ pub const Runtime = struct {
 
     fn routineReferencedByPerformLocked(
         self: *@This(),
-        kind: relational_sql.RoutineKind,
+        kind: sql_adapter.RoutineKind,
         routine_name: []const u8,
         argument_count: usize,
     ) bool {
@@ -558,7 +557,7 @@ pub const Runtime = struct {
 
     fn validatePerformCallsLocked(
         self: *@This(),
-        calls: []const relational_sql.RoutinePerformCall,
+        calls: []const sql_adapter.RoutinePerformCall,
     ) !void {
         for (calls) |call| {
             const routine = self.findRoutineLocked(.function, call.routine_name, call.argument_json.len) orelse return error.RoutineNotFound;
@@ -570,7 +569,7 @@ pub const Runtime = struct {
     fn executePerformCallsLocked(
         self: *@This(),
         alloc: std.mem.Allocator,
-        calls: []const relational_sql.RoutinePerformCall,
+        calls: []const sql_adapter.RoutinePerformCall,
     ) !void {
         for (calls) |call| {
             const routine = self.findRoutineLocked(.function, call.routine_name, call.argument_json.len) orelse return error.RoutineNotFound;
@@ -684,7 +683,7 @@ pub const Runtime = struct {
 
 pub fn freeExpressionRoutineBindings(
     alloc: std.mem.Allocator,
-    bindings: []const relational_sql.RoutineExpressionBinding,
+    bindings: []const sql_adapter.RoutineExpressionBinding,
 ) void {
     for (bindings) |binding| {
         alloc.free(@constCast(binding.sql_name));
@@ -990,7 +989,7 @@ fn nativeQueryFunctionExpressionAlloc(
 fn routineArgumentObjectJsonAlloc(
     alloc: std.mem.Allocator,
     argument_json: []const []const u8,
-    null_input: ?relational_sql.RoutineNullInput,
+    null_input: ?sql_adapter.RoutineNullInput,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -1018,7 +1017,7 @@ fn routineTriggerTupleJsonAlloc(alloc: std.mem.Allocator, tuple_json: []const u8
     return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
 }
 
-fn cloneCreateRoutineRecordAlloc(alloc: std.mem.Allocator, plan: relational_sql.CreateRoutinePlan) !RoutineRecord {
+fn cloneCreateRoutineRecordAlloc(alloc: std.mem.Allocator, plan: sql_adapter.CreateRoutinePlan) !RoutineRecord {
     const name = try alloc.dupe(u8, plan.routine_name);
     errdefer alloc.free(name);
     const returns_type = if (plan.returns_type) |value| try alloc.dupe(u8, value) else null;
@@ -1078,9 +1077,9 @@ fn freeOwnedStringSlice(alloc: std.mem.Allocator, values: [][]u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
-fn cloneRoutineSettingsAlloc(alloc: std.mem.Allocator, source: []const relational_sql.RoutineSetting) ![]relational_sql.RoutineSetting {
+fn cloneRoutineSettingsAlloc(alloc: std.mem.Allocator, source: []const sql_adapter.RoutineSetting) ![]sql_adapter.RoutineSetting {
     if (source.len == 0) return &.{};
-    const out = try alloc.alloc(relational_sql.RoutineSetting, source.len);
+    const out = try alloc.alloc(sql_adapter.RoutineSetting, source.len);
     var copied: usize = 0;
     errdefer {
         for (out[0..copied]) |*setting| setting.deinit(alloc);
@@ -1099,12 +1098,12 @@ fn cloneRoutineSettingsAlloc(alloc: std.mem.Allocator, source: []const relationa
     return out;
 }
 
-fn freeRoutineSettings(alloc: std.mem.Allocator, settings: []relational_sql.RoutineSetting) void {
+fn freeRoutineSettings(alloc: std.mem.Allocator, settings: []sql_adapter.RoutineSetting) void {
     for (settings) |*setting| setting.deinit(alloc);
     if (settings.len > 0) alloc.free(settings);
 }
 
-fn cloneRoutineBodyAlloc(alloc: std.mem.Allocator, body: relational_sql.RoutineBodyPlan) !relational_sql.RoutineBodyPlan {
+fn cloneRoutineBodyAlloc(alloc: std.mem.Allocator, body: sql_adapter.RoutineBodyPlan) !sql_adapter.RoutineBodyPlan {
     const expression = if (body.expression) |value| try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, value) else null;
     errdefer if (expression) |value| runtime_schema.freeRelationalRowsExpression(alloc, value);
     const perform_calls = try cloneRoutinePerformCallsAlloc(alloc, body.perform_calls);
@@ -1119,9 +1118,9 @@ fn cloneRoutineBodyAlloc(alloc: std.mem.Allocator, body: relational_sql.RoutineB
 
 fn cloneRoutinePerformCallsAlloc(
     alloc: std.mem.Allocator,
-    source: []const relational_sql.RoutinePerformCall,
-) ![]relational_sql.RoutinePerformCall {
-    const out = try alloc.alloc(relational_sql.RoutinePerformCall, source.len);
+    source: []const sql_adapter.RoutinePerformCall,
+) ![]sql_adapter.RoutinePerformCall {
+    const out = try alloc.alloc(sql_adapter.RoutinePerformCall, source.len);
     var initialized: usize = 0;
     errdefer {
         freeRoutinePerformCallItems(alloc, out[0..initialized]);
@@ -1140,35 +1139,35 @@ fn cloneRoutinePerformCallsAlloc(
     return out;
 }
 
-fn freeRoutinePerformCalls(alloc: std.mem.Allocator, calls: []relational_sql.RoutinePerformCall) void {
+fn freeRoutinePerformCalls(alloc: std.mem.Allocator, calls: []sql_adapter.RoutinePerformCall) void {
     freeRoutinePerformCallItems(alloc, calls);
     if (calls.len > 0) alloc.free(calls);
 }
 
-fn freeRoutinePerformCallItems(alloc: std.mem.Allocator, calls: []relational_sql.RoutinePerformCall) void {
+fn freeRoutinePerformCallItems(alloc: std.mem.Allocator, calls: []sql_adapter.RoutinePerformCall) void {
     for (calls) |*call| call.deinit(alloc);
 }
 
 const PersistedRoutineRecord = struct {
     version: u32 = 1,
     origin: RoutineOrigin = .catalog,
-    kind: relational_sql.RoutineKind,
+    kind: sql_adapter.RoutineKind,
     name: []u8,
     argument_count: usize,
     returns_type: ?[]u8 = null,
     language: ?[]u8 = null,
-    volatility: ?relational_sql.RoutineVolatility = null,
-    security: ?relational_sql.RoutineSecurity = null,
-    null_input: ?relational_sql.RoutineNullInput = null,
-    parallel_safety: ?relational_sql.RoutineParallelSafety = null,
+    volatility: ?sql_adapter.RoutineVolatility = null,
+    security: ?sql_adapter.RoutineSecurity = null,
+    null_input: ?sql_adapter.RoutineNullInput = null,
+    parallel_safety: ?sql_adapter.RoutineParallelSafety = null,
     leakproof: bool = false,
     window: bool = false,
     support_function: ?[]u8 = null,
     transform_types: [][]u8 = &.{},
-    settings: []relational_sql.RoutineSetting = &.{},
+    settings: []sql_adapter.RoutineSetting = &.{},
     cost: ?[]u8 = null,
     rows: ?[]u8 = null,
-    body: ?relational_sql.RoutineBodyPlan = null,
+    body: ?sql_adapter.RoutineBodyPlan = null,
 };
 
 fn encodeRoutineRecordAlloc(alloc: std.mem.Allocator, record: RoutineRecord) ![]u8 {
@@ -1238,7 +1237,7 @@ fn clonePersistedRoutineRecordAlloc(alloc: std.mem.Allocator, persisted: Persist
 
 fn routineRecordKeyAlloc(
     alloc: std.mem.Allocator,
-    kind: relational_sql.RoutineKind,
+    kind: sql_adapter.RoutineKind,
     name: []const u8,
     argument_count: usize,
 ) ![]u8 {
@@ -1300,7 +1299,7 @@ fn hashLowerIdentifier(alloc: std.mem.Allocator, hasher: anytype, value: []const
 
 test "sql routine runtime stores and executes safe expression bodies" {
     const alloc = std.testing.allocator;
-    var plan = try relational_sql.lowerDdlPlanAlloc(
+    var plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
     );
@@ -1334,7 +1333,7 @@ test "sql routine runtime persists catalog routines across reopen" {
         defer runtime.deinit();
         try runtime.attachOpenedStore(opened);
 
-        var plan = try relational_sql.lowerDdlPlanAlloc(
+        var plan = try sql_adapter.lowerDdlPlanAlloc(
             alloc,
             "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
         );
@@ -1344,7 +1343,7 @@ test "sql routine runtime persists catalog routines across reopen" {
             else => return error.TestUnexpectedResult,
         });
 
-        var procedure_plan = try relational_sql.lowerDdlPlanAlloc(
+        var procedure_plan = try sql_adapter.lowerDdlPlanAlloc(
             alloc,
             "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
         );
@@ -1382,7 +1381,7 @@ test "sql routine runtime persists catalog routines across reopen" {
         try runtime.executeProcedureRoutineArgs("rotate_usage", 0);
         try std.testing.expectError(error.RoutineNotFound, runtime.executeProcedureRoutineArgs("rotate_usage", 1));
 
-        var drop_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION normalize_status(text);");
+        var drop_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP FUNCTION normalize_status(text);");
         defer drop_plan.deinit(alloc);
         try runtime.apply(switch (drop_plan) {
             .function_catalog => |function_plan| function_plan,
@@ -1390,7 +1389,7 @@ test "sql routine runtime persists catalog routines across reopen" {
         });
         try std.testing.expectEqual(@as(usize, 1), runtime.routineCountForTest());
 
-        var drop_procedure_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP PROCEDURE rotate_usage();");
+        var drop_procedure_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP PROCEDURE rotate_usage();");
         defer drop_procedure_plan.deinit(alloc);
         try runtime.apply(switch (drop_procedure_plan) {
             .function_catalog => |function_plan| function_plan,
@@ -1438,7 +1437,7 @@ test "sql routine runtime validates perform dependencies during durable recovery
     const alloc = std.testing.allocator;
     const Helper = struct {
         fn applyDdl(allocator: std.mem.Allocator, runtime: *Runtime, sql: []const u8) !void {
-            var plan = try relational_sql.lowerDdlPlanAlloc(allocator, sql);
+            var plan = try sql_adapter.lowerDdlPlanAlloc(allocator, sql);
             defer plan.deinit(allocator);
             try runtime.apply(switch (plan) {
                 .function_catalog => |function_plan| function_plan,
@@ -1507,7 +1506,7 @@ test "sql routine runtime validates perform dependencies during durable recovery
             opened.deinit();
             alloc.destroy(opened);
         }
-        var unsafe_plan = try relational_sql.lowerDdlPlanAlloc(
+        var unsafe_plan = try sql_adapter.lowerDdlPlanAlloc(
             alloc,
             "CREATE FUNCTION audit_log() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
         );
@@ -1532,7 +1531,7 @@ test "sql routine runtime validates perform dependencies during durable recovery
 
 test "sql routine runtime executes bounded multi argument expression bodies" {
     const alloc = std.testing.allocator;
-    var plan = try relational_sql.lowerDdlPlanAlloc(
+    var plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION add_amounts(numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1 + $2';",
     );
@@ -1549,7 +1548,7 @@ test "sql routine runtime executes bounded multi argument expression bodies" {
     defer alloc.free(out);
     try std.testing.expectEqualStrings("5.5", out);
 
-    var concat_plan = try relational_sql.lowerDdlPlanAlloc(
+    var concat_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
     );
@@ -1568,7 +1567,7 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
 
-    var normalize_plan = try relational_sql.lowerDdlPlanAlloc(
+    var normalize_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql AS 'SELECT lower($1)';",
     );
@@ -1578,7 +1577,7 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
         else => return error.TestUnexpectedResult,
     });
 
-    var label_plan = try relational_sql.lowerDdlPlanAlloc(
+    var label_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION status_label(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('' '', $1, $2)';",
     );
@@ -1588,7 +1587,7 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
         else => return error.TestUnexpectedResult,
     });
 
-    var strict_plan = try relational_sql.lowerDdlPlanAlloc(
+    var strict_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
     );
@@ -1618,7 +1617,7 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
         } else if (std.mem.eql(u8, binding.sql_name, "strict_normalize_status")) {
             saw_strict = true;
             try std.testing.expectEqual(@as(u16, 1), binding.arity);
-            try std.testing.expectEqual(relational_sql.RoutineNullInput.returns_null, binding.null_input.?);
+            try std.testing.expectEqual(sql_adapter.RoutineNullInput.returns_null, binding.null_input.?);
         }
     }
     try std.testing.expect(saw_normalize);
@@ -1628,7 +1627,7 @@ test "sql routine runtime exports expression routine bindings for SQL lowering" 
 
 test "sql routine runtime executes nested safe expression bodies" {
     const alloc = std.testing.allocator;
-    var plan = try relational_sql.lowerDdlPlanAlloc(
+    var plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION status_label_nested(text, text) RETURNS text LANGUAGE sql AS 'SELECT concat_ws('':'', lower($1), coalesce($2, ''missing''))';",
     );
@@ -1649,7 +1648,7 @@ test "sql routine runtime executes nested safe expression bodies" {
     defer alloc.free(active);
     try std.testing.expectEqualStrings("\"tenant:active\"", active);
 
-    var clamp_plan = try relational_sql.lowerDdlPlanAlloc(
+    var clamp_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION clamp_amount(numeric, numeric, numeric) RETURNS numeric LANGUAGE sql AS 'SELECT least(greatest($1, $2), $3)';",
     );
@@ -1669,7 +1668,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     var runtime = Runtime.init(alloc);
     defer runtime.deinit();
 
-    var redact_plan = try relational_sql.lowerDdlPlanAlloc(
+    var redact_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION redact_digits(text) RETURNS text LANGUAGE sql AS 'SELECT regexp_replace($1, ''[0-9]'', ''#'', ''g'')';",
     );
@@ -1683,7 +1682,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(redacted);
     try std.testing.expectEqualStrings("\"acct-###\"", redacted);
 
-    var replace_plan = try relational_sql.lowerDdlPlanAlloc(
+    var replace_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION normalize_dash(text) RETURNS text LANGUAGE sql AS 'SELECT replace($1::text, ''-'', ''_'')';",
     );
@@ -1697,7 +1696,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(normalized);
     try std.testing.expectEqualStrings("\"a_b_c\"", normalized);
 
-    var cast_plan = try relational_sql.lowerDdlPlanAlloc(
+    var cast_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION cast_amount(text) RETURNS numeric LANGUAGE sql AS 'SELECT cast($1 AS numeric) + 1';",
     );
@@ -1713,14 +1712,14 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION missing_arg(text) RETURNS text LANGUAGE sql AS 'SELECT lower($2)';"),
+        sql_adapter.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION missing_arg(text) RETURNS text LANGUAGE sql AS 'SELECT lower($2)';"),
     );
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        relational_sql.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION ambient_field(text) RETURNS text LANGUAGE sql AS 'SELECT lower(status)';"),
+        sql_adapter.lowerDdlPlanAlloc(alloc, "CREATE FUNCTION ambient_field(text) RETURNS text LANGUAGE sql AS 'SELECT lower(status)';"),
     );
 
-    var trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+    var trigger_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
     );
@@ -1744,7 +1743,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         runtime.executeTriggerRoutineAlloc(alloc, "audit_body", null, "{\"id\":\"u1\"}"),
     );
 
-    var old_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+    var old_trigger_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
     );
@@ -1768,7 +1767,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         runtime.executeTriggerRoutineAlloc(alloc, "old_audit_body", "{\"id\":\"u1\"}", "null"),
     );
 
-    var null_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+    var null_trigger_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION skip_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
     );
@@ -1787,7 +1786,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(trigger_null);
     try std.testing.expectEqualStrings("null", trigger_null);
 
-    var noop_procedure_plan = try relational_sql.lowerDdlPlanAlloc(
+    var noop_procedure_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage() LANGUAGE plpgsql AS 'BEGIN NULL; END';",
     );
@@ -1802,7 +1801,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectError(error.RoutineNotFound, runtime.executeProcedureRoutineArgs("rotate_usage", 1));
     try std.testing.expectError(error.RoutineNotFound, runtime.executeProcedureRoutineArgs("audit_body", 0));
 
-    var notice_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+    var notice_trigger_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION audit_notice_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RAISE NOTICE ''audit''; RETURN NEW; END';",
     );
@@ -1821,7 +1820,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(trigger_notice_new);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"updated\"}", trigger_notice_new);
 
-    var missing_perform_plan = try relational_sql.lowerDdlPlanAlloc(
+    var missing_perform_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION audit_missing_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_missing(); RETURN NEW; END';",
     );
@@ -1831,7 +1830,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         else => return error.TestUnexpectedResult,
     }));
 
-    var unsafe_perform_plan = try relational_sql.lowerDdlPlanAlloc(
+    var unsafe_perform_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION audit_unsafe_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_notice_body(); RETURN NEW; END';",
     );
@@ -1841,7 +1840,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         else => return error.TestUnexpectedResult,
     }));
 
-    var audit_log_plan = try relational_sql.lowerDdlPlanAlloc(
+    var audit_log_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION audit_log() RETURNS text LANGUAGE sql AS 'SELECT ''ok''';",
     );
@@ -1851,7 +1850,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         else => return error.TestUnexpectedResult,
     });
     try std.testing.expectEqual(@as(usize, 9), runtime.routineCountForTest());
-    var perform_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+    var perform_trigger_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(); RETURN NEW; END';",
     );
@@ -1870,7 +1869,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     defer alloc.free(trigger_perform_new);
     try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"updated\"}", trigger_perform_new);
 
-    var rotate_usage_now_plan = try relational_sql.lowerDdlPlanAlloc(
+    var rotate_usage_now_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION rotate_usage_now() RETURNS text LANGUAGE sql AS 'SELECT ''ok''';",
     );
@@ -1880,7 +1879,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         else => return error.TestUnexpectedResult,
     });
     try std.testing.expectEqual(@as(usize, 11), runtime.routineCountForTest());
-    var perform_procedure_plan = try relational_sql.lowerDdlPlanAlloc(
+    var perform_procedure_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(); END';",
     );
@@ -1892,7 +1891,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectEqual(@as(usize, 12), runtime.routineCountForTest());
     try runtime.executeProcedureRoutineArgs("rotate_usage_perform", 0);
 
-    var rotate_usage_now_arg_plan = try relational_sql.lowerDdlPlanAlloc(
+    var rotate_usage_now_arg_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION rotate_usage_now(n numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1 + 1';",
     );
@@ -1902,7 +1901,7 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
         else => return error.TestUnexpectedResult,
     });
     try std.testing.expectEqual(@as(usize, 13), runtime.routineCountForTest());
-    var perform_procedure_arg_plan = try relational_sql.lowerDdlPlanAlloc(
+    var perform_procedure_arg_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(1); END';",
     );
@@ -1921,21 +1920,21 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectEqual(@as(usize, 1), stored_perform_arg_body.perform_calls[0].argument_json.len);
     try std.testing.expectEqualStrings("1", stored_perform_arg_body.perform_calls[0].argument_json[0]);
 
-    var drop_audit_log_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION audit_log();");
+    var drop_audit_log_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP FUNCTION audit_log();");
     defer drop_audit_log_plan.deinit(alloc);
     try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_audit_log_plan) {
         .function_catalog => |function_plan| function_plan,
         else => return error.TestUnexpectedResult,
     }));
 
-    var drop_rotate_usage_now_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now();");
+    var drop_rotate_usage_now_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now();");
     defer drop_rotate_usage_now_plan.deinit(alloc);
     try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_rotate_usage_now_plan) {
         .function_catalog => |function_plan| function_plan,
         else => return error.TestUnexpectedResult,
     }));
 
-    var drop_rotate_usage_now_arg_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now(numeric);");
+    var drop_rotate_usage_now_arg_plan = try sql_adapter.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now(numeric);");
     defer drop_rotate_usage_now_arg_plan.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), switch (drop_rotate_usage_now_arg_plan) {
         .function_catalog => |function_plan| switch (function_plan) {
@@ -1966,7 +1965,7 @@ test "sql routine runtime persists safe row trigger catalog records" {
         defer runtime.deinit();
         try runtime.attachOpenedStore(opened);
 
-        var trigger_fn_plan = try relational_sql.lowerDdlPlanAlloc(
+        var trigger_fn_plan = try sql_adapter.lowerDdlPlanAlloc(
             alloc,
             "CREATE FUNCTION audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';",
         );
@@ -2036,7 +2035,7 @@ test "sql routine runtime validates trigger ddl against executable trigger bodie
         "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records EXECUTE FUNCTION missing_trigger();",
     ));
 
-    var old_trigger_plan = try relational_sql.lowerDdlPlanAlloc(
+    var old_trigger_plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION old_audit_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
     );
@@ -2104,7 +2103,7 @@ test "sql routine runtime replaces ready extension query function bindings" {
 
 test "sql routine runtime applies returns-null null-input policy before execution" {
     const alloc = std.testing.allocator;
-    var plan = try relational_sql.lowerDdlPlanAlloc(
+    var plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION strict_normalize_status(text) RETURNS text LANGUAGE sql STRICT AS 'SELECT lower($1)';",
     );
@@ -2124,7 +2123,7 @@ test "sql routine runtime applies returns-null null-input policy before executio
 
 test "sql routine runtime preserves typed catalog metadata" {
     const alloc = std.testing.allocator;
-    var plan = try relational_sql.lowerDdlPlanAlloc(
+    var plan = try sql_adapter.lowerDdlPlanAlloc(
         alloc,
         "CREATE FUNCTION normalize_status(text) RETURNS text LANGUAGE sql IMMUTABLE SECURITY DEFINER PARALLEL SAFE LEAKPROOF COST 3 SET search_path TO public AS 'SELECT lower($1)';",
     );
@@ -2139,9 +2138,9 @@ test "sql routine runtime preserves typed catalog metadata" {
 
     try std.testing.expectEqual(@as(usize, 1), runtime.routines.items.len);
     const routine = runtime.routines.items[0];
-    try std.testing.expectEqual(relational_sql.RoutineVolatility.immutable, routine.volatility.?);
-    try std.testing.expectEqual(relational_sql.RoutineSecurity.definer, routine.security.?);
-    try std.testing.expectEqual(relational_sql.RoutineParallelSafety.safe, routine.parallel_safety.?);
+    try std.testing.expectEqual(sql_adapter.RoutineVolatility.immutable, routine.volatility.?);
+    try std.testing.expectEqual(sql_adapter.RoutineSecurity.definer, routine.security.?);
+    try std.testing.expectEqual(sql_adapter.RoutineParallelSafety.safe, routine.parallel_safety.?);
     try std.testing.expect(routine.leakproof);
     try std.testing.expectEqualStrings("3", routine.cost.?);
     try std.testing.expectEqual(@as(usize, 1), routine.settings.len);

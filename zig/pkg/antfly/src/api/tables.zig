@@ -31,7 +31,7 @@ const full_text_indexes = @import("full_text_indexes.zig");
 const indexes_api = @import("indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 const catalog_resources = @import("catalog_resources.zig");
-const relational_sql = @import("relational_sql.zig");
+const sql_adapter = @import("sql_adapter/mod.zig");
 const table_reads = @import("table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;
@@ -67,7 +67,7 @@ pub const AppliedRelationalSqlDdlRecord = struct {
     requires_rebuild: bool = false,
     validation_required: bool = false,
     rewrite_required: bool = false,
-    work_items: []const relational_sql.AppliedDdlWorkItem = &.{},
+    work_items: []const sql_adapter.AppliedDdlWorkItem = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         metadata_table_manager.freeTable(alloc, self.table);
@@ -1478,9 +1478,9 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
     table: *const metadata_table_manager.TableRecord,
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: relational_sql.SqlFunctionBindings,
+    function_bindings: sql_adapter.SqlFunctionBindings,
 ) !AppliedRelationalSqlDdlRecord {
-    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     if (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) |table_ref_value| {
@@ -1513,7 +1513,7 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
         .create_index, .drop_index, .alter_table, .create_update_policy => table.schema_json,
         else => return error.UnsupportedSqlShape,
     };
-    var applied = try relational_sql.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan);
+    var applied = try sql_adapter.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan);
     defer applied.deinit(alloc);
 
     const updated = try applyRelationalDdlSchemaRecordAlloc(alloc, table, applied.schema_json);
@@ -1545,7 +1545,7 @@ fn tableIndexesJsonContainsIndex(
 fn applyRelationalDerivedIndexCreateToTableRecordAlloc(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
-    plan: relational_sql.CreateIndexPlan,
+    plan: sql_adapter.CreateIndexPlan,
     index_json: []const u8,
 ) !AppliedRelationalSqlDdlRecord {
     if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
@@ -1574,7 +1574,7 @@ fn applyRelationalDerivedIndexCreateToTableRecordAlloc(
     return .{
         .table = updated,
         .requires_rebuild = true,
-        .work_items = try relational_sql.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, false, false),
+        .work_items = try sql_adapter.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, false, false),
     };
 }
 
@@ -1597,7 +1597,7 @@ fn applyRelationalDerivedIndexDropToTableRecordAlloc(
     return .{
         .table = updated,
         .requires_rebuild = true,
-        .work_items = try relational_sql.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, false, false),
+        .work_items = try sql_adapter.appliedDdlTableWorkItemsForFlagsAlloc(alloc, true, false, false),
     };
 }
 
@@ -1748,9 +1748,9 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: relational_sql.SqlFunctionBindings,
+    function_bindings: sql_adapter.SqlFunctionBindings,
 ) !RelationalSqlDdlTarget {
-    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     var table_ref = (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) orelse return error.UnsupportedSqlShape;
@@ -1778,21 +1778,21 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
 
 fn relationalSqlDdlPlanTableRefAlloc(
     alloc: std.mem.Allocator,
-    plan: relational_sql.LoweredDdlPlan,
+    plan: sql_adapter.LoweredDdlPlan,
 ) !?RelationalSqlDdlTableRef {
     return try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, catalog_resources.SqlCatalogSession.default());
 }
 
 fn relationalSqlDdlPlanTableRefWithSessionAlloc(
     alloc: std.mem.Allocator,
-    plan: relational_sql.LoweredDdlPlan,
+    plan: sql_adapter.LoweredDdlPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !?RelationalSqlDdlTableRef {
     const table_name = relationalSqlDdlPlanTableName(plan) orelse return null;
     return try parseRelationalSqlDdlTableRefWithSessionAlloc(alloc, table_name, session);
 }
 
-fn relationalSqlDdlPlanTableName(plan: relational_sql.LoweredDdlPlan) ?[]const u8 {
+fn relationalSqlDdlPlanTableName(plan: sql_adapter.LoweredDdlPlan) ?[]const u8 {
     return switch (plan) {
         .create_table => |create_table| create_table.table_name,
         .create_index => |create_index| if (create_index.table_name.len == 0) null else create_index.table_name,
@@ -1832,7 +1832,7 @@ fn parseRelationalSqlDdlTableRefWithSessionAlloc(
 
 fn retargetRelationalSqlDdlPlanTableNameAlloc(
     alloc: std.mem.Allocator,
-    plan: *relational_sql.LoweredDdlPlan,
+    plan: *sql_adapter.LoweredDdlPlan,
     table_name: []const u8,
 ) !void {
     const owned = try alloc.dupe(u8, table_name);
@@ -3773,7 +3773,7 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(
     snapshot: *const metadata_api.AdminSnapshot,
     sql: []const u8,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: relational_sql.SqlFunctionBindings,
+    function_bindings: sql_adapter.SqlFunctionBindings,
 ) !?AppliedRelationalSqlDdlRecord {
     const ServiceType = @TypeOf(svc);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
@@ -3790,7 +3790,7 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(
         return null;
     }
 
-    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     switch (plan) {
@@ -3805,7 +3805,7 @@ pub fn applyDatabaseCatalogPlanOnServiceAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
-    plan: relational_sql.DatabaseCatalogPlan,
+    plan: sql_adapter.DatabaseCatalogPlan,
 ) !AppliedRelationalSqlDdlRecord {
     var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
     errdefer applied.deinit(alloc);
@@ -3858,7 +3858,7 @@ fn applyNamespaceCatalogPlanOnServiceAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
-    plan: relational_sql.SchemaNamespaceCatalogPlan,
+    plan: sql_adapter.SchemaNamespaceCatalogPlan,
     session: catalog_resources.SqlCatalogSession,
 ) !AppliedRelationalSqlDdlRecord {
     var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
@@ -3932,7 +3932,7 @@ pub fn applyTablespaceCatalogPlanOnServiceAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
-    plan: relational_sql.TablespaceCatalogPlan,
+    plan: sql_adapter.TablespaceCatalogPlan,
 ) !AppliedRelationalSqlDdlRecord {
     var applied = try emptyAppliedRelationalSqlDdlRecordAlloc(alloc);
     errdefer applied.deinit(alloc);
@@ -4061,7 +4061,7 @@ fn namespaceHasTables(snapshot: *const metadata_api.AdminSnapshot, database_id: 
 fn databaseSettingsJsonAfterAlterAlloc(
     alloc: std.mem.Allocator,
     settings_json: []const u8,
-    operations: []const relational_sql.DatabaseAlterOperation,
+    operations: []const sql_adapter.DatabaseAlterOperation,
 ) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, settings_json, .{});
     defer parsed.deinit();
@@ -4073,7 +4073,7 @@ fn databaseSettingsJsonAfterAlterAlloc(
                 const value = try std.json.parseFromSliceLeaky(std.json.Value, parsed.arena.allocator(), set.value_json, .{});
                 const setting_value = try sqlDatabaseSettingTextFromJsonValueAlloc(alloc, value);
                 defer alloc.free(setting_value);
-                try relational_sql.validateSqlDatabaseSettingValue(set.name, setting_value);
+                try sql_adapter.validateSqlDatabaseSettingValue(set.name, setting_value);
                 try parsed.value.object.put(parsed.arena.allocator(), try parsed.arena.allocator().dupe(u8, set.name), value);
             },
         }
@@ -5715,7 +5715,7 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(!altered.validation_required);
     try std.testing.expect(!altered.rewrite_required);
     try std.testing.expectEqual(@as(usize, 1), altered.work_items.len);
-    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, altered.work_items[0].action);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rebuild, altered.work_items[0].action);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.schema_json, "\"status\":{\"type\":\"keyword\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, altered.table.read_schema_json, "\"version\":0") != null);
@@ -5731,8 +5731,8 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(!generated.validation_required);
     try std.testing.expect(generated.rewrite_required);
     try std.testing.expectEqual(@as(usize, 2), generated.work_items.len);
-    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, generated.work_items[0].action);
-    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rewrite, generated.work_items[1].action);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rebuild, generated.work_items[0].action);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rewrite, generated.work_items[1].action);
     const concat_rewrite = generated.work_items[1].rewrite_expression orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("tenant_status_key", concat_rewrite.target_column);
     try std.testing.expectEqual(runtime_schema_mod.RelationalRowsExpressionKind.concat, concat_rewrite.expression.kind);
@@ -5795,8 +5795,8 @@ test "metadata.schema update sql ddl applies relational catalog changes through 
     try std.testing.expect(indexed.validation_required);
     try std.testing.expect(!indexed.rewrite_required);
     try std.testing.expectEqual(@as(usize, 2), indexed.work_items.len);
-    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.rebuild, indexed.work_items[0].action);
-    try std.testing.expectEqual(relational_sql.AppliedDdlWorkAction.validate, indexed.work_items[1].action);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.rebuild, indexed.work_items[0].action);
+    try std.testing.expectEqual(sql_adapter.AppliedDdlWorkAction.validate, indexed.work_items[1].action);
     try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"users_tenant_email_key\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, indexed.table.schema_json, "\"version\":2") != null);
 

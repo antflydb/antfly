@@ -644,6 +644,9 @@ Current implementation status:
   security execution, catalog jobs, notifications, and extension lifecycle use
   adapter-native plan types instead of importing the broader relational SQL
   facade.
+- Corpus coverage now uses centralized plan root/read/merge kind helpers for
+  read, merge, and recursive insert-source plan-family checks instead of
+  repeated raw prefix probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
