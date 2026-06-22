@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "eaaafd1981c418f5bd84e0407b6071c0b1446a5651e1483be0c627ce33da82b1",
-  "source_entry_count": 1026,
-  "entry_count": 1026,
+  "source_sha256": "afc45341c30e2029357e86a6eddbe7f41ca7fd165f779037d27bfab22d95c5be",
+  "source_entry_count": 1025,
+  "entry_count": 1025,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -5934,24 +5934,11 @@
       "sql": "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5"
     },
     {
-      "name": "read duplicate output name disambiguates computed projection",
-      "family": "read",
-      "summary": {
-        "table_name": "usage_records"
-      },
-      "plan": "read:window:window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=1:order=0:limit=-1",
+      "name": "read duplicate output name fails closed",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=duplicate_output_name",
+      "classification_reason": "duplicate_output_name",
       "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
-    },
-    {
-      "name": "aggregate duplicate output name disambiguates aggregate projection",
-      "family": "aggregate",
-      "summary": {
-        "table_name": "usage_records",
-        "group_by": 1,
-        "aggregations": 1
-      },
-      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=-1",
-      "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
     },
     {
       "name": "ordered-set mode aggregate",

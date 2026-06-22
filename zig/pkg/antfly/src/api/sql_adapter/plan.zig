@@ -919,10 +919,12 @@ pub fn mergeNotMatchedHasDoNothing(arms: []const MergeNotMatchedArm) bool {
 
 pub const LoweredAggregate = struct {
     table_name: []const u8,
+    ctes: []const db_mod.types.RelationalRowsCte = &.{},
     aggregate: db_mod.types.RelationalRowsAggregateRequest,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
+        freePlanCtes(alloc, self.ctes);
         self.aggregate.deinit(alloc);
         self.* = undefined;
     }
@@ -1238,7 +1240,20 @@ pub fn parseWindowPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: WindowPlanParserHooks,
 ) !LoweredWindowPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseWindowWithCtes(hooks, &.{});
+    if (!parser.peekKeyword(tokens, pos.*, "with")) {
+        var lowered = try parseWindowWithCtes(hooks, &.{});
+        errdefer lowered.deinit(alloc);
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |table| alloc.free(table);
+        if (lowered.plan.ctes.len != 0) try resolveWindowSourceForPlanAlloc(alloc, &lowered, lowered.plan.ctes, &base_table_name);
+        if (lowered.plan.ctes.len != 0) {
+            const table_name = base_table_name orelse return error.UnsupportedSqlShape;
+            base_table_name = null;
+            alloc.free(lowered.table_name);
+            lowered.table_name = table_name;
+        }
+        return lowered;
+    }
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
@@ -1270,11 +1285,25 @@ pub fn parseAggregatePlanAlloc(
     if (!parser.peekKeyword(tokens, pos.*, "with")) {
         var lowered = try parseAggregateWithCtes(hooks, &.{});
         errdefer lowered.deinit(alloc);
-        const table_name = lowered.table_name;
-        lowered.table_name = "";
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |table| alloc.free(table);
+        if (lowered.ctes.len != 0) try resolveAggregateSourceForPlanAlloc(alloc, &lowered, lowered.ctes, &base_table_name);
+        const table_name = if (lowered.ctes.len != 0) blk: {
+            const base = base_table_name orelse return error.UnsupportedSqlShape;
+            base_table_name = null;
+            alloc.free(lowered.table_name);
+            lowered.table_name = "";
+            break :blk base;
+        } else blk: {
+            const table = lowered.table_name;
+            lowered.table_name = "";
+            break :blk table;
+        };
+        const ctes = lowered.ctes;
+        lowered.ctes = &.{};
         return .{
             .table_name = table_name,
-            .plan = .{ .aggregate = lowered.aggregate },
+            .plan = .{ .ctes = ctes, .aggregate = lowered.aggregate },
         };
     }
 
@@ -1898,8 +1927,9 @@ pub fn resolveSelectSourceForPlanAlloc(
     ctes: []const db_mod.types.RelationalRowsCte,
     base_table_name: *?[]const u8,
 ) !void {
-    if (findCteByName(ctes, lowered.table_name) != null) {
+    if (findCteByName(ctes, lowered.table_name)) |cte| {
         lowered.query.source_cte = try alloc.dupe(u8, lowered.table_name);
+        if (cte.table_function) |table_function| try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
         return;
     }
     try resolveBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
@@ -1911,8 +1941,9 @@ pub fn resolveAggregateSourceForPlanAlloc(
     ctes: []const db_mod.types.RelationalRowsCte,
     base_table_name: *?[]const u8,
 ) !void {
-    if (findCteByName(ctes, lowered.table_name) != null) {
+    if (findCteByName(ctes, lowered.table_name)) |cte| {
         lowered.aggregate.source.source_cte = try alloc.dupe(u8, lowered.table_name);
+        if (cte.table_function) |table_function| try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
         return;
     }
     try resolveBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
@@ -1924,8 +1955,9 @@ pub fn resolveWindowSourceForPlanAlloc(
     ctes: []const db_mod.types.RelationalRowsCte,
     base_table_name: *?[]const u8,
 ) !void {
-    if (findCteByName(ctes, lowered.table_name) != null) {
+    if (findCteByName(ctes, lowered.table_name)) |cte| {
         lowered.plan.window.source.source_cte = try alloc.dupe(u8, lowered.table_name);
+        if (cte.table_function) |table_function| try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
         return;
     }
     try resolveBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
@@ -1962,8 +1994,9 @@ fn resolveJoinSideSourceForPlanAlloc(
     ctes: []const db_mod.types.RelationalRowsCte,
     base_table_name: *?[]const u8,
 ) !void {
-    if (findCteByName(ctes, table_name.*) != null) {
+    if (findCteByName(ctes, table_name.*)) |cte| {
         source.source_cte = try alloc.dupe(u8, table_name.*);
+        if (cte.table_function) |table_function| try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
         const base = base_table_name.* orelse return error.UnsupportedSqlShape;
         const physical_table_name = try alloc.dupe(u8, base);
         alloc.free(table_name.*);

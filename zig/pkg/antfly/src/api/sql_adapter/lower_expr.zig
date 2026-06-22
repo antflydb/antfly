@@ -15736,7 +15736,16 @@ pub fn parseAggregateAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
 
-    const inferred_table_ref = try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
+    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes);
+    var direct_graph_source_transferred = false;
+    defer if (!direct_graph_source_transferred) {
+        if (direct_graph_source) |*source| source.deinit(alloc);
+    };
+
+    const inferred_table_ref = if (direct_graph_source) |source|
+        try cloneTableAliasAlloc(alloc, source.table_ref)
+    else
+        try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
     defer if (inferred_table_ref) |value| plan_mod.freeTableAlias(alloc, value);
     var inferred_qualifiers: [2][]const u8 = undefined;
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
@@ -15744,9 +15753,14 @@ pub fn parseAggregateAlloc(
     if (inferred_table_ref) |value| {
         inferred_qualifiers = .{ value.name, value.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
-        if (plan_mod.findCteByName(options.available_ctes, value.name) != null) {
-            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, initial_context.schema, options.available_ctes);
+        if (direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, value.name) != null) {
+            const ctes = if (direct_graph_source) |*source| source_ctes: {
+                const implicit_ctes = [_]db_mod.types.RelationalRowsCte{source.cte};
+                break :source_ctes implicit_ctes[0..];
+            } else options.available_ctes;
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, initial_context.schema, ctes);
             current_context.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            current_context.defer_row_expression_field_validation = true;
         }
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
@@ -15786,7 +15800,11 @@ pub fn parseAggregateAlloc(
     } else if (select.aggregations.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
-    const table_ref = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    const table_ref = if (direct_graph_source) |source| table_ref: {
+        if (pos.* != source.function_start) return error.UnsupportedSqlShape;
+        pos.* = source.source_end;
+        break :table_ref try cloneTableAliasAlloc(alloc, source.table_ref);
+    } else try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     errdefer alloc.free(table_ref.name);
     defer alloc.free(table_ref.alias);
     if (inferred_table_ref) |value| {
@@ -15794,8 +15812,10 @@ pub fn parseAggregateAlloc(
     } else {
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
-        options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
+    const source_is_cte = direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
+    if (source_is_cte) current_context.defer_row_expression_field_validation = true;
+    options.context_hooks.set_context(options.context_hooks.ptr, current_context);
 
     var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
     errdefer {
@@ -16082,8 +16102,19 @@ pub fn parseAggregateAlloc(
     };
     group_by_transferred = true;
     select_group_expressions_transferred = true;
+    const ctes = if (direct_graph_source) |*source| ctes: {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsCte, 1);
+        out[0] = source.cte;
+        source.cte = .{ .name = "" };
+        direct_graph_source_transferred = true;
+        plan_mod.freeTableAlias(alloc, source.table_ref);
+        source.table_ref = .{ .name = "", .alias = "" };
+        break :ctes out;
+    } else &.{};
+
     return .{
         .table_name = table_ref.name,
+        .ctes = ctes,
         .aggregate = aggregate_request,
     };
 }
@@ -16100,7 +16131,16 @@ pub fn parseWindowSelectAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
 
-    const inferred_table_ref = try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
+    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes);
+    var direct_graph_source_transferred = false;
+    defer if (!direct_graph_source_transferred) {
+        if (direct_graph_source) |*source| source.deinit(alloc);
+    };
+
+    const inferred_table_ref = if (direct_graph_source) |source|
+        try cloneTableAliasAlloc(alloc, source.table_ref)
+    else
+        try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
     defer if (inferred_table_ref) |value| plan_mod.freeTableAlias(alloc, value);
     var inferred_qualifiers: [2][]const u8 = undefined;
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
@@ -16108,9 +16148,14 @@ pub fn parseWindowSelectAlloc(
     if (inferred_table_ref) |value| {
         inferred_qualifiers = .{ value.name, value.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
-        if (plan_mod.findCteByName(options.available_ctes, value.name) != null) {
-            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, initial_context.schema, options.available_ctes);
+        if (direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, value.name) != null) {
+            const ctes = if (direct_graph_source) |*source| source_ctes: {
+                const implicit_ctes = [_]db_mod.types.RelationalRowsCte{source.cte};
+                break :source_ctes implicit_ctes[0..];
+            } else options.available_ctes;
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, initial_context.schema, ctes);
             current_context.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            current_context.defer_row_expression_field_validation = true;
         }
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
@@ -16168,7 +16213,11 @@ pub fn parseWindowSelectAlloc(
     if (select.windows.len == 0) return error.UnsupportedSqlShape;
 
     try parser.expectKeyword(tokens, pos, "from");
-    const table_ref = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    const table_ref = if (direct_graph_source) |source| table_ref: {
+        if (pos.* != source.function_start) return error.UnsupportedSqlShape;
+        pos.* = source.source_end;
+        break :table_ref try cloneTableAliasAlloc(alloc, source.table_ref);
+    } else try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     errdefer alloc.free(table_ref.name);
     defer alloc.free(table_ref.alias);
     if (inferred_table_ref) |value| {
@@ -16176,8 +16225,10 @@ pub fn parseWindowSelectAlloc(
     } else {
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
-        options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
+    const source_is_cte = direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
+    if (source_is_cte) current_context.defer_row_expression_field_validation = true;
+    options.context_hooks.set_context(options.context_hooks.ptr, current_context);
 
     var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
     errdefer {
@@ -16358,9 +16409,20 @@ pub fn parseWindowSelectAlloc(
         }
     }
 
+    const ctes = if (direct_graph_source) |*source| ctes: {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsCte, 1);
+        out[0] = source.cte;
+        source.cte = .{ .name = "" };
+        direct_graph_source_transferred = true;
+        plan_mod.freeTableAlias(alloc, source.table_ref);
+        source.table_ref = .{ .name = "", .alias = "" };
+        break :ctes out;
+    } else &.{};
+
     return .{
         .table_name = table_ref.name,
         .plan = .{
+            .ctes = ctes,
             .window = .{
                 .source = .{
                     .predicates = try predicates.toOwnedSlice(alloc),
@@ -20333,27 +20395,10 @@ pub fn parseWindowSelectListAlloc(
             );
             var parsed_spec_transferred = false;
             errdefer if (!parsed_spec_transferred) plan_mod.freeWindowSpec(alloc, parsed_spec);
-            const maybe_output = try allocateDisambiguatedWindowSpecOutputAlloc(
-                alloc,
-                parsed_spec.output,
-                fields.items,
-                windows.items,
-            );
-            var output_transferred = false;
-            errdefer if (!output_transferred) {
-                if (maybe_output) |output| alloc.free(output);
-            };
-            const spec = if (maybe_output) |output| windowSpecWithOutput(parsed_spec, output) else parsed_spec;
-            parsed_spec_transferred = true;
-            if (maybe_output != null) {
-                alloc.free(parsed_spec.output);
-                output_transferred = true;
-            }
-            var spec_transferred = false;
-            errdefer if (!spec_transferred) plan_mod.freeWindowSpec(alloc, spec);
+            if (windowSpecOutputCollision(parsed_spec.output, fields.items, windows.items)) return error.UnsupportedSqlShape;
             try outputs.append(alloc, .{ .kind = .window, .index = windows.items.len });
-            try windows.append(alloc, spec);
-            spec_transferred = true;
+            try windows.append(alloc, parsed_spec);
+            parsed_spec_transferred = true;
         } else {
             const parsed_field = try parseRowExpressionFieldOwnedAlloc(
                 alloc,
@@ -24372,6 +24417,86 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     return lowered;
 }
 
+fn lowerJoinForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredJoin {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .joined_source_schema = schema,
+        .params = params,
+    };
+    var lowered = plan_mod.parseJoinPlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.joinPlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsJoinPlanCteOutputAlloc(alloc, schema, lowered.asPlan()) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn lowerLateralForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredLateralPlan {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .joined_source_schema = schema,
+        .params = params,
+    };
+    var lowered = plan_mod.parseLateralPlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.lateralPlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsLateralPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
 fn lowerWindowPlanForLowerExprTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -24383,6 +24508,7 @@ fn lowerWindowPlanForLowerExprTestAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -24390,10 +24516,63 @@ fn lowerWindowPlanForLowerExprTestAlloc(
         .schema = schema,
         .params = params,
     };
-    return parser_context.ParserState.ContextAccessors.parseWindowSelect(&parser_state) catch |err| switch (err) {
+    var lowered = plan_mod.parseWindowPlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.windowPlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
         else => return err,
     };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsWindowPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn lowerAggregatePlanForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredAggregatePlan {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+    };
+    var lowered = plan_mod.parseAggregatePlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.aggregatePlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsAggregatePlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
 }
 
 fn lowerAggregateForLowerExprTestAlloc(
@@ -27052,6 +27231,57 @@ test "sql adapter lower expr lowers pagination limit all and fetch forms" {
     defer window.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 2), window.plan.window.limit.?);
     try std.testing.expectEqual(@as(u32, 4), window.plan.window.offset);
+}
+
+test "sql adapter lower expr treats direct graph table functions as relation sources" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm WHERE graph_name = 'graph_match' ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer query.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", query.table_name);
+    try std.testing.expectEqual(@as(usize, 1), query.plan.ctes.len);
+    try std.testing.expectEqualStrings("gm", query.plan.ctes[0].name);
+    try std.testing.expect(query.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("gm", query.plan.query.source_cte);
+
+    var aggregate = try lowerAggregatePlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT graph_name, COUNT(*) AS row_count FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm WHERE score >= 0 GROUP BY graph_name ORDER BY row_count DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer aggregate.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", aggregate.table_name);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.plan.ctes.len);
+    try std.testing.expectEqualStrings("gm", aggregate.plan.ctes[0].name);
+    try std.testing.expect(aggregate.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("gm", aggregate.plan.aggregate.source.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.plan.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("graph_name", aggregate.plan.aggregate.group_by[0]);
+
+    var window = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT graph_name, id, row_number() OVER (PARTITION BY graph_name ORDER BY score DESC) AS rn FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm WHERE graph_name = 'graph_match' ORDER BY rn ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer window.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", window.table_name);
+    try std.testing.expectEqual(@as(usize, 1), window.plan.ctes.len);
+    try std.testing.expectEqualStrings("gm", window.plan.ctes[0].name);
+    try std.testing.expect(window.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("gm", window.plan.window.source.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), window.plan.window.windows.len);
 }
 
 test "sql adapter lower expr lowers select all with named extra projections" {
@@ -31929,6 +32159,1313 @@ test "sql adapter lower expr validates unique expression lists" {
         .{ .op = .expression, .expression = lower_status },
         .{ .op = .expression, .expression = lower_status },
     }));
+}
+
+test "sql adapter lower expr lowers equality join queries" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"enabled":{"type":"boolean"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY amount DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", lowered.right_table_name);
+    const lowered_plan = lowered.asPlan();
+    try std.testing.expectEqualStrings("usage_records", lowered_plan.left_table);
+    try std.testing.expectEqualStrings("usage_records", lowered_plan.right_table);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.left, lowered.join.join_type);
+    try std.testing.expectEqual(@as(usize, 2), lowered.join.on.len);
+    try std.testing.expectEqualStrings("tenant", lowered.join.on[0].left_field);
+    try std.testing.expectEqualStrings("tenant", lowered.join.on[0].right_field);
+    try std.testing.expectEqualStrings("customer_id", lowered.join.on[1].left_field);
+    try std.testing.expectEqualStrings("id", lowered.join.on[1].right_field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.join.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", lowered.join.left.predicates[0].field);
+    try std.testing.expectEqualStrings("\"order\"", lowered.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.join.right.predicates.len);
+    try std.testing.expectEqualStrings("kind", lowered.join.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"customer\"", lowered.join.right.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 3), lowered.join.select.len);
+    try std.testing.expectEqualStrings("order_id", lowered.join.select[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, lowered.join.select[0].side);
+    try std.testing.expectEqualStrings("id", lowered.join.select[0].field);
+    try std.testing.expectEqualStrings("customer_name", lowered.join.select[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, lowered.join.select[1].side);
+    try std.testing.expectEqualStrings("name", lowered.join.select[1].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.join.order_by.len);
+    try std.testing.expectEqualStrings("amount", lowered.join.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.join.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 5), lowered.join.limit.?);
+
+    var graph_cte_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_cte_join.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_join.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_cte_join.ctes[0].name);
+    try std.testing.expect(graph_cte_join.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("usage_records", graph_cte_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", graph_cte_join.right_table_name);
+    try std.testing.expectEqualStrings("gm", graph_cte_join.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_join.join.on.len);
+    try std.testing.expectEqualStrings("id", graph_cte_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", graph_cte_join.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_join.join.right.predicates.len);
+    try std.testing.expectEqualStrings("graph_name", graph_cte_join.join.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"graph_match\"", graph_cte_join.join.right.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), graph_cte_join.join.select.len);
+    try std.testing.expectEqualStrings("doc_id", graph_cte_join.join.select[0].output);
+    try std.testing.expectEqualStrings("graph_score", graph_cte_join.join.select[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, graph_cte_join.join.select[1].side);
+    try std.testing.expectEqualStrings("score", graph_cte_join.join.select[1].field);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_join.join.order_by.len);
+    try std.testing.expectEqualStrings("graph_score", graph_cte_join.join.order_by[0].field);
+
+    var graph_direct_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_direct_join.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), graph_direct_join.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_direct_join.ctes[0].name);
+    try std.testing.expect(graph_direct_join.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("usage_records", graph_direct_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", graph_direct_join.right_table_name);
+    try std.testing.expectEqualStrings("gm", graph_direct_join.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), graph_direct_join.join.on.len);
+    try std.testing.expectEqualStrings("id", graph_direct_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", graph_direct_join.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), graph_direct_join.join.right.predicates.len);
+    try std.testing.expectEqualStrings("graph_name", graph_direct_join.join.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"graph_match\"", graph_direct_join.join.right.predicates[0].value_json.?);
+
+    var graph_cte_read = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT id, score FROM gm WHERE graph_name = 'graph_match' ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_cte_read.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_cte_read.table_name);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_read.plan.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_cte_read.plan.ctes[0].name);
+    try std.testing.expect(graph_cte_read.plan.ctes[0].table_function != null);
+    const graph_table_function = graph_cte_read.plan.ctes[0].table_function.?.graph_query;
+    try std.testing.expectEqualStrings("usage_records", graph_table_function.table_name);
+    try std.testing.expectEqualStrings("gm", graph_cte_read.plan.query.source_cte);
+    try std.testing.expectEqual(@as(usize, 2), graph_cte_read.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", graph_cte_read.plan.query.select[0]);
+    try std.testing.expectEqualStrings("score", graph_cte_read.plan.query.select[1]);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_read.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("graph_name", graph_cte_read.plan.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"graph_match\"", graph_cte_read.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_read.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("score", graph_cte_read.plan.query.order_by[0].field);
+
+    var graph_direct_read = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm WHERE graph_name = 'graph_match' ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_direct_read.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_direct_read.table_name);
+    try std.testing.expectEqual(@as(usize, 1), graph_direct_read.plan.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_direct_read.plan.ctes[0].name);
+    try std.testing.expect(graph_direct_read.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("gm", graph_direct_read.plan.query.source_cte);
+    try std.testing.expectEqual(@as(usize, 2), graph_direct_read.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", graph_direct_read.plan.query.select[0]);
+    try std.testing.expectEqualStrings("score", graph_direct_read.plan.query.select[1]);
+
+    var inner_lowered = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer inner_lowered.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, inner_lowered.join.join_type);
+    try std.testing.expectEqual(@as(usize, 2), inner_lowered.join.on.len);
+    try std.testing.expectEqual(@as(usize, 1), inner_lowered.join.left.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), inner_lowered.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), inner_lowered.join.select.len);
+
+    var public_qualified = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM public.usage_records AS o LEFT JOIN public.usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' ORDER BY 1 ASC LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer public_qualified.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", public_qualified.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", public_qualified.right_table_name);
+    try std.testing.expectEqual(@as(usize, 1), public_qualified.join.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", public_qualified.join.left.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), public_qualified.join.on.len);
+    try std.testing.expectEqualStrings("customer_id", public_qualified.join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", public_qualified.join.on[0].right_field);
+
+    var on_side_predicate = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND c.kind = 'customer' WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer on_side_predicate.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.left, on_side_predicate.join.join_type);
+    try std.testing.expectEqual(@as(usize, 1), on_side_predicate.join.on.len);
+    try std.testing.expectEqualStrings("customer_id", on_side_predicate.join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", on_side_predicate.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), on_side_predicate.join.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", on_side_predicate.join.left.predicates[0].field);
+    try std.testing.expectEqualStrings("\"order\"", on_side_predicate.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), on_side_predicate.join.right.predicates.len);
+    try std.testing.expectEqualStrings("kind", on_side_predicate.join.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"customer\"", on_side_predicate.join.right.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 0), on_side_predicate.join.on_expression_predicates.len);
+
+    var preserved_side_on_predicate = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND o.kind = 'order' ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer preserved_side_on_predicate.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.left, preserved_side_on_predicate.join.join_type);
+    try std.testing.expectEqual(@as(usize, 0), preserved_side_on_predicate.join.left.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), preserved_side_on_predicate.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), preserved_side_on_predicate.join.on.len);
+    try std.testing.expectEqual(@as(usize, 1), preserved_side_on_predicate.join.on_expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, preserved_side_on_predicate.join.on_expression_predicates[0].op);
+    try std.testing.expectEqualStrings("kind", preserved_side_on_predicate.join.on_expression_predicates[0].lhs.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, preserved_side_on_predicate.join.on_expression_predicates[0].lhs.field_source);
+    try std.testing.expectEqualStrings("\"order\"", preserved_side_on_predicate.join.on_expression_predicates[0].rhs[0].value_json);
+
+    var computed_on_predicate = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND lower(o.kind) = lower(c.kind) ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer computed_on_predicate.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.left, computed_on_predicate.join.join_type);
+    try std.testing.expectEqual(@as(usize, 1), computed_on_predicate.join.on.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_on_predicate.join.on_expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), computed_on_predicate.join.match_expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_on_predicate.join.on_expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, computed_on_predicate.join.on_expression_predicates[0].lhs.operands[0].field_source);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_on_predicate.join.on_expression_predicates[0].rhs[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, computed_on_predicate.join.on_expression_predicates[0].rhs[0].operands[0].field_source);
+
+    var grouped_computed_on_predicate = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id AND (lower(o.kind) = 'order' OR lower(c.name) = 'ada') ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer grouped_computed_on_predicate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), grouped_computed_on_predicate.join.on.len);
+    try std.testing.expectEqual(@as(usize, 2), grouped_computed_on_predicate.join.on_expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), grouped_computed_on_predicate.join.match_expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), grouped_computed_on_predicate.join.on_expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(@as(usize, 1), grouped_computed_on_predicate.join.on_expression_or_predicates[1].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, grouped_computed_on_predicate.join.on_expression_or_predicates[0].conditions[0].lhs.operands[0].field_source);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, grouped_computed_on_predicate.join.on_expression_or_predicates[1].conditions[0].lhs.operands[0].field_source);
+
+    var boolean_side_filters = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.enabled IS TRUE AND c.enabled IS UNKNOWN ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer boolean_side_filters.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_side_filters.join.left.predicates.len);
+    try std.testing.expectEqualStrings("enabled", boolean_side_filters.join.left.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, boolean_side_filters.join.left.predicates[0].op);
+    try std.testing.expectEqualStrings("true", boolean_side_filters.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), boolean_side_filters.join.right.predicates.len);
+    try std.testing.expectEqualStrings("enabled", boolean_side_filters.join.right.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_side_filters.join.right.predicates[0].op);
+    try std.testing.expect(boolean_side_filters.join.right.predicates[0].value_json == null);
+
+    var null_inclusive_boolean_side_filters = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE c.enabled IS NOT TRUE ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer null_inclusive_boolean_side_filters.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), null_inclusive_boolean_side_filters.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), null_inclusive_boolean_side_filters.join.right.expression_or_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, null_inclusive_boolean_side_filters.join.right.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("enabled", null_inclusive_boolean_side_filters.join.right.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("true", null_inclusive_boolean_side_filters.join.right.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, null_inclusive_boolean_side_filters.join.right.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqualStrings("enabled", null_inclusive_boolean_side_filters.join.right.expression_or_predicates[1].conditions[0].lhs.field);
+
+    var archive_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM archive.usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id",
+        schema,
+        &.{},
+    );
+    defer archive_join.deinit(alloc);
+    try std.testing.expectEqualStrings("archive.usage_records", archive_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", archive_join.right_table_name);
+
+    var ordinal_order = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer ordinal_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), ordinal_order.join.order_by.len);
+    try std.testing.expectEqualStrings("amount", ordinal_order.join.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, ordinal_order.join.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_order.join.order_by[0].direction);
+    try std.testing.expectEqualStrings("amount", ordinal_order.join.order_by[1].field);
+    try std.testing.expect(ordinal_order.join.order_by[1].null_test == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_order.join.order_by[1].direction);
+
+    var expression_order = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, o.amount AS order_amount, c.amount AS customer_amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY (order_amount - customer_amount) DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_order.join.order_by.len);
+    try std.testing.expectEqualStrings("", expression_order.join.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, expression_order.join.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, expression_order.join.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression_order.join.order_by[0].expression.?.operands.len);
+    try std.testing.expectEqualStrings("order_amount", expression_order.join.order_by[0].expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("customer_amount", expression_order.join.order_by[0].expression.?.operands[1].field);
+
+    var expression_side_filter = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) = 'ada' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_side_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_side_filter.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_side_filter.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_side_filter.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("name", expression_side_filter.join.right.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, expression_side_filter.join.right.expression_predicates[0].op);
+    try std.testing.expectEqualStrings("\"ada\"", expression_side_filter.join.right.expression_predicates[0].rhs[0].value_json);
+
+    var computed_pattern_side_filter = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE lower(c.name) ILIKE 'ad!_%' ESCAPE '!' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_side_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_pattern_side_filter.join.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_side_filter.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ilike, computed_pattern_side_filter.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_side_filter.join.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("name", computed_pattern_side_filter.join.right.expression_predicates[0].lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"ad\\\\_%\"", computed_pattern_side_filter.join.right.expression_predicates[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_pattern_side_filter.join.right.expression_predicates[0].rhs[0].value_json);
+
+    var escaped_text_side_filter = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE c.name NOT ILIKE $1 ESCAPE $2 ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{ .{ .string = "bot!_%" }, .{ .string = "!" } },
+    );
+    defer escaped_text_side_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), escaped_text_side_filter.join.right.text_patterns.len);
+    try std.testing.expectEqualStrings("name", escaped_text_side_filter.join.right.text_patterns[0].field);
+    try std.testing.expectEqualStrings("bot\\_%", escaped_text_side_filter.join.right.text_patterns[0].pattern);
+    try std.testing.expect(escaped_text_side_filter.join.right.text_patterns[0].case_insensitive);
+    try std.testing.expect(escaped_text_side_filter.join.right.text_patterns[0].negated);
+
+    var expression_not_and_computed_array_side_filter = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE NOT (lower(c.name) = 'bot') AND string_to_array(c.scope, ' ') @> ARRAY['read'] ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_not_and_computed_array_side_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_not_and_computed_array_side_filter.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_and_computed_array_side_filter.join.right.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_and_computed_array_side_filter.join.right.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_not_and_computed_array_side_filter.join.right.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("name", expression_not_and_computed_array_side_filter.join.right.expression_not_predicates[0].conditions[0].lhs.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, expression_not_and_computed_array_side_filter.join.right.expression_not_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("\"bot\"", expression_not_and_computed_array_side_filter.join.right.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_and_computed_array_side_filter.join.right.expression_array_contains.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, expression_not_and_computed_array_side_filter.join.right.expression_array_contains[0].expression.kind);
+    try std.testing.expectEqualStrings("scope", expression_not_and_computed_array_side_filter.join.right.expression_array_contains[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("[\"read\"]", expression_not_and_computed_array_side_filter.join.right.expression_array_contains[0].value_json);
+
+    var mixed_expression_filter = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' AND lower(o.customer_id) = lower(c.id) ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_expression_filter.join.left.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), mixed_expression_filter.join.match_expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, mixed_expression_filter.join.match_expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_filter.join.match_expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("customer_id", mixed_expression_filter.join.match_expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, mixed_expression_filter.join.match_expression_predicates[0].lhs.operands[0].field_source);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_filter.join.match_expression_predicates[0].rhs[0].kind);
+    try std.testing.expectEqualStrings("id", mixed_expression_filter.join.match_expression_predicates[0].rhs[0].operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, mixed_expression_filter.join.match_expression_predicates[0].rhs[0].operands[0].field_source);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant ORDER BY 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant ORDER BY 2",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS id, c.id AS id FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant ORDER BY id",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS id, c.id AS id FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant ORDER BY 1",
+        schema,
+        &.{},
+    ));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c ON o.tenant = o.id",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers bounded left join lateral queries" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"enabled":{"type":"boolean"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", lowered.right_table_name);
+    try std.testing.expectEqualStrings("usage_records", lowered.plan.left_table);
+    try std.testing.expectEqualStrings("usage_records", lowered.plan.right_table);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", lowered.plan.lateral.left.predicates[0].field);
+    try std.testing.expectEqualStrings("\"organization\"", lowered.plan.lateral.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.right.predicates.len);
+    try std.testing.expectEqualStrings("kind", lowered.plan.lateral.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"balance\"", lowered.plan.lateral.right.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.correlations.len);
+    try std.testing.expectEqualStrings("id", lowered.plan.lateral.correlations[0].left_field);
+    try std.testing.expectEqualStrings("organization_id", lowered.plan.lateral.correlations[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.right.order_by.len);
+    try std.testing.expectEqualStrings("created_at", lowered.plan.lateral.right.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.lateral.right.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 1), lowered.plan.lateral.right.limit.?);
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.lateral.select.len);
+    try std.testing.expectEqualStrings("organization_id", lowered.plan.lateral.select[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, lowered.plan.lateral.select[0].side);
+    try std.testing.expectEqualStrings("latest_amount", lowered.plan.lateral.select[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, lowered.plan.lateral.select[1].side);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.order_by.len);
+    try std.testing.expectEqualStrings("latest_amount", lowered.plan.lateral.order_by[0].field);
+    try std.testing.expectEqual(@as(u32, 10), lowered.plan.lateral.limit.?);
+
+    var escaped_lateral_filter = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind LIKE 'bal!_%' ESCAPE '!' ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer escaped_lateral_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), escaped_lateral_filter.plan.lateral.right.text_patterns.len);
+    try std.testing.expectEqualStrings("kind", escaped_lateral_filter.plan.lateral.right.text_patterns[0].field);
+    try std.testing.expectEqualStrings("bal\\_%", escaped_lateral_filter.plan.lateral.right.text_patterns[0].pattern);
+    try std.testing.expect(!escaped_lateral_filter.plan.lateral.right.text_patterns[0].case_insensitive);
+    try std.testing.expect(!escaped_lateral_filter.plan.lateral.right.text_patterns[0].negated);
+
+    var computed_pattern_lateral_filter = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND lower(bal.kind) LIKE 'bal!_%' ESCAPE '!' ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_lateral_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_pattern_lateral_filter.plan.lateral.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_lateral_filter.plan.lateral.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_pattern_lateral_filter.plan.lateral.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_lateral_filter.plan.lateral.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("kind", computed_pattern_lateral_filter.plan.lateral.right.expression_predicates[0].lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"bal\\\\_%\"", computed_pattern_lateral_filter.plan.lateral.right.expression_predicates[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_pattern_lateral_filter.plan.lateral.right.expression_predicates[0].rhs[0].value_json);
+
+    var residual_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' AND latest.amount + org.amount > 10 ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer residual_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), residual_lateral.plan.lateral.left.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), residual_lateral.plan.lateral.match_expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, residual_lateral.plan.lateral.match_expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount", residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[0].field_source);
+    try std.testing.expectEqualStrings("amount", residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[1].field_source);
+    try std.testing.expectEqualStrings("10", residual_lateral.plan.lateral.match_expression_predicates[0].rhs[0].value_json);
+
+    var subquery_residual_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' AND bal.amount + org.amount > 10 ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer subquery_residual_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), subquery_residual_lateral.plan.lateral.left.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), subquery_residual_lateral.plan.lateral.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), subquery_residual_lateral.plan.lateral.match_expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, subquery_residual_lateral.plan.lateral.match_expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount", subquery_residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, subquery_residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[0].field_source);
+    try std.testing.expectEqualStrings("amount", subquery_residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, subquery_residual_lateral.plan.lateral.match_expression_predicates[0].lhs.operands[1].field_source);
+    try std.testing.expectEqualStrings("10", subquery_residual_lateral.plan.lateral.match_expression_predicates[0].rhs[0].value_json);
+
+    var subquery_residual_or_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' AND (bal.amount + org.amount > 10 OR bal.amount + org.amount < 100) ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer subquery_residual_or_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), subquery_residual_or_lateral.plan.lateral.match_expression_or_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, subquery_residual_or_lateral.plan.lateral.match_expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, subquery_residual_or_lateral.plan.lateral.match_expression_or_predicates[1].conditions[0].lhs.kind);
+
+    var subquery_residual_function_or_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' AND (bal.amount + org.amount > 10 OR lower(bal.kind) = lower(org.kind)) ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer subquery_residual_function_or_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), subquery_residual_function_or_lateral.plan.lateral.match_expression_or_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, subquery_residual_function_or_lateral.plan.lateral.match_expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, subquery_residual_function_or_lateral.plan.lateral.match_expression_or_predicates[1].conditions[0].lhs.kind);
+
+    var subquery_residual_not_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' AND NOT (bal.amount + org.amount > 100) ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer subquery_residual_not_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), subquery_residual_not_lateral.plan.lateral.match_expression_not_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, subquery_residual_not_lateral.plan.lateral.match_expression_not_predicates[0].conditions[0].lhs.kind);
+
+    var subquery_residual_array_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' AND string_to_array(bal.scope || ' ' || org.scope, ' ') @> ARRAY['read'] ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer subquery_residual_array_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), subquery_residual_array_lateral.plan.lateral.match_expression_array_contains.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("scope", subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].expression.operands[0].operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].expression.operands[0].operands[0].field_source);
+    try std.testing.expectEqualStrings("scope", subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].expression.operands[0].operands[2].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].expression.operands[0].operands[2].field_source);
+    try std.testing.expectEqualStrings("[\"read\"]", subquery_residual_array_lateral.plan.lateral.match_expression_array_contains[0].value_json);
+
+    var public_qualified = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM public.usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM public.usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer public_qualified.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", public_qualified.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", public_qualified.right_table_name);
+    try std.testing.expectEqual(@as(usize, 1), public_qualified.plan.lateral.correlations.len);
+    try std.testing.expectEqualStrings("id", public_qualified.plan.lateral.correlations[0].left_field);
+    try std.testing.expectEqualStrings("organization_id", public_qualified.plan.lateral.correlations[0].right_field);
+
+    var boolean_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.enabled IS FALSE ORDER BY 2 DESC LIMIT 1) AS latest ON true ORDER BY 2 DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer boolean_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_lateral.plan.lateral.correlations.len);
+    try std.testing.expectEqual(@as(usize, 1), boolean_lateral.plan.lateral.right.predicates.len);
+    try std.testing.expectEqualStrings("enabled", boolean_lateral.plan.lateral.right.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, boolean_lateral.plan.lateral.right.predicates[0].op);
+    try std.testing.expectEqualStrings("false", boolean_lateral.plan.lateral.right.predicates[0].value_json.?);
+
+    var null_inclusive_boolean_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.enabled IS NOT FALSE ORDER BY amount DESC LIMIT 1) AS latest ON true ORDER BY 1 ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer null_inclusive_boolean_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), null_inclusive_boolean_lateral.plan.lateral.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("enabled", null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("false", null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqualStrings("enabled", null_inclusive_boolean_lateral.plan.lateral.right.expression_or_predicates[1].conditions[0].lhs.field);
+
+    var archive_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id FROM archive.usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true",
+        schema,
+        &.{},
+    );
+    defer archive_lateral.deinit(alloc);
+    try std.testing.expectEqualStrings("archive.usage_records", archive_lateral.plan.left_table);
+    try std.testing.expectEqualStrings("usage_records", archive_lateral.plan.right_table);
+
+    var ordinal_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 2 DESC NULLS FIRST LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer ordinal_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), ordinal_lateral.plan.lateral.order_by.len);
+    try std.testing.expectEqualStrings("latest_amount", ordinal_lateral.plan.lateral.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, ordinal_lateral.plan.lateral.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_lateral.plan.lateral.order_by[0].direction);
+    try std.testing.expectEqualStrings("latest_amount", ordinal_lateral.plan.lateral.order_by[1].field);
+    try std.testing.expect(ordinal_lateral.plan.lateral.order_by[1].null_test == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_lateral.plan.lateral.order_by[1].direction);
+
+    var expression_lateral = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.amount AS organization_amount, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY (latest_amount - organization_amount) DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer expression_lateral.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_lateral.plan.lateral.order_by.len);
+    try std.testing.expectEqualStrings("", expression_lateral.plan.lateral.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, expression_lateral.plan.lateral.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, expression_lateral.plan.lateral.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression_lateral.plan.lateral.order_by[0].expression.?.operands.len);
+    try std.testing.expectEqualStrings("latest_amount", expression_lateral.plan.lateral.order_by[0].expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("organization_amount", expression_lateral.plan.lateral.order_by[0].expression.?.operands[1].field);
+
+    var expression_side_filters = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND lower(bal.kind) = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE lower(org.kind) = 'organization' ORDER BY 2 DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_side_filters.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_side_filters.plan.lateral.left.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_side_filters.plan.lateral.left.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("kind", expression_side_filters.plan.lateral.left.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"organization\"", expression_side_filters.plan.lateral.left.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), expression_side_filters.plan.lateral.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_side_filters.plan.lateral.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("kind", expression_side_filters.plan.lateral.right.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"balance\"", expression_side_filters.plan.lateral.right.expression_predicates[0].rhs[0].value_json);
+
+    var expression_not_and_computed_array_side_filters = try lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND NOT (lower(bal.kind) = 'archived') AND string_to_array(bal.scope, ' ') @> ARRAY['read'] ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE NOT (lower(org.kind) = 'deleted') ORDER BY 2 DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_not_and_computed_array_side_filters.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_and_computed_array_side_filters.plan.lateral.left.expression_not_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_not_and_computed_array_side_filters.plan.lateral.left.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("kind", expression_not_and_computed_array_side_filters.plan.lateral.left.expression_not_predicates[0].conditions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"deleted\"", expression_not_and_computed_array_side_filters.plan.lateral.left.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_and_computed_array_side_filters.plan.lateral.right.expression_not_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_not_and_computed_array_side_filters.plan.lateral.right.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("kind", expression_not_and_computed_array_side_filters.plan.lateral.right.expression_not_predicates[0].conditions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"archived\"", expression_not_and_computed_array_side_filters.plan.lateral.right.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), expression_not_and_computed_array_side_filters.plan.lateral.right.expression_array_contains.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, expression_not_and_computed_array_side_filters.plan.lateral.right.expression_array_contains[0].expression.kind);
+    try std.testing.expectEqualStrings("scope", expression_not_and_computed_array_side_filters.plan.lateral.right.expression_array_contains[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("[\"read\"]", expression_not_and_computed_array_side_filters.plan.lateral.right.expression_array_contains[0].value_json);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id ORDER BY amount DESC LIMIT 1) AS latest ON true ORDER BY 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id ORDER BY amount DESC LIMIT 1) AS latest ON true ORDER BY 3",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS id, latest.amount AS id FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id ORDER BY amount DESC LIMIT 1) AS latest ON true ORDER BY id",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS id, latest.amount AS id FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id ORDER BY amount DESC LIMIT 1) AS latest ON true ORDER BY 2",
+        schema,
+        &.{},
+    ));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerLateralForLowerExprTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id) AS latest ON true",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers row_number window query plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.source.predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.plan.window.source.predicates[0].field);
+    try std.testing.expectEqualStrings("\"open\"", lowered.plan.window.source.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.window.select.len);
+    try std.testing.expectEqualStrings("tenant", lowered.plan.window.select[0]);
+    try std.testing.expectEqualStrings("id", lowered.plan.window.select[1]);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.row_number, lowered.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("row_num", lowered.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows[0].partition_by.len);
+    try std.testing.expectEqualStrings("tenant", lowered.plan.window.windows[0].partition_by[0]);
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.window.windows[0].order_by.len);
+    try std.testing.expectEqualStrings("amount", lowered.plan.window.windows[0].order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.window.windows[0].order_by[0].direction);
+    try std.testing.expectEqualStrings("id", lowered.plan.window.windows[0].order_by[1].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("row_num", lowered.plan.window.order_by[0].field);
+    try std.testing.expectEqual(@as(u32, 5), lowered.plan.window.limit.?);
+
+    var unordered_count = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER () AS total_rows FROM usage_records WHERE status = 'open' ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer unordered_count.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), unordered_count.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.count, unordered_count.plan.window.windows[0].function);
+    try std.testing.expectEqual(@as(usize, 0), unordered_count.plan.window.windows[0].partition_by.len);
+    try std.testing.expectEqual(@as(usize, 0), unordered_count.plan.window.windows[0].order_by.len);
+    try std.testing.expect(unordered_count.plan.window.windows[0].frame == null);
+    try std.testing.expectEqualStrings("total_rows", unordered_count.plan.window.windows[0].output);
+
+    var partition_only_sum = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount) OVER usage_partition AS tenant_amount FROM usage_records WHERE status = 'open' WINDOW usage_partition AS (PARTITION BY tenant) ORDER BY tenant ASC, id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer partition_only_sum.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), partition_only_sum.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.sum, partition_only_sum.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("tenant", partition_only_sum.plan.window.windows[0].partition_by[0]);
+    try std.testing.expectEqual(@as(usize, 0), partition_only_sum.plan.window.windows[0].order_by.len);
+    try std.testing.expectEqualStrings("tenant_amount", partition_only_sum.plan.window.windows[0].output);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, rank() OVER () AS bad_rank FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, sum(amount) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS bad_sum FROM usage_records",
+        schema,
+        &.{},
+    ));
+
+    var named_window = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER usage_window AS row_num, rank() OVER usage_window AS usage_rank FROM usage_records WHERE status = 'open' WINDOW usage_window AS (PARTITION BY tenant ORDER BY amount DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ORDER BY row_num ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer named_window.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", named_window.table_name);
+    try std.testing.expectEqual(@as(usize, 2), named_window.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.row_number, named_window.plan.window.windows[0].function);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.rank, named_window.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("tenant", named_window.plan.window.windows[0].partition_by[0]);
+    try std.testing.expectEqualStrings("tenant", named_window.plan.window.windows[1].partition_by[0]);
+    try std.testing.expectEqualStrings("amount", named_window.plan.window.windows[0].order_by[0].field);
+    try std.testing.expectEqualStrings("amount", named_window.plan.window.windows[1].order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, named_window.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, named_window.plan.window.windows[1].frame.?.unit);
+    try std.testing.expectEqualStrings("row_num", named_window.plan.window.order_by[0].field);
+
+    var alias_source = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT u.tenant, u.id, row_number() OVER (PARTITION BY u.tenant ORDER BY u.amount DESC, u.id ASC) AS row_num FROM usage_records AS u WHERE u.status = 'open' ORDER BY row_num ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer alias_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", alias_source.table_name);
+    try std.testing.expectEqual(@as(usize, 2), alias_source.plan.window.select.len);
+    try std.testing.expectEqualStrings("tenant", alias_source.plan.window.select[0]);
+    try std.testing.expectEqualStrings("id", alias_source.plan.window.select[1]);
+    try std.testing.expectEqualStrings("tenant", alias_source.plan.window.windows[0].partition_by[0]);
+    try std.testing.expectEqualStrings("amount", alias_source.plan.window.windows[0].order_by[0].field);
+    try std.testing.expectEqualStrings("id", alias_source.plan.window.windows[0].order_by[1].field);
+    try std.testing.expectEqual(@as(usize, 1), alias_source.plan.window.source.predicates.len);
+    try std.testing.expectEqualStrings("status", alias_source.plan.window.source.predicates[0].field);
+    try std.testing.expectEqualStrings("\"open\"", alias_source.plan.window.source.predicates[0].value_json.?);
+
+    var ordinal_order = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY 3 DESC NULLS FIRST LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer ordinal_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), ordinal_order.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("row_num", ordinal_order.plan.window.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, ordinal_order.plan.window.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_order.plan.window.order_by[0].direction);
+    try std.testing.expectEqualStrings("row_num", ordinal_order.plan.window.order_by[1].field);
+    try std.testing.expect(ordinal_order.plan.window.order_by[1].null_test == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordinal_order.plan.window.order_by[1].direction);
+
+    var canonical_output = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) FROM usage_records WHERE status = 'open' ORDER BY row_number ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer canonical_output.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), canonical_output.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.row_number, canonical_output.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("row_number", canonical_output.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(usize, 1), canonical_output.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("row_number", canonical_output.plan.window.order_by[0].field);
+
+    var expression_order = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY (row_num + 1) DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_order.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("", expression_order.plan.window.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, expression_order.plan.window.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, expression_order.plan.window.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression_order.plan.window.order_by[0].expression.?.operands.len);
+    try std.testing.expectEqualStrings("row_num", expression_order.plan.window.order_by[0].expression.?.operands[0].field);
+
+    var ranked = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank, dense_rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_dense_rank FROM usage_records WHERE status = 'open' ORDER BY usage_rank ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer ranked.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", ranked.table_name);
+    try std.testing.expectEqual(@as(usize, 2), ranked.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.rank, ranked.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("usage_rank", ranked.plan.window.windows[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.dense_rank, ranked.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("usage_dense_rank", ranked.plan.window.windows[1].output);
+    try std.testing.expectEqual(@as(usize, 1), ranked.plan.window.order_by.len);
+    try std.testing.expectEqualStrings("usage_rank", ranked.plan.window.order_by[0].field);
+
+    var relative_ranked = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, percent_rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_percent_rank, cume_dist() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_cume_dist FROM usage_records WHERE status = 'open' ORDER BY usage_percent_rank ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer relative_ranked.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), relative_ranked.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.percent_rank, relative_ranked.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("usage_percent_rank", relative_ranked.plan.window.windows[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.cume_dist, relative_ranked.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("usage_cume_dist", relative_ranked.plan.window.windows[1].output);
+    try std.testing.expect(relative_ranked.plan.window.windows[0].value_expression == null);
+
+    var bucketed = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, ntile(4) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS amount_bucket FROM usage_records WHERE status = 'open' ORDER BY amount_bucket ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer bucketed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), bucketed.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.ntile, bucketed.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("amount_bucket", bucketed.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(u32, 4), bucketed.plan.window.windows[0].offset);
+    try std.testing.expect(bucketed.plan.window.windows[0].value_expression == null);
+
+    var offset_windows = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, lag(amount, 2, 0) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS previous_amount, lead(status) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS next_status, first_value(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS first_amount, last_value(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amount, count(*) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS neighbor_count, count(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS range_amount_count, sum(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS running_sum, avg(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS running_avg, min(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS running_min, max(amount) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS running_max FROM usage_records WHERE status = 'open' ORDER BY previous_amount ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer offset_windows.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", offset_windows.table_name);
+    try std.testing.expectEqual(@as(usize, 10), offset_windows.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.lag, offset_windows.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("previous_amount", offset_windows.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(u32, 2), offset_windows.plan.window.windows[0].offset);
+    try std.testing.expectEqualStrings("0", offset_windows.plan.window.windows[0].default_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, offset_windows.plan.window.windows[0].value_expression.?.kind);
+    try std.testing.expectEqualStrings("amount", offset_windows.plan.window.windows[0].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.lead, offset_windows.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("next_status", offset_windows.plan.window.windows[1].output);
+    try std.testing.expectEqualStrings("status", offset_windows.plan.window.windows[1].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.first_value, offset_windows.plan.window.windows[2].function);
+    try std.testing.expectEqualStrings("first_amount", offset_windows.plan.window.windows[2].output);
+    try std.testing.expectEqualStrings("amount", offset_windows.plan.window.windows[2].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.current_row, offset_windows.plan.window.windows[2].frame.?.start);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.unbounded_following, offset_windows.plan.window.windows[2].frame.?.end);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.last_value, offset_windows.plan.window.windows[3].function);
+    try std.testing.expectEqualStrings("last_amount", offset_windows.plan.window.windows[3].output);
+    try std.testing.expectEqualStrings("amount", offset_windows.plan.window.windows[3].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, offset_windows.plan.window.windows[3].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.unbounded_following, offset_windows.plan.window.windows[3].frame.?.end);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.count, offset_windows.plan.window.windows[4].function);
+    try std.testing.expectEqualStrings("neighbor_count", offset_windows.plan.window.windows[4].output);
+    try std.testing.expect(offset_windows.plan.window.windows[4].value_expression == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.offset_preceding, offset_windows.plan.window.windows[4].frame.?.start);
+    try std.testing.expectEqual(@as(u32, 1), offset_windows.plan.window.windows[4].frame.?.start_offset);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.offset_following, offset_windows.plan.window.windows[4].frame.?.end);
+    try std.testing.expectEqual(@as(u32, 1), offset_windows.plan.window.windows[4].frame.?.end_offset);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.count, offset_windows.plan.window.windows[5].function);
+    try std.testing.expectEqualStrings("range_amount_count", offset_windows.plan.window.windows[5].output);
+    try std.testing.expectEqualStrings("amount", offset_windows.plan.window.windows[5].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.sum, offset_windows.plan.window.windows[6].function);
+    try std.testing.expectEqualStrings("running_sum", offset_windows.plan.window.windows[6].output);
+    try std.testing.expectEqualStrings("amount", offset_windows.plan.window.windows[6].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.avg, offset_windows.plan.window.windows[7].function);
+    try std.testing.expectEqualStrings("running_avg", offset_windows.plan.window.windows[7].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.min, offset_windows.plan.window.windows[8].function);
+    try std.testing.expectEqualStrings("running_min", offset_windows.plan.window.windows[8].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.max, offset_windows.plan.window.windows[9].function);
+    try std.testing.expectEqualStrings("running_max", offset_windows.plan.window.windows[9].output);
+
+    var scalar_extrema_windows = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, min(status) OVER (PARTITION BY tenant) AS first_status, max(lower(status)) OVER (PARTITION BY tenant) AS last_status_key FROM usage_records WHERE status = 'open' ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer scalar_extrema_windows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), scalar_extrema_windows.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.min, scalar_extrema_windows.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("status", scalar_extrema_windows.plan.window.windows[0].value_expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.max, scalar_extrema_windows.plan.window.windows[1].function);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, scalar_extrema_windows.plan.window.windows[1].value_expression.?.kind);
+
+    var modulo_window = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount % 7) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS running_remainder, avg(MOD(amount + 1, 7)) OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS average_shifted_remainder FROM usage_records WHERE status = 'open' ORDER BY running_remainder DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer modulo_window.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), modulo_window.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.sum, modulo_window.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("running_remainder", modulo_window.plan.window.windows[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_window.plan.window.windows[0].value_expression.?.kind);
+    try std.testing.expectEqualStrings("amount", modulo_window.plan.window.windows[0].value_expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("7", modulo_window.plan.window.windows[0].value_expression.?.operands[1].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.avg, modulo_window.plan.window.windows[1].function);
+    try std.testing.expectEqualStrings("average_shifted_remainder", modulo_window.plan.window.windows[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_window.plan.window.windows[1].value_expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, modulo_window.plan.window.windows[1].value_expression.?.operands[0].kind);
+    try std.testing.expectEqualStrings("running_remainder", modulo_window.plan.window.order_by[0].field);
+
+    var boolean_windows = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, bool_or(enabled) FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS any_enabled, bool_and(starts_with(status, 'op')) FILTER (WHERE lower(status) LIKE 'op!_%' ESCAPE '!') OVER (PARTITION BY tenant ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS all_openish FROM usage_records WHERE status = 'open' ORDER BY any_enabled DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer boolean_windows.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), boolean_windows.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.bool_or, boolean_windows.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("enabled", boolean_windows.plan.window.windows[0].value_expression.?.field);
+    try std.testing.expectEqual(@as(usize, 1), boolean_windows.plan.window.windows[0].filter_predicates.len);
+    try std.testing.expectEqualStrings("status", boolean_windows.plan.window.windows[0].filter_predicates[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.bool_and, boolean_windows.plan.window.windows[1].function);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, boolean_windows.plan.window.windows[1].value_expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 1), boolean_windows.plan.window.windows[1].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, boolean_windows.plan.window.windows[1].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, boolean_windows.plan.window.windows[1].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("\"op\\\\_%\"", boolean_windows.plan.window.windows[1].filter_expressions[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("any_enabled", boolean_windows.plan.window.order_by[0].field);
+
+    var pattern_set_window = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount) FILTER (WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])) OVER (PARTITION BY tenant ORDER BY amount DESC) AS open_amount FROM usage_records WHERE status = 'open' ORDER BY open_amount DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer pattern_set_window.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pattern_set_window.plan.window.windows.len);
+    try std.testing.expectEqual(@as(usize, 1), pattern_set_window.plan.window.windows[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"op%\"", pattern_set_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", pattern_set_window.plan.window.windows[0].filter_expressions[0].rhs[0].value_json);
+
+    var pattern_some_window = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, sum(amount) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) OVER (PARTITION BY tenant ORDER BY amount DESC) AS open_amount FROM usage_records WHERE status = 'open' ORDER BY open_amount DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer pattern_some_window.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), pattern_some_window.plan.window.windows.len);
+    try std.testing.expectEqual(@as(usize, 1), pattern_some_window.plan.window.windows[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"op%\"", pattern_some_window.plan.window.windows[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", pattern_some_window.plan.window.windows[0].filter_expressions[0].rhs[0].value_json);
+
+    var cte = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH open_usage AS (SELECT tenant, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY created_at ASC) AS rn FROM open_usage LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer cte.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cte.table_name);
+    try std.testing.expectEqual(@as(usize, 1), cte.plan.ctes.len);
+    try std.testing.expectEqualStrings("open_usage", cte.plan.window.source.source_cte);
+    try std.testing.expectEqualStrings("rn", cte.plan.window.windows[0].output);
+
+    var hinted_cte = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH open_usage AS MATERIALIZED (SELECT tenant, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY created_at ASC) AS rn FROM open_usage LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer hinted_cte.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", hinted_cte.table_name);
+    try std.testing.expectEqual(@as(usize, 1), hinted_cte.plan.ctes.len);
+    try std.testing.expectEqualStrings("open_usage", hinted_cte.plan.window.source.source_cte);
+    try std.testing.expectEqualStrings("rn", hinted_cte.plan.window.windows[0].output);
+
+    var column_alias_list = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH open_usage(tenant_id, row_id, row_status, usage_amount, created_time) AS (SELECT tenant, id, status, amount, created_at FROM usage_records WHERE status = 'open') SELECT tenant_id, row_id, row_number() OVER (PARTITION BY tenant_id ORDER BY created_time ASC) AS rn FROM open_usage LIMIT 2",
+        schema,
+        &.{},
+    );
+    defer column_alias_list.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", column_alias_list.table_name);
+    try std.testing.expectEqual(@as(usize, 1), column_alias_list.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 5), column_alias_list.plan.ctes[0].query.field_aliases.len);
+    try std.testing.expectEqualStrings("tenant_id", column_alias_list.plan.ctes[0].query.field_aliases[0].output);
+    try std.testing.expectEqualStrings("tenant", column_alias_list.plan.ctes[0].query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("open_usage", column_alias_list.plan.window.source.source_cte);
+    try std.testing.expectEqualStrings("tenant_id", column_alias_list.plan.window.windows[0].partition_by[0]);
+    try std.testing.expectEqualStrings("created_time", column_alias_list.plan.window.windows[0].order_by[0].field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, rank() FILTER (WHERE status = 'open') OVER (PARTITION BY tenant ORDER BY amount DESC) AS bad_rank FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "WITH ids_only AS (SELECT tenant, id FROM usage_records WHERE status = 'open') SELECT tenant, id, lag(amount, 1, 0) OVER (PARTITION BY tenant ORDER BY amount ASC) AS previous_amount FROM ids_only ORDER BY previous_amount ASC LIMIT 5",
+        schema,
+        &.{},
+    ));
+
+    var framed = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, row_number() OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer framed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), framed.plan.window.windows.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.row_number, framed.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("rn", framed.plan.window.windows[0].output);
+    try std.testing.expectEqual(@as(usize, 1), framed.plan.window.windows[0].order_by.len);
+    try std.testing.expectEqualStrings("id", framed.plan.window.windows[0].order_by[0].field);
+
+    var shorthand_rows_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount ROWS 1 PRECEDING) AS recent_count FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer shorthand_rows_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, shorthand_rows_frame.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.offset_preceding, shorthand_rows_frame.plan.window.windows[0].frame.?.start);
+    try std.testing.expectEqual(@as(u32, 1), shorthand_rows_frame.plan.window.windows[0].frame.?.start_offset);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.current_row, shorthand_rows_frame.plan.window.windows[0].frame.?.end);
+
+    var current_row_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, row_number() OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS rn FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer current_row_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.current_row, current_row_frame.plan.window.windows[0].frame.?.start);
+
+    var nth_value_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, nth_value(amount, 2) OVER (ORDER BY amount ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS second_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer nth_value_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFunction.nth_value, nth_value_frame.plan.window.windows[0].function);
+    try std.testing.expectEqualStrings("second_amount", nth_value_frame.plan.window.windows[0].output);
+    try std.testing.expectEqualStrings("amount", nth_value_frame.plan.window.windows[0].value_expression.?.field);
+    try std.testing.expectEqual(@as(u32, 2), nth_value_frame.plan.window.windows[0].offset);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.current_row, nth_value_frame.plan.window.windows[0].frame.?.start);
+
+    var following_rows_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS current_and_next FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer following_rows_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.rows, following_rows_frame.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.current_row, following_rows_frame.plan.window.windows[0].frame.?.start);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.offset_following, following_rows_frame.plan.window.windows[0].frame.?.end);
+    try std.testing.expectEqual(@as(u32, 1), following_rows_frame.plan.window.windows[0].frame.?.end_offset);
+
+    var numeric_range_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_count FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer numeric_range_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.range, numeric_range_frame.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.offset_preceding, numeric_range_frame.plan.window.windows[0].frame.?.start);
+    try std.testing.expectEqual(@as(u32, 1), numeric_range_frame.plan.window.windows[0].frame.?.start_offset);
+
+    var shorthand_range_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount RANGE UNBOUNDED PRECEDING) AS range_count FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer shorthand_range_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.range, shorthand_range_frame.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.unbounded_preceding, shorthand_range_frame.plan.window.windows[0].frame.?.start);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameBound.current_row, shorthand_range_frame.plan.window.windows[0].frame.?.end);
+
+    var expression_range_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount + 1 RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_count FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer expression_range_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.range, expression_range_frame.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, expression_range_frame.plan.window.windows[0].order_by[0].expression.?.kind);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, row_number() OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS rn FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, percent_rank(amount) OVER (ORDER BY amount) AS bad_percent_rank FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, ntile() OVER (ORDER BY amount) AS bad_ntile FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, ntile(0) OVER (ORDER BY amount) AS bad_ntile FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, nth_value(amount) OVER (ORDER BY amount) AS missing_n FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY lower(status) RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_count FROM usage_records",
+        schema,
+        &.{},
+    ));
+    var multi_key_range_frame = try lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount DESC, id ASC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_count FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer multi_key_range_frame.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsWindowFrameUnit.range, multi_key_range_frame.plan.window.windows[0].frame.?.unit);
+    try std.testing.expectEqual(@as(usize, 2), multi_key_range_frame.plan.window.windows[0].order_by.len);
+    try std.testing.expectEqualStrings("amount", multi_key_range_frame.plan.window.windows[0].order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, multi_key_range_frame.plan.window.windows[0].order_by[0].direction);
+    try std.testing.expectEqualStrings("id", multi_key_range_frame.plan.window.windows[0].order_by[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, multi_key_range_frame.plan.window.windows[0].order_by[1].direction);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, count(*) OVER (ORDER BY amount ROWS 1 FOLLOWING) AS invalid_frame FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, sum(status) OVER (ORDER BY amount) AS bad_sum FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records ORDER BY 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records ORDER BY 4",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER missing_window AS row_num FROM usage_records WINDOW usage_window AS (PARTITION BY tenant ORDER BY amount DESC)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER usage_window AS row_num FROM usage_records WINDOW usage_window AS (PARTITION BY tenant ORDER BY amount DESC), usage_window AS (PARTITION BY tenant ORDER BY id ASC)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS id FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC), row_number() OVER (PARTITION BY tenant ORDER BY id ASC) FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS id FROM usage_records ORDER BY id",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS id FROM usage_records ORDER BY 3",
+        schema,
+        &.{},
+    ));
 }
 
 test "sql adapter lower expr detects deterministic row expressions" {

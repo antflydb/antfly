@@ -6366,24 +6366,11 @@
       "sql": "SELECT id, jsonb_build_object('status', status) AS status_doc FROM usage_records ORDER BY jsonb_build_object('status', status) ASC LIMIT 5"
     },
     {
-      "name": "read duplicate output name disambiguates computed projection",
-      "family": "read",
-      "summary": {
-        "table_name": "usage_records"
-      },
-      "plan": "read:window:window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=0:select=1:order=0:limit=-1",
+      "name": "read duplicate output name fails closed",
+      "family": "unsupported_read",
+      "classification_reason": "duplicate_output_name",
+      "plan": "unsupported:read:requires=duplicate_output_name",
       "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
-    },
-    {
-      "name": "aggregate duplicate output name disambiguates aggregate projection",
-      "family": "aggregate",
-      "summary": {
-        "table_name": "usage_records",
-        "group_by": 1,
-        "aggregations": 1
-      },
-      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=1:limit=-1",
-      "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id ORDER BY customer_id"
     },
     {
       "name": "ordered-set mode aggregate",

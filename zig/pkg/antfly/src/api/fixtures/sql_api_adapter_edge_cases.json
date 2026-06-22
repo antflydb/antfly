@@ -23,6 +23,17 @@
       "sql": "SELECT row_number() OVER (ORDER BY id) FROM users"
     },
     {
+      "name": "aggregate duplicate group output name fails closed",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "aggregate_duplicate_output_name_rejection",
+        "expected_error_invalid_sql_catalog"
+      ],
+      "expected_error": "invalid_sql_catalog",
+      "sql": "SELECT organization_id, COUNT(*) AS organization_id FROM users GROUP BY organization_id ORDER BY organization_id"
+    },
+    {
       "name": "direct left join rejected by point select lowerer",
       "action": "select",
       "coverage": [

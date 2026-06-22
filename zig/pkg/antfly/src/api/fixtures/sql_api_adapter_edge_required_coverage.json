@@ -8,6 +8,7 @@
     "action_select",
     "action_update",
     "action_write_plan",
+    "aggregate_duplicate_output_name_rejection",
     "cte_write_classification",
     "cte_write_plan_rejection",
     "expected_error_invalid_sql_catalog",

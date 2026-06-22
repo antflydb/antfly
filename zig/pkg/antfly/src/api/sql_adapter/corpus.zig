@@ -900,6 +900,7 @@ pub const SqlAdapterEdgeCaseCoverage = struct {
     action_select: bool = false,
     action_update: bool = false,
     action_write_plan: bool = false,
+    aggregate_duplicate_output_name_rejection: bool = false,
     cte_write_classification: bool = false,
     cte_write_plan_rejection: bool = false,
     expected_error_invalid_sql_catalog: bool = false,

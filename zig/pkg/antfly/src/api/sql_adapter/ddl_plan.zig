@@ -7759,12 +7759,21 @@ fn lowerDdlPlanForTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !LoweredDdlPlan {
+    return try lowerDdlPlanWithFunctionBindingsForTestAlloc(alloc, sql, .{});
+}
+
+fn lowerDdlPlanWithFunctionBindingsForTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !LoweredDdlPlan {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
 
     var state = parser_context.ParserState{
         .alloc = alloc,
         .tokens = tokens.items,
+        .function_bindings = function_bindings,
     };
     return try parseDdlPlanAlloc(alloc, tokens.items, &state.pos, .{
         .schema = state.schema,
@@ -9580,6 +9589,96 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
         alloc,
         "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION arbitrary_trigger()",
     ));
+}
+
+test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
+    const alloc = std.testing.allocator;
+
+    const normalize_operands = [_]db_mod.types.RelationalRowsExpression{.{ .kind = .field, .field = "arg1" }};
+    const normalize_expression = db_mod.types.RelationalRowsExpression{
+        .kind = .lower,
+        .operands = &normalize_operands,
+    };
+    const bindings = [_]lower_expr.RoutineExpressionBinding{.{
+        .sql_name = "normalize_status",
+        .arity = 1,
+        .expression = normalize_expression,
+    }};
+
+    var generated_table = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+        alloc,
+        "CREATE TABLE usage_records (id text PRIMARY KEY, status text, status_key text GENERATED ALWAYS AS (normalize_status(status)) STORED);",
+        .{ .routine_expressions = &bindings },
+    );
+    defer generated_table.deinit(alloc);
+    const generated_create = switch (generated_table) {
+        .create_table => |create| create,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 3), generated_create.columns.len);
+    const generated = generated_create.columns[2].generated orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, generated.op);
+    const generated_expression = generated.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, generated_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), generated_expression.operands.len);
+    try std.testing.expectEqualStrings("status", generated_expression.operands[0].field);
+
+    var rewrite_table = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ALTER COLUMN status TYPE text USING normalize_status(status);",
+        .{ .routine_expressions = &bindings },
+    );
+    defer rewrite_table.deinit(alloc);
+    const rewrite_alter = switch (rewrite_table) {
+        .alter_table => |alter| alter,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), rewrite_alter.operations.len);
+    const rewrite_expression = switch (rewrite_alter.operations[0]) {
+        .alter_column_type => |operation| (operation.rewrite_expression orelse return error.TestUnexpectedResult).expression,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, rewrite_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), rewrite_expression.operands.len);
+    try std.testing.expectEqualStrings("status", rewrite_expression.operands[0].field);
+
+    var checked_table = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+        alloc,
+        "CREATE TABLE usage_records (id text PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (normalize_status(status) != 'deleted'));",
+        .{ .routine_expressions = &bindings },
+    );
+    defer checked_table.deinit(alloc);
+    const checked_create = switch (checked_table) {
+        .create_table => |create| create,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), checked_create.checks.len);
+    try std.testing.expectEqualStrings("usage_records_status_check", checked_create.checks[0].name);
+    const checked_expression = checked_create.checks[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, checked_expression.lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, checked_expression.op);
+    try std.testing.expectEqualStrings("status", checked_expression.lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"deleted\"", checked_expression.rhs[0].value_json);
+
+    var routine_policy = try lowerDdlPlanWithFunctionBindingsForTestAlloc(
+        alloc,
+        "CREATE POLICY usage_records_normalized_policy ON usage_records USING (normalize_status(status) = 'active');",
+        .{ .routine_expressions = &bindings },
+    );
+    defer routine_policy.deinit(alloc);
+    const routine_policy_create = switch (routine_policy) {
+        .row_security_catalog => |catalog_plan| switch (catalog_plan) {
+            .create_policy => |create| create,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const routine_policy_expression = switch (routine_policy_create.predicate) {
+        .expression => |predicate| predicate,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, routine_policy_expression.lhs.kind);
+    try std.testing.expectEqualStrings("status", routine_policy_expression.lhs.operands[0].field);
 }
 
 test "sql adapter ddl plan rejects unsupported ddl shapes explicitly" {
