@@ -524,12 +524,14 @@ Lake bindings route to the lake-native row-source plans described in
 Implementation note: `src/sql/source_binding.zig` now defines the public
 `SqlSourceBinding` union, `CatalogTableRef`, per-family binding structs, and the
 conservative runtime-schema classifier used to distinguish relational,
-document, and lake sources. `src/sql/document_plan.zig` defines the first
-document read-plan family for `_id` lookup and explicitly bounded scans, with a
-fail-closed full-text producer placeholder until the native query service
-exposes a typed hit producer for SQL row projection. Public SQL execution can
-route simple document reads through the document plan family, and later lowerers
-no longer need to invent this source-family boundary.
+document, and lake sources. Document bindings derive their
+`DocumentSqlCapabilities` from ready indexed runtime columns, so full-text,
+scalar-index, vector, and algebraic-aggregate eligibility are facts from the
+catalog schema rather than lowerer-local defaults. `src/sql/document_plan.zig`
+defines the document read-plan family for `_id` lookup, indexed document query
+producers, and explicitly bounded scans. Public SQL execution can route simple
+document reads through the document plan family, and later lowerers no longer
+need to invent this source-family boundary.
 
 The review rule is that no lowerer should probe another source family by
 trial-and-error. The binder selects the family once from catalog facts and every
