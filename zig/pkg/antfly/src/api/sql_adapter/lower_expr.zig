@@ -24661,6 +24661,127 @@ test "sql adapter lower expr lowers nullif projections" {
     ));
 }
 
+test "sql adapter lower expr lowers numeric function projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"cap":{"type":"numeric"},"floor":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT greatest(amount, cap, 0) AS max_amount, least(amount, floor, 100) AS min_amount, abs(amount - floor) AS amount_distance, round(abs(amount - floor)) AS rounded_distance, trunc(amount - floor) AS truncated_distance, floor(amount - floor) AS floored_distance, ceil(amount - floor) AS ceiled_distance, sqrt(amount) AS amount_root, sign(amount - floor) AS amount_direction, power(amount, 2) AS amount_squared FROM invoices WHERE floor(amount - floor) > $1 ORDER BY ceil(amount - floor) ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 10 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 10), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("max_amount", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.greatest, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), lowered.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("min_amount", lowered.plan.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.least, lowered.plan.query.expressions[1].expression.kind);
+    try std.testing.expectEqualStrings("amount_distance", lowered.plan.query.expressions[2].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.abs, lowered.plan.query.expressions[2].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.plan.query.expressions[2].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("rounded_distance", lowered.plan.query.expressions[3].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.round, lowered.plan.query.expressions[3].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.abs, lowered.plan.query.expressions[3].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("truncated_distance", lowered.plan.query.expressions[4].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trunc, lowered.plan.query.expressions[4].expression.kind);
+    try std.testing.expectEqualStrings("floored_distance", lowered.plan.query.expressions[5].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.floor, lowered.plan.query.expressions[5].expression.kind);
+    try std.testing.expectEqualStrings("ceiled_distance", lowered.plan.query.expressions[6].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ceil, lowered.plan.query.expressions[6].expression.kind);
+    try std.testing.expectEqualStrings("amount_root", lowered.plan.query.expressions[7].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sqrt, lowered.plan.query.expressions[7].expression.kind);
+    try std.testing.expectEqualStrings("amount_direction", lowered.plan.query.expressions[8].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sign, lowered.plan.query.expressions[8].expression.kind);
+    try std.testing.expectEqualStrings("amount_squared", lowered.plan.query.expressions[9].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.power, lowered.plan.query.expressions[9].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.floor, lowered.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ceil, lowered.plan.query.order_by[0].expression.?.kind);
+
+    var null_first = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT greatest(NULL, amount, 0) AS max_amount FROM invoices WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer null_first.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.greatest, null_first.plan.query.expressions[0].expression.kind);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT greatest(amount, 'bad') AS bad_amount FROM invoices WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    ));
+
+    var aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT SUM(ceil(floor(abs(amount - floor)))) AS amount_distance FROM invoices",
+        schema,
+        &.{},
+    );
+    defer aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), aggregate.aggregate.aggregations.len);
+    try std.testing.expect(aggregate.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ceil, aggregate.aggregate.aggregations[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.floor, aggregate.aggregate.aggregations[0].expression.?.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.abs, aggregate.aggregate.aggregations[0].expression.?.operands[0].operands[0].kind);
+
+    var trunc_aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT SUM(trunc(amount)) AS amount_truncated_sum FROM invoices",
+        schema,
+        &.{},
+    );
+    defer trunc_aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), trunc_aggregate.aggregate.aggregations.len);
+    try std.testing.expect(trunc_aggregate.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trunc, trunc_aggregate.aggregate.aggregations[0].expression.?.kind);
+
+    var sqrt_aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT SUM(sqrt(amount)) AS amount_root_sum FROM invoices",
+        schema,
+        &.{},
+    );
+    defer sqrt_aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), sqrt_aggregate.aggregate.aggregations.len);
+    try std.testing.expect(sqrt_aggregate.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sqrt, sqrt_aggregate.aggregate.aggregations[0].expression.?.kind);
+
+    var sign_aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT SUM(sign(amount - floor)) AS amount_direction_sum FROM invoices",
+        schema,
+        &.{},
+    );
+    defer sign_aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), sign_aggregate.aggregate.aggregations.len);
+    try std.testing.expect(sign_aggregate.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sign, sign_aggregate.aggregate.aggregations[0].expression.?.kind);
+
+    var power_aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT SUM(power(amount, 2)) AS amount_squared_sum FROM invoices",
+        schema,
+        &.{},
+    );
+    defer power_aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), power_aggregate.aggregate.aggregations.len);
+    try std.testing.expect(power_aggregate.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.power, power_aggregate.aggregate.aggregations[0].expression.?.kind);
+}
+
 test "sql adapter lower expr assembles boolean predicate groups" {
     const alloc = std.testing.allocator;
 
