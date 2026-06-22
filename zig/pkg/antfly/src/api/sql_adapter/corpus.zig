@@ -23,13 +23,41 @@ const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
+const plan_mod = @import("plan.zig");
+const query_contract = @import("../query_contract.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const table_catalog = @import("../table_catalog.zig");
 const value_mod = @import("value.zig");
 
 pub const SqlValue = value_mod.SqlValue;
+const LoweredAggregate = plan_mod.LoweredAggregate;
+const LoweredAggregatePlan = plan_mod.LoweredAggregatePlan;
+const LoweredJoin = plan_mod.LoweredJoin;
+const LoweredLateralPlan = plan_mod.LoweredLateralPlan;
+const LoweredReadPlan = plan_mod.LoweredReadPlan;
+const LoweredRecursiveCteMemberPlan = plan_mod.LoweredRecursiveCteMemberPlan;
+const LoweredRecursiveCtePlan = plan_mod.LoweredRecursiveCtePlan;
+const LoweredSetOperationPlan = plan_mod.LoweredSetOperationPlan;
+const LoweredWindowPlan = plan_mod.LoweredWindowPlan;
+const aggregateDescendingPercentileCount = lower_expr.aggregateDescendingPercentileCount;
+const aggregateFilterExpressionArrayCount = lower_expr.aggregateFilterExpressionArrayCount;
+const aggregateFilterExpressionCount = lower_expr.aggregateFilterExpressionCount;
+const aggregateFilterGroupCount = lower_expr.aggregateFilterGroupCount;
+const aggregateFilterJsonAccessCount = lower_expr.aggregateFilterJsonAccessCount;
+const aggregateFilterStructuredAccessCount = lower_expr.aggregateFilterStructuredAccessCount;
+const aggregateInputExpressionCount = lower_expr.aggregateInputExpressionCount;
+const aggregateModeCount = lower_expr.aggregateModeCount;
+const aggregatePercentileArrayCount = lower_expr.aggregatePercentileArrayCount;
 const expressionOrderCount = lower_expr.expressionOrderCount;
 const sqlRowClaimFingerprintName = lower_expr.sqlRowClaimFingerprintName;
+const sourceQueryUsesExtendedPredicates = lower_expr.sourceQueryUsesExtendedPredicates;
+const windowDefaultCount = lower_expr.windowDefaultCount;
+const windowFilterAccessCount = lower_expr.windowFilterAccessCount;
+const windowFilterExpressionCount = lower_expr.windowFilterExpressionCount;
+const windowFilterGroupCount = lower_expr.windowFilterGroupCount;
+const windowFilterPredicateCount = lower_expr.windowFilterPredicateCount;
+const windowFrameSignature = lower_expr.windowFrameSignature;
+const windowValueExpressionCount = lower_expr.windowValueExpressionCount;
 
 pub const UnsupportedPlanFamily = enum {
     query,
@@ -4141,6 +4169,67 @@ pub fn appendCteAccessPathFingerprintAlloc(
     return fingerprint;
 }
 
+pub const TransformOpFingerprintCounts = struct {
+    set: usize = 0,
+    set_on_insert: usize = 0,
+    unset: usize = 0,
+    inc: usize = 0,
+    push: usize = 0,
+    pull: usize = 0,
+    add_to_set: usize = 0,
+    pop: usize = 0,
+    mul: usize = 0,
+    min: usize = 0,
+    max: usize = 0,
+    current_date: usize = 0,
+    rename: usize = 0,
+};
+
+pub fn transformOpFingerprintCounts(transforms: []const db_mod.types.DocumentTransform) TransformOpFingerprintCounts {
+    var counts: TransformOpFingerprintCounts = .{};
+    for (transforms) |transform| {
+        for (transform.operations) |operation| switch (operation.op) {
+            .set => counts.set += 1,
+            .set_on_insert => counts.set_on_insert += 1,
+            .unset => counts.unset += 1,
+            .inc => counts.inc += 1,
+            .push => counts.push += 1,
+            .pull => counts.pull += 1,
+            .add_to_set => counts.add_to_set += 1,
+            .pop => counts.pop += 1,
+            .mul => counts.mul += 1,
+            .min => counts.min += 1,
+            .max => counts.max += 1,
+            .current_date => counts.current_date += 1,
+            .rename => counts.rename += 1,
+        };
+    }
+    return counts;
+}
+
+pub fn appendTransformOpFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    transforms: []const db_mod.types.DocumentTransform,
+) ![]u8 {
+    const counts = transformOpFingerprintCounts(transforms);
+    var fingerprint = owned_base;
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_set", counts.set);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_set_on_insert", counts.set_on_insert);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_unset", counts.unset);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_inc", counts.inc);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_push", counts.push);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_pull", counts.pull);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_add_to_set", counts.add_to_set);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_pop", counts.pop);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_mul", counts.mul);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_min", counts.min);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_max", counts.max);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_current_date", counts.current_date);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "op_rename", counts.rename);
+    return fingerprint;
+}
+
 pub fn unsupportedPlanMatchesFamily(plan: []const u8, family: UnsupportedPlanFamily) bool {
     const prefix = "unsupported:";
     if (!std.mem.startsWith(u8, plan, prefix)) return false;
@@ -4179,6 +4268,372 @@ pub const PlanStringTokenScan = union(enum) {
     value: []const u8,
     invalid,
 };
+
+pub fn aggregateFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregate) ![]u8 {
+    const source = lowered.aggregate.source;
+    const filter_groups = aggregateFilterGroupCount(lowered.aggregate.aggregations);
+    const filter_expression_arrays = aggregateFilterExpressionArrayCount(lowered.aggregate.aggregations);
+    const filter_json_access = aggregateFilterJsonAccessCount(lowered.aggregate.aggregations);
+    const filter_structured_access = aggregateFilterStructuredAccessCount(lowered.aggregate.aggregations);
+    if (lowered.aggregate.having_expressions.len > 0 or lowered.aggregate.having_any.len > 0 or lowered.aggregate.having_not.len > 0 or filter_groups > 0 or filter_expression_arrays > 0 or filter_json_access > 0 or filter_structured_access > 0) {
+        const base = try std.fmt.allocPrint(
+            alloc,
+            "aggregate:table={s}:source_pred={d}:source_array_any={d}:source_expr_pred={d}:source_expr_or={d}:source_expr_not={d}:source_expr_array={d}:source_json_eq={d}:group={d}:group_expr={d}:aggs={d}:agg_expr={d}:filter_expr={d}:filter_groups={d}:having={d}:having_expr={d}:having_any={d}:having_not={d}:order={d}:limit={d}",
+            .{
+                lowered.table_name,
+                source.predicates.len,
+                source.array_any.len,
+                source.expression_predicates.len,
+                source.expression_or_predicates.len,
+                source.expression_not_predicates.len,
+                source.expression_array_contains.len,
+                source.json_path_eq.len,
+                lowered.aggregate.group_by.len,
+                lowered.aggregate.group_expressions.len,
+                lowered.aggregate.aggregations.len,
+                aggregateInputExpressionCount(lowered.aggregate.aggregations),
+                aggregateFilterExpressionCount(lowered.aggregate.aggregations),
+                filter_groups,
+                lowered.aggregate.having_predicates.len,
+                lowered.aggregate.having_expressions.len,
+                lowered.aggregate.having_any.len,
+                lowered.aggregate.having_not.len,
+                lowered.aggregate.order_by.len,
+                appParityLimitValue(lowered.aggregate.limit),
+            },
+        );
+        var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_expr_array", filter_expression_arrays);
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_json", filter_json_access);
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_structured", filter_structured_access);
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "mode", aggregateModeCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", source.in_predicates.len);
+        return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, source);
+    }
+    if (sourceQueryUsesExtendedPredicates(source)) {
+        const base = try std.fmt.allocPrint(
+            alloc,
+            "aggregate:table={s}:source_pred={d}:source_array_any={d}:source_expr_pred={d}:source_expr_or={d}:source_expr_not={d}:source_expr_array={d}:source_json_eq={d}:group={d}:group_expr={d}:aggs={d}:agg_expr={d}:filter_expr={d}:having={d}:order={d}:limit={d}",
+            .{
+                lowered.table_name,
+                source.predicates.len,
+                source.array_any.len,
+                source.expression_predicates.len,
+                source.expression_or_predicates.len,
+                source.expression_not_predicates.len,
+                source.expression_array_contains.len,
+                source.json_path_eq.len,
+                lowered.aggregate.group_by.len,
+                lowered.aggregate.group_expressions.len,
+                lowered.aggregate.aggregations.len,
+                aggregateInputExpressionCount(lowered.aggregate.aggregations),
+                aggregateFilterExpressionCount(lowered.aggregate.aggregations),
+                lowered.aggregate.having_predicates.len,
+                lowered.aggregate.order_by.len,
+                appParityLimitValue(lowered.aggregate.limit),
+            },
+        );
+        var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "mode", aggregateModeCount(lowered.aggregate.aggregations));
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", source.in_predicates.len);
+        return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, source);
+    }
+    const base = try std.fmt.allocPrint(
+        alloc,
+        "aggregate:table={s}:source_pred={d}:source_json_eq={d}:group={d}:group_expr={d}:aggs={d}:agg_expr={d}:filter_expr={d}:having={d}:order={d}:limit={d}",
+        .{
+            lowered.table_name,
+            source.predicates.len,
+            source.json_path_eq.len,
+            lowered.aggregate.group_by.len,
+            lowered.aggregate.group_expressions.len,
+            lowered.aggregate.aggregations.len,
+            aggregateInputExpressionCount(lowered.aggregate.aggregations),
+            aggregateFilterExpressionCount(lowered.aggregate.aggregations),
+            lowered.aggregate.having_predicates.len,
+            lowered.aggregate.order_by.len,
+            appParityLimitValue(lowered.aggregate.limit),
+        },
+    );
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, base, "order_expr", expressionOrderCount(lowered.aggregate.order_by));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_desc", aggregateDescendingPercentileCount(lowered.aggregate.aggregations));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "percentile_array", aggregatePercentileArrayCount(lowered.aggregate.aggregations));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "mode", aggregateModeCount(lowered.aggregate.aggregations));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", source.in_predicates.len);
+    return try appendSourceQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, source);
+}
+
+pub fn aggregatePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredAggregatePlan) ![]u8 {
+    const aggregate = LoweredAggregate{
+        .table_name = lowered.table_name,
+        .aggregate = lowered.plan.aggregate,
+    };
+    var fingerprint = try aggregateFingerprintAlloc(alloc, aggregate);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ctes", lowered.plan.ctes.len);
+    fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.ctes);
+    return fingerprint;
+}
+
+pub fn joinFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredJoin) ![]u8 {
+    const left = lowered.join.left;
+    const right = lowered.join.right;
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "join:type={s}:left={s}:right={s}:left_pred={d}:left_array_any={d}:left_expr_pred={d}:left_expr_or={d}:left_expr_not={d}:left_expr_array={d}:left_json_eq={d}:left_text={d}:right_pred={d}:right_array_any={d}:right_expr_pred={d}:right_expr_or={d}:right_expr_not={d}:right_expr_array={d}:right_json_eq={d}:right_text={d}:on={d}:select={d}:order={d}:order_expr={d}:limit={d}",
+        .{
+            sqlJoinTypeFingerprintName(lowered.join.join_type),
+            lowered.left_table_name,
+            lowered.right_table_name,
+            left.predicates.len,
+            left.array_any.len,
+            left.expression_predicates.len,
+            left.expression_or_predicates.len,
+            left.expression_not_predicates.len,
+            left.expression_array_contains.len,
+            left.json_path_eq.len,
+            left.text_patterns.len,
+            right.predicates.len,
+            right.array_any.len,
+            right.expression_predicates.len,
+            right.expression_or_predicates.len,
+            right.expression_not_predicates.len,
+            right.expression_array_contains.len,
+            right.json_path_eq.len,
+            right.text_patterns.len,
+            lowered.join.on.len,
+            lowered.join.select.len,
+            lowered.join.order_by.len,
+            expressionOrderCount(lowered.join.order_by),
+            appParityLimitValue(lowered.join.limit),
+        },
+    );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_expr_pred", lowered.join.on_expression_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_expr_or", lowered.join.on_expression_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_expr_not", lowered.join.on_expression_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_expr_array", lowered.join.on_expression_array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_pred", lowered.join.match_expression_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_or", lowered.join.match_expression_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_not", lowered.join.match_expression_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_array", lowered.join.match_expression_array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ctes", lowered.ctes.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "left_source_cte", if (lowered.join.left.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "right_source_cte", if (lowered.join.right.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.ctes);
+    fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "left", left);
+    fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "right", right);
+    return fingerprint;
+}
+
+pub fn lateralFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredLateralPlan) ![]u8 {
+    const left = lowered.plan.lateral.left;
+    const right = lowered.plan.lateral.right;
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "lateral:left={s}:right={s}:ctes={d}:left_pred={d}:left_array_any={d}:left_expr_pred={d}:left_expr_or={d}:left_expr_not={d}:left_expr_array={d}:left_json_eq={d}:left_text={d}:right_pred={d}:right_array_any={d}:right_expr_pred={d}:right_expr_or={d}:right_expr_not={d}:right_expr_array={d}:right_json_eq={d}:right_text={d}:right_order={d}:right_order_expr={d}:right_limit={d}:corr={d}:select={d}:order={d}:order_expr={d}:limit={d}",
+        .{
+            lowered.left_table_name,
+            lowered.right_table_name,
+            lowered.plan.ctes.len,
+            left.predicates.len,
+            left.array_any.len,
+            left.expression_predicates.len,
+            left.expression_or_predicates.len,
+            left.expression_not_predicates.len,
+            left.expression_array_contains.len,
+            left.json_path_eq.len,
+            left.text_patterns.len,
+            right.predicates.len,
+            right.array_any.len,
+            right.expression_predicates.len,
+            right.expression_or_predicates.len,
+            right.expression_not_predicates.len,
+            right.expression_array_contains.len,
+            right.json_path_eq.len,
+            right.text_patterns.len,
+            right.order_by.len,
+            expressionOrderCount(right.order_by),
+            appParityLimitValue(right.limit),
+            lowered.plan.lateral.correlations.len,
+            lowered.plan.lateral.select.len,
+            lowered.plan.lateral.order_by.len,
+            expressionOrderCount(lowered.plan.lateral.order_by),
+            appParityLimitValue(lowered.plan.lateral.limit),
+        },
+    );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "left_source_cte", if (left.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "right_source_cte", if (right.source_cte.len > 0) 1 else 0);
+    fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.ctes);
+    fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "left", left);
+    fingerprint = try appendSideQueryAccessOnlyFingerprintAlloc(alloc, fingerprint, "right", right);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_pred", lowered.plan.lateral.match_expression_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_or", lowered.plan.lateral.match_expression_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_not", lowered.plan.lateral.match_expression_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_array", lowered.plan.lateral.match_expression_array_contains.len);
+    return fingerprint;
+}
+
+pub fn readFingerprintWithPrefixAlloc(
+    alloc: std.mem.Allocator,
+    owned_fingerprint: []u8,
+    family: []const u8,
+) ![]u8 {
+    defer alloc.free(owned_fingerprint);
+    return try std.fmt.allocPrint(alloc, "read:{s}:{s}", .{ family, owned_fingerprint });
+}
+
+pub fn windowFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWindowPlan) ![]u8 {
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "window:table={s}:ctes={d}:source_cte={d}:source_pred={d}:windows={d}:window_expr={d}:window_default={d}:window_frame_sig={d}:select={d}:order={d}:limit={d}",
+        .{
+            lowered.table_name,
+            lowered.plan.ctes.len,
+            @as(u8, if (lowered.plan.window.source.source_cte.len > 0) 1 else 0),
+            lowered.plan.window.source.predicates.len,
+            lowered.plan.window.windows.len,
+            windowValueExpressionCount(lowered.plan.window.windows),
+            windowDefaultCount(lowered.plan.window.windows),
+            windowFrameSignature(lowered.plan.window.windows),
+            lowered.plan.window.select.len,
+            lowered.plan.window.order_by.len,
+            appParityLimitValue(lowered.plan.window.limit),
+        },
+    );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "order_expr", expressionOrderCount(lowered.plan.window.order_by));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter", windowFilterPredicateCount(lowered.plan.window.windows));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter_expr", windowFilterExpressionCount(lowered.plan.window.windows));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter_access", windowFilterAccessCount(lowered.plan.window.windows));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter_groups", windowFilterGroupCount(lowered.plan.window.windows));
+    fingerprint = try appendSourceQueryAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.window.source);
+    fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.ctes);
+    fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lowered.plan.window.offset);
+    return fingerprint;
+}
+
+pub fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) ![]u8 {
+    return switch (lowered) {
+        .query => |query| blk: {
+            var fingerprint = try queryFingerprintAlloc(alloc, "query", query.table_name, query.plan.query, query.plan.ctes.len);
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", query.plan.query.offset);
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "select_all", query.plan.query.select_all);
+            fingerprint = try appendQueryAccessPathFingerprintAlloc(alloc, fingerprint, query.plan.query);
+            fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, query.plan.ctes);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "query");
+        },
+        .set_operation => |set_operation| blk: {
+            const fingerprint = try setOperationFingerprintAlloc(alloc, set_operation);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "set_operation");
+        },
+        .recursive_cte => |recursive_cte| blk: {
+            const fingerprint = try recursiveCteFingerprintAlloc(alloc, recursive_cte);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "recursive_cte");
+        },
+        .aggregate => |aggregate| blk: {
+            var fingerprint = try aggregatePlanFingerprintAlloc(alloc, aggregate);
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", aggregate.plan.aggregate.offset);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "aggregate");
+        },
+        .join => |join| blk: {
+            var fingerprint = try joinFingerprintAlloc(alloc, join);
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", join.join.offset);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "join");
+        },
+        .lateral => |lateral| blk: {
+            var fingerprint = try lateralFingerprintAlloc(alloc, lateral);
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "right_offset", lateral.plan.lateral.right.offset);
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lateral.plan.lateral.offset);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "lateral");
+        },
+        .window => |window| blk: {
+            const fingerprint = try windowFingerprintAlloc(alloc, window);
+            break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "window");
+        },
+    };
+}
+
+pub fn queryFunctionFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    lowered: query_contract.OwnedQueryRequest,
+) ![]u8 {
+    const req = lowered.req;
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "query_function:text={d}:full_text_queries={d}:dense={d}:sparse={d}:graph_search={d}:graph_metric={d}:fields={d}:limit={d}",
+        .{
+            @as(usize, if (req.full_text != null) 1 else 0),
+            req.full_text_queries.len,
+            req.dense_queries.len + @as(usize, if (req.dense != null) 1 else 0),
+            req.sparse_queries.len + @as(usize, if (req.sparse != null) 1 else 0),
+            req.graph_queries.len,
+            req.graph_metric_queries.len,
+            lowered.fields.len + req.fields.len,
+            req.limit,
+        },
+    );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "primary_text_index", if (req.primary_text_index_name != null) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "graph_metric_rerank", if (req.graph_metric_rerank != null) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "merge", if (req.merge_config != null) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "reranker", if (req.reranker != null) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "filter_json", if (req.filter_query_json.len > 0) 1 else 0);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "doc_filter_bindings", req.doc_filter_bindings.len);
+    fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", req.offset);
+    fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "count", req.count_only);
+    fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "profile", req.profile);
+    return fingerprint;
+}
+
+pub fn recursiveCteFingerprintAlloc(alloc: std.mem.Allocator, recursive_cte: LoweredRecursiveCtePlan) ![]u8 {
+    const anchor = try queryFingerprintAlloc(alloc, "anchor", recursive_cte.anchor.table_name, recursive_cte.anchor.plan.query, recursive_cte.anchor.plan.ctes.len);
+    defer alloc.free(anchor);
+    const member = try recursiveCteMemberFingerprintAlloc(alloc, recursive_cte.recursive_member);
+    defer alloc.free(member);
+    return try std.fmt.allocPrint(
+        alloc,
+        "recursive_cte:name={s}:op={s}:anchor={s}:member={s}:outputs={d}:self_ref={}:max_rows={d}:max_bytes={d}:spill_after={d}",
+        .{
+            recursive_cte.cte_name,
+            @tagName(recursive_cte.operation),
+            anchor,
+            member,
+            recursive_cte.output_columns.len,
+            recursive_cte.recursive_member_references_cte,
+            recursive_cte.max_rows orelse 0,
+            recursive_cte.max_bytes orelse 0,
+            recursive_cte.spill_after_bytes orelse 0,
+        },
+    );
+}
+
+pub fn recursiveCteMemberFingerprintAlloc(alloc: std.mem.Allocator, member: LoweredRecursiveCteMemberPlan) ![]u8 {
+    return switch (member) {
+        .join => |join| try std.fmt.allocPrint(
+            alloc,
+            "recursive_member_join:type={s}:left={s}:right={s}:on={d}:projections={d}",
+            .{ sqlJoinTypeFingerprintName(join.join_type), join.left_table_name, join.right_table_name, join.on.len, join.projections.len },
+        ),
+    };
+}
+
+pub fn setOperationFingerprintAlloc(alloc: std.mem.Allocator, set_operation: LoweredSetOperationPlan) ![]u8 {
+    const left = try queryFingerprintAlloc(alloc, "left", set_operation.left.table_name, set_operation.left.plan.query, set_operation.left.plan.ctes.len);
+    defer alloc.free(left);
+    const right = try queryFingerprintAlloc(alloc, "right", set_operation.right.table_name, set_operation.right.plan.query, set_operation.right.plan.ctes.len);
+    defer alloc.free(right);
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "set_operation:op={s}:left={s}:right={s}",
+        .{ @tagName(set_operation.operation), left, right },
+    );
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "result_output", set_operation.output_columns.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "result_order", set_operation.order_by.len);
+    if (set_operation.limit) |limit| fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "result_limit", limit);
+    fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "result_offset", set_operation.offset);
+    return fingerprint;
+}
 
 pub const PlanFingerprintView = struct {
     plan: []const u8,
