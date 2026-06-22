@@ -557,6 +557,10 @@ Current implementation status:
 - Sequence typed/owned coverage now uses parsed keyword and identifier tokens
   for `AS`, `bigint`/`integer`, `OWNED BY`, and `NONE` instead of raw SQL
   substring probes.
+- Routine DDL and temporal DML coverage now uses parsed identifiers, function
+  calls, and string tokens for external security, named argument expressions,
+  interval updates, `TIMESTAMPTZ` literals, and resolver-hint `ON CONFLICT`
+  validation instead of raw SQL scans.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

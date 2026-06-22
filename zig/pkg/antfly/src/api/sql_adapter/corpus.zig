@@ -2922,7 +2922,7 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
     if (has_resolver_hint and !corpusFixtureFamilyAllowsResolverHint(entry.family)) return error.TestUnexpectedResult;
     if (has_resolver_hint and
         (entry.family == .insert or entry.family == .invalid_insert or entry.family == .unsupported_insert) and
-        std.mem.indexOf(u8, entry.sql, "ON CONFLICT") == null)
+        !corpusSqlHasOnConflictTokens(entry.sql))
     {
         return error.TestUnexpectedResult;
     }
@@ -2948,6 +2948,15 @@ pub fn validateSourceCorpusEntryMetadata(entry: AppParityCorpusEntry) !void {
 
 pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
     return validateCorpusMetadataCore(entry, .generated_fixture);
+}
+
+fn corpusSqlHasOnConflictTokens(sql: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tokenized_sql = tokenized.TokenizedSql.initAlloc(alloc, sql) catch return false;
+    defer tokenized_sql.deinit(alloc);
+    return appParityTokensHaveKeywordSequence(tokenized_sql.items(), &.{ .on, .conflict });
 }
 
 fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
@@ -8585,7 +8594,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_volatility = self.ddl_function_volatility or std.mem.indexOf(u8, entry.plan, ":volatility=") != null;
                     self.ddl_function_security = self.ddl_function_security or std.mem.indexOf(u8, entry.plan, ":security=") != null;
                     self.ddl_function_external_security = self.ddl_function_external_security or
-                        (std.mem.indexOf(u8, entry.plan, ":security=") != null and std.mem.indexOf(u8, entry.sql, " EXTERNAL SECURITY ") != null);
+                        (std.mem.indexOf(u8, entry.plan, ":security=") != null and
+                            appParityTokensHaveIdentifier(sql_tokens, "external") and
+                            appParityTokensHaveIdentifier(sql_tokens, "security"));
                     self.ddl_function_null_input = self.ddl_function_null_input or std.mem.indexOf(u8, entry.plan, ":null_input=") != null;
                     self.ddl_function_cost = self.ddl_function_cost or std.mem.indexOf(u8, entry.plan, ":cost=") != null;
                     self.ddl_function_rows = self.ddl_function_rows or std.mem.indexOf(u8, entry.plan, ":rows=") != null;
@@ -8606,8 +8617,9 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_sql_expression_named_arg_body = self.ddl_function_sql_expression_named_arg_body or
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
-                            std.mem.indexOf(u8, entry.sql, "status_text text") != null and
-                            std.mem.indexOf(u8, entry.sql, "lower(status_text)") != null);
+                            appParityTokensHaveIdentifier(sql_tokens, "status_text") and
+                            appParityTokensHaveIdentifier(sql_tokens, "text") and
+                            appParityTokensHaveStringLiteralContaining(sql_tokens, "lower(status_text)"));
                     self.ddl_function_sql_expression_nested_body = self.ddl_function_sql_expression_nested_body or
                         (std.mem.indexOf(u8, entry.plan, ":body=sql_expression:hook=expression:") != null and
                             std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null and
@@ -9502,9 +9514,11 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.writePlanHasCounts(entry.plan, 0, 0) and
                 sql_adapter.planHasExactUsizeToken(entry.plan, ":returning_rows=", 0));
             self.conflict_interval_update = self.conflict_interval_update or
-                std.mem.indexOf(u8, entry.sql, "INTERVAL '1 second'") != null;
+                (appParityTokensHaveIdentifier(sql_tokens, "interval") and
+                    appParityTokensHaveStringLiteral(sql_tokens, "1 second"));
             self.conflict_mixed_interval_update = self.conflict_mixed_interval_update or
-                std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month 1 day'") != null;
+                (appParityTokensHaveIdentifier(sql_tokens, "interval") and
+                    appParityTokensHaveStringLiteral(sql_tokens, "1 month 1 day"));
             self.conflict_date_bin_update = self.conflict_date_bin_update or
                 (appParityTokensHaveFunctionCall(sql_tokens, "date_bin") and
                     appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update, .set }) and
@@ -9559,7 +9573,7 @@ pub const AppParityCorpusCoverage = struct {
         if (entry.family == .insert and !uses_insert_conflict) {
             self.multi_row_insert = self.multi_row_insert or uses_multi_row_insert;
             self.insert_typed_datetime_literal = self.insert_typed_datetime_literal or
-                std.mem.indexOf(u8, entry.sql, "TIMESTAMPTZ ") != null;
+                appParityTokensHaveIdentifier(sql_tokens, "timestamptz");
         }
         self.point_update_expression_partial_unique_selector = self.point_update_expression_partial_unique_selector or
             (entry.family == .update and std.mem.indexOf(u8, entry.name, "expression partial unique selector") != null);
