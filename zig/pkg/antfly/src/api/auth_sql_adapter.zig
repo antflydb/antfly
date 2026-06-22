@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const relational_sql = @import("relational_sql.zig");
 const sql_adapter = @import("sql_adapter/mod.zig");
 const tables_api = @import("tables.zig");
 const catalog_resources = @import("catalog_resources.zig");
@@ -68,9 +67,9 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
     alloc: std.mem.Allocator,
     sql: []const u8,
     catalog: SqlAuthCatalog,
-    function_bindings: relational_sql.SqlFunctionBindings,
+    function_bindings: sql_adapter.SqlFunctionBindings,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
 
     switch (plan) {
@@ -94,7 +93,7 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
 fn executeCreateRole(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.CreateRolePlan,
+    plan: sql_adapter.CreateRolePlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const subject = try sqlRoleSubjectAlloc(alloc, plan.role_name);
     defer alloc.free(subject);
@@ -105,7 +104,7 @@ fn executeCreateRole(
 fn executeAlterRole(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.AlterRolePlan,
+    plan: sql_adapter.AlterRolePlan,
     catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const subject = try principalSubjectAlloc(manager, alloc, plan.role_name);
@@ -140,7 +139,7 @@ fn executeAlterRole(
     return try changedRecordAlloc(alloc);
 }
 
-fn alterRoleSettingValue(catalog: SqlAuthCatalog, plan: relational_sql.AlterRolePlan) ![]const u8 {
+fn alterRoleSettingValue(catalog: SqlAuthCatalog, plan: sql_adapter.AlterRolePlan) ![]const u8 {
     const value = plan.setting_value orelse return error.UnsupportedSqlShape;
     return switch (value) {
         .literal => |literal| literal,
@@ -151,7 +150,7 @@ fn alterRoleSettingValue(catalog: SqlAuthCatalog, plan: relational_sql.AlterRole
 fn executeDropRole(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.DropRolePlan,
+    plan: sql_adapter.DropRolePlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const subject = try sqlRoleSubjectAlloc(alloc, plan.role_name);
     defer alloc.free(subject);
@@ -173,7 +172,7 @@ const SqlPermissionChangeList = std.ArrayList(usermgr.PermissionChange);
 fn executePrivilegeChange(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.PrivilegeChangePlan,
+    plan: sql_adapter.PrivilegeChangePlan,
     kind: PrivilegeChangeKind,
     catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
@@ -206,7 +205,7 @@ fn executePrivilegeChange(
 fn executeAlterRowSecurity(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.AlterRowSecurityPlan,
+    plan: sql_adapter.AlterRowSecurityPlan,
     catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
@@ -224,7 +223,7 @@ fn executeAlterRowSecurity(
 fn executeCreateRowSecurityPolicy(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.CreateRowSecurityPolicyPlan,
+    plan: sql_adapter.CreateRowSecurityPolicyPlan,
     catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
@@ -249,7 +248,7 @@ fn executeCreateRowSecurityPolicy(
 fn executeAlterRowSecurityPolicy(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.AlterRowSecurityPolicyPlan,
+    plan: sql_adapter.AlterRowSecurityPolicyPlan,
     catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
@@ -288,7 +287,7 @@ fn executeAlterRowSecurityPolicy(
 fn executeDropRowSecurityPolicy(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
-    plan: relational_sql.DropRowSecurityPolicyPlan,
+    plan: sql_adapter.DropRowSecurityPolicyPlan,
     catalog: SqlAuthCatalog,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     const table_resource = try sqlAuthTableResourceNameAlloc(alloc, plan.table_name, catalog);
@@ -365,7 +364,7 @@ fn validateRowSecurityPredicateForCatalogTableSchema(
     alloc: std.mem.Allocator,
     sql_object_name: []const u8,
     catalog: SqlAuthCatalog,
-    predicate: relational_sql.RowSecurityPolicyPredicate,
+    predicate: sql_adapter.RowSecurityPolicyPredicate,
 ) !void {
     const table_ref = (try sqlAuthTableRefForObject(sql_object_name, catalog)) orelse return;
     if (table_ref.schema_json.len == 0) return;
@@ -379,7 +378,7 @@ fn validateRowSecurityPredicateForCatalogTableSchema(
 fn validateRowSecurityPredicateForSchema(
     alloc: std.mem.Allocator,
     schema: runtime_schema.TableSchema,
-    predicate: relational_sql.RowSecurityPolicyPredicate,
+    predicate: sql_adapter.RowSecurityPolicyPredicate,
 ) !void {
     switch (predicate) {
         .current_setting_equals => |current_setting| {
@@ -570,7 +569,7 @@ fn sqlPrivilegeMappingCount(privilege_name: []const u8) usize {
 
 fn rowSecurityFilterJsonAlloc(
     alloc: std.mem.Allocator,
-    predicate: relational_sql.RowSecurityPolicyPredicate,
+    predicate: sql_adapter.RowSecurityPolicyPredicate,
 ) anyerror![]u8 {
     return switch (predicate) {
         .current_setting_equals => |current_setting| try currentSettingRowFilterJsonAlloc(alloc, current_setting),
@@ -583,7 +582,7 @@ fn rowSecurityFilterJsonAlloc(
 
 fn currentSettingRowFilterJsonAlloc(
     alloc: std.mem.Allocator,
-    predicate: relational_sql.RowSecurityCurrentSettingPredicate,
+    predicate: sql_adapter.RowSecurityCurrentSettingPredicate,
 ) ![]u8 {
     usermgr.validateRoleSettingName(predicate.setting_name) catch return error.UnsupportedSqlShape;
     const field_json = try std.json.Stringify.valueAlloc(alloc, predicate.field, .{});
@@ -597,7 +596,7 @@ fn currentSettingRowFilterJsonAlloc(
 
 fn literalRowFilterJsonAlloc(
     alloc: std.mem.Allocator,
-    predicate: relational_sql.RowSecurityLiteralPredicate,
+    predicate: sql_adapter.RowSecurityLiteralPredicate,
 ) ![]u8 {
     const field_json = try std.json.Stringify.valueAlloc(alloc, predicate.field, .{});
     defer alloc.free(field_json);
@@ -620,7 +619,7 @@ fn expressionRowFilterJsonAlloc(
 fn boolRowFilterJsonAlloc(
     alloc: std.mem.Allocator,
     key: []const u8,
-    predicate: relational_sql.RowSecurityConjunctionPredicate,
+    predicate: sql_adapter.RowSecurityConjunctionPredicate,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(alloc);

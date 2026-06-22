@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const extension_domain = @import("mod.zig");
-const relational_sql = @import("../api/relational_sql.zig");
+const sql_adapter = @import("../api/sql_adapter/mod.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -24,7 +24,7 @@ pub fn executeRelationalSqlDdlOnService(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try relational_sql.lowerDdlPlanAlloc(alloc, sql);
+    var plan = try sql_adapter.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
 
     switch (plan) {
@@ -46,7 +46,7 @@ pub fn executeRelationalSqlDdlOnService(
 fn executeCreate(
     service: anytype,
     alloc: std.mem.Allocator,
-    plan: relational_sql.CreateExtensionPlan,
+    plan: sql_adapter.CreateExtensionPlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
@@ -71,7 +71,7 @@ fn executeCreate(
 fn executeUpdate(
     service: anytype,
     alloc: std.mem.Allocator,
-    plan: relational_sql.UpdateExtensionPlan,
+    plan: sql_adapter.UpdateExtensionPlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     var installed = try extension_domain.lifecycle.updateOnService(service, alloc, plan.extension_name, .{
         .target_version = plan.target_version orelse "",
@@ -83,7 +83,7 @@ fn executeUpdate(
 fn executeDrop(
     service: anytype,
     alloc: std.mem.Allocator,
-    plan: relational_sql.DropExtensionPlan,
+    plan: sql_adapter.DropExtensionPlan,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
     {
         var snapshot = try service.adminSnapshot();

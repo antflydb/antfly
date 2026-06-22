@@ -17,7 +17,6 @@ const std = @import("std");
 const catalog_resources = @import("catalog_resources.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const relational_sql = @import("relational_sql.zig");
 const runtime_schema_mod = @import("../storage/schema.zig");
 const sql_adapter = @import("sql_adapter/mod.zig");
 const tables_api = @import("tables.zig");
@@ -73,7 +72,7 @@ pub fn schemaRewriteJobForAppliedDdlWorkItem(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
     range: metadata_table_manager.RangeRecord,
-    item: relational_sql.AppliedDdlWorkItem,
+    item: sql_adapter.AppliedDdlWorkItem,
     ordinal: u32,
 ) !metadata_table_manager.SchemaRewriteJobRecord {
     var hasher = std.hash.Wyhash.init(0x5352514a);
@@ -151,7 +150,7 @@ pub fn appliedDdlHasSchemaRewriteWork(applied: tables_api.AppliedRelationalSqlDd
     return false;
 }
 
-fn schemaRewriteRenamesForAppliedRowRewritePlan(plan: relational_sql.AppliedDdlRowRewritePlan) []const metadata_table_manager.SchemaRewriteRename {
+fn schemaRewriteRenamesForAppliedRowRewritePlan(plan: sql_adapter.AppliedDdlRowRewritePlan) []const metadata_table_manager.SchemaRewriteRename {
     if (plan.renames.len == 0) return &.{};
     const ptr: [*]const metadata_table_manager.SchemaRewriteRename = @ptrCast(@alignCast(plan.renames.ptr));
     return ptr[0..plan.renames.len];
@@ -216,7 +215,7 @@ test "catalog jobs schedules typed schema rewrite jobs from applied SQL DDL work
         .operands = &.{.{ .kind = .field, .field = "status" }},
     });
     errdefer runtime_schema_mod.freeRelationalRowsExpression(alloc, expression);
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .rewrite,
         .subject = .table,
@@ -243,7 +242,7 @@ test "catalog jobs schedules typed schema rewrite jobs from applied SQL DDL work
         .operands = &.{.{ .kind = .field, .field = "status" }},
     });
     defer runtime_schema_mod.freeRelationalRowsExpression(alloc, alternate_expression);
-    const alternate_item: relational_sql.AppliedDdlWorkItem = .{
+    const alternate_item: sql_adapter.AppliedDdlWorkItem = .{
         .action = .rewrite,
         .subject = .table,
         .reason = .row_images,
@@ -318,7 +317,7 @@ test "catalog jobs schedules durable schema validation jobs from applied SQL DDL
         .schema_json = "{\"version\":3,\"storage_mode\":\"relational\"}",
     });
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .validate,
         .subject = .table,
@@ -389,14 +388,14 @@ test "catalog jobs schedules row-plan schema rewrite jobs from applied SQL DDL w
         .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"state\":{\"type\":\"keyword\"}}}}}}",
     });
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const renames = try alloc.alloc(relational_sql.AppliedDdlRowRewriteRename, 1);
+    const renames = try alloc.alloc(sql_adapter.AppliedDdlRowRewriteRename, 1);
     renames[0] = .{
         .old_path = try alloc.dupe(u8, "status"),
         .new_path = try alloc.dupe(u8, "state"),
     };
     const drops = try alloc.alloc([]const u8, 1);
     drops[0] = try alloc.dupe(u8, "legacy_status");
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .rewrite,
         .subject = .table,
@@ -414,7 +413,7 @@ test "catalog jobs schedules row-plan schema rewrite jobs from applied SQL DDL w
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
 
     const same_row_plan_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
-    const alternate_item: relational_sql.AppliedDdlWorkItem = .{
+    const alternate_item: sql_adapter.AppliedDdlWorkItem = .{
         .action = .rewrite,
         .subject = .table,
         .reason = .row_images,
@@ -475,7 +474,7 @@ test "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL w
         .schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"state\":{\"type\":\"keyword\"}}}}}}",
     });
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .rewrite,
         .subject = .table,
@@ -493,7 +492,7 @@ test "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL w
     try scheduleSchemaRewriteJobsForAppliedDdlOnService(&service, alloc, applied);
 
     const same_full_job = try schemaRewriteJobForAppliedDdlWorkItem(alloc, applied.table, service.ranges[0], applied.work_items[0], 1);
-    const alternate_item: relational_sql.AppliedDdlWorkItem = .{
+    const alternate_item: sql_adapter.AppliedDdlWorkItem = .{
         .action = .rewrite,
         .subject = .table,
         .reason = .row_images,
@@ -544,7 +543,7 @@ test "catalog jobs rejects schema rewrite jobs without typed row operation" {
         .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
     });
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .rewrite,
         .subject = .table,
@@ -570,7 +569,7 @@ test "catalog jobs detects schema rewrite wakeable applied DDL work" {
         .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
     });
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .validate,
         .subject = .table,
@@ -612,7 +611,7 @@ test "catalog jobs snapshot scheduler does not require HTTP service surface" {
         .schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}",
     });
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const work_items = try alloc.alloc(relational_sql.AppliedDdlWorkItem, 1);
+    const work_items = try alloc.alloc(sql_adapter.AppliedDdlWorkItem, 1);
     work_items[0] = .{
         .action = .validate,
         .subject = .table,

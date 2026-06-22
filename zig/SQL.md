@@ -640,6 +640,10 @@ Current implementation status:
 - Relational SQL catalog/read parsed lowering helpers are public typed adapter
   APIs, and the HTTP routine-binding read path constructs `ParsedSql` once
   before dispatching to catalog or non-catalog lowering.
+- DDL plan lowering now lives behind `sql_adapter` exports; auth role/row
+  security execution, catalog jobs, notifications, and extension lifecycle use
+  adapter-native plan types instead of importing the broader relational SQL
+  facade.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

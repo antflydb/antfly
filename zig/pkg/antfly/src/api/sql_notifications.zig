@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const relational_sql = @import("relational_sql.zig");
+const sql_adapter = @import("sql_adapter/mod.zig");
 
 const SpinMutex = struct {
     inner: std.Io.Mutex = .init,
@@ -88,7 +88,7 @@ pub const Runtime = struct {
 
     pub fn apply(
         self: *@This(),
-        plan: relational_sql.NotificationChannelPlan,
+        plan: sql_adapter.NotificationChannelPlan,
         session_id: u64,
         timestamp_ns: u64,
     ) !ApplyResult {
@@ -180,7 +180,7 @@ pub const Runtime = struct {
     fn unlistenLocked(
         self: *@This(),
         session_id: u64,
-        plan: relational_sql.UnlistenNotificationPlan,
+        plan: sql_adapter.UnlistenNotificationPlan,
     ) !ApplyResult {
         if (plan.all) {
             var i: usize = 0;

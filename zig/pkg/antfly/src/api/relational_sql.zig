@@ -2239,7 +2239,7 @@ pub fn lowerDdlPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !LoweredDdlPlan {
-    return try lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, .{});
+    return try sql_adapter.lowerDdlPlanAlloc(alloc, sql);
 }
 
 pub fn lowerDdlPlanWithFunctionBindingsAlloc(
@@ -2247,16 +2247,14 @@ pub fn lowerDdlPlanWithFunctionBindingsAlloc(
     sql: []const u8,
     function_bindings: SqlFunctionBindings,
 ) !LoweredDdlPlan {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, function_bindings);
+    return try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
 }
 
 fn lowerDdlPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const sql_adapter.ParsedSql,
 ) !LoweredDdlPlan {
-    return try lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, .{});
+    return try sql_adapter.lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql);
 }
 
 fn lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(
@@ -2264,26 +2262,7 @@ fn lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     function_bindings: SqlFunctionBindings,
 ) !LoweredDdlPlan {
-    const tokens = parsed_sql.items();
-
-    var parser = Parser{
-        .alloc = alloc,
-        .tokens = tokens,
-        .function_bindings = function_bindings,
-    };
-    return sql_adapter.parseDdlPlanAlloc(alloc, tokens, &parser.pos, .{
-        .schema = parser.schema,
-        .field_expression_qualifiers = parser.field_expression_qualifiers,
-        .returning_expression_qualifiers = parser.returning_expression_qualifiers,
-        .defer_row_expression_field_validation = parser.defer_row_expression_field_validation,
-        .column_definition_options = Parser.ContextAccessors.ddlColumnDefinitionOptions(&parser),
-        .domain_options = Parser.ContextAccessors.ddlDomainOptions(&parser),
-        .create_index_options = Parser.ContextAccessors.createIndexOptions(&parser),
-        .row_security_policy_options = Parser.ContextAccessors.rowSecurityPolicyOptions(&parser),
-    }) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    return try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
 }
 
 pub const lowerAntflyQueryFunctionSqlAlloc = sql_adapter.lowerAntflyQueryFunctionSqlAlloc;

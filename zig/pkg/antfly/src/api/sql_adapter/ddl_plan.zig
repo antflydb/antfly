@@ -7780,14 +7780,14 @@ pub fn relationalIndexLifecycleName(lifecycle: runtime_schema.RelationalIndexLif
     };
 }
 
-fn lowerDdlPlanForTestAlloc(
+pub fn lowerDdlPlanAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !LoweredDdlPlan {
-    return try lowerDdlPlanWithFunctionBindingsForTestAlloc(alloc, sql, .{});
+    return try lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, .{});
 }
 
-fn lowerDdlPlanWithFunctionBindingsForTestAlloc(
+pub fn lowerDdlPlanWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
     function_bindings: lower_expr.SqlFunctionBindings,
@@ -7795,10 +7795,17 @@ fn lowerDdlPlanWithFunctionBindingsForTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
 
-    return try lowerDdlPlanParsedSqlWithFunctionBindingsForTestAlloc(alloc, &parsed_sql, function_bindings);
+    return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, function_bindings);
 }
 
-fn lowerDdlPlanParsedSqlWithFunctionBindingsForTestAlloc(
+pub fn lowerDdlPlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) !LoweredDdlPlan {
+    return try lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, .{});
+}
+
+pub fn lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     function_bindings: lower_expr.SqlFunctionBindings,
