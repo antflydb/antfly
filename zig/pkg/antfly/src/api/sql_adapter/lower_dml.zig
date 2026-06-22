@@ -11734,6 +11734,96 @@ fn lowerMergeMutationPlanForDmlTestAlloc(
     );
 }
 
+fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
+fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
+fn lowerRecursiveMergeMutationWithSchemasForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+) !plan_mod.LoweredRecursiveMergeMutation {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveMergeMutation(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
 fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -11846,6 +11936,38 @@ fn lowerMergeMutationPlanParsedSqlForDmlTestAlloc(
     return try lowerMergeMutationPlanForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params);
 }
 
+fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, row_claim);
+}
+
+fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredRecursiveJoinedMutationSource {
+    return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, row_claim);
+}
+
+fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+) !plan_mod.LoweredRecursiveMergeMutation {
+    return try lowerRecursiveMergeMutationWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params);
+}
+
 fn lowerWritePlanForDmlTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -11860,9 +11982,9 @@ fn lowerWritePlanForDmlTestAlloc(
         .params = params,
         .callbacks = .{
             .lower_recursive_insert_source_with_schemas = unsupportedRecursiveInsertSourceForDmlTestAlloc,
-            .lower_recursive_update_joined_source_with_schemas = unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc,
-            .lower_recursive_delete_joined_source_with_schemas = unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc,
-            .lower_recursive_merge_mutation_with_schemas = unsupportedRecursiveMergeMutationForDmlTestAlloc,
+            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc,
             .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlForDmlTestAlloc,
             .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc,
             .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
@@ -17556,6 +17678,78 @@ test "sql adapter lower dml lowers joined mutation source with separate target a
     try std.testing.expectEqualStrings("source_quantity", mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.operands[1].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.operands[1].field_source);
     try std.testing.expectEqualStrings("10", mixed_delete_filter.mutation.req.match_expression_predicates[0].rhs[0].value_json);
+}
+
+test "sql adapter lower dml lowers recursive cte joined mutation sources" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const txn_id = [_]u8{ 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f };
+    const row_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-recursive-joined-mutation",
+        .txn_id = txn_id,
+    };
+
+    var update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
+        schema,
+        &.{},
+        .{ .row_claim = row_claim },
+    );
+    defer update_plan.deinit(alloc);
+    switch (update_plan) {
+        .recursive_update_joined_source => |recursive_update| {
+            try std.testing.expectEqualStrings("source_rows", recursive_update.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_update.mutation.target_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, recursive_update.mutation.mutation.req.kind);
+            try std.testing.expect(recursiveJoinedMutationSourceUsesCte(recursive_update.mutation.mutation.req, recursive_update.recursive.cte_name));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)",
+        schema,
+        &.{},
+        .{ .row_claim = row_claim },
+    );
+    defer delete_plan.deinit(alloc);
+    switch (delete_plan) {
+        .recursive_delete_joined_source => |recursive_delete| {
+            try std.testing.expectEqualStrings("source_rows", recursive_delete.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_delete.mutation.target_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, recursive_delete.mutation.mutation.req.kind);
+            try std.testing.expect(recursiveJoinedMutationSourceUsesCte(recursive_delete.mutation.mutation.req, recursive_delete.recursive.cte_name));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var merge_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+        schema,
+        &.{},
+        .{},
+    );
+    defer merge_plan.deinit(alloc);
+    switch (merge_plan) {
+        .recursive_merge_mutation => |recursive_merge| {
+            try std.testing.expectEqualStrings("source_rows", recursive_merge.recursive.cte_name);
+            try std.testing.expectEqualStrings("usage_records", recursive_merge.merge.target_table_name);
+            try std.testing.expectEqualStrings("source_rows", recursive_merge.merge.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 0), recursive_merge.merge.ctes.len);
+            try std.testing.expectEqual(@as(usize, 1), recursive_merge.merge.matched_arms.len);
+            try std.testing.expectEqual(@as(usize, 1), recursive_merge.merge.matched_arms[0].update.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lower dml detects merge target row usage" {

@@ -295,7 +295,10 @@ Current implementation status:
   population lowering callbacks consume borrowed `ParsedSql`, so nested
   dispatch does not re-tokenize after the entrypoint has built its shared SQL
   view. Catalog-backed read/write prebinding resolves source schemas from that
-  shared token stream before routing to the typed lowerer.
+  shared token stream before routing to the typed lowerer. Public facade
+  wrappers for direct select, insert, strict insert/update, and aggregate
+  lowering now delegate through parsed helper variants instead of owning
+  separate tokenization paths.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source

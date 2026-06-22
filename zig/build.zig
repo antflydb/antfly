@@ -3877,6 +3877,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml appends joined mutation in predicates",
             "sql adapter lower dml resolves joined mutation CTE source",
             "sql adapter lower dml lowers joined mutation source with separate target and source schemas",
+            "sql adapter lower dml lowers recursive cte joined mutation sources",
             "sql adapter lower dml rejects insert without primary key",
             "sql adapter lower dml lowers insert default values into defaulted row batch",
             "sql adapter lower dml lowers on conflict primary do nothing and update",

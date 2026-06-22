@@ -615,20 +615,30 @@ pub fn lowerSelectAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredSelect {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerSelectParsedSqlAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerSelectParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredSelect {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens.items, "with");
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
 
     var parser = Parser{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
     var lowered = sql_adapter.parseQueryPlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser.pos,
         params,
         Parser.ContextAccessors.cteSelectParserHooks(&parser),
@@ -1175,13 +1185,23 @@ pub fn lowerInsertAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredInsert {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerInsertParsedSqlAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerInsertParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredInsert {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
+    const tokens = parsed_sql.items();
 
     var parser = Parser{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
@@ -1233,13 +1253,24 @@ pub fn lowerInsertWithResolverStrictAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredInsert {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerInsertWithResolverStrictParsedSqlAlloc(alloc, &parsed_sql, schema, params, unique_resolver);
+}
+
+fn lowerInsertWithResolverStrictParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !LoweredInsert {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
+    const tokens = parsed_sql.items();
 
     var parser = Parser{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
@@ -1484,13 +1515,24 @@ pub fn lowerUpdateStrictAlloc(
     params: []const SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !LoweredMutation {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerUpdateStrictParsedSqlAlloc(alloc, &parsed_sql, schema, params, unique_resolver);
+}
+
+fn lowerUpdateStrictParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !LoweredMutation {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
+    const tokens = parsed_sql.items();
 
     var parser = Parser{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
@@ -1980,13 +2022,23 @@ pub fn lowerAggregateAlloc(
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
 ) !LoweredAggregate {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerAggregateParsedSqlAlloc(alloc, &parsed_sql, schema, params);
+}
+
+fn lowerAggregateParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+) !LoweredAggregate {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try tokenizeAlloc(alloc, sql);
-    defer freeTokens(alloc, &tokens);
+    const tokens = parsed_sql.items();
 
     var parser = Parser{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
@@ -15799,80 +15851,6 @@ test "postgres sql adapter lowers recursive cte stream contract" {
         &.{},
         .{},
     ));
-}
-
-test "postgres sql adapter lowers recursive cte joined mutation sources" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
-
-    const txn_id = [_]u8{ 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f };
-    const row_claim: db_mod.types.RowClaimRequest = .{
-        .mode = .for_update,
-        .owner_id = "sql-recursive-joined-mutation",
-        .txn_id = txn_id,
-    };
-
-    var update_plan = try lowerWritePlanAlloc(
-        alloc,
-        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
-        schema,
-        &.{},
-        .{ .row_claim = row_claim },
-    );
-    defer update_plan.deinit(alloc);
-    switch (update_plan) {
-        .recursive_update_joined_source => |recursive_update| {
-            try std.testing.expectEqualStrings("source_rows", recursive_update.recursive.cte_name);
-            try std.testing.expectEqualStrings("usage_records", recursive_update.mutation.target_table_name);
-            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, recursive_update.mutation.mutation.req.kind);
-            try std.testing.expect(sql_adapter.recursiveJoinedMutationSourceUsesCte(recursive_update.mutation.mutation.req, recursive_update.recursive.cte_name));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    var delete_plan = try lowerWritePlanAlloc(
-        alloc,
-        "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)",
-        schema,
-        &.{},
-        .{ .row_claim = row_claim },
-    );
-    defer delete_plan.deinit(alloc);
-    switch (delete_plan) {
-        .recursive_delete_joined_source => |recursive_delete| {
-            try std.testing.expectEqualStrings("source_rows", recursive_delete.recursive.cte_name);
-            try std.testing.expectEqualStrings("usage_records", recursive_delete.mutation.target_table_name);
-            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, recursive_delete.mutation.mutation.req.kind);
-            try std.testing.expect(sql_adapter.recursiveJoinedMutationSourceUsesCte(recursive_delete.mutation.mutation.req, recursive_delete.recursive.cte_name));
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    var merge_plan = try lowerWritePlanAlloc(
-        alloc,
-        "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
-        schema,
-        &.{},
-        .{},
-    );
-    defer merge_plan.deinit(alloc);
-    switch (merge_plan) {
-        .recursive_merge_mutation => |recursive_merge| {
-            try std.testing.expectEqualStrings("source_rows", recursive_merge.recursive.cte_name);
-            try std.testing.expectEqualStrings("usage_records", recursive_merge.merge.target_table_name);
-            try std.testing.expectEqualStrings("source_rows", recursive_merge.merge.source.source_cte);
-            try std.testing.expectEqual(@as(usize, 0), recursive_merge.merge.ctes.len);
-            try std.testing.expectEqual(@as(usize, 1), recursive_merge.merge.matched_arms.len);
-            try std.testing.expectEqual(@as(usize, 1), recursive_merge.merge.matched_arms[0].update.len);
-        },
-        else => return error.TestUnexpectedResult,
-    }
 }
 
 test "postgres sql adapter classifies read sql into typed plan families" {
