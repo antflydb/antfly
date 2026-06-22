@@ -1222,6 +1222,12 @@ pub const ComputeBackend = struct {
         /// Element-wise addition. Result is a new tensor; inputs are NOT freed.
         add: *const fn (ctx: *anyopaque, a: CT, b: CT) anyerror!CT,
 
+        /// In-place row-wise bias add for an owned `[rows, out_dim]` tensor and
+        /// `[out_dim]` bias. Backends return null when unsupported; callers
+        /// retain ownership of `input` on null/error and own the returned tensor
+        /// on success.
+        addBiasRowsConsume: ?*const fn (ctx: *anyopaque, input: CT, bias: CT, rows: usize, out_dim: usize) anyerror!?CT = null,
+
         /// Optional destructive addition that may reuse the left-hand tensor's
         /// storage when it is uniquely owned and already matches the output
         /// size. Callers must only use this when `a` is at last use.
@@ -2550,6 +2556,11 @@ pub const ComputeBackend = struct {
 
     pub fn add(self: *const ComputeBackend, a: CT, b: CT) !CT {
         return self.vtable.add(self.ptr, a, b);
+    }
+
+    pub fn addBiasRowsConsume(self: *const ComputeBackend, input: CT, bias: CT, rows: usize, out_dim: usize) !?CT {
+        if (self.vtable.addBiasRowsConsume) |f| return f(self.ptr, input, bias, rows, out_dim);
+        return null;
     }
 
     pub fn addConsumeLeft(self: *const ComputeBackend, a: CT, b: CT) !?CT {

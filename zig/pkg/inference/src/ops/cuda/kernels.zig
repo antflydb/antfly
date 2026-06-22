@@ -98,6 +98,13 @@ pub const KernelModule = struct {
     conv2d_f32: driver_mod.CUfunction = null,
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
+    cross_attention_f32: driver_mod.CUfunction = null,
+    token_to_nchw_f32: driver_mod.CUfunction = null,
+    nchw_to_token_f32: driver_mod.CUfunction = null,
+    pack_windows_f32: driver_mod.CUfunction = null,
+    unpad_windows_f32: driver_mod.CUfunction = null,
+    channel_scores_softmax_f32: driver_mod.CUfunction = null,
+    channel_apply_f32: driver_mod.CUfunction = null,
     rope_f32: driver_mod.CUfunction = null,
     rope_scaled_f32: driver_mod.CUfunction = null,
     rope_per_item_f32: driver_mod.CUfunction = null,
@@ -156,6 +163,7 @@ pub const KernelModule = struct {
     linear_q4_k_bias_add_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_bias_quick_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_bias_relu_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_k_triple_bias_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_span_bias_f32_tile8_r2: driver_mod.CUfunction = null,
     linear_q4_k_span_bias_relu_f32_tile8_r2: driver_mod.CUfunction = null,
     linear_q4_k_span_bias_f32_tile4_r8: driver_mod.CUfunction = null,
@@ -277,6 +285,13 @@ pub const KernelModule = struct {
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32, module, "termite_attention_f32"));
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
+        const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
+        const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
+        const nchw_to_token_f32 = loadOptionalFunction(ctx, module, "termite_nchw_to_token_f32");
+        const pack_windows_f32 = loadOptionalFunction(ctx, module, "termite_pack_windows_f32");
+        const unpad_windows_f32 = loadOptionalFunction(ctx, module, "termite_unpad_windows_f32");
+        const channel_scores_softmax_f32 = loadOptionalFunction(ctx, module, "termite_channel_scores_softmax_f32");
+        const channel_apply_f32 = loadOptionalFunction(ctx, module, "termite_channel_apply_f32");
         const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
         const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
@@ -365,6 +380,7 @@ pub const KernelModule = struct {
         const linear_q4_k_bias_add_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_add_f32_tc_hmma");
         const linear_q4_k_bias_quick_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma");
         const linear_q4_k_bias_relu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_relu_f32_tc_hmma");
+        const linear_q4_k_triple_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_triple_bias_f32_tc_hmma");
         const linear_q4_k_span_bias_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_f32_tile8_r2");
         const linear_q4_k_span_bias_relu_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_relu_f32_tile8_r2");
         const linear_q4_k_span_bias_f32_tile4_r8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_f32_tile4_r8");
@@ -455,6 +471,13 @@ pub const KernelModule = struct {
             .conv2d_f32 = conv2d_f32,
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
+            .cross_attention_f32 = cross_attention_f32,
+            .token_to_nchw_f32 = token_to_nchw_f32,
+            .nchw_to_token_f32 = nchw_to_token_f32,
+            .pack_windows_f32 = pack_windows_f32,
+            .unpad_windows_f32 = unpad_windows_f32,
+            .channel_scores_softmax_f32 = channel_scores_softmax_f32,
+            .channel_apply_f32 = channel_apply_f32,
             .rope_f32 = rope_f32,
             .rope_scaled_f32 = rope_scaled_f32,
             .rope_per_item_f32 = rope_per_item_f32,
@@ -515,6 +538,7 @@ pub const KernelModule = struct {
             .linear_q4_k_bias_add_f32_tc_hmma = linear_q4_k_bias_add_f32_tc_hmma,
             .linear_q4_k_bias_quick_gelu_f32_tc_hmma = linear_q4_k_bias_quick_gelu_f32_tc_hmma,
             .linear_q4_k_bias_relu_f32_tc_hmma = linear_q4_k_bias_relu_f32_tc_hmma,
+            .linear_q4_k_triple_bias_f32_tc_hmma = linear_q4_k_triple_bias_f32_tc_hmma,
             .linear_q4_k_span_bias_f32_tile8_r2 = linear_q4_k_span_bias_f32_tile8_r2,
             .linear_q4_k_span_bias_relu_f32_tile8_r2 = linear_q4_k_span_bias_relu_f32_tile8_r2,
             .linear_q4_k_span_bias_f32_tile4_r8 = linear_q4_k_span_bias_f32_tile4_r8,
@@ -598,6 +622,13 @@ pub const KernelModule = struct {
             self.conv2d_f32 = null;
             self.attention_f32 = null;
             self.attention_f32_block = null;
+            self.cross_attention_f32 = null;
+            self.token_to_nchw_f32 = null;
+            self.nchw_to_token_f32 = null;
+            self.pack_windows_f32 = null;
+            self.unpad_windows_f32 = null;
+            self.channel_scores_softmax_f32 = null;
+            self.channel_apply_f32 = null;
             self.rope_f32 = null;
             self.rope_scaled_f32 = null;
             self.rope_per_item_f32 = null;
@@ -732,6 +763,20 @@ pub const KernelModule = struct {
             self.gliner_gru_combine_f32 != null;
     }
 
+    pub fn hasFlorence2Primitives(self: *const KernelModule) bool {
+        return self.hasClipClapPrimitives() and
+            self.hasQuantMatmulMvpPrimitives() and
+            self.hasQ4KTensorCorePrimitives() and
+            self.split_last_dim3_f32 != null and
+            self.cross_attention_f32 != null and
+            self.token_to_nchw_f32 != null and
+            self.nchw_to_token_f32 != null and
+            self.pack_windows_f32 != null and
+            self.unpad_windows_f32 != null and
+            self.channel_scores_softmax_f32 != null and
+            self.channel_apply_f32 != null;
+    }
+
     pub fn hasGlinerSpanQ4KPrimitives(self: *const KernelModule) bool {
         return self.linear_q4_k_span_bias_f32_tile8_r2 != null and
             self.linear_q4_k_span_bias_relu_f32_tile8_r2 != null and
@@ -740,6 +785,16 @@ pub const KernelModule = struct {
             self.linear_q4_k_span_pair_bias_f32_tile8_r2 != null and
             self.linear_q4_k_span_pair_bias_relu_f32_tile8_r2 != null and
             self.linear_q4_k_span_pair2_bias_f32_tile8_r2 != null;
+    }
+
+    pub fn hasQ4KTensorCorePrimitives(self: *const KernelModule) bool {
+        return self.linear_q4_k_f32_tc_hmma != null and
+            self.linear_q4_k_bias_f32_tc_hmma != null and
+            self.linear_q4_k_bias_gelu_f32_tc_hmma != null and
+            self.linear_q4_k_bias_add_f32_tc_hmma != null and
+            self.linear_q4_k_bias_quick_gelu_f32_tc_hmma != null and
+            self.linear_q4_k_bias_relu_f32_tc_hmma != null and
+            self.linear_q4_k_triple_bias_f32_tc_hmma != null;
     }
 
     pub fn hasQuantMatmulMvpPrimitives(self: *const KernelModule) bool {
@@ -763,6 +818,10 @@ pub const KernelModule = struct {
 
     pub fn requireGemma4DecoderPrimitives(self: *const KernelModule) driver_mod.Error!void {
         if (!self.hasGemma4DecoderPrimitives()) return error.CudaKernelUnavailable;
+    }
+
+    pub fn requireFlorence2Primitives(self: *const KernelModule) driver_mod.Error!void {
+        if (!self.hasFlorence2Primitives()) return error.CudaKernelUnavailable;
     }
 
     pub fn launchFillF32(
@@ -2801,6 +2860,282 @@ pub const KernelModule = struct {
         }
     }
 
+    pub fn launchCrossAttentionF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        q: buffer_mod.DeviceBuffer,
+        k: buffer_mod.DeviceBuffer,
+        v: buffer_mod.DeviceBuffer,
+        mask: buffer_mod.DeviceBuffer,
+        batch: usize,
+        dec_seq: usize,
+        enc_seq: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) driver_mod.Error!void {
+        if (self.cross_attention_f32 == null) return error.CudaKernelUnavailable;
+        const hidden = try checkedTensorElements(num_heads, head_dim);
+        const q_count = try checkedTensorElements(try checkedTensorElements(batch, dec_seq), hidden);
+        const kv_count = try checkedTensorElements(try checkedTensorElements(batch, enc_seq), hidden);
+        try checkBytes(dst, q_count);
+        try checkBytes(q, q_count);
+        try checkBytes(k, kv_count);
+        try checkBytes(v, kv_count);
+        if (mask.ptr != 0) try checkRawBytes(mask, try checkedTensorElements(batch, enc_seq) * @sizeOf(i64));
+        if (q_count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var q_ptr = q.ptr;
+        var k_ptr = k.ptr;
+        var v_ptr = v.ptr;
+        var mask_ptr = mask.ptr;
+        var batch_u32 = try toU32(batch);
+        var dec_seq_u32 = try toU32(dec_seq);
+        var enc_seq_u32 = try toU32(enc_seq);
+        var num_heads_u32 = try toU32(num_heads);
+        var head_dim_u32 = try toU32(head_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&q_ptr),
+            @ptrCast(&k_ptr),
+            @ptrCast(&v_ptr),
+            @ptrCast(&mask_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&dec_seq_u32),
+            @ptrCast(&enc_seq_u32),
+            @ptrCast(&num_heads_u32),
+            @ptrCast(&head_dim_u32),
+        };
+        try launch1d(self.cross_attention_f32, ctx, q_count, &params);
+    }
+
+    pub fn launchTokenToNchwF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) driver_mod.Error!void {
+        if (self.token_to_nchw_f32 == null) return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, channels), try checkedTensorElements(height, width));
+        try checkBytes(dst, count);
+        try checkBytes(src, count);
+        if (count == 0) return;
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var batch_u32 = try toU32(batch);
+        var channels_u32 = try toU32(channels);
+        var height_u32 = try toU32(height);
+        var width_u32 = try toU32(width);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&channels_u32),
+            @ptrCast(&height_u32),
+            @ptrCast(&width_u32),
+        };
+        try launch1d(self.token_to_nchw_f32, ctx, count, &params);
+    }
+
+    pub fn launchNchwToTokenF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+    ) driver_mod.Error!void {
+        if (self.nchw_to_token_f32 == null) return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, channels), try checkedTensorElements(height, width));
+        try checkBytes(dst, count);
+        try checkBytes(src, count);
+        if (count == 0) return;
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var batch_u32 = try toU32(batch);
+        var channels_u32 = try toU32(channels);
+        var height_u32 = try toU32(height);
+        var width_u32 = try toU32(width);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&channels_u32),
+            @ptrCast(&height_u32),
+            @ptrCast(&width_u32),
+        };
+        try launch1d(self.nchw_to_token_f32, ctx, count, &params);
+    }
+
+    pub fn launchPackWindowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        window_size: usize,
+        padded_h: usize,
+        padded_w: usize,
+    ) driver_mod.Error!void {
+        if (self.pack_windows_f32 == null) return error.CudaKernelUnavailable;
+        const window_count = try checkedTensorElements(try checkedTensorElements(batch, padded_h / window_size), padded_w / window_size);
+        const count = try checkedTensorElements(try checkedTensorElements(window_count, window_size * window_size), dim);
+        try checkBytes(dst, count);
+        try checkBytes(src, try checkedTensorElements(try checkedTensorElements(batch, height * width), dim));
+        if (count == 0) return;
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var batch_u32 = try toU32(batch);
+        var height_u32 = try toU32(height);
+        var width_u32 = try toU32(width);
+        var dim_u32 = try toU32(dim);
+        var window_size_u32 = try toU32(window_size);
+        var padded_h_u32 = try toU32(padded_h);
+        var padded_w_u32 = try toU32(padded_w);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&height_u32),
+            @ptrCast(&width_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&window_size_u32),
+            @ptrCast(&padded_h_u32),
+            @ptrCast(&padded_w_u32),
+        };
+        try launch1d(self.pack_windows_f32, ctx, count, &params);
+    }
+
+    pub fn launchUnpadWindowsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        window_size: usize,
+        padded_h: usize,
+        padded_w: usize,
+    ) driver_mod.Error!void {
+        if (self.unpad_windows_f32 == null) return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, height * width), dim);
+        const window_count = try checkedTensorElements(try checkedTensorElements(batch, padded_h / window_size), padded_w / window_size);
+        const src_count = try checkedTensorElements(try checkedTensorElements(window_count, window_size * window_size), dim);
+        try checkBytes(dst, count);
+        try checkBytes(src, src_count);
+        if (count == 0) return;
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var batch_u32 = try toU32(batch);
+        var height_u32 = try toU32(height);
+        var width_u32 = try toU32(width);
+        var dim_u32 = try toU32(dim);
+        var window_size_u32 = try toU32(window_size);
+        var padded_h_u32 = try toU32(padded_h);
+        var padded_w_u32 = try toU32(padded_w);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&height_u32),
+            @ptrCast(&width_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&window_size_u32),
+            @ptrCast(&padded_h_u32),
+            @ptrCast(&padded_w_u32),
+        };
+        try launch1d(self.unpad_windows_f32, ctx, count, &params);
+    }
+
+    pub fn launchChannelScoresSoftmaxF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        scores: buffer_mod.DeviceBuffer,
+        qkv: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        dim: usize,
+        groups: usize,
+    ) driver_mod.Error!void {
+        if (self.channel_scores_softmax_f32 == null) return error.CudaKernelUnavailable;
+        if (groups == 0 or dim % groups != 0) return error.InvalidCudaState;
+        const channels_per_group = dim / groups;
+        if (channels_per_group > 256) return error.InvalidCudaState;
+        const qkv_count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), dim * 3);
+        const score_count = try checkedTensorElements(try checkedTensorElements(batch, groups), channels_per_group * channels_per_group);
+        try checkBytes(qkv, qkv_count);
+        try checkBytes(scores, score_count);
+        const rows = try checkedTensorElements(try checkedTensorElements(batch, groups), channels_per_group);
+        if (rows == 0) return;
+        var scores_ptr = scores.ptr;
+        var qkv_ptr = qkv.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var dim_u32 = try toU32(dim);
+        var groups_u32 = try toU32(groups);
+        var params = [_]?*anyopaque{
+            @ptrCast(&scores_ptr),
+            @ptrCast(&qkv_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&groups_u32),
+        };
+        try launchBlocks(self.channel_scores_softmax_f32, ctx, rows, 256, &params);
+    }
+
+    pub fn launchChannelApplyF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        qkv: buffer_mod.DeviceBuffer,
+        scores: buffer_mod.DeviceBuffer,
+        batch: usize,
+        seq_len: usize,
+        dim: usize,
+        groups: usize,
+    ) driver_mod.Error!void {
+        if (self.channel_apply_f32 == null) return error.CudaKernelUnavailable;
+        if (groups == 0 or dim % groups != 0) return error.InvalidCudaState;
+        const channels_per_group = dim / groups;
+        const count = try checkedTensorElements(try checkedTensorElements(batch, seq_len), dim);
+        const qkv_count = try checkedTensorElements(count, 3);
+        const score_count = try checkedTensorElements(try checkedTensorElements(batch, groups), channels_per_group * channels_per_group);
+        try checkBytes(dst, count);
+        try checkBytes(qkv, qkv_count);
+        try checkBytes(scores, score_count);
+        if (count == 0) return;
+        var dst_ptr = dst.ptr;
+        var qkv_ptr = qkv.ptr;
+        var scores_ptr = scores.ptr;
+        var batch_u32 = try toU32(batch);
+        var seq_len_u32 = try toU32(seq_len);
+        var dim_u32 = try toU32(dim);
+        var groups_u32 = try toU32(groups);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&qkv_ptr),
+            @ptrCast(&scores_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&groups_u32),
+        };
+        try launch1d(self.channel_apply_f32, ctx, count, &params);
+    }
+
     pub fn launchRopeF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -4833,6 +5168,79 @@ pub const KernelModule = struct {
         try launch2d(function, ctx, (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols, (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows, q_tc_hmma_threads, &params);
     }
 
+    pub fn launchLinearQ4KTripleBiasTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        dst_c: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_a_packed: buffer_mod.DeviceBuffer,
+        bias_a: buffer_mod.DeviceBuffer,
+        weight_b_packed: buffer_mod.DeviceBuffer,
+        bias_b: buffer_mod.DeviceBuffer,
+        weight_c_packed: buffer_mod.DeviceBuffer,
+        bias_c: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_k_triple_bias_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_k_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_tc_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkBytes(dst_c, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_a_packed, weight_bytes);
+        try checkRawBytes(weight_b_packed, weight_bytes);
+        try checkRawBytes(weight_c_packed, weight_bytes);
+        try checkBytes(bias_a, out_dim);
+        try checkBytes(bias_b, out_dim);
+        try checkBytes(bias_c, out_dim);
+        if (out_count == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var dst_c_ptr = dst_c.ptr;
+        var input_ptr = input.ptr;
+        var weight_a_ptr = weight_a_packed.ptr;
+        var bias_a_ptr = bias_a.ptr;
+        var weight_b_ptr = weight_b_packed.ptr;
+        var bias_b_ptr = bias_b.ptr;
+        var weight_c_ptr = weight_c_packed.ptr;
+        var bias_c_ptr = bias_c.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&dst_c_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&bias_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&bias_b_ptr),
+            @ptrCast(&weight_c_ptr),
+            @ptrCast(&bias_c_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch3d(
+            function,
+            ctx,
+            (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols,
+            (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows,
+            3,
+            q_tc_hmma_threads,
+            &params,
+        );
+    }
+
     pub fn launchLinearQ4KBiasQuickGeluTiledF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6030,6 +6438,28 @@ fn launch2d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid
     ctx.noteKernelLaunch();
 }
 
+fn launch3d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid_x: usize, grid_y: usize, grid_z: usize, threads: usize, params: [*]?*anyopaque) driver_mod.Error!void {
+    const gx: c_uint = try toU32(grid_x);
+    const gy: c_uint = try toU32(grid_y);
+    const gz: c_uint = try toU32(grid_z);
+    const block: c_uint = try toU32(threads);
+    try ctx.makeCurrent();
+    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        function,
+        gx,
+        gy,
+        gz,
+        block,
+        1,
+        1,
+        0,
+        ctx.stream,
+        params,
+        null,
+    ));
+    ctx.noteKernelLaunch();
+}
+
 fn launchRaw(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid: c_uint, block: c_uint, params: [*]?*anyopaque) driver_mod.Error!void {
     try ctx.makeCurrent();
     try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
@@ -6197,6 +6627,20 @@ pub fn smokeGemma4Primitives(allocator: std.mem.Allocator) !void {
     try smokeArgmaxLastRowSuppressF32(&ctx, &module);
     try smokeGemma4MtpMaskedArgmaxF32(&ctx, &module);
     try smokeGemma4MtpVerifyCommitU32(&ctx, &module);
+}
+
+pub fn smokeFlorence2Primitives(allocator: std.mem.Allocator) !void {
+    var ctx = try context_mod.CudaContext.initDefault();
+    defer ctx.deinit();
+    var module = try KernelModule.load(&ctx);
+    defer module.unload(&ctx);
+
+    try module.requireFlorence2Primitives();
+    try smokeFlorence2CrossAttentionF32(allocator, &ctx, &module);
+    try smokeFlorence2LayoutF32(allocator, &ctx, &module);
+    try smokeFlorence2WindowsF32(allocator, &ctx, &module);
+    try smokeFlorence2ChannelAttentionF32(allocator, &ctx, &module);
+    try smokeFlorence2TripleQ4KTcHmmaF32(allocator, &ctx, &module);
 }
 
 pub fn smokeTurboquantKv(allocator: std.mem.Allocator) !void {
@@ -7080,6 +7524,153 @@ fn smokeAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext
     try expectApproxSlice(out, &expected_sdpa, 0.001);
 }
 
+fn smokeFlorence2CrossAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 1;
+    const dec_seq: usize = 2;
+    const enc_seq: usize = 2;
+    const heads: usize = 1;
+    const head_dim: usize = 2;
+    const q_data = [_]f32{ 1, 0, 0, 1 };
+    const k_data = [_]f32{ 1, 0, 0, 1 };
+    const v_data = [_]f32{ 10, 0, 0, 20 };
+    const expected = [_]f32{ 6.697615, 6.604769, 3.302384, 13.395231 };
+
+    var q = try buffer_mod.DeviceBuffer.alloc(ctx, q_data.len * @sizeOf(f32));
+    defer q.free(ctx);
+    var k = try buffer_mod.DeviceBuffer.alloc(ctx, k_data.len * @sizeOf(f32));
+    defer k.free(ctx);
+    var v = try buffer_mod.DeviceBuffer.alloc(ctx, v_data.len * @sizeOf(f32));
+    defer v.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, expected.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try q.copyFromHost(ctx, std.mem.sliceAsBytes(&q_data));
+    try k.copyFromHost(ctx, std.mem.sliceAsBytes(&k_data));
+    try v.copyFromHost(ctx, std.mem.sliceAsBytes(&v_data));
+    try module.launchCrossAttentionF32(ctx, output, q, k, v, .{}, batch, dec_seq, enc_seq, heads, head_dim);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, expected.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.001);
+
+    const mask_data = [_]i64{ 1, 0 };
+    const expected_masked = [_]f32{ 10, 0, 10, 0 };
+    var mask = try buffer_mod.DeviceBuffer.alloc(ctx, mask_data.len * @sizeOf(i64));
+    defer mask.free(ctx);
+    try mask.copyFromHost(ctx, std.mem.sliceAsBytes(&mask_data));
+    try module.launchCrossAttentionF32(ctx, output, q, k, v, mask, batch, dec_seq, enc_seq, heads, head_dim);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_masked, 0.001);
+}
+
+fn smokeFlorence2LayoutF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 1;
+    const channels: usize = 2;
+    const height: usize = 2;
+    const width: usize = 2;
+    const token_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const expected_nchw = [_]f32{ 1, 3, 5, 7, 2, 4, 6, 8 };
+
+    var token = try buffer_mod.DeviceBuffer.alloc(ctx, token_data.len * @sizeOf(f32));
+    defer token.free(ctx);
+    var nchw = try buffer_mod.DeviceBuffer.alloc(ctx, token_data.len * @sizeOf(f32));
+    defer nchw.free(ctx);
+    var roundtrip = try buffer_mod.DeviceBuffer.alloc(ctx, token_data.len * @sizeOf(f32));
+    defer roundtrip.free(ctx);
+    try token.copyFromHost(ctx, std.mem.sliceAsBytes(&token_data));
+    try module.launchTokenToNchwF32(ctx, nchw, token, batch, channels, height, width);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, token_data.len);
+    defer allocator.free(out);
+    try nchw.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_nchw, 0.0001);
+
+    try module.launchNchwToTokenF32(ctx, roundtrip, nchw, batch, channels, height, width);
+    try ctx.synchronize();
+    try roundtrip.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &token_data, 0.0001);
+}
+
+fn smokeFlorence2WindowsF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 1;
+    const height: usize = 2;
+    const width: usize = 3;
+    const dim: usize = 1;
+    const window_size: usize = 2;
+    const padded_h: usize = 2;
+    const padded_w: usize = 4;
+    const token_data = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const expected_packed = [_]f32{ 1, 2, 4, 5, 3, 0, 6, 0 };
+
+    var token = try buffer_mod.DeviceBuffer.alloc(ctx, token_data.len * @sizeOf(f32));
+    defer token.free(ctx);
+    var packed_windows = try buffer_mod.DeviceBuffer.alloc(ctx, expected_packed.len * @sizeOf(f32));
+    defer packed_windows.free(ctx);
+    var unpacked = try buffer_mod.DeviceBuffer.alloc(ctx, token_data.len * @sizeOf(f32));
+    defer unpacked.free(ctx);
+    try token.copyFromHost(ctx, std.mem.sliceAsBytes(&token_data));
+    try module.launchPackWindowsF32(ctx, packed_windows, token, batch, height, width, dim, window_size, padded_h, padded_w);
+    try ctx.synchronize();
+
+    const packed_out = try allocator.alloc(f32, expected_packed.len);
+    defer allocator.free(packed_out);
+    try packed_windows.copyToHost(ctx, std.mem.sliceAsBytes(packed_out));
+    try ctx.synchronize();
+    try expectApproxSlice(packed_out, &expected_packed, 0.0001);
+
+    const unpacked_out = try allocator.alloc(f32, token_data.len);
+    defer allocator.free(unpacked_out);
+    try module.launchUnpadWindowsF32(ctx, unpacked, packed_windows, batch, height, width, dim, window_size, padded_h, padded_w);
+    try ctx.synchronize();
+    try unpacked.copyToHost(ctx, std.mem.sliceAsBytes(unpacked_out));
+    try ctx.synchronize();
+    try expectApproxSlice(unpacked_out, &token_data, 0.0001);
+}
+
+fn smokeFlorence2ChannelAttentionF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 1;
+    const seq_len: usize = 2;
+    const dim: usize = 2;
+    const groups: usize = 1;
+    const qkv_data = [_]f32{
+        1, 0, 1, 0, 10, 20,
+        0, 1, 0, 1, 30, 40,
+    };
+    const expected_scores = [_]f32{ 0.669762, 0.330238, 0.330238, 0.669762 };
+    const expected_out = [_]f32{ 13.30238, 16.69762, 33.30238, 36.69762 };
+
+    var qkv = try buffer_mod.DeviceBuffer.alloc(ctx, qkv_data.len * @sizeOf(f32));
+    defer qkv.free(ctx);
+    var scores = try buffer_mod.DeviceBuffer.alloc(ctx, expected_scores.len * @sizeOf(f32));
+    defer scores.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, expected_out.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try qkv.copyFromHost(ctx, std.mem.sliceAsBytes(&qkv_data));
+    try module.launchChannelScoresSoftmaxF32(ctx, scores, qkv, batch, seq_len, dim, groups);
+    try ctx.synchronize();
+
+    const score_out = try allocator.alloc(f32, expected_scores.len);
+    defer allocator.free(score_out);
+    try scores.copyToHost(ctx, std.mem.sliceAsBytes(score_out));
+    try ctx.synchronize();
+    try expectApproxSlice(score_out, &expected_scores, 0.001);
+
+    const out = try allocator.alloc(f32, expected_out.len);
+    defer allocator.free(out);
+    try module.launchChannelApplyF32(ctx, output, qkv, scores, batch, seq_len, dim, groups);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_out, 0.001);
+}
+
 fn smokeRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
     const head_dim: usize = 4;
     const rope_dim: usize = 4;
@@ -7478,6 +8069,92 @@ pub fn smokeQ4_K(allocator: std.mem.Allocator) !void {
     try output_c.copyToHost(&ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_bias, 0.1);
+}
+
+fn smokeFlorence2TripleQ4KTcHmmaF32(
+    allocator: std.mem.Allocator,
+    ctx: *context_mod.CudaContext,
+    module: *KernelModule,
+) !void {
+    const rows: usize = 2;
+    const in_dim: usize = 256;
+    const out_dim: usize = 2;
+    var input_data: [rows * in_dim]f32 = undefined;
+    for (0..in_dim) |i| {
+        input_data[i] = @floatFromInt(i + 1);
+        input_data[in_dim + i] = -@as(f32, @floatFromInt(i + 1));
+    }
+    var weight_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    writeQ4_KSmokeRow(weight_raw[0..144], 1.0, 1);
+    writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
+    var weight_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
+    writeQ4_KSmokeTensorCore(&weight_tc_raw, &weight_raw, in_dim, out_dim);
+    const bias_data = [_]f32{ 0.25, -1.0 };
+
+    var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
+    defer input.free(ctx);
+    var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_tc_raw.len);
+    defer weight.free(ctx);
+    var bias = try buffer_mod.DeviceBuffer.alloc(ctx, bias_data.len * @sizeOf(f32));
+    defer bias.free(ctx);
+    var output_a = try buffer_mod.DeviceBuffer.alloc(ctx, rows * out_dim * @sizeOf(f32));
+    defer output_a.free(ctx);
+    var output_b = try buffer_mod.DeviceBuffer.alloc(ctx, rows * out_dim * @sizeOf(f32));
+    defer output_b.free(ctx);
+    var output_c = try buffer_mod.DeviceBuffer.alloc(ctx, rows * out_dim * @sizeOf(f32));
+    defer output_c.free(ctx);
+
+    try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
+    try weight.copyFromHost(ctx, &weight_tc_raw);
+    try bias.copyFromHost(ctx, std.mem.sliceAsBytes(&bias_data));
+    try module.launchLinearQ4KTripleBiasTcHmmaF32(ctx, output_a, output_b, output_c, input, weight, bias, weight, bias, weight, bias, rows, in_dim, out_dim);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, rows * out_dim);
+    defer allocator.free(out);
+    const expected_bias = [_]f32{ 32896.25, 32895, -32895.75, -32897 };
+    try output_a.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_bias, 4.0);
+    try output_b.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_bias, 4.0);
+    try output_c.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected_bias, 4.0);
+}
+
+fn writeQ4_KSmokeTensorCore(dst: []u8, raw: []const u8, in_dim: usize, out_dim: usize) void {
+    std.debug.assert(in_dim != 0 and in_dim % q4_k_values_per_block == 0);
+    const row_blocks = in_dim / q4_k_values_per_block;
+    const block_count = out_dim * row_blocks;
+    std.debug.assert(raw.len == block_count * q4_k_block_bytes);
+    std.debug.assert(dst.len == block_count * q4_k_tc_block_bytes);
+
+    const meta_bytes = block_count * 20;
+    for (0..block_count) |block| {
+        const src = raw[block * q4_k_block_bytes ..][0..q4_k_block_bytes];
+        const meta = dst[block * 20 ..][0..20];
+        @memcpy(meta[0..4], src[0..4]);
+        const scales = src[4..16];
+        for (0..8) |sub| {
+            meta[4 + sub] = q4KSmokeScale(scales, sub);
+            meta[12 + sub] = q4KSmokeMin(scales, sub);
+        }
+        @memcpy(dst[meta_bytes + block * 128 ..][0..128], src[16..144]);
+    }
+}
+
+fn q4KSmokeScale(scales: []const u8, sub: usize) u8 {
+    std.debug.assert(scales.len >= 12);
+    if (sub < 4) return scales[sub] & 63;
+    return (scales[sub + 4] & 0x0f) | ((scales[sub - 4] >> 6) << 4);
+}
+
+fn q4KSmokeMin(scales: []const u8, sub: usize) u8 {
+    std.debug.assert(scales.len >= 12);
+    if (sub < 4) return scales[sub + 4] & 63;
+    return (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
 }
 
 fn writeQ8_0SmokeRow(dst: []u8, scale: f32, value: i8) void {

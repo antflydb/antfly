@@ -96,6 +96,13 @@ required_symbols=(
   termite_linear_bf16_weight_f32_tiled
   termite_embedding_lookup_bf16_weight_f32
   termite_attention_f32_block
+  termite_cross_attention_f32
+  termite_token_to_nchw_f32
+  termite_nchw_to_token_f32
+  termite_pack_windows_f32
+  termite_unpad_windows_f32
+  termite_channel_scores_softmax_f32
+  termite_channel_apply_f32
   termite_deberta_attention_f32
   termite_gliner_gather_concat_relu_f32
   termite_split_last_dim3_f32

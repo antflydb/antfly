@@ -346,14 +346,8 @@ pub fn writeFlorence2VariantsManifestForModel(
             try appendUniqueName(allocator, &gguf_names, name);
         }
     }
-    if (hasFile(names.items, "florence-2-base.gguf")) {
-        try appendUniqueName(allocator, &gguf_names, "florence-2-base.gguf");
-    }
     for (names.items) |name| {
-        const prefix = "florence-2-base.";
-        const ext = ".gguf";
-        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, ext)) continue;
-        if (name.len <= prefix.len + ext.len) continue;
+        if (!isFlorence2GgufFileName(name)) continue;
         try appendUniqueName(allocator, &gguf_names, name);
     }
     if (gguf_names.items.len == 0) return;
@@ -412,6 +406,17 @@ fn appendUniqueName(allocator: Allocator, names: *std.ArrayListUnmanaged([]const
         if (std.mem.eql(u8, existing, name)) return;
     }
     try names.append(allocator, name);
+}
+
+fn isFlorence2GgufFileName(name: []const u8) bool {
+    if (!std.mem.endsWith(u8, name, ".gguf")) return false;
+    if (std.mem.eql(u8, name, "florence-2-base.gguf")) return true;
+    if (std.mem.eql(u8, name, "Florence-2-base.gguf")) return true;
+    if (std.mem.eql(u8, name, "florence2.gguf")) return true;
+    if (std.mem.startsWith(u8, name, "florence-2-base.")) return true;
+    if (std.mem.startsWith(u8, name, "Florence-2-base.")) return true;
+    if (std.mem.startsWith(u8, name, "florence2.")) return true;
+    return false;
 }
 
 fn florence2FormatSuffixFromGgufName(name: []const u8) []const u8 {
@@ -505,9 +510,8 @@ fn looksLikeGliner2Repo(names: []const []const u8) bool {
 }
 
 fn looksLikeFlorence2Repo(names: []const []const u8) bool {
-    if (hasFile(names, "florence-2-base.gguf")) return true;
     for (names) |name| {
-        if (std.mem.startsWith(u8, name, "florence-2-base.") and std.mem.endsWith(u8, name, ".gguf")) return true;
+        if (isFlorence2GgufFileName(name)) return true;
     }
     return false;
 }
@@ -679,6 +683,37 @@ test "Florence2 variants manifest indexes available GGUF models" {
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-f32\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"model\": \"florence-2-base.Q4_K.gguf\"") != null);
+}
+
+test "Florence2 variants manifest indexes alternate published GGUF names" {
+    const allocator = std.testing.allocator;
+    const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/florence2-alt-variants-manifest-{d}", .{std.posix.system.getpid()});
+    defer allocator.free(dir_path);
+    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    try compat.cwd().createDirPath(compat.io(), dir_path);
+
+    const files = [_][]const u8{
+        "florence2.Q4_K.gguf",
+        "Florence-2-base.Q8_0.gguf",
+    };
+    for (files) |file_name| {
+        const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
+        defer allocator.free(path);
+        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+    }
+
+    try writeFlorence2VariantsManifest(allocator, compat.io(), dir_path);
+
+    const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(manifest_path);
+    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    defer allocator.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"family\": \"florence2_variants/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q8_0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"model\": \"florence2.Q4_K.gguf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"model\": \"Florence-2-base.Q8_0.gguf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"model\": \"florence2.IQ4_NL.gguf\"") == null);
 }
 
 test "Florence2 variants manifest indexes explicit custom GGUF model" {
