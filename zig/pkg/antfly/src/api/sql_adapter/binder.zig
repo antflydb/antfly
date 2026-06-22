@@ -22,11 +22,13 @@ const db_mod = @import("../../storage/db/mod.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../table_catalog.zig");
+const classifier = @import("classifier.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
 
 const Token = token_mod.Token;
 
@@ -735,6 +737,105 @@ pub const CatalogBoundReadPlanSourceSchema = struct {
     }
 };
 
+pub const BoundSqlBinding = union(enum) {
+    read_catalog: CatalogBoundReadPlanSourceSchema,
+    write_catalog: CatalogBoundWritePlanOptions,
+    none,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .read_catalog => |*read| read.deinit(alloc),
+            .write_catalog => |*write| write.deinit(alloc),
+            .none => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const BoundSqlStatement = struct {
+    statement: tokenized.ParsedStatement,
+    binding: BoundSqlBinding = .none,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.binding.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn readCatalog(self: *BoundSqlStatement) !*CatalogBoundReadPlanSourceSchema {
+        return switch (self.binding) {
+            .read_catalog => |*read| read,
+            else => error.UnsupportedSqlShape,
+        };
+    }
+
+    pub fn writeCatalog(self: *BoundSqlStatement) !*CatalogBoundWritePlanOptions {
+        return switch (self.binding) {
+            .write_catalog => |*write| write,
+            else => error.UnsupportedSqlShape,
+        };
+    }
+};
+
+pub const CatalogLogicalReadPlan = struct {
+    statement: tokenized.ParsedStatement,
+    source_schema: ?runtime_schema.TableSchema = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        self.* = undefined;
+    }
+};
+
+pub const CatalogLogicalWritePlan = struct {
+    statement: tokenized.ParsedStatement,
+    options: plan_mod.LowerWritePlanOptions,
+    owned_insert_source_schema: ?runtime_schema.TableSchema = null,
+    owned_joined_source_schema: ?runtime_schema.TableSchema = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.owned_insert_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        if (self.owned_joined_source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        self.* = undefined;
+    }
+};
+
+pub const LogicalSqlPlan = union(enum) {
+    catalog_read: CatalogLogicalReadPlan,
+    catalog_write: CatalogLogicalWritePlan,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .catalog_read => |*read| read.deinit(alloc),
+            .catalog_write => |*write| write.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
+    const read = try bound.readCatalog();
+    const source_schema = read.source_schema;
+    read.source_schema = null;
+    return .{ .catalog_read = .{
+        .statement = bound.statement,
+        .source_schema = source_schema,
+    } };
+}
+
+pub fn logicalWritePlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
+    const write = try bound.writeCatalog();
+    const owned_insert_source_schema = write.owned_insert_source_schema;
+    const owned_joined_source_schema = write.owned_joined_source_schema;
+    write.owned_insert_source_schema = null;
+    write.owned_joined_source_schema = null;
+    return .{ .catalog_write = .{
+        .statement = bound.statement,
+        .options = write.options,
+        .owned_insert_source_schema = owned_insert_source_schema,
+        .owned_joined_source_schema = owned_joined_source_schema,
+    } };
+}
+
 pub const ReadPlanCatalogLoweringHooks = struct {
     ptr: *anyopaque,
     lower_with_source_schema: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!plan_mod.LoweredReadPlan,
@@ -763,10 +864,24 @@ pub fn lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(
     catalog: table_catalog.CatalogSource,
     hooks: ReadPlanCatalogLoweringHooks,
 ) !plan_mod.LoweredReadPlan {
-    var resolved = try resolveReadPlanCatalogSourceSchemaFromTokensAlloc(alloc, tokens, catalog);
+    var resolved = try bindReadPlanCatalogStatementFromTokensAlloc(alloc, tokens, catalog);
     defer resolved.deinit(alloc);
-    if (resolved.source_schema) |source_schema| return try hooks.lower_with_source_schema(hooks.ptr, source_schema);
-    return try hooks.lower_without_source_schema(hooks.ptr);
+    var logical = try logicalReadPlanFromBoundStatement(&resolved);
+    defer logical.deinit(alloc);
+    return try lowerReadCatalogLogicalPlan(&logical, hooks);
+}
+
+pub fn lowerReadPlanWithCatalogBoundStatementAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    hooks: ReadPlanCatalogLoweringHooks,
+) !plan_mod.LoweredReadPlan {
+    var resolved = try bindReadPlanCatalogStatementAlloc(alloc, parsed_sql, catalog);
+    defer resolved.deinit(alloc);
+    var logical = try logicalReadPlanFromBoundStatement(&resolved);
+    defer logical.deinit(alloc);
+    return try lowerReadCatalogLogicalPlan(&logical, hooks);
 }
 
 pub fn lowerWritePlanWithCatalogOptionsAlloc(
@@ -788,9 +903,42 @@ pub fn lowerWritePlanWithCatalogOptionsFromTokensAlloc(
     catalog: table_catalog.CatalogSource,
     hooks: WritePlanCatalogLoweringHooks,
 ) !plan_mod.LoweredWritePlan {
-    var resolved = try resolveWritePlanCatalogOptionsFromTokensAlloc(alloc, tokens, options, catalog);
+    var resolved = try bindWritePlanCatalogStatementFromTokensAlloc(alloc, tokens, options, catalog);
     defer resolved.deinit(alloc);
-    return try hooks.lower_with_options(hooks.ptr, resolved.options);
+    var logical = try logicalWritePlanFromBoundStatement(&resolved);
+    defer logical.deinit(alloc);
+    return try lowerWriteCatalogLogicalPlan(&logical, hooks);
+}
+
+pub fn lowerWritePlanWithCatalogBoundStatementAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    hooks: WritePlanCatalogLoweringHooks,
+) !plan_mod.LoweredWritePlan {
+    var resolved = try bindWritePlanCatalogStatementAlloc(alloc, parsed_sql, options, catalog);
+    defer resolved.deinit(alloc);
+    var logical = try logicalWritePlanFromBoundStatement(&resolved);
+    defer logical.deinit(alloc);
+    return try lowerWriteCatalogLogicalPlan(&logical, hooks);
+}
+
+pub fn lowerReadCatalogLogicalPlan(logical: *LogicalSqlPlan, hooks: ReadPlanCatalogLoweringHooks) !plan_mod.LoweredReadPlan {
+    return switch (logical.*) {
+        .catalog_read => |*read| if (read.source_schema) |source_schema|
+            try hooks.lower_with_source_schema(hooks.ptr, source_schema)
+        else
+            try hooks.lower_without_source_schema(hooks.ptr),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+pub fn lowerWriteCatalogLogicalPlan(logical: *LogicalSqlPlan, hooks: WritePlanCatalogLoweringHooks) !plan_mod.LoweredWritePlan {
+    return switch (logical.*) {
+        .catalog_write => |*write| try hooks.lower_with_options(hooks.ptr, write.options),
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 const SelectReadTableNames = struct {
@@ -889,6 +1037,55 @@ pub fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, toke
     return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, 0);
 }
 
+pub fn bindWritePlanCatalogStatementAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    return try bindWritePlanCatalogStatementFromTokensWithStatementAlloc(
+        alloc,
+        parsed_sql.statement,
+        parsed_sql.items(),
+        options,
+        catalog,
+    );
+}
+
+pub fn bindWritePlanCatalogStatementFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    const raw_statement = tokenized.RawSqlStatement{
+        .family = null,
+        .token_start = 0,
+        .token_end = tokens.len,
+        .source_span = if (tokens.len > 0) .{
+            .start = tokens[0].source_start,
+            .end = tokens[tokens.len - 1].source_end,
+        } else .{},
+    };
+    const statement: tokenized.ParsedStatement = .{ .unknown = raw_statement };
+    return try bindWritePlanCatalogStatementFromTokensWithStatementAlloc(alloc, statement, tokens, options, catalog);
+}
+
+fn bindWritePlanCatalogStatementFromTokensWithStatementAlloc(
+    alloc: std.mem.Allocator,
+    statement: tokenized.ParsedStatement,
+    tokens: []const Token,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    var resolved = try resolveWritePlanCatalogOptionsFromTokensAlloc(alloc, tokens, options, catalog);
+    errdefer resolved.deinit(alloc);
+    return .{
+        .statement = statement,
+        .binding = .{ .write_catalog = resolved },
+    };
+}
+
 pub fn resolveWritePlanCatalogOptionsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -958,6 +1155,51 @@ pub fn resolveReadPlanCatalogSourceSchemaAlloc(
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
     return try resolveReadPlanCatalogSourceSchemaFromTokensAlloc(alloc, tokens.items, catalog);
+}
+
+pub fn bindReadPlanCatalogStatementAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    return try bindReadPlanCatalogStatementFromTokensWithStatementAlloc(
+        alloc,
+        parsed_sql.statement,
+        parsed_sql.items(),
+        catalog,
+    );
+}
+
+pub fn bindReadPlanCatalogStatementFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    const raw_statement = tokenized.RawSqlStatement{
+        .family = null,
+        .token_start = 0,
+        .token_end = tokens.len,
+        .source_span = if (tokens.len > 0) .{
+            .start = tokens[0].source_start,
+            .end = tokens[tokens.len - 1].source_end,
+        } else .{},
+    };
+    const statement: tokenized.ParsedStatement = .{ .unknown = raw_statement };
+    return try bindReadPlanCatalogStatementFromTokensWithStatementAlloc(alloc, statement, tokens, catalog);
+}
+
+fn bindReadPlanCatalogStatementFromTokensWithStatementAlloc(
+    alloc: std.mem.Allocator,
+    statement: tokenized.ParsedStatement,
+    tokens: []const Token,
+    catalog: table_catalog.CatalogSource,
+) !BoundSqlStatement {
+    var resolved = try resolveReadPlanCatalogSourceSchemaFromTokensAlloc(alloc, tokens, catalog);
+    errdefer resolved.deinit(alloc);
+    return .{
+        .statement = statement,
+        .binding = .{ .read_catalog = resolved },
+    };
 }
 
 pub fn resolveReadPlanCatalogSourceSchemaFromTokensAlloc(
@@ -1578,6 +1820,130 @@ test "sql adapter binder resolves catalog prebind table names from shared tokens
     defer joined_write.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", joined_write.target);
     try std.testing.expectEqualStrings("incoming_usage", joined_write.source);
+}
+
+const MultiTableTestCatalog = struct {
+    tables: [2]metadata_table_manager.TableRecord,
+
+    fn init(
+        left_table_name: []const u8,
+        left_schema_json: []const u8,
+        source_table_name: []const u8,
+        source_schema_json: []const u8,
+    ) @This() {
+        return .{ .tables = .{
+            .{
+                .table_id = 1,
+                .name = left_table_name,
+                .database_name = metadata_table_manager.default_database_name,
+                .namespace_name = metadata_table_manager.default_namespace_name,
+                .placement_role = "data",
+                .schema_json = left_schema_json,
+            },
+            .{
+                .table_id = 2,
+                .name = source_table_name,
+                .database_name = metadata_table_manager.default_database_name,
+                .namespace_name = metadata_table_manager.default_namespace_name,
+                .placement_role = "data",
+                .schema_json = source_schema_json,
+            },
+        } };
+    }
+
+    fn iface(self: *@This()) table_catalog.CatalogSource {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            },
+        };
+    }
+
+    fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return .{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = self.tables[0..],
+            .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+            .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+            .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+            .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+            .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+        };
+    }
+
+    fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+};
+
+test "sql adapter binder produces bound sql statements for catalog read and write" {
+    const alloc = std.testing.allocator;
+    const usage_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const incoming_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var catalog = MultiTableTestCatalog.init("usage_records", usage_schema_json, "incoming_usage", incoming_schema_json);
+
+    var parsed_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT usage_records.id, incoming_usage.status FROM usage_records JOIN incoming_usage ON usage_records.id = incoming_usage.id",
+    );
+    defer parsed_read.deinit(alloc);
+    var bound_read = try bindReadPlanCatalogStatementAlloc(alloc, &parsed_read, catalog.iface());
+    defer bound_read.deinit(alloc);
+    switch (bound_read.statement) {
+        .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.join, statement.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    const read = try bound_read.readCatalog();
+    try std.testing.expect(read.source_schema != null);
+    try std.testing.expectEqual(@as(usize, 3), read.source_schema.?.relational_columns.len);
+    var logical_read = try logicalReadPlanFromBoundStatement(&bound_read);
+    defer logical_read.deinit(alloc);
+    switch (logical_read) {
+        .catalog_read => |logical| {
+            switch (logical.statement) {
+                .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.join, statement.kind),
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(logical.source_schema != null);
+            try std.testing.expectEqual(@as(usize, 3), logical.source_schema.?.relational_columns.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try bound_read.readCatalog()).source_schema == null);
+
+    var parsed_write = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) SELECT id, status FROM incoming_usage",
+    );
+    defer parsed_write.deinit(alloc);
+    var bound_write = try bindWritePlanCatalogStatementAlloc(alloc, &parsed_write, .{}, catalog.iface());
+    defer bound_write.deinit(alloc);
+    switch (bound_write.statement) {
+        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    const write = try bound_write.writeCatalog();
+    try std.testing.expect(write.options.insert_source_schema != null);
+    try std.testing.expectEqual(@as(usize, 3), write.options.insert_source_schema.?.relational_columns.len);
+    var logical_write = try logicalWritePlanFromBoundStatement(&bound_write);
+    defer logical_write.deinit(alloc);
+    switch (logical_write) {
+        .catalog_write => |logical| {
+            switch (logical.statement) {
+                .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert, statement.kind),
+                else => return error.TestUnexpectedResult,
+            }
+            try std.testing.expect(logical.options.insert_source_schema != null);
+            try std.testing.expectEqual(@as(usize, 3), logical.options.insert_source_schema.?.relational_columns.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try bound_write.writeCatalog()).owned_insert_source_schema == null);
 }
 
 test "sql adapter binder rejects ambiguous physical cte read source tables" {

@@ -291,16 +291,23 @@ Current implementation status:
 - `ParsedSql` wraps `TokenizedSql` with a raw statement view and byte-source
   span. DDL lowering, catalog-apply test lowering, read statement dispatch, and
   write statement dispatch now use that shared wrapper as the top-level SQL
-  object. Read, write, catalog-backed read/write, EXPLAIN, and relation
-  population lowering callbacks consume borrowed `ParsedSql`, so nested
-  dispatch does not re-tokenize after the entrypoint has built its shared SQL
-  view. Catalog-backed read/write prebinding resolves source schemas from that
-  shared token stream before routing to the typed lowerer. Public facade
-  wrappers for direct select, insert, strict insert/update, and aggregate
-  lowering now delegate through parsed helper variants instead of owning
-  separate tokenization paths. DML adapter write-plan regression callbacks also
-  consume borrowed parsed tokens instead of round-tripping through SQL text.
-  Parsed-only lowering context construction does not require a raw SQL field.
+  object. `ParsedSql` owns a typed `ParsedStatement` union with read, write,
+  DDL, EXPLAIN, transaction, and session variants, and read/write lowerer
+  dispatch now routes from that parsed statement view instead of reaching back
+  into tokenization metadata. Read, write, catalog-backed read/write, EXPLAIN,
+  and relation population lowering callbacks consume borrowed `ParsedSql`. `EXPLAIN` and
+  contiguous relation-population sources such as `CREATE TABLE AS` now hand
+  nested lowerers parsed child statements cloned from the parent token stream;
+  `SELECT INTO` still uses a compatibility rewrite until the raw AST can model
+  that non-contiguous source directly. Catalog-backed read/write prebinding now
+  produces `BoundSqlStatement`, preserving the parsed statement variant while
+  carrying resolved source schemas or write-plan catalog options before routing
+  through `LogicalSqlPlan` into the typed lowerer. Public facade wrappers for
+  direct select, insert, strict insert/update, and aggregate lowering now
+  delegate through parsed helper variants instead of owning separate
+  tokenization paths. DML adapter write-plan regression callbacks also consume
+  borrowed parsed tokens instead of round-tripping through SQL text. Parsed-only
+  lowering context construction does not require a raw SQL field.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source
@@ -326,6 +333,92 @@ one SQL input
 This mirrors the useful PostgreSQL lessons: avoid scanner backtracking, keep
 raw parse separate from semantic analysis, reset transient memory in bulk, and
 avoid repeated parse/lower passes over the same statement.
+
+## Long-Term Production Shape
+
+Raw SQL should exist only at external boundaries: HTTP, SQL wire protocol,
+CLI, MCP, A2A, fixtures, and tests. Once a request enters the SQL adapter, the
+first step should construct a shared parsed object. Every internal phase should
+then consume typed parser, binder, and plan objects rather than reparsing SQL
+text or probing independent string-oriented lowerers.
+
+The production pipeline should be:
+
+```text
+raw SQL
+  -> ParsedSql
+  -> BoundSqlStatement
+  -> LogicalSqlPlan
+  -> Antfly execution/storage plan
+```
+
+`ParsedSql` should own the statement's immutable parse-time view:
+
+- original SQL source and source byte spans;
+- shared token stream and compact keyword metadata;
+- top-level statement family and statement kind;
+- raw statement tree;
+- nested statement nodes for `EXPLAIN`, CTEs, subqueries, relation population,
+  `INSERT ... SELECT`, `MERGE`, and other embedded read/write sources.
+
+The raw AST should be separate from semantic binding. Parser output should be
+cheap to construct, source-span preserving, and independent of catalog state.
+It should not normalize names into durable catalog identity, evaluate
+privileges, infer table schemas, parse JSON literals eagerly, or allocate
+storage-owned plan data.
+
+After parsing, a catalog/session-aware binder should produce
+`BoundSqlStatement`. Binding should resolve:
+
+- current database, current namespace/schema, and `search_path`;
+- table, index, extension, role, database, namespace, and tablespace names;
+- catalog object ids and catalog versions;
+- source and target schemas for read/write lowering;
+- role and privilege checks;
+- dependency and placement metadata needed by DDL.
+
+Statement-family dispatch should happen from typed parser variants rather than
+from sequential lowerer probes. The core families should be explicit:
+
+- `ParsedReadStatement`;
+- `ParsedWriteStatement`;
+- `ParsedDdlStatement`;
+- `ParsedExplainStatement`;
+- `ParsedTransactionStatement`;
+- `ParsedSessionStatement`.
+
+Nested SQL must be represented as nested parsed nodes, not as extracted SQL
+strings. For example:
+
+- `EXPLAIN` should carry `Explain(statement: *ParsedStatement)`;
+- `CREATE TABLE AS` and relation population should carry a
+  `ParsedReadStatement` source;
+- `INSERT ... SELECT` should carry a parsed source read statement;
+- `MERGE` should carry typed target and source statement nodes;
+- CTEs and subqueries should remain structured children of the enclosing
+  statement.
+
+That shape keeps nested dispatch from paying a second tokenize/parse cost and
+lets diagnostics point at the original statement source instead of reconstructed
+fragments.
+
+Errors should be diagnostic objects from the phase that detected them, not
+opaque lowerer failures. Parser, binder, planner, and executor errors should
+carry:
+
+- SQLSTATE or stable Antfly error code;
+- phase (`parse`, `bind`, `plan`, or `execute`);
+- source byte span;
+- message;
+- optional hint.
+
+Fixture and coverage validation should inspect structured plan summaries or
+coverage bits emitted by parser, binder, and lowerer phases. They should not
+scan SQL strings or fingerprints as a second parser.
+
+JSON and JSONB literals should stay as source spans or token references during
+lexing, classification, and raw parsing. Only semantic phases that need typed
+JSON values should pay parse/stringify costs.
 
 ## Parity and Test Strategy
 

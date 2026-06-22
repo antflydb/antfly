@@ -103,7 +103,7 @@ pub const ReadPlanLoweringContext = struct {
     pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
         const old_statement_kind = self.statement_kind;
         const old_parsed_sql = self.parsed_sql;
-        self.statement_kind = parsed_sql.tokenized_sql.read_statement_kind;
+        self.statement_kind = parsed_sql.readStatementKind();
         self.parsed_sql = parsed_sql;
         defer self.statement_kind = old_statement_kind;
         defer self.parsed_sql = old_parsed_sql;
@@ -208,7 +208,7 @@ pub const CatalogReadPlanLoweringContext = struct {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        return try binder.lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(self.alloc, parsed_sql.items(), catalog, self.hooks());
+        return try binder.lowerReadPlanWithCatalogBoundStatementAlloc(self.alloc, parsed_sql, catalog, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.ReadPlanCatalogLoweringHooks {
@@ -816,7 +816,7 @@ pub const CatalogWritePlanLoweringContext = struct {
         const old_parsed_sql = self.parsed_sql;
         self.parsed_sql = parsed_sql;
         defer self.parsed_sql = old_parsed_sql;
-        return try binder.lowerWritePlanWithCatalogOptionsFromTokensAlloc(self.alloc, parsed_sql.items(), options, catalog, self.hooks());
+        return try binder.lowerWritePlanWithCatalogBoundStatementAlloc(self.alloc, parsed_sql, options, catalog, self.hooks());
     }
 
     fn hooks(self: *@This()) binder.WritePlanCatalogLoweringHooks {
@@ -1124,7 +1124,7 @@ pub const ExplainPlanLoweringContext = struct {
     pub fn lower(self: *@This(), sql: []const u8) !plan.LoweredExplainPlan {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        return try plan.lowerExplainPlanWithParsedSqlAlloc(&parsed_sql, self.hooks());
+        return try plan.lowerExplainPlanWithParsedSqlAlloc(self.alloc, &parsed_sql, self.hooks());
     }
 
     fn hooks(self: *@This()) plan.ExplainPlanLoweringHooks {
@@ -1135,24 +1135,20 @@ pub const ExplainPlanLoweringContext = struct {
         };
     }
 
-    fn lowerReadHook(ptr: *anyopaque, inner_sql: []const u8) anyerror!plan.LoweredReadPlan {
+    fn lowerReadHook(ptr: *anyopaque, parsed_sql: *const tokenized.ParsedSql) anyerror!plan.LoweredReadPlan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, inner_sql);
-        defer parsed_sql.deinit(self.alloc);
         if (self.catalog) |source_catalog| {
-            return try self.callbacks.lower_read_with_catalog(self.alloc, &parsed_sql, self.schema, self.params, source_catalog, self.function_bindings);
+            return try self.callbacks.lower_read_with_catalog(self.alloc, parsed_sql, self.schema, self.params, source_catalog, self.function_bindings);
         }
-        return try self.callbacks.lower_read_without_catalog(self.alloc, &parsed_sql, self.schema, self.params, self.function_bindings);
+        return try self.callbacks.lower_read_without_catalog(self.alloc, parsed_sql, self.schema, self.params, self.function_bindings);
     }
 
-    fn lowerWriteHook(ptr: *anyopaque, inner_sql: []const u8) anyerror!plan.LoweredWritePlan {
+    fn lowerWriteHook(ptr: *anyopaque, parsed_sql: *const tokenized.ParsedSql) anyerror!plan.LoweredWritePlan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, inner_sql);
-        defer parsed_sql.deinit(self.alloc);
         if (self.catalog) |source_catalog| {
-            return try self.callbacks.lower_write_with_catalog(self.alloc, &parsed_sql, self.schema, self.params, self.options, source_catalog);
+            return try self.callbacks.lower_write_with_catalog(self.alloc, parsed_sql, self.schema, self.params, self.options, source_catalog);
         }
-        return try self.callbacks.lower_write_without_catalog(self.alloc, &parsed_sql, self.schema, self.params, self.options);
+        return try self.callbacks.lower_write_without_catalog(self.alloc, parsed_sql, self.schema, self.params, self.options);
     }
 };
 
@@ -1199,13 +1195,11 @@ pub const RelationPopulationLoweringContext = struct {
         };
     }
 
-    fn lowerRead(ptr: *anyopaque, source_sql: []const u8) anyerror!plan.LoweredReadPlan {
+    fn lowerRead(ptr: *anyopaque, parsed_sql: *const tokenized.ParsedSql) anyerror!plan.LoweredReadPlan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, source_sql);
-        defer parsed_sql.deinit(self.alloc);
         if (self.catalog) |source_catalog| {
-            return try self.callbacks.lower_read_with_catalog(self.alloc, &parsed_sql, self.schema, self.params, source_catalog, self.function_bindings);
+            return try self.callbacks.lower_read_with_catalog(self.alloc, parsed_sql, self.schema, self.params, source_catalog, self.function_bindings);
         }
-        return try self.callbacks.lower_read_without_catalog(self.alloc, &parsed_sql, self.schema, self.params, self.function_bindings);
+        return try self.callbacks.lower_read_without_catalog(self.alloc, parsed_sql, self.schema, self.params, self.function_bindings);
     }
 };

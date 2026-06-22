@@ -1347,6 +1347,8 @@ pub const RelationPopulationSyntax = struct {
     if_not_exists: bool = false,
     populate: bool = true,
     source_sql: []u8,
+    source_token_start: ?usize = null,
+    source_token_end: ?usize = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.source_sql);
@@ -1376,6 +1378,36 @@ pub fn parseExplainPrefix(sql: []const u8) !SqlExplainPrefix {
     const inner = std.mem.trim(u8, sql[index..], " \t\r\n;");
     if (inner.len == 0) return error.UnsupportedSqlShape;
     prefix.inner_sql = inner;
+    return prefix;
+}
+
+pub fn parseExplainPrefixTokens(sql: []const u8, tokens: []const Token) !SqlExplainPrefix {
+    if (tokens.len == 0) return error.UnsupportedSqlShape;
+    var index: usize = 0;
+    if (!parser.matchKeyword(tokens, &index, "explain")) return error.UnsupportedSqlShape;
+    if (index >= tokens.len) return error.UnsupportedSqlShape;
+
+    var prefix = SqlExplainPrefix{ .inner_sql = "" };
+    if (parser.matchToken(tokens, &index, .lparen) != null) {
+        try parseExplainOptionsTokens(tokens, &index, &prefix);
+        if (index >= tokens.len) return error.UnsupportedSqlShape;
+    }
+
+    if (parser.matchKeyword(tokens, &index, "analyze")) {
+        prefix.analyze = true;
+        if (index >= tokens.len) return error.UnsupportedSqlShape;
+    }
+
+    var inner_end = tokens.len;
+    while (inner_end > index and tokens[inner_end - 1].kind == .semicolon) inner_end -= 1;
+    if (index >= inner_end) return error.UnsupportedSqlShape;
+
+    prefix.inner_token_start = index;
+    prefix.inner_token_end = inner_end;
+    const source_start = tokens[index].source_start;
+    const source_end = tokens[inner_end - 1].source_end;
+    if (source_end <= source_start or source_end > sql.len) return error.UnsupportedSqlShape;
+    prefix.inner_sql = sql[source_start..source_end];
     return prefix;
 }
 
@@ -1428,6 +1460,43 @@ fn parseExplainOptions(sql: []const u8, index: *usize, prefix: *SqlExplainPrefix
     }
 }
 
+fn parseExplainOptionsTokens(tokens: []const Token, index: *usize, prefix: *SqlExplainPrefix) !void {
+    while (true) {
+        if (index.* >= tokens.len) return error.UnsupportedSqlShape;
+        if (parser.matchKeyword(tokens, index, "format")) {
+            if (parser.matchKeyword(tokens, index, "json")) {
+                prefix.format = .json;
+            } else if (parser.matchKeyword(tokens, index, "text")) {
+                prefix.format = .text;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (parser.matchKeyword(tokens, index, "verbose")) {
+            prefix.verbose = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "costs")) {
+            prefix.costs = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "analyze")) {
+            prefix.analyze = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "buffers")) {
+            prefix.buffers = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "timing")) {
+            prefix.timing = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "summary")) {
+            prefix.summary = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "settings")) {
+            prefix.settings = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else if (parser.matchKeyword(tokens, index, "wal")) {
+            prefix.wal = try parseOptionalExplainBoolTokens(tokens, index, true);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+
+        if (parser.matchToken(tokens, index, .comma) != null) continue;
+        if (parser.matchToken(tokens, index, .rparen) != null) return;
+        return error.UnsupportedSqlShape;
+    }
+}
+
 fn parseOptionalExplainBool(sql: []const u8, index: *usize, default_value: bool) !bool {
     const before = index.*;
     index.* = skipSqlWhitespace(sql, index.*);
@@ -1440,6 +1509,25 @@ fn parseOptionalExplainBool(sql: []const u8, index: *usize, default_value: bool)
     if (consumeSqlKeyword(sql, index, "false") or
         consumeSqlKeyword(sql, index, "off") or
         consumeSqlKeyword(sql, index, "no"))
+    {
+        return false;
+    }
+    index.* = before;
+    return default_value;
+}
+
+fn parseOptionalExplainBoolTokens(tokens: []const Token, index: *usize, default_value: bool) !bool {
+    const before = index.*;
+    if (parser.matchKeyword(tokens, index, "true") or
+        parser.matchKeyword(tokens, index, "on") or
+        parser.matchKeyword(tokens, index, "yes"))
+    {
+        return true;
+    }
+    index.* = before;
+    if (parser.matchKeyword(tokens, index, "false") or
+        parser.matchKeyword(tokens, index, "off") or
+        parser.matchKeyword(tokens, index, "no"))
     {
         return false;
     }
@@ -7851,7 +7939,14 @@ fn parseCreateTableAsPopulationSqlAlloc(
     if (index >= tokens.len or tokens[index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[index].text, "select")) return error.UnsupportedSqlShape;
     const select_start = try tokenStartOffset(sql, tokens[index]);
     const data_clause = parseTrailingRelationPopulationDataClause(tokens, index);
-    const source_end = if (data_clause) |clause| try tokenStartOffset(sql, tokens[clause.start_index]) else sql.len;
+    var source_token_end = if (data_clause) |clause| clause.start_index else tokens.len;
+    while (source_token_end > index and tokens[source_token_end - 1].kind == .semicolon) source_token_end -= 1;
+    const source_end = if (data_clause) |clause|
+        try tokenStartOffset(sql, tokens[clause.start_index])
+    else if (source_token_end > index)
+        try tokenEndOffset(sql, tokens[source_token_end - 1])
+    else
+        sql.len;
     const source_sql = try alloc.dupe(u8, std.mem.trim(u8, sql[select_start..source_end], " \t\r\n"));
     return .{
         .mode = .create_table_as,
@@ -7860,6 +7955,8 @@ fn parseCreateTableAsPopulationSqlAlloc(
         .if_not_exists = if_not_exists,
         .populate = if (data_clause) |clause| clause.populate else true,
         .source_sql = source_sql,
+        .source_token_start = index,
+        .source_token_end = source_token_end,
     };
 }
 
@@ -7870,6 +7967,12 @@ fn tokenStartOffset(sql: []const u8, token: Token) !usize {
     if (token_start >= sql_start and token_start <= sql_end) return token_start - sql_start;
     if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
     return error.UnsupportedSqlShape;
+}
+
+fn tokenEndOffset(sql: []const u8, token: Token) !usize {
+    const start = try tokenStartOffset(sql, token);
+    if (start + token.text.len > sql.len) return error.UnsupportedSqlShape;
+    return start + token.text.len;
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -11646,19 +11749,37 @@ test "sql adapter grammar parses cursor portal syntax" {
 }
 
 test "sql adapter grammar parses explain prefixes and options" {
-    const basic = try parseExplainPrefix("EXPLAIN SELECT id FROM usage_records;");
+    const alloc = std.testing.allocator;
+
+    const basic_sql = "EXPLAIN SELECT id FROM usage_records;";
+    const basic = try parseExplainPrefix(basic_sql);
     try std.testing.expect(!basic.analyze);
     try std.testing.expectEqual(ast.SqlExplainFormat.text, basic.format);
     try std.testing.expect(!basic.verbose);
     try std.testing.expect(basic.costs);
     try std.testing.expectEqualStrings("SELECT id FROM usage_records", basic.inner_sql);
+    var basic_tokens = try lexer.tokenizeAlloc(alloc, basic_sql);
+    defer lexer.freeTokens(alloc, &basic_tokens);
+    const basic_from_tokens = try parseExplainPrefixTokens(basic_sql, basic_tokens.items);
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records", basic_from_tokens.inner_sql);
+    try std.testing.expectEqual(@as(usize, 1), basic_from_tokens.inner_token_start);
+    try std.testing.expectEqual(@as(usize, 5), basic_from_tokens.inner_token_end);
 
-    const options = try parseExplainPrefix("EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON) SELECT id FROM usage_records");
+    const options_sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON) SELECT id FROM usage_records";
+    const options = try parseExplainPrefix(options_sql);
     try std.testing.expect(options.analyze);
     try std.testing.expectEqual(ast.SqlExplainFormat.json, options.format);
     try std.testing.expect(options.verbose);
     try std.testing.expect(!options.costs);
     try std.testing.expectEqualStrings("SELECT id FROM usage_records", options.inner_sql);
+    var options_tokens = try lexer.tokenizeAlloc(alloc, options_sql);
+    defer lexer.freeTokens(alloc, &options_tokens);
+    const options_from_tokens = try parseExplainPrefixTokens(options_sql, options_tokens.items);
+    try std.testing.expect(options_from_tokens.analyze);
+    try std.testing.expectEqual(ast.SqlExplainFormat.json, options_from_tokens.format);
+    try std.testing.expect(options_from_tokens.verbose);
+    try std.testing.expect(!options_from_tokens.costs);
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records", options_from_tokens.inner_sql);
 
     const runtime_options = try parseExplainPrefix("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records");
     try std.testing.expect(runtime_options.analyze);
@@ -11761,6 +11882,8 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expect(select_into.target_lifetime == null);
     try std.testing.expect(!select_into.if_not_exists);
     try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into.source_sql);
+    try std.testing.expect(select_into.source_token_start == null);
+    try std.testing.expect(select_into.source_token_end == null);
 
     var select_into_temp = try parseRelationPopulationSqlAlloc(
         alloc,
@@ -11795,6 +11918,8 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expect(create_as.if_not_exists);
     try std.testing.expect(create_as.populate);
     try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as.source_sql);
+    try std.testing.expect(create_as.source_token_start != null);
+    try std.testing.expect(create_as.source_token_end != null);
 
     const padded_create_as_sql = "  CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;  ";
     var padded_tokens = try lexer.tokenizeAlloc(alloc, padded_create_as_sql);
@@ -11809,6 +11934,8 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expectEqualStrings("usage_archive", parsed_from_tokens.target_identifier);
     try std.testing.expect(parsed_from_tokens.populate);
     try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", parsed_from_tokens.source_sql);
+    try std.testing.expect(parsed_from_tokens.source_token_start != null);
+    try std.testing.expect(parsed_from_tokens.source_token_end != null);
 
     var create_as_no_data = try parseRelationPopulationSqlAlloc(
         alloc,

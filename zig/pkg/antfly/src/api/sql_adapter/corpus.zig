@@ -17,7 +17,9 @@ const sql_adapter = @This();
 
 const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
+const db_mod = @import("../../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
+const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
@@ -26,6 +28,8 @@ const table_catalog = @import("../table_catalog.zig");
 const value_mod = @import("value.zig");
 
 pub const SqlValue = value_mod.SqlValue;
+const expressionOrderCount = lower_expr.expressionOrderCount;
+const sqlRowClaimFingerprintName = lower_expr.sqlRowClaimFingerprintName;
 
 pub const UnsupportedPlanFamily = enum {
     query,
@@ -617,7 +621,6 @@ pub fn parseNativeRequirementRootAlloc(
     if (requirement_format != app_parity_native_requirement_fixture_format) return error.TestUnexpectedResult;
     const required = try parseFixtureStringListAlloc(alloc, root, "required");
     errdefer if (required.len > 0) alloc.free(required);
-    if (required.len == 0) return error.TestUnexpectedResult;
 
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
@@ -3800,6 +3803,344 @@ pub fn appendStringFingerprintAlloc(
     return out;
 }
 
+pub fn appParityLimitValue(limit: ?u32) i64 {
+    return if (limit) |value| @intCast(value) else -1;
+}
+
+pub fn appParityBoolValue(value: bool) u8 {
+    return sql_adapter.boolFingerprintValue(value);
+}
+
+pub fn sqlJoinTypeFingerprintName(join_type: db_mod.types.RelationalRowsJoinType) []const u8 {
+    return switch (join_type) {
+        .inner => "inner",
+        .left => "left",
+    };
+}
+
+pub fn queryFingerprintAlloc(alloc: std.mem.Allocator, family: []const u8, table_name: []const u8, query: db_mod.types.RelationalRowsQueryRequest, ctes: usize) ![]u8 {
+    const claim = if (query.row_claim) |claim_value| sqlRowClaimFingerprintName(claim_value) else "none";
+    const order_expr = expressionOrderCount(query.order_by);
+    const distinct_on_count = query.distinct_on.len + query.distinct_on_expressions.len;
+    if (distinct_on_count > 0) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:distinct_on={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.expression_predicates.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                distinct_on_count,
+                query.order_by.len,
+                order_expr,
+                appParityLimitValue(query.limit),
+                claim,
+            },
+        );
+    }
+    if (ctes > 0 or query.source_cte.len > 0) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:source_cte={d}:pred={d}:array_any={d}:expr_pred={d}:expr_or={d}:expr_not={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                @as(u8, if (query.source_cte.len > 0) 1 else 0),
+                query.predicates.len,
+                query.array_any.len,
+                query.expression_predicates.len,
+                query.expression_or_predicates.len,
+                query.expression_not_predicates.len,
+                query.expression_array_contains.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                appParityLimitValue(query.limit),
+                claim,
+            },
+        );
+    }
+    if (query.array_any.len > 0 or query.expression_or_predicates.len > 0 or query.expression_not_predicates.len > 0) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:array_any={d}:expr_pred={d}:expr_or={d}:expr_not={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.array_any.len,
+                query.expression_predicates.len,
+                query.expression_or_predicates.len,
+                query.expression_not_predicates.len,
+                query.expression_array_contains.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                appParityLimitValue(query.limit),
+                claim,
+            },
+        );
+    }
+    if (query.expression_array_contains.len > 0) {
+        if (query.limit) |limit| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+                .{
+                    family,
+                    table_name,
+                    ctes,
+                    query.predicates.len,
+                    query.expression_predicates.len,
+                    query.expression_array_contains.len,
+                    query.json_path_eq.len,
+                    query.or_predicates.len,
+                    query.not_predicates.len,
+                    query.select.len,
+                    query.expressions.len,
+                    query.field_aliases.len,
+                    query.order_by.len,
+                    order_expr,
+                    limit,
+                    claim,
+                },
+            );
+        }
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:expr_array={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.expression_predicates.len,
+                query.expression_array_contains.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                claim,
+            },
+        );
+    }
+    if (query.text_patterns.len > 0) {
+        if (query.limit) |limit| {
+            return try std.fmt.allocPrint(
+                alloc,
+                "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:text_pattern={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+                .{
+                    family,
+                    table_name,
+                    ctes,
+                    query.predicates.len,
+                    query.expression_predicates.len,
+                    query.json_path_eq.len,
+                    query.text_patterns.len,
+                    query.or_predicates.len,
+                    query.not_predicates.len,
+                    query.select.len,
+                    query.expressions.len,
+                    query.field_aliases.len,
+                    query.order_by.len,
+                    order_expr,
+                    limit,
+                    claim,
+                },
+            );
+        }
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:text_pattern={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.expression_predicates.len,
+                query.json_path_eq.len,
+                query.text_patterns.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                claim,
+            },
+        );
+    }
+    if (query.limit) |limit| {
+        return try std.fmt.allocPrint(
+            alloc,
+            "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit={d}:claim={s}",
+            .{
+                family,
+                table_name,
+                ctes,
+                query.predicates.len,
+                query.expression_predicates.len,
+                query.json_path_eq.len,
+                query.or_predicates.len,
+                query.not_predicates.len,
+                query.select.len,
+                query.expressions.len,
+                query.field_aliases.len,
+                query.order_by.len,
+                order_expr,
+                limit,
+                claim,
+            },
+        );
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s}:table={s}:ctes={d}:pred={d}:expr_pred={d}:json_eq={d}:or={d}:not={d}:select={d}:expr={d}:alias={d}:order={d}:order_expr={d}:limit=none:claim={s}",
+        .{
+            family,
+            table_name,
+            ctes,
+            query.predicates.len,
+            query.expression_predicates.len,
+            query.json_path_eq.len,
+            query.or_predicates.len,
+            query.not_predicates.len,
+            query.select.len,
+            query.expressions.len,
+            query.field_aliases.len,
+            query.order_by.len,
+            order_expr,
+            claim,
+        },
+    );
+}
+
+pub fn appendQueryAccessPathFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]u8 {
+    var fingerprint = owned_base;
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "in", query.in_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "json_contains", query.json_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "json_exists", query.json_path_exists.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "array_contains", query.array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "array_eq", query.array_eq.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "access_or", query.access_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "access_not", query.access_not_predicates.len);
+    return fingerprint;
+}
+
+pub fn appendSourceQueryAccessPathFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]u8 {
+    var fingerprint = owned_base;
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_array_any", query.array_any.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_in", query.in_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_json_eq", query.json_path_eq.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_json_contains", query.json_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_json_exists", query.json_path_exists.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_array_contains", query.array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_array_eq", query.array_eq.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_text_pattern", query.text_patterns.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_access_or", query.access_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_access_not", query.access_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_pred", query.expression_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_or", query.expression_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_not", query.expression_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_array", query.expression_array_contains.len);
+    return fingerprint;
+}
+
+pub fn appendSourceQueryAccessOnlyFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]u8 {
+    var fingerprint = owned_base;
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_json_contains", query.json_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_json_exists", query.json_path_exists.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_array_contains", query.array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_array_eq", query.array_eq.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_text_pattern", query.text_patterns.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_access_or", query.access_or_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_access_not", query.access_not_predicates.len);
+    return fingerprint;
+}
+
+pub fn appendSideQueryAccessOnlyFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    prefix: []const u8,
+    query: db_mod.types.RelationalRowsQueryRequest,
+) ![]u8 {
+    var fingerprint = owned_base;
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "in", query.in_predicates.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "json_contains", query.json_contains.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "json_exists", query.json_path_exists.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "array_contains", query.array_contains.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "array_eq", query.array_eq.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "text_pattern", query.text_patterns.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "access_or", query.access_or_predicates.len);
+    fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "access_not", query.access_not_predicates.len);
+    return fingerprint;
+}
+
+pub fn appendCteAccessPathFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    ctes: []const db_mod.types.RelationalRowsCte,
+) ![]u8 {
+    var fingerprint = owned_base;
+    for (ctes, 0..) |cte, i| {
+        const prefix = try std.fmt.allocPrint(alloc, "cte{d}", .{i});
+        defer alloc.free(prefix);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "array_any", cte.query.array_any.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "in", cte.query.in_predicates.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "json_eq", cte.query.json_path_eq.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "json_contains", cte.query.json_contains.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "json_exists", cte.query.json_path_exists.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "array_contains", cte.query.array_contains.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "array_eq", cte.query.array_eq.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "text_pattern", cte.query.text_patterns.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "access_or", cte.query.access_or_predicates.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "access_not", cte.query.access_not_predicates.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_pred", cte.query.expression_predicates.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_or", cte.query.expression_or_predicates.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_not", cte.query.expression_not_predicates.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_array", cte.query.expression_array_contains.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "alias", cte.query.field_aliases.len);
+    }
+    return fingerprint;
+}
+
 pub fn unsupportedPlanMatchesFamily(plan: []const u8, family: UnsupportedPlanFamily) bool {
     const prefix = "unsupported:";
     if (!std.mem.startsWith(u8, plan, prefix)) return false;
@@ -4557,7 +4898,6 @@ fn expectSourceCorpusNativeRequirements(
     required: []const []const u8,
     resolved: []const AppParityResolvedRequirement,
 ) !void {
-    if (required.len == 0) return error.TestUnexpectedResult;
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
 
@@ -4598,7 +4938,6 @@ test "sql adapter corpus validates native requirement manifest" {
     var requirements = try parseAppParityNativeRequirementsAlloc(alloc);
     defer requirements.deinit(alloc);
     try std.testing.expectEqual(app_parity_native_requirement_fixture_format, requirements.root.requirement_format);
-    try std.testing.expect(requirements.root.required.len > 0);
 
     const unknown_json =
         \\{
@@ -4694,7 +5033,7 @@ fn expectNativeRequirementPolicyComplete(
     unresolved: []const []const u8,
     resolved: []const AppParityResolvedRequirement,
 ) !void {
-    if (unresolved.len == 0 or resolved.len == 0) return error.TestUnexpectedResult;
+    if (resolved.len == 0) return error.TestUnexpectedResult;
     inline for (std.meta.fields(diagnostics.SqlAdapterClassificationReason)) |field| {
         const reason: diagnostics.SqlAdapterClassificationReason = @enumFromInt(field.value);
         if (diagnostics.classificationReasonIsUnsupportedRequirement(reason)) {
@@ -6079,7 +6418,6 @@ pub const AppParityCorpusCoverage = struct {
     invalid_delete: bool = false,
     invalid_delete_multi_output_subquery_selector: bool = false,
     unsupported_insert: bool = false,
-    unsupported_merge_mutation: bool = false,
     invalid_read_row_lock_target: bool = false,
     invalid_update_source_row_lock_mode: bool = false,
     invalid_update_source_row_lock_target: bool = false,
@@ -6091,6 +6429,7 @@ pub const AppParityCorpusCoverage = struct {
     read_row_lock_key_share: bool = false,
     query_row_lock_no_key_update: bool = false,
     merge_mutation_cte: bool = false,
+    merge_mutation_data_modifying_cte: bool = false,
     merge_mutation_typed_plan: bool = false,
     merge_mutation_default_expressions: bool = false,
     truncate_multi_table_generation_barrier: bool = false,
@@ -7228,6 +7567,10 @@ pub const AppParityCorpusCoverage = struct {
                     recursive_merge or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
+                self.merge_mutation_data_modifying_cte = self.merge_mutation_data_modifying_cte or
+                    sql_adapter.planHasExactUsizeToken(entry.plan, ":data_ctes=", 1) and
+                        sql_adapter.planHasExactUsizeToken(entry.plan, ":data_cte_update=", 1) and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":data_cte_returning=");
             },
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
             .invalid_read => {
@@ -7274,7 +7617,7 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported_delete => {},
             .unsupported_update_joined_source => {},
             .unsupported_delete_joined_source => {},
-            .unsupported_merge_mutation => self.unsupported_merge_mutation = true,
+            .unsupported_merge_mutation => {},
             .read => {
                 const is_read_query = std.mem.startsWith(u8, entry.plan, "read:query:");
                 const is_read_aggregate = std.mem.startsWith(u8, entry.plan, "read:aggregate:");

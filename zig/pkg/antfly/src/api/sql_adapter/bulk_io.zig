@@ -1145,10 +1145,376 @@ fn stringSliceContains(values: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
+fn jsonStringifyAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return try alloc.dupe(u8, out.written());
+}
+
 fn singleByteOption(option: ?[]const u8, default: u8) !u8 {
     if (option) |value| {
         if (value.len == 1) return value[0];
         return error.UnsupportedSqlShape;
     }
     return default;
+}
+
+test "sql adapter bulk io lowers COPY execution routes" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_][]const u8{ "id", "status" };
+    const where_rhs = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .value, .value_json = "\"active\"" },
+    };
+    const where_expressions = [_]db_mod.types.RelationalRowsExpressionCondition{
+        .{
+            .lhs = .{ .kind = .field, .field = "status" },
+            .op = .eq,
+            .rhs = where_rhs[0..],
+        },
+    };
+
+    const copy_from_plan = ddl_plan.BulkIoPlan{
+        .direction = .from,
+        .table_name = "usage_records",
+        .columns = columns[0..],
+        .endpoint = "STDIN",
+        .format = "csv",
+        .where_expressions = where_expressions[0..],
+    };
+    const copy_from = try executionPlanFromDdlPlan(copy_from_plan);
+    try std.testing.expectEqual(BulkSqlIoOperation.import_rows, copy_from.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_batch, copy_from.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.stdin, copy_from.stream);
+    try std.testing.expectEqual(BulkSqlIoCodec.csv, copy_from.codec);
+    try std.testing.expectEqual(ddl_plan.BulkIoEndpointKind.stream, copy_from.endpoint_kind);
+    try std.testing.expectEqual(usermgr.PermissionType.write, copy_from.required_permission);
+    try std.testing.expectEqual(BulkSqlIoAuditAction.copy_from, copy_from.audit_action);
+    try std.testing.expect(copy_from.requires_external_stream);
+    const copy_from_fingerprint = try executionFingerprintAlloc(alloc, copy_from);
+    defer alloc.free(copy_from_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:codec=csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=1:requires_stream=true", copy_from_fingerprint);
+
+    const copy_from_text = try executionPlanFromDdlPlan(.{
+        .direction = .from,
+        .table_name = "usage_records",
+        .columns = columns[0..],
+        .endpoint = "STDIN",
+    });
+    try std.testing.expectEqual(BulkSqlIoCodec.postgres_text, copy_from_text.codec);
+
+    const copy_to = try executionPlanFromDdlPlan(.{
+        .direction = .to,
+        .table_name = "usage_records",
+        .columns = columns[0..],
+        .endpoint = "STDOUT",
+        .format = "csv",
+        .force_quote_all = true,
+    });
+    try std.testing.expectEqual(BulkSqlIoOperation.export_rows, copy_to.operation);
+    try std.testing.expectEqual(BulkSqlIoNativeRoute.rows_query, copy_to.native_route);
+    try std.testing.expectEqual(BulkSqlIoStream.stdout, copy_to.stream);
+    try std.testing.expectEqual(usermgr.PermissionType.read, copy_to.required_permission);
+    try std.testing.expectEqual(BulkSqlIoAuditAction.copy_to, copy_to.audit_action);
+    const copy_to_fingerprint = try executionFingerprintAlloc(alloc, copy_to);
+    defer alloc.free(copy_to_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:codec=csv:auth=table/read:audit=copy_to:table=usage_records:columns=2:where_expr=0:requires_stream=true", copy_to_fingerprint);
+
+    const copy_from_file = try executionPlanFromDdlPlan(.{
+        .direction = .from,
+        .table_name = "usage_records",
+        .columns = columns[0..],
+        .endpoint_kind = .file,
+        .endpoint = "/tmp/usage.csv",
+        .format = "csv",
+    });
+    try std.testing.expectEqual(BulkSqlIoStream.file, copy_from_file.stream);
+    try std.testing.expect(!copy_from_file.requires_external_stream);
+    const copy_from_file_fingerprint = try executionFingerprintAlloc(alloc, copy_from_file);
+    defer alloc.free(copy_from_file_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=file:codec=csv:endpoint_kind=file:endpoint=/tmp/usage.csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=false", copy_from_file_fingerprint);
+
+    const copy_from_program = try executionPlanFromDdlPlan(.{
+        .direction = .from,
+        .table_name = "usage_records",
+        .columns = columns[0..],
+        .endpoint_kind = .program,
+        .endpoint = "cat /tmp/usage.csv",
+    });
+    try std.testing.expectEqual(BulkSqlIoStream.program, copy_from_program.stream);
+    const copy_from_program_fingerprint = try executionFingerprintAlloc(alloc, copy_from_program);
+    defer alloc.free(copy_from_program_fingerprint);
+    try std.testing.expectEqualStrings("bulk_sql_io:op=import_rows:native=rows_batch:stream=program:codec=postgres_text:endpoint_kind=program:endpoint=cat /tmp/usage.csv:auth=table/write:audit=copy_from:table=usage_records:columns=2:where_expr=0:requires_stream=false", copy_from_program_fingerprint);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, executionPlanFromDdlPlan(.{
+        .direction = .from,
+        .table_name = "usage_records",
+        .columns = columns[0..],
+        .endpoint = "STDOUT",
+    }));
+}
+
+test "sql adapter bulk io imports COPY rows into row batches" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .text, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .text, .nullable = true },
+        .{ .name = "status_key", .path = "status_key", .field_type = .text, .nullable = true, .generated = .{ .op = .lower, .field = "status" } },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+        .{ .name = "metadata", .path = "metadata", .field_type = .json, .nullable = true },
+    };
+    const primary_columns = [_][]const u8{"id"};
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .primary_key = .{ .columns = primary_columns[0..] },
+    };
+    const import_columns = [_][]const u8{ "id", "status", "amount", "active", "metadata" };
+    const base_csv_plan = BulkSqlIoExecutionPlan{
+        .operation = .import_rows,
+        .native_route = .rows_batch,
+        .stream = .stdin,
+        .codec = .csv,
+        .endpoint_kind = .stream,
+        .endpoint = "STDIN",
+        .table_name = "usage_records",
+        .columns = import_columns[0..],
+        .required_permission = .write,
+        .audit_action = .copy_from,
+        .header = true,
+    };
+    var csv_batch = try importRowsBatchFromStdinAlloc(
+        alloc,
+        schema,
+        base_csv_plan,
+        "id,status,amount,active,metadata\nu1,Ready,42,true,{\"source\":\"copy\"}\n\\.\n",
+    );
+    defer csv_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), csv_batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u1\",\"status\":\"Ready\",\"amount\":42,\"active\":true,\"metadata\":{\"source\":\"copy\"},\"status_key\":\"ready\"}", csv_batch.writes[0].value);
+
+    const text_rhs_json = try jsonStringifyAlloc(alloc, "line\nbreak");
+    defer alloc.free(text_rhs_json);
+    const text_rhs = [_]db_mod.types.RelationalRowsExpression{
+        .{ .kind = .value, .value_json = text_rhs_json },
+    };
+    const text_where = [_]db_mod.types.RelationalRowsExpressionCondition{
+        .{
+            .lhs = .{ .kind = .field, .field = "status" },
+            .op = .eq,
+            .rhs = text_rhs[0..],
+        },
+    };
+    var text_plan = base_csv_plan;
+    text_plan.codec = .postgres_text;
+    text_plan.header = false;
+    text_plan.default_marker = "DEFAULT";
+    text_plan.where_expressions = text_where[0..];
+    var text_batch = try importRowsBatchFromStdinAlloc(
+        alloc,
+        schema,
+        text_plan,
+        "u_text_1\tline\\nbreak\t7\ttrue\t{\"source\":\"copy_text\"}\nu_text_2\tclosed\tDEFAULT\tfalse\t\\N\n\\.\n",
+    );
+    defer text_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), text_batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u_text_1\",\"status\":\"line\\nbreak\",\"amount\":7,\"active\":true,\"metadata\":{\"source\":\"copy_text\"},\"status_key\":\"line\\nbreak\"}", text_batch.writes[0].value);
+
+    const nullable_columns = [_][]const u8{ "id", "status", "amount" };
+    var null_plan = base_csv_plan;
+    null_plan.columns = nullable_columns[0..];
+    null_plan.header = false;
+    null_plan.null_marker = "";
+    var null_batch = try importRowsBatchFromStdinAlloc(alloc, schema, null_plan, "u_empty_unquoted,,0\nu_empty_quoted,\"\",0\n");
+    defer null_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), null_batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"u_empty_unquoted\",\"status\":null,\"amount\":0,\"status_key\":null}", null_batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"u_empty_quoted\",\"status\":\"\",\"amount\":0,\"status_key\":\"\"}", null_batch.writes[1].value);
+
+    const status_option_columns = [_][]const u8{"status"};
+    var force_null_plan = null_plan;
+    force_null_plan.force_null_columns = status_option_columns[0..];
+    var force_null_batch = try importRowsBatchFromStdinAlloc(alloc, schema, force_null_plan, "u_force_null,\"\",0\n");
+    defer force_null_batch.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"id\":\"u_force_null\",\"status\":null,\"amount\":0,\"status_key\":null}", force_null_batch.writes[0].value);
+
+    var force_not_null_plan = null_plan;
+    force_not_null_plan.force_not_null_columns = status_option_columns[0..];
+    var force_not_null_batch = try importRowsBatchFromStdinAlloc(alloc, schema, force_not_null_plan, "u_force_not_null,,0\n");
+    defer force_not_null_batch.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"id\":\"u_force_not_null\",\"status\":\"\",\"amount\":0,\"status_key\":\"\"}", force_not_null_batch.writes[0].value);
+
+    var malformed_plan = base_csv_plan;
+    malformed_plan.delimiter = "::";
+    try std.testing.expectError(error.UnsupportedSqlShape, importRowsBatchFromStdinAlloc(alloc, schema, malformed_plan, "u_bad:ready\n"));
+
+    var invalid_options = base_csv_plan;
+    invalid_options.delimiter = "|";
+    invalid_options.quote = "|";
+    try std.testing.expectError(error.UnsupportedSqlShape, importRowsBatchFromStdinAlloc(alloc, schema, invalid_options, "u_bad|ready|0\n"));
+
+    const duplicate_columns = [_][]const u8{ "id", "id" };
+    var duplicate_plan = base_csv_plan;
+    duplicate_plan.columns = duplicate_columns[0..];
+    duplicate_plan.header = false;
+    try std.testing.expectError(error.InvalidRowsRequest, importRowsBatchFromStdinAlloc(alloc, schema, duplicate_plan, "u_bad,u_bad_again\n"));
+
+    const generated_columns = [_][]const u8{ "id", "status_key" };
+    var generated_plan = base_csv_plan;
+    generated_plan.columns = generated_columns[0..];
+    generated_plan.header = false;
+    try std.testing.expectError(error.InvalidRowsRequest, importRowsBatchFromStdinAlloc(alloc, schema, generated_plan, "u5,ready\n"));
+}
+
+test "sql adapter bulk io imports and exports COPY text csv and binary codecs" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .text, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .text, .nullable = true },
+        .{ .name = "note", .path = "note", .field_type = .text, .nullable = true },
+    };
+    const plan_columns = [_][]const u8{ "id", "status", "note" };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns[0..],
+        .primary_key = .{ .columns = plan_columns[0..1] },
+    };
+
+    const csv_plan = BulkSqlIoExecutionPlan{
+        .operation = .import_rows,
+        .native_route = .rows_batch,
+        .stream = .stdin,
+        .codec = .csv,
+        .endpoint_kind = .stream,
+        .endpoint = "STDIN",
+        .table_name = "usage_records",
+        .columns = plan_columns[0..],
+        .required_permission = .write,
+        .audit_action = .copy_from,
+    };
+    var csv_batch = try importRowsBatchFromStdinAlloc(alloc, schema, csv_plan, "r1,,\"\"\n");
+    defer csv_batch.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"id\":\"r1\",\"status\":null,\"note\":\"\"}", csv_batch.writes[0].value);
+
+    const forced_columns = [_][]const u8{ "status", "note" };
+    var forced_csv_plan = csv_plan;
+    forced_csv_plan.force_not_null_columns = forced_columns[0..];
+    forced_csv_plan.force_null_columns = forced_columns[0..];
+    var forced_csv_batch = try importRowsBatchFromStdinAlloc(alloc, schema, forced_csv_plan, "r2,,\"\"\n");
+    defer forced_csv_batch.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"id\":\"r2\",\"status\":\"\",\"note\":null}", forced_csv_batch.writes[0].value);
+
+    var text_plan = csv_plan;
+    text_plan.codec = .postgres_text;
+    var text_batch = try importRowsBatchFromStdinAlloc(alloc, schema, text_plan, "r3\t\\N\tliteral\\\\N\nr4\tline\\nbreak\tplain\\ttab\n");
+    defer text_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), text_batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"r3\",\"status\":null,\"note\":\"literal\\\\N\"}", text_batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"r4\",\"status\":\"line\\nbreak\",\"note\":\"plain\\ttab\"}", text_batch.writes[1].value);
+
+    var text_export_rows = [_][]const u8{
+        "{\"id\":\"r3\",\"status\":null,\"note\":\"literal\\\\N\"}",
+        "{\"id\":\"r4\",\"status\":\"line\\nbreak\",\"note\":\"plain\\ttab\"}",
+    };
+    const text_export_plan = BulkSqlIoExecutionPlan{
+        .operation = .export_rows,
+        .native_route = .rows_query,
+        .stream = .stdout,
+        .codec = .postgres_text,
+        .endpoint_kind = .stream,
+        .endpoint = "STDOUT",
+        .table_name = "usage_records",
+        .columns = plan_columns[0..],
+        .required_permission = .read,
+        .audit_action = .copy_to,
+    };
+    const text_export = try exportRowsCsvToStdoutAlloc(alloc, schema, text_export_plan, .{
+        .rows = text_export_rows[0..],
+        .total = 2,
+    });
+    defer alloc.free(text_export);
+    try std.testing.expectEqualStrings("r3\t\\N\tliteral\\\\N\nr4\tline\\nbreak\tplain\\ttab\n", text_export);
+
+    const BinaryCopy = struct {
+        fn appendI16(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: i16) !void {
+            var buf: [2]u8 = undefined;
+            std.mem.writeInt(i16, &buf, value, .big);
+            try out.appendSlice(allocator, &buf);
+        }
+
+        fn appendI32(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: i32) !void {
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(i32, &buf, value, .big);
+            try out.appendSlice(allocator, &buf);
+        }
+
+        fn appendU32(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: u32) !void {
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, value, .big);
+            try out.appendSlice(allocator, &buf);
+        }
+
+        fn appendField(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: ?[]const u8) !void {
+            const bytes = value orelse {
+                try appendI32(allocator, out, -1);
+                return;
+            };
+            try appendI32(allocator, out, @intCast(bytes.len));
+            try out.appendSlice(allocator, bytes);
+        }
+    };
+    var binary_payload = std.ArrayList(u8).empty;
+    defer binary_payload.deinit(alloc);
+    try binary_payload.appendSlice(alloc, postgres_binary_copy_signature);
+    try BinaryCopy.appendU32(alloc, &binary_payload, 0);
+    try BinaryCopy.appendU32(alloc, &binary_payload, 0);
+    try BinaryCopy.appendI16(alloc, &binary_payload, 3);
+    try BinaryCopy.appendField(alloc, &binary_payload, "b1");
+    try BinaryCopy.appendField(alloc, &binary_payload, "ready");
+    try BinaryCopy.appendField(alloc, &binary_payload, null);
+    try BinaryCopy.appendI16(alloc, &binary_payload, 3);
+    try BinaryCopy.appendField(alloc, &binary_payload, "b2");
+    try BinaryCopy.appendField(alloc, &binary_payload, "done");
+    try BinaryCopy.appendField(alloc, &binary_payload, "memo");
+    try BinaryCopy.appendI16(alloc, &binary_payload, -1);
+
+    var binary_import_plan = csv_plan;
+    binary_import_plan.codec = .postgres_binary;
+    var binary_batch = try importRowsBatchFromStdinAlloc(alloc, schema, binary_import_plan, binary_payload.items);
+    defer binary_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), binary_batch.writes.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b1\",\"status\":\"ready\",\"note\":null}", binary_batch.writes[0].value);
+    try std.testing.expectEqualStrings("{\"id\":\"b2\",\"status\":\"done\",\"note\":\"memo\"}", binary_batch.writes[1].value);
+
+    const binary_export_plan = BulkSqlIoExecutionPlan{
+        .operation = .export_rows,
+        .native_route = .rows_query,
+        .stream = .stdout,
+        .codec = .postgres_binary,
+        .endpoint_kind = .stream,
+        .endpoint = "STDOUT",
+        .table_name = "usage_records",
+        .columns = plan_columns[0..],
+        .required_permission = .read,
+        .audit_action = .copy_to,
+    };
+    var binary_export_rows = [_][]const u8{
+        binary_batch.writes[0].value,
+        binary_batch.writes[1].value,
+    };
+    const binary_export = try exportRowsCsvToStdoutAlloc(alloc, schema, binary_export_plan, .{
+        .rows = binary_export_rows[0..],
+        .total = 2,
+    });
+    defer alloc.free(binary_export);
+    try std.testing.expect(binary_export.len > postgres_binary_copy_signature.len);
+    try std.testing.expectEqualSlices(u8, postgres_binary_copy_signature, binary_export[0..postgres_binary_copy_signature.len]);
+    var binary_roundtrip_batch = try importRowsBatchFromStdinAlloc(alloc, schema, binary_import_plan, binary_export);
+    defer binary_roundtrip_batch.deinit(alloc);
+    try std.testing.expectEqualStrings(binary_batch.writes[0].value, binary_roundtrip_batch.writes[0].value);
+    try std.testing.expectEqualStrings(binary_batch.writes[1].value, binary_roundtrip_batch.writes[1].value);
 }

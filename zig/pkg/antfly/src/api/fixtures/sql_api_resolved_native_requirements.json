@@ -23,6 +23,12 @@
       ]
     },
     {
+      "reason": "cte_mutation_source_plan",
+      "coverage": [
+        "merge_mutation_data_modifying_cte"
+      ]
+    },
+    {
       "reason": "duplicate_conflict_update_target",
       "coverage": [
         "invalid_duplicate_conflict_update_target"

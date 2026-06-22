@@ -51,6 +51,8 @@ pub const SqlExplainPrefix = struct {
     settings: bool = false,
     wal: bool = false,
     inner_sql: []const u8,
+    inner_token_start: usize = 0,
+    inner_token_end: usize = 0,
 };
 
 pub const SqlPatternQuantifier = enum {

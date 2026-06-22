@@ -1679,6 +1679,18 @@ remains an Antfly row-plan input rather than SQL text attached to execution.
 Local execution materializes that source CTE through the ordinary row-plan
 reader, including catalog-resolved cross-schema source tables, before feeding
 the resulting typed source rows into the deterministic MERGE batch builder.
+Mutation-producing MERGE CTEs use the same rule at the producer boundary:
+`WITH source_rows AS (UPDATE ... RETURNING ... | DELETE ... RETURNING ...)
+MERGE ... USING source_rows` lowers the CTE body into an owned
+mutation-source request beside the MERGE plan, records the CTE name and
+returning shape, and makes the final MERGE consume `source_rows` through a
+typed `source_cte` reference. The SQL adapter currently marks that producer
+with an explicit claim placeholder because the coordinator, not the parser,
+must bind the real row-claim owner and transaction before execution. This keeps
+the long-term runtime shape honest: data-modifying CTE producers are native
+mutation-source work items, not embedded SQL strings, and promotion to
+executable work is responsible for replacing placeholder claim metadata with a
+real transaction participant.
 Recursive CTE-backed `INSERT ... SELECT` has its own typed write envelope: the
 SQL adapter lowers `WITH RECURSIVE ... INSERT ... SELECT ...` into a recursive
 producer plus an insert-source request, the catalog resolver loads the

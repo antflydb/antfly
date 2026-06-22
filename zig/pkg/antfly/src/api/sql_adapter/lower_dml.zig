@@ -91,16 +91,26 @@ pub const MergeMutationParserContextHooks = struct {
 pub const MergeMutationParserOptions = struct {
     params: []const sql_value.SqlValue = &.{},
     schema: runtime_schema.TableSchema,
+    function_bindings: lower_expr.SqlFunctionBindings = .{},
     joined_source_schema: ?runtime_schema.TableSchema = null,
+    defer_row_expression_field_validation: bool = false,
     context_hooks: MergeMutationParserContextHooks,
     condition_options: MergeArmConditionParserOptions,
     assignment_options: MergeAssignmentParserOptions,
+    mutation_context_hooks: MutationSourceParserContextHooks,
+    mutation_assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
+    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    order_expression_hooks: lower_expr.OrderExpressionParserOptions,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
 
 pub const MergeMutationBodyOptions = struct {
     ctes: []const db_mod.types.RelationalRowsCte,
+    data_modifying_ctes: []const plan_mod.LoweredDataModifyingCte = &.{},
     base_table_name: ?*?[]const u8,
 };
 
@@ -976,20 +986,238 @@ pub fn parseMergeMutationPlanAlloc(
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
-    var ctes = try plan_mod.parseCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks);
-    errdefer plan_mod.freePlanCtes(alloc, ctes);
+    var parsed_ctes = try parseMergeCtesForPlanAlloc(alloc, tokens, pos, &base_table_name, cte_hooks, parser_options);
+    errdefer parsed_ctes.deinit(alloc);
 
     var final = try parseMergeMutationBodyAlloc(alloc, tokens, pos, parser_options, .{
-        .ctes = ctes,
+        .ctes = parsed_ctes.read_ctes,
+        .data_modifying_ctes = parsed_ctes.data_modifying_ctes,
         .base_table_name = &base_table_name,
     });
     errdefer final.deinit(alloc);
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
     _ = base_table_name orelse return error.UnsupportedSqlShape;
-    final.ctes = ctes;
-    ctes = &.{};
+    final.ctes = parsed_ctes.read_ctes;
+    final.data_modifying_ctes = parsed_ctes.data_modifying_ctes;
+    parsed_ctes.read_ctes = &.{};
+    parsed_ctes.data_modifying_ctes = &.{};
     return final;
+}
+
+const ParsedMergeCtes = struct {
+    read_ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    data_modifying_ctes: []const plan_mod.LoweredDataModifyingCte = &.{},
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        plan_mod.freePlanCtes(alloc, self.read_ctes);
+        for (self.data_modifying_ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.data_modifying_ctes.len > 0) alloc.free(self.data_modifying_ctes);
+        self.* = undefined;
+    }
+};
+
+fn parseMergeCtesForPlanAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    base_table_name: *?[]const u8,
+    hooks: plan_mod.CteSelectParserHooks,
+    parser_options: MergeMutationParserOptions,
+) !ParsedMergeCtes {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("with");
+    var read_ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
+    errdefer {
+        for (read_ctes.items) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        read_ctes.deinit(alloc);
+    }
+    var data_ctes = std.ArrayListUnmanaged(plan_mod.LoweredDataModifyingCte).empty;
+    errdefer {
+        for (data_ctes.items) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        data_ctes.deinit(alloc);
+    }
+
+    while (true) {
+        const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) alloc.free(cte_name);
+        if (plan_mod.findCteByName(read_ctes.items, cte_name) != null or findDataModifyingCteByName(data_ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
+        const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
+        defer strings.freeStringSlice(alloc, cte_column_aliases);
+        try cursor.expectKeyword("as");
+        try parser.consumeCteMaterializationHint(tokens, pos);
+        try cursor.expectToken(.lparen);
+        const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
+        if (parser.peekKeyword(tokens, pos.*, "update") or parser.peekKeyword(tokens, pos.*, "delete")) {
+            if (cte_column_aliases.len != 0) return error.UnsupportedSqlShape;
+            var inner_pos: usize = 0;
+            var lowered = try parseDataModifyingCteMutationSourceAlloc(alloc, tokens[pos.*..close_index], &inner_pos, parser_options);
+            var lowered_transferred = false;
+            errdefer if (!lowered_transferred) lowered.deinit(alloc);
+            if (!parser.atEnd(tokens[pos.*..close_index], inner_pos)) return error.UnsupportedSqlShape;
+            try resolveDataModifyingCteBaseSourceTableAlloc(alloc, lowered.table_name, base_table_name);
+            try data_ctes.append(alloc, .{
+                .name = cte_name,
+                .table_name = lowered.table_name,
+                .mutation = lowered.mutation,
+                .claim_placeholder = true,
+            });
+            lowered_transferred = true;
+            cte_name_transferred = true;
+            pos.* = close_index + 1;
+            if (cursor.matchToken(.comma) == null) break;
+            continue;
+        }
+        if (plan_mod.lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
+            pos.* = close_index + 1;
+            try plan_mod.resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
+            try read_ctes.append(alloc, .{
+                .name = cte_name,
+                .table_function = table_function,
+            });
+            cte_name_transferred = true;
+            if (cursor.matchToken(.comma) == null) break;
+            continue;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+        var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], read_ctes.items);
+        errdefer lowered.deinit(alloc);
+        pos.* = close_index + 1;
+        try plan_mod.applyCteColumnAliasesAlloc(alloc, &lowered, cte_column_aliases);
+        try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &lowered, read_ctes.items, base_table_name);
+        try read_ctes.append(alloc, .{
+            .name = cte_name,
+            .query = lowered.query,
+        });
+        lowered.query = .{};
+        lowered.clearSelectOutputs(alloc);
+        alloc.free(lowered.table_name);
+        lowered.table_name = "";
+        cte_name_transferred = true;
+        if (cursor.matchToken(.comma) == null) break;
+    }
+
+    return .{
+        .read_ctes = try read_ctes.toOwnedSlice(alloc),
+        .data_modifying_ctes = try data_ctes.toOwnedSlice(alloc),
+    };
+}
+
+fn parseDataModifyingCteMutationSourceAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    parser_options: MergeMutationParserOptions,
+) !plan_mod.LoweredMutationSource {
+    const options = try dataModifyingCteMutationSourceParserOptionsAlloc(alloc, parser_options);
+    if (parser.peekKeyword(tokens, pos.*, "update")) return try parseUpdateMutationSourceAlloc(alloc, tokens, pos, options);
+    if (parser.peekKeyword(tokens, pos.*, "delete")) return try parseDeleteMutationSourceAlloc(alloc, tokens, pos, options);
+    if (options.row_claim.owner_id.len > 0) alloc.free(options.row_claim.owner_id);
+    return error.UnsupportedSqlShape;
+}
+
+fn dataModifyingCteMutationSourceParserOptionsAlloc(
+    alloc: std.mem.Allocator,
+    parser_options: MergeMutationParserOptions,
+) !MutationSourceParserOptions {
+    return .{
+        .params = parser_options.params,
+        .schema = parser_options.schema,
+        .function_bindings = parser_options.function_bindings,
+        .row_claim = .{
+            .mode = .for_update,
+            .wait_policy = .wait,
+            .owner_id = try alloc.dupe(u8, "__antfly_sql_data_modifying_cte_claim__"),
+            .txn_id = [_]u8{0} ** 16,
+        },
+        .realtime_ns = parser_options.realtime_ns,
+        .defer_row_expression_field_validation = parser_options.defer_row_expression_field_validation,
+        .context_hooks = parser_options.mutation_context_hooks,
+        .assignment_value_hooks = parser_options.mutation_assignment_value_hooks,
+        .fixed_binary_hooks = parser_options.fixed_binary_hooks,
+        .bare_boolean_hooks = parser_options.bare_boolean_hooks,
+        .expression_alternatives_hooks = parser_options.expression_alternatives_hooks,
+        .expression_condition_hooks = parser_options.expression_condition_hooks,
+        .order_expression_hooks = parser_options.order_expression_hooks,
+        .returning_hooks = parser_options.returning_hooks,
+    };
+}
+
+fn resolveDataModifyingCteBaseSourceTableAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    base_table_name: *?[]const u8,
+) !void {
+    if (base_table_name.*) |base| {
+        if (!std.mem.eql(u8, base, table_name)) return error.UnsupportedSqlShape;
+        return;
+    }
+    base_table_name.* = try alloc.dupe(u8, table_name);
+}
+
+fn findDataModifyingCteByName(
+    ctes: []const plan_mod.LoweredDataModifyingCte,
+    name: []const u8,
+) ?plan_mod.LoweredDataModifyingCte {
+    for (ctes) |cte| {
+        if (std.ascii.eqlIgnoreCase(cte.name, name)) return cte;
+    }
+    return null;
+}
+
+const DataModifyingCteReturningSchema = struct {
+    schema: runtime_schema.TableSchema,
+    owns_columns: bool = false,
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        if (self.owns_columns and self.schema.relational_columns.len > 0) {
+            alloc.free(self.schema.relational_columns);
+        }
+    }
+};
+
+fn dataModifyingCteReturningSchemaAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    producer: plan_mod.LoweredDataModifyingCte,
+) !DataModifyingCteReturningSchema {
+    if (producer.mutation.req.returning_all) {
+        return .{ .schema = base_schema };
+    }
+    if (producer.mutation.req.returning_expressions.len != 0) return error.UnsupportedSqlShape;
+    if (producer.mutation.req.returning.len == 0) return error.UnsupportedSqlShape;
+    for (producer.mutation.req.returning) |field| {
+        if (std.mem.eql(u8, field, "*")) return .{ .schema = base_schema };
+    }
+
+    var columns = try alloc.alloc(runtime_schema.RelationalColumn, producer.mutation.req.returning.len);
+    errdefer alloc.free(columns);
+    for (producer.mutation.req.returning, 0..) |field, i| {
+        columns[i] = binder.relationalColumnForField(base_schema, field, null) orelse return error.UnsupportedSqlShape;
+    }
+
+    var schema = base_schema;
+    schema.relational_columns = columns;
+    schema.primary_key = null;
+    schema.unique_constraints = &.{};
+    schema.checks = &.{};
+    schema.foreign_keys = &.{};
+    return .{
+        .schema = schema,
+        .owns_columns = true,
+    };
 }
 
 pub fn parseMergeMutationBodyAlloc(
@@ -1019,19 +1247,35 @@ pub fn parseMergeMutationBodyAlloc(
     var parse_context = previous_context;
     parse_context.joined_source_schema = parser_options.joined_source_schema;
     parse_context.available_ctes = options.ctes;
+    var source_resolved_from_cte = false;
+    const data_cte_source = findDataModifyingCteByName(options.data_modifying_ctes, source_table.name);
+    var data_cte_source_schema: ?DataModifyingCteReturningSchema = null;
+    defer if (data_cte_source_schema) |schema| schema.deinit(alloc);
     if (options.ctes.len != 0) {
         planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, base_source_schema, options.ctes);
         if (relational_rows.rowsPlannedCteSchema(planned_ctes, source_table.name)) |cte_schema| {
             source.source_cte = try alloc.dupe(u8, source_table.name);
             parse_context.joined_source_schema = cte_schema;
             resolved_source_table = (options.base_table_name orelse return error.UnsupportedSqlShape).* orelse return error.UnsupportedSqlShape;
-        } else {
+            source_resolved_from_cte = true;
+        } else if (data_cte_source == null) {
             const base_ptr = options.base_table_name orelse return error.UnsupportedSqlShape;
             if (base_ptr.*) |base| {
                 if (!std.mem.eql(u8, base, source_table.name)) return error.UnsupportedSqlShape;
             } else {
                 base_ptr.* = try alloc.dupe(u8, source_table.name);
             }
+        }
+    }
+    if (!source_resolved_from_cte) {
+        if (data_cte_source) |producer| {
+            if (source.source_cte.len != 0) return error.UnsupportedSqlShape;
+            source.source_cte = try alloc.dupe(u8, source_table.name);
+            data_cte_source_schema = try dataModifyingCteReturningSchemaAlloc(alloc, parser_options.schema, producer);
+            parse_context.joined_source_schema = data_cte_source_schema.?.schema;
+            resolved_source_table = producer.table_name;
+        } else if (options.data_modifying_ctes.len != 0) {
+            return error.UnsupportedSqlShape;
         }
     }
     parser_options.context_hooks.set_context(parser_options.context_hooks.ptr, parse_context);
@@ -15574,6 +15818,42 @@ test "sql adapter lower dml lowers insert source write plans" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var data_cte_merge = try lowerMergeMutationPlanForDmlTestAlloc(
+        alloc,
+        "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id, status) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+        schema,
+        schema,
+        &.{},
+    );
+    defer data_cte_merge.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", data_cte_merge.target_table_name);
+    try std.testing.expectEqualStrings("usage_records", data_cte_merge.source_table_name);
+    try std.testing.expectEqualStrings("source_rows", data_cte_merge.source.source_cte);
+    try std.testing.expectEqual(@as(usize, 0), data_cte_merge.ctes.len);
+    try std.testing.expectEqual(@as(usize, 1), data_cte_merge.data_modifying_ctes.len);
+    try std.testing.expectEqualStrings("source_rows", data_cte_merge.data_modifying_ctes[0].name);
+    try std.testing.expectEqualStrings("usage_records", data_cte_merge.data_modifying_ctes[0].table_name);
+    try std.testing.expect(data_cte_merge.data_modifying_ctes[0].claim_placeholder);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, data_cte_merge.data_modifying_ctes[0].mutation.req.kind);
+    try std.testing.expectEqual(@as(usize, 1), data_cte_merge.data_modifying_ctes[0].mutation.req.operations.len);
+    try std.testing.expectEqual(@as(usize, 2), data_cte_merge.data_modifying_ctes[0].mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", data_cte_merge.data_modifying_ctes[0].mutation.req.returning[0]);
+    try std.testing.expectEqualStrings("status", data_cte_merge.data_modifying_ctes[0].mutation.req.returning[1]);
+    try std.testing.expectEqual(@as(usize, 1), data_cte_merge.match_fields.len);
+    try std.testing.expectEqual(@as(usize, 1), data_cte_merge.matched_arms.len);
+    try std.testing.expectEqual(@as(usize, 1), data_cte_merge.matched_arms[0].update.len);
+
+    try std.testing.expectError(
+        error.InvalidSqlCatalog,
+        lowerMergeMutationPlanForDmlTestAlloc(
+            alloc,
+            "WITH source_rows AS (UPDATE usage_records SET status = 'ready' RETURNING id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status",
+            schema,
+            schema,
+            &.{},
+        ),
+    );
 }
 
 test "sql adapter lower dml lowers insert values returning into row batch" {

@@ -1,6 +1,4 @@
 {
   "requirement_format": 1,
-  "required": [
-    "cte_mutation_source_plan"
-  ]
+  "required": []
 }

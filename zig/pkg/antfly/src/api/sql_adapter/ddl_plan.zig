@@ -11075,6 +11075,236 @@ test "sql adapter ddl plan lowers maintenance job ddl plans" {
     }
 }
 
+test "sql adapter ddl plan lowers bulk io ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var copy_from = try lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);");
+    defer copy_from.deinit(alloc);
+    switch (copy_from) {
+        .bulk_io => |plan| {
+            try std.testing.expectEqual(BulkIoDirection.from, plan.direction);
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 2), plan.columns.len);
+            try std.testing.expectEqualStrings("id", plan.columns[0]);
+            try std.testing.expectEqualStrings("status", plan.columns[1]);
+            try std.testing.expectEqualStrings("STDIN", plan.endpoint);
+            try std.testing.expectEqualStrings("csv", plan.format.?);
+            try std.testing.expectEqual(BulkIoEndpointKind.stream, plan.endpoint_kind);
+            try std.testing.expect(!plan.header);
+            try std.testing.expect(!plan.freeze);
+            try std.testing.expectEqual(BulkIoOnErrorPolicy.stop, plan.on_error);
+            try std.testing.expect(plan.reject_limit == null);
+            try std.testing.expectEqual(BulkIoLogVerbosity.default, plan.log_verbosity);
+            try std.testing.expectEqual(@as(usize, 0), plan.force_not_null_columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.force_null_columns.len);
+            try std.testing.expectEqual(@as(usize, 0), plan.where_expressions.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var copy_header = try lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');");
+    defer copy_header.deinit(alloc);
+    switch (copy_header) {
+        .bulk_io => |plan| {
+            try std.testing.expect(plan.header);
+            try std.testing.expect(plan.freeze);
+            try std.testing.expectEqual(BulkIoOnErrorPolicy.ignore, plan.on_error);
+            try std.testing.expectEqual(@as(?usize, 10), plan.reject_limit);
+            try std.testing.expectEqual(BulkIoLogVerbosity.verbose, plan.log_verbosity);
+            try std.testing.expectEqual(@as(usize, 2), plan.force_not_null_columns.len);
+            try std.testing.expectEqualStrings("id", plan.force_not_null_columns[0]);
+            try std.testing.expectEqualStrings("status", plan.force_not_null_columns[1]);
+            try std.testing.expectEqual(@as(usize, 1), plan.force_null_columns.len);
+            try std.testing.expectEqualStrings("status", plan.force_null_columns[0]);
+            try std.testing.expectEqualStrings(",", plan.delimiter.?);
+            try std.testing.expectEqualStrings("\"", plan.quote.?);
+            try std.testing.expectEqualStrings("!", plan.escape.?);
+            try std.testing.expectEqualStrings("", plan.null_marker.?);
+            try std.testing.expectEqualStrings("n/a", plan.default_marker.?);
+            try std.testing.expectEqualStrings("UTF8", plan.encoding.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var copy_where = try lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';");
+    defer copy_where.deinit(alloc);
+    switch (copy_where) {
+        .bulk_io => |plan| {
+            try std.testing.expectEqual(@as(usize, 1), plan.where_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, plan.where_expressions[0].lhs.kind);
+            try std.testing.expectEqualStrings("status", plan.where_expressions[0].lhs.field);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, plan.where_expressions[0].op);
+            try std.testing.expectEqualStrings("\"active\"", plan.where_expressions[0].rhs[0].value_json);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const endpoint_cases = [_]struct {
+        sql: []const u8,
+        direction: BulkIoDirection,
+        endpoint_kind: BulkIoEndpointKind,
+        endpoint: []const u8,
+    }{
+        .{ .sql = "COPY usage_records (id, status) FROM '/tmp/usage.csv' WITH (FORMAT csv, HEADER true);", .direction = .from, .endpoint_kind = .file, .endpoint = "/tmp/usage.csv" },
+        .{ .sql = "COPY usage_records (id, status) TO '/tmp/usage.csv' WITH (FORMAT csv);", .direction = .to, .endpoint_kind = .file, .endpoint = "/tmp/usage.csv" },
+        .{ .sql = "COPY usage_records (id, status) FROM PROGRAM 'cat /tmp/usage.csv';", .direction = .from, .endpoint_kind = .program, .endpoint = "cat /tmp/usage.csv" },
+        .{ .sql = "COPY usage_records (id, status) TO PROGRAM 'cat > /tmp/usage.csv' WITH (FORMAT csv);", .direction = .to, .endpoint_kind = .program, .endpoint = "cat > /tmp/usage.csv" },
+    };
+    for (endpoint_cases) |case| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .bulk_io => |plan| {
+                try std.testing.expectEqual(case.direction, plan.direction);
+                try std.testing.expectEqual(case.endpoint_kind, plan.endpoint_kind);
+                try std.testing.expectEqualStrings(case.endpoint, plan.endpoint);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "COPY usage_records (id, status) FROM STDIN WITH (OIDS true);"));
+}
+
+test "sql adapter ddl plan lowers session catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    const noops = [_][]const u8{
+        "SET LOCAL client_min_messages = warning;",
+        "SET client_encoding = 'UTF8';",
+        "RESET client_min_messages;",
+    };
+    for (noops) |sql| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .adapter_noop => |plan| try std.testing.expectEqual(AdapterNoopDdlReason.session_setting, plan.reason),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var set_public_search_path = try lowerDdlPlanForTestAlloc(alloc, "SET search_path TO public;");
+    defer set_public_search_path.deinit(alloc);
+    switch (set_public_search_path) {
+        .session_catalog => |plan| switch (plan) {
+            .set_search_path => |set| {
+                try std.testing.expectEqual(@as(usize, 1), set.namespaces.len);
+                try std.testing.expectEqualStrings("public", set.namespaces[0]);
+                try std.testing.expect(!set.local);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_tenant_search_path = try lowerDdlPlanForTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
+    defer set_tenant_search_path.deinit(alloc);
+    switch (set_tenant_search_path) {
+        .session_catalog => |plan| switch (plan) {
+            .set_search_path => |set| {
+                try std.testing.expectEqual(@as(usize, 2), set.namespaces.len);
+                try std.testing.expectEqualStrings("tenant_schema", set.namespaces[0]);
+                try std.testing.expectEqualStrings("public", set.namespaces[1]);
+                try std.testing.expect(set.local);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_app_setting = try lowerDdlPlanForTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer set_app_setting.deinit(alloc);
+    switch (set_app_setting) {
+        .session_catalog => |plan| switch (plan) {
+            .set_setting => |set| {
+                try std.testing.expectEqualStrings("app.tenant_id", set.name);
+                try std.testing.expectEqualStrings("tenant-a", set.value);
+                try std.testing.expectEqual(SessionSettingKind.app, set.kind);
+                try std.testing.expect(!set.local);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_sync_level = try lowerDdlPlanForTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
+    defer set_sync_level.deinit(alloc);
+    switch (set_sync_level) {
+        .session_catalog => |plan| switch (plan) {
+            .set_setting => |set| {
+                try std.testing.expectEqualStrings("antfly.sync_level", set.name);
+                try std.testing.expectEqualStrings("propose", set.value);
+                try std.testing.expectEqual(SessionSettingKind.antfly, set.kind);
+                try std.testing.expect(set.local);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_runtime_setting = try lowerDdlPlanForTestAlloc(alloc, "SET statement_timeout = '1ms';");
+    defer set_runtime_setting.deinit(alloc);
+    switch (set_runtime_setting) {
+        .session_catalog => |plan| switch (plan) {
+            .set_setting => |set| {
+                try std.testing.expectEqualStrings("statement_timeout", set.name);
+                try std.testing.expectEqualStrings("1ms", set.value);
+                try std.testing.expectEqual(SessionSettingKind.runtime, set.kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var reset_app_setting = try lowerDdlPlanForTestAlloc(alloc, "RESET app.tenant_id;");
+    defer reset_app_setting.deinit(alloc);
+    switch (reset_app_setting) {
+        .session_catalog => |plan| switch (plan) {
+            .reset_setting => |reset| {
+                try std.testing.expectEqualStrings("app.tenant_id", reset.name);
+                try std.testing.expectEqual(SessionSettingKind.app, reset.kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const session_commands = [_]struct {
+        sql: []const u8,
+        tag: std.meta.Tag(SessionCatalogPlan),
+    }{
+        .{ .sql = "RESET ALL;", .tag = .discard_all },
+        .{ .sql = "RESET search_path;", .tag = .reset_search_path },
+        .{ .sql = "SHOW search_path;", .tag = .show_search_path },
+        .{ .sql = "DISCARD ALL;", .tag = .discard_all },
+    };
+    for (session_commands) |case| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .session_catalog => |plan| try std.testing.expectEqual(case.tag, std.meta.activeTag(plan)),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    const unsupported = [_][]const u8{
+        "SET ROLE app_user;",
+        "SET row_security = off;",
+        "SET LOCAL lock_timeout = '5s';",
+        "SET idle_in_transaction_session_timeout = '5s';",
+        "SET default_tablespace = fastspace;",
+        "SET default_table_access_method = heap;",
+        "SET client_encoding = 'LATIN1';",
+        "SET standard_conforming_strings = off;",
+        "SET unknown_setting = 'x';",
+        "SHOW ALL;",
+        "DISCARD TEMP;",
+    };
+    for (unsupported) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, sql));
+    }
+}
+
 test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
     const alloc = std.testing.allocator;
 

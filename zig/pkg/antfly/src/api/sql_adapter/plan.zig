@@ -545,10 +545,25 @@ pub const MergeNotMatchedArm = struct {
     do_nothing: bool = false,
 };
 
+pub const LoweredDataModifyingCte = struct {
+    name: []const u8,
+    table_name: []const u8,
+    mutation: relational_rows.OwnedRowsMutationSourceRequest,
+    claim_placeholder: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.table_name);
+        self.mutation.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredMergeMutationPlan = struct {
     target_table_name: []const u8,
     source_table_name: []const u8,
     ctes: []const db_mod.types.RelationalRowsCte = &.{},
+    data_modifying_ctes: []const LoweredDataModifyingCte = &.{},
     source: db_mod.types.RelationalRowsQueryRequest = .{},
     match_fields: []const MergeFieldMapping = &.{},
     matched_arms: []const MergeMatchedArm = &.{},
@@ -564,6 +579,11 @@ pub const LoweredMergeMutationPlan = struct {
             owned.deinit(alloc);
         }
         if (self.ctes.len > 0) alloc.free(self.ctes);
+        for (self.data_modifying_ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.data_modifying_ctes.len > 0) alloc.free(self.data_modifying_ctes);
         self.source.deinit(alloc);
         freeMergeFieldMappings(alloc, self.match_fields);
         freeMergeMatchedArms(alloc, self.matched_arms);
@@ -760,7 +780,7 @@ pub fn lowerWritePlanWithParsedSqlAlloc(
         return try lowerRecursiveWritePlanWithHooksAlloc(tokens, schema, options, hooks);
     }
 
-    const write_kind = parsed_sql.tokenized_sql.write_statement_kind orelse
+    const write_kind = parsed_sql.writeStatementKind() orelse
         return try lowerRecursiveWritePlanWithHooksAlloc(tokens, schema, options, hooks);
 
     if (write_kind == .insert) {
@@ -1181,14 +1201,14 @@ pub fn parseCtesForPlanAlloc(
     return try ctes.toOwnedSlice(alloc);
 }
 
-fn lowerAntflyGraphTableFunctionCteAlloc(
+pub fn lowerAntflyGraphTableFunctionCteAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
 ) !db_mod.types.RelationalRowsTableFunction {
     return try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, tokens);
 }
 
-fn resolveTableFunctionBaseSourceTableAlloc(
+pub fn resolveTableFunctionBaseSourceTableAlloc(
     alloc: std.mem.Allocator,
     table_function: db_mod.types.RelationalRowsTableFunction,
     base_table_name: *?[]const u8,
@@ -2195,7 +2215,7 @@ pub fn relationPopulationPlanFromSyntaxAlloc(
 
 pub const RelationPopulationLoweringHooks = struct {
     ptr: *anyopaque,
-    lower_read: *const fn (*anyopaque, []const u8) anyerror!LoweredReadPlan,
+    lower_read: *const fn (*anyopaque, *const tokenized.ParsedSql) anyerror!LoweredReadPlan,
 };
 
 pub fn lowerRelationPopulationPlanWithHooksAlloc(
@@ -2203,11 +2223,9 @@ pub fn lowerRelationPopulationPlanWithHooksAlloc(
     sql: []const u8,
     hooks: RelationPopulationLoweringHooks,
 ) !LoweredRelationPopulationPlan {
-    var parsed = try grammar.parseRelationPopulationSqlAlloc(alloc, sql);
-    defer parsed.deinit(alloc);
-    var source = try hooks.lower_read(hooks.ptr, parsed.source_sql);
-    errdefer source.deinit(alloc);
-    return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &parsed_sql, hooks);
 }
 
 pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
@@ -2221,9 +2239,23 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
         parsed_sql.items()[parsed_sql.raw_statement.token_start..parsed_sql.raw_statement.token_end],
     );
     defer parsed.deinit(alloc);
-    var source = try hooks.lower_read(hooks.ptr, parsed.source_sql);
+    var parsed_source = try relationPopulationSourceParsedSqlAlloc(alloc, parsed_sql, parsed);
+    defer parsed_source.deinit(alloc);
+    var source = try hooks.lower_read(hooks.ptr, &parsed_source);
     errdefer source.deinit(alloc);
     return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
+}
+
+fn relationPopulationSourceParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parent_sql: *const tokenized.ParsedSql,
+    parsed: grammar.RelationPopulationSyntax,
+) !tokenized.ParsedSql {
+    if (parsed.source_token_start) |start| {
+        const end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
+        return try tokenized.ParsedSql.initChildStatementAlloc(alloc, parent_sql, start, end);
+    }
+    return try tokenized.ParsedSql.initAlloc(alloc, parsed.source_sql);
 }
 
 pub const ExplainFormat = ast.SqlExplainFormat;
@@ -2261,23 +2293,46 @@ pub const LoweredExplainSubject = union(enum) {
 
 pub const ExplainPlanLoweringHooks = struct {
     ptr: *anyopaque,
-    lower_read: *const fn (*anyopaque, []const u8) anyerror!LoweredReadPlan,
-    lower_write: *const fn (*anyopaque, []const u8) anyerror!LoweredWritePlan,
+    lower_read: *const fn (*anyopaque, *const tokenized.ParsedSql) anyerror!LoweredReadPlan,
+    lower_write: *const fn (*anyopaque, *const tokenized.ParsedSql) anyerror!LoweredWritePlan,
 };
 
-pub fn lowerExplainPlanWithHooksAlloc(sql: []const u8, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
-    const parsed = try grammar.parseExplainPrefix(sql);
-    return try lowerExplainPlanWithParsedPrefixAlloc(parsed, hooks);
+pub fn lowerExplainPlanWithHooksAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    hooks: ExplainPlanLoweringHooks,
+) !LoweredExplainPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerExplainPlanWithParsedSqlAlloc(alloc, &parsed_sql, hooks);
 }
 
-pub fn lowerExplainPlanWithParsedSqlAlloc(parsed_sql: *const tokenized.ParsedSql, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
-    const parsed = try grammar.parseExplainPrefix(parsed_sql.statementSql());
-    return try lowerExplainPlanWithParsedPrefixAlloc(parsed, hooks);
+pub fn lowerExplainPlanWithParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    hooks: ExplainPlanLoweringHooks,
+) !LoweredExplainPlan {
+    const statement_tokens = parsed_sql.items()[parsed_sql.raw_statement.token_start..parsed_sql.raw_statement.token_end];
+    const parsed = try grammar.parseExplainPrefixTokens(parsed_sql.sql(), statement_tokens);
+    return try lowerExplainPlanWithParsedPrefixAlloc(alloc, parsed_sql, parsed, hooks);
 }
 
-fn lowerExplainPlanWithParsedPrefixAlloc(parsed: ast.SqlExplainPrefix, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
+fn lowerExplainPlanWithParsedPrefixAlloc(
+    alloc: std.mem.Allocator,
+    parent_sql: *const tokenized.ParsedSql,
+    parsed: ast.SqlExplainPrefix,
+    hooks: ExplainPlanLoweringHooks,
+) !LoweredExplainPlan {
+    var inner_sql = try tokenized.ParsedSql.initChildStatementAlloc(
+        alloc,
+        parent_sql,
+        parsed.inner_token_start,
+        parsed.inner_token_end,
+    );
+    defer inner_sql.deinit(alloc);
+
     var read_err: ?anyerror = null;
-    if (hooks.lower_read(hooks.ptr, parsed.inner_sql)) |read| {
+    if (hooks.lower_read(hooks.ptr, &inner_sql)) |read| {
         return .{
             .analyze = parsed.analyze,
             .format = parsed.format,
@@ -2294,7 +2349,7 @@ fn lowerExplainPlanWithParsedPrefixAlloc(parsed: ast.SqlExplainPrefix, hooks: Ex
         if (!sqlWritePlanFallbackAllowed(err)) return err;
         read_err = err;
     }
-    if (hooks.lower_write(hooks.ptr, parsed.inner_sql)) |write| {
+    if (hooks.lower_write(hooks.ptr, &inner_sql)) |write| {
         return .{
             .analyze = parsed.analyze,
             .format = parsed.format,

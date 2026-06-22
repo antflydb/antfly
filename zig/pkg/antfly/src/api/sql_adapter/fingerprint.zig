@@ -2465,6 +2465,73 @@ test "sql adapter ddl fingerprint owns maintenance job ddl surfaces" {
     }
 }
 
+test "sql adapter ddl fingerprint owns bulk io ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv);",
+            .fingerprint = "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+        },
+        .{
+            .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv, HEADER true, FREEZE true, ON_ERROR ignore, REJECT_LIMIT 10, LOG_VERBOSITY verbose, FORCE_NOT_NULL (id, status), FORCE_NULL (status), DELIMITER ',', QUOTE '\"', ESCAPE '!', NULL '', DEFAULT 'n/a', ENCODING 'UTF8');",
+            .fingerprint = "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=true:freeze=true:on_error=ignore:reject_limit=10:log_verbosity=verbose:force_quote=none:force_quote_columns=0:force_not_null_columns=2:force_null_columns=1:delimiter_hex=2c:quote_hex=22:escape_hex=21:null_marker_hex=empty:default_marker_hex=6e2f61:encoding_hex=55544638:where_expressions=0",
+        },
+        .{
+            .sql = "COPY usage_records (id, status) FROM STDIN WITH (FORMAT csv) WHERE status = 'active';",
+            .fingerprint = "ddl:copy_from:table=usage_records:columns=2:endpoint=STDIN:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=none:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=1",
+        },
+        .{
+            .sql = "COPY usage_records (id, status) TO STDOUT WITH (FORMAT csv, FORCE_QUOTE *);",
+            .fingerprint = "ddl:copy_to:table=usage_records:columns=2:endpoint=STDOUT:format=csv:header=false:freeze=false:on_error=stop:reject_limit=none:log_verbosity=default:force_quote=all:force_quote_columns=0:force_not_null_columns=0:force_null_columns=0:delimiter_hex=default:quote_hex=default:escape_hex=default:null_marker_hex=default:default_marker_hex=default:encoding_hex=default:where_expressions=0",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
+test "sql adapter ddl fingerprint owns session catalog ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{ .sql = "SET LOCAL client_min_messages = warning;", .fingerprint = "adapter_noop:ddl:reason=session_setting" },
+        .{ .sql = "SET client_encoding = 'UTF8';", .fingerprint = "adapter_noop:ddl:reason=session_setting" },
+        .{ .sql = "SET search_path TO public;", .fingerprint = "ddl:session:set_search_path:namespaces=1:local=false" },
+        .{ .sql = "SET search_path TO tenant_schema, public;", .fingerprint = "ddl:session:set_search_path:namespaces=2:local=false" },
+        .{ .sql = "SET LOCAL search_path TO public;", .fingerprint = "ddl:session:set_search_path:namespaces=1:local=true" },
+        .{ .sql = "SET LOCAL search_path TO tenant_schema, public;", .fingerprint = "ddl:session:set_search_path:namespaces=2:local=true" },
+        .{ .sql = "SET app.tenant_id = 'tenant-a';", .fingerprint = "ddl:session:set_setting:setting=app.tenant_id:setting_kind=app:local=false" },
+        .{ .sql = "SET LOCAL app.tenant_id = 'tenant-b';", .fingerprint = "ddl:session:set_setting:setting=app.tenant_id:setting_kind=app:local=true" },
+        .{ .sql = "SET antfly.sync_level = 'full_index';", .fingerprint = "ddl:session:set_setting:setting=antfly.sync_level:setting_kind=antfly:local=false" },
+        .{ .sql = "SET LOCAL antfly.sync_level = 'propose';", .fingerprint = "ddl:session:set_setting:setting=antfly.sync_level:setting_kind=antfly:local=true" },
+        .{ .sql = "SET statement_timeout = '1ms';", .fingerprint = "ddl:session:set_setting:setting=statement_timeout:setting_kind=runtime:local=false" },
+        .{ .sql = "RESET app.tenant_id;", .fingerprint = "ddl:session:reset_setting:setting=app.tenant_id:setting_kind=app" },
+        .{ .sql = "RESET ALL;", .fingerprint = "ddl:session:discard_all" },
+        .{ .sql = "RESET search_path;", .fingerprint = "ddl:session:reset_search_path" },
+        .{ .sql = "RESET client_min_messages;", .fingerprint = "adapter_noop:ddl:reason=session_setting" },
+        .{ .sql = "SHOW search_path;", .fingerprint = "ddl:session:show_search_path" },
+        .{ .sql = "DISCARD ALL;", .fingerprint = "ddl:session:discard_all" },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
 test "sql adapter ddl fingerprint owns transaction protocol ddl surfaces" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {

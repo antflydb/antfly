@@ -1617,6 +1617,157 @@ fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected:
     }
 }
 
+test "catalog apply applies SQL session catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var set_tenant_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO tenant_schema, public;");
+    defer set_tenant_search_path.deinit(alloc);
+    const set_tenant_search_path_plan = switch (set_tenant_search_path) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var tenant_session = try applySessionCatalogPlanAlloc(alloc, catalog_resources.SqlCatalogSession.default(), set_tenant_search_path_plan);
+    defer tenant_session.deinit(alloc);
+    try std.testing.expectEqualStrings(catalog_resources.default_database_name, tenant_session.session().currentDatabase());
+    try std.testing.expectEqualStrings("tenant_schema", tenant_session.session().primarySearchPathNamespace());
+
+    var set_local_public_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO public;");
+    defer set_local_public_search_path.deinit(alloc);
+    const set_local_public_search_path_plan = switch (set_local_public_search_path) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_public_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_local_public_search_path_plan);
+    defer local_public_session.deinit(alloc);
+    try std.testing.expect(local_public_session.transaction_local_search_path);
+    try std.testing.expectEqualStrings("public", local_public_session.session().primarySearchPathNamespace());
+
+    var set_local_tenant_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL search_path TO tenant_schema, public;");
+    defer set_local_tenant_search_path.deinit(alloc);
+    const set_local_tenant_search_path_plan = switch (set_local_tenant_search_path) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_tenant_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_local_tenant_search_path_plan);
+    defer local_tenant_session.deinit(alloc);
+    try std.testing.expect(local_tenant_session.transaction_local_search_path);
+    try std.testing.expectEqualStrings("tenant_schema", local_tenant_session.session().primarySearchPathNamespace());
+
+    var empty_path_session = try OwnedSqlCatalogSession.fromSessionAlloc(alloc, .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{},
+    });
+    defer empty_path_session.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_ops", empty_path_session.session().currentDatabase());
+    try std.testing.expectEqual(@as(usize, 1), empty_path_session.search_path.len);
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, empty_path_session.session().primarySearchPathNamespace());
+
+    var set_app_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET app.tenant_id = 'tenant-a';");
+    defer set_app_setting.deinit(alloc);
+    const set_app_setting_plan = switch (set_app_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var app_setting_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_app_setting_plan);
+    defer app_setting_session.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant-a", app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    var set_local_app_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL app.tenant_id = 'tenant-b';");
+    defer set_local_app_setting.deinit(alloc);
+    const set_local_app_setting_plan = switch (set_local_app_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_app_setting_session = try applyOwnedSessionCatalogPlanAlloc(alloc, app_setting_session, set_local_app_setting_plan);
+    defer local_app_setting_session.deinit(alloc);
+    try std.testing.expect(local_app_setting_session.transaction_local_settings);
+    try std.testing.expectEqualStrings("tenant-b", local_app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+    try local_app_setting_session.clearTransactionLocalState(alloc);
+    try std.testing.expect(!local_app_setting_session.transaction_local_settings);
+    try std.testing.expect(local_app_setting_session.transaction_local_settings_base == null);
+    try std.testing.expectEqualStrings("tenant-a", local_app_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    var set_sync_level = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'full_index';");
+    defer set_sync_level.deinit(alloc);
+    const set_sync_level_plan = switch (set_sync_level) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var sync_level_session = try applySessionCatalogPlanAlloc(alloc, tenant_session.session(), set_sync_level_plan);
+    defer sync_level_session.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, try sqlSyncLevelFromSession(sync_level_session.session()));
+
+    var set_local_sync_level = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET LOCAL antfly.sync_level = 'propose';");
+    defer set_local_sync_level.deinit(alloc);
+    const set_local_sync_level_plan = switch (set_local_sync_level) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var local_sync_level_session = try applyOwnedSessionCatalogPlanAlloc(alloc, sync_level_session, set_local_sync_level_plan);
+    defer local_sync_level_session.deinit(alloc);
+    try std.testing.expect(local_sync_level_session.transaction_local_settings);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.propose, try sqlSyncLevelFromSession(local_sync_level_session.session()));
+    try local_sync_level_session.clearTransactionLocalState(alloc);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, try sqlSyncLevelFromSession(local_sync_level_session.session()));
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, try sqlSyncLevelFromSession(catalog_resources.SqlCatalogSession.default()));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET antfly.sync_level = 'eventual';"));
+
+    var set_runtime_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '1ms';");
+    defer set_runtime_setting.deinit(alloc);
+    const set_runtime_setting_plan = switch (set_runtime_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var runtime_setting_session = try applySessionCatalogPlanAlloc(alloc, app_setting_session.session(), set_runtime_setting_plan);
+    defer runtime_setting_session.deinit(alloc);
+    try std.testing.expectEqualStrings("1ms", runtime_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("tenant-a", runtime_setting_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), try parseSqlStatementTimeoutNs("1"));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_ms), try parseSqlStatementTimeoutNs("1ms"));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_us), try parseSqlStatementTimeoutNs("1us"));
+    try std.testing.expectEqual(@as(u64, std.time.ns_per_s), try parseSqlStatementTimeoutNs("1s"));
+    try std.testing.expectEqual(@as(u64, 60 * std.time.ns_per_s), try parseSqlStatementTimeoutNs("1min"));
+    try std.testing.expectEqual(@as(u64, 60 * 60 * std.time.ns_per_s), try parseSqlStatementTimeoutNs("1h"));
+    try std.testing.expectError(error.InvalidRoleSetting, parseSqlStatementTimeoutNs(""));
+    try std.testing.expectError(error.InvalidRoleSetting, parseSqlStatementTimeoutNs("five"));
+    try std.testing.expectError(error.InvalidRoleSetting, parseSqlStatementTimeoutNs("5fortnights"));
+    try std.testing.expectEqual(@as(?u64, std.time.ns_per_ms), try sqlStatementTimeoutNsFromSession(runtime_setting_session.session()));
+    try std.testing.expect(sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(runtime_setting_session.session()), 1_000, 1_000 + std.time.ns_per_ms));
+    try std.testing.expect(!sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(runtime_setting_session.session()), 1_000, 1_000 + std.time.ns_per_ms - 1));
+    try enforceSqlStatementTimeoutAt(runtime_setting_session.session(), 1_000, 1_000 + std.time.ns_per_ms - 1);
+    try std.testing.expectError(error.StatementTimeout, enforceSqlStatementTimeoutAt(runtime_setting_session.session(), 1_000, 1_000 + std.time.ns_per_ms));
+
+    var disable_timeout = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = '0';");
+    defer disable_timeout.deinit(alloc);
+    const disable_timeout_plan = switch (disable_timeout) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var disabled_timeout_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), disable_timeout_plan);
+    defer disabled_timeout_session.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, null), try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()));
+    try std.testing.expect(!sqlStatementTimeoutExpired(try sqlStatementTimeoutNsFromSession(disabled_timeout_session.session()), 1_000, std.math.maxInt(u64)));
+
+    var invalid_timeout = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET statement_timeout = 'five';");
+    defer invalid_timeout.deinit(alloc);
+    const invalid_timeout_plan = switch (invalid_timeout) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.InvalidRoleSetting, applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), invalid_timeout_plan));
+
+    var reset_app_setting = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "RESET app.tenant_id;");
+    defer reset_app_setting.deinit(alloc);
+    const reset_app_setting_plan = switch (reset_app_setting) {
+        .session_catalog => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    var reset_app_setting_session = try applySessionCatalogPlanAlloc(alloc, runtime_setting_session.session(), reset_app_setting_plan);
+    defer reset_app_setting_session.deinit(alloc);
+    try std.testing.expect(reset_app_setting_session.session().settingValue("app.tenant_id") == null);
+    try std.testing.expectEqualStrings("1ms", reset_app_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+}
+
 test "catalog apply creates clones and replaces public schema json" {
     const alloc = std.testing.allocator;
     var create = try lowerDdlPlanForCatalogApplyTestAlloc(
