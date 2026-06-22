@@ -5546,15 +5546,16 @@ allowed for trigger bodies. `CALL procedure_name()` executes that hook through
 the routine runtime after catalog recovery; the hook is still intentionally not
 executable through the expression-function path. Other PL/pgSQL bodies,
 including argument-bearing `PERFORM`, dynamic SQL, procedural branches, loops,
-table writes, or external side effects, still fail closed under
-`routine_body_plan` until their row inputs, side effects, dependency tracking,
-replay behavior, and repair semantics have native contracts.
+table writes, or external side effects, fail closed under `routine_body_plan`
+unless their row inputs, side effects, dependency tracking, replay behavior,
+and repair semantics have native contracts.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.
-Routine bodies and routine options that do not yet have typed metadata remain
-unsupported and are pinned in the source parity corpus under
-`routine_body_plan` and `routine_option_plan` until there is a broader native
-mutation-hook/catalog contract: deterministic hook identity, declared row
+Routine bodies and routine options are resolved only when they lower to typed
+metadata over this safe catalog/runtime subset. Bodies or options outside that
+subset are pinned in the source parity corpus under `routine_body_plan` and
+`routine_option_plan` as deliberate fail-closed classifications, preserving the
+native mutation-hook/catalog contract: deterministic hook identity, declared row
 inputs and outputs, allowed side effects, dependency tracking, schema
 promotion, authorization hooks, replay behavior, and repair/rebuild semantics.
 Storage should never execute or persist opaque PL/pgSQL bodies as part of the

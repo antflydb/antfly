@@ -10444,6 +10444,424 @@ test "sql adapter ddl plan lowers authorization catalog ddl plans" {
     }
 }
 
+test "sql adapter ddl plan lowers partition and row security catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var create_partitioned_table = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);");
+    defer create_partitioned_table.deinit(alloc);
+    switch (create_partitioned_table) {
+        .table_partition_catalog => |plan| switch (plan) {
+            .create_partitioned => |create| {
+                try std.testing.expectEqualStrings("usage_events", create.create_table.table_name);
+                try std.testing.expectEqual(TablePartitionMethod.range, create.method);
+                try std.testing.expectEqual(@as(usize, 1), create.keys.len);
+                try std.testing.expectEqualStrings("created_at", create.keys[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_table_partition = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    defer create_table_partition.deinit(alloc);
+    switch (create_table_partition) {
+        .table_partition_catalog => |plan| switch (plan) {
+            .create_partition => |create| {
+                try std.testing.expectEqualStrings("usage_events_2026", create.table_name);
+                try std.testing.expectEqualStrings("usage_events", create.parent_table_name);
+                try std.testing.expectEqualStrings("\"2026-01-01\"", create.bounds.lower_json);
+                try std.testing.expectEqualStrings("\"2027-01-01\"", create.bounds.upper_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var attach_partition = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');");
+    defer attach_partition.deinit(alloc);
+    switch (attach_partition) {
+        .table_partition_catalog => |plan| switch (plan) {
+            .attach => |attach| {
+                try std.testing.expectEqualStrings("usage_events", attach.parent_table_name);
+                try std.testing.expectEqualStrings("usage_events_2026", attach.partition_table_name);
+                try std.testing.expectEqualStrings("\"2026-01-01\"", attach.bounds.lower_json);
+                try std.testing.expectEqualStrings("\"2027-01-01\"", attach.bounds.upper_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var detach_partition = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;");
+    defer detach_partition.deinit(alloc);
+    switch (detach_partition) {
+        .table_partition_catalog => |plan| switch (plan) {
+            .detach => |detach| {
+                try std.testing.expectEqualStrings("usage_events", detach.parent_table_name);
+                try std.testing.expectEqualStrings("usage_events_2026", detach.partition_table_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var enable_row_security = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;");
+    defer enable_row_security.deinit(alloc);
+    switch (enable_row_security) {
+        .row_security_catalog => |plan| switch (plan) {
+            .alter_table => |alter| {
+                try std.testing.expect(alter.enabled);
+                try std.testing.expectEqualStrings("usage_records", alter.table_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_row_policy = try lowerDdlPlanForTestAlloc(alloc, "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));");
+    defer create_row_policy.deinit(alloc);
+    switch (create_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create| {
+                try std.testing.expectEqualStrings("usage_records_targeted_policy", create.policy_name);
+                try std.testing.expectEqualStrings("usage_records", create.table_name);
+                try std.testing.expectEqual(@as(usize, 2), create.role_targets.len);
+                try std.testing.expectEqualStrings("app_reader", create.role_targets[0]);
+                try std.testing.expectEqualStrings("app_writer", create.role_targets[1]);
+                const predicate = switch (create.predicate) {
+                    .current_setting_equals => |predicate| predicate,
+                    else => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqualStrings("tenant_id", predicate.field);
+                try std.testing.expectEqualStrings("app.tenant_id", predicate.setting_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var expression_row_policy = try lowerDdlPlanForTestAlloc(alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');");
+    defer expression_row_policy.deinit(alloc);
+    switch (expression_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .create_policy => |create| {
+                const predicate = switch (create.predicate) {
+                    .expression => |predicate| predicate,
+                    else => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, predicate.lhs.kind);
+                try std.testing.expectEqualStrings("status", predicate.lhs.operands[0].field);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_row_policy = try lowerDdlPlanForTestAlloc(alloc, "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');");
+    defer alter_row_policy.deinit(alloc);
+    switch (alter_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .alter_policy => |alter| {
+                try std.testing.expectEqualStrings("usage_records_tenant_policy", alter.policy_name);
+                try std.testing.expectEqualStrings("usage_records", alter.table_name);
+                try std.testing.expect(!alter.role_targets_present);
+                try std.testing.expect(alter.predicate == null);
+                const check_predicate = switch (alter.check_predicate orelse return error.TestUnexpectedResult) {
+                    .literal_equals => |predicate| predicate,
+                    else => return error.TestUnexpectedResult,
+                };
+                try std.testing.expectEqualStrings("status", check_predicate.field);
+                try std.testing.expectEqualStrings("\"ready\"", check_predicate.value_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_row_policy = try lowerDdlPlanForTestAlloc(alloc, "DROP POLICY usage_records_tenant_policy ON usage_records;");
+    defer drop_row_policy.deinit(alloc);
+    switch (drop_row_policy) {
+        .row_security_catalog => |plan| switch (plan) {
+            .drop_policy => |drop| {
+                try std.testing.expectEqualStrings("usage_records_tenant_policy", drop.policy_name);
+                try std.testing.expectEqualStrings("usage_records", drop.table_name);
+                try std.testing.expect(!drop.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers namespace database and tablespace catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var create_schema = try lowerDdlPlanForTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS tenant_ops;");
+    defer create_schema.deinit(alloc);
+    switch (create_schema) {
+        .schema_namespace_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("tenant_ops", create.schema_name);
+                try std.testing.expect(create.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rename_schema = try lowerDdlPlanForTestAlloc(alloc, "ALTER SCHEMA tenant_ops RENAME TO tenant_ops_archive;");
+    defer rename_schema.deinit(alloc);
+    switch (rename_schema) {
+        .schema_namespace_catalog => |plan| switch (plan) {
+            .rename => |rename| {
+                try std.testing.expectEqualStrings("tenant_ops", rename.schema_name);
+                try std.testing.expectEqualStrings("tenant_ops_archive", rename.new_schema_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_schema = try lowerDdlPlanForTestAlloc(alloc, "DROP SCHEMA IF EXISTS tenant_ops CASCADE;");
+    defer drop_schema.deinit(alloc);
+    switch (drop_schema) {
+        .schema_namespace_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("tenant_ops", drop.schema_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_database = try lowerDdlPlanForTestAlloc(alloc, "CREATE DATABASE tenant_ops;");
+    defer create_database.deinit(alloc);
+    switch (create_database) {
+        .database_catalog => |plan| switch (plan) {
+            .create => |create| try std.testing.expectEqualStrings("tenant_ops", create.database_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_database = try lowerDdlPlanForTestAlloc(alloc, "ALTER DATABASE tenant_ops SET timezone TO 'UTC';");
+    defer alter_database.deinit(alloc);
+    switch (alter_database) {
+        .database_catalog => |plan| switch (plan) {
+            .alter => |alter| {
+                try std.testing.expectEqualStrings("tenant_ops", alter.database_name);
+                try std.testing.expectEqual(@as(usize, 1), alter.operations.len);
+                const operation = switch (alter.operations[0]) {
+                    .set_parameter => |operation| operation,
+                };
+                try std.testing.expectEqualStrings("timezone", operation.name);
+                try std.testing.expectEqualStrings("\"UTC\"", operation.value_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_database = try lowerDdlPlanForTestAlloc(alloc, "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE);");
+    defer drop_database.deinit(alloc);
+    switch (drop_database) {
+        .database_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("tenant_ops", drop.database_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.force);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_tablespace = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';");
+    defer create_tablespace.deinit(alloc);
+    switch (create_tablespace) {
+        .tablespace_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("fastspace", create.tablespace_name);
+                try std.testing.expectEqualStrings("\"/var/lib/antfly/fastspace\"", create.location_json);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rename_tablespace = try lowerDdlPlanForTestAlloc(alloc, "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;");
+    defer rename_tablespace.deinit(alloc);
+    switch (rename_tablespace) {
+        .tablespace_catalog => |plan| switch (plan) {
+            .rename => |rename| {
+                try std.testing.expectEqualStrings("fastspace", rename.tablespace_name);
+                try std.testing.expectEqualStrings("fastspace_archive", rename.new_tablespace_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_tablespace = try lowerDdlPlanForTestAlloc(alloc, "DROP TABLESPACE IF EXISTS fastspace_archive;");
+    defer drop_tablespace.deinit(alloc);
+    switch (drop_tablespace) {
+        .tablespace_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("fastspace_archive", drop.tablespace_name);
+                try std.testing.expect(drop.if_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers notification and logical replication catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var listen_notification = try lowerDdlPlanForTestAlloc(alloc, "LISTEN usage_events;");
+    defer listen_notification.deinit(alloc);
+    switch (listen_notification) {
+        .notification_channel => |plan| switch (plan) {
+            .listen => |listen| try std.testing.expectEqualStrings("usage_events", listen.channel_name),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var notify_notification = try lowerDdlPlanForTestAlloc(alloc, "NOTIFY usage_events, 'updated';");
+    defer notify_notification.deinit(alloc);
+    switch (notify_notification) {
+        .notification_channel => |plan| switch (plan) {
+            .notify => |notify| {
+                try std.testing.expectEqualStrings("usage_events", notify.channel_name);
+                try std.testing.expectEqualStrings("\"updated\"", notify.payload_json orelse return error.TestUnexpectedResult);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unlisten_all_notification = try lowerDdlPlanForTestAlloc(alloc, "UNLISTEN *;");
+    defer unlisten_all_notification.deinit(alloc);
+    switch (unlisten_all_notification) {
+        .notification_channel => |plan| switch (plan) {
+            .unlisten => |unlisten| {
+                try std.testing.expect(unlisten.all);
+                try std.testing.expect(unlisten.channel_name == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_publication = try lowerDdlPlanForTestAlloc(alloc, "CREATE PUBLICATION usage_pub FOR TABLE usage_records;");
+    defer create_publication.deinit(alloc);
+    switch (create_publication) {
+        .logical_replication => |plan| switch (plan) {
+            .publication => |publication| switch (publication) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("usage_pub", create.publication_name);
+                    try std.testing.expectEqual(@as(usize, 1), create.table_names.len);
+                    try std.testing.expectEqualStrings("usage_records", create.table_names[0]);
+                    try std.testing.expect(!create.all_tables);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_publication = try lowerDdlPlanForTestAlloc(alloc, "ALTER PUBLICATION usage_pub ADD TABLE usage_events;");
+    defer alter_publication.deinit(alloc);
+    switch (alter_publication) {
+        .logical_replication => |plan| switch (plan) {
+            .publication => |publication| switch (publication) {
+                .alter => |alter| {
+                    try std.testing.expectEqualStrings("usage_pub", alter.publication_name);
+                    const tables = switch (alter.operation) {
+                        .add_tables => |tables| tables,
+                    };
+                    try std.testing.expectEqual(@as(usize, 1), tables.len);
+                    try std.testing.expectEqualStrings("usage_events", tables[0]);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_publication = try lowerDdlPlanForTestAlloc(alloc, "DROP PUBLICATION IF EXISTS usage_pub;");
+    defer drop_publication.deinit(alloc);
+    switch (drop_publication) {
+        .logical_replication => |plan| switch (plan) {
+            .publication => |publication| switch (publication) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("usage_pub", drop.publication_name);
+                    try std.testing.expect(drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_subscription = try lowerDdlPlanForTestAlloc(alloc, "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;");
+    defer create_subscription.deinit(alloc);
+    switch (create_subscription) {
+        .logical_replication => |plan| switch (plan) {
+            .subscription => |subscription| switch (subscription) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("usage_sub", create.subscription_name);
+                    try std.testing.expectEqualStrings("\"host=localhost dbname=usage\"", create.connection_json);
+                    try std.testing.expectEqual(@as(usize, 1), create.publication_names.len);
+                    try std.testing.expectEqualStrings("usage_pub", create.publication_names[0]);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_subscription = try lowerDdlPlanForTestAlloc(alloc, "ALTER SUBSCRIPTION usage_sub DISABLE;");
+    defer alter_subscription.deinit(alloc);
+    switch (alter_subscription) {
+        .logical_replication => |plan| switch (plan) {
+            .subscription => |subscription| switch (subscription) {
+                .alter => |alter| {
+                    try std.testing.expectEqualStrings("usage_sub", alter.subscription_name);
+                    try std.testing.expect(!alter.enabled);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_subscription = try lowerDdlPlanForTestAlloc(alloc, "DROP SUBSCRIPTION IF EXISTS usage_sub;");
+    defer drop_subscription.deinit(alloc);
+    switch (drop_subscription) {
+        .logical_replication => |plan| switch (plan) {
+            .subscription => |subscription| switch (subscription) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("usage_sub", drop.subscription_name);
+                    try std.testing.expect(drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     const alloc = std.testing.allocator;
 

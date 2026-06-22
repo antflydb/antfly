@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "23bf403e98045bcfd92bcb58d5cb441ce7b60d64ff886b945ba6ee0c5d7df09c",
-  "source_entry_count": 1025,
-  "entry_count": 1025,
+  "source_sha256": "370f8be41734392234317d47fb9a7f2c3f26af7f34095255810bdda16e800f74",
+  "source_entry_count": 1026,
+  "entry_count": 1026,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -5939,6 +5939,13 @@
       "plan": "unsupported:read:requires=duplicate_output_name",
       "classification_reason": "duplicate_output_name",
       "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
+    },
+    {
+      "name": "aggregate duplicate output name fails closed",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=aggregate_duplicate_output_name",
+      "classification_reason": "aggregate_duplicate_output_name",
+      "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id"
     },
     {
       "name": "ordered-set mode aggregate",

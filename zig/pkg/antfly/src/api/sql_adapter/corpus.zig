@@ -4555,6 +4555,7 @@ fn expectSourceCorpusNativeRequirements(
     alloc: std.mem.Allocator,
     entries: []const AppParityCorpusEntry,
     required: []const []const u8,
+    resolved: []const AppParityResolvedRequirement,
 ) !void {
     if (required.len == 0) return error.TestUnexpectedResult;
     var seen = std.StringHashMapUnmanaged(void){};
@@ -4565,7 +4566,7 @@ fn expectSourceCorpusNativeRequirements(
         if (corpusPlanFamilyIsInvalid(entry.family)) continue;
         const reason = diagnostics.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
         if (!diagnostics.classificationReasonIsUnsupportedRequirement(reason)) continue;
-        if (!stringListContains(required, entry.classification_reason)) {
+        if (!stringListContains(required, entry.classification_reason) and !resolvedRequirementContains(resolved, entry.classification_reason)) {
             std.debug.print("unlisted source corpus native requirement: {s}\n", .{entry.classification_reason});
             return error.TestUnexpectedResult;
         }
@@ -4586,8 +4587,10 @@ test "sql adapter source corpus covers required native requirement classificatio
     defer source.deinit(alloc);
     var requirements = try parseAppParityNativeRequirementsAlloc(alloc);
     defer requirements.deinit(alloc);
+    var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved.deinit(alloc);
 
-    try expectSourceCorpusNativeRequirements(alloc, source.root.entries, requirements.root.required);
+    try expectSourceCorpusNativeRequirements(alloc, source.root.entries, requirements.root.required, resolved.root.resolved);
 }
 
 test "sql adapter corpus validates native requirement manifest" {
@@ -4647,11 +4650,20 @@ test "sql adapter corpus validates native requirement manifest" {
     };
     try std.testing.expectError(
         error.TestUnexpectedResult,
-        expectSourceCorpusNativeRequirements(alloc, &entries, &.{ "aggregate_duplicate_output_name", "bulk_io_plan" }),
+        expectSourceCorpusNativeRequirements(alloc, &entries, &.{ "aggregate_duplicate_output_name", "bulk_io_plan" }, &.{}),
     );
     try std.testing.expectError(
         error.TestUnexpectedResult,
-        expectSourceCorpusNativeRequirements(alloc, &entries, &.{"aggregate_duplicate_output_name"}),
+        expectSourceCorpusNativeRequirements(alloc, &entries, &.{"aggregate_duplicate_output_name"}, &.{}),
+    );
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectSourceCorpusNativeRequirements(
+            alloc,
+            &entries,
+            &.{"aggregate_duplicate_output_name"},
+            &.{.{ .reason = "bulk_io_plan", .coverage = &.{"ddl_copy_from_execution_contract"} }},
+        ),
     );
 }
 
@@ -4685,13 +4697,14 @@ fn expectNativeRequirementPolicyComplete(
     if (unresolved.len == 0 or resolved.len == 0) return error.TestUnexpectedResult;
     inline for (std.meta.fields(diagnostics.SqlAdapterClassificationReason)) |field| {
         const reason: diagnostics.SqlAdapterClassificationReason = @enumFromInt(field.value);
-        if (!diagnostics.classificationReasonIsUnsupportedRequirement(reason)) continue;
-        const name = diagnostics.classificationReasonToken(reason);
-        const is_unresolved = stringListContains(unresolved, name);
-        const is_resolved = resolvedRequirementContains(resolved, name);
-        if (is_unresolved == is_resolved) {
-            std.debug.print("native requirement policy must classify exactly once: {s}\n", .{name});
-            return error.TestUnexpectedResult;
+        if (diagnostics.classificationReasonIsUnsupportedRequirement(reason)) {
+            const name = diagnostics.classificationReasonToken(reason);
+            const is_unresolved = stringListContains(unresolved, name);
+            const is_resolved = resolvedRequirementContains(resolved, name);
+            if (is_unresolved == is_resolved) {
+                std.debug.print("native requirement policy must classify exactly once: {s}\n", .{name});
+                return error.TestUnexpectedResult;
+            }
         }
     }
 }
@@ -6030,6 +6043,8 @@ pub const AppParityCorpusCoverage = struct {
     delete_joined_source_cte_mutation: bool = false,
     adapter_noop_ddl: bool = false,
     unsupported_read: bool = false,
+    unsupported_read_aggregate_duplicate_output_name: bool = false,
+    unsupported_read_duplicate_output_name: bool = false,
     unsupported_ddl: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
@@ -7329,6 +7344,10 @@ pub const AppParityCorpusCoverage = struct {
             },
         }
         if (entry.family == .unsupported_read) {
+            self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
+                std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
+            self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or
+                std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);

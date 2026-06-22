@@ -2177,3 +2177,204 @@ test "sql adapter ddl fingerprint owns authorization catalog ddl surfaces" {
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
 }
+
+test "sql adapter ddl fingerprint owns partition and row security catalog ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "CREATE TABLE usage_events (tenant_id text, id uuid, created_at timestamptz, PRIMARY KEY (tenant_id, id)) PARTITION BY RANGE (created_at);",
+            .fingerprint = "ddl:create_partitioned_table:table=usage_events:columns=3:method=range:keys=1",
+        },
+        .{
+            .sql = "CREATE TABLE usage_events_2026 PARTITION OF usage_events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');",
+            .fingerprint = "ddl:create_table_partition:table=usage_events_2026:parent=usage_events:lower=\"2026-01-01\":upper=\"2027-01-01\"",
+        },
+        .{
+            .sql = "ALTER TABLE usage_events ATTACH PARTITION usage_events_2026 FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');",
+            .fingerprint = "ddl:attach_table_partition:parent=usage_events:partition=usage_events_2026:lower=\"2026-01-01\":upper=\"2027-01-01\"",
+        },
+        .{
+            .sql = "ALTER TABLE usage_events DETACH PARTITION usage_events_2026;",
+            .fingerprint = "ddl:detach_table_partition:parent=usage_events:partition=usage_events_2026",
+        },
+        .{
+            .sql = "ALTER TABLE usage_records ENABLE ROW LEVEL SECURITY;",
+            .fingerprint = "ddl:enable_row_security:table=usage_records",
+        },
+        .{
+            .sql = "ALTER TABLE usage_records DISABLE ROW LEVEL SECURITY;",
+            .fingerprint = "ddl:disable_row_security:table=usage_records",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_tenant_policy ON usage_records USING (tenant_id = current_setting('app.tenant_id'));",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_targeted_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:roles=2:role=app_reader:role=app_writer",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_active_policy ON usage_records USING (status = 'active');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_active_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_write_policy ON usage_records USING (tenant_id = 'tenant-a') WITH CHECK (status = 'active');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_write_policy:table=usage_records:kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:check=kind=literal_eq:field=status:value_json_hex=2261637469766522",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_compound_policy ON usage_records USING (tenant_id = 'tenant-a' AND status = 'active');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_compound_policy:table=usage_records:kind=and:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=literal_eq:field=status:value_json_hex=2261637469766522",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_or_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_or_policy:table=usage_records:kind=or:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=literal_eq:field=status:value_json_hex=2261637469766522",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_mixed_policy ON usage_records USING (tenant_id = 'tenant-a' OR status = 'active' AND region = 'us');",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_mixed_policy:table=usage_records:kind=or:terms=2:term=kind=literal_eq:field=tenant_id:value_json_hex=2274656e616e742d6122:term=kind=and:terms=2:term=kind=literal_eq:field=status:value_json_hex=2261637469766522:term=kind=literal_eq:field=region:value_json_hex=22757322",
+        },
+        .{
+            .sql = "ALTER POLICY usage_records_tenant_policy ON usage_records USING (status = 'active');",
+            .fingerprint = "ddl:alter_row_policy:policy=usage_records_tenant_policy:table=usage_records:kind=literal_eq:field=status:value_json_hex=2261637469766522",
+        },
+        .{
+            .sql = "ALTER POLICY usage_records_tenant_policy ON usage_records TO app_writer;",
+            .fingerprint = "ddl:alter_row_policy:policy=usage_records_tenant_policy:table=usage_records:roles=1:role=app_writer",
+        },
+        .{
+            .sql = "ALTER POLICY usage_records_tenant_policy ON usage_records WITH CHECK (status = 'ready');",
+            .fingerprint = "ddl:alter_row_policy:policy=usage_records_tenant_policy:table=usage_records:check=kind=literal_eq:field=status:value_json_hex=22726561647922",
+        },
+        .{
+            .sql = "DROP POLICY usage_records_tenant_policy ON usage_records;",
+            .fingerprint = "ddl:drop_row_policy:policy=usage_records_tenant_policy:table=usage_records:if_exists=false",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+
+    var expression_policy = try lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE POLICY usage_records_lower_policy ON usage_records USING (lower(status) = 'active');");
+    defer expression_policy.deinit(alloc);
+    const expression_fingerprint = try ddlFingerprintAlloc(alloc, expression_policy);
+    defer alloc.free(expression_fingerprint);
+    try std.testing.expect(std.mem.indexOf(u8, expression_fingerprint, "ddl:create_row_policy:policy=usage_records_lower_policy:table=usage_records:kind=expression:json_hex=") != null);
+}
+
+test "sql adapter ddl fingerprint owns namespace database and tablespace catalog ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "CREATE SCHEMA IF NOT EXISTS tenant_ops;",
+            .fingerprint = "ddl:create_schema_namespace:schema=tenant_ops:if_not_exists=true",
+        },
+        .{
+            .sql = "ALTER SCHEMA tenant_ops RENAME TO tenant_ops_archive;",
+            .fingerprint = "ddl:rename_schema_namespace:schema=tenant_ops:new=tenant_ops_archive",
+        },
+        .{
+            .sql = "DROP SCHEMA IF EXISTS tenant_ops CASCADE;",
+            .fingerprint = "ddl:drop_schema_namespace:schema=tenant_ops:if_exists=true:cascade=true",
+        },
+        .{
+            .sql = "CREATE DATABASE tenant_ops;",
+            .fingerprint = "ddl:create_database:database=tenant_ops",
+        },
+        .{
+            .sql = "ALTER DATABASE tenant_ops SET timezone TO 'UTC';",
+            .fingerprint = "ddl:alter_database:database=tenant_ops:ops=1",
+        },
+        .{
+            .sql = "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE);",
+            .fingerprint = "ddl:drop_database:database=tenant_ops:if_exists=true:force=true",
+        },
+        .{
+            .sql = "CREATE TABLESPACE fastspace LOCATION '/var/lib/antfly/fastspace';",
+            .fingerprint = "ddl:create_tablespace:tablespace=fastspace:location=true",
+        },
+        .{
+            .sql = "ALTER TABLESPACE fastspace RENAME TO fastspace_archive;",
+            .fingerprint = "ddl:rename_tablespace:tablespace=fastspace:new=fastspace_archive",
+        },
+        .{
+            .sql = "DROP TABLESPACE IF EXISTS fastspace_archive;",
+            .fingerprint = "ddl:drop_tablespace:tablespace=fastspace_archive:if_exists=true",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
+test "sql adapter ddl fingerprint owns notification and logical replication ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "LISTEN usage_events;",
+            .fingerprint = "ddl:listen_notification:channel=usage_events",
+        },
+        .{
+            .sql = "NOTIFY usage_events, 'updated';",
+            .fingerprint = "ddl:notify_notification:channel=usage_events:payload=true",
+        },
+        .{
+            .sql = "UNLISTEN usage_events;",
+            .fingerprint = "ddl:unlisten_notification:channel=usage_events",
+        },
+        .{
+            .sql = "UNLISTEN *;",
+            .fingerprint = "ddl:unlisten_notification:all=true",
+        },
+        .{
+            .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records;",
+            .fingerprint = "ddl:create_publication:publication=usage_pub:tables=1:all=false",
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_events;",
+            .fingerprint = "ddl:alter_publication:publication=usage_pub:add_tables=1",
+        },
+        .{
+            .sql = "DROP PUBLICATION IF EXISTS usage_pub;",
+            .fingerprint = "ddl:drop_publication:publication=usage_pub:if_exists=true",
+        },
+        .{
+            .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;",
+            .fingerprint = "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub DISABLE;",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:enabled=false",
+        },
+        .{
+            .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub;",
+            .fingerprint = "ddl:drop_subscription:subscription=usage_sub:if_exists=true",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}

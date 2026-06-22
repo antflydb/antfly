@@ -6373,6 +6373,13 @@
       "sql": "SELECT id, row_number() OVER (ORDER BY amount DESC) AS id FROM usage_records"
     },
     {
+      "name": "aggregate duplicate output name fails closed",
+      "family": "unsupported_read",
+      "classification_reason": "aggregate_duplicate_output_name",
+      "plan": "unsupported:read:requires=aggregate_duplicate_output_name",
+      "sql": "SELECT customer_id, COUNT(*) AS customer_id FROM usage_records GROUP BY customer_id"
+    },
+    {
       "name": "ordered-set mode aggregate",
       "family": "aggregate",
       "summary": {

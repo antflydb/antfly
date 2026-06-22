@@ -2,6 +2,12 @@
   "resolution_format": 1,
   "resolved": [
     {
+      "reason": "aggregate_duplicate_output_name",
+      "coverage": [
+        "unsupported_read_aggregate_duplicate_output_name"
+      ]
+    },
+    {
       "reason": "bulk_io_plan",
       "coverage": [
         "ddl_copy_binary_execution_contract",
@@ -23,6 +29,12 @@
       ]
     },
     {
+      "reason": "duplicate_output_name",
+      "coverage": [
+        "unsupported_read_duplicate_output_name"
+      ]
+    },
+    {
       "reason": "duplicate_row_batch_target",
       "coverage": [
         "invalid_duplicate_row_batch_target"
@@ -32,6 +44,16 @@
       "reason": "duplicate_update_target",
       "coverage": [
         "invalid_duplicate_update_target"
+      ]
+    },
+    {
+      "reason": "enforced_unique_conflict_target",
+      "coverage": [
+        "schema_expression_unique_conflict_target",
+        "schema_mixed_expression_unique_conflict_target",
+        "schema_partial_unique_conflict_target",
+        "schema_unique_conflict_target",
+        "unsupported_unvalidated_unique_conflict_target"
       ]
     },
     {
@@ -47,13 +69,15 @@
       ]
     },
     {
-      "reason": "enforced_unique_conflict_target",
+      "reason": "multi_output_subquery_delete_selector",
       "coverage": [
-        "schema_expression_unique_conflict_target",
-        "schema_mixed_expression_unique_conflict_target",
-        "schema_partial_unique_conflict_target",
-        "schema_unique_conflict_target",
-        "unsupported_unvalidated_unique_conflict_target"
+        "invalid_delete_multi_output_subquery_selector"
+      ]
+    },
+    {
+      "reason": "multi_output_subquery_update_selector",
+      "coverage": [
+        "invalid_update_multi_output_subquery_selector"
       ]
     },
     {
@@ -76,6 +100,22 @@
       "coverage": [
         "ddl_role_alter_runtime_reset",
         "ddl_role_alter_runtime_setting"
+      ]
+    },
+    {
+      "reason": "routine_body_plan",
+      "coverage": [
+        "ddl_function_trigger_perform_body",
+        "ddl_procedure_noop_body",
+        "ddl_procedure_perform_body",
+        "unsupported_ddl_routine_function_body",
+        "unsupported_ddl_routine_procedure_body"
+      ]
+    },
+    {
+      "reason": "routine_option_plan",
+      "coverage": [
+        "unsupported_ddl_routine_option"
       ]
     },
     {

@@ -2,8 +2,6 @@
   "requirement_format": 1,
   "required": [
     "cte_mutation_source_plan",
-    "multi_table_generation_barrier",
-    "routine_body_plan",
-    "routine_option_plan"
+    "multi_table_generation_barrier"
   ]
 }
