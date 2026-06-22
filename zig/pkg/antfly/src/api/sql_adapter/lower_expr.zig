@@ -23,6 +23,7 @@ const lexer = @import("lexer.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../../platform/time.zig");
+const query_function = @import("query_function.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
@@ -15274,6 +15275,109 @@ pub fn simpleSelectProjectionsEqual(
     return true;
 }
 
+const DirectGraphTableFunctionSource = struct {
+    cte: db_mod.types.RelationalRowsCte,
+    table_ref: plan_mod.TableAlias,
+    function_start: usize,
+    source_end: usize,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        var cte = self.cte;
+        cte.deinit(alloc);
+        plan_mod.freeTableAlias(alloc, self.table_ref);
+        self.* = undefined;
+    }
+};
+
+fn cloneTableAliasAlloc(alloc: std.mem.Allocator, value: plan_mod.TableAlias) !plan_mod.TableAlias {
+    const name = try alloc.dupe(u8, value.name);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const alias = try alloc.dupe(u8, value.alias);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(alias);
+    name_transferred = true;
+    alias_transferred = true;
+    return .{ .name = name, .alias = alias };
+}
+
+fn parseDirectGraphTableFunctionSourceAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    select_body_pos: usize,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+) !?DirectGraphTableFunctionSource {
+    const from_index = parser.findTopLevelKeywordFromIndex(tokens, select_body_pos, "from") orelse return null;
+    const function_start = from_index + 1;
+    if (function_start + 1 >= tokens.len) return null;
+    if (tokens[function_start].kind != .identifier or tokens[function_start + 1].kind != .lparen) return null;
+    const function = query_function.antflyQueryFunctionFromSqlName(tokens[function_start].text) orelse return null;
+    switch (function) {
+        .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {},
+        else => return null,
+    }
+    const close_index = parser.findMatchingRParenIndex(tokens, function_start + 1) orelse return error.UnsupportedSqlShape;
+    const function_end = close_index + 1;
+
+    var alias_pos = function_end;
+    const explicit_alias = parser.matchKeyword(tokens, &alias_pos, "as");
+    const alias_source = if (explicit_alias) blk: {
+        if (alias_pos >= tokens.len or tokens[alias_pos].kind != .identifier) return error.UnsupportedSqlShape;
+        const alias = tokens[alias_pos].text;
+        alias_pos += 1;
+        break :blk alias;
+    } else if (alias_pos < tokens.len and
+        tokens[alias_pos].kind == .identifier and
+        !plan_mod.selectSourceAliasTailKeyword(tokens[alias_pos].text))
+    blk: {
+        const alias = tokens[alias_pos].text;
+        alias_pos += 1;
+        break :blk alias;
+    } else "__antfly_graph_table_function";
+
+    if (plan_mod.findCteByName(available_ctes, alias_source) != null) return error.UnsupportedSqlShape;
+    var wrapped = std.ArrayListUnmanaged(Token).empty;
+    defer wrapped.deinit(alloc);
+    try wrapped.append(alloc, .{ .kind = .identifier, .text = "select" });
+    try wrapped.append(alloc, .{ .kind = .star, .text = "*" });
+    try wrapped.append(alloc, .{ .kind = .identifier, .text = "from" });
+    try wrapped.appendSlice(alloc, tokens[function_start..function_end]);
+
+    const table_function = try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, wrapped.items);
+    var table_function_transferred = false;
+    errdefer if (!table_function_transferred) {
+        var owned = table_function;
+        owned.deinit(alloc);
+    };
+
+    const cte_name = try alloc.dupe(u8, alias_source);
+    var cte_name_transferred = false;
+    errdefer if (!cte_name_transferred) alloc.free(cte_name);
+    const table_name = try alloc.dupe(u8, alias_source);
+    var table_name_transferred = false;
+    errdefer if (!table_name_transferred) alloc.free(table_name);
+    const table_alias = try alloc.dupe(u8, alias_source);
+    var table_alias_transferred = false;
+    errdefer if (!table_alias_transferred) alloc.free(table_alias);
+
+    table_function_transferred = true;
+    cte_name_transferred = true;
+    table_name_transferred = true;
+    table_alias_transferred = true;
+    return .{
+        .cte = .{
+            .name = cte_name,
+            .table_function = table_function,
+        },
+        .table_ref = .{
+            .name = table_name,
+            .alias = table_alias,
+        },
+        .function_start = function_start,
+        .source_end = alias_pos,
+    };
+}
+
 pub fn parseSelectAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -15286,7 +15390,16 @@ pub fn parseSelectAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
 
-    const inferred_table_ref = try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
+    var direct_graph_source = try parseDirectGraphTableFunctionSourceAlloc(alloc, tokens, pos.*, options.available_ctes);
+    var direct_graph_source_transferred = false;
+    defer if (!direct_graph_source_transferred) {
+        if (direct_graph_source) |*source| source.deinit(alloc);
+    };
+
+    const inferred_table_ref = if (direct_graph_source) |source|
+        try cloneTableAliasAlloc(alloc, source.table_ref)
+    else
+        try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
     defer if (inferred_table_ref) |value| plan_mod.freeTableAlias(alloc, value);
     var inferred_qualifiers: [2][]const u8 = undefined;
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
@@ -15294,9 +15407,14 @@ pub fn parseSelectAlloc(
     if (inferred_table_ref) |value| {
         inferred_qualifiers = .{ value.name, value.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
-        if (plan_mod.findCteByName(options.available_ctes, value.name) != null) {
-            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, initial_context.schema, options.available_ctes);
+        if (direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, value.name) != null) {
+            const ctes = if (direct_graph_source) |*source| source_ctes: {
+                const implicit_ctes = [_]db_mod.types.RelationalRowsCte{source.cte};
+                break :source_ctes implicit_ctes[0..];
+            } else options.available_ctes;
+            planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, initial_context.schema, ctes);
             current_context.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, value.name) orelse return error.UnsupportedSqlShape;
+            current_context.defer_row_expression_field_validation = true;
         }
         options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     }
@@ -15338,7 +15456,11 @@ pub fn parseSelectAlloc(
     defer if (select.outputs.len > 0) alloc.free(select.outputs);
 
     try parser.expectKeyword(tokens, pos, "from");
-    const table_ref = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    const table_ref = if (direct_graph_source) |source| table_ref: {
+        if (pos.* != source.function_start) return error.UnsupportedSqlShape;
+        pos.* = source.source_end;
+        break :table_ref try cloneTableAliasAlloc(alloc, source.table_ref);
+    } else try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     errdefer alloc.free(table_ref.name);
     defer alloc.free(table_ref.alias);
     if (inferred_table_ref) |value| {
@@ -15347,7 +15469,7 @@ pub fn parseSelectAlloc(
         inferred_qualifiers = .{ table_ref.name, table_ref.alias };
         current_context.field_expression_qualifiers = inferred_qualifiers[0..];
     }
-    const source_is_cte = plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
+    const source_is_cte = direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, table_ref.name) != null;
     if (source_is_cte) current_context.defer_row_expression_field_validation = true;
     options.context_hooks.set_context(options.context_hooks.ptr, current_context);
     const system_time_as_of_sequence = try parseOptionalSystemTimeAsOfSequence(tokens, pos);
@@ -15529,9 +15651,19 @@ pub fn parseSelectAlloc(
         if (order_by.items.len == 0) return error.UnsupportedSqlShape;
         try validateDistinctOnOrder(distinct_on, order_by.items);
     }
+    const ctes = if (direct_graph_source) |*source| ctes: {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsCte, 1);
+        out[0] = source.cte;
+        source.cte = .{ .name = "" };
+        direct_graph_source_transferred = true;
+        plan_mod.freeTableAlias(alloc, source.table_ref);
+        source.table_ref = .{ .name = "", .alias = "" };
+        break :ctes out;
+    } else &.{};
 
     return .{
         .table_name = table_ref.name,
+        .ctes = ctes,
         .query = .{
             .predicates = try predicates.toOwnedSlice(alloc),
             .array_any = try array_any.toOwnedSlice(alloc),
@@ -17299,20 +17431,39 @@ pub fn parseQueryPlanAlloc(
         var lowered = try parseQueryPlanSelectWithContext(query_hooks, &.{}, true, false);
         errdefer lowered.deinit(alloc);
         if (!parser.atEnd(tokens, pos.*)) {
+            if (lowered.ctes.len != 0) return error.UnsupportedSqlShape;
             const op = try grammar.parseSelectSetOperation(tokens, pos);
             var rhs = try parseQueryPlanSelectWithContext(query_hooks, &.{}, false, true);
             defer rhs.deinit(alloc);
+            if (rhs.ctes.len != 0) return error.UnsupportedSqlShape;
             if (lowered.system_time_as_of_sequence != null or rhs.system_time_as_of_sequence != null) return error.UnsupportedSqlShape;
             try applySimpleSelectSetOperationAlloc(alloc, &lowered, rhs, op);
             try plan_mod.parseSimpleSelectSetResultTailAlloc(alloc, tokens, pos, params, &lowered, tail_hooks);
         }
-        const table_name = lowered.table_name;
+        var base_table_name: ?[]const u8 = null;
+        defer if (base_table_name) |table| alloc.free(table);
+        if (lowered.ctes.len != 0) try plan_mod.resolveSelectSourceForPlanAlloc(alloc, &lowered, lowered.ctes, &base_table_name);
+        const table_name = if (lowered.ctes.len != 0) blk: {
+            const base = base_table_name orelse return error.UnsupportedSqlShape;
+            base_table_name = null;
+            alloc.free(lowered.table_name);
+            lowered.table_name = "";
+            break :blk base;
+        } else blk: {
+            const table = lowered.table_name;
+            lowered.table_name = "";
+            break :blk table;
+        };
+        const ctes = lowered.ctes;
         const system_time_as_of_sequence = lowered.system_time_as_of_sequence;
-        lowered.table_name = "";
+        lowered.ctes = &.{};
         lowered.clearSelectOutputs(alloc);
         return .{
             .table_name = table_name,
-            .plan = .{ .query = lowered.query },
+            .plan = .{
+                .ctes = ctes,
+                .query = lowered.query,
+            },
             .system_time_as_of_sequence = system_time_as_of_sequence,
         };
     }

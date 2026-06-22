@@ -12127,6 +12127,22 @@ test "postgres sql adapter lowers equality join queries" {
     try std.testing.expectEqual(@as(usize, 1), graph_cte_read.query.order_by.len);
     try std.testing.expectEqualStrings("score", graph_cte_read.query.order_by[0].field);
 
+    var graph_direct_read = try lowerQueryPlanAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm WHERE graph_name = 'graph_match' ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_direct_read.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_direct_read.table_name);
+    try std.testing.expectEqual(@as(usize, 1), graph_direct_read.plan.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_direct_read.plan.ctes[0].name);
+    try std.testing.expect(graph_direct_read.plan.ctes[0].table_function != null);
+    try std.testing.expectEqualStrings("gm", graph_direct_read.plan.query.source_cte);
+    try std.testing.expectEqual(@as(usize, 2), graph_direct_read.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", graph_direct_read.plan.query.select[0]);
+    try std.testing.expectEqualStrings("score", graph_direct_read.plan.query.select[1]);
+
     var inner_lowered = try lowerJoinAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
