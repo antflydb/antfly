@@ -4838,14 +4838,18 @@
         "table_name": "audit_perform_body",
         "operations": 0
       },
-      "plan": "ddl:create_function:name=audit_perform_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log",
+      "plan": "ddl:create_function:name=audit_perform_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log:perform_args=0",
       "sql": "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$"
     },
     {
-      "name": "unsupported create function executable argument side-effect body",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=routine_body_plan",
-      "classification_reason": "routine_body_plan",
+      "name": "create trigger argument perform function body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_function",
+        "table_name": "audit_perform_arg_body",
+        "operations": 0
+      },
+      "plan": "ddl:create_function:name=audit_perform_arg_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log:perform_args=1:arg=1",
       "sql": "CREATE FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(1); RETURN NEW; END$$"
     },
     {
@@ -4918,7 +4922,7 @@
         "table_name": "rotate_usage_perform",
         "operations": 0
       },
-      "plan": "ddl:create_procedure:name=rotate_usage_perform:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now",
+      "plan": "ddl:create_procedure:name=rotate_usage_perform:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now:perform_args=0",
       "sql": "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$"
     },
     {
@@ -4933,10 +4937,14 @@
       "sql": "CALL rotate_usage()"
     },
     {
-      "name": "unsupported create procedure executable argument statement body",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=routine_body_plan",
-      "classification_reason": "routine_body_plan",
+      "name": "create argument perform procedure body catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_procedure",
+        "table_name": "rotate_usage_perform_arg",
+        "operations": 0
+      },
+      "plan": "ddl:create_procedure:name=rotate_usage_perform_arg:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now:perform_args=1:arg=1",
       "sql": "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$"
     },
     {

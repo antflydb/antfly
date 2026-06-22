@@ -1370,15 +1370,30 @@ pub const RoutineExecutionHook = enum {
     procedure_noop,
 };
 
+pub const RoutinePerformCall = struct {
+    routine_name: []const u8,
+    argument_json: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.routine_name));
+        freeStringSlice(alloc, self.argument_json);
+        self.* = undefined;
+    }
+};
+
 pub const RoutineBodyPlan = struct {
     kind: RoutineBodyKind,
     hook: RoutineExecutionHook,
     expression: ?db_mod.types.RelationalRowsExpression = null,
-    perform_routines: []const []const u8 = &.{},
+    perform_calls: []const RoutinePerformCall = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
-        freeStringSlice(alloc, self.perform_routines);
+        for (self.perform_calls) |*call| {
+            var owned = call.*;
+            owned.deinit(alloc);
+        }
+        if (self.perform_calls.len > 0) alloc.free(self.perform_calls);
         self.* = undefined;
     }
 };
@@ -10258,8 +10273,9 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
                 try std.testing.expectEqual(RoutineBodyKind.plpgsql_trigger, body.kind);
                 try std.testing.expectEqual(RoutineExecutionHook.trigger_return_new, body.hook);
                 try std.testing.expect(body.expression == null);
-                try std.testing.expectEqual(@as(usize, 1), body.perform_routines.len);
-                try std.testing.expectEqualStrings("audit_log", body.perform_routines[0]);
+                try std.testing.expectEqual(@as(usize, 1), body.perform_calls.len);
+                try std.testing.expectEqualStrings("audit_log", body.perform_calls[0].routine_name);
+                try std.testing.expectEqual(@as(usize, 0), body.perform_calls[0].argument_json.len);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -10293,8 +10309,9 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
                 const body = create.body orelse return error.TestUnexpectedResult;
                 try std.testing.expectEqual(RoutineBodyKind.plpgsql_procedure, body.kind);
                 try std.testing.expectEqual(RoutineExecutionHook.procedure_noop, body.hook);
-                try std.testing.expectEqual(@as(usize, 1), body.perform_routines.len);
-                try std.testing.expectEqualStrings("rotate_usage_now", body.perform_routines[0]);
+                try std.testing.expectEqual(@as(usize, 1), body.perform_calls.len);
+                try std.testing.expectEqualStrings("rotate_usage_now", body.perform_calls[0].routine_name);
+                try std.testing.expectEqual(@as(usize, 0), body.perform_calls[0].argument_json.len);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -10328,7 +10345,21 @@ test "sql adapter ddl plan lowers routine catalog ddl plans" {
     }
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;"));
+    var create_procedure_arg = try lowerDdlPlanForTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;");
+    defer create_procedure_arg.deinit(alloc);
+    switch (create_procedure_arg) {
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| {
+                const body = create.body orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), body.perform_calls.len);
+                try std.testing.expectEqualStrings("rotate_usage_now", body.perform_calls[0].routine_name);
+                try std.testing.expectEqual(@as(usize, 1), body.perform_calls[0].argument_json.len);
+                try std.testing.expectEqualStrings("1", body.perform_calls[0].argument_json[0]);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CALL rotate_usage(1);"));
 }
 

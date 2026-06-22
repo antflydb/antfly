@@ -18,6 +18,7 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const fingerprint = @import("fingerprint.zig");
 const lower_expr = @import("lower_expr.zig");
 const mem_backend = @import("../../storage/mem_backend.zig");
 const parser_context = @import("parser_context.zig");
@@ -1766,6 +1767,139 @@ test "catalog apply applies SQL session catalog plans" {
     defer reset_app_setting_session.deinit(alloc);
     try std.testing.expect(reset_app_setting_session.session().settingValue("app.tenant_id") == null);
     try std.testing.expectEqualStrings("1ms", reset_app_setting_session.session().settingValue("statement_timeout") orelse return error.TestUnexpectedResult);
+}
+
+test "catalog apply applies adapter noops and comment ddl to public schema json" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        \\CREATE TABLE users (
+        \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  email text COLLATE "C",
+        \\  attrs jsonb,
+        \\  tags text[],
+        \\  updated_at_ns bigint DEFAULT 0,
+        \\  current_day_ns date DEFAULT CURRENT_DATE,
+        \\  CONSTRAINT users_tenant_email_key UNIQUE (tenant_id, email),
+        \\  CONSTRAINT users_updated_check CHECK (updated_at_ns >= 0)
+        \\);
+        ,
+    );
+    defer create.deinit(alloc);
+
+    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create);
+    defer applied.deinit(alloc);
+
+    var create_public_schema = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE SCHEMA IF NOT EXISTS public;");
+    defer create_public_schema.deinit(alloc);
+    const create_public_schema_noop = switch (create_public_schema) {
+        .adapter_noop => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.schema_namespace, create_public_schema_noop.reason);
+    const create_public_schema_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_public_schema);
+    defer alloc.free(create_public_schema_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=schema_namespace", create_public_schema_fingerprint);
+    var public_schema_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_public_schema);
+    defer public_schema_applied.deinit(alloc);
+    try std.testing.expectEqualStrings(applied.schema_json, public_schema_applied.schema_json);
+
+    var create_extension = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto;");
+    defer create_extension.deinit(alloc);
+    const create_extension_noop = switch (create_extension) {
+        .adapter_noop => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, create_extension_noop.reason);
+    const create_extension_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_extension);
+    defer alloc.free(create_extension_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_extension_fingerprint);
+    var extension_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, create_extension);
+    defer extension_applied.deinit(alloc);
+    try std.testing.expectEqualStrings(applied.schema_json, extension_applied.schema_json);
+
+    var create_public_extension = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;");
+    defer create_public_extension.deinit(alloc);
+    const create_public_extension_noop = switch (create_public_extension) {
+        .adapter_noop => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(ddl_plan.AdapterNoopDdlReason.extension, create_public_extension_noop.reason);
+    const create_public_extension_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, create_public_extension);
+    defer alloc.free(create_public_extension_fingerprint);
+    try std.testing.expectEqualStrings("adapter_noop:ddl:reason=extension", create_public_extension_fingerprint);
+
+    var table_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS 'metered usage rows';");
+    defer table_comment.deinit(alloc);
+    const table_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, table_comment);
+    defer alloc.free(table_comment_fingerprint);
+    try std.testing.expectEqualStrings("ddl:comment:kind=table:object=users:comment=true", table_comment_fingerprint);
+    var table_commented = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_comment);
+    defer table_commented.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, table_commented.schema_json, "\"comments\":{\"table\":\"metered usage rows\"") != null);
+
+    var column_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON COLUMN users.email IS 'contact address';");
+    defer column_comment.deinit(alloc);
+    const column_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, column_comment);
+    defer alloc.free(column_comment_fingerprint);
+    try std.testing.expectEqualStrings("ddl:comment:kind=column:object=users.email:comment=true", column_comment_fingerprint);
+    var column_commented = try applyDdlPlanToSchemaJsonAlloc(alloc, table_commented.schema_json, column_comment);
+    defer column_commented.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, column_commented.schema_json, "\"columns\":{\"email\":\"contact address\"}") != null);
+
+    var comment_index_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX users_email_comment_idx ON users (email);");
+    defer comment_index_create.deinit(alloc);
+    var comment_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, column_commented.schema_json, comment_index_create);
+    defer comment_indexed.deinit(alloc);
+
+    var index_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON INDEX users_email_comment_idx IS 'email lookup';");
+    defer index_comment.deinit(alloc);
+    const index_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, index_comment);
+    defer alloc.free(index_comment_fingerprint);
+    try std.testing.expectEqualStrings("ddl:comment:kind=index:object=users_email_comment_idx:comment=true", index_comment_fingerprint);
+    var index_commented = try applyDdlPlanToSchemaJsonAlloc(alloc, comment_indexed.schema_json, index_comment);
+    defer index_commented.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, index_commented.schema_json, "\"indexes\":{\"users_email_comment_idx\":\"email lookup\"}") != null);
+
+    var constraint_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON CONSTRAINT users_updated_check ON users IS 'valid status';");
+    defer constraint_comment.deinit(alloc);
+    const constraint_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, constraint_comment);
+    defer alloc.free(constraint_comment_fingerprint);
+    try std.testing.expectEqualStrings("ddl:comment:kind=constraint:object=users_updated_check:table=users:comment=true", constraint_comment_fingerprint);
+    var constraint_commented = try applyDdlPlanToSchemaJsonAlloc(alloc, index_commented.schema_json, constraint_comment);
+    defer constraint_commented.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, constraint_commented.schema_json, "\"constraints\":{\"users_updated_check\":\"valid status\"}") != null);
+
+    var clear_table_comment = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMENT ON TABLE users IS NULL;");
+    defer clear_table_comment.deinit(alloc);
+    const clear_table_comment_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, clear_table_comment);
+    defer alloc.free(clear_table_comment_fingerprint);
+    try std.testing.expectEqualStrings("ddl:comment:kind=table:object=users:comment=false", clear_table_comment_fingerprint);
+    var table_comment_cleared = try applyDdlPlanToSchemaJsonAlloc(alloc, constraint_commented.schema_json, clear_table_comment);
+    defer table_comment_cleared.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, table_comment_cleared.schema_json, "\"table\":\"metered usage rows\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, table_comment_cleared.schema_json, "\"columns\":{\"email\":\"contact address\"}") != null);
+
+    var rename_commented_column = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN email TO contact_email;");
+    defer rename_commented_column.deinit(alloc);
+    var renamed_column_comment = try applyDdlPlanToSchemaJsonAlloc(alloc, table_comment_cleared.schema_json, rename_commented_column);
+    defer renamed_column_comment.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, renamed_column_comment.schema_json, "\"columns\":{\"contact_email\":\"contact address\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamed_column_comment.schema_json, "\"columns\":{\"email\":\"contact address\"}") == null);
+
+    var rename_commented_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_updated_check TO users_updated_at_check;");
+    defer rename_commented_constraint.deinit(alloc);
+    var renamed_constraint_comment = try applyDdlPlanToSchemaJsonAlloc(alloc, renamed_column_comment.schema_json, rename_commented_constraint);
+    defer renamed_constraint_comment.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, renamed_constraint_comment.schema_json, "\"constraints\":{\"users_updated_at_check\":\"valid status\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, renamed_constraint_comment.schema_json, "\"constraints\":{\"users_updated_check\":\"valid status\"}") == null);
+
+    var drop_commented_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_comment_idx;");
+    defer drop_commented_index.deinit(alloc);
+    var dropped_index_comment = try applyDdlPlanToSchemaJsonAlloc(alloc, renamed_constraint_comment.schema_json, drop_commented_index);
+    defer dropped_index_comment.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, dropped_index_comment.schema_json, "\"users_email_comment_idx\":\"email lookup\"") == null);
 }
 
 test "catalog apply creates clones and replaces public schema json" {

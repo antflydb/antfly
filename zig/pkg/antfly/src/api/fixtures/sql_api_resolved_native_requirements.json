@@ -120,9 +120,7 @@
       "coverage": [
         "ddl_function_trigger_perform_body",
         "ddl_procedure_noop_body",
-        "ddl_procedure_perform_body",
-        "unsupported_ddl_routine_function_body",
-        "unsupported_ddl_routine_procedure_body"
+        "ddl_procedure_perform_body"
       ]
     },
     {

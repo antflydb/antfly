@@ -21,6 +21,11 @@ const token_mod = @import("token.zig");
 pub const Token = token_mod.Token;
 pub const SourceSpan = token_mod.SourceSpan;
 
+pub const TokenRange = struct {
+    start: usize,
+    end: usize,
+};
+
 pub const RawSqlStatement = struct {
     family: ?classifier.SqlStatementFamily = null,
     token_start: usize = 0,
@@ -126,6 +131,23 @@ pub const TokenizedSql = struct {
         };
     }
 
+    pub fn initFromTokenRangesAlloc(
+        alloc: std.mem.Allocator,
+        sql: []const u8,
+        source_tokens: []const Token,
+        ranges: []const TokenRange,
+    ) !TokenizedSql {
+        var tokens = try cloneTokenRangesAlloc(alloc, source_tokens, ranges);
+        errdefer lexer.freeTokens(alloc, &tokens);
+        return .{
+            .sql = sql,
+            .tokens = tokens,
+            .statement_family = classifier.classifyStatementFamily(tokens.items),
+            .read_statement_kind = classifier.classifyReadStatement(tokens.items),
+            .write_statement_kind = classifier.classifyWriteStatement(tokens.items),
+        };
+    }
+
     pub fn deinit(self: *TokenizedSql, alloc: std.mem.Allocator) void {
         lexer.freeTokens(alloc, &self.tokens);
         self.* = undefined;
@@ -171,6 +193,21 @@ pub const ParsedSql = struct {
     ) !ParsedSql {
         if (token_start >= token_end or token_end > parent.items().len) return error.UnsupportedSqlShape;
         return try initFromTokenSliceAlloc(alloc, parent.sql(), parent.items()[token_start..token_end]);
+    }
+
+    pub fn initChildStatementFromTokenRangesAlloc(
+        alloc: std.mem.Allocator,
+        parent: *const ParsedSql,
+        ranges: []const TokenRange,
+    ) !ParsedSql {
+        var tokenized_sql = try TokenizedSql.initFromTokenRangesAlloc(alloc, parent.sql(), parent.items(), ranges);
+        errdefer tokenized_sql.deinit(alloc);
+        const raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family);
+        return .{
+            .tokenized_sql = tokenized_sql,
+            .raw_statement = raw_statement,
+            .statement = parseStatement(raw_statement, &tokenized_sql),
+        };
     }
 
     pub fn deinit(self: *ParsedSql, alloc: std.mem.Allocator) void {
@@ -232,6 +269,33 @@ fn cloneTokensAlloc(alloc: std.mem.Allocator, source_tokens: []const Token) !std
             cloned.owned = false;
         }
         out.appendAssumeCapacity(cloned);
+    }
+    return out;
+}
+
+fn cloneTokenRangesAlloc(
+    alloc: std.mem.Allocator,
+    source_tokens: []const Token,
+    ranges: []const TokenRange,
+) !std.ArrayListUnmanaged(Token) {
+    var total: usize = 0;
+    for (ranges) |range| {
+        if (range.start >= range.end or range.end > source_tokens.len) return error.UnsupportedSqlShape;
+        total += range.end - range.start;
+    }
+    var out = try std.ArrayListUnmanaged(Token).initCapacity(alloc, total);
+    errdefer lexer.freeTokens(alloc, &out);
+    for (ranges) |range| {
+        for (source_tokens[range.start..range.end]) |token| {
+            var cloned = token;
+            if (token.owned) {
+                cloned.text = try alloc.dupe(u8, token.text);
+                cloned.owned = true;
+            } else {
+                cloned.owned = false;
+            }
+            out.appendAssumeCapacity(cloned);
+        }
     }
     return out;
 }
@@ -316,6 +380,30 @@ test "sql adapter parsed sql exposes raw statement source spans" {
     var nested_semicolon = try ParsedSql.initAlloc(alloc, "SELECT ';' AS separator");
     defer nested_semicolon.deinit(alloc);
     try std.testing.expectEqualStrings("SELECT ';' AS separator", nested_semicolon.statementSql());
+}
+
+test "sql adapter parsed sql builds non-contiguous child statements from parent tokens" {
+    const alloc = std.testing.allocator;
+
+    var parent = try ParsedSql.initAlloc(
+        alloc,
+        "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10",
+    );
+    defer parent.deinit(alloc);
+
+    const ranges = [_]TokenRange{
+        .{ .start = 0, .end = 4 },
+        .{ .start = 6, .end = parent.items().len },
+    };
+    var child = try ParsedSql.initChildStatementFromTokenRangesAlloc(alloc, &parent, &ranges);
+    defer child.deinit(alloc);
+
+    try std.testing.expectEqual(classifier.SqlStatementFamily.select, child.raw_statement.family.?);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, child.readStatementKind().?);
+    try std.testing.expectEqual(@as(usize, parent.items().len - 2), child.items().len);
+    try std.testing.expectEqualStrings("SELECT", child.items()[0].text);
+    try std.testing.expectEqualStrings("FROM", child.items()[4].text);
+    try std.testing.expectEqualStrings("usage_records", child.items()[5].text);
 }
 
 test "sql adapter parsed sql owns typed statement variants" {

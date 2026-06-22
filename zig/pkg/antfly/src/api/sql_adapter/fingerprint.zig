@@ -1619,17 +1619,21 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
             alloc.free(next);
             next = with_expression;
         }
-        if (body.perform_routines.len != 0) {
-            const with_count = try appendNonZeroUsizeFingerprintAlloc(alloc, next, "perform", body.perform_routines.len);
+        if (body.perform_calls.len != 0) {
+            const with_count = try appendNonZeroUsizeFingerprintAlloc(alloc, next, "perform", body.perform_calls.len);
             next = with_count;
-            for (body.perform_routines) |routine_name| {
+            for (body.perform_calls) |call| {
                 const with_routine = try std.fmt.allocPrint(
                     alloc,
-                    "{s}:perform={s}",
-                    .{ next, routine_name },
+                    "{s}:perform={s}:perform_args={d}",
+                    .{ next, call.routine_name, call.argument_json.len },
                 );
                 alloc.free(next);
-                next = with_routine;
+                var with_args = with_routine;
+                for (call.argument_json) |argument_json| {
+                    with_args = try appendStringFingerprintAlloc(alloc, with_args, "arg", argument_json);
+                }
+                next = with_args;
             }
         }
         base = next;
@@ -2052,7 +2056,7 @@ test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
         },
         .{
             .sql = "CREATE FUNCTION audit_perform_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(); RETURN NEW; END$$;",
-            .fingerprint = "ddl:create_function:name=audit_perform_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log",
+            .fingerprint = "ddl:create_function:name=audit_perform_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log:perform_args=0",
         },
         .{
             .sql = "DROP FUNCTION IF EXISTS audit_changes();",
@@ -2076,7 +2080,11 @@ test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
         },
         .{
             .sql = "CREATE PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(); END$$;",
-            .fingerprint = "ddl:create_procedure:name=rotate_usage_perform:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now",
+            .fingerprint = "ddl:create_procedure:name=rotate_usage_perform:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now:perform_args=0",
+        },
+        .{
+            .sql = "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;",
+            .fingerprint = "ddl:create_procedure:name=rotate_usage_perform_arg:args=0:replace=false:returns=:language=plpgsql:body=plpgsql_procedure:hook=procedure_noop:perform=1:perform=rotate_usage_now:perform_args=1:arg=1",
         },
         .{
             .sql = "CALL rotate_usage();",
@@ -2101,7 +2109,6 @@ test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
     }
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support;"));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS $$BEGIN PERFORM rotate_usage_now(1); END$$;"));
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForFingerprintTestAlloc(alloc, "CALL rotate_usage(1);"));
 }
 

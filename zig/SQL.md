@@ -295,12 +295,11 @@ Current implementation status:
   DDL, EXPLAIN, transaction, and session variants, and read/write lowerer
   dispatch now routes from that parsed statement view instead of reaching back
   into tokenization metadata. Read, write, catalog-backed read/write, EXPLAIN,
-  and relation population lowering callbacks consume borrowed `ParsedSql`. `EXPLAIN` and
-  contiguous relation-population sources such as `CREATE TABLE AS` now hand
-  nested lowerers parsed child statements cloned from the parent token stream;
-  `SELECT INTO` still uses a compatibility rewrite until the raw AST can model
-  that non-contiguous source directly. Catalog-backed read/write prebinding now
-  produces `BoundSqlStatement`, preserving the parsed statement variant while
+  and relation population lowering callbacks consume borrowed `ParsedSql`. `EXPLAIN`,
+  contiguous relation-population sources such as `CREATE TABLE AS`, and
+  non-contiguous relation-population sources such as `SELECT INTO` now hand
+  nested lowerers parsed child statements cloned from the parent token stream.
+  Catalog-backed read/write prebinding now produces `BoundSqlStatement`, preserving the parsed statement variant while
   carrying owned session identity (`current_database` and `search_path`) plus
   resolved source schemas or write-plan catalog options before routing through
   `LogicalSqlPlan` into the typed lowerer. Session-aware binder entrypoints can
@@ -421,6 +420,54 @@ scan SQL strings or fingerprints as a second parser.
 JSON and JSONB literals should stay as source spans or token references during
 lexing, classification, and raw parsing. Only semantic phases that need typed
 JSON values should pay parse/stringify costs.
+
+### Production Module Boundaries
+
+The long-term implementation should split SQL adapter ownership by phase:
+
+| Phase | Owns | Must not own |
+| --- | --- | --- |
+| Lexer/tokenizer | borrowed tokens, source spans, keyword metadata, literal spans | catalog names, typed JSON values, durable metadata |
+| Raw parser | raw statement tree, nested statement nodes, parse diagnostics | catalog lookup, privilege checks, storage plans |
+| Binder | session state, catalog identity, object versions, schemas, privileges | SQL string rewriting, storage execution |
+| Logical planner | typed logical read/write/DDL/session plans | backend-specific storage keys, compatibility SQL strings |
+| Lowerer/executor bridge | Antfly row, catalog, index, role, extension, job, and storage requests | parser probes, catalog-free name guessing |
+| Fixture/coverage tooling | structured summaries and coverage bits emitted by phases | substring scans that behave like another parser |
+
+Each phase should receive the previous phase's typed object plus explicit
+context. Hidden access to raw SQL text should be treated as a compatibility
+escape hatch and removed as the corresponding raw AST node becomes available.
+
+The preferred code shape is:
+
+- `TokenizedSql`: one owned token list for the input, with source spans and
+  compact keyword metadata.
+- `ParsedSql`: one raw parse tree for the input, including nested parsed
+  children for embedded statements and non-contiguous token ranges where SQL
+  syntax rearranges a source statement, such as `SELECT ... INTO ... FROM ...`.
+- `BoundSqlStatement`: the parsed statement plus SQL session state, resolved
+  catalog targets, object versions, schemas, and authorization decisions.
+- `LogicalSqlPlan`: catalog-free execution intent expressed in Antfly-native
+  plan families.
+- `LoweredReadPlan` / `LoweredWritePlan` / lifecycle plans: direct calls into
+  the shared Antfly services.
+
+The migration order should keep behavior stable while removing compatibility
+bridges:
+
+1. Route every SQL entrypoint through `ParsedSql` before classification,
+   diagnostics, fixture summaries, or lowering.
+2. Replace nested SQL substrings with parsed child statements cloned from the
+   parent token stream. Non-contiguous children should use token ranges instead
+   of reconstructed SQL text.
+3. Move all name resolution into `BoundSqlStatement` and make binder APIs take
+   an explicit SQL session object.
+4. Require read/write/DDL/session dispatch to use typed statement variants
+   rather than sequential lowerer probes.
+5. Emit fixture summaries and coverage from parsed, bound, or logical plan
+   objects instead of scanning SQL strings or fingerprints.
+6. Delete compatibility fallbacks only after parity fixtures cover the native
+   typed path for the corresponding statement family.
 
 ## Parity and Test Strategy
 

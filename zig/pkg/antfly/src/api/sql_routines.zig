@@ -309,7 +309,7 @@ pub const Runtime = struct {
         const routine = self.findRoutineLocked(.function, routine_name, 0) orelse return error.RoutineNotFound;
         const body = routine.body orelse return error.RoutineBodyNotExecutable;
         if (body.kind != .plpgsql_trigger or body.expression != null) return error.RoutineBodyNotExecutable;
-        try self.executePerformRoutinesLocked(alloc, body.perform_routines);
+        try self.executePerformCallsLocked(alloc, body.perform_calls);
         if (body.hook == .trigger_return_null) return try alloc.dupe(u8, "null");
         const tuple_json = switch (body.hook) {
             .trigger_return_new => new_row_json orelse return error.RoutineTriggerTupleUnavailable,
@@ -329,7 +329,7 @@ pub const Runtime = struct {
         const routine = self.findRoutineLocked(.procedure, routine_name, argument_count) orelse return error.RoutineNotFound;
         const body = routine.body orelse return error.RoutineBodyNotExecutable;
         if (body.kind != .plpgsql_procedure or body.hook != .procedure_noop or body.expression != null) return error.RoutineBodyNotExecutable;
-        try self.executePerformRoutinesLocked(self.alloc, body.perform_routines);
+        try self.executePerformCallsLocked(self.alloc, body.perform_calls);
     }
 
     pub fn listExpressionRoutineBindingsAlloc(
@@ -501,18 +501,18 @@ pub const Runtime = struct {
         switch (body.hook) {
             .expression => {
                 if (kind != .function or body.kind != .sql_expression or body.expression == null) return error.RoutineBodyNotExecutable;
-                if (body.perform_routines.len != 0) return error.RoutineBodyNotExecutable;
+                if (body.perform_calls.len != 0) return error.RoutineBodyNotExecutable;
             },
             .trigger_return_new, .trigger_return_old, .trigger_return_null => {
                 if (kind != .function or body.kind != .plpgsql_trigger or body.expression != null) return error.RoutineBodyNotExecutable;
                 const trigger_returns = returns_type orelse return error.RoutineBodyNotExecutable;
                 if (!std.ascii.eqlIgnoreCase(trigger_returns, "trigger")) return error.RoutineBodyNotExecutable;
-                try self.validatePerformRoutinesLocked(body.perform_routines);
+                try self.validatePerformCallsLocked(body.perform_calls);
             },
             .procedure_noop => {
                 if (kind != .procedure or body.kind != .plpgsql_procedure or body.expression != null) return error.RoutineBodyNotExecutable;
                 if (returns_type != null) return error.RoutineBodyNotExecutable;
-                try self.validatePerformRoutinesLocked(body.perform_routines);
+                try self.validatePerformCallsLocked(body.perform_calls);
             },
         }
     }
@@ -544,39 +544,40 @@ pub const Runtime = struct {
         routine_name: []const u8,
         argument_count: usize,
     ) bool {
-        if (kind != .function or argument_count != 0) return false;
+        if (kind != .function) return false;
         for (self.routines.items) |routine| {
             if (routine.body) |body| {
-                for (body.perform_routines) |perform_routine| {
-                    if (std.ascii.eqlIgnoreCase(perform_routine, routine_name)) return true;
+                for (body.perform_calls) |perform_call| {
+                    if (perform_call.argument_json.len == argument_count and
+                        std.ascii.eqlIgnoreCase(perform_call.routine_name, routine_name)) return true;
                 }
             }
         }
         return false;
     }
 
-    fn validatePerformRoutinesLocked(
+    fn validatePerformCallsLocked(
         self: *@This(),
-        routines: []const []const u8,
+        calls: []const relational_sql.RoutinePerformCall,
     ) !void {
-        for (routines) |routine_name| {
-            const routine = self.findRoutineLocked(.function, routine_name, 0) orelse return error.RoutineNotFound;
+        for (calls) |call| {
+            const routine = self.findRoutineLocked(.function, call.routine_name, call.argument_json.len) orelse return error.RoutineNotFound;
             const body = routine.body orelse return error.RoutineBodyNotExecutable;
             if (body.kind != .sql_expression or body.hook != .expression or body.expression == null) return error.RoutineBodyNotExecutable;
         }
     }
 
-    fn executePerformRoutinesLocked(
+    fn executePerformCallsLocked(
         self: *@This(),
         alloc: std.mem.Allocator,
-        routines: []const []const u8,
+        calls: []const relational_sql.RoutinePerformCall,
     ) !void {
-        for (routines) |routine_name| {
-            const routine = self.findRoutineLocked(.function, routine_name, 0) orelse return error.RoutineNotFound;
+        for (calls) |call| {
+            const routine = self.findRoutineLocked(.function, call.routine_name, call.argument_json.len) orelse return error.RoutineNotFound;
             const body = routine.body orelse return error.RoutineBodyNotExecutable;
             if (body.kind != .sql_expression or body.hook != .expression) return error.RoutineBodyNotExecutable;
             const expression = body.expression orelse return error.RoutineBodyNotExecutable;
-            const row_json = try routineArgumentObjectJsonAlloc(alloc, &.{}, routine.null_input);
+            const row_json = try routineArgumentObjectJsonAlloc(alloc, call.argument_json, routine.null_input);
             defer alloc.free(row_json);
             if (std.mem.eql(u8, row_json, "null")) continue;
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row_json, .{});
@@ -1106,14 +1107,46 @@ fn freeRoutineSettings(alloc: std.mem.Allocator, settings: []relational_sql.Rout
 fn cloneRoutineBodyAlloc(alloc: std.mem.Allocator, body: relational_sql.RoutineBodyPlan) !relational_sql.RoutineBodyPlan {
     const expression = if (body.expression) |value| try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, value) else null;
     errdefer if (expression) |value| runtime_schema.freeRelationalRowsExpression(alloc, value);
-    const perform_routines = try cloneStringSliceAlloc(alloc, body.perform_routines);
-    errdefer freeOwnedStringSlice(alloc, perform_routines);
+    const perform_calls = try cloneRoutinePerformCallsAlloc(alloc, body.perform_calls);
+    errdefer freeRoutinePerformCalls(alloc, perform_calls);
     return .{
         .kind = body.kind,
         .hook = body.hook,
         .expression = expression,
-        .perform_routines = perform_routines,
+        .perform_calls = perform_calls,
     };
+}
+
+fn cloneRoutinePerformCallsAlloc(
+    alloc: std.mem.Allocator,
+    source: []const relational_sql.RoutinePerformCall,
+) ![]relational_sql.RoutinePerformCall {
+    const out = try alloc.alloc(relational_sql.RoutinePerformCall, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeRoutinePerformCallItems(alloc, out[0..initialized]);
+        alloc.free(out);
+    }
+    for (source, 0..) |call, i| {
+        const routine_name = try alloc.dupe(u8, call.routine_name);
+        errdefer alloc.free(routine_name);
+        const argument_json = try cloneStringSliceAlloc(alloc, call.argument_json);
+        out[i] = .{
+            .routine_name = routine_name,
+            .argument_json = argument_json,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeRoutinePerformCalls(alloc: std.mem.Allocator, calls: []relational_sql.RoutinePerformCall) void {
+    freeRoutinePerformCallItems(alloc, calls);
+    if (calls.len > 0) alloc.free(calls);
+}
+
+fn freeRoutinePerformCallItems(alloc: std.mem.Allocator, calls: []relational_sql.RoutinePerformCall) void {
+    for (calls) |*call| call.deinit(alloc);
 }
 
 const PersistedRoutineRecord = struct {
@@ -1859,6 +1892,35 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     try std.testing.expectEqual(@as(usize, 12), runtime.routineCountForTest());
     try runtime.executeProcedureRoutineArgs("rotate_usage_perform", 0);
 
+    var rotate_usage_now_arg_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE FUNCTION rotate_usage_now(n numeric) RETURNS numeric LANGUAGE sql AS 'SELECT $1 + 1';",
+    );
+    defer rotate_usage_now_arg_plan.deinit(alloc);
+    try runtime.apply(switch (rotate_usage_now_arg_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 13), runtime.routineCountForTest());
+    var perform_procedure_arg_plan = try relational_sql.lowerDdlPlanAlloc(
+        alloc,
+        "CREATE PROCEDURE rotate_usage_perform_arg() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(1); END';",
+    );
+    defer perform_procedure_arg_plan.deinit(alloc);
+    try runtime.apply(switch (perform_procedure_arg_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectEqual(@as(usize, 14), runtime.routineCountForTest());
+    try runtime.executeProcedureRoutineArgs("rotate_usage_perform_arg", 0);
+
+    const stored_perform_arg = runtime.findRoutineLocked(.procedure, "rotate_usage_perform_arg", 0) orelse return error.TestUnexpectedResult;
+    const stored_perform_arg_body = stored_perform_arg.body orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), stored_perform_arg_body.perform_calls.len);
+    try std.testing.expectEqualStrings("rotate_usage_now", stored_perform_arg_body.perform_calls[0].routine_name);
+    try std.testing.expectEqual(@as(usize, 1), stored_perform_arg_body.perform_calls[0].argument_json.len);
+    try std.testing.expectEqualStrings("1", stored_perform_arg_body.perform_calls[0].argument_json[0]);
+
     var drop_audit_log_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION audit_log();");
     defer drop_audit_log_plan.deinit(alloc);
     try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_audit_log_plan) {
@@ -1869,6 +1931,20 @@ test "sql routine runtime executes native row expression bodies and rejects ambi
     var drop_rotate_usage_now_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now();");
     defer drop_rotate_usage_now_plan.deinit(alloc);
     try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_rotate_usage_now_plan) {
+        .function_catalog => |function_plan| function_plan,
+        else => return error.TestUnexpectedResult,
+    }));
+
+    var drop_rotate_usage_now_arg_plan = try relational_sql.lowerDdlPlanAlloc(alloc, "DROP FUNCTION rotate_usage_now(numeric);");
+    defer drop_rotate_usage_now_arg_plan.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), switch (drop_rotate_usage_now_arg_plan) {
+        .function_catalog => |function_plan| switch (function_plan) {
+            .drop => |drop| drop.argument_count,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    });
+    try std.testing.expectError(error.RoutineInUse, runtime.apply(switch (drop_rotate_usage_now_arg_plan) {
         .function_catalog => |function_plan| function_plan,
         else => return error.TestUnexpectedResult,
     }));

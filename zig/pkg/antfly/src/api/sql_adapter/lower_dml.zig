@@ -26,6 +26,7 @@ const plan_mod = @import("plan.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
+const test_support = @import("test_support.zig");
 const table_catalog = @import("../table_catalog.zig");
 const sql_value = @import("value.zig");
 const tokenized = @import("tokenized.zig");
@@ -12559,83 +12560,7 @@ fn unsupportedRecursiveMergeMutationForDmlTestAlloc(
     return error.UnsupportedSqlShape;
 }
 
-const TestPrimaryResolver = struct {
-    row_json: []const u8,
-    version: u64,
-    exists: bool = true,
-    resolved_key: []const u8 = "test-existing-primary",
-
-    fn resolver(self: *@This()) relational_rows.UniqueSelectorResolver {
-        return .{
-            .ptr = self,
-            .resolve = resolve,
-            .resolve_temporal_overlap = resolveTemporalOverlap,
-            .resolve_primary = primaryExists,
-            .lookup_primary = lookupPrimary,
-        };
-    }
-
-    fn resolve(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        constraint_name: []const u8,
-        encoded_value: []const u8,
-    ) anyerror!?[]u8 {
-        _ = table_name;
-        _ = constraint_name;
-        _ = encoded_value;
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (!self.exists) return null;
-        return try alloc.dupe(u8, self.resolved_key);
-    }
-
-    fn resolveTemporalOverlap(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        constraint_name: []const u8,
-        encoded_value: []const u8,
-        encoded_start: []const u8,
-        encoded_end: []const u8,
-    ) anyerror!?[]u8 {
-        _ = table_name;
-        _ = constraint_name;
-        _ = encoded_value;
-        if (encoded_start.len == 0 or encoded_end.len == 0) return error.TestUnexpectedResult;
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (!self.exists) return null;
-        return try alloc.dupe(u8, self.resolved_key);
-    }
-
-    fn primaryExists(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        physical_key: []const u8,
-    ) anyerror!bool {
-        _ = alloc;
-        _ = table_name;
-        _ = physical_key;
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.exists;
-    }
-
-    fn lookupPrimary(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        table_name: []const u8,
-        physical_key: []const u8,
-    ) anyerror!?relational_rows.ResolvedPrimaryRow {
-        _ = table_name;
-        if (physical_key.len == 0) return null;
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return .{
-            .json = try alloc.dupe(u8, self.row_json),
-            .version = self.version,
-        };
-    }
-};
+const TestPrimaryResolver = test_support.TestPrimaryResolver;
 
 test "sql adapter lower dml routes write sql through typed plan families" {
     const alloc = std.testing.allocator;

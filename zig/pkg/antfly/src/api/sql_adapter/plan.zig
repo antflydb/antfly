@@ -2253,9 +2253,17 @@ fn relationPopulationSourceParsedSqlAlloc(
 ) !tokenized.ParsedSql {
     if (parsed.source_token_start) |start| {
         const end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
+        if (parsed.source_suffix_token_start) |suffix_start| {
+            const suffix_end = parsed.source_suffix_token_end orelse return error.UnsupportedSqlShape;
+            const ranges = [_]tokenized.TokenRange{
+                .{ .start = start, .end = end },
+                .{ .start = suffix_start, .end = suffix_end },
+            };
+            return try tokenized.ParsedSql.initChildStatementFromTokenRangesAlloc(alloc, parent_sql, &ranges);
+        }
         return try tokenized.ParsedSql.initChildStatementAlloc(alloc, parent_sql, start, end);
     }
-    return try tokenized.ParsedSql.initAlloc(alloc, parsed.source_sql);
+    return error.UnsupportedSqlShape;
 }
 
 pub const ExplainFormat = ast.SqlExplainFormat;

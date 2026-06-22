@@ -1349,6 +1349,8 @@ pub const RelationPopulationSyntax = struct {
     source_sql: []u8,
     source_token_start: ?usize = null,
     source_token_end: ?usize = null,
+    source_suffix_token_start: ?usize = null,
+    source_suffix_token_end: ?usize = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.source_sql);
@@ -3183,10 +3185,13 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
     defer lexer.freeTokens(alloc, &body_tokens);
     var pos: usize = 0;
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
-    var perform_routines = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer freeStringSlice(alloc, perform_routines.items);
+    var perform_calls = std.ArrayListUnmanaged(ddl_plan.RoutinePerformCall).empty;
+    errdefer {
+        freeRoutinePerformCallItems(alloc, perform_calls.items);
+        perform_calls.deinit(alloc);
+    }
     try cursor.expectKeyword("begin");
-    _ = try consumeBenignPlpgsqlStatements(alloc, cursor, &perform_routines);
+    _ = try consumeBenignPlpgsqlStatements(alloc, cursor, &perform_calls);
     try cursor.expectKeyword("return");
     const hook: ddl_plan.RoutineExecutionHook = if (cursor.matchKeyword("new"))
         .trigger_return_new
@@ -3203,7 +3208,7 @@ fn parsePlpgsqlTriggerRoutineBodyPlanAlloc(
     return .{
         .kind = .plpgsql_trigger,
         .hook = hook,
-        .perform_routines = try perform_routines.toOwnedSlice(alloc),
+        .perform_calls = try perform_calls.toOwnedSlice(alloc),
     };
 }
 
@@ -3219,10 +3224,13 @@ fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
     defer lexer.freeTokens(alloc, &body_tokens);
     var pos: usize = 0;
     const cursor = parser.Cursor.init(body_tokens.items, &pos);
-    var perform_routines = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer freeStringSlice(alloc, perform_routines.items);
+    var perform_calls = std.ArrayListUnmanaged(ddl_plan.RoutinePerformCall).empty;
+    errdefer {
+        freeRoutinePerformCallItems(alloc, perform_calls.items);
+        perform_calls.deinit(alloc);
+    }
     try cursor.expectKeyword("begin");
-    _ = try consumeBenignPlpgsqlStatements(alloc, cursor, &perform_routines);
+    _ = try consumeBenignPlpgsqlStatements(alloc, cursor, &perform_calls);
     if (cursor.matchKeyword("null")) {
         try cursor.expectToken(.semicolon);
     } else if (!cursor.peekKeyword("end")) {
@@ -3234,14 +3242,21 @@ fn parsePlpgsqlProcedureRoutineBodyPlanAlloc(
     return .{
         .kind = .plpgsql_procedure,
         .hook = .procedure_noop,
-        .perform_routines = try perform_routines.toOwnedSlice(alloc),
+        .perform_calls = try perform_calls.toOwnedSlice(alloc),
     };
+}
+
+fn freeRoutinePerformCallItems(alloc: std.mem.Allocator, calls: []const ddl_plan.RoutinePerformCall) void {
+    for (calls) |call| {
+        var owned = call;
+        owned.deinit(alloc);
+    }
 }
 
 fn consumeBenignPlpgsqlStatements(
     alloc: std.mem.Allocator,
     cursor: parser.Cursor,
-    perform_routines: *std.ArrayListUnmanaged([]const u8),
+    perform_calls: *std.ArrayListUnmanaged(ddl_plan.RoutinePerformCall),
 ) !bool {
     var consumed = false;
     while (true) {
@@ -3258,12 +3273,26 @@ fn consumeBenignPlpgsqlStatements(
         }
         if (cursor.matchKeyword("perform")) {
             const routine = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
-            try cursor.expectToken(.lparen);
-            try cursor.expectToken(.rparen);
-            try cursor.expectToken(.semicolon);
             const owned_routine = try alloc.dupe(u8, routine.text);
             errdefer alloc.free(owned_routine);
-            try perform_routines.append(alloc, owned_routine);
+            try cursor.expectToken(.lparen);
+            var argument_json = std.ArrayListUnmanaged([]const u8).empty;
+            errdefer freeStringSlice(alloc, argument_json.items);
+            if (!cursor.peekKind(.rparen)) {
+                while (true) {
+                    const value_json = try sql_value.parseJsonValueAlloc(alloc, cursor.tokens, cursor.pos, &.{});
+                    errdefer alloc.free(value_json);
+                    try argument_json.append(alloc, value_json);
+                    if (cursor.matchToken(.comma) == null) break;
+                }
+            }
+            try cursor.expectToken(.rparen);
+            try cursor.expectToken(.semicolon);
+            const owned_arguments = try argument_json.toOwnedSlice(alloc);
+            try perform_calls.append(alloc, .{
+                .routine_name = owned_routine,
+                .argument_json = owned_arguments,
+            });
             consumed = true;
             continue;
         }
@@ -7844,12 +7873,17 @@ fn parseSelectIntoPopulationSqlAlloc(
     const from_index = target_index + 1 + from_relative;
     if (from_index != target_index + 1) return error.UnsupportedSqlShape;
 
+    var source_token_end = tokens.len;
+    while (source_token_end > from_index and tokens[source_token_end - 1].kind == .semicolon) source_token_end -= 1;
+    if (source_token_end <= from_index) return error.UnsupportedSqlShape;
+
     const into_start = try tokenStartOffset(sql, tokens[into_index]);
     const from_start = try tokenStartOffset(sql, tokens[from_index]);
+    const source_end = try tokenEndOffset(sql, tokens[source_token_end - 1]);
     const source_sql = try std.fmt.allocPrint(
         alloc,
         "{s} {s}",
-        .{ std.mem.trim(u8, sql[0..into_start], " \t\r\n"), sql[from_start..] },
+        .{ std.mem.trim(u8, sql[0..into_start], " \t\r\n"), std.mem.trim(u8, sql[from_start..source_end], " \t\r\n") },
     );
     return .{
         .mode = .select_into,
@@ -7858,6 +7892,10 @@ fn parseSelectIntoPopulationSqlAlloc(
         .if_not_exists = false,
         .populate = true,
         .source_sql = source_sql,
+        .source_token_start = 0,
+        .source_token_end = into_index,
+        .source_suffix_token_start = from_index,
+        .source_suffix_token_end = source_token_end,
     };
 }
 
@@ -9155,8 +9193,9 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(perform_trigger_body_tokens.items.len, perform_trigger_body_pos);
     try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, perform_trigger_body.body.?.kind);
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, perform_trigger_body.body.?.hook);
-    try std.testing.expectEqual(@as(usize, 1), perform_trigger_body.body.?.perform_routines.len);
-    try std.testing.expectEqualStrings("audit_log", perform_trigger_body.body.?.perform_routines[0]);
+    try std.testing.expectEqual(@as(usize, 1), perform_trigger_body.body.?.perform_calls.len);
+    try std.testing.expectEqualStrings("audit_log", perform_trigger_body.body.?.perform_calls[0].routine_name);
+    try std.testing.expectEqual(@as(usize, 0), perform_trigger_body.body.?.perform_calls[0].argument_json.len);
 
     var perform_procedure_body_tokens = try lexer.tokenizeAlloc(alloc, "PROCEDURE rotate_usage_perform() LANGUAGE plpgsql AS 'BEGIN PERFORM rotate_usage_now(); END';");
     defer lexer.freeTokens(alloc, &perform_procedure_body_tokens);
@@ -9166,13 +9205,22 @@ test "sql adapter grammar parses routine catalog tails" {
     try std.testing.expectEqual(perform_procedure_body_tokens.items.len, perform_procedure_body_pos);
     try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_procedure, perform_procedure_body.body.?.kind);
     try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.procedure_noop, perform_procedure_body.body.?.hook);
-    try std.testing.expectEqual(@as(usize, 1), perform_procedure_body.body.?.perform_routines.len);
-    try std.testing.expectEqualStrings("rotate_usage_now", perform_procedure_body.body.?.perform_routines[0]);
+    try std.testing.expectEqual(@as(usize, 1), perform_procedure_body.body.?.perform_calls.len);
+    try std.testing.expectEqualStrings("rotate_usage_now", perform_procedure_body.body.?.perform_calls[0].routine_name);
+    try std.testing.expectEqual(@as(usize, 0), perform_procedure_body.body.?.perform_calls[0].argument_json.len);
 
     var perform_arg_body_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN PERFORM audit_log(1); RETURN NEW; END';");
     defer lexer.freeTokens(alloc, &perform_arg_body_tokens);
     var perform_arg_body_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseCreateRoutineCatalogTailAlloc(alloc, perform_arg_body_tokens.items, &perform_arg_body_pos));
+    var perform_arg_body = try parseCreateRoutineCatalogTailAlloc(alloc, perform_arg_body_tokens.items, &perform_arg_body_pos);
+    defer perform_arg_body.deinit(alloc);
+    try std.testing.expectEqual(perform_arg_body_tokens.items.len, perform_arg_body_pos);
+    try std.testing.expectEqual(ddl_plan.RoutineBodyKind.plpgsql_trigger, perform_arg_body.body.?.kind);
+    try std.testing.expectEqual(ddl_plan.RoutineExecutionHook.trigger_return_new, perform_arg_body.body.?.hook);
+    try std.testing.expectEqual(@as(usize, 1), perform_arg_body.body.?.perform_calls.len);
+    try std.testing.expectEqualStrings("audit_log", perform_arg_body.body.?.perform_calls[0].routine_name);
+    try std.testing.expectEqual(@as(usize, 1), perform_arg_body.body.?.perform_calls[0].argument_json.len);
+    try std.testing.expectEqualStrings("1", perform_arg_body.body.?.perform_calls[0].argument_json[0]);
 
     var security_tokens = try lexer.tokenizeAlloc(alloc, "FUNCTION normalize_status(input text) RETURNS text LANGUAGE sql SECURITY DEFINER;");
     defer lexer.freeTokens(alloc, &security_tokens);
@@ -11882,8 +11930,10 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expect(select_into.target_lifetime == null);
     try std.testing.expect(!select_into.if_not_exists);
     try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into.source_sql);
-    try std.testing.expect(select_into.source_token_start == null);
-    try std.testing.expect(select_into.source_token_end == null);
+    try std.testing.expectEqual(@as(?usize, 0), select_into.source_token_start);
+    try std.testing.expect(select_into.source_token_end != null);
+    try std.testing.expect(select_into.source_suffix_token_start != null);
+    try std.testing.expect(select_into.source_suffix_token_end != null);
 
     var select_into_temp = try parseRelationPopulationSqlAlloc(
         alloc,
@@ -11895,6 +11945,10 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expectEqual(RelationLifetimeKind.temporary, select_into_temp.target_lifetime.?);
     try std.testing.expect(!select_into_temp.if_not_exists);
     try std.testing.expectEqualStrings("SELECT account_id, total FROM usage_records WHERE total > 10", select_into_temp.source_sql);
+    try std.testing.expectEqual(@as(?usize, 0), select_into_temp.source_token_start);
+    try std.testing.expect(select_into_temp.source_token_end != null);
+    try std.testing.expect(select_into_temp.source_suffix_token_start != null);
+    try std.testing.expect(select_into_temp.source_suffix_token_end != null);
 
     var select_into_unlogged = try parseRelationPopulationSqlAlloc(
         alloc,
@@ -11906,6 +11960,10 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expectEqual(RelationLifetimeKind.unlogged, select_into_unlogged.target_lifetime.?);
     try std.testing.expect(!select_into_unlogged.if_not_exists);
     try std.testing.expectEqualStrings("SELECT account_id FROM usage_records WHERE total > 10", select_into_unlogged.source_sql);
+    try std.testing.expectEqual(@as(?usize, 0), select_into_unlogged.source_token_start);
+    try std.testing.expect(select_into_unlogged.source_token_end != null);
+    try std.testing.expect(select_into_unlogged.source_suffix_token_start != null);
+    try std.testing.expect(select_into_unlogged.source_suffix_token_end != null);
 
     var create_as = try parseRelationPopulationSqlAlloc(
         alloc,

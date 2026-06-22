@@ -6845,9 +6845,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     ddl_temporal_fk_update_cascade_action: bool = false,
-    unsupported_ddl_routine_function_body: bool = false,
     unsupported_ddl_routine_option: bool = false,
-    unsupported_ddl_routine_procedure_body: bool = false,
     ddl_system_versioned_table: bool = false,
     query_function: bool = false,
     query_function_full_text: bool = false,
@@ -8180,18 +8178,10 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     std.mem.startsWith(u8, entry.sql, "COPY ") and
                     std.mem.indexOf(u8, entry.sql, "OIDS") != null);
-            self.unsupported_ddl_routine_function_body = self.unsupported_ddl_routine_function_body or
-                (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
-                    std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
-                    std.mem.indexOf(u8, entry.sql, " AS ") != null);
             self.unsupported_ddl_routine_option = self.unsupported_ddl_routine_option or
                 (std.mem.eql(u8, entry.classification_reason, "routine_option_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE FUNCTION ") and
                     std.mem.indexOf(u8, entry.sql, " SUPPORT ") != null);
-            self.unsupported_ddl_routine_procedure_body = self.unsupported_ddl_routine_procedure_body or
-                (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
-                    std.mem.startsWith(u8, entry.sql, "CREATE PROCEDURE ") and
-                    std.mem.indexOf(u8, entry.sql, " AS ") != null);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
