@@ -2544,16 +2544,33 @@ pub fn corpusFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFam
 pub fn corpusExplainWriteInnerHasPrefix(entry: AppParityCorpusEntry, inner_prefix: []const u8) bool {
     const inner_token = ":inner=";
     if (!std.mem.startsWith(u8, inner_prefix, inner_token)) return false;
+    const expected = planRootKindFromExactPrefix(inner_prefix[inner_token.len..]) orelse return false;
     return entry.family == .explain and
         explainPlanHasKind(entry.plan, "write") and
-        explainPlanInnerStartsWith(entry.plan, inner_prefix[inner_token.len..]);
+        explainPlanInnerHasRootKind(entry.plan, expected);
 }
 
 pub fn corpusReadPlanHasPrefix(entry: AppParityCorpusEntry, read_prefix: []const u8) bool {
-    return (entry.family == .read and std.mem.startsWith(u8, entry.plan, read_prefix)) or
+    const expected = readPlanKindFromExactPrefix(read_prefix) orelse return false;
+    return (entry.family == .read and readPlanHasKind(entry.plan, expected)) or
         (entry.family == .explain and
             explainPlanHasKind(entry.plan, "read") and
-            explainPlanInnerStartsWith(entry.plan, read_prefix));
+            explainPlanInnerReadHasKind(entry.plan, expected));
+}
+
+fn planRootKindFromExactPrefix(prefix: []const u8) ?[]const u8 {
+    const end = std.mem.indexOfScalar(u8, prefix, ':') orelse return null;
+    if (end == 0 or end + 1 != prefix.len) return null;
+    return prefix[0..end];
+}
+
+fn readPlanKindFromExactPrefix(prefix: []const u8) ?[]const u8 {
+    const root = "read:";
+    if (!std.mem.startsWith(u8, prefix, root)) return null;
+    const sub_start = root.len;
+    const sub_end = std.mem.indexOfScalarPos(u8, prefix, sub_start, ':') orelse return null;
+    if (sub_end == sub_start or sub_end + 1 != prefix.len) return null;
+    return prefix[sub_start..sub_end];
 }
 
 pub fn corpusOptionalZeroSummaryMatchesPlan(plan_text: []const u8, token_text: []const u8, expected: usize) bool {
@@ -5054,11 +5071,21 @@ pub fn explainPlanHasKind(plan: []const u8, expected: []const u8) bool {
     return planHasExactStringToken(plan, "explain:kind=", expected);
 }
 
-pub fn explainPlanInnerStartsWith(plan: []const u8, inner_prefix: []const u8) bool {
+pub fn explainPlanInnerHasRootKind(plan: []const u8, expected: []const u8) bool {
+    const inner = explainPlanInnerFingerprint(plan) orelse return false;
+    return planHasRootKind(inner, expected);
+}
+
+pub fn explainPlanInnerReadHasKind(plan: []const u8, expected: []const u8) bool {
+    const inner = explainPlanInnerFingerprint(plan) orelse return false;
+    return readPlanHasKind(inner, expected);
+}
+
+fn explainPlanInnerFingerprint(plan: []const u8) ?[]const u8 {
     const inner_token = ":inner=";
-    const inner_index = std.mem.indexOf(u8, plan, inner_token) orelse return false;
-    if (std.mem.indexOfPos(u8, plan, inner_index + inner_token.len, inner_token) != null) return false;
-    return std.mem.startsWith(u8, plan[inner_index + inner_token.len ..], inner_prefix);
+    const inner_index = std.mem.indexOf(u8, plan, inner_token) orelse return null;
+    if (std.mem.indexOfPos(u8, plan, inner_index + inner_token.len, inner_token) != null) return null;
+    return plan[inner_index + inner_token.len ..];
 }
 
 pub fn planHasTrailingRowExpressionFragment(plan: []const u8, fragment: []const u8) bool {
@@ -6039,7 +6066,11 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(corpusReadPlanHasPrefix(.{ .name = "read query", .family = .read, .plan = "read:query:table=usage_records", .sql = "SELECT * FROM usage_records" }, "read:query:"));
     try std.testing.expect(corpusReadPlanHasPrefix(.{ .name = "explain read", .family = .explain, .plan = "explain:kind=read:inner=read:query:table=usage_records", .sql = "EXPLAIN SELECT * FROM usage_records" }, "read:query:"));
     try std.testing.expect(!corpusReadPlanHasPrefix(.{ .name = "read aggregate", .family = .read, .plan = "read:aggregate:table=usage_records", .sql = "SELECT count(*) FROM usage_records" }, "read:query:"));
+    try std.testing.expect(!corpusReadPlanHasPrefix(.{ .name = "read query extra", .family = .read, .plan = "read:query_extra:table=usage_records", .sql = "SELECT * FROM usage_records" }, "read:query:"));
+    try std.testing.expect(!corpusReadPlanHasPrefix(.{ .name = "malformed read prefix", .family = .read, .plan = "read:query:table=usage_records", .sql = "SELECT * FROM usage_records" }, "read:query"));
     try std.testing.expect(corpusExplainWriteInnerHasPrefix(.{ .name = "explain write", .family = .explain, .plan = "explain:kind=write:inner=insert:table=usage_records", .sql = "EXPLAIN INSERT INTO usage_records VALUES ('1')" }, ":inner=insert:"));
+    try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .name = "explain write extra", .family = .explain, .plan = "explain:kind=write:inner=insert_source:table=usage_records", .sql = "EXPLAIN INSERT INTO usage_records SELECT * FROM usage_records" }, ":inner=insert:"));
+    try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .name = "malformed explain prefix", .family = .explain, .plan = "explain:kind=write:inner=insert:table=usage_records", .sql = "EXPLAIN INSERT INTO usage_records VALUES ('1')" }, ":inner=insert"));
     try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .name = "explain read insert token", .family = .explain, .plan = "explain:kind=read:inner=insert:table=usage_records", .sql = "EXPLAIN SELECT * FROM usage_records" }, ":inner=insert:"));
 
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records", ":having_expr=", 0));
@@ -6274,8 +6305,9 @@ test "sql adapter corpus plan predicates are exact and structured" {
     const explain = "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0";
     try std.testing.expect(explainPlanHasKind(explain, "write"));
     try std.testing.expect(!explainPlanHasKind(explain, "read"));
-    try std.testing.expect(explainPlanInnerStartsWith(explain, "insert:"));
-    try std.testing.expect(!explainPlanInnerStartsWith("explain:kind=write:inner=insert:inner=update:", "insert:"));
+    try std.testing.expect(explainPlanInnerHasRootKind(explain, "insert"));
+    try std.testing.expect(!explainPlanInnerHasRootKind("explain:kind=write:inner=insert:inner=update:", "insert"));
+    try std.testing.expect(!explainPlanInnerHasRootKind("explain:kind=write:inner=insert_source:table=usage_records", "insert"));
 
     try std.testing.expect(writePlanHasCounts("insert:table=usage_records:writes=2:transforms=1", 2, 1));
     try std.testing.expect(!writePlanHasCounts("insert:table=usage_records:writes=2:transforms=1", 1, 1));
