@@ -813,7 +813,9 @@ fn validateDerivedIndexFieldRefsValue(schema: runtime_schema_mod.TableSchema, va
         if (value.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
     } else if (std.mem.eql(u8, type_value.string, "embeddings")) {
         if (value.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+        if (value.object.get("embedder")) |embedder| try validateEmbedderModelRefValue(embedder);
     } else if (std.mem.eql(u8, type_value.string, "graph")) {
+        if (value.object.get("edge_policy")) |edge_policy| try validateGraphEdgePolicyValue(edge_policy);
         if (value.object.get("edge_table")) |edge_table| {
             if (edge_table != .object) return error.InvalidTableIndexMetadata;
             try validateRequiredDerivedIndexFieldRef(schema, edge_table.object, "source_field");
@@ -824,6 +826,7 @@ fn validateDerivedIndexFieldRefsValue(schema: runtime_schema_mod.TableSchema, va
         if (value.object.get("artifact")) |artifact| {
             if (artifact != .object) return error.InvalidTableIndexMetadata;
             if (artifact.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+            if (artifact.object.get("producer_json")) |producer| try validateProducerModelRefValue(producer);
         }
         if (value.object.get("context")) |context| {
             if (context != .object) return error.InvalidTableIndexMetadata;
@@ -839,7 +842,25 @@ fn validateDerivedIndexFieldRefsValue(schema: runtime_schema_mod.TableSchema, va
         for (enrichments.array.items) |enrichment| {
             if (enrichment != .object) return error.InvalidTableIndexMetadata;
             if (enrichment.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+            if (enrichment.object.get("model")) |model| try validateModelRefValue(model);
         }
+    }
+}
+
+fn validateEmbedderModelRefValue(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    if (value.object.get("model")) |model| try validateModelRefValue(model);
+}
+
+fn validateProducerModelRefValue(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidTableIndexMetadata;
+    if (value.object.get("model")) |model| try validateModelRefValue(model);
+}
+
+fn validateModelRefValue(value: std.json.Value) !void {
+    if (value != .string or value.string.len == 0) return error.InvalidTableIndexMetadata;
+    for (value.string) |ch| {
+        if (ch < 0x20 or ch == 0x7f) return error.InvalidTableIndexMetadata;
     }
 }
 
@@ -1629,16 +1650,60 @@ fn validateDerivedIndexCatalogRefsForTableIndexesAlloc(
         const graph_index = try requiredJsonStringField(parsed_index.value.object, "graph_index");
         const graph_config = indexes.get(graph_index) orelse return error.InvalidTableIndexMetadata;
         try validateIndexConfigType(graph_config, "graph");
-        _ = try requiredJsonStringField(parsed_index.value.object, "metric");
+        const metric = try requiredJsonStringField(parsed_index.value.object, "metric");
+        try validateGraphMetricName(metric);
+        if (parsed_index.value.object.get("algorithm")) |algorithm| {
+            if (algorithm != .string) return error.InvalidTableIndexMetadata;
+            try validateGraphMetricAlgorithm(algorithm.string);
+        }
+        if (parsed_index.value.object.get("metric_freshness")) |freshness| try validateGraphMetricFreshnessValue(freshness);
+        if (parsed_index.value.object.get("publish")) |publish| try validateGraphMetricPublishValue(publish);
     } else if (std.mem.eql(u8, type_name, "hybrid")) {
         const sources = parsed_index.value.object.get("sources") orelse return error.InvalidTableIndexMetadata;
         if (sources != .array) return error.InvalidTableIndexMetadata;
         if (sources.array.items.len == 0) return error.InvalidTableIndexMetadata;
         for (sources.array.items) |source| {
             if (source != .string) return error.InvalidTableIndexMetadata;
-            if (!indexes.contains(source.string)) return error.InvalidTableIndexMetadata;
+            const source_config = indexes.get(source.string) orelse return error.InvalidTableIndexMetadata;
+            try validateHybridSourceIndexConfigType(source_config);
         }
     }
+}
+
+fn validateGraphEdgePolicyValue(value: std.json.Value) !void {
+    if (value != .string) return error.InvalidTableIndexMetadata;
+    if (std.ascii.eqlIgnoreCase(value.string, "all")) return;
+    return error.InvalidTableIndexMetadata;
+}
+
+fn validateGraphMetricName(metric: []const u8) !void {
+    if (!validRenderedFieldRef(metric)) return error.InvalidTableIndexMetadata;
+}
+
+fn validateGraphMetricAlgorithm(algorithm: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(algorithm, "degree")) return;
+    if (std.ascii.eqlIgnoreCase(algorithm, "pagerank")) return;
+    if (std.ascii.eqlIgnoreCase(algorithm, "eigenvector")) return;
+    if (std.ascii.eqlIgnoreCase(algorithm, "eigenvector_centrality")) return;
+    if (std.ascii.eqlIgnoreCase(algorithm, "hits")) return;
+    if (std.ascii.eqlIgnoreCase(algorithm, "authority")) return;
+    if (std.ascii.eqlIgnoreCase(algorithm, "hub")) return;
+    return error.InvalidTableIndexMetadata;
+}
+
+fn validateGraphMetricFreshnessValue(value: std.json.Value) !void {
+    if (value != .string) return error.InvalidTableIndexMetadata;
+    if (std.ascii.eqlIgnoreCase(value.string, "published")) return;
+    if (std.ascii.eqlIgnoreCase(value.string, "fresh")) return;
+    return error.InvalidTableIndexMetadata;
+}
+
+fn validateGraphMetricPublishValue(value: std.json.Value) !void {
+    if (value != .string) return error.InvalidTableIndexMetadata;
+    if (std.ascii.eqlIgnoreCase(value.string, "after_max_iterations")) return;
+    if (std.ascii.eqlIgnoreCase(value.string, "on_convergence")) return;
+    if (std.ascii.eqlIgnoreCase(value.string, "never")) return;
+    return error.InvalidTableIndexMetadata;
 }
 
 fn requiredJsonStringField(object: std.json.ObjectMap, field_name: []const u8) ![]const u8 {
@@ -1653,6 +1718,15 @@ fn validateIndexConfigType(config: std.json.Value, expected_type: []const u8) !v
     if (config != .object) return error.InvalidTableIndexMetadata;
     const type_name = try requiredJsonStringField(config.object, "type");
     if (!std.mem.eql(u8, type_name, expected_type)) return error.InvalidTableIndexMetadata;
+}
+
+fn validateHybridSourceIndexConfigType(config: std.json.Value) !void {
+    if (config != .object) return error.InvalidTableIndexMetadata;
+    const type_name = try requiredJsonStringField(config.object, "type");
+    if (std.mem.eql(u8, type_name, "full_text")) return;
+    if (std.mem.eql(u8, type_name, "embeddings")) return;
+    if (std.mem.eql(u8, type_name, "graph_metric")) return;
+    return error.InvalidTableIndexMetadata;
 }
 
 pub fn relationalSqlDdlTargetAlloc(
@@ -4658,6 +4732,11 @@ test "derived index field refs validate against relational and embedded json sch
     );
     try validateDerivedIndexFieldRefsForSchemaAlloc(
         alloc,
+        "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"source_doc\",\"target_field\":\"target_doc\"},\"edge_policy\":\"all\"}",
+        schema_json,
+    );
+    try validateDerivedIndexFieldRefsForSchemaAlloc(
+        alloc,
         "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"body\",\"content_type\":\"application/json\",\"producer_json\":{\"type\":\"extractor\",\"model\":\"relations\"}},\"nodes\":{\"model\":\"document\",\"source\":\"{{ _doc.key }}\",\"target\":\"{{ _item.target.document_id }}\"},\"edge\":{\"type\":\"{{ _item.type }}\",\"weight\":\"{{ _item.confidence }}\"},\"context\":{\"doc_fields\":[\"id\"]}}",
         schema_json,
     );
@@ -4698,7 +4777,39 @@ test "derived index field refs validate against relational and embedded json sch
         error.InvalidTableIndexMetadata,
         validateDerivedIndexFieldRefsForSchemaAlloc(
             alloc,
+            "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"source_doc\",\"target_field\":\"target_doc\"},\"edge_policy\":\"surprise\"}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
             "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"missing_body\"}}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"embeddings\",\"field\":\"body\",\"embedder\":{\"model\":\"\"}}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"embeddings\",\"field\":\"body\",\"enrichments\":[{\"name\":\"body_embedding\",\"kind\":\"embedding\",\"field\":\"body\",\"model\":\"\"}]}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"body\",\"content_type\":\"application/json\",\"producer_json\":{\"type\":\"extractor\",\"model\":\"\"}},\"nodes\":{\"model\":\"document\",\"source\":\"{{ _doc.key }}\",\"target\":\"{{ _item.target.document_id }}\"},\"edge\":{\"type\":\"{{ _item.type }}\",\"weight\":\"{{ _item.confidence }}\"},\"context\":{\"doc_fields\":[\"id\"]}}",
             schema_json,
         ),
     );
@@ -5415,6 +5526,14 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
             "ALTER GRAPH INDEX missing_graph ADD METRIC missing_pagerank USING pagerank;",
         ),
     );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &graph_metric_alter.table,
+            "ALTER GRAPH INDEX docs_graph ADD METRIC bad_metric USING shortest_path;",
+        ),
+    );
 
     var hybrid = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
@@ -5423,6 +5542,14 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
     );
     defer hybrid.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"docs_hybrid\"") != null);
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &graph_metric_alter.table,
+            "CREATE INDEX docs_bad_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_graph', fusion = 'rrf');",
+        ),
+    );
     try std.testing.expect(std.mem.indexOf(u8, hybrid.table.indexes_json, "\"sources\"") != null);
 
     try std.testing.expectError(
