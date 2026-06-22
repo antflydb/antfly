@@ -286,31 +286,31 @@ pub fn conflictExpressionStartAt(tokens: []const Token, pos: usize) ?ConflictExp
     if (lower_expr.peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
     if (lower_expr.peekReplaceFunctionCall(tokens, pos)) return .replace;
     if (lower_expr.peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpMatchFunction)) return .regexp_match;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpSubstrFunction)) return .regexp_substr;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpCountFunction)) return .regexp_count;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRegexpInstrFunction)) return .regexp_instr;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTranslateFunction)) return .translate;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpMatchFunction)) return .regexp_match;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpSubstrFunction)) return .regexp_substr;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpCountFunction)) return .regexp_count;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpInstrFunction)) return .regexp_instr;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsTranslateFunction)) return .translate;
     if (lower_expr.peekConcatFunctionCall(tokens, pos)) return .concat;
     if (lower_expr.peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
     if (lower_expr.peekNullifFunctionCall(tokens, pos)) return .nullif;
     if (lower_expr.peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsAsciiFunction)) return .ascii;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsChrFunction)) return .chr;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsAsciiFunction)) return .ascii;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsChrFunction)) return .chr;
     if (lower_expr.peekSubstringFunctionKeyword(tokens, pos)) return .substring;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsOverlayFunction)) return .overlay;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsOverlayFunction)) return .overlay;
     if (lower_expr.peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
     if (lower_expr.peekStrposFunctionKeyword(tokens, pos) or lower_expr.peekPositionFunctionSyntax(tokens, pos)) return .strpos;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsLeftRightFunction)) return .left_right;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsPadFunction)) return .pad;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsRepeatFunction)) return .repeat;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsReverseFunction)) return .reverse;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsMd5Function)) return .md5;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsStartsWithFunction)) return .starts_with;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsEndsWithFunction)) return .ends_with;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateTruncFunction)) return .date_trunc;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDateBinFunction)) return .date_bin;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsDatePartFunction)) return .date_part;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsLeftRightFunction)) return .left_right;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsPadFunction)) return .pad;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRepeatFunction)) return .repeat;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsReverseFunction)) return .reverse;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsMd5Function)) return .md5;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsStartsWithFunction)) return .starts_with;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsEndsWithFunction)) return .ends_with;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateTruncFunction)) return .date_trunc;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateBinFunction)) return .date_bin;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDatePartFunction)) return .date_part;
     if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
     if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
     if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
@@ -321,16 +321,16 @@ pub fn conflictExpressionStartAt(tokens: []const Token, pos: usize) ?ConflictExp
     if (lower_expr.peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
     if (lower_expr.peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
     if (lower_expr.peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonExtractPathFunction)) return .json_extract_path;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonBuildObjectFunction)) return .json_build_object;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonTypeofFunction)) return .json_typeof;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsJsonArrayLengthFunction)) return .json_array_length;
-    if (lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayLengthFunction)) return .array_length;
-    if (lower_expr.functionCallStartsAtIf(tokens, pos, lower_expr.sqlKeywordIsArrayPositionFunction)) return .array_position;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction)) return .json_extract_path;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonBuildObjectFunction)) return .json_build_object;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonTypeofFunction)) return .json_typeof;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonArrayLengthFunction)) return .json_array_length;
+    if (lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayLengthFunction)) return .array_length;
+    if (lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayPositionFunction)) return .array_position;
     if (lower_expr.peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
     if (lower_expr.peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
     if (lower_expr.peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
-    if (lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsUuidV4Function)) return .uuid_v4;
+    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsUuidV4Function)) return .uuid_v4;
     if (lower_expr.peekSqlNowExpressionSyntax(tokens, pos)) return .now;
     if (lower_expr.peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
     if (lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
@@ -4931,7 +4931,7 @@ pub fn parseConflictTextTernaryExpressionAlloc(
     if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     switch (kind) {
         .replace => try lower_expr.parseReplaceFunctionCallStart(tokens, pos),
-        .translate => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsTranslateFunction),
+        .translate => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsTranslateFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -4981,11 +4981,11 @@ pub fn parseConflictTextBinaryExpressionAlloc(
         if (!compatible) return error.UnsupportedSqlShape;
     }
     switch (kind) {
-        .regexp_count => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsRegexpCountFunction),
-        .regexp_instr => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsRegexpInstrFunction),
-        .regexp_substr => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsRegexpSubstrFunction),
-        .starts_with => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsStartsWithFunction),
-        .ends_with => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsEndsWithFunction),
+        .regexp_count => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpCountFunction),
+        .regexp_instr => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpInstrFunction),
+        .regexp_substr => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpSubstrFunction),
+        .starts_with => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsStartsWithFunction),
+        .ends_with => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsEndsWithFunction),
         else => return error.UnsupportedSqlShape,
     }
     const lhs = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
@@ -5027,7 +5027,7 @@ pub fn parseConflictRegexpListExpressionAlloc(
 
     switch (kind) {
         .regexp_replace => try lower_expr.parseRegexpReplaceFunctionCallStart(tokens, pos),
-        .regexp_match => try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsRegexpMatchFunction),
+        .regexp_match => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpMatchFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -5101,7 +5101,7 @@ pub fn parseConflictTextNumericBinaryExpressionAlloc(
             break :blk matched_kind;
         },
         .repeat => blk: {
-            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsRepeatFunction);
+            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRepeatFunction);
             break :blk .repeat;
         },
         else => return error.UnsupportedSqlShape,
@@ -5140,15 +5140,15 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
 
     const expression_kind: db_mod.types.RelationalRowsExpressionKind = switch (kind) {
         .substring => blk: {
-            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsSubstringFunction);
+            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsSubstringFunction);
             break :blk .substring;
         },
         .overlay => blk: {
-            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsOverlayFunction);
+            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsOverlayFunction);
             break :blk .overlay;
         },
         .split_part => blk: {
-            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsSplitPartFunction);
+            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsSplitPartFunction);
             break :blk .split_part;
         },
         .lpad, .rpad => blk: {
@@ -5309,7 +5309,7 @@ pub fn parseConflictStrposExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
 
-    if (lower_expr.matchFunctionKeyword(tokens, pos, lower_expr.sqlKeywordIsStrposFunction)) {
+    if (lower_expr.matchFunctionKeywordToken(tokens, pos, lower_expr.sqlTokenIsStrposFunction) != null) {
         try parser.expectToken(tokens, pos, .lparen);
         const source = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
         var source_transferred = false;
@@ -5389,7 +5389,7 @@ pub fn parseConflictDateExpressionAlloc(
 
     switch (kind) {
         .date_trunc => {
-            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsDateTruncFunction);
+            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsDateTruncFunction);
             const unit = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             var unit_transferred = false;
             errdefer if (!unit_transferred) freeExpression(alloc, unit);
@@ -5442,7 +5442,7 @@ pub fn parseConflictDateExpressionAlloc(
             return expression;
         },
         .date_bin => {
-            try lower_expr.parseFunctionCallStartIf(tokens, pos, lower_expr.sqlKeywordIsDateBinFunction);
+            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsDateBinFunction);
             const stride = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             var stride_transferred = false;
             errdefer if (!stride_transferred) freeExpression(alloc, stride);
@@ -5538,8 +5538,8 @@ pub fn parseConflictJsonExtractPathExpressionAlloc(
     type_context: lower_expr.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    const keyword = lower_expr.matchFunctionKeywordText(tokens, pos, lower_expr.sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
-    const as_text = lower_expr.sqlJsonExtractPathFunctionAsText(keyword);
+    const function_token = lower_expr.matchFunctionKeywordToken(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    const as_text = lower_expr.sqlJsonExtractPathTokenAsText(function_token);
     const output_type: runtime_schema.AntflyType = if (as_text) .keyword else .json;
     if (expected_type) |field_type| {
         if (!lower_expr.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;

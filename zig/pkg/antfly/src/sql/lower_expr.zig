@@ -5124,8 +5124,8 @@ pub fn parseJsonExtractPathRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     options: FixedUnaryRowExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    const keyword = matchFunctionKeywordText(tokens, pos, sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
-    const as_text = sqlJsonExtractPathFunctionAsText(keyword);
+    const function_token = matchFunctionKeywordToken(tokens, pos, sqlTokenIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    const as_text = sqlJsonExtractPathTokenAsText(function_token);
     try parser.expectToken(tokens, pos, .lparen);
     const operand = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
     var operand_transferred = false;
@@ -5400,11 +5400,11 @@ pub fn parseTextBinaryRowExpressionAlloc(
     hooks: FixedBinaryRowExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     switch (kind) {
-        .starts_with => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsStartsWithFunction),
-        .ends_with => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsEndsWithFunction),
-        .regexp_substr => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction),
-        .regexp_count => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpCountFunction),
-        .regexp_instr => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpInstrFunction),
+        .starts_with => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsStartsWithFunction),
+        .ends_with => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsEndsWithFunction),
+        .regexp_substr => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction),
+        .regexp_count => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction),
+        .regexp_instr => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -5435,7 +5435,7 @@ pub fn parseTextTernaryRowExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     switch (kind) {
         .replace => try parseReplaceFunctionCallStart(tokens, pos),
-        .translate => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsTranslateFunction),
+        .translate => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsTranslateFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -5474,7 +5474,7 @@ pub fn parseRegexpListRowExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     switch (kind) {
         .regexp_replace => try parseRegexpReplaceFunctionCallStart(tokens, pos),
-        .regexp_match => try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRegexpMatchFunction),
+        .regexp_match => try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -5536,7 +5536,7 @@ pub fn parseSubstringRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: VariadicRowExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
-    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsSubstringFunction);
+    try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsSubstringFunction);
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
     errdefer {
         for (operands.items) |operand| freeExpression(alloc, operand);
@@ -5595,7 +5595,7 @@ pub fn parseOverlayRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: VariadicRowExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
-    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsOverlayFunction);
+    try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsOverlayFunction);
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
     errdefer {
         for (operands.items) |operand| freeExpression(alloc, operand);
@@ -5645,7 +5645,7 @@ pub fn parseSplitPartRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: VariadicRowExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
-    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsSplitPartFunction);
+    try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsSplitPartFunction);
     const source = try hooks.parse_expression(hooks.ptr);
     var source_transferred = false;
     errdefer if (!source_transferred) freeExpression(alloc, source);
@@ -5678,7 +5678,7 @@ pub fn parseStrposRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: VariadicRowExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
-    if (matchFunctionKeyword(tokens, pos, sqlKeywordIsStrposFunction)) {
+    if (matchFunctionKeywordToken(tokens, pos, sqlTokenIsStrposFunction) != null) {
         try parser.expectToken(tokens, pos, .lparen);
         const source = try hooks.parse_expression(hooks.ptr);
         var source_transferred = false;
@@ -5778,7 +5778,7 @@ pub fn parseRepeatRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: FixedBinaryRowExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsRepeatFunction);
+    try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsRepeatFunction);
     return try parseTextNumericBinaryRowExpressionRestAlloc(alloc, tokens, pos, .repeat, type_context, hooks);
 }
 
@@ -5789,7 +5789,7 @@ pub fn parseDateTruncRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: FixedBinaryRowExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsDateTruncFunction);
+    try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsDateTruncFunction);
     const unit = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
     var unit_transferred = false;
     errdefer if (!unit_transferred) freeExpression(alloc, unit);
@@ -5815,7 +5815,7 @@ pub fn parseDateBinRowExpressionAlloc(
     type_context: RowExpressionTypeContext,
     hooks: VariadicRowExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
-    try parseFunctionCallStartIf(tokens, pos, sqlKeywordIsDateBinFunction);
+    try parseFunctionCallStartTokenIf(tokens, pos, sqlTokenIsDateBinFunction);
     const stride = try hooks.parse_expression(hooks.ptr);
     var stride_transferred = false;
     errdefer if (!stride_transferred) freeExpression(alloc, stride);
@@ -18553,6 +18553,11 @@ pub fn sqlJsonExtractPathFunctionAsText(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "jsonb_extract_path_text");
 }
 
+pub fn sqlJsonExtractPathTokenAsText(token: Token) bool {
+    return token.matchesKeywordTag(.json_extract_path_text) or
+        token.matchesKeywordTag(.jsonb_extract_path_text);
+}
+
 pub fn sqlKeywordIsAsciiFunction(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "ascii");
 }
@@ -18692,6 +18697,10 @@ pub fn sqlTokenIsArrayPositionFunction(token: Token) bool {
     return tokenMatchesKeywordTags(token, &.{ .array_position, .array_positions });
 }
 
+pub fn sqlTokenIsArrayToStringFunction(token: Token) bool {
+    return token.matchesKeywordTag(.array_to_string);
+}
+
 pub fn sqlTokenIsJsonTypeofFunction(token: Token) bool {
     return tokenMatchesKeywordTags(token, &.{ .json_typeof, .jsonb_typeof });
 }
@@ -18702,6 +18711,14 @@ pub fn sqlTokenIsJsonExtractPathFunction(token: Token) bool {
 
 pub fn sqlTokenIsJsonBuildObjectFunction(token: Token) bool {
     return tokenMatchesKeywordTags(token, &.{ .json_build_object, .jsonb_build_object });
+}
+
+pub fn sqlTokenIsAsciiFunction(token: Token) bool {
+    return token.matchesKeywordTag(.ascii);
+}
+
+pub fn sqlTokenIsChrFunction(token: Token) bool {
+    return token.matchesKeywordTag(.chr);
 }
 
 pub fn sqlTokenIsSubstringFunction(token: Token) bool {
@@ -19105,6 +19122,15 @@ pub fn parseFunctionCallStartIf(
     comptime predicate: fn ([]const u8) bool,
 ) !void {
     _ = matchFunctionKeywordText(tokens, pos, predicate) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+}
+
+pub fn parseFunctionCallStartTokenIf(
+    tokens: []const Token,
+    pos: *usize,
+    comptime predicate: fn (Token) bool,
+) !void {
+    _ = matchFunctionKeywordToken(tokens, pos, predicate) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
 }
 
