@@ -317,7 +317,8 @@ Current implementation status:
   `SqlDiagnostic` shape for unsupported classifications.
 - Fixture fingerprint checks use a structured `PlanFingerprintView` scanner with
   explicit exact-token and suffix-token modes instead of open-coded substring
-  searches.
+  searches. Lateral and window expression coverage checks now use emitted plan
+  tokens rather than matching SQL spelling.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
@@ -343,6 +344,25 @@ CLI, MCP, A2A, fixtures, and tests. Once a request enters the SQL adapter, the
 first step should construct a shared parsed object. Every internal phase should
 then consume typed parser, binder, and plan objects rather than reparsing SQL
 text or probing independent string-oriented lowerers.
+
+The production design is a small compiler frontend for Antfly-native plans,
+not a collection of SQL-shaped helpers. PostgreSQL is the compatibility grammar
+and the main reference for session/name-resolution behavior, but the durable
+contract is Antfly's catalog, row, index, role, extension, job, lake, backup,
+and storage services.
+
+The design has three hard rules:
+
+1. SQL text is an ingress format only. Durable metadata, job payloads, index
+   definitions, role settings, extension state, backup scopes, and storage
+   requests store typed Antfly objects, never SQL strings.
+2. Parsing is catalog-free. It produces source-span-preserving syntax trees and
+   diagnostics without reading tables, roles, extensions, indexes, tablespaces,
+   or storage metadata.
+3. Binding is the first semantic boundary. Catalog identity, session defaults,
+   privileges, object versions, schemas, placement policy, and dependency
+   checks are resolved once into typed bound statements before planning or
+   execution.
 
 The production pipeline should be:
 
@@ -421,6 +441,15 @@ scan SQL strings or fingerprints as a second parser.
 JSON and JSONB literals should stay as source spans or token references during
 lexing, classification, and raw parsing. Only semantic phases that need typed
 JSON values should pay parse/stringify costs.
+
+The end state should feel like this at API call sites:
+
+- external callers may submit SQL text;
+- adapter entrypoints immediately create `ParsedSql`;
+- catalog/session-aware paths bind that object into `BoundSqlStatement`;
+- planners lower bound statements into native logical plans;
+- executors and lifecycle services never need to know the request started as
+  SQL.
 
 ### Production Module Boundaries
 

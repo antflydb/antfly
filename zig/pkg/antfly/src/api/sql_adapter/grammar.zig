@@ -11615,57 +11615,6 @@ test "sql adapter grammar parses cursor portal syntax" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseFetchCursorPortalTail(extra_tokens.items, &extra_pos));
 }
 
-test "sql adapter grammar parses explain prefixes and options" {
-    const alloc = std.testing.allocator;
-
-    const basic_sql = "EXPLAIN SELECT id FROM usage_records;";
-    const basic = try parseExplainPrefix(basic_sql);
-    try std.testing.expect(!basic.analyze);
-    try std.testing.expectEqual(ast.SqlExplainFormat.text, basic.format);
-    try std.testing.expect(!basic.verbose);
-    try std.testing.expect(basic.costs);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", basic.inner_sql);
-    var basic_tokens = try lexer.tokenizeAlloc(alloc, basic_sql);
-    defer lexer.freeTokens(alloc, &basic_tokens);
-    const basic_from_tokens = try parseExplainPrefixTokens(basic_sql, basic_tokens.items);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", basic_from_tokens.inner_sql);
-    try std.testing.expectEqual(@as(usize, 1), basic_from_tokens.inner_token_start);
-    try std.testing.expectEqual(@as(usize, 5), basic_from_tokens.inner_token_end);
-
-    const options_sql = "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON) SELECT id FROM usage_records";
-    const options = try parseExplainPrefix(options_sql);
-    try std.testing.expect(options.analyze);
-    try std.testing.expectEqual(ast.SqlExplainFormat.json, options.format);
-    try std.testing.expect(options.verbose);
-    try std.testing.expect(!options.costs);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", options.inner_sql);
-    var options_tokens = try lexer.tokenizeAlloc(alloc, options_sql);
-    defer lexer.freeTokens(alloc, &options_tokens);
-    const options_from_tokens = try parseExplainPrefixTokens(options_sql, options_tokens.items);
-    try std.testing.expect(options_from_tokens.analyze);
-    try std.testing.expectEqual(ast.SqlExplainFormat.json, options_from_tokens.format);
-    try std.testing.expect(options_from_tokens.verbose);
-    try std.testing.expect(!options_from_tokens.costs);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", options_from_tokens.inner_sql);
-
-    const runtime_options = try parseExplainPrefix("EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records");
-    try std.testing.expect(runtime_options.analyze);
-    try std.testing.expect(runtime_options.buffers);
-    try std.testing.expect(!runtime_options.timing);
-    try std.testing.expect(!runtime_options.summary);
-    try std.testing.expect(runtime_options.settings);
-    try std.testing.expect(runtime_options.wal);
-    try std.testing.expectEqualStrings("SELECT id FROM usage_records", runtime_options.inner_sql);
-
-    const analyze = try parseExplainPrefix("EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')");
-    try std.testing.expect(analyze.analyze);
-    try std.testing.expectEqualStrings("INSERT INTO usage_records (id) VALUES ('u1')", analyze.inner_sql);
-
-    try std.testing.expectError(error.UnsupportedSqlShape, parseExplainPrefix("EXPLAIN (FORMAT YAML) SELECT 1"));
-    try std.testing.expectError(error.UnsupportedSqlShape, parseExplainPrefix("EXPLAINED SELECT 1"));
-    try std.testing.expectError(error.UnsupportedSqlShape, parseExplainPrefix("EXPLAIN"));
-}
-
 test "sql adapter grammar parses row claim clauses" {
     const alloc = std.testing.allocator;
 

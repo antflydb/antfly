@@ -40,21 +40,6 @@ pub const SqlExplainFormat = enum {
     json,
 };
 
-pub const SqlExplainPrefix = struct {
-    analyze: bool = false,
-    format: SqlExplainFormat = .text,
-    verbose: bool = false,
-    costs: bool = true,
-    buffers: bool = false,
-    timing: bool = true,
-    summary: bool = true,
-    settings: bool = false,
-    wal: bool = false,
-    inner_sql: []const u8,
-    inner_token_start: usize = 0,
-    inner_token_end: usize = 0,
-};
-
 pub const SqlPatternQuantifier = enum {
     any,
     all,

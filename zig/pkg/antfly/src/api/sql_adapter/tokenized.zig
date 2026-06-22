@@ -533,13 +533,15 @@ test "sql adapter parsed sql owns typed statement variants" {
         else => return error.TestUnexpectedResult,
     }
 
-    var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN SELECT id FROM usage_records");
+    var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN SELECT id FROM usage_records;");
     defer explain.deinit(alloc);
     switch (explain.statement) {
         .explain => |statement| {
-            try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records", statement.raw.sql(explain.sql()));
+            try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records;", statement.raw.sql(explain.sql()));
             try std.testing.expect(!statement.analyze);
             try std.testing.expectEqual(ast.SqlExplainFormat.text, statement.format);
+            try std.testing.expect(!statement.verbose);
+            try std.testing.expect(statement.costs);
             try std.testing.expectEqual(@as(?usize, 1), statement.inner_token_start);
             try std.testing.expectEqual(@as(?usize, 5), statement.inner_token_end);
         },
@@ -561,6 +563,36 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expect(statement.wal);
             try std.testing.expect(statement.inner_token_start != null);
             try std.testing.expect(statement.inner_token_end != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var explain_analyze = try ParsedSql.initAlloc(alloc, "EXPLAIN ANALYZE INSERT INTO usage_records (id) VALUES ('u1')");
+    defer explain_analyze.deinit(alloc);
+    switch (explain_analyze.statement) {
+        .explain => |statement| {
+            try std.testing.expect(statement.analyze);
+            try std.testing.expectEqualStrings("INSERT", explain_analyze.items()[statement.inner_token_start.?].text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var invalid_explain = try ParsedSql.initAlloc(alloc, "EXPLAIN (FORMAT YAML) SELECT 1");
+    defer invalid_explain.deinit(alloc);
+    switch (invalid_explain.statement) {
+        .explain => |statement| {
+            try std.testing.expect(statement.inner_token_start == null);
+            try std.testing.expect(statement.inner_token_end == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var empty_explain = try ParsedSql.initAlloc(alloc, "EXPLAIN");
+    defer empty_explain.deinit(alloc);
+    switch (empty_explain.statement) {
+        .explain => |statement| {
+            try std.testing.expect(statement.inner_token_start == null);
+            try std.testing.expect(statement.inner_token_end == null);
         },
         else => return error.TestUnexpectedResult,
     }

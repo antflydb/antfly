@@ -4473,6 +4473,7 @@ pub fn lateralFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredLateral
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_or", lowered.plan.lateral.match_expression_or_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_not", lowered.plan.lateral.match_expression_not_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_array", lowered.plan.lateral.match_expression_array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "match_expr_or_lower", predicateGroupsExpressionKindCount(lowered.plan.lateral.match_expression_or_predicates, .lower));
     return fingerprint;
 }
 
@@ -4483,6 +4484,83 @@ pub fn readFingerprintWithPrefixAlloc(
 ) ![]u8 {
     defer alloc.free(owned_fingerprint);
     return try std.fmt.allocPrint(alloc, "read:{s}:{s}", .{ family, owned_fingerprint });
+}
+
+fn expressionContainsKind(
+    expression: db_mod.types.RelationalRowsExpression,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) bool {
+    if (expression.kind == kind) return true;
+    for (expression.operands) |operand| {
+        if (expressionContainsKind(operand, kind)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (conditionContainsExpressionKind(branch.when, kind)) return true;
+        if (expressionContainsKind(branch.then, kind)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (expressionContainsKind(case_else, kind)) return true;
+    }
+    return false;
+}
+
+fn conditionContainsExpressionKind(
+    condition: db_mod.types.RelationalRowsExpressionCondition,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) bool {
+    if (expressionContainsKind(condition.lhs, kind)) return true;
+    for (condition.rhs) |rhs| {
+        if (expressionContainsKind(rhs, kind)) return true;
+    }
+    return false;
+}
+
+fn predicateGroupsExpressionKindCount(
+    groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) usize {
+    var count: usize = 0;
+    for (groups) |group| {
+        for (group.conditions) |condition| {
+            if (conditionContainsExpressionKind(condition, kind)) {
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+fn windowValueExpressionKindCount(
+    windows: []const db_mod.types.RelationalRowsWindowSpec,
+    kind: db_mod.types.RelationalRowsExpressionKind,
+) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        if (window.value_expression) |expression| {
+            if (expressionContainsKind(expression, kind)) count += 1;
+        }
+    }
+    return count;
+}
+
+fn windowFunctionCount(
+    windows: []const db_mod.types.RelationalRowsWindowSpec,
+    function: db_mod.types.RelationalRowsWindowFunction,
+) usize {
+    var count: usize = 0;
+    for (windows) |window| {
+        if (window.function == function) count += 1;
+    }
+    return count;
+}
+
+fn windowScalarMinMaxCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    return windowFunctionCount(windows, .min) + windowFunctionCount(windows, .max);
+}
+
+fn windowBooleanAggregateFunctionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
+    return windowFunctionCount(windows, .bool_or) + windowFunctionCount(windows, .bool_and);
 }
 
 pub fn windowFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWindowPlan) ![]u8 {
@@ -4508,6 +4586,9 @@ pub fn windowFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWindowPl
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter_expr", windowFilterExpressionCount(lowered.plan.window.windows));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter_access", windowFilterAccessCount(lowered.plan.window.windows));
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_filter_groups", windowFilterGroupCount(lowered.plan.window.windows));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_expr_mod", windowValueExpressionKindCount(lowered.plan.window.windows, .mod));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_scalar_minmax", windowScalarMinMaxCount(lowered.plan.window.windows));
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "window_bool_agg", windowBooleanAggregateFunctionCount(lowered.plan.window.windows));
     fingerprint = try appendSourceQueryAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.window.source);
     fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, lowered.plan.ctes);
     fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "offset", lowered.plan.window.offset);
@@ -7901,20 +7982,15 @@ pub const AppParityCorpusCoverage = struct {
                         (sql_adapter.planHasNonZeroToken(entry.plan, ":left_expr_pred=") or
                             sql_adapter.planHasNonZeroToken(entry.plan, ":right_expr_pred="));
                 self.lateral_subquery_match_expression = self.lateral_subquery_match_expression or
-                    (std.mem.indexOf(u8, entry.sql, "bal.amount + org.amount") != null and
-                        sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred=");
                 self.lateral_subquery_match_expression_or = self.lateral_subquery_match_expression_or or
-                    (std.mem.indexOf(u8, entry.sql, "bal.amount + org.amount < 100") != null and
-                        sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_or="));
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_or=");
                 self.lateral_subquery_function_match_expression_or = self.lateral_subquery_function_match_expression_or or
-                    (std.mem.indexOf(u8, entry.sql, "lower(bal.kind) = lower(org.kind)") != null and
-                        sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_or="));
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_or_lower=");
                 self.lateral_subquery_match_expression_not = self.lateral_subquery_match_expression_not or
-                    (std.mem.indexOf(u8, entry.sql, "NOT (bal.amount + org.amount > 100)") != null and
-                        sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_not="));
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_not=");
                 self.lateral_subquery_match_expression_array = self.lateral_subquery_match_expression_array or
-                    (std.mem.indexOf(u8, entry.sql, "string_to_array(bal.status || ' ' || org.status") != null and
-                        sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_array="));
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_array=");
                 self.lateral_expression_order = self.lateral_expression_order or sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr=");
                 self.lateral_right_offset = self.lateral_right_offset or sql_adapter.planHasNonZeroToken(entry.plan, ":right_offset=");
             },
@@ -7924,21 +8000,14 @@ pub const AppParityCorpusCoverage = struct {
                 self.window_rich_functions = self.window_rich_functions or sql_adapter.planHasNonZeroToken(entry.plan, ":windows=");
                 self.window_source_membership = self.window_source_membership or sql_adapter.planHasNonZeroToken(entry.plan, ":source_in=");
                 self.window_mixed_order = self.window_mixed_order or
-                    (std.mem.indexOf(u8, entry.sql, "AS amount_row_num") != null and
-                        std.mem.indexOf(u8, entry.sql, "AS id_row_num") != null and
-                        sql_adapter.planHasNonZeroToken(entry.plan, ":windows="));
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":windows=");
                 self.window_expression_order = self.window_expression_order or sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr=");
-                self.window_modulo_expression = self.window_modulo_expression or (std.mem.indexOf(u8, entry.sql, "sum(amount % quantity)") != null and
-                    std.mem.indexOf(u8, entry.sql, "avg(MOD(amount + quantity") != null and
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":window_expr="));
-                self.window_scalar_minmax = self.window_scalar_minmax or (std.mem.indexOf(u8, entry.sql, "min(status) OVER") != null and
-                    std.mem.indexOf(u8, entry.sql, "max(lower(status)) OVER") != null and
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":window_expr="));
-                self.window_boolean_aggregate_functions = self.window_boolean_aggregate_functions or (std.mem.indexOf(u8, entry.sql, "bool_or(") != null and
-                    std.mem.indexOf(u8, entry.sql, "bool_and(") != null and
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":windows=") and
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter=") and
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter_expr="));
+                self.window_modulo_expression = self.window_modulo_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":window_expr_mod=");
+                self.window_scalar_minmax = self.window_scalar_minmax or sql_adapter.planHasNonZeroToken(entry.plan, ":window_scalar_minmax=");
+                self.window_boolean_aggregate_functions = self.window_boolean_aggregate_functions or
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":window_bool_agg=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":window_filter_expr=");
                 self.window_cte = self.window_cte or uses_cte_stream;
                 self.window_cte_expression_access = self.window_cte_expression_access or
                     (sql_adapter.planHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_") or
