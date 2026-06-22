@@ -1096,10 +1096,16 @@ pub fn insertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?
 }
 
 pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != .insert_source or statement.recursive) return null;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
     return try insertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
-pub fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
+fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
     if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try insertSourceTableNamesFromWithAlloc(alloc, tokens);
     if (!std.ascii.eqlIgnoreCase(tokens[0].text, "insert")) return null;
@@ -1116,10 +1122,16 @@ pub fn recursiveInsertSourceTableNamesFromParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
 ) !?InsertSourceTableNames {
+    switch (parsed_sql.statement) {
+        .write => |statement| {
+            if (statement.kind != .insert_source or !statement.recursive) return null;
+        },
+        else => return error.UnsupportedSqlShape,
+    }
     return try recursiveInsertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
-pub fn recursiveInsertSourceTableNamesFromTokensAlloc(
+fn recursiveInsertSourceTableNamesFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
 ) !?InsertSourceTableNames {
@@ -1169,10 +1181,27 @@ pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u
 }
 
 pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
+    switch (parsed_sql.statement) {
+        .write => |statement| switch (statement.kind) {
+            .update,
+            .update_source,
+            .update_joined_source,
+            .delete,
+            .delete_source,
+            .delete_joined_source,
+            .merge,
+            => {},
+            .insert,
+            .insert_source,
+            .truncate,
+            => return null,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
     return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
-pub fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
+fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
     if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens);
     return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, 0);
@@ -1281,7 +1310,58 @@ pub fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundWritePlanOptions {
     try requireParsedCatalogWriteStatement(parsed_sql.statement);
-    return try resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(alloc, parsed_sql.items(), options, catalog, session);
+    return try resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(alloc, parsed_sql, options, catalog, session);
+}
+
+fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !CatalogBoundWritePlanOptions {
+    var out = CatalogBoundWritePlanOptions{
+        .options = options,
+    };
+    errdefer out.deinit(alloc);
+    var resolved_recursive_insert_source = false;
+
+    if (out.options.insert_source_schema == null) {
+        if (try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
+            var tables = resolved_tables;
+            defer tables.deinit(alloc);
+            resolved_recursive_insert_source = true;
+            if (!std.mem.eql(u8, tables.target, tables.source)) {
+                out.owned_insert_source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+                out.options.insert_source_schema = out.owned_insert_source_schema.?;
+            }
+        } else if (try insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
+            var tables = resolved_tables;
+            defer tables.deinit(alloc);
+            if (!std.mem.eql(u8, tables.target, tables.source)) {
+                out.owned_insert_source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+                out.options.insert_source_schema = out.owned_insert_source_schema.?;
+            }
+        }
+    }
+
+    if (!resolved_recursive_insert_source and out.options.joined_source_schema == null) {
+        if (joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |maybe_resolved_tables| {
+            if (maybe_resolved_tables) |resolved_tables| {
+                var tables = resolved_tables;
+                defer tables.deinit(alloc);
+                if (!std.mem.eql(u8, tables.target, tables.source)) {
+                    out.owned_joined_source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+                    out.options.joined_source_schema = out.owned_joined_source_schema.?;
+                }
+            }
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
+    }
+
+    return out;
 }
 
 fn resolveWritePlanCatalogOptionsFromTokensAlloc(
@@ -1369,7 +1449,25 @@ pub fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundReadPlanSourceSchema {
     try requireParsedCatalogReadStatement(parsed_sql.statement);
-    return try resolveReadPlanCatalogSourceSchemaFromTokensWithSessionAlloc(alloc, parsed_sql.items(), catalog, session);
+    return try resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog, session);
+}
+
+fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !CatalogBoundReadPlanSourceSchema {
+    var out = CatalogBoundReadPlanSourceSchema{};
+    errdefer out.deinit(alloc);
+    if (try readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
+        var tables = resolved_tables;
+        defer tables.deinit(alloc);
+        if (!std.mem.eql(u8, tables.left, tables.source)) {
+            out.source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+        }
+    }
+    return out;
 }
 
 pub fn bindReadPlanCatalogStatementAlloc(
@@ -1658,10 +1756,14 @@ pub fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?Re
 }
 
 pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?ReadSourceTableNames {
+    switch (parsed_sql.statement) {
+        .read => {},
+        else => return error.UnsupportedSqlShape,
+    }
     return try readSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
-pub fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
+fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
     if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try readSourceTableNamesFromWithAlloc(alloc, tokens);
     if (!std.ascii.eqlIgnoreCase(tokens[0].text, "select")) return null;
@@ -2072,6 +2174,37 @@ test "sql adapter binder resolves catalog prebind table names from shared tokens
     defer joined_write.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", joined_write.target);
     try std.testing.expectEqualStrings("incoming_usage", joined_write.source);
+}
+
+test "sql adapter binder source table helpers validate parsed statement family" {
+    const alloc = std.testing.allocator;
+
+    var read = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
+    defer read.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, insertSourceTableNamesFromParsedSqlAlloc(alloc, &read));
+    try std.testing.expectError(error.UnsupportedSqlShape, joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &read));
+
+    var point_insert = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) VALUES ('u1')");
+    defer point_insert.deinit(alloc);
+    try std.testing.expect((try insertSourceTableNamesFromParsedSqlAlloc(alloc, &point_insert)) == null);
+    try std.testing.expect((try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &point_insert)) == null);
+    try std.testing.expectError(error.UnsupportedSqlShape, readSourceTableNamesFromParsedSqlAlloc(alloc, &point_insert));
+
+    var insert_source = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id) SELECT id FROM incoming_usage");
+    defer insert_source.deinit(alloc);
+    var insert_tables = (try insertSourceTableNamesFromParsedSqlAlloc(alloc, &insert_source)).?;
+    defer insert_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", insert_tables.target);
+    try std.testing.expectEqualStrings("incoming_usage", insert_tables.source);
+    try std.testing.expect((try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &insert_source)) == null);
+
+    var recursive_insert = try tokenized.ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM incoming_usage) INSERT INTO usage_records (id) SELECT id FROM source_rows");
+    defer recursive_insert.deinit(alloc);
+    try std.testing.expect((try insertSourceTableNamesFromParsedSqlAlloc(alloc, &recursive_insert)) == null);
+    var recursive_tables = (try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &recursive_insert)).?;
+    defer recursive_tables.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", recursive_tables.target);
+    try std.testing.expectEqualStrings("incoming_usage", recursive_tables.source);
 }
 
 const MultiTableTestCatalog = struct {

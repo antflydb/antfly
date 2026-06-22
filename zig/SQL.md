@@ -335,7 +335,10 @@ Current implementation status:
   write planning no longer reclassifies recursive write kind from the token
   stream. Catalog-aware read/write bind, lower, and resolve APIs expose parsed
   or bound statement entrypoints publicly; token-only catalog helpers remain
-  private binder implementation details.
+  private binder implementation details. Source-table discovery for corpus
+  fixtures also enters through parsed source-table helpers instead of public
+  token-slice adapters, and those helpers now validate the parsed statement
+  family/kind before scanning source-table tokens.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source

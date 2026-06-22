@@ -484,16 +484,15 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
 ) !?[]const u8 {
     if (entry.source_schema_json.len == 0) return null;
-    const tokens = parsed_sql.items();
 
     switch (entry.family) {
         .insert_source => {
-            var tables = (try binder.insertSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
         .recursive_insert_source => {
-            var tables = (try binder.recursiveInsertSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
@@ -501,7 +500,7 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
         .delete_joined_source,
         .merge_mutation,
         => {
-            var tables = (try binder.joinedWriteSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
@@ -509,7 +508,7 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
         .join,
         .lateral,
         => {
-            var tables = (try binder.readSourceTableNamesFromTokensAlloc(alloc, tokens)) orelse return error.InvalidSqlCatalog;
+            var tables = (try binder.readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
