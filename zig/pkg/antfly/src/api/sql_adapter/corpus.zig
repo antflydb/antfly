@@ -5284,6 +5284,33 @@ test "sql adapter corpus numeric and bool token matching is exact and unique" {
     try std.testing.expect(!planHasExactBoolToken("ddl:replace=true_extra", "replace=", true));
 }
 
+test "sql adapter corpus cte coverage tokens are exact" {
+    const malformed = "query:table=usage_records:ctes=1:cte0_expr_pred=2x";
+    try std.testing.expect(!planHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_"));
+    try std.testing.expect(!planHasNonZeroUsizeTokenNamePrefix(malformed, "cte0_expr_"));
+    try std.testing.expect(!planHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=0", "cte0_expr_"));
+    try std.testing.expect(planHasNonZeroUsizeTokenNamePrefix("query:table=usage_records:ctes=1:cte0_expr_pred=2", "cte0_expr_"));
+
+    var coverage = AppParityCorpusCoverage{};
+    try coverage.observe(std.testing.allocator, .{
+        .name = "malformed cte expression predicate token",
+        .sql = "WITH active_usage AS (SELECT id FROM usage_records WHERE lower(status) = 'active') SELECT id FROM active_usage",
+        .family = .query,
+        .plan = malformed,
+    });
+    try std.testing.expect(!coverage.query_cte_structured_access);
+    try std.testing.expect(!coverage.query_cte_expression_access);
+
+    try coverage.observe(std.testing.allocator, .{
+        .name = "valid cte expression predicate token",
+        .sql = "WITH active_usage AS (SELECT id FROM usage_records WHERE lower(status) = 'active') SELECT id FROM active_usage",
+        .family = .query,
+        .plan = "query:table=usage_records:ctes=1:cte0_expr_pred=2",
+    });
+    try std.testing.expect(coverage.query_cte_structured_access);
+    try std.testing.expect(coverage.query_cte_expression_access);
+}
+
 test "sql adapter corpus plan predicates are exact and structured" {
     const applied = "applied:rebuild=true:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=10:unvalidated_fk=1:unvalidated_check=0:update_policy=0:work_items=1:work=rebuild/table/derived_artifacts";
     try std.testing.expect(appliedPlanIsStructured(applied));

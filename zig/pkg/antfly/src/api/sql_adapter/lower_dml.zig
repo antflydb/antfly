@@ -12389,6 +12389,673 @@ const TestPrimaryResolver = struct {
     }
 };
 
+test "sql adapter lower dml routes write sql through typed plan families" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\",\"organization_id\":\"o1\"}", .version = 9 };
+    const txn_id = [_]u8{ 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "sql-writer",
+        .txn_id = txn_id,
+    };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .row_claim = claim,
+        .sync_level = .full_text,
+    };
+
+    var insert_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, organization_id) VALUES ('u2', 'active', 'o1') RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer insert_plan.deinit(alloc);
+    switch (insert_plan) {
+        .insert => |insert| {
+            try std.testing.expectEqualStrings("usage_records", insert.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.sync_level);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, insert.batch.req.sync_level);
+            try std.testing.expectEqual(@as(u32, 1), insert.batch.inserted);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var point_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'disabled' WHERE id = 'u1' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer point_update_plan.deinit(alloc);
+    switch (point_update_plan) {
+        .update => |update| {
+            try std.testing.expectEqualStrings("usage_records", update.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, update.sync_level);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, update.batch.req.sync_level);
+            try std.testing.expectEqual(@as(u32, 1), update.batch.transformed);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var source_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'disabled' WHERE organization_id = 'o1' FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer source_update_plan.deinit(alloc);
+    switch (source_update_plan) {
+        .update_source => |update_source| {
+            try std.testing.expectEqualStrings("usage_records", update_source.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, update_source.sync_level);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.source.predicates.len);
+            try std.testing.expect(update_source.mutation.req.source.row_claim.?.skip_locked);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unclaimed_syntax_source_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'disabled' WHERE organization_id = 'o1' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer unclaimed_syntax_source_update_plan.deinit(alloc);
+    switch (unclaimed_syntax_source_update_plan) {
+        .update_source => |update_source| {
+            try std.testing.expectEqualStrings("usage_records", update_source.table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.source.predicates.len);
+            try std.testing.expect(update_source.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, update_source.mutation.req.source.row_claim.?.wait_policy);
+            try std.testing.expect(!update_source.mutation.req.source.row_claim.?.skip_locked);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var table_wide_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer table_wide_update_plan.deinit(alloc);
+    switch (table_wide_update_plan) {
+        .update_source => |update_source| {
+            try std.testing.expectEqualStrings("usage_records", update_source.table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 0), update_source.mutation.req.source.predicates.len);
+            try std.testing.expectEqual(@as(usize, 0), update_source.mutation.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, null), update_source.mutation.req.source.limit);
+            try std.testing.expect(update_source.mutation.req.source.row_claim != null);
+            try std.testing.expectEqual(db_mod.types.RowClaimWaitPolicy.wait, update_source.mutation.req.source.row_claim.?.wait_policy);
+            try std.testing.expect(!update_source.mutation.req.source.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var joined_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.status FROM usage_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer joined_update_plan.deinit(alloc);
+    switch (joined_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, update_joined_source.sync_level);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.source_assignments.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var targeted_joined_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records AS target SET status = source.status FROM usage_records AS source WHERE target.id = source.id FOR UPDATE OF target SKIP LOCKED RETURNING target.id",
+        schema,
+        &.{},
+        options,
+    );
+    defer targeted_joined_update_plan.deinit(alloc);
+    switch (targeted_joined_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.source_table_name);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim != null);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records AS target SET status = source.status FROM usage_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
+        schema,
+        &.{},
+        options,
+    ));
+
+    var semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.id FROM archived_records WHERE organization_id = 'o1') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer semijoin_update_plan.deinit(alloc);
+    switch (semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var non_primary_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer non_primary_semijoin_update_plan.deinit(alloc);
+    switch (non_primary_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("status", update_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var correlated_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.status = usage_records.status) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer correlated_semijoin_update_plan.deinit(alloc);
+    switch (correlated_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 2), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqualStrings("status", update_joined_source.mutation.req.join.on[1].left_field);
+            try std.testing.expectEqualStrings("status", update_joined_source.mutation.req.join.on[1].right_field);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var correlated_filtered_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer correlated_filtered_semijoin_update_plan.deinit(alloc);
+    switch (correlated_filtered_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 2), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var computed_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer computed_semijoin_update_plan.deinit(alloc);
+    switch (computed_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.match_expression_predicates.len);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var exists_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer exists_semijoin_update_plan.deinit(alloc);
+    switch (exists_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("status", update_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var computed_exists_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer computed_exists_semijoin_update_plan.deinit(alloc);
+    switch (computed_exists_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.match_expression_predicates.len);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    if (lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    )) |unexpected| {
+        var lowered = unexpected;
+        lowered.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(plan_mod.sqlWritePlanFallbackAllowed(err));
+    }
+
+    var row_value_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'archived' WHERE (usage_records.id, usage_records.status) IN (SELECT archived_records.organization_id, archived_records.status FROM archived_records) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer row_value_semijoin_update_plan.deinit(alloc);
+    switch (row_value_semijoin_update_plan) {
+        .update_joined_source => |update_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", update_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", update_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.update, update_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 2), update_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", update_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", update_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqualStrings("status", update_joined_source.mutation.req.join.on[1].left_field);
+            try std.testing.expectEqualStrings("status", update_joined_source.mutation.req.join.on[1].right_field);
+            try std.testing.expect(update_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.operations.len);
+            try std.testing.expectEqual(@as(usize, 1), update_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var point_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE id = 'u1' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer point_delete_plan.deinit(alloc);
+    switch (point_delete_plan) {
+        .delete => |delete| {
+            try std.testing.expectEqualStrings("usage_records", delete.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, delete.sync_level);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, delete.batch.req.sync_level);
+            try std.testing.expectEqual(@as(u32, 1), delete.batch.deleted);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var source_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE organization_id = 'o1' RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer source_delete_plan.deinit(alloc);
+    switch (source_delete_plan) {
+        .delete_source => |delete_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_source.table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, delete_source.sync_level);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_source.mutation.req.source.predicates.len);
+            try std.testing.expectEqualStrings("organization_id", delete_source.mutation.req.source.predicates[0].field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var table_wide_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer table_wide_delete_plan.deinit(alloc);
+    switch (table_wide_delete_plan) {
+        .delete_source => |delete_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_source.table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 0), delete_source.mutation.req.source.predicates.len);
+            try std.testing.expectEqual(@as(usize, 1), delete_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var joined_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING usage_records AS source WHERE usage_records.id = source.id FOR UPDATE RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer joined_delete_plan.deinit(alloc);
+    switch (joined_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, delete_joined_source.sync_level);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqual(@as(usize, 0), delete_joined_source.mutation.req.source_assignments.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.id FROM archived_records WHERE status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer semijoin_delete_plan.deinit(alloc);
+    switch (semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var non_primary_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer non_primary_semijoin_delete_plan.deinit(alloc);
+    switch (non_primary_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", delete_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var correlated_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.status = usage_records.status) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer correlated_semijoin_delete_plan.deinit(alloc);
+    switch (correlated_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 2), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", delete_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.on[1].left_field);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.on[1].right_field);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var correlated_filtered_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer correlated_filtered_semijoin_delete_plan.deinit(alloc);
+    switch (correlated_filtered_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 2), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("organization_id", delete_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var computed_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE usage_records.id IN (SELECT archived_records.organization_id FROM archived_records WHERE lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer computed_semijoin_delete_plan.deinit(alloc);
+    switch (computed_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", delete_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.match_expression_predicates.len);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var exists_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = usage_records.id AND archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer exists_semijoin_delete_plan.deinit(alloc);
+    switch (exists_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", delete_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.right.predicates[0].field);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var computed_exists_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE EXISTS (SELECT archived_records.organization_id FROM archived_records WHERE archived_records.organization_id = usage_records.id AND lower(archived_records.status) = lower(usage_records.status)) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer computed_exists_semijoin_delete_plan.deinit(alloc);
+    switch (computed_exists_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.match_expression_predicates.len);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    if (lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.status = 'archived') FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    )) |unexpected| {
+        var lowered = unexpected;
+        lowered.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(plan_mod.sqlWritePlanFallbackAllowed(err));
+    }
+
+    var row_value_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE (usage_records.id, usage_records.status) IN (SELECT archived_records.organization_id, archived_records.status FROM archived_records) FOR UPDATE SKIP LOCKED RETURNING id",
+        schema,
+        &.{},
+        options,
+    );
+    defer row_value_semijoin_delete_plan.deinit(alloc);
+    switch (row_value_semijoin_delete_plan) {
+        .delete_joined_source => |delete_joined_source| {
+            try std.testing.expectEqualStrings("usage_records", delete_joined_source.target_table_name);
+            try std.testing.expectEqualStrings("archived_records", delete_joined_source.source_table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, delete_joined_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 2), delete_joined_source.mutation.req.join.on.len);
+            try std.testing.expectEqualStrings("id", delete_joined_source.mutation.req.join.on[0].left_field);
+            try std.testing.expectEqualStrings("organization_id", delete_joined_source.mutation.req.join.on[0].right_field);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.on[1].left_field);
+            try std.testing.expectEqualStrings("status", delete_joined_source.mutation.req.join.on[1].right_field);
+            try std.testing.expect(delete_joined_source.mutation.req.join.left.row_claim.?.skip_locked);
+            try std.testing.expectEqual(@as(usize, 1), delete_joined_source.mutation.req.returning.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var truncate_plan = try lowerWritePlanForDmlTestAlloc(
+        alloc,
+        "TRUNCATE usage_records",
+        schema,
+        &.{},
+        options,
+    );
+    defer truncate_plan.deinit(alloc);
+    switch (truncate_plan) {
+        .truncate_source => |truncate_source| {
+            try std.testing.expectEqualStrings("usage_records", truncate_source.table_name);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, truncate_source.mutation.req.kind);
+            try std.testing.expectEqual(@as(usize, 0), truncate_source.mutation.req.source.predicates.len);
+            try std.testing.expectEqual(@as(usize, 0), truncate_source.mutation.req.source.order_by.len);
+            try std.testing.expectEqual(@as(?u32, null), truncate_source.mutation.req.source.limit);
+            try std.testing.expect(truncate_source.mutation.req.source.row_claim != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "sql adapter lower dml detects dotted path conflicts" {
     try std.testing.expect(sqlDottedPathsConflict("metadata", "metadata.status"));
     try std.testing.expect(sqlDottedPathsConflict("metadata.status", "metadata"));

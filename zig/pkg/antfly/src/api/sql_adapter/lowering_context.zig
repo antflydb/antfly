@@ -294,15 +294,138 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(
         .function_bindings = function_bindings,
         .callbacks = .{
             .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
-            .lower_window = unsupportedWindowParsedSqlForLoweringContextTestAlloc,
-            .lower_aggregate_plan = unsupportedAggregateParsedSqlForLoweringContextTestAlloc,
+            .lower_window = lowerWindowParsedSqlForLoweringContextTestAlloc,
+            .lower_aggregate_plan = lowerAggregateParsedSqlForLoweringContextTestAlloc,
             .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
-            .lower_query_plan = unsupportedQueryParsedSqlForLoweringContextTestAlloc,
+            .lower_query_plan = lowerQueryParsedSqlForLoweringContextTestAlloc,
             .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
         },
     };
     return try context.lowerParsed(parsed_sql);
+}
+
+fn lowerReadPlanForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan.LoweredReadPlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(alloc, &parsed_sql, schema, null, params, .{});
+}
+
+fn lowerQueryParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan.LoweredQueryPlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+        .function_bindings = function_bindings,
+    };
+    var lowered = lower_expr.parseQueryPlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        params,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.queryPlanParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.simpleSelectSetTailHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsQueryPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn lowerWindowParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan.LoweredWindowPlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+    };
+    var lowered = plan.parseWindowPlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.windowPlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsWindowPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn lowerAggregateParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan.LoweredAggregatePlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .params = params,
+    };
+    var lowered = plan.parseAggregatePlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.aggregatePlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsAggregatePlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
 }
 
 fn lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc(
@@ -383,24 +506,6 @@ fn lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc(
     return lowered;
 }
 
-fn unsupportedWindowParsedSqlForLoweringContextTestAlloc(
-    _: std.mem.Allocator,
-    _: *const tokenized.ParsedSql,
-    _: runtime_schema.TableSchema,
-    _: []const value_mod.SqlValue,
-) anyerror!plan.LoweredWindowPlan {
-    return error.UnsupportedSqlShape;
-}
-
-fn unsupportedAggregateParsedSqlForLoweringContextTestAlloc(
-    _: std.mem.Allocator,
-    _: *const tokenized.ParsedSql,
-    _: runtime_schema.TableSchema,
-    _: []const value_mod.SqlValue,
-) anyerror!plan.LoweredAggregatePlan {
-    return error.UnsupportedSqlShape;
-}
-
 fn unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc(
     _: std.mem.Allocator,
     _: *const tokenized.ParsedSql,
@@ -408,16 +513,6 @@ fn unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc(
     _: []const value_mod.SqlValue,
     _: lower_expr.SqlFunctionBindings,
 ) anyerror!plan.LoweredRecursiveCtePlan {
-    return error.UnsupportedSqlShape;
-}
-
-fn unsupportedQueryParsedSqlForLoweringContextTestAlloc(
-    _: std.mem.Allocator,
-    _: *const tokenized.ParsedSql,
-    _: runtime_schema.TableSchema,
-    _: []const value_mod.SqlValue,
-    _: lower_expr.SqlFunctionBindings,
-) anyerror!plan.LoweredQueryPlan {
     return error.UnsupportedSqlShape;
 }
 
@@ -430,6 +525,111 @@ fn unsupportedSetOperationParsedSqlForLoweringContextTestAlloc(
     _: lower_expr.SqlFunctionBindings,
 ) anyerror!plan.LoweredSetOperationPlan {
     return error.UnsupportedSqlShape;
+}
+
+test "sql adapter lowering context classifies read sql into typed plan families" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"name":{"type":"keyword"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var query = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "SELECT id, status FROM usage_records WHERE kind = 'order' ORDER BY created_at DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer query.deinit(alloc);
+    switch (query) {
+        .query => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var aggregate = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "SELECT status, SUM(amount) AS total FROM usage_records WHERE kind = 'order' GROUP BY status ORDER BY total DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer aggregate.deinit(alloc);
+    switch (aggregate) {
+        .aggregate => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+            try std.testing.expectEqual(@as(usize, 0), lowered.plan.ctes.len);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.plan.aggregate.aggregations[0].op);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cte_aggregate = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "WITH open_usage AS (SELECT tenant, amount, status FROM usage_records WHERE status = 'open') SELECT tenant, SUM(amount) AS total FROM open_usage GROUP BY tenant ORDER BY total DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer cte_aggregate.deinit(alloc);
+    switch (cte_aggregate) {
+        .aggregate => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.ctes.len);
+            try std.testing.expectEqualStrings("open_usage", lowered.plan.aggregate.source.source_cte);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.aggregate.aggregations.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var join = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer join.deinit(alloc);
+    switch (join) {
+        .join => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+            try std.testing.expectEqualStrings("usage_records", lowered.right_table_name);
+            try std.testing.expectEqual(@as(usize, 2), lowered.join.on.len);
+            try std.testing.expectEqual(@as(usize, 2), lowered.join.select.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var lateral = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer lateral.deinit(alloc);
+    switch (lateral) {
+        .lateral => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.left_table_name);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.lateral.correlations.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var window = try lowerReadPlanForLoweringContextTestAlloc(
+        alloc,
+        "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS row_num FROM usage_records WHERE status = 'open' ORDER BY row_num ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer window.deinit(alloc);
+    switch (window) {
+        .window => |lowered| {
+            try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+            try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lowering context lowers catalog-backed equality join read plans" {
