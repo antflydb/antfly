@@ -580,6 +580,78 @@ bridges:
 6. Delete compatibility fallbacks only after parity fixtures cover the native
    typed path for the corresponding statement family.
 
+### Target Adapter Architecture
+
+The best long-term production shape is a phase-separated SQL frontend with
+typed contracts between every phase. The adapter should have one sanctioned
+raw-SQL ingress path and no hidden parser or lowerer islands behind individual
+features.
+
+The intended module shape is:
+
+| Module | Primary types | Contract |
+| --- | --- | --- |
+| `lexer` / `tokenized` | `TokenizedSql`, `Token`, `Keyword`, `Span` | Tokenize once, attach keyword and span metadata, preserve literal source slices, and avoid semantic allocation. |
+| `parser` | `ParsedSql`, `ParsedStatement`, statement-family raw nodes | Build a catalog-free raw AST with nested statement children and span-aware diagnostics. |
+| `binder` | `SqlSession`, `BoundSqlStatement`, `ResolvedCatalogTarget`, `BoundSchema`, authz results | Resolve database, namespace, search path, schemas, object versions, privileges, dependencies, and placement facts once. |
+| `planner` | `LogicalSqlPlan`, `ReadPlan`, `WritePlan`, lifecycle plans | Convert bound statements into native Antfly intent without storage-specific keys or SQL text. |
+| `bridge` / service adapters | row, catalog, index, role, extension, job, lake, backup, storage requests | Call shared Antfly services through typed request objects only. |
+| `diagnostics` | `SqlDiagnostic`, stable codes, hints | Carry phase, code, span, message, and optional hint consistently across parse, bind, plan, and execute. |
+| `fixtures` / parity tooling | structured summaries, coverage bits | Validate behavior from emitted typed summaries instead of rescanning SQL strings. |
+
+The public API boundary should be deliberately narrow:
+
+- External facades may accept `[]const u8` SQL text. They must immediately
+  construct `ParsedSql` and pass that object forward.
+- Internal lowering APIs should accept `ParsedSql`, `ParsedStatement`,
+  `BoundSqlStatement`, or `LogicalSqlPlan`, not raw SQL text.
+- Catalog-aware operations must require `BoundSqlStatement`. A read/write/DDL
+  path that can affect catalog targets, roles, extensions, tablespaces, lakes,
+  backup scopes, or storage placement should not have an unbound shortcut.
+- Durable service requests must be Antfly-native structs. They must not include
+  SQL fragments as the source of truth for metadata, lifecycle jobs, indexes,
+  role settings, extension state, backup/restore scope, or storage routing.
+
+Statement-family dispatch should be a closed typed decision, not a sequence of
+feature probes. The parser should produce explicit variants for read, write,
+DDL, session, transaction, and explain statements. Each variant should carry a
+compact kind enum that planners can switch on directly. Unsupported shapes
+should fail from the earliest phase that can name the missing native model:
+syntax in parse, catalog/session gaps in bind, lifecycle/storage gaps in plan,
+and backend failures in execute.
+
+Nested SQL should remain structural all the way through planning. `EXPLAIN`,
+CTEs, subqueries, relation population, `INSERT ... SELECT`, `UPDATE ... FROM`,
+`DELETE ... USING`, `MERGE`, and future procedure-like constructs should refer
+to child raw nodes or token ranges in the parent `ParsedSql`. They should never
+reconstruct a SQL substring and call a second parser as part of normal
+execution.
+
+Memory ownership should make repeated parity and fixture runs cheap:
+
+- Source SQL is borrowed at ingress and owned only by `ParsedSql` when the
+  caller needs it to outlive the request frame.
+- Tokens, raw nodes, diagnostics, and intermediate binding data live in a
+  resettable per-statement arena.
+- Native plans and durable service requests own only the normalized data they
+  need after SQL planning finishes.
+- JSON and JSONB literals stay as source spans until expression binding or a
+  semantic phase explicitly needs typed JSON values.
+
+Distributed lifecycle work should flow through the same owner as non-SQL APIs.
+SQL can parse, bind, authorize, and build the requested lifecycle plan, but the
+catalog or metadata leader should commit catalog transitions, admit durable
+jobs, assign idempotency keys, and own retry/audit state. This applies to
+`ALTER TABLE`, derived-index builds, extension install/update/drop, role
+changes, tablespace placement changes, database/namespace lifecycle,
+backup/restore, and lake or foreign-source lifecycle.
+
+Review should reject new SQL work that bypasses these boundaries. A new
+statement is production-shaped only when it adds raw AST coverage, typed
+binding, a native logical plan, structured diagnostics, and parity coverage for
+the corresponding REST/SDK/MCP/A2A/CLI behavior. Syntax-only acceptance is not
+enough.
+
 ### Completion Design
 
 The remaining production work should converge on one typed route per statement

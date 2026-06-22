@@ -706,13 +706,11 @@ pub const WritePlanLoweringHooks = struct {
 };
 
 fn lowerRecursiveWritePlanWithHooksAlloc(
-    tokens: []const Token,
+    recursive_write_kind: classifier.SqlWriteStatementKind,
     schema: runtime_schema.TableSchema,
     options: LowerWritePlanOptions,
     hooks: WritePlanLoweringHooks,
 ) !LoweredWritePlan {
-    const recursive_write_kind = classifier.classifyRecursiveWriteStatement(tokens) orelse return error.UnsupportedSqlShape;
-
     switch (recursive_write_kind) {
         .insert_source => {
             const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
@@ -767,14 +765,11 @@ pub fn lowerWritePlanWithParsedSqlAlloc(
     hooks: WritePlanLoweringHooks,
 ) !LoweredWritePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    const tokens = parsed_sql.items();
 
-    if (tokens.len >= 2 and std.ascii.eqlIgnoreCase(tokens[0].text, "with") and std.ascii.eqlIgnoreCase(tokens[1].text, "recursive")) {
-        return try lowerRecursiveWritePlanWithHooksAlloc(tokens, schema, options, hooks);
+    const write_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
+    if (parsed_sql.isRecursiveWriteStatement()) {
+        return try lowerRecursiveWritePlanWithHooksAlloc(write_kind, schema, options, hooks);
     }
-
-    const write_kind = parsed_sql.writeStatementKind() orelse
-        return try lowerRecursiveWritePlanWithHooksAlloc(tokens, schema, options, hooks);
 
     if (write_kind == .insert) {
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;

@@ -953,7 +953,7 @@ pub fn lowerReadPlanWithCatalogSourceSchemaParsedSqlAlloc(
     return try lowerReadPlanWithCatalogBoundStatementAlloc(alloc, parsed_sql, catalog, hooks);
 }
 
-pub fn lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(
+fn lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     catalog: table_catalog.CatalogSource,
@@ -1011,7 +1011,7 @@ pub fn lowerWritePlanWithCatalogOptionsParsedSqlAlloc(
     return try lowerWritePlanWithCatalogBoundStatementAlloc(alloc, parsed_sql, options, catalog, hooks);
 }
 
-pub fn lowerWritePlanWithCatalogOptionsFromTokensAlloc(
+fn lowerWritePlanWithCatalogOptionsFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     options: plan_mod.LowerWritePlanOptions,
@@ -1205,7 +1205,7 @@ pub fn bindWritePlanCatalogStatementWithSessionAlloc(
     );
 }
 
-pub fn bindWritePlanCatalogStatementFromTokensAlloc(
+fn bindWritePlanCatalogStatementFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     options: plan_mod.LowerWritePlanOptions,
@@ -1214,7 +1214,7 @@ pub fn bindWritePlanCatalogStatementFromTokensAlloc(
     return try bindWritePlanCatalogStatementFromTokensWithSessionAlloc(alloc, tokens, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
-pub fn bindWritePlanCatalogStatementFromTokensWithSessionAlloc(
+fn bindWritePlanCatalogStatementFromTokensWithSessionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     options: plan_mod.LowerWritePlanOptions,
@@ -1284,7 +1284,7 @@ pub fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
     return try resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(alloc, parsed_sql.items(), options, catalog, session);
 }
 
-pub fn resolveWritePlanCatalogOptionsFromTokensAlloc(
+fn resolveWritePlanCatalogOptionsFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     options: plan_mod.LowerWritePlanOptions,
@@ -1293,7 +1293,7 @@ pub fn resolveWritePlanCatalogOptionsFromTokensAlloc(
     return try resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(alloc, tokens, options, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
-pub fn resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(
+fn resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     options: plan_mod.LowerWritePlanOptions,
@@ -1396,7 +1396,7 @@ pub fn bindReadPlanCatalogStatementWithSessionAlloc(
     );
 }
 
-pub fn bindReadPlanCatalogStatementFromTokensAlloc(
+fn bindReadPlanCatalogStatementFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     catalog: table_catalog.CatalogSource,
@@ -1404,7 +1404,7 @@ pub fn bindReadPlanCatalogStatementFromTokensAlloc(
     return try bindReadPlanCatalogStatementFromTokensWithSessionAlloc(alloc, tokens, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
-pub fn bindReadPlanCatalogStatementFromTokensWithSessionAlloc(
+fn bindReadPlanCatalogStatementFromTokensWithSessionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     catalog: table_catalog.CatalogSource,
@@ -1441,7 +1441,7 @@ fn bindReadPlanCatalogStatementFromTokensWithStatementAlloc(
     };
 }
 
-pub fn resolveReadPlanCatalogSourceSchemaFromTokensAlloc(
+fn resolveReadPlanCatalogSourceSchemaFromTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     catalog: table_catalog.CatalogSource,
@@ -1449,7 +1449,7 @@ pub fn resolveReadPlanCatalogSourceSchemaFromTokensAlloc(
     return try resolveReadPlanCatalogSourceSchemaFromTokensWithSessionAlloc(alloc, tokens, catalog, catalog_resources.SqlCatalogSession.default());
 }
 
-pub fn resolveReadPlanCatalogSourceSchemaFromTokensWithSessionAlloc(
+fn resolveReadPlanCatalogSourceSchemaFromTokensWithSessionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     catalog: table_catalog.CatalogSource,

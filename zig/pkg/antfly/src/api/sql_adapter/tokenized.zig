@@ -47,6 +47,7 @@ pub const ParsedReadStatement = struct {
 pub const ParsedWriteStatement = struct {
     kind: classifier.SqlWriteStatementKind,
     raw: RawSqlStatement,
+    recursive: bool = false,
 };
 
 pub const ParsedDdlStatement = struct {
@@ -108,6 +109,13 @@ pub const ParsedStatement = union(enum) {
         return switch (self) {
             .write => |statement| statement.kind,
             else => null,
+        };
+    }
+
+    pub fn isRecursiveWrite(self: ParsedStatement) bool {
+        return switch (self) {
+            .write => |statement| statement.recursive,
+            else => false,
         };
     }
 };
@@ -246,6 +254,10 @@ pub const ParsedSql = struct {
     pub fn writeStatementKind(self: *const ParsedSql) ?classifier.SqlWriteStatementKind {
         return self.statement.writeKind();
     }
+
+    pub fn isRecursiveWriteStatement(self: *const ParsedSql) bool {
+        return self.statement.isRecursiveWrite();
+    }
 };
 
 fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const TokenizedSql) ParsedStatement {
@@ -256,7 +268,7 @@ fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const Tokenize
         return .{ .write = .{ .kind = kind, .raw = raw_statement } };
     }
     if (classifier.classifyRecursiveWriteStatement(tokenized_sql.items())) |kind| {
-        return .{ .write = .{ .kind = kind, .raw = raw_statement } };
+        return .{ .write = .{ .kind = kind, .raw = raw_statement, .recursive = true } };
     }
     return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
@@ -536,14 +548,22 @@ test "sql adapter parsed sql owns typed statement variants" {
     var write = try ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'done' WHERE id = 'u1'");
     defer write.deinit(alloc);
     switch (write.statement) {
-        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, statement.kind),
+        .write => |statement| {
+            try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, statement.kind);
+            try std.testing.expect(!statement.recursive);
+            try std.testing.expect(!write.isRecursiveWriteStatement());
+        },
         else => return error.TestUnexpectedResult,
     }
 
     var recursive_write = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
     defer recursive_write.deinit(alloc);
     switch (recursive_write.statement) {
-        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, statement.kind),
+        .write => |statement| {
+            try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, statement.kind);
+            try std.testing.expect(statement.recursive);
+            try std.testing.expect(recursive_write.isRecursiveWriteStatement());
+        },
         else => return error.TestUnexpectedResult,
     }
 
