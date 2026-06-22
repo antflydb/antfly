@@ -334,7 +334,9 @@ Current implementation status:
   Recursive data-modifying CTEs carry a parsed recursive-write flag, so generic
   write planning no longer reclassifies recursive write kind from the token
   stream. Catalog-aware read/write bind, lower, and resolve APIs expose parsed
-  or bound statement entrypoints publicly; token-only catalog helpers remain
+  or bound statement entrypoints publicly. Bound catalog statements now resolve
+  source schemas and write-plan options from the parsed statement route rather
+  than a token-only compatibility route. Token-only source-table helpers remain
   private binder implementation details. Source-table discovery for corpus
   fixtures also enters through parsed source-table helpers instead of public
   token-slice adapters, and those helpers now validate the parsed statement

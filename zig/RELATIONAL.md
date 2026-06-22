@@ -1419,7 +1419,8 @@ prefix and option parsing belongs in grammar helpers so lowerers receive typed
 wrapper intent instead of scanning raw SQL. This boundary is now partially implemented:
 `api/sql_adapter/` owns token definitions, lexer behavior, parser cursor
 helpers, statement classification, diagnostics, parity-corpus fingerprints,
-catalog/source-name prebinding, catalog-independent object identifier
+catalog/source-name prebinding through parsed bound statements,
+catalog-independent object identifier
 normalization, owned identifier/list parsing, adapter-noop grammar tails,
 `EXPLAIN` prefix and option grammar, row-security grammar syntax for
 `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`,
