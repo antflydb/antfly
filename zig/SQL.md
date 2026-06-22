@@ -482,22 +482,29 @@ typed row plans.
 
 ## Document Table SQL
 
-Today the executable SQL read/write path is relational-only: SQL lowerers require
-`storage_mode = relational` and a declared primary key before they produce typed
-row plans. Non-relational document tables continue to use the native document,
-query, lookup, index, and retrieval APIs.
+Today the executable SQL read/write path is relational-only: SQL lowerers
+require `storage_mode = relational` and a declared primary key before they
+produce typed row plans. Non-relational document tables continue to use the
+native document, query, lookup, index, retrieval, and serverless segment APIs.
 
-The long-term SQL shape should add a separate document-table source binding
-instead of weakening relational invariants. MongoDB's SQL Interface is a useful
-precedent: it exposes live, read-only SQL access to document data through
-ODBC/JDBC, derives and stores schema mappings, and supports nested-object and
-array transformations such as flattening and unwinding. Antfly should use the
-same broad product shape for document tables: SQL as a compatibility/query
-frontend over document storage, not a second storage format and not an
+The long-term shape should let SQL read document tables without turning
+document tables into relational tables. The adapter needs a separate
+document-table source binding instead of weakening relational invariants or
+teaching relational row lowerers to guess at document semantics.
+
+MongoDB's SQL Interface is the useful precedent, not because Antfly should copy
+its implementation, but because the product boundary is right: live, read-only
+SQL access to document data through BI/client protocols, backed by durable
+schema mappings and explicit nested-object/array transforms. Antfly should use
+the same broad product shape for document tables: SQL as a compatibility/query
+frontend over native document storage, not a second storage format and not an
 unstructured write path. See MongoDB's SQL Interface overview:
 https://www.mongodb.com/docs/sql-interface/.
 
-The planner should introduce an explicit source-binding layer:
+### Source Binding
+
+The planner should introduce an explicit source-binding layer after parse and
+before semantic lowering:
 
 ```zig
 const SqlSourceBinding = union(enum) {
@@ -507,21 +514,41 @@ const SqlSourceBinding = union(enum) {
 };
 ```
 
-Binding chooses the source family from the resolved table catalog record and
-schema. Relational bindings continue through the existing typed row lowerers.
-Document bindings route to a new document SQL lowerer that can produce native
-document/query/index plans. Lake bindings route to the lake-native source plans
-described in [LAKES.md](LAKES.md). The review rule is that no lowerer should
-probe another source family by trial-and-error; the binder selects the family
-once from catalog facts.
+Binding chooses the source family from the resolved table catalog record,
+runtime schema, base-source metadata, and SQL session defaults. Relational
+bindings continue through the existing typed row lowerers. Document bindings
+route to a document SQL lowerer that produces native document/query/index plans.
+Lake bindings route to the lake-native row-source plans described in
+[LAKES.md](LAKES.md).
 
-The first document SQL milestone should be read-only. SQL writes over schemaless
-documents raise too many durable semantics questions for the first cut: missing
-fields, partial update behavior, JSON merge semantics, array mutation, generated
-fields, constraint interaction, and row-filter checks. A later write surface can
-be added only through explicit document semantics such as `INSERT INTO docs
-(_id, _doc) VALUES (...)` or typed JSON patch operations lowered into the same
-native document write path as REST/SDK callers.
+The review rule is that no lowerer should probe another source family by
+trial-and-error. The binder selects the family once from catalog facts and every
+later phase receives a typed binding. A useful initial shape is:
+
+```zig
+const DocumentBinding = struct {
+    target: CatalogTableRef,
+    runtime_schema: storage_schema.RuntimeTableSchema,
+    virtual_schema: DocumentSqlSchema,
+    capabilities: DocumentSqlCapabilities,
+};
+
+const DocumentSqlCapabilities = struct {
+    doc_id_lookup: bool,
+    indexed_scalar_filters: bool,
+    full_text_filters: bool,
+    vector_filters: bool,
+    bounded_scan: ?BoundedScanPolicy,
+};
+```
+
+The binder should fail closed when a SQL statement references more than one
+source family unless there is an explicit cross-source plan. A future query can
+join relational, document, and lake sources, but that should be represented as a
+typed cross-source logical plan, not by having each family lower part of an
+unstructured SQL string.
+
+### Virtual Schema
 
 Document SQL needs a virtual SQL schema. The minimum projection should expose:
 
@@ -552,6 +579,52 @@ Sampling can help user experience, but it must not become the durable semantic
 contract. If a field needs stable BI or agent access, the table schema, an index
 definition, or a SQL view should record that mapping explicitly.
 
+Type mapping should stay conservative:
+
+| Document value | SQL-facing type |
+| --- | --- |
+| document id | `text` or a stable Antfly `document_id` domain |
+| string | `text` |
+| boolean | `boolean` |
+| integer | `bigint` when lossless |
+| floating number | `double precision` |
+| object | `jsonb` |
+| array | `jsonb` unless explicitly unnested |
+| mixed/unknown | `jsonb` or nullable inferred scalar only through a view |
+
+The virtual schema is a read contract, not a promise that every document has the
+field. Declared fields use declared nullability. Indexed/statistical fields are
+nullable unless a durable schema constraint proves otherwise.
+
+### Supported Query Shape
+
+The first document SQL milestone should be read-only. SQL writes over schemaless
+documents raise durable semantics questions that should not be answered by the
+SQL adapter alone: missing fields, partial update behavior, JSON merge
+semantics, array mutation, generated fields, constraint interaction, trigger
+ordering, row-filter checks, and audit records. A later write surface can be
+added only through explicit document semantics such as `INSERT INTO docs (_id,
+_doc) VALUES (...)` or typed JSON patch operations lowered into the same native
+document write path as REST/SDK callers.
+
+Initial document reads should support:
+
+- single-table `SELECT` over one document table;
+- `_id`, `_doc`, declared field, and JSON-path projection;
+- `WHERE _id = ...` and `WHERE _id IN (...)`;
+- simple scalar predicates on declared or indexed field paths;
+- conjunctions of pushdown-capable predicates;
+- `LIMIT` with a required bounded-scan policy when there is no selective
+  lookup/index predicate;
+- simple `ORDER BY` only when backed by an index, an explicitly bounded result,
+  or a future materialized sidecar.
+
+The first milestone should reject joins, aggregates, windows, recursive CTEs,
+set operations, data-modifying CTEs, and broad ordered scans for document
+tables. Those features can be added only when they lower to a typed
+cross-source, aggregate, or materialized-sidecar plan with an explicit cost
+model.
+
 Document SQL lowering should push down only behavior that Antfly can execute
 natively:
 
@@ -568,6 +641,11 @@ Anything not safely pushdown-capable should fail closed or require an explicit
 bounded scan contract. The adapter should not silently run broad document scans
 because a SQL BI client submitted a relational-looking query.
 
+Residual filters are allowed only after an explicit bounded producer. For
+example, residual JSON expression evaluation can run after an `_id IN (...)`
+lookup, a selective index query, or a limit-governed scan. It should not become
+a hidden table scan path.
+
 Arrays must be explicit. Document tables should not pretend nested arrays are
 ordinary scalar columns. The SQL surface should require `UNNEST` or an
 Antfly-named equivalent for array expansion:
@@ -581,11 +659,89 @@ WHERE tag = 'urgent';
 This gives agents and BI tools predictable cardinality and cost behavior while
 still allowing Mongo-style flatten/unwind workflows over document data.
 
+### Execution Contract
+
+Document SQL should reuse the same external response envelope as relational SQL
+while preserving a distinct internal plan family:
+
+```zig
+const LogicalSqlReadPlan = union(enum) {
+    relational: RelationalReadPlan,
+    document: DocumentReadPlan,
+    lake: LakeReadPlan,
+};
+
+const DocumentReadPlan = struct {
+    table: CatalogTableRef,
+    projection: []const DocumentProjection,
+    producer: DocumentProducer,
+    residual_filter: ?RowExpression,
+    limit: ?usize,
+};
+
+const DocumentProducer = union(enum) {
+    id_lookup: []const DocumentId,
+    indexed_query: DocumentIndexQuery,
+    text_query: DocumentTextQuery,
+    vector_query: DocumentVectorQuery,
+    bounded_scan: BoundedDocumentScan,
+};
+```
+
+The runtime path should be:
+
+```text
+SQL ingress
+  -> TokenizedSql / ParsedSql
+  -> SqlSourceBinding(document)
+  -> DocumentReadPlan
+  -> native document/query/index/read source
+  -> SQL row envelope
+```
+
+The executor should call the same document read/query/index services used by
+REST, SDK, MCP, A2A, and CLI callers. It should not reconstruct behavior by
+walking storage internals from the SQL adapter. Authorization, row filters,
+audit hooks, sync visibility, and session defaults should all pass through the
+shared service boundary.
+
 The document SQL result contract should remain the same SQL response envelope as
 relational reads (`kind = read`, `statement_kind = query`, `result.rows = ...`),
 but the inner plan family should identify that it came from a document source.
 That keeps CLI, HTTP, SQL wire, MCP, and A2A clients uniform while preserving
 source-family-specific planning and diagnostics.
+
+Diagnostics should name the unsupported document SQL feature and the missing
+native capability. Examples:
+
+- `document_sql_requires_bounded_scan` for an unindexed predicate without an
+  explicit bounded scan policy;
+- `document_sql_array_requires_unnest` for scalar treatment of an array path;
+- `document_sql_unsupported_join` until there is a cross-source join plan;
+- `document_sql_write_unsupported` until document writes have shared native
+  write semantics.
+
+### Relationship To Lake And Serverless
+
+Document SQL, lake SQL, and relational SQL should converge at the typed row
+contract, not at raw SQL strings. The same SQL surface can eventually query:
+
+- native relational tables through row plans;
+- native document tables through document producers plus virtual projection;
+- external or Antfly-owned lake tables through lake row sources and sidecars.
+
+The serverless segment/index system gives document SQL an advantage over a
+generic document-to-SQL adapter. Full-text, sparse, dense-vector, graph, and
+algebraic sidecars can be selected as producers or materialized helpers for
+document SQL, just as lake SQL can use lake sidecars. The rule is the same:
+sidecars may narrow candidate sets, rank rows, or answer materialized folds only
+when their source binding, snapshot/generation, schema fingerprint, and
+freshness policy match the document table being queried.
+
+This is why document SQL should be built as a source family next to relational
+and lake bindings. It lets Antfly share parser, session, auth, response, and
+expression infrastructure while keeping storage-specific execution efficient
+and auditable.
 
 Implementation should be scaffolded in small steps:
 
