@@ -3,12 +3,7 @@
   "required": [
     "bulk_io_plan",
     "cte_mutation_source_plan",
-    "duplicate_conflict_update_target",
-    "duplicate_row_batch_target",
-    "duplicate_update_target",
     "enforced_unique_conflict_target",
-    "invalid_expression_conflict_target",
-    "invalid_named_conflict_target",
     "multi_table_generation_barrier",
     "routine_body_plan",
     "routine_option_plan",

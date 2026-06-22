@@ -1794,28 +1794,144 @@ test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
         fingerprint: []const u8,
     }{
         .{
+            .sql = "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);",
+            .fingerprint = "ddl:table_clone:table=users_copy:source=users:if_not_exists=true:columns=true:defaults=true:generated=true:checks=true:constraints=true:indexes=true:periods=true:update_policies=true",
+        },
+        .{
             .sql = "CREATE VIEW users_v AS SELECT id, email FROM users;",
             .fingerprint = "ddl:create_view:view=users_v:source=users:source_fields=2:fields=2:replace=false:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE OR REPLACE VIEW users_v AS SELECT id, email FROM users;",
+            .fingerprint = "ddl:create_view:view=users_v:source=users:source_fields=2:fields=2:replace=true:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id, email FROM users;",
+            .fingerprint = "ddl:create_view:view=users_v:source=users:source_fields=2:fields=2:replace=true:if_not_exists=true",
+        },
+        .{
+            .sql = "ALTER VIEW users_v RENAME TO active_users_v;",
+            .fingerprint = "ddl:rename_view:view=users_v:new=active_users_v",
+        },
+        .{
+            .sql = "DROP VIEW IF EXISTS active_users_v CASCADE;",
+            .fingerprint = "ddl:drop_view:view=active_users_v:if_exists=true:cascade=true",
+        },
+        .{
+            .sql = "DROP VIEW users_v RESTRICT;",
+            .fingerprint = "ddl:drop_view:view=users_v:if_exists=false",
         },
         .{
             .sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS users_mv AS SELECT id, email FROM users WITH NO DATA;",
             .fingerprint = "ddl:create_materialized_view:view=users_mv:source=users:source_fields=2:fields=2:replace=false:if_not_exists=true:populate=false",
         },
         .{
+            .sql = "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users WITH DATA;",
+            .fingerprint = "ddl:create_materialized_view:view=users_mv:source=users:source_fields=2:fields=2:replace=false:if_not_exists=false:populate=true",
+        },
+        .{
+            .sql = "CREATE OR REPLACE MATERIALIZED VIEW users_mv AS SELECT id, email FROM users WITH NO DATA;",
+            .fingerprint = "ddl:create_materialized_view:view=users_mv:source=users:source_fields=2:fields=2:replace=true:if_not_exists=false:populate=false",
+        },
+        .{
+            .sql = "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS users_mv AS SELECT id, email FROM users;",
+            .fingerprint = "ddl:create_materialized_view:view=users_mv:source=users:source_fields=2:fields=2:replace=true:if_not_exists=true:populate=true",
+        },
+        .{
+            .sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH DATA;",
+            .fingerprint = "ddl:refresh_materialized_view:view=users_mv:concurrently=true:populate=true",
+        },
+        .{
+            .sql = "REFRESH MATERIALIZED VIEW CONCURRENTLY users_mv WITH NO DATA;",
+            .fingerprint = "ddl:refresh_materialized_view:view=users_mv:concurrently=true:populate=false",
+        },
+        .{
+            .sql = "DROP MATERIALIZED VIEW IF EXISTS users_mv RESTRICT;",
+            .fingerprint = "ddl:drop_materialized_view:view=users_mv:if_exists=true",
+        },
+        .{
+            .sql = "DROP MATERIALIZED VIEW IF EXISTS users_mv CASCADE;",
+            .fingerprint = "ddl:drop_materialized_view:view=users_mv:if_exists=true:cascade=true",
+        },
+        .{
             .sql = "CREATE TEMPORARY TABLE users_session (id uuid PRIMARY KEY, status text);",
             .fingerprint = "ddl:relation_lifetime:kind=temporary:table=users_session:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE TEMPORARY TABLE IF NOT EXISTS users_session (id uuid PRIMARY KEY, status text);",
+            .fingerprint = "ddl:relation_lifetime:kind=temporary:table=users_session:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+        },
+        .{
+            .sql = "CREATE UNLOGGED TABLE users_ingest (id uuid PRIMARY KEY, payload jsonb);",
+            .fingerprint = "ddl:relation_lifetime:kind=unlogged:table=users_ingest:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE UNLOGGED TABLE IF NOT EXISTS users_ingest (id uuid PRIMARY KEY, payload jsonb);",
+            .fingerprint = "ddl:relation_lifetime:kind=unlogged:table=users_ingest:columns=2:unique=0:fk=0:checks=0:if_not_exists=true",
+        },
+        .{
+            .sql = "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);",
+            .fingerprint = "ddl:identity_allocator:table=usage_records:column=id:kind=bigserial:primary=true:columns=1",
+        },
+        .{
+            .sql = "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text);",
+            .fingerprint = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_by_default:primary=true:columns=1",
+        },
+        .{
+            .sql = "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text);",
+            .fingerprint = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=6",
         },
         .{
             .sql = "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done');",
             .fingerprint = "ddl:create_enum_type:type=usage_status:values=3",
         },
         .{
+            .sql = "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';",
+            .fingerprint = "ddl:add_enum_value:type=usage_status:if_not_exists=true:position=after",
+        },
+        .{
+            .sql = "DROP TYPE IF EXISTS usage_status CASCADE;",
+            .fingerprint = "ddl:drop_enum_type:type=usage_status:if_exists=true:cascade=true",
+        },
+        .{
             .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);",
             .fingerprint = "ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false",
         },
         .{
+            .sql = "CREATE DOMAIN status_text AS text DEFAULT 'queued' NOT NULL;",
+            .fingerprint = "ddl:create_domain:domain=status_text:type=keyword:checks=0:not_null=true:default=true",
+        },
+        .{
+            .sql = "ALTER DOMAIN positive_amount SET NOT NULL;",
+            .fingerprint = "ddl:alter_domain:domain=positive_amount:ops=1",
+        },
+        .{
+            .sql = "DROP DOMAIN IF EXISTS positive_amount CASCADE;",
+            .fingerprint = "ddl:drop_domain:domain=positive_amount:if_exists=true:cascade=true",
+        },
+        .{
             .sql = "CREATE SEQUENCE IF NOT EXISTS users_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE;",
             .fingerprint = "ddl:create_sequence:sequence=users_id_seq:if_not_exists=true:options=6",
+        },
+        .{
+            .sql = "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;",
+            .fingerprint = "ddl:create_sequence:sequence=users_owned_id_seq:if_not_exists=false:options=3",
+        },
+        .{
+            .sql = "ALTER SEQUENCE users_id_seq RESTART WITH 1000 INCREMENT BY 5;",
+            .fingerprint = "ddl:alter_sequence:sequence=users_id_seq:if_exists=false:ops=2",
+        },
+        .{
+            .sql = "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;",
+            .fingerprint = "ddl:alter_sequence:sequence=users_owned_id_seq:if_exists=true:ops=2",
+        },
+        .{
+            .sql = "DROP SEQUENCE IF EXISTS users_id_seq RESTRICT;",
+            .fingerprint = "ddl:drop_sequence:sequence=users_id_seq:if_exists=true",
+        },
+        .{
+            .sql = "DROP SEQUENCE IF EXISTS users_id_seq CASCADE;",
+            .fingerprint = "ddl:drop_sequence:sequence=users_id_seq:if_exists=true:cascade=true",
         },
     };
 

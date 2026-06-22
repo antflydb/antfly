@@ -9932,6 +9932,221 @@ test "sql adapter ddl plan lowers updated-at trigger ddl into typed update polic
     ));
 }
 
+test "sql adapter ddl plan lowers catalog-only ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var table_clone = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
+    defer table_clone.deinit(alloc);
+    switch (table_clone) {
+        .table_clone => |plan| {
+            try std.testing.expectEqualStrings("users_copy", plan.table_name);
+            try std.testing.expectEqualStrings("users", plan.source_table_name);
+            try std.testing.expect(plan.if_not_exists);
+            try std.testing.expect(plan.options.columns);
+            try std.testing.expect(plan.options.defaults);
+            try std.testing.expect(plan.options.generated);
+            try std.testing.expect(plan.options.checks);
+            try std.testing.expect(plan.options.constraints);
+            try std.testing.expect(plan.options.indexes);
+            try std.testing.expect(plan.options.periods);
+            try std.testing.expect(plan.options.update_policies);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_view = try lowerDdlPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id, contact_email) AS SELECT id, email FROM users;");
+    defer create_view.deinit(alloc);
+    switch (create_view) {
+        .view_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("users_v", create.view_name);
+                try std.testing.expectEqualStrings("users", create.source_table_name);
+                try std.testing.expectEqualStrings("id", create.source_fields[0]);
+                try std.testing.expectEqualStrings("email", create.source_fields[1]);
+                try std.testing.expectEqualStrings("user_id", create.output_fields[0]);
+                try std.testing.expectEqualStrings("contact_email", create.output_fields[1]);
+                try std.testing.expect(!create.replace_existing);
+                try std.testing.expect(!create.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_or_replace_view = try lowerDdlPlanForTestAlloc(alloc, "CREATE OR REPLACE VIEW IF NOT EXISTS users_v AS SELECT id, email FROM users;");
+    defer create_or_replace_view.deinit(alloc);
+    switch (create_or_replace_view) {
+        .view_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expect(create.replace_existing);
+                try std.testing.expect(create.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE VIEW users_v(user_id) AS SELECT id, email FROM users;"));
+
+    var materialized_view = try lowerDdlPlanForTestAlloc(alloc, "CREATE MATERIALIZED VIEW users_mv(user_id, contact_email) AS SELECT id, email FROM users WITH NO DATA;");
+    defer materialized_view.deinit(alloc);
+    switch (materialized_view) {
+        .materialized_view_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("users_mv", create.view_name);
+                try std.testing.expectEqualStrings("users", create.source_table_name);
+                try std.testing.expectEqualStrings("user_id", create.output_fields[0]);
+                try std.testing.expectEqualStrings("contact_email", create.output_fields[1]);
+                try std.testing.expect(!create.populate_on_create);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var add_enum_value = try lowerDdlPlanForTestAlloc(alloc, "ALTER TYPE usage_status ADD VALUE IF NOT EXISTS 'archived' AFTER 'done';");
+    defer add_enum_value.deinit(alloc);
+    switch (add_enum_value) {
+        .enum_type_catalog => |plan| switch (plan) {
+            .add_value => |add| {
+                try std.testing.expectEqualStrings("usage_status", add.type_name);
+                try std.testing.expectEqualStrings("archived", add.value);
+                try std.testing.expect(add.if_not_exists);
+                try std.testing.expectEqual(EnumValuePosition.after, add.position);
+                try std.testing.expectEqualStrings("done", add.neighbor_value.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var serial_identity = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigserial PRIMARY KEY, status text);");
+    defer serial_identity.deinit(alloc);
+    switch (serial_identity) {
+        .identity_allocator_catalog => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqualStrings("id", plan.column.name);
+            try std.testing.expectEqual(IdentityAllocatorKind.bigserial, plan.kind);
+            try std.testing.expect(plan.primary_key);
+            try std.testing.expectEqual(@as(usize, 1), plan.additional_columns.len);
+            try std.testing.expectEqualStrings("status", plan.additional_columns[0].name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_identity = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, status text);");
+    defer generated_identity.deinit(alloc);
+    switch (generated_identity) {
+        .identity_allocator_catalog => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqualStrings("id", plan.column.name);
+            try std.testing.expectEqual(IdentityAllocatorKind.generated_by_default, plan.kind);
+            try std.testing.expect(plan.primary_key);
+            try std.testing.expectEqual(@as(usize, 1), plan.additional_columns.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_identity_options = try lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 10 NO MINVALUE NO MAXVALUE CACHE 4 NO CYCLE) PRIMARY KEY, status text);");
+    defer generated_identity_options.deinit(alloc);
+    switch (generated_identity_options) {
+        .identity_allocator_catalog => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqualStrings("id", plan.column.name);
+            try std.testing.expectEqual(IdentityAllocatorKind.generated_always, plan.kind);
+            try std.testing.expect(plan.primary_key);
+            try std.testing.expectEqual(@as(?i64, 100), plan.options.start_with);
+            try std.testing.expectEqual(@as(?i64, 10), plan.options.increment_by);
+            try std.testing.expect(plan.options.min_value_specified);
+            try std.testing.expectEqual(@as(?i64, null), plan.options.min_value);
+            try std.testing.expect(plan.options.max_value_specified);
+            try std.testing.expectEqual(@as(?i64, null), plan.options.max_value);
+            try std.testing.expectEqual(@as(?i64, 4), plan.options.cache);
+            try std.testing.expectEqual(@as(?bool, false), plan.options.cycle);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (NO MINVALUE MINVALUE 1) PRIMARY KEY, status text);"));
+
+    var create_domain = try lowerDdlPlanForTestAlloc(alloc, "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);");
+    defer create_domain.deinit(alloc);
+    switch (create_domain) {
+        .domain_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("positive_amount", create.domain_name);
+                try std.testing.expectEqual(runtime_schema.AntflyType.numeric, create.field_type);
+                try std.testing.expect(!create.not_null);
+                try std.testing.expect(create.default_value == null);
+                try std.testing.expectEqual(@as(usize, 1), create.checks.len);
+                try std.testing.expectEqualStrings("VALUE", create.checks[0].field);
+                try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, create.checks[0].op);
+                try std.testing.expectEqualStrings("0", create.checks[0].value_json.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_domain = try lowerDdlPlanForTestAlloc(alloc, "ALTER DOMAIN positive_amount SET NOT NULL;");
+    defer alter_domain.deinit(alloc);
+    switch (alter_domain) {
+        .domain_catalog => |plan| switch (plan) {
+            .alter => |alter| {
+                try std.testing.expectEqualStrings("positive_amount", alter.domain_name);
+                try std.testing.expectEqual(@as(usize, 1), alter.operations.len);
+                try std.testing.expectEqual(@as(std.meta.Tag(DomainAlterOperation), .set_not_null), std.meta.activeTag(alter.operations[0]));
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_sequence = try lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE public.users_owned_id_seq AS bigint START WITH 10 OWNED BY public.users.id;");
+    defer create_sequence.deinit(alloc);
+    switch (create_sequence) {
+        .sequence_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("users_owned_id_seq", create.sequence_name);
+                try std.testing.expectEqualStrings("bigint", create.options.as_type.?);
+                try std.testing.expectEqual(@as(?i64, 10), create.options.start_with);
+                try std.testing.expect(create.options.owned_by != null);
+                try std.testing.expectEqualStrings("users", create.options.owned_by.?.table_name);
+                try std.testing.expectEqualStrings("id", create.options.owned_by.?.column_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var alter_sequence = try lowerDdlPlanForTestAlloc(alloc, "ALTER SEQUENCE IF EXISTS users_owned_id_seq AS integer OWNED BY NONE;");
+    defer alter_sequence.deinit(alloc);
+    switch (alter_sequence) {
+        .sequence_catalog => |plan| switch (plan) {
+            .alter => |alter| {
+                try std.testing.expectEqualStrings("users_owned_id_seq", alter.sequence_name);
+                try std.testing.expect(alter.if_exists);
+                try std.testing.expectEqual(@as(usize, 2), alter.operations.len);
+                switch (alter.operations[0]) {
+                    .set_type => |type_name| try std.testing.expectEqualStrings("integer", type_name),
+                    else => return error.TestUnexpectedResult,
+                }
+                switch (alter.operations[1]) {
+                    .set_owned_by => |owned_by| {
+                        try std.testing.expectEqualStrings("", owned_by.table_name);
+                        try std.testing.expectEqualStrings("", owned_by.column_name);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MINVALUE MINVALUE 1;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE SEQUENCE users_id_seq NO MAXVALUE MAXVALUE 100;"));
+}
+
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     const alloc = std.testing.allocator;
 

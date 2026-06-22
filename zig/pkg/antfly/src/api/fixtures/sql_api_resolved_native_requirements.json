@@ -2,6 +2,36 @@
   "resolution_format": 1,
   "resolved": [
     {
+      "reason": "duplicate_conflict_update_target",
+      "coverage": [
+        "invalid_duplicate_conflict_update_target"
+      ]
+    },
+    {
+      "reason": "duplicate_row_batch_target",
+      "coverage": [
+        "invalid_duplicate_row_batch_target"
+      ]
+    },
+    {
+      "reason": "duplicate_update_target",
+      "coverage": [
+        "invalid_duplicate_update_target"
+      ]
+    },
+    {
+      "reason": "invalid_expression_conflict_target",
+      "coverage": [
+        "invalid_expression_conflict_target"
+      ]
+    },
+    {
+      "reason": "invalid_named_conflict_target",
+      "coverage": [
+        "invalid_named_conflict_target"
+      ]
+    },
+    {
       "reason": "prepared_transaction_plan",
       "coverage": [
         "ddl_prepared_transaction_commit",

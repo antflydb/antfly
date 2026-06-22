@@ -4034,6 +4034,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter ddl plan lowers additive inline foreign key column ddl",
             "sql adapter ddl plan lowers updated-at trigger ddl into typed update policy",
             "sql adapter ddl plan lowers routine expression bindings into ddl plans",
+            "sql adapter ddl plan lowers catalog-only ddl plans",
             "sql adapter ddl plan rejects unsupported ddl shapes explicitly",
             "sql adapter ddl plan rejects mistyped expression checks during catalog validation",
             "catalog apply executes prepared transaction recovery intents",
