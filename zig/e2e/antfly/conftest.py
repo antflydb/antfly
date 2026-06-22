@@ -149,7 +149,7 @@ def wait_for_server(
                     return True
             else:
                 consecutive_successes = 0
-        except requests.ConnectionError:
+        except requests.RequestException:
             consecutive_successes = 0
         time.sleep(0.25)
     return False

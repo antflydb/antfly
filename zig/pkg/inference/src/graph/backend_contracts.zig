@@ -561,6 +561,9 @@ pub const RunGatedFfnResidualRequest = struct {
     post_gate_rms_norm_weight: ?CT = null,
     post_down_rms_norm_slot: ?usize = null,
     post_down_rms_norm_weight: ?CT = null,
+    /// Optional scalar applied after the final post-down norm + residual add.
+    /// Backends that cannot fuse it should preserve correctness with a fallback.
+    output_scale: ?CT = null,
     hidden_size: usize,
     intermediate_size: usize,
     eps: f32 = 0.0,

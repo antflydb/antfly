@@ -406,6 +406,7 @@ pub const OpCode = union(enum) {
     fused_concat: ConcatFusedAttrs,
     fused_elem_add: void,
     fused_elem_multiply: void,
+    fused_add_mul_scalar: void,
     fused_sdpa: AttentionAttrs,
     fused_causal_self_attention: AttentionAttrs,
     fused_cross_attention: CrossAttentionAttrs,

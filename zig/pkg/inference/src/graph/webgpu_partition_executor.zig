@@ -294,6 +294,7 @@ fn supportsCommandPartition(
             .fused_elem_add,
             .mul,
             .fused_elem_multiply,
+            .fused_add_mul_scalar,
             .sub,
             .div,
             .less_than,
@@ -356,6 +357,7 @@ fn encodeWebGpuCommandNode(
         .fused_elem_add,
         .mul,
         .fused_elem_multiply,
+        .fused_add_mul_scalar,
         .sub,
         .div,
         .less_than,
@@ -436,6 +438,17 @@ fn executeCommandNode(
             const lhs = valueFor(values, inputs[0]) orelse return error.MissingValue;
             const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
             break :blk try cb.multiply(lhs, rhs);
+        },
+        .fused_add_mul_scalar => blk: {
+            const lhs = valueFor(values, inputs[0]) orelse return error.MissingValue;
+            const rhs = valueFor(values, inputs[1]) orelse return error.MissingValue;
+            const scalar = valueFor(values, inputs[2]) orelse return error.MissingValue;
+            if (try cb.addMultiplyScalarTensor(lhs, rhs, scalar)) |fused| break :blk fused;
+            const sum = try cb.add(lhs, rhs);
+            errdefer cb.free(sum);
+            const scaled = try cb.multiply(sum, scalar);
+            cb.free(sum);
+            break :blk scaled;
         },
         .sub => blk: {
             const lhs = valueFor(values, inputs[0]) orelse return error.MissingValue;

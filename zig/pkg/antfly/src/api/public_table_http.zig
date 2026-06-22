@@ -59,6 +59,9 @@ pub const TableApi = struct {
         Backpressured,
         Unavailable,
         DocIdentityUnavailable,
+        HAReadOnlyStandby,
+        HAPromotedStandbyRequiresPrimaryOpen,
+        HAFencedPrimary,
         InternalFailure,
     };
 
@@ -464,6 +467,9 @@ pub fn handleTableBatch(
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
+        error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
+        error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "batch failed") },
     };
 
@@ -1343,6 +1349,60 @@ test "public table batch handler maps doc identity unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("doc identity unavailable", resp.body);
+}
+
+test "public table batch handler maps HA write gate errors" {
+    const Backend = struct {
+        err: TableApi.ExecuteBatchError,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
+        }
+    };
+
+    const Case = struct {
+        err: TableApi.ExecuteBatchError,
+        body: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .err = error.HAReadOnlyStandby, .body = "standby is read-only" },
+        .{ .err = error.HAPromotedStandbyRequiresPrimaryOpen, .body = "promoted standby requires primary open" },
+        .{ .err = error.HAFencedPrimary, .body = "fenced primary rejects writes" },
+    };
+
+    for (cases) |tc| {
+        var backend = Backend{ .err = tc.err };
+        var resp = try handleTableBatch(std.testing.allocator, "docs",
+            \\{"inserts":{"doc-a":{"title":"alpha"}}}
+        , backend.iface());
+        defer resp.deinit(std.testing.allocator);
+
+        try std.testing.expectEqual(@as(u16, 409), resp.status);
+        try std.testing.expectEqualStrings(tc.body, resp.body);
+    }
 }
 
 test "public table query handler maps doc identity unavailable errors" {

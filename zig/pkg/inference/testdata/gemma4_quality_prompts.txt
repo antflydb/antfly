@@ -1,0 +1,13 @@
+# Gemma4 CUDA first-token quality smoke prompts.
+Write one sentence about ants.
+Name two uses for a compass.
+Explain why rainbows appear after rain in one sentence.
+List three colors in order: red, green, blue.
+What is 7 plus 5? Answer with the number only.
+Write a tiny Python function name for adding two numbers.
+Complete the phrase: The capital of France is
+Give one safety tip for using a ladder.
+Rewrite this in uppercase: cuda kernels are fast
+In one sentence, describe a library.
+Say hello in Spanish.
+Name one planet that has rings.

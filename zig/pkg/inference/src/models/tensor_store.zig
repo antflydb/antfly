@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const compat = @import("../io/compat.zig");
 const manifest_mod = @import("manifest.zig");
 const weight_source_mod = @import("weight_source.zig");
+const DType = @import("../backends/tensor.zig").DType;
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = if (builtin.os.tag == .freestanding) struct {
     pub const MmapRegion = struct {
@@ -72,6 +73,29 @@ pub const LazyTensorRef = struct {
     }
 };
 
+pub const TensorRangeRef = struct {
+    name: []const u8,
+    path: []const u8,
+    byte_offset: u64,
+    byte_len: usize,
+    dtype: DType,
+    shape: []const i64,
+    owned_path: ?[]u8 = null,
+
+    pub fn deinit(self: *TensorRangeRef, allocator: std.mem.Allocator) void {
+        if (self.owned_path) |path| allocator.free(path);
+        self.* = .{
+            .name = &.{},
+            .path = &.{},
+            .byte_offset = 0,
+            .byte_len = 0,
+            .dtype = .f32,
+            .shape = &.{},
+            .owned_path = null,
+        };
+    }
+};
+
 pub const TensorStore = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -80,6 +104,7 @@ pub const TensorStore = struct {
         kind: *const fn (*anyopaque) StoreKind,
         weightSource: *const fn (*anyopaque) anyerror!?weight_source_mod.WeightSource,
         describeTensor: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!LazyTensorRef,
+        describeTensorRange: *const fn (*anyopaque, allocator: std.mem.Allocator, name: []const u8) anyerror!?TensorRangeRef,
         loadTensorRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!weight_source_mod.LoadedWeight,
         loadQuantizedStorageRef: *const fn (*anyopaque, tensor_ref: *const LazyTensorRef) anyerror!?weight_source_mod.QuantizedStorage,
         ggufFile: *const fn (*anyopaque) ?*const gguf_mod.format.File,
@@ -96,6 +121,10 @@ pub const TensorStore = struct {
 
     pub fn describeTensor(self: TensorStore, allocator: std.mem.Allocator, name: []const u8) !LazyTensorRef {
         return self.vtable.describeTensor(self.ptr, allocator, name);
+    }
+
+    pub fn describeTensorRange(self: TensorStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+        return self.vtable.describeTensorRange(self.ptr, allocator, name);
     }
 
     pub fn loadTensorRef(self: TensorStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -117,11 +146,13 @@ pub const TensorStore = struct {
 
 pub const SafetensorsStore = struct {
     source: *weight_source_mod.SafetensorsSource,
+    path: []const u8,
 
     const vtable = TensorStore.VTable{
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
+        .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -131,8 +162,12 @@ pub const SafetensorsStore = struct {
     pub fn initAbsolute(allocator: std.mem.Allocator, path: []const u8) !*SafetensorsStore {
         const self = try allocator.create(SafetensorsStore);
         errdefer allocator.destroy(self);
+        const source = try weight_source_mod.SafetensorsSource.initAbsolute(allocator, path);
+        errdefer source.weightSource().deinit();
+        const owned_path = try allocator.dupe(u8, path);
         self.* = .{
-            .source = try weight_source_mod.SafetensorsSource.initAbsolute(allocator, path),
+            .source = source,
+            .path = owned_path,
         };
         return self;
     }
@@ -158,6 +193,19 @@ pub const SafetensorsStore = struct {
         };
     }
 
+    fn describeTensorRangeImpl(self: *SafetensorsStore, _: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+        const meta = self.source.reader.header.tensors.get(name) orelse return error.TensorNotFound;
+        const len_u64 = meta.data_end - meta.data_start;
+        return .{
+            .name = name,
+            .path = self.path,
+            .byte_offset = self.source.reader.data_offset + meta.data_start,
+            .byte_len = @intCast(len_u64),
+            .dtype = meta.dtype,
+            .shape = meta.shape,
+        };
+    }
+
     fn loadTensorRefImpl(self: *SafetensorsStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
         return .{
             .tensor = try self.source.reader.readTensor(tensor_ref.name),
@@ -176,6 +224,7 @@ pub const SafetensorsStore = struct {
     fn deinitSelf(self: *SafetensorsStore) void {
         const allocator = self.source.reader.allocator;
         self.source.weightSource().deinit();
+        allocator.free(self.path);
         allocator.destroy(self);
     }
 };
@@ -187,6 +236,7 @@ pub const ShardedSafetensorsStore = struct {
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
+        .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -220,6 +270,21 @@ pub const ShardedSafetensorsStore = struct {
             .name = try allocator.dupe(u8, name),
             .byte_len = @intCast(resolved.meta.data_end - resolved.meta.data_start),
             .quantized = false,
+        };
+    }
+
+    fn describeTensorRangeImpl(self: *ShardedSafetensorsStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+        const resolved = try self.source.findTensorMetaWithShard(name);
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.source.model_dir, resolved.shard_name });
+        errdefer allocator.free(path);
+        return .{
+            .name = name,
+            .path = path,
+            .byte_offset = resolved.reader.data_offset + resolved.meta.data_start,
+            .byte_len = @intCast(resolved.meta.data_end - resolved.meta.data_start),
+            .dtype = resolved.meta.dtype,
+            .shape = resolved.meta.shape,
+            .owned_path = path,
         };
     }
 
@@ -257,6 +322,7 @@ pub const GgufStore = struct {
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
+        .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -337,6 +403,10 @@ pub const GgufStore = struct {
             .byte_len = @intCast(byte_len_u64),
             .quantized = tensor.tensor_type.isQuantized(),
         };
+    }
+
+    fn describeTensorRangeImpl(_: *GgufStore, _: std.mem.Allocator, _: []const u8) !?TensorRangeRef {
+        return null;
     }
 
     fn loadTensorRefImpl(self: *GgufStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -875,6 +945,7 @@ pub const CompositeGlinerStore = struct {
         .kind = @ptrCast(&kindImpl),
         .weightSource = @ptrCast(&weightSourceImpl),
         .describeTensor = @ptrCast(&describeTensorImpl),
+        .describeTensorRange = @ptrCast(&describeTensorRangeImpl),
         .loadTensorRef = @ptrCast(&loadTensorRefImpl),
         .loadQuantizedStorageRef = @ptrCast(&loadQuantizedStorageRefImpl),
         .ggufFile = @ptrCast(&ggufFileImpl),
@@ -932,6 +1003,14 @@ pub const CompositeGlinerStore = struct {
             return self.head_gguf.?.describeTensorImpl(allocator, name);
         }
         return self.encoder.describeTensorImpl(allocator, name);
+    }
+
+    fn describeTensorRangeImpl(self: *CompositeGlinerStore, allocator: std.mem.Allocator, name: []const u8) !?TensorRangeRef {
+        if (self.hasHeadTensor(name)) {
+            if (self.head_safetensors) |head| return head.describeTensorRangeImpl(allocator, name);
+            return null;
+        }
+        return null;
     }
 
     fn loadTensorRefImpl(self: *CompositeGlinerStore, tensor_ref: *const LazyTensorRef) !weight_source_mod.LoadedWeight {
@@ -1122,6 +1201,48 @@ test "safetensors tensor store preserves f16 dtype" {
     defer loaded.deinit();
     try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f16, loaded.tensor.dtype);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&values), loaded.tensor.data);
+}
+
+test "safetensors tensor store describes absolute byte ranges" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{"weights": {"dtype": "BF16", "shape": [2, 2], "data_offsets": [0, 8]}}
+    ;
+
+    var file = std.ArrayListUnmanaged(u8).empty;
+    defer file.deinit(allocator);
+    try appendLe(u64, allocator, &file, json.len);
+    try file.appendSlice(allocator, json);
+    const payload_offset = file.items.len;
+    try file.appendSlice(allocator, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+
+    const dir_path = try testScratchDir(allocator, "tensor-store-safetensors-range");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
+    defer allocator.free(path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = file.items });
+
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = allocator,
+        .safetensors_path = try allocator.dupe(u8, path),
+    };
+    defer manifest.deinit();
+
+    const store = try openFromManifest(allocator, manifest);
+    defer store.deinit();
+
+    var range = (try store.describeTensorRange(allocator, "weights")) orelse return error.TestUnexpectedResult;
+    defer range.deinit(allocator);
+    try std.testing.expectEqualStrings(path, range.path);
+    try std.testing.expectEqual(@as(u64, @intCast(payload_offset)), range.byte_offset);
+    try std.testing.expectEqual(@as(usize, 8), range.byte_len);
+    try std.testing.expectEqual(DType.bf16, range.dtype);
+    try std.testing.expectEqual(@as(i64, 2), range.shape[0]);
+    try std.testing.expectEqual(@as(i64, 2), range.shape[1]);
 }
 
 test "open gguf tensor store from manifest" {
