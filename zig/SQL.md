@@ -59,6 +59,50 @@ tree, but it should not read table metadata, role grants, extension state, or
 range ownership. That keeps parse behavior deterministic and lets unsupported
 statements be classified before any storage or metadata side effect is possible.
 
+## Design Summary
+
+The long-term production shape is a phase-separated SQL frontend over typed
+Antfly services. SQL text is accepted at external ingress only; after that, the
+adapter carries typed objects forward:
+
+```text
+SQL text
+  -> TokenizedSql
+  -> ParsedSql
+  -> BoundSqlStatement
+  -> LogicalSqlPlan
+  -> shared Antfly service request
+```
+
+Each phase has a narrow job:
+
+- `TokenizedSql` tokenizes once, records source spans, and attaches keyword
+  metadata without semantic allocation.
+- `ParsedSql` builds a catalog-free raw AST, including nested statement nodes
+  for `EXPLAIN`, CTEs, relation population, `INSERT ... SELECT`, and future
+  embedded statements.
+- `BoundSqlStatement` applies SQL session state, `current_database`,
+  `search_path`, catalog identity, object versions, schemas, dependency facts,
+  and role authorization.
+- `LogicalSqlPlan` expresses Antfly-native read, write, DDL, role, extension,
+  job, lake, backup/restore, and session intent.
+- Shared services own durable effects. The SQL adapter never independently
+  commits catalog state, schedules lifecycle jobs, stores extension metadata,
+  mutates roles, applies tablespace placement, or routes storage through raw
+  SQL strings.
+
+The metadata/catalog owner should admit lifecycle jobs and commit durable
+metadata transitions for SQL and non-SQL callers alike. SQL can parse, bind,
+authorize, and build the requested lifecycle plan, but the same job,
+authorization, audit, idempotency, retry, and compare-and-swap path must serve
+REST, SDK, MCP, A2A, CLI, internal automation, and SQL.
+
+New SQL work should be accepted only when it adds the full typed route:
+raw AST coverage, binder coverage, native logical plan coverage, span-aware
+diagnostics, and parity tests from structured summaries or coverage bits.
+Syntax-only support, durable SQL-string metadata, probe-based dispatch, and
+fixture scans that behave like a second parser are compatibility debt.
+
 Semantic planning is the first catalog-aware phase. It receives the raw AST,
 SQL session state, authenticated principal, and a catalog snapshot. It resolves
 names, checks permissions through the shared role system, type-binds
@@ -324,15 +368,19 @@ Current implementation status:
   resolve unqualified catalog names against non-default search paths. Public
   facade wrappers for direct select, insert, strict insert/update, and aggregate
   lowering now delegate through parsed helper variants instead of owning
-  separate tokenization paths. DML adapter write-plan regression callbacks and
-  direct DML test facades also consume borrowed parsed tokens instead of
-  round-tripping through SQL text. DDL fingerprint regression helpers parse once
-  through `ParsedSql` before computing structured fingerprints. Antfly query
-  function lowering has parsed entrypoints, and app-parity query-function
-  checks reuse `ParsedSql` instead of tokenizing fixture SQL directly.
+  separate tokenization paths. DML adapter write-plan regression callbacks,
+  direct DML test facades, and lower-expression query/join/lateral/window/
+  aggregate/set-operation/recursive-CTE test facades consume borrowed parsed
+  tokens instead of round-tripping through SQL text. DDL fingerprint regression
+  helpers parse once through `ParsedSql` before computing structured
+  fingerprints. Antfly query function lowering has parsed entrypoints, and
+  app-parity query-function checks reuse `ParsedSql` instead of tokenizing
+  fixture SQL directly.
   Corpus fixture parameter coverage parses fixture SQL once and validates
   placeholders from parsed token spans instead of using a separate raw string
-  scanner.
+  scanner. Corpus coverage observation now parses each entry once and uses
+  parsed token predicates for early syntax buckets such as conflict clauses,
+  query functions, computed patterns, and common function-name coverage.
   Parsed-only lowering context construction does not require a raw SQL field.
   Recursive data-modifying CTEs carry a parsed recursive-write flag, so generic
   write planning no longer reclassifies recursive write kind from the token
@@ -354,6 +402,9 @@ Current implementation status:
   searches. Lateral and window expression coverage checks now use emitted plan
   tokens rather than matching SQL spelling. Fixture parameter coverage now uses
   `ParsedSql` placeholder tokens instead of a separate raw SQL byte scanner.
+  Corpus feature coverage parses entries once and uses SQL tokens for query
+  function, conflict, multi-row insert, computed-pattern, JSONB, array, and UUID
+  coverage checks instead of raw substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

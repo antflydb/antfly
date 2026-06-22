@@ -29,6 +29,7 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../table_catalog.zig");
+const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -6509,9 +6510,55 @@ test "sql adapter corpus validates adapter edge case coverage requirements" {
     try std.testing.expectError(error.TestUnexpectedResult, parseSqlAdapterEdgeCaseCoverageRequirementsRootAlloc(alloc, parsed_unknown.value));
 }
 
-fn appParitySqlHasComputedPattern(sql: []const u8) bool {
-    return std.mem.indexOf(u8, sql, "lower(") != null and
-        (std.mem.indexOf(u8, sql, " LIKE ") != null or std.mem.indexOf(u8, sql, " ILIKE ") != null);
+fn appParityTokensHaveIdentifier(tokens: []const tokenized.Token, identifier: []const u8) bool {
+    for (tokens) |token| {
+        if (token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, identifier)) return true;
+    }
+    return false;
+}
+
+fn appParityTokensHaveIdentifierPrefix(tokens: []const tokenized.Token, prefix: []const u8) bool {
+    for (tokens) |token| {
+        if (token.kind == .identifier and std.ascii.startsWithIgnoreCase(token.text, prefix)) return true;
+    }
+    return false;
+}
+
+fn appParityTokensHaveKeyword(tokens: []const tokenized.Token, keyword: []const u8) bool {
+    for (tokens) |token| {
+        if (token.matchesKeyword(keyword)) return true;
+    }
+    return false;
+}
+
+fn appParityTokensHaveKeywordSequence(tokens: []const tokenized.Token, keywords: []const []const u8) bool {
+    if (keywords.len == 0) return true;
+    if (tokens.len < keywords.len) return false;
+    var start: usize = 0;
+    while (start + keywords.len <= tokens.len) : (start += 1) {
+        var offset: usize = 0;
+        while (offset < keywords.len and tokens[start + offset].matchesKeyword(keywords[offset])) : (offset += 1) {}
+        if (offset == keywords.len) return true;
+    }
+    return false;
+}
+
+fn appParityTokensHaveKindSequence(tokens: []const tokenized.Token, kinds: []const token_mod.TokenKind) bool {
+    if (kinds.len == 0) return true;
+    if (tokens.len < kinds.len) return false;
+    var start: usize = 0;
+    while (start + kinds.len <= tokens.len) : (start += 1) {
+        var offset: usize = 0;
+        while (offset < kinds.len and tokens[start + offset].kind == kinds[offset]) : (offset += 1) {}
+        if (offset == kinds.len) return true;
+    }
+    return false;
+}
+
+fn appParityParsedSqlHasComputedPattern(parsed_sql: *const tokenized.ParsedSql) bool {
+    const tokens = parsed_sql.items();
+    return appParityTokensHaveIdentifier(tokens, "lower") and
+        (appParityTokensHaveKeyword(tokens, "like") or appParityTokensHaveKeyword(tokens, "ilike"));
 }
 
 fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bool {
@@ -7299,12 +7346,16 @@ pub const AppParityCorpusCoverage = struct {
     }
 
     pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+        defer parsed_sql.deinit(alloc);
+        const sql_tokens = parsed_sql.items();
+
         const uses_cte_stream = sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") or sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
         const uses_returning_all = sql_adapter.planHasNonZeroToken(entry.plan, ":returning_all=");
         const uses_conflict_where = sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_where=");
-        const uses_insert_conflict = entry.family == .insert and std.mem.indexOf(u8, entry.sql, "ON CONFLICT") != null;
-        const uses_multi_row_insert = entry.family == .insert and std.mem.indexOf(u8, entry.sql, "), (") != null;
-        const uses_computed_pattern = appParitySqlHasComputedPattern(entry.sql);
+        const uses_insert_conflict = entry.family == .insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ "on", "conflict" });
+        const uses_multi_row_insert = entry.family == .insert and appParityTokensHaveKindSequence(sql_tokens, &.{ .rparen, .comma, .lparen });
+        const uses_computed_pattern = appParityParsedSqlHasComputedPattern(&parsed_sql);
         const is_update_joined_source = entry.family == .update_joined_source;
         const is_delete_joined_source = entry.family == .delete_joined_source;
         const is_joined_source = is_update_joined_source or is_delete_joined_source;
@@ -7333,21 +7384,21 @@ pub const AppParityCorpusCoverage = struct {
             self.query_function_full_text = self.query_function_full_text or
                 sql_adapter.planHasNonZeroToken(entry.plan, ":text=");
             self.query_function_semantic = self.query_function_semantic or
-                (std.mem.indexOf(u8, entry.sql, "antfly.semantic_search") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "antfly.semantic_search") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":dense="));
             self.query_function_vector = self.query_function_vector or
-                (std.mem.indexOf(u8, entry.sql, "antfly.vector_search") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "antfly.vector_search") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":dense="));
             self.query_function_graph_search = self.query_function_graph_search or
                 sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search=");
             self.query_function_graph_traverse = self.query_function_graph_traverse or
-                (std.mem.indexOf(u8, entry.sql, "antfly.graph_traverse") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_traverse") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_shortest_path = self.query_function_graph_shortest_path or
-                (std.mem.indexOf(u8, entry.sql, "antfly.graph_shortest_path") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_shortest_path") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_k_shortest_paths = self.query_function_graph_k_shortest_paths or
-                (std.mem.indexOf(u8, entry.sql, "antfly.graph_k_shortest_paths") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_k_shortest_paths") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_metric = self.query_function_graph_metric or
                 sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric=");
@@ -7359,32 +7410,32 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasNonZeroToken(entry.plan, ":dense=") or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric_rerank=")));
             self.query_function_hybrid_sources_json = self.query_function_hybrid_sources_json or
-                (std.mem.indexOf(u8, entry.sql, "sources_json") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "sources_json") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":merge="));
             self.query_function_hybrid_source_helpers = self.query_function_hybrid_source_helpers or
-                (std.mem.indexOf(u8, entry.sql, "antfly.source") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "antfly.source") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":merge="));
         }
-        self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or std.mem.indexOf(u8, entry.sql, "to_jsonb(") != null;
+        self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or appParityTokensHaveIdentifier(sql_tokens, "to_jsonb");
         self.to_jsonb_dynamic_expression = self.to_jsonb_dynamic_expression or
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(lower(") != null or
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(excluded.") != null;
+            (appParityTokensHaveIdentifier(sql_tokens, "to_jsonb") and
+                (appParityTokensHaveIdentifier(sql_tokens, "lower") or appParityTokensHaveIdentifierPrefix(sql_tokens, "excluded.")));
         self.update_source_json_set_expression = self.update_source_json_set_expression or
             (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":json_set_expr="));
         self.update_joined_source_json_set_expression = self.update_joined_source_json_set_expression or
             (entry.family == .update_joined_source and sql_adapter.planHasNonZeroToken(entry.plan, ":json_set_expr="));
-        self.point_update_jsonb = self.point_update_jsonb or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "jsonb_") != null);
+        self.point_update_jsonb = self.point_update_jsonb or (entry.family == .update and appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_"));
         self.point_update_jsonb_concat = self.point_update_jsonb_concat or (entry.family == .update and
             std.mem.indexOf(u8, entry.sql, "metadata ||") != null and
             std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
-        self.point_update_array = self.point_update_array or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "array_") != null);
+        self.point_update_array = self.point_update_array or (entry.family == .update and appParityTokensHaveIdentifierPrefix(sql_tokens, "array_"));
         self.write_plan_insert_op_set = self.write_plan_insert_op_set or (entry.family == .insert and sql_adapter.planHasNonZeroToken(entry.plan, ":op_set="));
         self.write_plan_insert_op_inc = self.write_plan_insert_op_inc or (entry.family == .insert and sql_adapter.planHasNonZeroToken(entry.plan, ":op_inc="));
         self.write_plan_update_op_set = self.write_plan_update_op_set or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_set="));
         self.write_plan_update_op_push = self.write_plan_update_op_push or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_push="));
         self.write_plan_update_op_pull = self.write_plan_update_op_pull or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_pull="));
-        self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null);
+        self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and appParityTokensHaveIdentifier(sql_tokens, "gen_random_uuid"));
         self.point_update_patch_expression = self.point_update_patch_expression or
             (entry.family == .update and std.mem.eql(u8, entry.name, "point update expression assignment"));
         self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and

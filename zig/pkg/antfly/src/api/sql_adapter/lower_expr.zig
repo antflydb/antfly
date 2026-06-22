@@ -28,6 +28,7 @@ const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
 const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
 pub const Token = token_mod.Token;
@@ -24439,20 +24440,21 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
     };
     var lowered = parseQueryPlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         params,
         parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
@@ -24481,20 +24483,21 @@ fn lowerJoinForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .joined_source_schema = schema,
         .params = params,
     };
     var lowered = plan_mod.parseJoinPlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.joinPlanParserHooks(&parser_state),
@@ -24521,20 +24524,21 @@ fn lowerLateralForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .joined_source_schema = schema,
         .params = params,
     };
     var lowered = plan_mod.parseLateralPlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.lateralPlanParserHooks(&parser_state),
@@ -24561,19 +24565,20 @@ fn lowerWindowPlanForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
     var lowered = plan_mod.parseWindowPlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.windowPlanParserHooks(&parser_state),
@@ -24600,19 +24605,20 @@ fn lowerAggregatePlanForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens.items, "with");
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
     var lowered = plan_mod.parseAggregatePlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
         parser_context.ParserState.ContextAccessors.aggregatePlanParserHooks(&parser_state),
@@ -24639,12 +24645,13 @@ fn lowerAggregateForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
@@ -24664,19 +24671,20 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
     };
     return try plan_mod.parseSetOperationPlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         schema,
         false,
@@ -24693,18 +24701,19 @@ fn lowerRecursiveCtePlanForLowerExprTestAlloc(
     const parser_context = @import("parser_context.zig");
 
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .schema = schema,
         .params = params,
     };
     return try plan_mod.parseRecursiveCtePlanAlloc(
         alloc,
-        tokens.items,
+        tokens,
         &parser_state.pos,
         parser_context.ParserState.ContextAccessors.recursiveCteParserHooks(&parser_state),
     );
