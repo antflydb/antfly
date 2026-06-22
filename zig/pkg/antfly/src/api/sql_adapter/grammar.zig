@@ -6911,7 +6911,7 @@ pub fn parseDdlUniquePredicatesAlloc(
         var depth: usize = 0;
         while (pos.* < tokens.len) {
             const token = tokens[pos.*];
-            if (depth == 0 and token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, "and")) break;
+            if (depth == 0 and token.matchesKeywordTag(.@"and")) break;
             if (depth == 0 and token.kind == .semicolon) break;
             switch (token.kind) {
                 .lparen => depth += 1,
@@ -6930,7 +6930,7 @@ pub fn parseDdlUniquePredicatesAlloc(
         errdefer if (!predicate_transferred) freeDdlUniquePredicate(alloc, predicate);
         try predicates.append(alloc, predicate);
         predicate_transferred = true;
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
     return try predicates.toOwnedSlice(alloc);
 }
@@ -6976,8 +6976,7 @@ pub fn parseDdlUniquePredicateWhereJsonAlloc(
         var depth: usize = 0;
         while (pos.* < tokens.len) {
             const token = tokens[pos.*];
-            if (depth == 0 and token.kind == .identifier and
-                (std.ascii.eqlIgnoreCase(token.text, "and") or std.ascii.eqlIgnoreCase(token.text, "do"))) break;
+            if (depth == 0 and (token.matchesKeywordTag(.@"and") or token.matchesKeywordTag(.do))) break;
             if (depth == 0 and token.kind == .semicolon) break;
             switch (token.kind) {
                 .lparen => depth += 1,
@@ -6996,7 +6995,7 @@ pub fn parseDdlUniquePredicateWhereJsonAlloc(
         errdefer if (!predicate_transferred) freeDdlUniquePredicate(alloc, predicate);
         try predicates.append(alloc, predicate);
         predicate_transferred = true;
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
     try lower_expr.validateUniquePredicatesForColumns(columns, predicates.items);
     return try uniquePredicateWhereJsonAlloc(alloc, predicates.items);
@@ -7016,15 +7015,15 @@ fn parseDdlUniquePredicateAtomAlloc(
     errdefer if (!field_transferred) alloc.free(field);
 
     if (idx >= tokens.len) return error.UnsupportedSqlShape;
-    if (tokens[idx].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[idx].text, "is")) {
+    if (tokens[idx].matchesKeywordTag(.is)) {
         idx += 1;
-        const op: runtime_schema.UniquePredicateOp = if (idx < tokens.len and tokens[idx].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[idx].text, "not")) blk: {
+        const op: runtime_schema.UniquePredicateOp = if (idx < tokens.len and tokens[idx].matchesKeywordTag(.not)) blk: {
             idx += 1;
-            if (idx >= tokens.len or tokens[idx].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[idx].text, "null")) return error.UnsupportedSqlShape;
+            if (idx >= tokens.len or !tokens[idx].matchesKeywordTag(.null)) return error.UnsupportedSqlShape;
             idx += 1;
             break :blk .is_not_null;
         } else blk: {
-            if (idx >= tokens.len or tokens[idx].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[idx].text, "null")) return error.UnsupportedSqlShape;
+            if (idx >= tokens.len or !tokens[idx].matchesKeywordTag(.null)) return error.UnsupportedSqlShape;
             idx += 1;
             break :blk .is_null;
         };

@@ -404,7 +404,7 @@ Current implementation status:
   `RETURNING` delimiters now use token keyword predicates in lower-DML scans.
   Relation-population parsing and update-source alias inference in the grammar
   also use keyword tags for statement heads, `FROM`/`AS`, set-operation tails,
-  and `WITH [NO] DATA`.
+  `WITH [NO] DATA`, and DDL unique-predicate delimiters and null-test atoms.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
