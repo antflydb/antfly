@@ -4704,7 +4704,7 @@ fn parseDdlGeneratedPrimaryExpressionAlloc(
         const value_json = try std.fmt.allocPrint(alloc, "-{s}", .{number.text});
         return try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
     }
-    if (cursor.peekFunctionCall("cast")) return try parseDdlGeneratedCastExpressionAlloc(alloc, cursor);
+    if (cursor.peekFunctionCallTag(.cast)) return try parseDdlGeneratedCastExpressionAlloc(alloc, cursor);
     if (cursor.peekFunctionCallIf(sqlKeywordIsJsonExtractPathFunction)) return try parseDdlGeneratedJsonExtractPathExpressionAlloc(alloc, cursor);
     if (cursor.peekKind(.identifier) and cursor.pos.* + 1 < cursor.tokens.len and cursor.tokens[cursor.pos.* + 1].kind == .lparen) {
         return try parseDdlGeneratedFunctionExpressionAlloc(alloc, cursor);
