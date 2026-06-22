@@ -7915,29 +7915,32 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_patch_expression = self.update_source_patch_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_boolean_expression_update = self.update_source_boolean_expression_update or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET enabled = enabled OR false") != null and
+            appParityTokensHaveKeyword(sql_tokens, .set) and
+            appParityTokensHaveIdentifier(sql_tokens, "enabled") and
+            appParityTokensHaveKeyword(sql_tokens, .@"or") and
+            appParityTokensHaveKeyword(sql_tokens, .false) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_increment_expression = self.update_source_increment_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":increment_expr="));
         self.update_source_modulo_expression = self.update_source_modulo_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "MOD(priority + 9, 7)") != null and
-            std.mem.indexOf(u8, entry.sql, "priority % 2") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "mod") and
+            appParityTokensHaveKind(sql_tokens, .percent) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_source_regexp_replace_expression = self.update_source_regexp_replace_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_replace(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_match_expression = self.update_source_regexp_match_expression or (entry.family == .update_source and
-            (std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null or
-                std.mem.indexOf(u8, entry.sql, "regexp_match(status") != null) and
+            (appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") or
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_match")) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_count_expression = self.update_source_regexp_count_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_instr_expression = self.update_source_regexp_instr_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_substr_expression = self.update_source_regexp_substr_expression or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.observeMigrationEquivalentDataBackfill(entry);
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
