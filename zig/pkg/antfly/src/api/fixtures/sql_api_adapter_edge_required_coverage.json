@@ -12,6 +12,7 @@
     "cte_write_classification",
     "cte_write_plan_rejection",
     "expected_error_invalid_sql_catalog",
+    "expected_error_unsupported_rows_query",
     "expected_error_unsupported_rows_selector",
     "expected_error_unsupported_sql_shape",
     "expression_conflict_target_rejection",
@@ -24,6 +25,8 @@
     "typed_select_predicate",
     "typed_update_mutation",
     "write_kind_delete",
-    "write_kind_update"
+    "write_kind_delete_joined_source",
+    "write_kind_update",
+    "write_kind_update_joined_source"
   ]
 }

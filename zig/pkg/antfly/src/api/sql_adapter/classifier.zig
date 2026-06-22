@@ -242,18 +242,22 @@ fn classifyUpdateStatement(tokens: []const Token, start: usize) ?SqlWriteStateme
     if (!statementStartsAt(tokens, start, "update")) return null;
     const statement = tokens[start..];
     const set_index = parser.findTopLevelKeyword(statement, "set") orelse return .update;
-    const from_index = parser.findTopLevelKeywordFromIndex(statement, set_index + 1, "from") orelse return .update;
-    const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
-    return if (from_index < stop_index) .update_joined_source else .update;
+    if (parser.findTopLevelKeywordFromIndex(statement, set_index + 1, "from")) |from_index| {
+        const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
+        if (from_index < stop_index) return .update_joined_source;
+    }
+    return if (statementHasWhereSemijoinSubquery(statement, set_index + 1)) .update_joined_source else .update;
 }
 
 fn classifyDeleteStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
     if (!statementStartsAt(tokens, start, "delete")) return null;
     const statement = tokens[start..];
     const from_index = parser.findTopLevelKeyword(statement, "from") orelse return .delete;
-    const using_index = parser.findTopLevelKeywordFromIndex(statement, from_index + 1, "using") orelse return .delete;
-    const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
-    return if (using_index < stop_index) .delete_joined_source else .delete;
+    if (parser.findTopLevelKeywordFromIndex(statement, from_index + 1, "using")) |using_index| {
+        const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
+        if (using_index < stop_index) return .delete_joined_source;
+    }
+    return if (statementHasWhereSemijoinSubquery(statement, from_index + 1)) .delete_joined_source else .delete;
 }
 
 fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []const []const u8) ?usize {
@@ -264,6 +268,37 @@ fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []co
         }
     }
     return first;
+}
+
+fn statementHasWhereSemijoinSubquery(tokens: []const Token, start: usize) bool {
+    const where_index = parser.findTopLevelKeywordFromIndex(tokens, start, "where") orelse return false;
+    const stop_index = firstTopLevelKeywordIndex(tokens, where_index + 1, &.{ "order", "limit", "offset", "fetch", "for", "returning" }) orelse tokens.len;
+    return tokenRangeHasTopLevelSemijoinSubquery(tokens[where_index + 1 .. stop_index]);
+}
+
+fn tokenRangeHasTopLevelSemijoinSubquery(tokens: []const Token) bool {
+    var depth: usize = 0;
+    for (tokens, 0..) |token, index| {
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0) {
+                if ((token.matchesKeyword("in") or token.matchesKeyword("exists")) and nextParenContainsSelect(tokens, index + 1)) return true;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn nextParenContainsSelect(tokens: []const Token, start: usize) bool {
+    var index = start;
+    while (index < tokens.len and tokens[index].kind == .comma) : (index += 1) {}
+    if (index >= tokens.len or tokens[index].kind != .lparen) return false;
+    if (index + 1 >= tokens.len or !tokens[index + 1].matchesKeyword("select")) return false;
+    return parser.findMatchingRParenIndex(tokens, index) != null;
 }
 
 fn keywordAt(tokens: []const Token, index: usize, keyword: []const u8) bool {
@@ -356,10 +391,20 @@ test "sql adapter classifier identifies write statement families" {
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows", .expected = .insert_source },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) VALUES ('u1')", .expected = .insert },
         .{ .sql = "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .expected = .update },
+        .{ .sql = "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) UPDATE usage_records SET status = source_rows.status FROM source_rows WHERE usage_records.id = source_rows.id", .expected = .update_joined_source },
         .{ .sql = "WITH source_rows AS NOT MATERIALIZED (SELECT id FROM usage_records) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)", .expected = .delete },
+        .{ .sql = "WITH source_rows AS NOT MATERIALIZED (SELECT id FROM usage_records) DELETE FROM usage_records USING source_rows WHERE usage_records.id = source_rows.id", .expected = .delete_joined_source },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = 'done'", .expected = .merge },
         .{ .sql = "UPDATE usage_records SET status = 'done'", .expected = .update },
+        .{ .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id", .expected = .update_joined_source },
+        .{ .sql = "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id", .expected = .update_joined_source },
+        .{ .sql = "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.id = usage_records.id)", .expected = .update_joined_source },
+        .{ .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a'", .expected = .update },
         .{ .sql = "DELETE FROM usage_records", .expected = .delete },
+        .{ .sql = "DELETE FROM usage_records USING source_records WHERE usage_records.id = source_records.id", .expected = .delete_joined_source },
+        .{ .sql = "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)", .expected = .delete_joined_source },
+        .{ .sql = "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.id = usage_records.id)", .expected = .delete_joined_source },
+        .{ .sql = "DELETE FROM usage_records WHERE status = 'expired' ORDER BY expires_at USING < LIMIT 10 RETURNING id", .expected = .delete },
         .{ .sql = "TRUNCATE usage_records", .expected = .truncate },
         .{ .sql = "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .expected = .merge },
     };
@@ -391,6 +436,27 @@ test "sql adapter classifier rejects non-write and non-token statements" {
     try std.testing.expect(classifyWriteStatement(recursive_tokens.items) == null);
 
     try std.testing.expect(classifyStatementFamily(&.{}) == null);
+}
+
+test "sql adapter classifier identifies recursive write final statement families" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        expected: SqlWriteStatementKind,
+    }{
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows", .expected = .insert_source },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .expected = .update_joined_source },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records) UPDATE usage_records SET status = source_rows.status FROM source_rows WHERE usage_records.id = source_rows.id", .expected = .update_joined_source },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)", .expected = .delete_joined_source },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) DELETE FROM usage_records USING source_rows WHERE usage_records.id = source_rows.id", .expected = .delete_joined_source },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN DELETE", .expected = .merge },
+    };
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(alloc, case.sql);
+        defer lexer.freeTokens(alloc, &tokens);
+        try std.testing.expect(classifyWriteStatement(tokens.items) == null);
+        try std.testing.expectEqual(case.expected, classifyRecursiveWriteStatement(tokens.items).?);
+    }
 }
 
 test "sql adapter classifier identifies read statement families" {

@@ -74,6 +74,9 @@ fn expectSqlAdapterEdgeCaseError(expected: []const u8, actual: anyerror) !void {
     if (std.mem.eql(u8, expected, "unsupported_rows_selector")) {
         return std.testing.expectEqual(error.UnsupportedRowsSelector, actual);
     }
+    if (std.mem.eql(u8, expected, "unsupported_rows_query")) {
+        return std.testing.expectEqual(error.UnsupportedRowsQuery, actual);
+    }
     return error.TestUnexpectedResult;
 }
 

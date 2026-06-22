@@ -965,6 +965,7 @@ pub const SqlAdapterEdgeCaseCoverage = struct {
     cte_write_classification: bool = false,
     cte_write_plan_rejection: bool = false,
     expected_error_invalid_sql_catalog: bool = false,
+    expected_error_unsupported_rows_query: bool = false,
     expected_error_unsupported_rows_selector: bool = false,
     expected_error_unsupported_sql_shape: bool = false,
     expression_conflict_target_rejection: bool = false,
@@ -977,7 +978,9 @@ pub const SqlAdapterEdgeCaseCoverage = struct {
     typed_select_predicate: bool = false,
     typed_update_mutation: bool = false,
     write_kind_delete: bool = false,
+    write_kind_delete_joined_source: bool = false,
     write_kind_update: bool = false,
+    write_kind_update_joined_source: bool = false,
 
     pub fn observe(self: *@This(), edge_case: SqlAdapterEdgeCase) !void {
         for (edge_case.coverage) |name| {
@@ -1644,6 +1647,7 @@ fn sqlAdapterEdgeCaseActionCoverageName(action: SqlAdapterEdgeCaseAction) []cons
 fn sqlAdapterEdgeCaseExpectedErrorCoverageName(expected_error: []const u8) !?[]const u8 {
     if (expected_error.len == 0) return null;
     if (std.mem.eql(u8, expected_error, "invalid_sql_catalog")) return "expected_error_invalid_sql_catalog";
+    if (std.mem.eql(u8, expected_error, "unsupported_rows_query")) return "expected_error_unsupported_rows_query";
     if (std.mem.eql(u8, expected_error, "unsupported_rows_selector")) return "expected_error_unsupported_rows_selector";
     if (std.mem.eql(u8, expected_error, "unsupported_sql_shape")) return "expected_error_unsupported_sql_shape";
     return error.TestUnexpectedResult;
@@ -1652,7 +1656,9 @@ fn sqlAdapterEdgeCaseExpectedErrorCoverageName(expected_error: []const u8) !?[]c
 fn sqlAdapterEdgeCaseWriteKindCoverageName(kind: classifier.SqlWriteStatementKind) []const u8 {
     return switch (kind) {
         .delete => "write_kind_delete",
+        .delete_joined_source => "write_kind_delete_joined_source",
         .update => "write_kind_update",
+        .update_joined_source => "write_kind_update_joined_source",
         else => "",
     };
 }

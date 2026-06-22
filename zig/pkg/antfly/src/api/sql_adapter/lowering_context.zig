@@ -969,7 +969,6 @@ pub const WritePlanLoweringContext = struct {
     fn hooks(self: *@This()) plan.WritePlanLoweringHooks {
         return .{
             .ptr = self,
-            .has_recursive_insert_source = hasRecursiveInsertSource,
             .lower_recursive_insert_source = lowerRecursiveInsertSource,
             .lower_recursive_update_joined_source = lowerRecursiveUpdateJoinedSource,
             .lower_recursive_delete_joined_source = lowerRecursiveDeleteJoinedSource,
@@ -990,17 +989,6 @@ pub const WritePlanLoweringContext = struct {
 
     fn fromPtr(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
-    }
-
-    fn hasRecursiveInsertSource(ptr: *anyopaque, tokens: []const plan.Token) anyerror!bool {
-        const self = fromPtr(ptr);
-        const maybe_recursive_tables = try binder.recursiveInsertSourceTableNamesFromTokensAlloc(self.alloc, tokens);
-        if (maybe_recursive_tables) |resolved_recursive_tables| {
-            var recursive_tables = resolved_recursive_tables;
-            recursive_tables.deinit(self.alloc);
-            return true;
-        }
-        return false;
     }
 
     fn lowerRecursiveInsertSource(ptr: *anyopaque, source_schema: runtime_schema.TableSchema, resolver: relational_rows.UniqueSelectorResolver) anyerror!plan.LoweredRecursiveInsertSource {

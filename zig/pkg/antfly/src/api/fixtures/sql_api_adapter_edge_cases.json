@@ -91,6 +91,17 @@
       "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
     },
     {
+      "name": "non-unique update write plan requires row selector",
+      "action": "write_plan",
+      "coverage": [
+        "action_write_plan",
+        "expected_error_unsupported_rows_selector",
+        "point_lowerer_boundary"
+      ],
+      "expected_error": "unsupported_rows_selector",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
+    },
+    {
       "name": "malformed update placeholder suffix",
       "action": "update",
       "coverage": [
@@ -124,15 +135,36 @@
       "sql": "UPDATE /* target */ users SET organization_id = 'o2' /* patch */ WHERE id = $1 -- identity\n"
     },
     {
-      "name": "cte update still classifies as update",
+      "name": "point update classifies as update",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_update"
+      ],
+      "expected_write_kind": "update",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE id = 'u1'"
+    },
+    {
+      "name": "cte semijoin update classifies as joined source update",
       "action": "classify_write",
       "coverage": [
         "action_classify_write",
         "cte_write_classification",
-        "write_kind_update"
+        "write_kind_update_joined_source"
       ],
-      "expected_write_kind": "update",
+      "expected_write_kind": "update_joined_source",
       "sql": "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "cte joined update classifies as joined source update",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "cte_write_classification",
+        "write_kind_update_joined_source"
+      ],
+      "expected_write_kind": "update_joined_source",
+      "sql": "WITH membership AS (SELECT id, organization_id FROM users) UPDATE users SET organization_id = membership.organization_id FROM membership WHERE users.id = membership.id"
     },
     {
       "name": "cte update has no supported write-plan selector",
@@ -140,9 +172,9 @@
       "coverage": [
         "action_write_plan",
         "cte_write_plan_rejection",
-        "expected_error_unsupported_rows_selector"
+        "expected_error_unsupported_rows_query"
       ],
-      "expected_error": "unsupported_rows_selector",
+      "expected_error": "unsupported_rows_query",
       "sql": "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)"
     },
     {
@@ -157,15 +189,36 @@
       "sql": "DELETE FROM users WHERE organization_id = 'o1'"
     },
     {
-      "name": "cte delete still classifies as delete",
+      "name": "point delete classifies as delete",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_delete"
+      ],
+      "expected_write_kind": "delete",
+      "sql": "DELETE FROM users WHERE id = 'u1'"
+    },
+    {
+      "name": "cte semijoin delete classifies as joined source delete",
       "action": "classify_write",
       "coverage": [
         "action_classify_write",
         "cte_write_classification",
-        "write_kind_delete"
+        "write_kind_delete_joined_source"
       ],
-      "expected_write_kind": "delete",
+      "expected_write_kind": "delete_joined_source",
       "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "cte joined delete classifies as joined source delete",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "cte_write_classification",
+        "write_kind_delete_joined_source"
+      ],
+      "expected_write_kind": "delete_joined_source",
+      "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users USING membership WHERE users.id = membership.id"
     },
     {
       "name": "cte delete has no supported write-plan selector",
@@ -173,9 +226,9 @@
       "coverage": [
         "action_write_plan",
         "cte_write_plan_rejection",
-        "expected_error_unsupported_rows_selector"
+        "expected_error_unsupported_rows_query"
       ],
-      "expected_error": "unsupported_rows_selector",
+      "expected_error": "unsupported_rows_query",
       "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)"
     },
     {

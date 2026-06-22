@@ -695,7 +695,6 @@ pub fn writePlanFallbackError(primary_err: ?anyerror, fallback_err: anyerror) an
 
 pub const WritePlanLoweringHooks = struct {
     ptr: *anyopaque,
-    has_recursive_insert_source: *const fn (*anyopaque, []const Token) anyerror!bool,
     lower_recursive_insert_source: *const fn (*anyopaque, runtime_schema.TableSchema, relational_rows.UniqueSelectorResolver) anyerror!LoweredRecursiveInsertSource,
     lower_recursive_update_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredRecursiveJoinedMutationSource,
     lower_recursive_delete_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredRecursiveJoinedMutationSource,
@@ -727,13 +726,17 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
             const source_schema = options.insert_source_schema orelse schema;
             return loweredWritePlanWithSyncLevel(.{ .recursive_insert_source = try hooks.lower_recursive_insert_source(hooks.ptr, source_schema, resolver) }, options.sync_level);
         },
-        .update_joined_source => {
+        .update,
+        .update_joined_source,
+        => {
             const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
             const source_schema = options.joined_source_schema orelse schema;
             const lowered = try hooks.lower_recursive_update_joined_source(hooks.ptr, source_schema, row_claim);
             return loweredWritePlanWithSyncLevel(.{ .recursive_update_joined_source = lowered }, options.sync_level);
         },
-        .delete_joined_source => {
+        .delete,
+        .delete_joined_source,
+        => {
             const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
             const source_schema = options.joined_source_schema orelse schema;
             const lowered = try hooks.lower_recursive_delete_joined_source(hooks.ptr, source_schema, row_claim);
@@ -745,8 +748,6 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
             return loweredWritePlanWithSyncLevel(.{ .recursive_merge_mutation = lowered }, options.sync_level);
         },
         .insert,
-        .update,
-        .delete,
         .truncate,
         => return error.UnsupportedSqlShape,
     }
