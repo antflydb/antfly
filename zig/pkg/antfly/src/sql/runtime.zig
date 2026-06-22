@@ -1016,20 +1016,30 @@ pub fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
     catalog: table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredReadPlan {
-    if (schema.storage_mode == .document) {
-        return .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) };
-    }
     var context = sql_adapter.CatalogReadPlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
         .callbacks = .{
+            .lower_document_target = lowerDocumentReadPlanFromBindingParsedSqlAlloc,
             .lower_with_source_schema = lowerReadPlanWithSchemasAndFunctionBindingsParsedSqlAlloc,
             .lower_without_source_schema = lowerReadPlanWithFunctionBindingsParsedSqlAlloc,
         },
     };
     return try context.lowerParsed(parsed_sql, catalog);
+}
+
+fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    document: sql_adapter.DocumentBinding,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredReadPlan {
+    _ = params;
+    _ = function_bindings;
+    return .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) };
 }
 
 pub fn lowerExplainPlanAlloc(

@@ -22957,9 +22957,7 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
     };
 
     var catalog = FakeCatalog{};
-    const native_table_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, "docs");
-    defer alloc.free(native_table_name);
-    var source = BoundTableReadSource.init(native_table_name, 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
     var result = (try executeLoweredSqlReadPlanAlloc(
         alloc,
         source.source(),
@@ -23044,7 +23042,9 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
     };
 
     var catalog = FakeCatalog{};
-    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    const native_table_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, "docs");
+    defer alloc.free(native_table_name);
+    var source = BoundTableReadSource.init(native_table_name, 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
 
     var lookup_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
         alloc,

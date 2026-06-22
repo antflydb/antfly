@@ -548,6 +548,7 @@ const DocumentSqlCapabilities = struct {
     indexed_scalar_filters: bool,
     full_text_filters: bool,
     vector_filters: bool,
+    algebraic_aggregates: bool,
     bounded_scan: ?BoundedScanPolicy,
 };
 ```
@@ -1200,6 +1201,10 @@ Current implementation status:
   already-lowered DDL plans directly, and HTTP SQL DDL reuses its existing
   lowered plan for auth catalog lookup, user-manager execution, extension
   lifecycle, and source-backed catalog/table DDL application.
+- Catalog-backed read binding carries `SqlSourceBinding` for the resolved
+  target table, including document source-family and runtime-schema facts, and
+  catalog document reads now lower through the bound statement path instead of
+  bypassing binding on `schema.storage_mode`.
 - DDL plan lowering now lives behind `sql_adapter` exports; auth role/row
   security execution, catalog jobs, notifications, and extension lifecycle use
   adapter-native plan types instead of importing the broader relational SQL

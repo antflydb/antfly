@@ -28,6 +28,7 @@ const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
+const source_binding = @import("source_binding.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 
@@ -667,6 +668,68 @@ pub fn runtimeSchemaForCatalogTableWithSessionAlloc(
     );
 }
 
+fn ownedCatalogTableRefForObjectNameAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !source_binding.CatalogTableRef {
+    const target = try session.tableTargetFromObjectName(table_name);
+    const database_name = try alloc.dupe(u8, target.database_name);
+    errdefer alloc.free(database_name);
+    const namespace_name = try alloc.dupe(u8, target.namespace_name);
+    errdefer alloc.free(namespace_name);
+    const owned_table_name = try alloc.dupe(u8, target.table_name);
+    errdefer alloc.free(owned_table_name);
+    return .{
+        .database_name = database_name,
+        .namespace_name = namespace_name,
+        .table_name = owned_table_name,
+    };
+}
+
+fn deinitCatalogTableRef(alloc: std.mem.Allocator, target: source_binding.CatalogTableRef) void {
+    alloc.free(@constCast(target.database_name));
+    alloc.free(@constCast(target.namespace_name));
+    alloc.free(@constCast(target.table_name));
+}
+
+fn sourceBindingForCatalogTableWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !source_binding.SqlSourceBinding {
+    const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
+    errdefer deinitCatalogTableRef(alloc, target);
+    const schema = try runtimeSchemaForQualifiedCatalogTableAlloc(
+        alloc,
+        catalog,
+        target.database_name,
+        target.namespace_name,
+        target.table_name,
+    );
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    return source_binding.bindingForRuntimeSchema(target, schema);
+}
+
+fn deinitSqlSourceBinding(alloc: std.mem.Allocator, binding: *source_binding.SqlSourceBinding) void {
+    switch (binding.*) {
+        .relational => |relational| {
+            deinitCatalogTableRef(alloc, relational.target);
+            runtime_schema.freeSchema(alloc, relational.schema);
+        },
+        .document => |document| {
+            deinitCatalogTableRef(alloc, document.target);
+            runtime_schema.freeSchema(alloc, document.schema);
+        },
+        .lake => |lake| {
+            deinitCatalogTableRef(alloc, lake.target);
+            runtime_schema.freeSchema(alloc, lake.schema);
+        },
+    }
+    binding.* = undefined;
+}
+
 pub fn runtimeSchemaForQualifiedCatalogTableAlloc(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -741,10 +804,16 @@ pub const CatalogBoundWritePlanOptions = struct {
 };
 
 pub const CatalogBoundReadPlanSourceSchema = struct {
+    target_binding: ?source_binding.SqlSourceBinding = null,
     source_schema: ?runtime_schema.TableSchema = null,
+    source_binding: ?source_binding.SqlSourceBinding = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
+        if (self.source_binding == null) {
+            if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        }
+        if (self.source_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
         self.* = undefined;
     }
 };
@@ -856,10 +925,16 @@ fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !voi
 pub const CatalogLogicalReadPlan = struct {
     statement: tokenized.ParsedStatement,
     session: BoundSqlSession,
+    target_binding: ?source_binding.SqlSourceBinding = null,
     source_schema: ?runtime_schema.TableSchema = null,
+    source_binding: ?source_binding.SqlSourceBinding = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
+        if (self.source_binding == null) {
+            if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        }
+        if (self.source_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
         self.session.deinit(alloc);
         self.* = undefined;
     }
@@ -895,14 +970,20 @@ pub const LogicalSqlPlan = union(enum) {
 
 pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlPlan {
     const read = try bound.readCatalog();
+    const target_binding = read.target_binding;
+    read.target_binding = null;
     const source_schema = read.source_schema;
     read.source_schema = null;
+    const source_binding_value = read.source_binding;
+    read.source_binding = null;
     const session = bound.session;
     bound.session = BoundSqlSession.empty();
     return .{ .catalog_read = .{
         .statement = bound.statement,
         .session = session,
+        .target_binding = target_binding,
         .source_schema = source_schema,
+        .source_binding = source_binding_value,
     } };
 }
 
@@ -925,6 +1006,7 @@ pub fn logicalWritePlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSql
 
 pub const ReadPlanCatalogLoweringHooks = struct {
     ptr: *anyopaque,
+    lower_document_target: *const fn (*anyopaque, source_binding.DocumentBinding) anyerror!plan_mod.LoweredReadPlan,
     lower_with_source_schema: *const fn (*anyopaque, runtime_schema.TableSchema) anyerror!plan_mod.LoweredReadPlan,
     lower_without_source_schema: *const fn (*anyopaque) anyerror!plan_mod.LoweredReadPlan,
 };
@@ -956,10 +1038,19 @@ pub fn lowerWritePlanWithBoundStatementAlloc(
 
 pub fn lowerReadCatalogLogicalPlan(logical: *LogicalSqlPlan, hooks: ReadPlanCatalogLoweringHooks) !plan_mod.LoweredReadPlan {
     return switch (logical.*) {
-        .catalog_read => |*read| if (read.source_schema) |source_schema|
-            try hooks.lower_with_source_schema(hooks.ptr, source_schema)
-        else
-            try hooks.lower_without_source_schema(hooks.ptr),
+        .catalog_read => |*read| blk: {
+            if (read.target_binding) |binding| {
+                switch (binding) {
+                    .document => |document| break :blk try hooks.lower_document_target(hooks.ptr, document),
+                    .lake => return error.UnsupportedSqlShape,
+                    .relational => {},
+                }
+            }
+            break :blk if (read.source_schema) |source_schema|
+                try hooks.lower_with_source_schema(hooks.ptr, source_schema)
+            else
+                try hooks.lower_without_source_schema(hooks.ptr);
+        },
         else => error.UnsupportedSqlShape,
     };
 }
@@ -1221,8 +1312,14 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAlloc(
     if (try readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
         var tables = resolved_tables;
         defer tables.deinit(alloc);
+        out.target_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.left, session);
         if (!std.mem.eql(u8, tables.left, tables.source)) {
-            out.source_schema = try runtimeSchemaForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+            out.source_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+            out.source_schema = switch (out.source_binding.?) {
+                .relational => |binding| binding.schema,
+                .document => |binding| binding.schema,
+                .lake => |binding| binding.schema,
+            };
         }
     }
     return out;
@@ -1999,8 +2096,17 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         else => return error.TestUnexpectedResult,
     }
     const read = try bound_read.readCatalog();
+    try std.testing.expect(read.target_binding != null);
+    switch (read.target_binding.?) {
+        .relational => |binding| {
+            try std.testing.expectEqualStrings("usage_records", binding.target.table_name);
+            try std.testing.expectEqual(runtime_schema.StorageMode.relational, binding.schema.storage_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
     try std.testing.expect(read.source_schema != null);
     try std.testing.expectEqual(@as(usize, 3), read.source_schema.?.relational_columns.len);
+    try std.testing.expect(read.source_binding != null);
     var logical_read = try logicalReadPlanFromBoundStatement(&bound_read);
     defer logical_read.deinit(alloc);
     switch (logical_read) {
@@ -2009,12 +2115,38 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
                 .read => |statement| try std.testing.expectEqual(classifier.SqlReadStatementKind.join, statement.kind),
                 else => return error.TestUnexpectedResult,
             }
+            try std.testing.expect(logical.target_binding != null);
             try std.testing.expect(logical.source_schema != null);
             try std.testing.expectEqual(@as(usize, 3), logical.source_schema.?.relational_columns.len);
+            try std.testing.expect(logical.source_binding != null);
         },
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expect((try bound_read.readCatalog()).target_binding == null);
     try std.testing.expect((try bound_read.readCatalog()).source_schema == null);
+    try std.testing.expect((try bound_read.readCatalog()).source_binding == null);
+
+    const document_schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
+    ;
+    var document_catalog = MultiTableTestCatalog.init("docs", document_schema_json, "incoming_usage", incoming_schema_json);
+    var parsed_document_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, title FROM docs WHERE _id = 'doc:a'",
+    );
+    defer parsed_document_read.deinit(alloc);
+    var bound_document_read = try bindReadPlanCatalogStatementAlloc(alloc, &parsed_document_read, document_catalog.iface());
+    defer bound_document_read.deinit(alloc);
+    const document_read = try bound_document_read.readCatalog();
+    try std.testing.expect(document_read.target_binding != null);
+    switch (document_read.target_binding.?) {
+        .document => |binding| {
+            try std.testing.expectEqualStrings("docs", binding.target.table_name);
+            try std.testing.expectEqual(runtime_schema.StorageMode.document, binding.schema.storage_mode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(document_read.source_schema == null);
 
     var parsed_write = try tokenized.ParsedSql.initAlloc(
         alloc,

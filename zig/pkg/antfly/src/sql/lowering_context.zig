@@ -29,6 +29,7 @@ const relational_rows = @import("../api/relational_rows.zig");
 const table_catalog = @import("../api/table_catalog.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
+const source_binding = @import("source_binding.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -165,6 +166,13 @@ pub const ReadPlanLoweringContext = struct {
 };
 
 pub const CatalogReadPlanLoweringCallbacks = struct {
+    lower_document_target: *const fn (
+        std.mem.Allocator,
+        *const tokenized.ParsedSql,
+        source_binding.DocumentBinding,
+        []const value_mod.SqlValue,
+        lower_expr.SqlFunctionBindings,
+    ) anyerror!plan.LoweredReadPlan,
     lower_with_source_schema: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
@@ -216,9 +224,15 @@ pub const CatalogReadPlanLoweringContext = struct {
     fn hooks(self: *@This()) binder.ReadPlanCatalogLoweringHooks {
         return .{
             .ptr = self,
+            .lower_document_target = lowerDocumentTarget,
             .lower_with_source_schema = lowerWithSourceSchema,
             .lower_without_source_schema = lowerWithoutSourceSchema,
         };
+    }
+
+    fn lowerDocumentTarget(ptr: *anyopaque, document: source_binding.DocumentBinding) anyerror!plan.LoweredReadPlan {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.callbacks.lower_document_target(self.alloc, self.parsed_sql.?, document, self.params, self.function_bindings);
     }
 
     fn lowerWithSourceSchema(ptr: *anyopaque, source_schema: runtime_schema.TableSchema) anyerror!plan.LoweredReadPlan {
@@ -252,11 +266,24 @@ fn lowerReadPlanWithCatalogForLoweringContextTestAlloc(
         .params = params,
         .function_bindings = .{},
         .callbacks = .{
+            .lower_document_target = lowerDocumentTargetParsedSqlForLoweringContextTestAlloc,
             .lower_with_source_schema = lowerReadPlanWithSourceSchemaParsedSqlForLoweringContextTestAlloc,
             .lower_without_source_schema = lowerReadPlanParsedSqlForLoweringContextTestAlloc,
         },
     };
     return try context.lower(catalog);
+}
+
+fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    document: source_binding.DocumentBinding,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan.LoweredReadPlan {
+    _ = params;
+    _ = function_bindings;
+    return .{ .document_query = try @import("document_plan.zig").lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) };
 }
 
 fn lowerReadPlanWithSourceSchemaParsedSqlForLoweringContextTestAlloc(
