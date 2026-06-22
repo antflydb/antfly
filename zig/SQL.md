@@ -399,7 +399,9 @@ Current implementation status:
   top-level clauses, set-operation tails, and optional `ONLY`/`AS`/`LATERAL`
   modifiers instead of local string-keyword checks. Relation/source alias
   inference and DML target alias tail detection also use token keyword metadata
-  for clause boundaries and join/source modifiers.
+  for clause boundaries and join/source modifiers. Insert-source select tails,
+  DML assignment tails, boolean expression operators, and `ON CONFLICT` /
+  `RETURNING` delimiters now use token keyword predicates in lower-DML scans.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,

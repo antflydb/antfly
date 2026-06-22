@@ -18416,6 +18416,16 @@ pub fn sqlAssignmentTailKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "for");
 }
 
+pub fn sqlAssignmentTailKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.from) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.@"for");
+}
+
 pub fn sqlKeywordIsLengthFunction(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "length") or
         std.ascii.eqlIgnoreCase(text, "char_length") or

@@ -949,11 +949,11 @@ fn parseInsertSourceSelectAlloc(
                 break;
             },
             .identifier => if (depth == 0) {
-                if (std.ascii.eqlIgnoreCase(token.text, "returning")) {
+                if (token.matchesKeywordTag(.returning)) {
                     end = i;
                     break;
                 }
-                if (std.ascii.eqlIgnoreCase(token.text, "on") and i + 1 < tokens.len and tokens[i + 1].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[i + 1].text, "conflict")) {
+                if (token.matchesKeywordTag(.on) and i + 1 < tokens.len and tokens[i + 1].matchesKeywordTag(.conflict)) {
                     end = i;
                     break;
                 }
@@ -5359,7 +5359,7 @@ pub fn parseDatePartUnitLiteralExpressionAlloc(
         token
     else
         return error.UnsupportedSqlShape;
-    if (std.ascii.eqlIgnoreCase(token.text, "from")) return error.UnsupportedSqlShape;
+    if (token.matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
     return .{
         .kind = .value,
         .value_json = try std.json.Stringify.valueAlloc(alloc, token.text, .{}),
@@ -6228,7 +6228,7 @@ pub fn mergeParenthesizedExpressionOrWhereCanStart(tokens: []const Token, pos: u
                 depth -= 1;
                 if (depth == 0) return false;
             },
-            .identifier => if (depth == 1 and std.ascii.eqlIgnoreCase(token.text, "or")) return true,
+            .identifier => if (depth == 1 and token.matchesKeywordTag(.@"or")) return true,
             .semicolon => return false,
             else => {},
         }
@@ -10811,11 +10811,11 @@ fn scanBooleanAssignmentTail(tokens: []const Token, pos: usize, assignment_tail:
             .lparen => depth += 1,
             .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return false,
             .identifier => {
-                if (depth == 0 and assignment_tail and lower_expr.sqlAssignmentTailKeyword(token.text)) break;
+                if (depth == 0 and assignment_tail and lower_expr.sqlAssignmentTailKeywordToken(token)) break;
                 if (lower_expr.sqlKeywordStartsScalarPredicate(token.text)) return false;
-                if (std.ascii.eqlIgnoreCase(token.text, "and") or
-                    std.ascii.eqlIgnoreCase(token.text, "or") or
-                    std.ascii.eqlIgnoreCase(token.text, "not"))
+                if (token.matchesKeywordTag(.@"and") or
+                    token.matchesKeywordTag(.@"or") or
+                    token.matchesKeywordTag(.not))
                 {
                     saw_boolean_operator = true;
                 }
@@ -10858,9 +10858,9 @@ fn scanBareBooleanExpressionTail(tokens: []const Token, pos: usize) BareBooleanS
                     .saw_boolean_syntax = false,
                     .saw_token = false,
                 };
-                if (std.ascii.eqlIgnoreCase(token.text, "and") or
-                    std.ascii.eqlIgnoreCase(token.text, "or") or
-                    std.ascii.eqlIgnoreCase(token.text, "not"))
+                if (token.matchesKeywordTag(.@"and") or
+                    token.matchesKeywordTag(.@"or") or
+                    token.matchesKeywordTag(.not))
                 {
                     saw_boolean_syntax = true;
                 }
