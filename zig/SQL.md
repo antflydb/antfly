@@ -301,13 +301,15 @@ Current implementation status:
   `SELECT INTO` still uses a compatibility rewrite until the raw AST can model
   that non-contiguous source directly. Catalog-backed read/write prebinding now
   produces `BoundSqlStatement`, preserving the parsed statement variant while
-  carrying resolved source schemas or write-plan catalog options before routing
-  through `LogicalSqlPlan` into the typed lowerer. Public facade wrappers for
-  direct select, insert, strict insert/update, and aggregate lowering now
-  delegate through parsed helper variants instead of owning separate
-  tokenization paths. DML adapter write-plan regression callbacks also consume
-  borrowed parsed tokens instead of round-tripping through SQL text. Parsed-only
-  lowering context construction does not require a raw SQL field.
+  carrying owned session identity (`current_database` and `search_path`) plus
+  resolved source schemas or write-plan catalog options before routing through
+  `LogicalSqlPlan` into the typed lowerer. Session-aware binder entrypoints can
+  resolve unqualified catalog names against non-default search paths. Public
+  facade wrappers for direct select, insert, strict insert/update, and aggregate
+  lowering now delegate through parsed helper variants instead of owning
+  separate tokenization paths. DML adapter write-plan regression callbacks also
+  consume borrowed parsed tokens instead of round-tripping through SQL text.
+  Parsed-only lowering context construction does not require a raw SQL field.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source
