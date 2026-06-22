@@ -331,6 +331,11 @@ Current implementation status:
   function lowering has parsed entrypoints, and app-parity query-function
   checks reuse `ParsedSql` instead of tokenizing fixture SQL directly.
   Parsed-only lowering context construction does not require a raw SQL field.
+  Recursive data-modifying CTEs carry a parsed recursive-write flag, so generic
+  write planning no longer reclassifies recursive write kind from the token
+  stream. Catalog-aware read/write bind, lower, and resolve APIs expose parsed
+  or bound statement entrypoints publicly; token-only catalog helpers remain
+  private binder implementation details.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source
