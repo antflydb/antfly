@@ -424,12 +424,7 @@ fn parseWhereClauseIntoAlloc(
 
 fn parseFullTextQueryAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?[]const u8 {
     if (tokens.len != 4) return null;
-    if (tokens[0].kind != .identifier or
-        (!std.ascii.eqlIgnoreCase(tokens[0].text, "full_text_search") and
-            !std.ascii.eqlIgnoreCase(tokens[0].text, "antfly.full_text_search")))
-    {
-        return null;
-    }
+    if (!tokens[0].matchesQualifiedKeywordTag("antfly", .full_text_search)) return null;
     if (tokens[1].kind != .lparen or tokens[2].kind != .string or tokens[3].kind != .rparen) return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, tokens[2].text);
 }
@@ -462,11 +457,106 @@ fn parseScalarFilterClauseAlloc(
             .{ std.json.fmt(field.path, .{}), values_json },
         );
     }
+    if (tokens.len == op_index + 2) {
+        return try buildRangeFilterClauseAlloc(alloc, field, tokens[op_index], tokens[op_index + 1]);
+    }
     return null;
+}
+
+const DocumentRangeBound = struct {
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    inclusive_min: bool = true,
+    inclusive_max: bool = false,
+};
+
+fn buildRangeFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    field: DocumentFilterField,
+    operator: Token,
+    value: Token,
+) !?[]const u8 {
+    if (!field.exact_declared_path) return error.DocumentSqlIndexUnavailable;
+    const bound = documentRangeBound(operator.kind, value.text) orelse return null;
+    return switch (field.field_type) {
+        .numeric => try buildNumericRangeFilterClauseAlloc(alloc, field.path, bound, value),
+        .datetime => try buildDateRangeFilterClauseAlloc(alloc, field.path, bound, value),
+        .keyword, .text, .search_as_you_type => try buildTermRangeFilterClauseAlloc(alloc, field.path, bound, value),
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn documentRangeBound(kind: token_mod.TokenKind, value: []const u8) ?DocumentRangeBound {
+    return switch (kind) {
+        .gt => .{ .min = value, .inclusive_min = false },
+        .gte => .{ .min = value, .inclusive_min = true },
+        .lt => .{ .max = value, .inclusive_max = false },
+        .lte => .{ .max = value, .inclusive_max = true },
+        else => null,
+    };
+}
+
+fn buildNumericRangeFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    bound: DocumentRangeBound,
+    value: Token,
+) ![]const u8 {
+    if (value.kind != .number) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"numeric_range\":{{\"path\":{f}", .{std.json.fmt(path, .{})});
+    if (bound.min) |min| try writer.print(",\"min\":{s}", .{min});
+    if (bound.max) |max| try writer.print(",\"max\":{s}", .{max});
+    if (bound.min != null) try writer.print(",\"inclusive_min\":{}", .{bound.inclusive_min});
+    if (bound.max != null) try writer.print(",\"inclusive_max\":{}", .{bound.inclusive_max});
+    try writer.writeAll("}}");
+    return try out.toOwnedSlice();
+}
+
+fn buildDateRangeFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    bound: DocumentRangeBound,
+    value: Token,
+) ![]const u8 {
+    if (value.kind != .string) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"date_range\":{{\"path\":{f}", .{std.json.fmt(path, .{})});
+    if (bound.min) |min| try writer.print(",\"start\":{f}", .{std.json.fmt(min, .{})});
+    if (bound.max) |max| try writer.print(",\"end\":{f}", .{std.json.fmt(max, .{})});
+    if (bound.min != null) try writer.print(",\"inclusive_start\":{}", .{bound.inclusive_min});
+    if (bound.max != null) try writer.print(",\"inclusive_end\":{}", .{bound.inclusive_max});
+    try writer.writeAll("}}");
+    return try out.toOwnedSlice();
+}
+
+fn buildTermRangeFilterClauseAlloc(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    bound: DocumentRangeBound,
+    value: Token,
+) ![]const u8 {
+    if (value.kind != .string and value.kind != .identifier) return error.UnsupportedSqlShape;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("{{\"term_range\":{{\"path\":{f}", .{std.json.fmt(path, .{})});
+    if (bound.min) |min| try writer.print(",\"min\":{f}", .{std.json.fmt(min, .{})});
+    if (bound.max) |max| try writer.print(",\"max\":{f}", .{std.json.fmt(max, .{})});
+    if (bound.min != null) try writer.print(",\"inclusive_min\":{}", .{bound.inclusive_min});
+    if (bound.max != null) try writer.print(",\"inclusive_max\":{}", .{bound.inclusive_max});
+    try writer.writeAll("}}");
+    return try out.toOwnedSlice();
 }
 
 const DocumentFilterField = struct {
     path: []u8,
+    field_type: runtime_schema.AntflyType,
+    exact_declared_path: bool = true,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.path.len > 0) alloc.free(self.path);
@@ -483,13 +573,28 @@ fn documentFilterFieldForExpressionAlloc(
         if (std.mem.eql(u8, tokens[0].text, "_id")) return null;
         const column = documentFieldColumn(schema, tokens[0].text) orelse return error.InvalidSqlCatalog;
         if (!documentColumnIndexReady(column)) return error.DocumentSqlIndexUnavailable;
-        return .{ .path = try documentFilterPathAlloc(alloc, column.path) };
+        return .{
+            .path = try documentFilterPathAlloc(alloc, column.path),
+            .field_type = column.field_type,
+        };
     }
 
     var expression = (try parseDocumentJsonPathExpressionAlloc(alloc, tokens, schema)) orelse return null;
     defer expression.deinit(alloc);
+    const exact_column = documentColumnForPath(schema, expression.path);
+    if (exact_column) |column| {
+        if (!documentColumnIndexReady(column)) return error.DocumentSqlIndexUnavailable;
+        return .{
+            .path = try alloc.dupe(u8, expression.path),
+            .field_type = column.field_type,
+        };
+    }
     if (!documentFilterPathIndexReady(schema, expression.path, expression.root_column)) return error.DocumentSqlIndexUnavailable;
-    return .{ .path = try alloc.dupe(u8, expression.path) };
+    return .{
+        .path = try alloc.dupe(u8, expression.path),
+        .field_type = expression.root_column.field_type,
+        .exact_declared_path = false,
+    };
 }
 
 fn documentColumnIndexReady(column: runtime_schema.RelationalColumn) bool {
@@ -537,7 +642,7 @@ fn findTopLevelScalarFilterOperator(tokens: []const Token) ?usize {
             .rparen => {
                 if (depth > 0) depth -= 1;
             },
-            .eq => if (depth == 0) return i,
+            .eq, .gt, .gte, .lt, .lte => if (depth == 0) return i,
             .identifier => if (depth == 0 and token.matchesKeywordTag(.in)) return i,
             else => {},
         }
@@ -550,9 +655,9 @@ fn tokenLiteralJsonAlloc(alloc: std.mem.Allocator, token: Token) ![]u8 {
         .string => try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(token.text, .{})}),
         .number => try alloc.dupe(u8, token.text),
         .identifier => blk: {
-            if (std.ascii.eqlIgnoreCase(token.text, "true")) break :blk try alloc.dupe(u8, "true");
-            if (std.ascii.eqlIgnoreCase(token.text, "false")) break :blk try alloc.dupe(u8, "false");
-            if (std.ascii.eqlIgnoreCase(token.text, "null")) break :blk try alloc.dupe(u8, "null");
+            if (token.matchesKeywordTag(.true)) break :blk try alloc.dupe(u8, "true");
+            if (token.matchesKeywordTag(.false)) break :blk try alloc.dupe(u8, "false");
+            if (token.matchesKeywordTag(.null)) break :blk try alloc.dupe(u8, "null");
             break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(token.text, .{})});
         },
         else => error.UnsupportedSqlShape,
@@ -784,6 +889,22 @@ test "document SQL lowers full text producer" {
     try std.testing.expectEqual(@as(?u32, 5), lowered.limit);
 }
 
+test "document SQL lowers qualified full text producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE antfly.full_text_search('title:alpha') LIMIT 5");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
+    try std.testing.expectEqual(@as(?u32, 5), lowered.limit);
+}
+
 test "document SQL lowers scalar equality to indexed filter producer" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
@@ -814,6 +935,56 @@ test "document SQL lowers json path equality to indexed filter producer" {
     defer lowered.deinit(alloc);
     try std.testing.expectEqualStrings("/metadata/status", lowered.projection[1].field);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/metadata/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.filter_query_json.?);
+}
+
+test "document SQL lowers scalar range predicates to indexed filter producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "amount", .path = "amount", .field_type = .numeric, .indexed = true, .index_lifecycle = .ready },
+            .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+            .{ .name = "published_at", .path = "published_at", .field_type = .datetime, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, amount FROM docs WHERE amount >= 10 AND status < 'closed' AND published_at <= '2026-01-03T00:00:00Z' LIMIT 10");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings(
+        "{\"bool\":{\"filter\":[{\"numeric_range\":{\"path\":\"/amount\",\"min\":10,\"inclusive_min\":true}},{\"term_range\":{\"path\":\"/status\",\"max\":\"closed\",\"inclusive_max\":false}},{\"date_range\":{\"path\":\"/published_at\",\"end\":\"2026-01-03T00:00:00Z\",\"inclusive_end\":true}}]}}",
+        lowered.producer.indexed_query.filter_query_json.?,
+    );
+}
+
+test "document SQL lowers declared json path range predicates to indexed filter producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "metadata", .path = "metadata", .field_type = .json },
+            .{ .name = "metadata_score", .path = "metadata/score", .field_type = .numeric, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, metadata->>'score' AS score FROM docs WHERE metadata->>'score' > 7 LIMIT 10");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("/metadata/score", lowered.projection[1].field);
+    try std.testing.expectEqualStrings("{\"numeric_range\":{\"path\":\"/metadata/score\",\"min\":7,\"inclusive_min\":false}}", lowered.producer.indexed_query.filter_query_json.?);
+}
+
+test "document SQL rejects untyped json subtree range predicates" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "metadata", .path = "metadata", .field_type = .json, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE metadata->>'score' > 7 LIMIT 10");
+    defer parsed.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
 }
 
 test "document SQL lowers scalar in and conjunction to indexed filter producer" {

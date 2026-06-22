@@ -503,21 +503,26 @@ pub fn relationalColumnCatalogsEqual(current: []const RelationalColumn, next: []
     for (current, next) |a, b| {
         if (!std.mem.eql(u8, a.name, b.name)) return false;
         if (!std.mem.eql(u8, a.path, b.path)) return false;
-        if (a.field_type != b.field_type) return false;
-        if (a.array_item_type != b.array_item_type) return false;
-        if (a.nullable != b.nullable) return false;
-        if (!optionalBytesEqual(a.collation, b.collation)) return false;
-        if (a.indexed != b.indexed) return false;
-        if (a.index_lifecycle != b.index_lifecycle) return false;
-        if (a.index_generation != b.index_generation) return false;
-        if (!optionalBytesEqual(a.index_name, b.index_name)) return false;
-        if (!stringSlicesEqual(a.index_include_columns, b.index_include_columns)) return false;
-        if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
-        if (!relationalDefaultsEqual(a.on_update_value, b.on_update_value)) return false;
-        if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
-        if (!uniquePredicateSlicesEqual(a.index_where, b.index_where)) return false;
-        if (!relationalRowsExpressionConditionSlicesEqual(a.index_where_expressions, b.index_where_expressions)) return false;
+        if (!relationalColumnDefinitionsEqual(a, b)) return false;
     }
+    return true;
+}
+
+pub fn relationalColumnDefinitionsEqual(a: RelationalColumn, b: RelationalColumn) bool {
+    if (a.field_type != b.field_type) return false;
+    if (a.array_item_type != b.array_item_type) return false;
+    if (a.nullable != b.nullable) return false;
+    if (!optionalBytesEqual(a.collation, b.collation)) return false;
+    if (a.indexed != b.indexed) return false;
+    if (a.index_lifecycle != b.index_lifecycle) return false;
+    if (a.index_generation != b.index_generation) return false;
+    if (!optionalBytesEqual(a.index_name, b.index_name)) return false;
+    if (!stringSlicesEqual(a.index_include_columns, b.index_include_columns)) return false;
+    if (!relationalDefaultsEqual(a.default_value, b.default_value)) return false;
+    if (!relationalDefaultsEqual(a.on_update_value, b.on_update_value)) return false;
+    if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
+    if (!uniquePredicateSlicesEqual(a.index_where, b.index_where)) return false;
+    if (!relationalRowsExpressionConditionSlicesEqual(a.index_where_expressions, b.index_where_expressions)) return false;
     return true;
 }
 

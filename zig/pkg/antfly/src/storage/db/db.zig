@@ -6860,23 +6860,104 @@ pub const DB = struct {
     }
 
     fn validateRelationalColumnCatalogTransition(current_columns: []const schema_mod.RelationalColumn, next_columns: []const schema_mod.RelationalColumn) !void {
-        if (current_columns.len > next_columns.len) return error.InvalidSchemaUpdateRequest;
-        for (current_columns, 0..) |_, index| {
-            if (!schema_mod.relationalColumnCatalogsEqual(current_columns[index .. index + 1], next_columns[index .. index + 1])) {
-                return error.InvalidSchemaUpdateRequest;
-            }
-        }
-        for (next_columns[current_columns.len..]) |column| {
-            if (column.generated) |generated| {
-                try validateAppendedGeneratedColumnTransition(current_columns, next_columns, generated);
+        for (next_columns) |column| {
+            if (findRelationalColumnByPath(current_columns, column.path)) |current_column| {
+                if (!relationalColumnCatalogEqual(current_column.*, column)) {
+                    return error.InvalidSchemaUpdateRequest;
+                }
                 continue;
             }
-            if (column.default_value) |default_value| {
-                if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
+            if (try relationalColumnHasUniqueDroppedRenameSource(current_columns, next_columns, column)) continue;
+            try validateNewRelationalColumnTransition(current_columns, next_columns, column);
+        }
+    }
+
+    fn relationalColumnCatalogEqual(a: schema_mod.RelationalColumn, b: schema_mod.RelationalColumn) bool {
+        return schema_mod.relationalColumnCatalogsEqual(&.{a}, &.{b});
+    }
+
+    fn findRelationalColumnByPath(columns: []const schema_mod.RelationalColumn, path: []const u8) ?*const schema_mod.RelationalColumn {
+        for (columns) |*column| {
+            if (std.mem.eql(u8, column.path, path)) return column;
+        }
+        return null;
+    }
+
+    fn relationalColumnPathExists(columns: []const schema_mod.RelationalColumn, path: []const u8) bool {
+        return findRelationalColumnByPath(columns, path) != null;
+    }
+
+    fn relationalColumnHasUniqueDroppedRenameSource(
+        current_columns: []const schema_mod.RelationalColumn,
+        next_columns: []const schema_mod.RelationalColumn,
+        target_column: schema_mod.RelationalColumn,
+    ) !bool {
+        var source_index: ?usize = null;
+        for (current_columns, 0..) |current_column, index| {
+            if (relationalColumnPathExists(next_columns, current_column.path)) continue;
+            if (!schema_mod.relationalColumnDefinitionsEqual(current_column, target_column)) continue;
+            if (source_index != null) return error.InvalidSchemaUpdateRequest;
+            source_index = index;
+        }
+        const matched_source_index = source_index orelse return false;
+
+        var use_count: usize = 0;
+        for (next_columns) |next_column| {
+            if (relationalColumnPathExists(current_columns, next_column.path)) continue;
+            if (schema_mod.relationalColumnDefinitionsEqual(current_columns[matched_source_index], next_column)) {
+                use_count += 1;
+            }
+        }
+        if (use_count != 1) return error.InvalidSchemaUpdateRequest;
+        return true;
+    }
+
+    fn validateNewRelationalColumnTransition(
+        current_columns: []const schema_mod.RelationalColumn,
+        next_columns: []const schema_mod.RelationalColumn,
+        column: schema_mod.RelationalColumn,
+    ) !void {
+        if (column.generated) |generated| {
+            try validateAppendedGeneratedColumnTransition(current_columns, next_columns, generated);
+            return;
+        }
+        if (column.default_value) |default_value| {
+            if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
+            return;
+        }
+        if (!column.nullable) return error.InvalidSchemaUpdateRequest;
+    }
+
+    fn relationalColumnMatchesGeneratedSource(column: schema_mod.RelationalColumn, field: []const u8, normalized: []const u8) bool {
+        return std.mem.eql(u8, field, column.name) or
+            std.mem.eql(u8, field, column.path) or
+            std.mem.eql(u8, normalized, column.name) or
+            std.mem.eql(u8, normalized, column.path);
+    }
+
+    fn validateGeneratedColumnBackfillSource(
+        current_columns: []const schema_mod.RelationalColumn,
+        next_columns: []const schema_mod.RelationalColumn,
+        field: []const u8,
+    ) !void {
+        const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
+        for (current_columns) |column| {
+            if (relationalColumnMatchesGeneratedSource(column, field, normalized)) {
+                return;
+            }
+        }
+        for (next_columns) |column| {
+            if (relationalColumnPathExists(current_columns, column.path)) continue;
+            if (!relationalColumnMatchesGeneratedSource(column, field, normalized)) {
                 continue;
             }
-            if (!column.nullable) return error.InvalidSchemaUpdateRequest;
+            if (column.generated != null) return error.InvalidSchemaUpdateRequest;
+            const default_value = column.default_value orelse return error.InvalidSchemaUpdateRequest;
+            if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
+            if (jsonLiteralIsNull(default_value.value_json)) return error.InvalidSchemaUpdateRequest;
+            return;
         }
+        return error.InvalidSchemaUpdateRequest;
     }
 
     fn validateAppendedGeneratedColumnTransition(
@@ -6925,38 +7006,6 @@ pub const DB = struct {
     ) error{InvalidSchemaUpdateRequest}!void {
         try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, condition.lhs);
         for (condition.rhs) |rhs| try validateGeneratedColumnExpressionBackfillSources(current_columns, next_columns, rhs);
-    }
-
-    fn validateGeneratedColumnBackfillSource(
-        current_columns: []const schema_mod.RelationalColumn,
-        next_columns: []const schema_mod.RelationalColumn,
-        field: []const u8,
-    ) !void {
-        const normalized = if (std.mem.startsWith(u8, field, "/")) field[1..] else field;
-        for (current_columns) |column| {
-            if (std.mem.eql(u8, field, column.name) or
-                std.mem.eql(u8, field, column.path) or
-                std.mem.eql(u8, normalized, column.name) or
-                std.mem.eql(u8, normalized, column.path))
-            {
-                return;
-            }
-        }
-        for (next_columns[current_columns.len..]) |column| {
-            if (!(std.mem.eql(u8, field, column.name) or
-                std.mem.eql(u8, field, column.path) or
-                std.mem.eql(u8, normalized, column.name) or
-                std.mem.eql(u8, normalized, column.path)))
-            {
-                continue;
-            }
-            if (column.generated != null) return error.InvalidSchemaUpdateRequest;
-            const default_value = column.default_value orelse return error.InvalidSchemaUpdateRequest;
-            if (default_value.kind != .literal) return error.InvalidSchemaUpdateRequest;
-            if (jsonLiteralIsNull(default_value.value_json)) return error.InvalidSchemaUpdateRequest;
-            return;
-        }
-        return error.InvalidSchemaUpdateRequest;
     }
 
     fn validateConstraintCatalogTransition(current_schema: schema_mod.TableSchema, next_schema: schema_mod.TableSchema) !void {
@@ -7011,9 +7060,7 @@ pub const DB = struct {
         next_schema: schema_mod.TableSchema,
     ) !void {
         if (current_schema.storage_mode != .relational or next_schema.storage_mode != .relational) return;
-        if (next_schema.relational_columns.len <= current_schema.relational_columns.len) return;
 
-        const appended_columns = next_schema.relational_columns[current_schema.relational_columns.len..];
         var sets = std.ArrayListUnmanaged(relational_store_mod.RowRewriteSet).empty;
         defer sets.deinit(alloc);
         var owned_rows = std.ArrayListUnmanaged([]u8).empty;
@@ -7030,7 +7077,9 @@ pub const DB = struct {
         var generated_columns = std.ArrayListUnmanaged(schema_mod.RelationalColumn).empty;
         defer generated_columns.deinit(alloc);
 
-        for (appended_columns) |column| {
+        for (next_schema.relational_columns) |column| {
+            if (relationalColumnPathExists(current_schema.relational_columns, column.path)) continue;
+            if (try relationalColumnHasUniqueDroppedRenameSource(current_schema.relational_columns, next_schema.relational_columns, column)) continue;
             if (column.generated != null) {
                 try generated_columns.append(alloc, column);
                 continue;

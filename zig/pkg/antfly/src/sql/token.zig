@@ -342,6 +342,17 @@ pub const Token = struct {
         return std.ascii.eqlIgnoreCase(self.text, keyword_text);
     }
 
+    pub fn matchesQualifiedKeywordTag(self: Token, qualifier: []const u8, keyword: TokenKeyword) bool {
+        if (self.matchesKeywordTag(keyword)) return true;
+        if (self.kind != .identifier) return false;
+        const dot = std.mem.indexOfScalar(u8, self.text, '.') orelse return false;
+        if (std.mem.indexOfScalar(u8, self.text[dot + 1 ..], '.') != null) return false;
+        if (!std.ascii.eqlIgnoreCase(self.text[0..dot], qualifier)) return false;
+        const member = self.text[dot + 1 ..];
+        if (keywordFromIdentifier(member)) |member_keyword| return member_keyword == keyword;
+        return false;
+    }
+
     pub fn sourceSpan(self: Token) SourceSpan {
         return .{ .start = self.source_start, .end = self.source_end };
     }
@@ -393,6 +404,17 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
         .keyword = keywordFromIdentifier("array_agg"),
     };
     try std.testing.expect(aggregate_function.matchesKeywordTag(.array_agg));
+
+    const qualified_function = Token{
+        .kind = .identifier,
+        .text = "antfly.full_text_search",
+        .source_start = 0,
+        .source_end = 23,
+    };
+    try std.testing.expect(qualified_function.matchesQualifiedKeywordTag("antfly", .full_text_search));
+    try std.testing.expect(!qualified_function.matchesKeywordTag(.full_text_search));
+    try std.testing.expect(!qualified_function.matchesQualifiedKeywordTag("public", .full_text_search));
+
     try std.testing.expectEqual(TokenKeyword.before, keywordFromIdentifier("BEFORE").?);
     try std.testing.expectEqual(TokenKeyword.then, keywordFromIdentifier("THEN").?);
     try std.testing.expectEqual(TokenKeyword.@"else", keywordFromIdentifier("ELSE").?);
