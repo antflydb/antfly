@@ -21260,6 +21260,134 @@ test "metal native decoder runtime attention device bias mask matches host" {
     }
 }
 
+test "metal native decoder runtime florence window pack unpack matches host" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    const input_data = [_]f32{
+        1.0,  2.0,
+        3.0,  4.0,
+        5.0,  6.0,
+        7.0,  8.0,
+        9.0,  10.0,
+        11.0, 12.0,
+    };
+    var input = try testDeviceTensorFromSlice(runtime, &input_data, &[_]i32{ 6, 2 });
+    defer input.deinit();
+
+    var packed_windows = (try decoderRuntimeFlorenceWindowPackF32Device(&provider, input, 1, 2, 3, 2, 2)) orelse return error.UnexpectedNull;
+    defer packed_windows.deinit();
+    try std.testing.expect(packed_windows.isDevice());
+
+    const packed_values = try packed_windows.toHostSlice();
+    try std.testing.expectEqualSlices(f32, &.{
+        1.0,  2.0,  3.0, 4.0,
+        7.0,  8.0,  9.0, 10.0,
+        5.0,  6.0,  0.0, 0.0,
+        11.0, 12.0, 0.0, 0.0,
+    }, packed_values);
+
+    var unpacked = (try decoderRuntimeFlorenceWindowUnpackF32Device(&provider, packed_windows, 1, 2, 3, 2, 2)) orelse return error.UnexpectedNull;
+    defer unpacked.deinit();
+    try std.testing.expect(unpacked.isDevice());
+
+    const unpacked_values = try unpacked.toHostSlice();
+    try std.testing.expectEqualSlices(f32, &input_data, unpacked_values);
+}
+
+fn testFlorenceChannelAttentionHost(
+    output: []f32,
+    qkv: []const f32,
+    batch: usize,
+    seq_len: usize,
+    dim: usize,
+    groups: usize,
+) void {
+    const channels_per_group = dim / groups;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(seq_len)));
+    var scores_buf: [64 * 64]f32 = undefined;
+
+    for (0..batch) |b| {
+        for (0..groups) |g| {
+            const group_offset = g * channels_per_group;
+            const scores = scores_buf[0 .. channels_per_group * channels_per_group];
+            @memset(scores, 0.0);
+
+            for (0..channels_per_group) |qc| {
+                const row = scores[qc * channels_per_group ..][0..channels_per_group];
+                for (0..channels_per_group) |kc| {
+                    var acc: f32 = 0.0;
+                    for (0..seq_len) |n| {
+                        const base = ((b * seq_len + n) * dim * 3) + group_offset;
+                        acc += qkv[base + qc] * qkv[base + dim + kc];
+                    }
+                    row[kc] = acc * scale;
+                }
+
+                var best = row[0];
+                for (row[1..]) |value| best = @max(best, value);
+                var sum: f32 = 0.0;
+                for (row) |*value| {
+                    value.* = @exp(value.* - best);
+                    sum += value.*;
+                }
+                const inv_sum = if (sum > 0.0) 1.0 / sum else 0.0;
+                for (row) |*value| value.* *= inv_sum;
+            }
+
+            for (0..seq_len) |n| {
+                const dst = (b * seq_len + n) * dim + group_offset;
+                const value_base = ((b * seq_len + n) * dim * 3) + 2 * dim + group_offset;
+                for (0..channels_per_group) |qc| {
+                    var acc: f32 = 0.0;
+                    for (0..channels_per_group) |vc| {
+                        acc += scores[qc * channels_per_group + vc] * qkv[value_base + vc];
+                    }
+                    output[dst + qc] = acc;
+                }
+            }
+        }
+    }
+}
+
+test "metal native decoder runtime florence channel attention matches host" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+
+    const metal_native_provider = @import("metal_native_provider.zig");
+    var provider = try metal_native_provider.MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    if (!provider.hasDecoderRuntime()) return error.SkipZigTest;
+
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    var qkv_data: [1 * 3 * 4 * 3]f32 = undefined;
+    for (&qkv_data, 0..) |*value, i| {
+        const centered: i32 = @intCast((i * 7) % 17);
+        value.* = @as(f32, @floatFromInt(centered - 8)) * 0.125;
+    }
+
+    var expected: [1 * 3 * 4]f32 = undefined;
+    testFlorenceChannelAttentionHost(&expected, &qkv_data, 1, 3, 4, 2);
+
+    var qkv = try testDeviceTensorFromSlice(runtime, &qkv_data, &[_]i32{ 3, 12 });
+    defer qkv.deinit();
+    var output = (try decoderRuntimeFlorenceChannelAttentionF32Device(&provider, qkv, 1, 3, 4, 2)) orelse return error.UnexpectedNull;
+    defer output.deinit();
+    try std.testing.expect(output.isDevice());
+
+    const actual = try output.toHostSlice();
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try std.testing.expectApproxEqAbs(want, got, 1e-5);
+    }
+}
+
 test "metal native decoder runtime dense linear and rms-linear preserve device tensors" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
