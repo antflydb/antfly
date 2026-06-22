@@ -1062,11 +1062,11 @@ Combine search with LLM-powered classification and generation using the retrieva
 ### Pull a generation model
 
 ```bash
-antfly inference pull ggml-org/gemma-4-e2b-it-gguf:gguf:Q4_K_M
+antfly inference pull ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_K_M
 ```
 
 <Callout type="info">
-`ggml-org/gemma-4-e2b-it-gguf` runs locally via Antfly inference and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. For alternative providers, see the [next step](#rag-with-alternative-providers).
+`ggml-org/gemma-4-E4B-it-GGUF` runs locally via Antfly inference and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. The generator config caps output at 128 tokens for predictable local latency. For alternative providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 
 ### Classify and generate
@@ -1098,7 +1098,8 @@ antfly agents retrieval --table wikipedia \
   --pruner '{"min_score_ratio": 0.6, "max_score_gap_percent": 40}' \
   --generator '{
     "provider": "antfly",
-    "model": "ggml-org/gemma-4-e2b-it-gguf"
+    "model": "ggml-org/gemma-4-E4B-it-GGUF",
+    "max_tokens": 128
   }' \
   --max-context-tokens 512 \
   --classify --reasoning --generate --followup
@@ -1125,7 +1126,8 @@ curl -X POST http://localhost:8080/db/v1/agents/retrieval \
     }],
     "generator": {
       "provider": "antfly",
-      "model": "ggml-org/gemma-4-e2b-it-gguf"
+      "model": "ggml-org/gemma-4-E4B-it-GGUF",
+      "max_tokens": 128
     },
     "max_context_tokens": 512,
     "classify": true,
@@ -1154,7 +1156,8 @@ const result = await client.agents.retrieval({
   }],
   generator: {
     provider: 'antfly',
-    model: 'ggml-org/gemma-4-e2b-it-gguf',
+    model: 'ggml-org/gemma-4-E4B-it-GGUF',
+    max_tokens: 128,
   },
   max_context_tokens: 512,
   classify: true,
@@ -1182,8 +1185,9 @@ result = client.agents.retrieval(
         'pruner': {'min_score_ratio': 0.6, 'max_score_gap_percent': 40},
     }],
     generator={
-        'provider': 'inference',
-        'model': 'ggml-org/gemma-4-e2b-it-gguf',
+        'provider': 'antfly',
+        'model': 'ggml-org/gemma-4-E4B-it-GGUF',
+        'max_tokens': 128,
     },
     max_context_tokens=512,
     classify=True,
@@ -1217,7 +1221,8 @@ resp, err := client.RetrievalAgentWithResponse(
 		}},
 		Generator: &antfly.Generator{
 			Provider: strPtr("antfly"),
-			Model:    strPtr("ggml-org/gemma-4-e2b-it-gguf"),
+			Model:    strPtr("ggml-org/gemma-4-E4B-it-GGUF"),
+			MaxTokens: 128,
 		},
 		MaxContextTokens: intPtr(512),
 		Classify:         boolPtr(true),
@@ -1248,7 +1253,8 @@ let resp = client
         }],
         "generator": {
             "provider": "antfly",
-            "model": "ggml-org/gemma-4-e2b-it-gguf"
+            "model": "ggml-org/gemma-4-E4B-it-GGUF",
+            "max_tokens": 128
         },
         "max_context_tokens": 512,
         "classify": true,
@@ -1261,7 +1267,7 @@ let resp = client
   </TabsContent>
 </Tabs>
 
-This command searches for semantically similar articles, reranks and prunes results for quality, classifies the query, generates an answer with reasoning, and suggests follow-up questions — all using the local Gemma model.
+This command searches for semantically similar articles, reranks and prunes results for quality, classifies the query, generates a capped answer with reasoning, and suggests follow-up questions — all using the local Gemma model.
 
 <Callout type="tip">
 **Pruning for RAG:** Score-based pruning (`--pruner`) filters out marginally relevant documents, while token-based pruning (`--max-context-tokens`) ensures the context fits within the model's limits.
@@ -1333,7 +1339,7 @@ antfly agents retrieval --table wikipedia \
 
 <Callout type="info">
 **Choosing a generator model:**
-- **`ggml-org/gemma-4-e2b-it-gguf`** — local GGUF inference via Antfly inference, no API key needed, supports all RAG features
+- **`ggml-org/gemma-4-E4B-it-GGUF`** — local GGUF inference via Antfly inference, no API key needed
 - **Ollama `gemma3:4b-it-qat`** — local inference via Ollama, quantized for fast CPU/GPU performance
 - **Gemini `gemini-2.5-flash`** — cloud API, fast and high quality, requires API key
 - **OpenAI `gpt-4.1-mini`** — cloud API, fast and high quality, requires API key

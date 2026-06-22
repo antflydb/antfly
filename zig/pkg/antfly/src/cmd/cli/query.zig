@@ -29,6 +29,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     var exclusion_query: ?[]const u8 = null;
     var aggregations_json: ?[]const u8 = null;
     var reranker_json: ?[]const u8 = null;
+    var pruner_json: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
@@ -45,7 +46,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             if (args.next()) |s| limit = std.fmt.parseInt(i64, s, 10) catch null;
         } else if (std.mem.eql(u8, arg, "--offset")) {
             if (args.next()) |s| offset = std.fmt.parseInt(i64, s, 10) catch null;
-        } else if (std.mem.eql(u8, arg, "--indexes")) {
+        } else if (std.mem.eql(u8, arg, "--indexes") or std.mem.eql(u8, arg, "-i")) {
             indexes_str = args.next();
         } else if (std.mem.eql(u8, arg, "--filter-query")) {
             filter_query = args.next();
@@ -55,104 +56,77 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
             aggregations_json = args.next();
         } else if (std.mem.eql(u8, arg, "--reranker")) {
             reranker_json = args.next();
+        } else if (std.mem.eql(u8, arg, "--pruner")) {
+            pruner_json = args.next();
+        } else {
+            cli.fatal("unknown query flag: {s}", .{arg});
         }
     }
 
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    const writer = &out.writer;
+    if (full_text_search != null and full_text_search_json != null) {
+        cli.fatal("only one of --full-text-search or --full-text-search-json may be provided", .{});
+    }
 
-    try writer.writeAll("{");
-    var first = true;
-
+    var full_text_value: ?std.json.Parsed(std.json.Value) = null;
+    defer if (full_text_value) |*parsed| parsed.deinit();
     if (full_text_search) |q| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"full_text_search\":{{\"query\":\"{s}\"}}", .{q});
-        first = false;
-    }
-    if (full_text_search_json) |q| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"full_text_search\":{s}", .{q});
-        first = false;
-    }
-    if (semantic_search) |q| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"semantic_search\":\"{s}\"", .{q});
-        first = false;
-    }
-    if (limit) |l| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"limit\":{d}", .{l});
-        first = false;
-    }
-    if (offset) |o| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"offset\":{d}", .{o});
-        first = false;
-    }
-    if (fields_str) |f| {
-        if (!first) try writer.writeAll(",");
-        try writer.writeAll("\"fields\":[");
-        var it = std.mem.splitScalar(u8, f, ',');
-        var field_first = true;
-        while (it.next()) |field| {
-            if (!field_first) try writer.writeAll(",");
-            try writer.print("\"{s}\"", .{std.mem.trim(u8, field, " ")});
-            field_first = false;
-        }
-        try writer.writeAll("]");
-        first = false;
-    }
-    if (indexes_str) |idx| {
-        if (!first) try writer.writeAll(",");
-        try writer.writeAll("\"indexes\":[");
-        var it = std.mem.splitScalar(u8, idx, ',');
-        var idx_first = true;
-        while (it.next()) |index_name| {
-            if (!idx_first) try writer.writeAll(",");
-            try writer.print("\"{s}\"", .{std.mem.trim(u8, index_name, " ")});
-            idx_first = false;
-        }
-        try writer.writeAll("]");
-        first = false;
-    }
-    if (filter_query) |fq| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"filter_query\":{s}", .{fq});
-        first = false;
-    }
-    if (exclusion_query) |eq| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"exclusion_query\":{s}", .{eq});
-        first = false;
-    }
-    if (aggregations_json) |agg| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"aggregations\":{s}", .{agg});
-        first = false;
-    }
-    if (reranker_json) |rr| {
-        if (!first) try writer.writeAll(",");
-        try writer.print("\"reranker\":{s}", .{rr});
-        first = false;
+        full_text_value = buildFullTextSearchValue(allocator, q);
+    } else if (full_text_search_json) |q| {
+        full_text_value = parseJsonArg(std.json.Value, allocator, "--full-text-search-json", q);
     }
 
-    try writer.writeAll("}");
+    var filter_value: ?std.json.Parsed(std.json.Value) = null;
+    defer if (filter_value) |*parsed| parsed.deinit();
+    if (filter_query) |raw| filter_value = parseJsonArg(std.json.Value, allocator, "--filter-query", raw);
 
-    const json_body = out.written();
-    var parsed = std.json.parseFromSlice(antfly_client.types.QueryRequest, allocator, json_body, .{ .ignore_unknown_fields = true }) catch |err| {
-        cli.fatal("failed to build query request: {}", .{err});
+    var exclusion_value: ?std.json.Parsed(std.json.Value) = null;
+    defer if (exclusion_value) |*parsed| parsed.deinit();
+    if (exclusion_query) |raw| exclusion_value = parseJsonArg(std.json.Value, allocator, "--exclusion-query", raw);
+
+    var aggregations_value: ?std.json.Parsed(std.json.ArrayHashMap(antfly_client.types.AggregationRequest)) = null;
+    defer if (aggregations_value) |*parsed| parsed.deinit();
+    if (aggregations_json) |raw| {
+        aggregations_value = parseJsonArg(std.json.ArrayHashMap(antfly_client.types.AggregationRequest), allocator, "--aggregations", raw);
+    }
+
+    var reranker_value: ?std.json.Parsed(antfly_client.types.RerankerConfig) = null;
+    defer if (reranker_value) |*parsed| parsed.deinit();
+    if (reranker_json) |raw| reranker_value = parseJsonArg(antfly_client.types.RerankerConfig, allocator, "--reranker", raw);
+
+    var pruner_value: ?std.json.Parsed(antfly_client.types.Pruner) = null;
+    defer if (pruner_value) |*parsed| parsed.deinit();
+    if (pruner_json) |raw| pruner_value = parseJsonArg(antfly_client.types.Pruner, allocator, "--pruner", raw);
+
+    var fields: ?[]const []const u8 = null;
+    defer if (fields) |slice| allocator.free(slice);
+    if (fields_str) |raw| fields = try cli.splitCommaListAlloc(allocator, raw);
+
+    var indexes: ?[]const []const u8 = null;
+    defer if (indexes) |slice| allocator.free(slice);
+    if (indexes_str) |raw| indexes = try cli.splitCommaListAlloc(allocator, raw);
+
+    const body = antfly_client.types.QueryRequest{
+        .full_text_search = if (full_text_value) |*parsed| parsed.value else null,
+        .semantic_search = semantic_search,
+        .indexes = indexes,
+        .fields = fields,
+        .limit = limit,
+        .offset = offset,
+        .filter_query = if (filter_value) |*parsed| parsed.value else null,
+        .exclusion_query = if (exclusion_value) |*parsed| parsed.value else null,
+        .aggregations = if (aggregations_value) |*parsed| parsed.value else null,
+        .reranker = if (reranker_value) |*parsed| parsed.value else null,
+        .pruner = if (pruner_value) |*parsed| parsed.value else null,
     };
-    defer parsed.deinit();
 
     if (table_name) |tbl| {
-        var resp = try client.queryTable(tbl, parsed.value);
+        var resp = try client.queryTable(tbl, body);
         defer resp.deinit();
         if (resp.data) |data| {
             try cli.writeJson(allocator, io, data.value);
         }
     } else {
-        var resp = try client.query(parsed.value);
+        var resp = try client.query(body);
         defer resp.deinit();
         if (resp.data) |data| {
             try cli.writeJson(allocator, io, data.value);
@@ -180,4 +154,27 @@ pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
     if (resp.data) |data| {
         try cli.writeJson(allocator, io, data.value);
     }
+}
+
+fn buildFullTextSearchValue(allocator: std.mem.Allocator, query: []const u8) std.json.Parsed(std.json.Value) {
+    const escaped = std.json.Stringify.valueAlloc(allocator, query, .{}) catch |err| {
+        cli.fatal("failed to encode --full-text-search: {}", .{err});
+    };
+    defer allocator.free(escaped);
+
+    const json_body = std.fmt.allocPrint(allocator, "{{\"query\":{s}}}", .{escaped}) catch |err| {
+        cli.fatal("failed to build --full-text-search value: {}", .{err});
+    };
+    defer allocator.free(json_body);
+
+    return parseJsonArg(std.json.Value, allocator, "--full-text-search", json_body);
+}
+
+fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8, raw: []const u8) std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, raw, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        cli.fatal("invalid JSON for {s}: {}", .{ flag, err });
+    };
 }

@@ -21,6 +21,7 @@ pub const linear_merge = @import("linear_merge.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
+pub const retrieval_agent = @import("retrieval_agent.zig");
 pub const public_table_http = @import("public_table_http.zig");
 pub const public_embedding_query = @import("public_embedding_query.zig");
 pub const public_graph_query = @import("public_graph_query.zig");
@@ -165,6 +166,7 @@ test "api module compiles" {
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;
+    _ = retrieval_agent;
     _ = public_table_http;
     _ = public_graph_query;
     _ = public_query_string;

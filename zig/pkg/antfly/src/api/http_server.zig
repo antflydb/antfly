@@ -5499,6 +5499,7 @@ pub const ApiHttpServer = struct {
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.HAReadRequiresPrimary, error.ReadRequiresPrimary => return error.ReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata, error.ReadUnavailable => return error.ReadUnavailable,
+            error.ModelNotFound => return error.ModelNotFound,
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
@@ -5569,6 +5570,7 @@ pub const ApiHttpServer = struct {
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
                 error.TableNotFound => return error.TableNotFound,
+                error.ModelNotFound => return error.ModelNotFound,
                 error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
                 error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
                 error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -5586,6 +5588,7 @@ pub const ApiHttpServer = struct {
 
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            error.ModelNotFound => return error.ModelNotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -5622,6 +5625,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             error.TableNotFound => return error.NotFound,
+            error.ModelNotFound => return error.ModelNotFound,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.HAReadRequiresPrimary => return error.HAReadRequiresPrimary,
             error.HAReadWaitForApply, error.HAReadWaitForMetadata => return err,
@@ -6729,6 +6733,7 @@ pub const ApiHttpServer = struct {
         ) catch |err| switch (err) {
             error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
             error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
             error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
             else => {
                 std.log.err("public table query execution failed table={s} err={}", .{ table_name, err });
@@ -6788,6 +6793,7 @@ pub const ApiHttpServer = struct {
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid query request"),
                 error.NotFound, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
                 error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
                 else => {
                     std.log.err("public table multiquery execution failed table={s} err={}", .{ table_name, err });
@@ -8434,6 +8440,14 @@ fn jsonErrorResponse(alloc: std.mem.Allocator, status: u16, message: []const u8)
         .status = status,
         .content_type = try alloc.dupe(u8, "application/json"),
         .body = try std.fmt.allocPrint(alloc, "{{\"error\":{f}}}", .{std.json.fmt(message, .{})}),
+    };
+}
+
+fn modelNotFoundResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    return .{
+        .status = 404,
+        .content_type = try alloc.dupe(u8, "application/json"),
+        .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
     };
 }
 

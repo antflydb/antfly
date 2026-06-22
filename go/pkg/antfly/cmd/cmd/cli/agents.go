@@ -51,11 +51,11 @@ Tool calling & chat mode:
                         Starts an interactive REPL where conversation history,
                         filters, and clarification questions persist across turns.
   --tools              Comma-separated list of enabled tools. When omitted, defaults to
-                        add_filter, ask_clarification, search plus any index-based tools
+                        add_filter, ask_clarification plus any index-based tools
                         (semantic_search, full_text_search, tree_search, graph_search)
                         auto-enabled from the table's indexes. When set explicitly, only
                         the listed tools are enabled.
-                        Available: add_filter, ask_clarification, search, websearch, fetch,
+                        Available: add_filter, ask_clarification, web_search, fetch,
                         semantic_search, full_text_search, tree_search, graph_search.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			params, err := parseSearchParams(cmd)
@@ -125,7 +125,7 @@ Tool calling & chat mode:
 			}
 			ragReq.Steps.Followup.Enabled = followup
 			ragReq.Steps.Confidence.Enabled = confidence
-			ragReq.Steps.Tools = toolsConfig
+			ragReq.Tools = toolsConfig
 
 			if evalConfig != nil {
 				ragReq.Steps.Eval = *evalConfig
@@ -183,8 +183,8 @@ Tool calling & chat mode:
 	// Tool calling & chat mode
 	retrievalCmd.Flags().Int("max-context-tokens", 0, "Maximum tokens for document context (0 = no limit). Documents exceeding this budget are pruned.")
 	retrievalCmd.Flags().Int("max-internal-iterations", 0, "Enable multi-turn chat with N tool-calling rounds per turn (0 = single-shot)")
-	retrievalCmd.Flags().String("tools", "", "Comma-separated list of enabled tools (e.g. semantic_search,websearch,fetch)")
-	retrievalCmd.Flags().String("websearch-config", "", "JSON config for websearch tool (e.g. '{\"provider\":\"tavily\"}')")
+	retrievalCmd.Flags().String("tools", "", "Comma-separated list of enabled tools (e.g. semantic_search,web_search,fetch)")
+	retrievalCmd.Flags().String("web-search-config", "", "JSON config for web_search tool (e.g. '{\"provider\":\"tavily\"}')")
 	retrievalCmd.Flags().String("fetch-config", "", "JSON config for fetch tool (e.g. '{\"max_content_length\":10000}')")
 
 	_ = retrievalCmd.MarkFlagRequired("generator")
@@ -249,7 +249,7 @@ Example:
 	parent.AddCommand(agentsCmd)
 }
 
-// parseToolsConfig parses the --tools, --websearch-config, and --fetch-config flags into a ChatToolsConfig.
+// parseToolsConfig parses the --tools, --web-search-config, and --fetch-config flags into a ChatToolsConfig.
 func parseToolsConfig(cmd *cobra.Command) (antfly.ChatToolsConfig, error) {
 	var config antfly.ChatToolsConfig
 
@@ -262,13 +262,13 @@ func parseToolsConfig(cmd *cobra.Command) (antfly.ChatToolsConfig, error) {
 		config.EnabledTools = append(config.EnabledTools, name)
 	}
 
-	websearchStr, _ := cmd.Flags().GetString("websearch-config")
+	websearchStr, _ := cmd.Flags().GetString("web-search-config")
 	if websearchStr != "" {
-		wsc, err := parseJSONFlag[antfly.WebSearchConfig](websearchStr, "websearch-config")
+		wsc, err := parseJSONFlag[antfly.WebSearchConfig](websearchStr, "web-search-config")
 		if err != nil {
 			return config, err
 		}
-		config.WebsearchConfig = wsc
+		config.WebSearchConfig = wsc
 	}
 
 	fetchStr, _ := cmd.Flags().GetString("fetch-config")
@@ -407,7 +407,7 @@ func runChat(cmd *cobra.Command, params SearchParams, generator antfly.Generator
 			ragReq.Steps.Generation.SystemPrompt = systemPrompt
 		}
 		ragReq.Steps.Followup.Enabled = true
-		ragReq.Steps.Tools = toolsConfig
+		ragReq.Tools = toolsConfig
 
 		sp := newSpinner(os.Stderr)
 		sp.start("Thinking...")

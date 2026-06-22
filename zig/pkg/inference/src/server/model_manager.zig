@@ -697,6 +697,7 @@ pub fn isManifestPotentiallyLoadableInCurrentBuild(man: manifest_mod.ModelManife
     if (man.hasIncompleteGlinerBundle()) return false;
     if (man.hasIncompleteColqwenBundle()) return false;
     if (man.hasIncompleteClipclapGgufBundle()) return false;
+    if (man.hasIncompleteFlorence2GgufBundle()) return false;
     if (man.onnx_path != null or
         man.visual_model_path != null or
         man.audio_model_path != null or
@@ -1060,6 +1061,7 @@ pub const ModelManager = struct {
         if (man.hasIncompleteGlinerBundle()) return error.IncompleteGlinerBundle;
         if (man.hasIncompleteColqwenBundle()) return error.IncompleteColqwenBundle;
         if (man.hasIncompleteClipclapGgufBundle()) return error.IncompleteClipclapGgufBundle;
+        if (man.hasIncompleteFlorence2GgufBundle()) return error.IncompleteFlorence2Bundle;
 
         // Load tokenizer
         var hf_tok: ?*hf_tokenizer.HfTokenizer = null;

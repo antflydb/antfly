@@ -322,6 +322,20 @@ pub const ModelManifest = struct {
             self.processor_config_path == null;
     }
 
+    pub fn isFlorence2GgufBundle(self: *const ModelManifest) bool {
+        return std.mem.eql(u8, self.inference_bundle_family, "florence2_gguf_bundle/v1");
+    }
+
+    pub fn hasIncompleteFlorence2GgufBundle(self: *const ModelManifest) bool {
+        if (!self.isFlorence2GgufBundle()) return false;
+        return self.gguf_path == null or
+            self.config_path == null or
+            self.model_manifest_path == null or
+            self.tokenizer_json_path == null or
+            self.tokenizer_config_path == null or
+            self.preprocessor_config_path == null;
+    }
+
     pub fn hasInput(self: *const ModelManifest, input: []const u8) bool {
         for (self.inputs) |candidate| {
             if (std.mem.eql(u8, candidate, input)) return true;
@@ -1432,6 +1446,16 @@ fn parseInferenceBundleJson(manifest: *ModelManifest, allocator: std.mem.Allocat
             manifest.config_model_arch = allocator.dupe(u8, "clipclap") catch "";
             try setManifestInputs(allocator, manifest, &.{ "text", "image", "audio" });
         }
+        if (std.mem.eql(u8, bundle_family, "florence2_gguf_bundle/v1")) {
+            const model = obj.get("model") orelse obj.get("gguf") orelse return;
+            if (model == .string and model.string.len > 0) {
+                try applyFlorence2GgufBundle(
+                    manifest,
+                    allocator,
+                    try resolveBundlePath(allocator, model_dir_path, model.string),
+                );
+            }
+        }
     }
 }
 
@@ -1469,6 +1493,9 @@ fn parseInferenceVariantsJson(manifest: *ModelManifest, allocator: std.mem.Alloc
     const obj = parsed.value.object;
     const variants_family = obj.get("family") orelse return;
     if (variants_family != .string) return;
+    if (std.mem.eql(u8, variants_family.string, "florence2_variants/v1")) {
+        return parseFlorence2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
+    }
     if (std.mem.eql(u8, variants_family.string, "gliner2_variants/v1")) {
         return parseGliner2InferenceVariantsJson(manifest, allocator, model_dir_path, obj);
     }
@@ -1571,6 +1598,68 @@ fn parseGliner2InferenceVariantsJson(
     try setManifestInputs(allocator, manifest, &.{"text"});
 }
 
+fn parseFlorence2InferenceVariantsJson(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    obj: std.json.ObjectMap,
+) !void {
+    const variants = obj.get("variants") orelse return;
+    if (variants != .array) return;
+
+    var selected: ?ResolvedFlorence2Gguf = null;
+    errdefer if (selected) |*model| model.deinit(allocator);
+    for (variants.array.items) |variant| {
+        if (!isFlorence2GgufVariant(variant)) continue;
+        var model = (try resolveExistingFlorence2GgufVariant(allocator, model_dir_path, variant)) orelse continue;
+        if (variant.object.get("format")) |format| {
+            if (format == .string and std.mem.eql(u8, format.string, "Q4_K")) {
+                if (selected) |*old| old.deinit(allocator);
+                selected = model;
+                break;
+            }
+        }
+        if (selected == null) {
+            selected = model;
+        } else {
+            model.deinit(allocator);
+        }
+    }
+
+    var model = selected orelse return;
+    selected = null;
+    errdefer model.deinit(allocator);
+
+    try applyFlorence2GgufBundle(manifest, allocator, model.model_path);
+    model.model_path = "";
+}
+
+fn applyFlorence2GgufBundle(
+    manifest: *ModelManifest,
+    allocator: std.mem.Allocator,
+    gguf_path: []const u8,
+) !void {
+    var path = gguf_path;
+    errdefer if (path.len > 0) allocator.free(path);
+
+    var family = try allocator.dupe(u8, "florence2_gguf_bundle/v1");
+    errdefer if (family.len > 0) allocator.free(family);
+    var arch = try allocator.dupe(u8, "florence2");
+    errdefer if (arch.len > 0) allocator.free(arch);
+
+    if (manifest.inference_bundle_family.len > 0) allocator.free(manifest.inference_bundle_family);
+    manifest.inference_bundle_family = family;
+    family = "";
+    setOptionalPath(allocator, &manifest.gguf_path, path);
+    path = "";
+    manifest.native_arch_hint = .florence;
+    manifest.model_type = .reader;
+    if (manifest.config_model_arch.len > 0) allocator.free(manifest.config_model_arch);
+    manifest.config_model_arch = arch;
+    arch = "";
+    try setManifestInputs(allocator, manifest, &.{ "text", "image" });
+}
+
 fn setManifestInputs(allocator: std.mem.Allocator, manifest: *ModelManifest, inputs: []const []const u8) !void {
     if (manifest.inputs.len > 0) {
         for (manifest.inputs) |input| allocator.free(input);
@@ -1611,6 +1700,15 @@ const ResolvedGliner2GgufPair = struct {
         if (self.encoder_path.len > 0) allocator.free(self.encoder_path);
         if (self.head_path.len > 0) allocator.free(self.head_path);
         self.* = .{ .encoder_path = "", .head_path = "" };
+    }
+};
+
+const ResolvedFlorence2Gguf = struct {
+    model_path: []const u8,
+
+    fn deinit(self: *ResolvedFlorence2Gguf, allocator: std.mem.Allocator) void {
+        if (self.model_path.len > 0) allocator.free(self.model_path);
+        self.* = .{ .model_path = "" };
     }
 };
 
@@ -1658,6 +1756,23 @@ fn resolveExistingGliner2GgufVariant(
     return .{ .encoder_path = encoder_path, .head_path = head_path };
 }
 
+fn resolveExistingFlorence2GgufVariant(
+    allocator: std.mem.Allocator,
+    model_dir_path: []const u8,
+    variant: std.json.Value,
+) !?ResolvedFlorence2Gguf {
+    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return null;
+    if (model != .string or model.string.len == 0) return null;
+
+    const model_path = try resolveBundlePath(allocator, model_dir_path, model.string);
+    errdefer allocator.free(model_path);
+    if (!c_file.fileExists(allocator, model_path)) {
+        allocator.free(model_path);
+        return null;
+    }
+    return .{ .model_path = model_path };
+}
+
 fn isClipclapGgufVariant(variant: std.json.Value) bool {
     if (variant != .object) return false;
     const target = variant.object.get("target") orelse return false;
@@ -1674,6 +1789,14 @@ fn isGliner2GgufVariant(variant: std.json.Value) bool {
     const encoder = variant.object.get("encoder") orelse return false;
     const head = variant.object.get("head") orelse return false;
     return encoder == .string and encoder.string.len > 0 and head == .string and head.string.len > 0;
+}
+
+fn isFlorence2GgufVariant(variant: std.json.Value) bool {
+    if (variant != .object) return false;
+    const target = variant.object.get("target") orelse return false;
+    if (target != .string or !std.mem.eql(u8, target.string, "gguf")) return false;
+    const model = variant.object.get("model") orelse variant.object.get("gguf") orelse return false;
+    return model == .string and model.string.len > 0;
 }
 
 fn resolveBundlePath(allocator: std.mem.Allocator, model_dir_path: []const u8, path: []const u8) ![]const u8 {
@@ -2126,6 +2249,26 @@ test "manifest parses clipclap gguf bundle marker" {
     try std.testing.expect(manifest.hasInput("audio"));
 }
 
+test "manifest parses florence2 gguf bundle marker" {
+    const allocator = std.testing.allocator;
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceBundleJson(&manifest, allocator, "/tmp/florence2-q4_k",
+        \\{"family":"florence2_gguf_bundle/v1","model":"florence-2-base.Q4_K.gguf","inputs":["text","image"]}
+    );
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expect(manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expect(manifest.gguf_path != null);
+    try std.testing.expect(std.mem.endsWith(u8, manifest.gguf_path.?, "/tmp/florence2-q4_k/florence-2-base.Q4_K.gguf"));
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+}
+
 test "manifest discovers clip onnx variants and prefers f16 over i8" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-onnx-f16-preferred");
@@ -2424,6 +2567,146 @@ test "manifest parses gliner2 variants gguf pair" {
     try std.testing.expectEqualStrings(encoder_path, manifest.gguf_path.?);
     try std.testing.expectEqualStrings(head_path, manifest.gliner_head_gguf_path.?);
     try std.testing.expect(manifest.hasInput("text"));
+}
+
+test "manifest parses florence2 variants gguf model" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence2-variants-gguf");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
+    defer allocator.free(q4_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(q4_path, manifest.gguf_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest loads canonical antfly florence2 variants before first gguf fallback" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence2-canonical-variants");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+    const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q8_0.gguf" });
+    defer allocator.free(q8_path);
+    const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
+    defer allocator.free(q4_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = config_path,
+        .data = "{\"model_type\":\"florence2\",\"text_config\":{\"d_model\":768},\"vision_config\":{\"image_size\":768}}",
+    });
+    const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
+    defer allocator.free(model_manifest_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = model_manifest_path,
+        .data = "{\"type\":\"reader\",\"tasks\":[\"read\"],\"inputs\":[\"text\",\"image\"]}",
+    });
+    const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
+    defer allocator.free(tokenizer_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
+    defer allocator.free(tokenizer_config_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{}" });
+    const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
+    defer allocator.free(preprocessor_path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"size\":{\"height\":768,\"width\":768}}" });
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    try compat.cwd().writeFile(compat.io(), .{
+        .sub_path = variants_path,
+        .data =
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q8_0",
+        \\      "target": "gguf",
+        \\      "format": "Q8_0",
+        \\      "model": "florence-2-base.Q8_0.gguf"
+        \\    },
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+        ,
+    });
+
+    var manifest = try loadFromDir(allocator, dir_path);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.isFlorence2GgufBundle());
+    try std.testing.expect(!manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expectEqual(ModelType.reader, manifest.model_type);
+    try std.testing.expectEqual(NativeArchHint.florence, manifest.native_arch_hint);
+    try std.testing.expectEqualStrings("florence2", manifest.config_model_arch);
+    try std.testing.expectEqualStrings(q4_path, manifest.gguf_path.?);
+    try std.testing.expect(manifest.hasInput("text"));
+    try std.testing.expect(manifest.hasInput("image"));
+}
+
+test "manifest ignores stale florence2 variants with missing gguf files" {
+    const allocator = std.testing.allocator;
+    const dir_path = try testScratchDir(allocator, "manifest-florence2-stale-variants");
+    defer {
+        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        allocator.free(dir_path);
+    }
+
+    var manifest = ModelManifest{ .allocator = allocator };
+    defer manifest.deinit();
+
+    try parseInferenceVariantsJson(&manifest, allocator, dir_path,
+        \\{
+        \\  "family": "florence2_variants/v1",
+        \\  "variants": [
+        \\    {
+        \\      "id": "gguf-Q4_K",
+        \\      "target": "gguf",
+        \\      "format": "Q4_K",
+        \\      "model": "florence-2-base.Q4_K.gguf"
+        \\    }
+        \\  ]
+        \\}
+    );
+
+    try std.testing.expect(!manifest.isFlorence2GgufBundle());
+    try std.testing.expectEqual(@as(?[]const u8, null), manifest.gguf_path);
 }
 
 test "manifest uses clipclap variants when default ONNX bundle is partial" {

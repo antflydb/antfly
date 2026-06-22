@@ -71,7 +71,7 @@ GraphIndexV0Config:
   type: object
   properties:
     summarizer:                               # NEW
-      description: "Configuration for generating node summaries (enables tree navigation in AnswerAgent)"
+      description: "Configuration for generating node summaries (enables tree navigation in Retrieval Agent)"
       $ref: "../../../lib/ai/openapi.yaml#/components/schemas/GeneratorConfig"
     template:                                 # NEW (matches aknn naming)
       x-go-type-skip-optional-pointer: true
@@ -360,9 +360,10 @@ Field-based edge extraction happens through the enricher (`LeaderFactory`), not 
 
 No changes needed. The existing `StartLeaderFactory()` (line 351) calls `LeaderFactory` on all `EnrichableIndex` implementations. The `Register()` method (line 656) uses `NeedsEnricher()` for dynamically registered indexes. Both paths will work with the new `GraphIndexV0` implementation.
 
-### 6. AnswerAgent: `src/metadata/api_ai.go` (follow-up PR)
+### 6. Retrieval Agent Integration
 
-Future work - extend AnswerAgent to detect `IsNavigable()` graph indexes and use tree navigation with summaries.
+The current native Retrieval Agent owns tree navigation with summaries. See `zig/A2A.md` for the current native-agent
+surface.
 
 ---
 
@@ -423,8 +424,8 @@ For each document + field-based edge type:
 16. Add handlebars template rendering (reuse `lib/template.Render()`)
 17. Add tests for summary generation
 
-### Phase 6: AnswerAgent Integration (follow-up PR)
-18. Detect navigable graph in AnswerAgent
+### Phase 6: Retrieval Agent Integration
+18. Detect navigable graph indexes in the Retrieval Agent
 19. Implement tree navigation logic
 20. Add e2e tests
 

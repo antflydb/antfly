@@ -69,7 +69,10 @@ pub fn main(init: std.process.Init) !void {
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
-            return runCliCommand(init.gpa, cli_cmd, &args);
+            return runCliCommand(init.gpa, cli_cmd, &args) catch |err| switch (err) {
+                error.ApiError => std.process.exit(1),
+                else => return err,
+            };
         }
     }
 

@@ -16322,6 +16322,64 @@ fn containsStoreWriteKey(list: []const docstore_mod.KVPair, key: []const u8) boo
     return false;
 }
 
+const BorrowedGraphMaterializationBatch = struct {
+    writes: []docstore_mod.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.writes.len > 0) alloc.free(self.writes);
+        if (self.deletes.len > 0) alloc.free(self.deletes);
+        self.* = .{};
+    }
+};
+
+fn storeValueDiffers(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8, value: []const u8) !bool {
+    const existing = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return true,
+        else => return err,
+    };
+    defer alloc.free(existing);
+    return !std.mem.eql(u8, existing, value);
+}
+
+fn storeContainsKey(alloc: Allocator, store: *docstore_mod.DocStore, key: []const u8) !bool {
+    const existing = store.get(alloc, key) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    alloc.free(existing);
+    return true;
+}
+
+fn filterChangedGraphMaterializationBatch(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    writes: []const docstore_mod.KVPair,
+    deletes: []const []const u8,
+) !BorrowedGraphMaterializationBatch {
+    var changed_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    errdefer changed_writes.deinit(alloc);
+    for (writes) |write| {
+        if (try storeValueDiffers(alloc, store, write.key, write.value)) {
+            try changed_writes.append(alloc, write);
+        }
+    }
+
+    var changed_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer changed_deletes.deinit(alloc);
+    for (deletes) |key| {
+        if (containsStoreWriteKey(writes, key)) continue;
+        if (try storeContainsKey(alloc, store, key)) {
+            try changed_deletes.append(alloc, key);
+        }
+    }
+
+    return .{
+        .writes = try changed_writes.toOwnedSlice(alloc),
+        .deletes = try changed_deletes.toOwnedSlice(alloc),
+    };
+}
+
 fn appendAssetArtifactSourceIndexMutations(
     alloc: Allocator,
     store_writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
@@ -21207,7 +21265,11 @@ fn materializeGraphSourceArtifactsForIndex(
         state_value_owned = false;
 
         if (writes.items.len > 0 or deletes.items.len > 0) {
-            try store.putBatch(writes.items, deletes.items);
+            var changed_batch = try filterChangedGraphMaterializationBatch(alloc, store, writes.items, deletes.items);
+            defer changed_batch.deinit(alloc);
+            if (changed_batch.writes.len > 0 or changed_batch.deletes.len > 0) {
+                try store.putBatch(changed_batch.writes, changed_batch.deletes);
+            }
         }
     }
 
@@ -21346,7 +21408,11 @@ fn materializeMentionEdgesForResolutionKey(
     if (writes.items.len > 0 or mention_writes.items.len > 0 or deletes.items.len > 0) {
         const combined = try concatKVPairSlices(alloc, writes.items, mention_writes.items);
         defer alloc.free(combined);
-        try store.putBatch(combined, deletes.items);
+        var changed_batch = try filterChangedGraphMaterializationBatch(alloc, store, combined, deletes.items);
+        defer changed_batch.deinit(alloc);
+        if (changed_batch.writes.len > 0 or changed_batch.deletes.len > 0) {
+            try store.putBatch(changed_batch.writes, changed_batch.deletes);
+        }
     }
 }
 

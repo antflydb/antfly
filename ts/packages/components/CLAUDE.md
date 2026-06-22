@@ -82,14 +82,14 @@ The library uses Antfly's query DSL (match, conjuncts, disjuncts) and communicat
 ### RAG/AI Components
 - **RAGBox**: Search input for retrieval-augmented generation queries (can contain Autosuggest)
 - **RAGResults**: Display RAG results with streaming summary support
-- **AnswerBox**: Search input for Answer Agent queries (can contain Autosuggest)
-- **AnswerResults**: Display Answer Agent results with streaming reasoning and answers
+- **AnswerBox**: Legacy-named search input for Retrieval Agent queries (can contain Autosuggest)
+- **AnswerResults**: Legacy-named Retrieval Agent results component with streaming reasoning and answers
 - **AnswerFeedback**: Collect user ratings and comments on AI-generated answers (see `docs/feedback.md`)
 
 ### Hooks
 - **useSearchHistory**: Manage search history with localStorage persistence (max results configurable, 0 to disable)
-- **useAnswerStream**: Stream Answer Agent responses with state management (answer, reasoning, classification, hits, follow-up questions)
-- **useCitations**: Parse and render citations in RAG/Answer Agent responses (supports `[resource_id X]` and `[X]` formats)
+- **useAnswerStream**: Stream Retrieval Agent responses with state management (answer, reasoning, classification, hits, follow-up questions)
+- **useCitations**: Parse and render citations in RAG and Retrieval Agent responses (supports `[resource_id X]` and `[X]` formats)
 
 ### Internal Components
 - **Listener**: Internal component that coordinates queries (not typically used directly)
@@ -101,13 +101,13 @@ The library depends on `@antfly/sdk` (from `ts/` directory) which provides:
 - `AntflyClient`: HTTP client for Antfly API
 - Type definitions for queries and responses
 - Multi-query support via `multiquery()`
-- Streaming support for RAG and Answer Agent
+- Streaming support for RAG and the Retrieval Agent
 
 Client initialization happens in `Antfly` component via `initializeAntflyClient()`. The client is stored as a singleton accessible via `getAntflyClient()`.
 
-### Streaming RAG and Answer Agent
+### Streaming RAG and Retrieval Agent
 
-The library provides `streamRAG()` and `streamAnswer()` utilities (in `utils.ts`) for streaming responses:
+The library provides `streamRAG()` and the legacy-named `streamAnswer()` utility (in `utils.ts`) for streaming responses:
 
 ```typescript
 // RAG streaming
@@ -119,7 +119,7 @@ streamRAG(url, tableName, request, headers, {
   onRAGResult: (result) => { /* handle non-streaming result */ }
 });
 
-// Answer Agent streaming
+// Retrieval Agent streaming
 streamAnswer(url, request, headers, {
   onClassification: (data) => { /* handle query classification */ },
   onHit: (hit) => { /* handle search hit */ },
@@ -176,7 +176,7 @@ Widgets support a `table` prop to override the default table from `Antfly`:
 - Priority: `widget.table` > `Antfly.table`
 - Resolved via `resolveTable()` in utils.ts:144-154
 
-### Citation Handling (RAG/Answer Agent)
+### Citation Handling (RAG/Retrieval Agent)
 
 The `citations.ts` module provides utilities for parsing and rendering citations in AI responses:
 

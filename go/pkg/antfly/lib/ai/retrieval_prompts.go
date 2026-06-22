@@ -91,7 +91,7 @@ You have access to search tools that let you query the database. Analyze the use
 
 // RetrievalAgentSystemPromptWithoutTools builds the system prompt for Ollama-style
 // structured output fallback (no native tool calling).
-func RetrievalAgentSystemPromptWithoutTools(availableIndexes []IndexInfo, tableSchema string, agentKnowledge string) string {
+func RetrievalAgentSystemPromptWithoutTools(availableIndexes []IndexInfo, toolsConfig ChatToolsConfig, tableSchema string, agentKnowledge string) string {
 	var sb strings.Builder
 
 	sb.WriteString(`You are an intelligent retrieval agent with access to a document database. Your role is to find the most relevant documents to answer the user's query.
@@ -109,22 +109,27 @@ When you need to search or perform actions, use XML-like tags in your response.
 	for _, idx := range availableIndexes {
 		switch idx.Type {
 		case "embeddings", "aknn_v0":
-			hasAknn = true
+			hasAknn = toolsConfig.IsToolEnabled(ToolNameSemanticSearch)
 		case "full_text", "full_text_v0":
-			hasFullText = true
+			hasFullText = toolsConfig.IsToolEnabled(ToolNameFullTextSearch)
 		case "graph", "graph_v0":
 			hasGraph = true
 		}
 	}
 
-	sb.WriteString(`### Add a filter:
+	if toolsConfig.IsToolEnabled(ToolNameFilter) {
+		sb.WriteString(`### Add a filter:
 <filter>
 field: field_name
 operator: eq|ne|gt|gte|lt|lte|contains|prefix|range|in
 value: filter_value
 </filter>
 
-### Ask for clarification:
+`)
+	}
+
+	if toolsConfig.IsToolEnabled(ToolNameClarification) {
+		sb.WriteString(`### Ask for clarification:
 <clarification>
 question: Your clarifying question here
 options:
@@ -133,6 +138,7 @@ options:
 </clarification>
 
 `)
+	}
 
 	if hasAknn {
 		sb.WriteString(`### Semantic search (vector similarity):
@@ -156,7 +162,7 @@ limit: 10
 `)
 	}
 
-	if hasGraph {
+	if hasGraph && toolsConfig.IsToolEnabled(ToolNameTreeSearch) {
 		sb.WriteString(`### Tree search (hierarchical navigation):
 <tree_search>
 query: Your query for tree exploration
@@ -166,6 +172,11 @@ max_depth: 3
 beam_width: 3
 </tree_search>
 
+`)
+	}
+
+	if hasGraph && toolsConfig.IsToolEnabled(ToolNameGraphSearch) {
+		sb.WriteString(`
 ### Graph search (relationship traversal):
 <graph_search>
 start_node: node_id
@@ -174,6 +185,16 @@ edge_type: relationship_type
 direction: outgoing|incoming|both
 depth: 1
 </graph_search>
+
+`)
+	}
+
+	if toolsConfig.IsToolEnabled(ToolNameAggregate) {
+		sb.WriteString(`### Aggregate:
+<aggregate>
+table: optional_table_name
+aggregations: {"by_field":{"type":"terms","field":"field_name","size":10}}
+</aggregate>
 
 `)
 	}
@@ -213,12 +234,28 @@ depth: 1
 	sb.WriteString(`## Guidelines
 
 - Start with the most likely search action based on the query type
-- Use semantic_search for natural language questions and conceptual queries
-- Use full_text_search for keyword/phrase matching and exact terms
-- Use tree_search to navigate hierarchical document structures
-- Use graph_search to explore relationships between documents
-- Use ask_clarification ONLY if the query is truly ambiguous
-- You can combine multiple actions in one response
+`)
+
+	if hasAknn {
+		sb.WriteString("- Use semantic_search for natural language questions and conceptual queries\n")
+	}
+	if hasFullText {
+		sb.WriteString("- Use full_text_search for keyword/phrase matching and exact terms\n")
+	}
+	if hasGraph && toolsConfig.IsToolEnabled(ToolNameTreeSearch) {
+		sb.WriteString("- Use tree_search to navigate hierarchical document structures\n")
+	}
+	if hasGraph && toolsConfig.IsToolEnabled(ToolNameGraphSearch) {
+		sb.WriteString("- Use graph_search to explore relationships between documents\n")
+	}
+	if toolsConfig.IsToolEnabled(ToolNameAggregate) {
+		sb.WriteString("- Use aggregate for counts, grouped buckets, statistics, histograms, and summary metrics\n")
+	}
+	if toolsConfig.IsToolEnabled(ToolNameClarification) {
+		sb.WriteString("- Use ask_clarification ONLY if the query is truly ambiguous\n")
+	}
+
+	sb.WriteString(`- You can combine multiple actions in one response
 - When you have found sufficient relevant documents, stop using actions and provide your final response
 - Cite documents using their IDs: [resource_id <ID>]
 `)

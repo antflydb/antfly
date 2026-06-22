@@ -9,12 +9,12 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.chat_tools_config import ChatToolsConfig
     from ..models.classification_step_config import ClassificationStepConfig
     from ..models.confidence_step_config import ConfidenceStepConfig
     from ..models.eval_config import EvalConfig
     from ..models.followup_step_config import FollowupStepConfig
     from ..models.generation_step_config import GenerationStepConfig
+    from ..models.retrieval_step_config import RetrievalStepConfig
 
 
 T = TypeVar("T", bound="RetrievalAgentSteps")
@@ -27,15 +27,12 @@ class RetrievalAgentSteps:
     If a step is not configured, it is skipped (retrieval always runs).
 
         Attributes:
-            tools (ChatToolsConfig | Unset): Configuration for chat agent tools.
-
-                If `enabled_tools` is empty/omitted, defaults to: add_filter, ask_clarification, search.
-
-                For models that don't support native tool calling (e.g., Ollama),
-                a prompt-based fallback is used with structured output parsing.
             classification (ClassificationStepConfig | Unset): Configuration for the classification step. This step analyzes
                 the query,
                 selects the optimal retrieval strategy, and generates semantic transformations.
+            retrieval (RetrievalStepConfig | Unset): Configuration for the retrieval step. Retrieval tools are constrained
+                by
+                the top-level request tools policy when both are present.
             generation (GenerationStepConfig | Unset): Configuration for the generation step. This step generates the final
                 response from retrieved documents using the reasoning as context.
             followup (FollowupStepConfig | Unset): Configuration for generating follow-up questions. Uses a separate
@@ -44,11 +41,11 @@ class RetrievalAgentSteps:
             confidence (ConfidenceStepConfig | Unset): Configuration for confidence assessment. Evaluates answer quality and
                 resource relevance. Can use a model calibrated for scoring tasks.
             eval_ (EvalConfig | Unset): Configuration for inline evaluation of query results.
-                Add to RAGRequest, QueryRequest, or AnswerAgentRequest.
+                Add to RetrievalAgentRequest, QueryRequest, or other evaluation-capable request schemas.
     """
 
-    tools: ChatToolsConfig | Unset = UNSET
     classification: ClassificationStepConfig | Unset = UNSET
+    retrieval: RetrievalStepConfig | Unset = UNSET
     generation: GenerationStepConfig | Unset = UNSET
     followup: FollowupStepConfig | Unset = UNSET
     confidence: ConfidenceStepConfig | Unset = UNSET
@@ -56,13 +53,13 @@ class RetrievalAgentSteps:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        tools: dict[str, Any] | Unset = UNSET
-        if not isinstance(self.tools, Unset):
-            tools = self.tools.to_dict()
-
         classification: dict[str, Any] | Unset = UNSET
         if not isinstance(self.classification, Unset):
             classification = self.classification.to_dict()
+
+        retrieval: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.retrieval, Unset):
+            retrieval = self.retrieval.to_dict()
 
         generation: dict[str, Any] | Unset = UNSET
         if not isinstance(self.generation, Unset):
@@ -83,10 +80,10 @@ class RetrievalAgentSteps:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
-        if tools is not UNSET:
-            field_dict["tools"] = tools
         if classification is not UNSET:
             field_dict["classification"] = classification
+        if retrieval is not UNSET:
+            field_dict["retrieval"] = retrieval
         if generation is not UNSET:
             field_dict["generation"] = generation
         if followup is not UNSET:
@@ -100,27 +97,27 @@ class RetrievalAgentSteps:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.chat_tools_config import ChatToolsConfig
         from ..models.classification_step_config import ClassificationStepConfig
         from ..models.confidence_step_config import ConfidenceStepConfig
         from ..models.eval_config import EvalConfig
         from ..models.followup_step_config import FollowupStepConfig
         from ..models.generation_step_config import GenerationStepConfig
+        from ..models.retrieval_step_config import RetrievalStepConfig
 
         d = dict(src_dict)
-        _tools = d.pop("tools", UNSET)
-        tools: ChatToolsConfig | Unset
-        if isinstance(_tools, Unset):
-            tools = UNSET
-        else:
-            tools = ChatToolsConfig.from_dict(_tools)
-
         _classification = d.pop("classification", UNSET)
         classification: ClassificationStepConfig | Unset
         if isinstance(_classification, Unset):
             classification = UNSET
         else:
             classification = ClassificationStepConfig.from_dict(_classification)
+
+        _retrieval = d.pop("retrieval", UNSET)
+        retrieval: RetrievalStepConfig | Unset
+        if isinstance(_retrieval, Unset):
+            retrieval = UNSET
+        else:
+            retrieval = RetrievalStepConfig.from_dict(_retrieval)
 
         _generation = d.pop("generation", UNSET)
         generation: GenerationStepConfig | Unset
@@ -151,8 +148,8 @@ class RetrievalAgentSteps:
             eval_ = EvalConfig.from_dict(_eval_)
 
         retrieval_agent_steps = cls(
-            tools=tools,
             classification=classification,
+            retrieval=retrieval,
             generation=generation,
             followup=followup,
             confidence=confidence,

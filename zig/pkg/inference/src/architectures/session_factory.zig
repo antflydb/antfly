@@ -4298,6 +4298,60 @@ pub fn getFlorenceConfig(session: Session) ?florence_mod.Config {
     };
 }
 
+pub fn runFlorenceEncoderResident(
+    session: Session,
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    pixel_values: []const f32,
+    batch: usize,
+    prompt_input_ids: []const i64,
+    prompt_seq_len: usize,
+) !?florence_arch.EncoderForwardTensorResult {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .florence => |cfg| try florence_arch.encoderForwardTensor(
+            cb,
+            allocator,
+            cfg,
+            pixel_values,
+            batch,
+            prompt_input_ids,
+            prompt_seq_len,
+        ),
+        else => null,
+    };
+}
+
+pub fn runFlorenceDecoderResident(
+    session: Session,
+    cb: *const ops.ComputeBackend,
+    allocator: std.mem.Allocator,
+    decoder_input_ids: []const i64,
+    encoder_hidden: ops.CT,
+    encoder_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+) !?ops.CT {
+    if (session.vtable != &arch_vtable) return null;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    return switch (self.arch_config) {
+        .florence => |cfg| try florence_arch.decoderForwardTensor(
+            cb,
+            allocator,
+            cfg,
+            decoder_input_ids,
+            encoder_hidden,
+            encoder_mask,
+            batch,
+            dec_seq,
+            enc_seq,
+        ),
+        else => null,
+    };
+}
+
 /// Get a ComputeBackend from an architecture session.
 pub fn getComputeBackend(session: Session, allocator: std.mem.Allocator) !ops.ComputeBackend {
     if (session.vtable != &arch_vtable) return error.NotArchSession;

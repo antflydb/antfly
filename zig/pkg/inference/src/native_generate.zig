@@ -893,14 +893,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
                 },
             );
             print(
-                "metal_active_decode_kernels: attention_f32={d} q8_0_linear={d} q8_0_attn_linear={d} q8_0_ffn_down={d} q8_0_ple={d} q8_0_pair_activation={d} rms_norm={d} rms_norm_add={d} layer_norm={d} add={d} head_norm_rope_fused={d} blit={d}\n",
+                "metal_active_decode_kernels: attention_f32={d} quant_linear={d} quant_attn_linear={d} quant_ffn_down={d} quant_ple={d} quant_gate_up_pair={d} rms_norm={d} rms_norm_add={d} layer_norm={d} add={d} head_norm_rope_fused={d} blit={d}\n",
                 .{
                     metal_snapshot.provider.active_decode_attention_f32_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_attention_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_ffn_down_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_ple_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_pair_activation_kernels,
+                    metal_snapshot.provider.active_decode_quant_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_attention_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_ffn_down_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_ple_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_gate_up_pair_kernels,
                     metal_snapshot.provider.active_decode_rms_norm_kernels,
                     metal_snapshot.provider.active_decode_rms_norm_add_kernels,
                     metal_snapshot.provider.active_decode_layer_norm_kernels,
@@ -3109,14 +3109,14 @@ fn tryRunLiveWholeModelExecutorGenerate(
                 },
             );
             print(
-                "metal_active_decode_kernels: attention_f32={d} q8_0_linear={d} q8_0_attn_linear={d} q8_0_ffn_down={d} q8_0_ple={d} q8_0_pair_activation={d} rms_norm={d} rms_norm_add={d} layer_norm={d} add={d} head_norm_rope_fused={d} blit={d}\n",
+                "metal_active_decode_kernels: attention_f32={d} quant_linear={d} quant_attn_linear={d} quant_ffn_down={d} quant_ple={d} quant_gate_up_pair={d} rms_norm={d} rms_norm_add={d} layer_norm={d} add={d} head_norm_rope_fused={d} blit={d}\n",
                 .{
                     metal_snapshot.provider.active_decode_attention_f32_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_attention_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_ffn_down_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_ple_linear_kernels,
-                    metal_snapshot.provider.active_decode_q8_0_pair_activation_kernels,
+                    metal_snapshot.provider.active_decode_quant_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_attention_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_ffn_down_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_ple_linear_kernels,
+                    metal_snapshot.provider.active_decode_quant_gate_up_pair_kernels,
                     metal_snapshot.provider.active_decode_rms_norm_kernels,
                     metal_snapshot.provider.active_decode_rms_norm_add_kernels,
                     metal_snapshot.provider.active_decode_layer_norm_kernels,
