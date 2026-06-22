@@ -1725,10 +1725,9 @@ pub fn valueEqualsAnyArrayPredicateCanStart(tokens: []const Token, pos: usize) b
             break :blk pos + 2;
         },
         .identifier => blk: {
-            const text = tokens[pos].text;
-            if (!std.ascii.eqlIgnoreCase(text, "null") and
-                !std.ascii.eqlIgnoreCase(text, "true") and
-                !std.ascii.eqlIgnoreCase(text, "false"))
+            if (!tokens[pos].matchesKeywordTag(.null) and
+                !tokens[pos].matchesKeywordTag(.true) and
+                !tokens[pos].matchesKeywordTag(.false))
             {
                 return false;
             }
@@ -1739,7 +1738,8 @@ pub fn valueEqualsAnyArrayPredicateCanStart(tokens: []const Token, pos: usize) b
     if (value_end + 3 >= tokens.len) return false;
     return tokens[value_end].kind == .eq and
         tokens[value_end + 1].kind == .identifier and
-        sqlKeywordIsAnyOrSome(tokens[value_end + 1].text) and
+        (tokens[value_end + 1].matchesKeywordTag(.any) or
+            tokens[value_end + 1].matchesKeywordTag(.some)) and
         tokens[value_end + 2].kind == .lparen and
         tokens[value_end + 3].kind == .identifier;
 }
@@ -7274,8 +7274,9 @@ pub fn jsonExtractMembershipPredicateCanStartAt(tokens: []const Token, index: us
     if (op.kind == .eq or op.kind == .neq) {
         return index + 4 < tokens.len and
             tokens[index + 4].kind == .identifier and
-            (sqlKeywordIsAnyOrSome(tokens[index + 4].text) or
-                std.ascii.eqlIgnoreCase(tokens[index + 4].text, "all"));
+            (tokens[index + 4].matchesKeywordTag(.any) or
+                tokens[index + 4].matchesKeywordTag(.some) or
+                tokens[index + 4].matchesKeywordTag(.all));
     }
     return false;
 }
@@ -11623,7 +11624,7 @@ pub fn topLevelWindowClauseStart(tokens: []const Token, pos: usize) ?usize {
             .rparen => if (depth > 0) {
                 depth -= 1;
             },
-            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "window")) return i,
+            .identifier => if (depth == 0 and token.matchesKeywordTag(.window)) return i,
             .semicolon => if (depth == 0) return null,
             else => {},
         }
@@ -24125,6 +24126,32 @@ test "sql adapter expression keyword predicates classify function and tail token
     const unsupported_tail_tokens = [_]Token{.{ .kind = .identifier, .text = "LATERAL", .keyword = .lateral }};
     try std.testing.expect(nextIsUnsupportedQueryKeyword(unsupported_tail_tokens[0..], 0));
 
+    const top_level_window_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "SELECT", .keyword = .select },
+        .{ .kind = .identifier, .text = "WINDOW", .keyword = .window },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), topLevelWindowClauseStart(top_level_window_tokens[0..], 0));
+    const quoted_window_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "window", .source_start = 0, .source_end = 8 },
+    };
+    try std.testing.expect(topLevelWindowClauseStart(quoted_window_tokens[0..], 0) == null);
+    const value_any_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "TRUE", .keyword = .true },
+        .{ .kind = .eq, .text = "=" },
+        .{ .kind = .identifier, .text = "ANY", .keyword = .any },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "flags" },
+    };
+    try std.testing.expect(valueEqualsAnyArrayPredicateCanStart(value_any_tokens[0..], 0));
+    const quoted_value_any_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "true", .source_start = 0, .source_end = 6 },
+        .{ .kind = .eq, .text = "=" },
+        .{ .kind = .identifier, .text = "any", .source_start = 9, .source_end = 14 },
+        .{ .kind = .lparen, .text = "(" },
+        .{ .kind = .identifier, .text = "flags" },
+    };
+    try std.testing.expect(!valueEqualsAnyArrayPredicateCanStart(quoted_value_any_tokens[0..], 0));
+
     const length_tokens = [_]Token{
         .{ .kind = .identifier, .text = "char_length" },
         .{ .kind = .lparen, .text = "(" },
@@ -33237,6 +33264,14 @@ test "sql adapter lower expr detects catalog expression references" {
         .{ .kind = .identifier, .text = "in" },
     };
     try std.testing.expect(jsonExtractMembershipPredicateCanStartAt(&json_membership_tokens, 0));
+    const json_all_membership_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .arrow_text, .text = "->>" },
+        .{ .kind = .string, .text = "status" },
+        .{ .kind = .eq, .text = "=" },
+        .{ .kind = .identifier, .text = "ALL", .keyword = .all },
+    };
+    try std.testing.expect(jsonExtractMembershipPredicateCanStartAt(&json_all_membership_tokens, 0));
     const not_group_tokens = [_]Token{
         .{ .kind = .identifier, .text = "not" },
         .{ .kind = .lparen, .text = "(" },

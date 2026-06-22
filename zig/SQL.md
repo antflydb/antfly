@@ -749,6 +749,11 @@ Current implementation status:
 - Generated-column expression matching also uses token keyword metadata for
   `lower`, `upper`, `md5`, `concat`, and `concat_ws` instead of local
   case-insensitive token-text checks.
+- Window-clause discovery and JSON extraction membership probes use token
+  keyword tags for `WINDOW`, `ANY`, `SOME`, and `ALL`.
+- SQL/API parity fixture callbacks receive the already parsed corpus statement
+  when deriving applied DDL fingerprints, so generated-fixture and metadata
+  validation paths do not re-tokenize the statement after ingress parsing.
 - HTTP relational SQL DDL execution, source-backed DDL application, bulk SQL,
   and auth-catalog DDL helpers construct `ParsedSql` once at ingress before
   lowering DDL/session control plans, and transaction-boundary session cleanup

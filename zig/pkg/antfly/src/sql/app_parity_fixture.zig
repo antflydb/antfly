@@ -26,6 +26,7 @@ pub const AppParityFixtureMetadataCallbacks = struct {
         std.mem.Allocator,
         []const u8,
         corpus.AppParityCorpusEntry,
+        *const tokenized.ParsedSql,
     ) anyerror![]u8,
 };
 
@@ -34,6 +35,7 @@ pub const AppParityFixtureGenerationCallbacks = struct {
         std.mem.Allocator,
         []const u8,
         corpus.AppParityCorpusEntry,
+        *const tokenized.ParsedSql,
     ) anyerror![]u8,
 };
 
@@ -57,7 +59,9 @@ pub fn fixtureJsonAlloc(
     for (entries) |entry| {
         var applied_plan = entry.applied_plan;
         if (applied_plan.len == 0 and try corpus.corpusDdlFixtureRequiresAppliedPlan(entry)) {
-            const derived_applied_plan = callbacks.applied_ddl_plan(alloc, schema_json, entry) catch |err| switch (err) {
+            var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+            defer parsed_sql.deinit(alloc);
+            const derived_applied_plan = callbacks.applied_ddl_plan(alloc, schema_json, entry, &parsed_sql) catch |err| switch (err) {
                 error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
                     try skipped_entries.append(alloc, entry.name);
                     continue;
@@ -109,10 +113,11 @@ fn appParityFixtureAppliedPlanMatchesDerived(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
     entry: corpus.AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
     callbacks: AppParityFixtureMetadataCallbacks,
 ) !bool {
     if (entry.applied_plan.len == 0) return true;
-    const derived = callbacks.applied_ddl_plan(alloc, base_schema_json, entry) catch |err| switch (err) {
+    const derived = callbacks.applied_ddl_plan(alloc, base_schema_json, entry, parsed_sql) catch |err| switch (err) {
         error.InvalidSqlCatalog,
         error.UnsupportedSqlShape,
         error.InvalidSchemaUpdateRequest,
@@ -143,7 +148,7 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
         break :blk owned_applied_base_schema_json.?;
     } else "";
     if (entry.applied_plan.len > 0) {
-        if (!(try appParityFixtureAppliedPlanMatchesDerived(alloc, applied_base_schema_json, entry, callbacks))) {
+        if (!(try appParityFixtureAppliedPlanMatchesDerived(alloc, applied_base_schema_json, entry, &parsed_sql, callbacks))) {
             return error.TestUnexpectedResult;
         }
     }
