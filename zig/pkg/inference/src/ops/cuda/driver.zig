@@ -28,6 +28,7 @@ pub const CUevent = ?*anyopaque;
 pub const CUjit_option = c_uint;
 pub const CUstreamCaptureMode = c_uint;
 pub const CUgraphExecUpdateResult = c_uint;
+pub const CUgraphInstantiateResult = c_uint;
 pub const CUDA_SUCCESS: CUresult = 0;
 pub const CU_EVENT_DEFAULT: c_uint = 0;
 pub const CU_EVENT_DISABLE_TIMING: c_uint = 2;
@@ -46,6 +47,13 @@ pub const CU_GRAPH_EXEC_UPDATE_ERROR_NOT_SUPPORTED: CUgraphExecUpdateResult = 6;
 pub const CU_GRAPH_EXEC_UPDATE_ERROR_UNSUPPORTED_FUNCTION_CHANGE: CUgraphExecUpdateResult = 7;
 pub const CU_GRAPH_EXEC_UPDATE_ERROR_ATTRIBUTES_CHANGED: CUgraphExecUpdateResult = 8;
 
+pub const CUDA_GRAPH_INSTANTIATE_SUCCESS: CUgraphInstantiateResult = 0;
+pub const CUDA_GRAPH_INSTANTIATE_ERROR: CUgraphInstantiateResult = 1;
+pub const CUDA_GRAPH_INSTANTIATE_INVALID_STRUCTURE: CUgraphInstantiateResult = 2;
+pub const CUDA_GRAPH_INSTANTIATE_NODE_OPERATION_NOT_SUPPORTED: CUgraphInstantiateResult = 3;
+pub const CUDA_GRAPH_INSTANTIATE_MULTIPLE_CTXS_NOT_SUPPORTED: CUgraphInstantiateResult = 4;
+pub const CUDA_GRAPH_INSTANTIATE_CONDITIONAL_HANDLE_UNUSED: CUgraphInstantiateResult = 5;
+
 pub const CUgraphExecUpdateResultInfo = extern struct {
     result: CUgraphExecUpdateResult = CU_GRAPH_EXEC_UPDATE_ERROR,
     errorNode: CUgraphNode = null,
@@ -57,6 +65,13 @@ pub const CUgraphExecUpdateFn = *const fn (
     hGraph: CUgraph,
     resultInfo: *CUgraphExecUpdateResultInfo,
 ) callconv(.c) CUresult;
+
+pub const CUDA_GRAPH_INSTANTIATE_PARAMS = extern struct {
+    flags: c_ulonglong = 0,
+    hUploadStream: CUstream = null,
+    hErrNode_out: CUgraphNode = null,
+    result_out: CUgraphInstantiateResult = CUDA_GRAPH_INSTANTIATE_SUCCESS,
+};
 
 pub const CU_JIT_INFO_LOG_BUFFER: CUjit_option = 3;
 pub const CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES: CUjit_option = 4;
@@ -121,6 +136,7 @@ pub const CudaDriver = struct {
             extra: ?[*]?*anyopaque,
         ) callconv(.c) CUresult,
         cuGraphInstantiate: *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, flags: c_ulonglong) callconv(.c) CUresult,
+        cuGraphInstantiateWithParams: ?*const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult,
         cuGraphExecUpdate: ?CUgraphExecUpdateFn,
         cuGraphLaunch: *const fn (hGraphExec: CUgraphExec, hStream: CUstream) callconv(.c) CUresult,
         cuGraphExecDestroy: *const fn (hGraphExec: CUgraphExec) callconv(.c) CUresult,
@@ -167,6 +183,7 @@ pub const CudaDriver = struct {
                 .cuModuleGetFunction = lookup(&lib, @TypeOf(@as(Table, undefined).cuModuleGetFunction), "cuModuleGetFunction") catch return error.CudaSymbolMissing,
                 .cuLaunchKernel = lookup(&lib, @TypeOf(@as(Table, undefined).cuLaunchKernel), "cuLaunchKernel") catch return error.CudaSymbolMissing,
                 .cuGraphInstantiate = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphInstantiate), "cuGraphInstantiateWithFlags") catch return error.CudaSymbolMissing,
+                .cuGraphInstantiateWithParams = lookupOptional(&lib, *const fn (phGraphExec: *CUgraphExec, hGraph: CUgraph, instantiateParams: *CUDA_GRAPH_INSTANTIATE_PARAMS) callconv(.c) CUresult, "cuGraphInstantiateWithParams"),
                 .cuGraphExecUpdate = lib.lookup(CUgraphExecUpdateFn, "cuGraphExecUpdate_v2"),
                 .cuGraphLaunch = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphLaunch), "cuGraphLaunch") catch return error.CudaSymbolMissing,
                 .cuGraphExecDestroy = lookup(&lib, @TypeOf(@as(Table, undefined).cuGraphExecDestroy), "cuGraphExecDestroy") catch return error.CudaSymbolMissing,

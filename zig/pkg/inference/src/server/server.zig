@@ -75,6 +75,15 @@ const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
 pub const metrics_mod = @import("metrics.zig");
 const request_queue_mod = @import("request_queue.zig");
 
+fn shouldSkipAutoMtpDraftLoad(config: generation.GenerationConfig, draft_cfg: gpt_model_mod.Config) bool {
+    if (config.speculation_policy != .auto) return false;
+    if (!draft_cfg.gemma4_mtp_assistant) return false;
+    if (config.speculation_calibration == .none) return true;
+    if (!generation.gemma4MtpTargetReplayLikelyActive()) return true;
+    const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
+    return requested_max_tokens < generation.gemma4MtpAutoMinGenerationTokens();
+}
+
 pub const BudgetOverrides = struct {
     host_limit_bytes: usize = 0,
     backend_limit_bytes: usize = 0,
@@ -1985,6 +1994,7 @@ pub const Node = struct {
                 if (body.speculative_k) |k| @intCast(@max(k, 1)) else 4
             else
                 4,
+            .speculation_requested = effective_draft_model_name != null,
             .prefill_chunk_size = 256,
             .cache_dtype = body.cache_dtype,
             .cache_compaction_ratio = body.cache_compaction_ratio,
@@ -2325,45 +2335,59 @@ pub const Node = struct {
             const draft_model_path = self.resolveModelPath(ctx.io, draft_model_name, "generators") catch
                 return ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = "draft model not found" });
             if (!std.mem.eql(u8, draft_model_path, model_path)) {
-                const draft_model = if (backend_selection.native_choice != .auto) blk: {
-                    var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
-                    configureGenerateBackendPreference(&request_session_manager, backend_selection);
-                    break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
+                config.draft_model = draft_model_path;
+                var load_draft_backend = true;
+                if (config.speculation_policy == .auto) {
+                    var draft_manifest = manifest_mod.loadFromDir(ctx.allocator, draft_model_path) catch |err|
                         return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                } else self.model_manager.loadFromDir(draft_model_path) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
-                const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_MODEL",
-                        .message = "draft_model does not support generation",
-                    });
-                const draft_tok = draft_model.getTokenizer();
-                const target_special = tok.specialTokens();
-                const draft_special = draft_tok.specialTokens();
-                if (draft_tok.vocabSize() != tok.vocabSize() or
-                    draft_cfg.vocab_size != gpt_config.vocab_size or
-                    draft_special.cls_id != target_special.cls_id or
-                    draft_special.sep_id != target_special.sep_id or
-                    draft_special.pad_id != target_special.pad_id or
-                    draft_special.unk_id != target_special.unk_id)
-                {
-                    return ctx.status(400).json(.{
-                        .@"error" = "INVALID_REQUEST",
-                        .message = "draft_model tokenizer is incompatible with target model",
-                    });
+                    defer draft_manifest.deinit();
+                    const draft_cfg = session_factory.loadGptConfigFromModelDir(ctx.allocator, draft_model_path, draft_manifest) catch |err|
+                        return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) });
+                    if (shouldSkipAutoMtpDraftLoad(config, draft_cfg)) {
+                        draft_gpt_config = draft_cfg;
+                        load_draft_backend = false;
+                    }
                 }
-
-                draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
-                    if (err == error.MemoryBudgetExceeded) {
-                        return ctx.status(507).json(.{
-                            .@"error" = "MEMORY_BUDGET_EXCEEDED",
-                            .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
+                if (load_draft_backend) {
+                    const draft_model = if (backend_selection.native_choice != .auto) blk: {
+                        var request_session_manager = backends_mod.SessionManager.init(ctx.allocator);
+                        configureGenerateBackendPreference(&request_session_manager, backend_selection);
+                        break :blk self.model_manager.loadFromDirWithPreferredBackends(draft_model_path, request_session_manager.preferred_backends, false) catch |err|
+                            return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    } else self.model_manager.loadFromDir(draft_model_path) catch |err|
+                        return ctx.status(500).json(.{ .@"error" = "MODEL_LOAD_FAILED", .message = @errorName(err) });
+                    const draft_cfg = session_factory.getGptConfig(draft_model.session) orelse
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_MODEL",
+                            .message = "draft_model does not support generation",
+                        });
+                    const draft_tok = draft_model.getTokenizer();
+                    const target_special = tok.specialTokens();
+                    const draft_special = draft_tok.specialTokens();
+                    if (draft_tok.vocabSize() != tok.vocabSize() or
+                        draft_cfg.vocab_size != gpt_config.vocab_size or
+                        draft_special.cls_id != target_special.cls_id or
+                        draft_special.sep_id != target_special.sep_id or
+                        draft_special.pad_id != target_special.pad_id or
+                        draft_special.unk_id != target_special.unk_id)
+                    {
+                        return ctx.status(400).json(.{
+                            .@"error" = "INVALID_REQUEST",
+                            .message = "draft_model tokenizer is incompatible with target model",
                         });
                     }
-                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-                };
-                draft_gpt_config = draft_cfg;
-                config.draft_model = draft_model_path;
+
+                    draft_cb = session_factory.getComputeBackendWithBudget(draft_model.session, ctx.allocator, &run_budget) catch |err| {
+                        if (err == error.MemoryBudgetExceeded) {
+                            return ctx.status(507).json(.{
+                                .@"error" = "MEMORY_BUDGET_EXCEEDED",
+                                .message = memoryBudgetExceededMessage(ctx.allocator, draft_model.session, &run_budget),
+                            });
+                        }
+                        return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                    };
+                    draft_gpt_config = draft_cfg;
+                }
             }
         }
 
@@ -2405,29 +2429,31 @@ pub const Node = struct {
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| state.deinit();
 
-        if (draft_gpt_config) |draft_cfg| {
-            // Draft model uses the same backend kind as the target — they run
-            // on the same machine so the available backends are identical.
-            const draft_backend_kind = backend_kind;
-            const draft_kv_dtype = session_factory.recommendedKvDTypeForGptConfig(draft_cfg, draft_backend_kind);
-            draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
-            const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
-                null
-            else if (draft_cfg.sliding_window > 0)
-                @intCast(draft_cfg.sliding_window)
-            else
-                null;
-            const draft_pool_id = draft_kv_manager.?.addPool(.{
-                .backend = draft_backend_kind,
-                .dtype = draft_kv_dtype,
-                .page_size_tokens = 16,
-                .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
-                .num_kv_heads = draft_cfg.num_key_value_heads,
-                .head_dim = draft_cfg.hidden_size / draft_cfg.num_attention_heads,
-                .sliding_window_size = draft_sliding_window_size,
-            }) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
-            draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
+        if (draft_cb != null) {
+            if (draft_gpt_config) |draft_cfg| {
+                // Draft model uses the same backend kind as the target — they run
+                // on the same machine so the available backends are identical.
+                const draft_backend_kind = backend_kind;
+                const draft_kv_dtype = session_factory.recommendedKvDTypeForGptConfig(draft_cfg, draft_backend_kind);
+                draft_kv_manager = runtime.kv.manager.KvManager.init(ctx.allocator);
+                const draft_sliding_window_size: ?u32 = if (draft_cfg.position_encoding == .absolute)
+                    null
+                else if (draft_cfg.sliding_window > 0)
+                    @intCast(draft_cfg.sliding_window)
+                else
+                    null;
+                const draft_pool_id = draft_kv_manager.?.addPool(.{
+                    .backend = draft_backend_kind,
+                    .dtype = draft_kv_dtype,
+                    .page_size_tokens = 16,
+                    .num_layers_packed = @intCast(draft_cfg.num_hidden_layers),
+                    .num_kv_heads = draft_cfg.num_key_value_heads,
+                    .head_dim = draft_cfg.hidden_size / draft_cfg.num_attention_heads,
+                    .sliding_window_size = draft_sliding_window_size,
+                }) catch |err|
+                    return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
+                draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
+            }
         }
 
         const graph_mode = backend_selection.graph_mode_requested or

@@ -48,6 +48,8 @@ pub const QMatmulVariant = enum {
 pub const KernelModule = struct {
     module: driver_mod.CUmodule = null,
     fill_f32: driver_mod.CUfunction = null,
+    copy_f32: driver_mod.CUfunction = null,
+    copy_u8: driver_mod.CUfunction = null,
     f32_to_bf16: driver_mod.CUfunction = null,
     scale_f32: driver_mod.CUfunction = null,
     add_scalar_f32: driver_mod.CUfunction = null,
@@ -99,7 +101,9 @@ pub const KernelModule = struct {
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
     rope_f32: driver_mod.CUfunction = null,
+    rope_decode_scalars_f32: driver_mod.CUfunction = null,
     rope_scaled_f32: driver_mod.CUfunction = null,
+    rope_scaled_decode_scalars_f32: driver_mod.CUfunction = null,
     rope_per_item_f32: driver_mod.CUfunction = null,
     rms_norm_heads_rope_f32: driver_mod.CUfunction = null,
     rms_norm_heads_rope_decode_scalars_f32: driver_mod.CUfunction = null,
@@ -194,6 +198,8 @@ pub const KernelModule = struct {
 
         var fill_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&fill_f32, module, "termite_fill_f32"));
+        const copy_f32 = loadOptionalFunction(ctx, module, "termite_copy_f32");
+        const copy_u8 = loadOptionalFunction(ctx, module, "termite_copy_u8");
         const f32_to_bf16 = loadOptionalFunction(ctx, module, "termite_f32_to_bf16");
         var scale_f32: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&scale_f32, module, "termite_scale_f32"));
@@ -278,7 +284,9 @@ pub const KernelModule = struct {
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
         const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
+        const rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_decode_scalars_f32");
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
+        const rope_scaled_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_decode_scalars_f32");
         const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
         const rms_norm_heads_rope_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_f32");
         const rms_norm_heads_rope_decode_scalars_f32 = loadOptionalFunction(ctx, module, "termite_rms_norm_heads_rope_decode_scalars_f32");
@@ -405,6 +413,8 @@ pub const KernelModule = struct {
         return .{
             .module = module,
             .fill_f32 = fill_f32,
+            .copy_f32 = copy_f32,
+            .copy_u8 = copy_u8,
             .f32_to_bf16 = f32_to_bf16,
             .scale_f32 = scale_f32,
             .add_scalar_f32 = add_scalar_f32,
@@ -456,7 +466,9 @@ pub const KernelModule = struct {
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
             .rope_f32 = rope_f32,
+            .rope_decode_scalars_f32 = rope_decode_scalars_f32,
             .rope_scaled_f32 = rope_scaled_f32,
+            .rope_scaled_decode_scalars_f32 = rope_scaled_decode_scalars_f32,
             .rope_per_item_f32 = rope_per_item_f32,
             .rms_norm_heads_rope_f32 = rms_norm_heads_rope_f32,
             .rms_norm_heads_rope_decode_scalars_f32 = rms_norm_heads_rope_decode_scalars_f32,
@@ -599,7 +611,9 @@ pub const KernelModule = struct {
             self.attention_f32 = null;
             self.attention_f32_block = null;
             self.rope_f32 = null;
+            self.rope_decode_scalars_f32 = null;
             self.rope_scaled_f32 = null;
+            self.rope_scaled_decode_scalars_f32 = null;
             self.rope_per_item_f32 = null;
             self.rms_norm_heads_rope_f32 = null;
             self.rms_norm_heads_rope_decode_scalars_f32 = null;
@@ -799,6 +813,52 @@ pub const KernelModule = struct {
             null,
         ));
         ctx.noteKernelLaunch();
+    }
+
+    pub fn launchCopyF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        count: usize,
+    ) driver_mod.Error!void {
+        const function = self.copy_f32 orelse return error.CudaKernelUnavailable;
+        try checkBytes(dst, count);
+        try checkBytes(src, count);
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var n = try toU32(count);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&n),
+        };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchCopyBytes(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        src: buffer_mod.DeviceBuffer,
+        len: usize,
+    ) driver_mod.Error!void {
+        const function = self.copy_u8 orelse return error.CudaKernelUnavailable;
+        try checkRawBytes(dst, len);
+        try checkRawBytes(src, len);
+        if (len == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var src_ptr = src.ptr;
+        var n = try toU32(len);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&src_ptr),
+            @ptrCast(&n),
+        };
+        try launch1d(function, ctx, len, &params);
     }
 
     pub fn launchLinearF32(
@@ -2866,6 +2926,69 @@ pub const KernelModule = struct {
         try launch1d(function, ctx, count, &params);
     }
 
+    pub fn launchRopeDecodeScalarsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        position_offset: usize,
+        seq_len: usize,
+        chunks_per_position: usize,
+        consecutive_pairs: bool,
+    ) driver_mod.Error!void {
+        const function = self.rope_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var head_dim_u32 = try toU32(head_dim);
+        var rope_dim_u32 = try toU32(rope_dim);
+        var theta_f32 = theta;
+        var freq_scale_f32 = freq_scale;
+        var position_offset_u32 = try toU32(position_offset);
+        var seq_len_u32 = try toU32(seq_len);
+        var chunks_per_position_u32 = try toU32(chunks_per_position);
+        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&rope_dim_u32),
+            @ptrCast(&theta_f32),
+            @ptrCast(&freq_scale_f32),
+            @ptrCast(&position_offset_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&chunks_per_position_u32),
+            @ptrCast(&consecutive_pairs_u32),
+            @ptrCast(&decode_scalars_ptr),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope_decode_scalars dst=0x{x} input=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                input_ptr,
+                decode_scalars_ptr,
+                position_offset_u32,
+                seq_len_u32,
+            });
+        }
+        try launch1d(function, ctx, count, &params);
+    }
+
     pub fn launchRopeScaledF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -2914,6 +3037,72 @@ pub const KernelModule = struct {
             @ptrCast(&consecutive_pairs_u32),
             @ptrCast(&scale_f32),
         };
+        try launch1d(function, ctx, count, &params);
+    }
+
+    pub fn launchRopeScaledDecodeScalarsF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        decode_scalars: buffer_mod.DeviceBuffer,
+        total_chunks: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        theta: f32,
+        freq_scale: f32,
+        position_offset: usize,
+        seq_len: usize,
+        chunks_per_position: usize,
+        consecutive_pairs: bool,
+        scale: f32,
+    ) driver_mod.Error!void {
+        const function = self.rope_scaled_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
+        const count = try checkedTensorElements(total_chunks, head_dim);
+        try checkBytes(dst, count);
+        try checkBytes(input, count);
+        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
+        if (count == 0) return;
+
+        var dst_ptr = dst.ptr;
+        var input_ptr = input.ptr;
+        var total_chunks_u32 = try toU32(total_chunks);
+        var head_dim_u32 = try toU32(head_dim);
+        var rope_dim_u32 = try toU32(rope_dim);
+        var theta_f32 = theta;
+        var freq_scale_f32 = freq_scale;
+        var position_offset_u32 = try toU32(position_offset);
+        var seq_len_u32 = try toU32(seq_len);
+        var chunks_per_position_u32 = try toU32(chunks_per_position);
+        var consecutive_pairs_u32: u32 = if (consecutive_pairs) 1 else 0;
+        var scale_f32 = scale;
+        var decode_scalars_ptr = decode_scalars.ptr;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&total_chunks_u32),
+            @ptrCast(&head_dim_u32),
+            @ptrCast(&rope_dim_u32),
+            @ptrCast(&theta_f32),
+            @ptrCast(&freq_scale_f32),
+            @ptrCast(&position_offset_u32),
+            @ptrCast(&seq_len_u32),
+            @ptrCast(&chunks_per_position_u32),
+            @ptrCast(&consecutive_pairs_u32),
+            @ptrCast(&scale_f32),
+            @ptrCast(&decode_scalars_ptr),
+        };
+        if (captureParamTraceIndex(ctx)) |trace_index| {
+            std.log.info("cuda_capture_param_trace: capture={d} index={d} kernel=rope_scaled_decode_scalars dst=0x{x} input=0x{x} scalars=0x{x} fallback_position_offset={d} seq_len={d}", .{
+                ctx.debug_graph_capture_id,
+                trace_index,
+                dst_ptr,
+                input_ptr,
+                decode_scalars_ptr,
+                position_offset_u32,
+                seq_len_u32,
+            });
+        }
         try launch1d(function, ctx, count, &params);
     }
 
@@ -3072,7 +3261,7 @@ pub const KernelModule = struct {
     ) driver_mod.Error!void {
         const function = self.rms_norm_heads_rope_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
         if (rows == 0 or total_dim == 0 or head_dim == 0 or total_dim % head_dim != 0 or rope_dim == 0 or rope_dim > head_dim or rope_dim % 2 != 0 or seq_len == 0) return error.InvalidCudaState;
-        try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         const total = try checkedTensorElements(rows, total_dim);
         const total_chunks = total / head_dim;
         const chunks_per_position = total_dim / head_dim;
@@ -3284,7 +3473,7 @@ pub const KernelModule = struct {
         try checkBytes(q, q_count);
         try checkBytes(k, kv_count);
         try checkBytes(v, kv_count);
-        try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         if (mask_len != 0) try checkRawBytes(attn_or_mask, mask_len);
         if (bias_mode != 0) try checkBytes(bias, try checkedTensorElements(if (bias_mode == 2) batch * num_heads else num_heads, try checkedTensorElements(q_seq_len, kv_seq_len)));
         if (q_count == 0) return .none;
@@ -3376,7 +3565,7 @@ pub const KernelModule = struct {
         fallback_total_token_count: usize,
     ) driver_mod.Error!void {
         const function = self.kv_write_suffix_decode_scalars_f32 orelse return error.CudaKernelUnavailable;
-        try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
         const total = try checkedTensorElements(suffix_token_count, row_width);
         try checkBytes(k_src, total);
         try checkBytes(v_src, total);
@@ -3450,7 +3639,7 @@ pub const KernelModule = struct {
         try checkRawBytes(k_dst, try checkedTensorElements(physical_token_capacity, key_row_bytes));
         try checkRawBytes(v_dst, try checkedTensorElements(physical_token_capacity, value_row_bytes));
         if (block_count != 0) try checkRawBytes(block_table, try checkedTensorElements(block_count, @sizeOf(u32)));
-        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 4 * @sizeOf(u32));
+        if (decode_scalars.ptr != 0) try checkRawBytes(decode_scalars, 5 * @sizeOf(u32));
 
         var k_dst_ptr = k_dst.ptr;
         var v_dst_ptr = v_dst.ptr;

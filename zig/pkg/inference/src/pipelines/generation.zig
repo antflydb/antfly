@@ -507,11 +507,13 @@ fn enableGemma4MtpDebug() bool {
 
 const Gemma4MtpPositionMode = enum {
     target_absolute,
+    target_constant,
     legacy_one,
 
     fn name(self: Gemma4MtpPositionMode) []const u8 {
         return switch (self) {
             .target_absolute => "target_absolute",
+            .target_constant => "target_constant",
             .legacy_one => "legacy_one",
         };
     }
@@ -529,11 +531,17 @@ const Gemma4MtpTargetHiddenSource = enum {
     }
 };
 
+fn parseGemma4MtpPositionMode(raw: ?[]const u8) Gemma4MtpPositionMode {
+    const value = raw orelse return .target_constant;
+    if (std.mem.eql(u8, value, "legacy_one")) return .legacy_one;
+    if (std.mem.eql(u8, value, "target_constant")) return .target_constant;
+    if (std.mem.eql(u8, value, "block_constant")) return .target_constant;
+    if (std.mem.eql(u8, value, "target_absolute")) return .target_absolute;
+    return .target_constant;
+}
+
 fn gemma4MtpPositionMode() Gemma4MtpPositionMode {
-    const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_POSITION_MODE") orelse return .target_absolute;
-    if (std.mem.eql(u8, raw, "legacy_one")) return .legacy_one;
-    if (std.mem.eql(u8, raw, "target_absolute")) return .target_absolute;
-    return .target_absolute;
+    return parseGemma4MtpPositionMode(platform.env.getenv("ANTFLY_GEMMA4_MTP_POSITION_MODE"));
 }
 
 fn parseGemma4MtpTargetHiddenSource(raw: ?[]const u8) Gemma4MtpTargetHiddenSource {
@@ -550,6 +558,7 @@ fn gemma4MtpTargetHiddenSource() Gemma4MtpTargetHiddenSource {
 fn gemma4MtpAssistantTotalSequenceLen(mode: Gemma4MtpPositionMode, seq_len: usize, draft_count: usize) usize {
     return switch (mode) {
         .target_absolute => seq_len + draft_count,
+        .target_constant => seq_len,
         .legacy_one => 1,
     };
 }
@@ -562,6 +571,7 @@ fn gemma4MtpAssistantDecodeContext(
 ) gpt_arch.DecodeContext {
     const context_seq_len = switch (mode) {
         .target_absolute => seq_len + draft_count,
+        .target_constant => seq_len,
         .legacy_one => seq_len,
     };
     var ctx = decode_state.gptDecodeContext(context_seq_len, 1);
@@ -819,12 +829,12 @@ fn classifyGemma4MtpMismatch(
 }
 
 fn gemma4MtpMinAcceptancePermille() usize {
-    const configured = platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_MIN_ACCEPTANCE_PERMILLE") orelse 750;
+    const configured = platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_MIN_ACCEPTANCE_PERMILLE") orelse 200;
     return @min(configured, 1000);
 }
 
 fn gemma4MtpAcceptanceProbeDrafts() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_ACCEPTANCE_PROBE_DRAFTS") orelse 4;
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_ACCEPTANCE_PROBE_DRAFTS") orelse 64;
 }
 
 fn gemma4MtpAdaptiveKEnabled() bool {
@@ -832,15 +842,19 @@ fn gemma4MtpAdaptiveKEnabled() bool {
 }
 
 fn gemma4MtpProbeK() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_PROBE_K") orelse 1;
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_PROBE_K") orelse 2;
+}
+
+fn gemma4MtpAutoMaxK() usize {
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MAX_K") orelse 2;
 }
 
 fn gemma4MtpAutoCostProbeRounds() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_COST_PROBE_ROUNDS") orelse 4;
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_COST_PROBE_ROUNDS") orelse 16;
 }
 
 fn gemma4MtpAutoMinAcceptedPerRoundMilli() usize {
-    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_ACCEPTED_PER_ROUND_MILLI") orelse 3000;
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_ACCEPTED_PER_ROUND_MILLI") orelse 1600;
 }
 
 fn gemma4MtpHiddenOnlyMaterializeEnabled() bool {
@@ -859,7 +873,24 @@ fn gemma4MtpVerifyDeviceResultEnabled() bool {
     return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_VERIFY_DEVICE_RESULT", false);
 }
 
-fn gemma4MtpTargetReplayLikelyActive() bool {
+fn gemma4MtpMaterializeReplayEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_MATERIALIZE_REPLAY", false);
+}
+
+fn gemma4MtpDraftEmbeddingCacheSize() usize {
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_DRAFT_EMBED_CACHE") orelse 64;
+}
+
+pub fn gemma4MtpAutoMinGenerationTokens() usize {
+    return platform.env.getenvUsize("ANTFLY_GEMMA4_MTP_AUTO_MIN_TOKENS") orelse 128;
+}
+
+fn gemma4MtpUnsafeTargetReplayEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_UNSAFE_TARGET_REPLAY", false);
+}
+
+pub fn gemma4MtpTargetReplayLikelyActive() bool {
+    if (!gemma4MtpUnsafeTargetReplayEnabled()) return false;
     const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
     if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return false;
     if (platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_TEMP_SLOT_PERIOD")) |period| {
@@ -871,6 +902,7 @@ fn gemma4MtpTargetReplayLikelyActive() bool {
 fn gemma4MtpGraphReplayStatusName() []const u8 {
     const raw = platform.env.getenv("ANTFLY_GEMMA4_MTP_TARGET_REPLAY") orelse "auto";
     if (std.mem.eql(u8, raw, "off") or std.mem.eql(u8, raw, "0") or std.mem.eql(u8, raw, "false")) return "off";
+    if (!gemma4MtpUnsafeTargetReplayEnabled()) return "disabled_unsafe";
     if (std.mem.eql(u8, raw, "force") or std.mem.eql(u8, raw, "1") or std.mem.eql(u8, raw, "true")) return "forced";
     return "auto";
 }
@@ -1924,7 +1956,7 @@ pub const NativeGenerationPipeline = struct {
     pjrt_client: ?*anyopaque = null,
 
     const prefetch_drain_budget_per_step: usize = 4;
-    const default_mtp_zero_match_fallback_rounds: usize = 1;
+    const default_mtp_zero_match_fallback_rounds: usize = 16;
 
     fn rejectUnsupportedDeepSeekV4GraphMode(self: *const NativeGenerationPipeline) !void {
         if (!NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config)) return;
@@ -2024,6 +2056,7 @@ pub const NativeGenerationPipeline = struct {
 
         const has_images = messagesHaveImages(messages);
         const has_audio = messagesHaveAudio(messages);
+        const requested_max_tokens: usize = @intCast(@max(config.max_tokens, 1));
 
         // --- Speculative decoding path ---
         // Use the draft model to propose K tokens, then verify them against
@@ -2035,11 +2068,15 @@ pub const NativeGenerationPipeline = struct {
             cfg.gemma4_mtp_assistant and cfg.mtp_num_centroids == 0 and cfg.mtp_backbone_hidden_size == self.gpt_config.hidden_size
         else
             false;
+        const allow_unshared_gemma4_mtp =
+            platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET") or
+            config.speculation_policy == .force or
+            config.speculation_calibration != .none;
         const disable_unshared_gemma4_mtp =
             draft_is_gemma4_mtp and
             !draft_is_nextn_gemma4_mtp and
             self.gpt_config.num_kv_shared_layers == 0 and
-            !platform.env.getenvBool("ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET");
+            !allow_unshared_gemma4_mtp;
         if (disable_unshared_gemma4_mtp) {
             std.log.warn("Gemma4 MTP disabled: target has no shared-KV metadata; set ANTFLY_GEMMA4_MTP_ALLOW_UNSHARED_TARGET=1 to force experimental MTP", .{});
         }
@@ -2050,8 +2087,13 @@ pub const NativeGenerationPipeline = struct {
             speculation_policy == .auto and
             draft_is_gemma4_mtp and
             config.speculation_calibration == .none;
+        const mtp_auto_too_short =
+            speculation_policy == .auto and
+            draft_is_gemma4_mtp and
+            requested_max_tokens < gemma4MtpAutoMinGenerationTokens();
         const use_speculative = speculation_policy != .off and
             !mtp_auto_uncalibrated and
+            !mtp_auto_too_short and
             loaded_draft_requested and
             !disable_unshared_gemma4_mtp;
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
@@ -2192,7 +2234,7 @@ pub const NativeGenerationPipeline = struct {
 
         // Build token sequence. Add slack only when speculative decoding is
         // active; the bonus token can write one position past max_tokens.
-        const max_tokens: usize = @intCast(@max(config.max_tokens, 1));
+        const max_tokens = requested_max_tokens;
         const spec_slack: usize = if (use_speculative and config.speculative_k > 0) 1 else 0;
         const max_seq = prompt_token_count + max_tokens + spec_slack;
         var token_ids = try allocator.alloc(i64, max_seq);
@@ -2216,14 +2258,19 @@ pub const NativeGenerationPipeline = struct {
         }
 
         // Prefill
+        const allow_prefill_greedy_token = !use_speculative or (use_speculative and draft_is_gemma4_mtp);
+        const capture_mtp_prefill_hidden = use_speculative and draft_is_gemma4_mtp and gemma4MtpTargetHiddenSource() == .final;
         const prefill_output = if (prepared_multimodal_prompt) |*prepared|
             PrefillOutput{ .last_logits = try self.executePreparedMultimodalPrefill(prepared, seq_len, decode_state) }
         else
-            try self.executePrefill(token_ids[0..seq_len], seq_len, decode_state, config, !use_speculative);
+            try self.executePrefill(token_ids[0..seq_len], seq_len, decode_state, config, allow_prefill_greedy_token, capture_mtp_prefill_hidden);
         var prefill_last_logits = prefill_output.last_logits;
         var prefill_greedy_token = prefill_output.greedy_token;
+        const prefill_last_hidden = prefill_output.last_hidden;
+        const prefill_last_hidden_rows = prefill_output.last_hidden_rows;
         const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer if (prefill_last_logits) |logits| allocator.free(logits);
+        defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
         debugGenerationStage(
             "finished prefill seq_len={d} cached_logits={} greedy_token={}",
             .{ seq_len, prefill_last_logits != null, prefill_greedy_token != null },
@@ -2271,6 +2318,8 @@ pub const NativeGenerationPipeline = struct {
                 speculative_stats.mtp_disabled_reason = "speculation_policy_off";
             } else if (mtp_auto_uncalibrated) {
                 speculative_stats.mtp_disabled_reason = "speculation_calibration_required";
+            } else if (mtp_auto_too_short) {
+                speculative_stats.mtp_disabled_reason = "mtp_auto_min_tokens";
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
@@ -2379,17 +2428,79 @@ pub const NativeGenerationPipeline = struct {
             }
 
             // Also prefill the target if we haven't yet (non-chunked path)
+            var mtp_first_outcome: ?SampleOutcome = null;
             if (prefill_last_logits == null) {
-                const target_ctx = decode_runtime.makeDecodeContext(seq_len, seq_len);
                 if (use_gemma4_mtp) {
-                    var target_prefill = try self.forwardAllLogitsAndHiddenHost(token_ids[0..seq_len], 1, seq_len, &target_ctx);
-                    defer target_prefill.deinit();
-                    prefill_last_logits = try allocator.dupe(
-                        f32,
-                        target_prefill.logits[(seq_len - 1) * vocab_size ..][0..vocab_size],
-                    );
-                    mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRow(&target_prefill, seq_len - 1, mtp_hidden_source));
+                    if (prefill_greedy_token) |token| {
+                        debugGemma4Mtp("first_token_prefill cached_greedy token={d}", .{token});
+                        mtp_first_outcome = .{
+                            .token = token,
+                            .grammar_complete = false,
+                        };
+                    }
+                    if (mtp_first_outcome) |_| {
+                        const seeded_from_prefill = if (prefill_last_hidden) |hidden|
+                            try self.replaceGemma4MtpActivationFromPrefillHidden(
+                                &mtp_activation,
+                                hidden,
+                                prefill_last_hidden_rows,
+                                mtp_hidden_source,
+                                can_use_resident_mtp,
+                                &draft_pipeline.cb,
+                            )
+                        else
+                            false;
+                        if (!seeded_from_prefill) {
+                            try self.replaceGemma4MtpActivationFromPrompt(
+                                &mtp_activation,
+                                token_ids[0..seq_len],
+                                seq_len,
+                                mtp_hidden_source,
+                                can_use_resident_mtp,
+                                &draft_pipeline.cb,
+                            );
+                        }
+                    } else {
+                        debugGemma4Mtp("first_token_prefill host_logits_fallback", .{});
+                        var seed_state = NativeDecodeState.initContiguous(allocator);
+                        defer seed_state.deinit();
+                        seed_state.configureForGptConfig(self.gpt_config);
+                        var seed_runtime = BorrowedDecodeStateRuntime.init(&seed_state);
+                        const target_ctx = seed_runtime.makeDecodeContext(seq_len, seq_len);
+                        var target_prefill = try self.forwardAllLogitsAndHiddenHost(token_ids[0..seq_len], 1, seq_len, &target_ctx);
+                        defer target_prefill.deinit();
+                        prefill_last_logits = try allocator.dupe(
+                            f32,
+                            target_prefill.logits[(seq_len - 1) * vocab_size ..][0..vocab_size],
+                        );
+                        if (can_use_resident_mtp) {
+                            const seeded_from_prefill = if (prefill_last_hidden) |hidden|
+                                try self.replaceGemma4MtpActivationFromPrefillHidden(
+                                    &mtp_activation,
+                                    hidden,
+                                    prefill_last_hidden_rows,
+                                    mtp_hidden_source,
+                                    true,
+                                    &draft_pipeline.cb,
+                                )
+                            else
+                                false;
+                            if (!seeded_from_prefill) {
+                                try self.replaceGemma4MtpActivationFromPrompt(
+                                    &mtp_activation,
+                                    token_ids[0..seq_len],
+                                    seq_len,
+                                    mtp_hidden_source,
+                                    true,
+                                    &draft_pipeline.cb,
+                                );
+                            }
+                        } else {
+                            mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRow(&target_prefill, seq_len - 1, mtp_hidden_source));
+                        }
+                    }
                 } else {
+                    const target_ctx = decode_runtime.makeDecodeContext(seq_len, seq_len);
                     const target_prefill_logits = try self.forwardAllLogits(token_ids[0..seq_len], 1, seq_len, &target_ctx);
                     defer allocator.free(target_prefill_logits);
                     prefill_last_logits = try allocator.dupe(
@@ -2398,14 +2509,31 @@ pub const NativeGenerationPipeline = struct {
                     );
                 }
             } else if (use_gemma4_mtp and mtp_activation.host == null and mtp_activation.device == null) {
-                const target_ctx = decode_runtime.makeDecodeContext(seq_len, 1);
-                var target_last = try self.forwardAllLogitsAndHiddenHost(token_ids[seq_len - 1 .. seq_len], 1, seq_len, &target_ctx);
-                defer target_last.deinit();
-                mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRow(&target_last, 0, mtp_hidden_source));
+                const seeded_from_prefill = if (prefill_last_hidden) |hidden|
+                    try self.replaceGemma4MtpActivationFromPrefillHidden(
+                        &mtp_activation,
+                        hidden,
+                        prefill_last_hidden_rows,
+                        mtp_hidden_source,
+                        can_use_resident_mtp,
+                        &draft_pipeline.cb,
+                    )
+                else
+                    false;
+                if (!seeded_from_prefill) {
+                    try self.replaceGemma4MtpActivationFromPrompt(
+                        &mtp_activation,
+                        token_ids[0..seq_len],
+                        seq_len,
+                        mtp_hidden_source,
+                        can_use_resident_mtp,
+                        &draft_pipeline.cb,
+                    );
+                }
             }
 
             // Use prefill last logits for the first token
-            const first_outcome = try self.sampleNextToken(
+            const first_outcome = mtp_first_outcome orelse try self.sampleNextToken(
                 prefill_last_logits.?,
                 config,
                 &penalty_state,
@@ -2440,24 +2568,7 @@ pub const NativeGenerationPipeline = struct {
             }
 
             if (use_gemma4_mtp and !first_is_eos and !first_outcome.grammar_complete) {
-                if (can_use_resident_mtp) {
-                    const materialized_hidden = (try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
-                        token_ids,
-                        seq_len,
-                        decode_state,
-                        mtp_hidden_source,
-                        &draft_pipeline.cb,
-                    )) orelse return error.UnsupportedBackend;
-                    mtp_activation.replaceDevice(materialized_hidden);
-                } else {
-                    const materialized_hidden = try self.materializeAcceptedTokenKvAndReturnHidden(
-                        token_ids,
-                        seq_len,
-                        decode_state,
-                        mtp_hidden_source,
-                    );
-                    mtp_activation.replaceHost(materialized_hidden);
-                }
+                mtp_activation.cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, seq_len, decode_state, mtp_hidden_source);
             }
 
             // Speculative decode loop
@@ -2475,10 +2586,17 @@ pub const NativeGenerationPipeline = struct {
                     gemma4MtpMinAcceptancePermille()
                 else
                     0;
-                var mtp_adaptive_k = MtpAdaptiveKPolicy.init(
-                    @intCast(config.speculative_k),
+                const mtp_adaptive_enabled = use_gemma4_mtp and speculation_policy == .auto and gemma4MtpAdaptiveKEnabled();
+                const mtp_policy_max_k: usize = if (use_gemma4_mtp and speculation_policy == .auto)
+                    @max(@as(usize, 1), @min(@as(usize, @intCast(config.speculative_k)), gemma4MtpAutoMaxK()))
+                else
+                    @as(usize, @intCast(config.speculative_k));
+                var mtp_adaptive_k = MtpAdaptiveKPolicy.initFromValues(
+                    mtp_policy_max_k,
                     mtp_min_acceptance_permille,
                     mtp_acceptance_probe_drafts,
+                    mtp_adaptive_enabled,
+                    gemma4MtpProbeK(),
                 );
                 const mtp_effective_zero_match_fallback_rounds =
                     gemma4MtpEffectiveZeroMatchFallbackRounds(mtp_zero_match_fallback_rounds, use_gemma4_mtp and mtp_adaptive_k.enabled);
@@ -2763,6 +2881,8 @@ pub const NativeGenerationPipeline = struct {
     const PrefillOutput = struct {
         last_logits: ?[]f32 = null,
         greedy_token: ?usize = null,
+        last_hidden: ?ops.CT = null,
+        last_hidden_rows: usize = 0,
     };
 
     /// Run the prefill phase: process prompt tokens through the model,
@@ -2775,10 +2895,14 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
         config: GenerationConfig,
         allow_resident_greedy_token: bool,
+        capture_last_hidden: bool,
     ) !PrefillOutput {
         const allocator = self.allocator;
         var prefill_last_logits: ?[]f32 = null;
         var prefill_greedy_token: ?usize = null;
+        var prefill_last_hidden: ?ops.CT = null;
+        var prefill_last_hidden_rows: usize = 0;
+        errdefer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
         const use_cuda_prefill_greedy_token = shouldUseCudaPrefillGreedyToken(
             self.cb.kind(),
             config,
@@ -2903,13 +3027,30 @@ pub const NativeGenerationPipeline = struct {
                 try decode_runtime.appendPrefillChunk(chunk.len);
                 const decode_context = decode_runtime.makeDecodeContext(chunk_end, chunk.len);
                 if (chunk_end == seq_len and use_cuda_prefill_greedy_token) {
-                    prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
-                        if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
-                            current_chunk_size = @max(chunk_size / 2, 1);
-                            continue;
+                    if (capture_last_hidden) {
+                        var greedy_hidden = gpt_arch.forwardGreedyLastTokenWithFinalHidden(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                            if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
+                                current_chunk_size = @max(chunk_size / 2, 1);
+                                continue;
+                            }
+                            return err;
+                        };
+                        prefill_greedy_token = greedy_hidden.token_id;
+                        if (greedy_hidden.token_tensor) |token| {
+                            self.cb.free(token);
+                            greedy_hidden.token_tensor = null;
                         }
-                        return err;
-                    };
+                        prefill_last_hidden = greedy_hidden.hidden;
+                        prefill_last_hidden_rows = greedy_hidden.rows;
+                    } else {
+                        prefill_greedy_token = gpt_arch.forwardGreedyLastToken(&self.cb, allocator, self.gpt_config, chunk, 1, chunk_end, &decode_context) catch |err| {
+                            if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
+                                current_chunk_size = @max(chunk_size / 2, 1);
+                                continue;
+                            }
+                            return err;
+                        };
+                    }
                     debugGenerationStage(
                         "executePrefill captured greedy token={d}",
                         .{prefill_greedy_token.?},
@@ -2973,7 +3114,12 @@ pub const NativeGenerationPipeline = struct {
             "executePrefill exit cached_logits={} greedy_token={}",
             .{ prefill_last_logits != null, prefill_greedy_token != null },
         );
-        return .{ .last_logits = prefill_last_logits, .greedy_token = prefill_greedy_token };
+        return .{
+            .last_logits = prefill_last_logits,
+            .greedy_token = prefill_greedy_token,
+            .last_hidden = prefill_last_hidden,
+            .last_hidden_rows = prefill_last_hidden_rows,
+        };
     }
 
     fn executePreparedMultimodalPrefill(
@@ -3618,14 +3764,23 @@ pub const NativeGenerationPipeline = struct {
     };
 
     const Gemma4MtpActivationState = struct {
+        const DraftEmbeddingCacheEntry = struct {
+            token_id: i64,
+            tensor: ops.CT,
+        };
+
         allocator: std.mem.Allocator,
         draft_cb: *const ComputeBackend,
         host: ?[]f32 = null,
         device: ?ops.CT = null,
+        cached_target_choice: ?u32 = null,
+        draft_embedding_cache: std.ArrayListUnmanaged(DraftEmbeddingCacheEntry) = .empty,
 
         fn deinit(self: *Gemma4MtpActivationState) void {
             if (self.host) |activation| self.allocator.free(activation);
             if (self.device) |tensor| self.draft_cb.free(tensor);
+            for (self.draft_embedding_cache.items) |entry| self.draft_cb.free(entry.tensor);
+            self.draft_embedding_cache.deinit(self.allocator);
             self.* = undefined;
         }
 
@@ -3634,6 +3789,7 @@ pub const NativeGenerationPipeline = struct {
             if (self.device) |old| self.draft_cb.free(old);
             self.host = activation;
             self.device = null;
+            self.cached_target_choice = null;
         }
 
         fn replaceDevice(self: *Gemma4MtpActivationState, tensor: ops.CT) void {
@@ -3641,12 +3797,134 @@ pub const NativeGenerationPipeline = struct {
             if (self.device) |old| self.draft_cb.free(old);
             self.host = null;
             self.device = tensor;
+            self.cached_target_choice = null;
         }
 
         fn residentReady(self: *const Gemma4MtpActivationState) bool {
             return self.device != null;
         }
+
+        fn cachedDraftEmbedding(self: *const Gemma4MtpActivationState, token_id: i64) ?ops.CT {
+            for (self.draft_embedding_cache.items) |entry| {
+                if (entry.token_id == token_id) return entry.tensor;
+            }
+            return null;
+        }
+
+        fn rememberDraftEmbedding(self: *Gemma4MtpActivationState, token_id: i64, tensor: ops.CT, limit: usize) !void {
+            if (limit == 0) {
+                self.draft_cb.free(tensor);
+                return;
+            }
+            if (self.cachedDraftEmbedding(token_id) != null) {
+                self.draft_cb.free(tensor);
+                return;
+            }
+            while (self.draft_embedding_cache.items.len >= limit) {
+                const old = self.draft_embedding_cache.orderedRemove(0);
+                self.draft_cb.free(old.tensor);
+            }
+            try self.draft_embedding_cache.append(self.allocator, .{
+                .token_id = token_id,
+                .tensor = tensor,
+            });
+        }
     };
+
+    fn replaceGemma4MtpActivationFromPrompt(
+        self: *NativeGenerationPipeline,
+        mtp_activation: *Gemma4MtpActivationState,
+        prompt_ids: []const i64,
+        seq_len: usize,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        use_resident_draft: bool,
+        draft_cb: *const ComputeBackend,
+    ) !void {
+        if (seq_len == 0 or prompt_ids.len < seq_len) return error.InvalidTensorShape;
+        var seed_state = NativeDecodeState.initContiguous(self.allocator);
+        defer seed_state.deinit();
+        seed_state.configureForGptConfig(self.gpt_config);
+        var seed_runtime = BorrowedDecodeStateRuntime.init(&seed_state);
+        const seed_ctx = seed_runtime.makeDecodeContext(seq_len, seq_len);
+        var target_hidden = try self.forwardMtpTargetHiddenDevice(
+            prompt_ids[0..seq_len],
+            1,
+            seq_len,
+            &seed_ctx,
+            hidden_source,
+            "gpt.mtp_seed_prompt_hidden",
+        );
+        defer target_hidden.deinit();
+
+        const row = seq_len - 1;
+        if (use_resident_draft) {
+            if (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
+                mtp_activation.replaceDevice(activation);
+                return;
+            }
+        }
+        mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source));
+    }
+
+    fn replaceGemma4MtpActivationFromPrefillHidden(
+        self: *NativeGenerationPipeline,
+        mtp_activation: *Gemma4MtpActivationState,
+        hidden: ops.CT,
+        rows: usize,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        use_resident_draft: bool,
+        draft_cb: *const ComputeBackend,
+    ) !bool {
+        if (rows == 0) return error.InvalidTensorShape;
+        if (hidden_source != .final) return false;
+        const target_hidden = ForwardHiddenDevice{
+            .cb = &self.cb,
+            .hidden = hidden,
+            .pre_norm_hidden = null,
+            .rows = rows,
+        };
+        const row = rows - 1;
+        if (use_resident_draft) {
+            if (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, draft_cb)) |activation| {
+                mtp_activation.replaceDevice(activation);
+                return true;
+            }
+        }
+        mtp_activation.replaceHost(try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source));
+        return true;
+    }
+
+    fn cachedMtpDraftTargetEmbedding(
+        self: *NativeGenerationPipeline,
+        draft_pipeline: *NativeGenerationPipeline,
+        mtp_activation: *Gemma4MtpActivationState,
+        token_id: i64,
+    ) !?ops.CT {
+        const limit = gemma4MtpDraftEmbeddingCacheSize();
+        if (limit == 0) return null;
+        if (mtp_activation.cachedDraftEmbedding(token_id)) |cached| return cached;
+
+        const backbone_hidden: usize = @intCast(draft_pipeline.gpt_config.mtp_backbone_hidden_size);
+        const target_hidden_size: usize = @intCast(self.gpt_config.hidden_size);
+        if (backbone_hidden == 0 or target_hidden_size != backbone_hidden) return null;
+        const target_embed_w = try gpt_arch.getEmbeddingWeight(&self.cb, self.gpt_config);
+        defer self.cb.free(target_embed_w);
+        const token_arr = [_]i64{token_id};
+        const target_embedded = try self.cb.embeddingLookup(target_embed_w, &token_arr, 1, backbone_hidden);
+        const target_embedding = try gpt_arch.maybeScaleTokenEmbeddings(
+            &self.cb,
+            self.allocator,
+            self.gpt_config,
+            target_embedded,
+            1,
+            backbone_hidden,
+        );
+        defer self.cb.free(target_embedding);
+        const copied = (try draft_pipeline.cb.copyTensorFromBackend(&self.cb, target_embedding)) orelse return null;
+        errdefer draft_pipeline.cb.free(copied);
+        try mtp_activation.rememberDraftEmbedding(token_id, copied, limit);
+        return copied;
+    }
 
     fn forwardAllLogitsAndHiddenHost(
         self: *NativeGenerationPipeline,
@@ -3770,6 +4048,46 @@ pub const NativeGenerationPipeline = struct {
         hidden_source: Gemma4MtpTargetHiddenSource,
         replay_label: []const u8,
     ) !ForwardHiddenDevice {
+        return self.forwardMtpTargetHiddenDeviceReplayMode(
+            input_ids,
+            batch,
+            seq_len,
+            decode_context,
+            hidden_source,
+            replay_label,
+            gemma4MtpUnsafeTargetReplayEnabled(),
+        );
+    }
+
+    fn forwardMtpTargetHiddenDeviceNoReplay(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+    ) !ForwardHiddenDevice {
+        return self.forwardMtpTargetHiddenDeviceReplayMode(
+            input_ids,
+            batch,
+            seq_len,
+            decode_context,
+            hidden_source,
+            "",
+            false,
+        );
+    }
+
+    fn forwardMtpTargetHiddenDeviceReplayMode(
+        self: *NativeGenerationPipeline,
+        input_ids: []const i64,
+        batch: usize,
+        seq_len: usize,
+        decode_context: *const gpt_arch.DecodeContext,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+        replay_label: []const u8,
+        allow_replay: bool,
+    ) !ForwardHiddenDevice {
         if (hidden_source != .final) {
             return self.forwardHiddenDevice(input_ids, batch, seq_len, decode_context);
         }
@@ -3789,18 +4107,31 @@ pub const NativeGenerationPipeline = struct {
         const ple_vectors = try gpt_arch.computePleVectors(&self.cb, allocator, self.gpt_config, input_ids, hidden_input, total);
         defer if (ple_vectors) |pv| self.cb.free(pv);
 
-        const hidden_result = try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
-            &self.cb,
-            allocator,
-            self.gpt_config,
-            hidden_input,
-            .{},
-            batch,
-            seq_len,
-            decode_context,
-            ple_vectors,
-            replay_label,
-        );
+        const hidden_result = if (allow_replay)
+            try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0OverridesCudaReplay(
+                &self.cb,
+                allocator,
+                self.gpt_config,
+                hidden_input,
+                .{},
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+                replay_label,
+            )
+        else
+            try gpt_arch.forwardFinalHiddenTensorFromEmbeddingsWithLayer0Overrides(
+                &self.cb,
+                allocator,
+                self.gpt_config,
+                hidden_input,
+                .{},
+                batch,
+                seq_len,
+                decode_context,
+                ple_vectors,
+            );
         errdefer self.cb.free(hidden_result.hidden);
 
         return .{
@@ -4387,6 +4718,11 @@ pub const NativeGenerationPipeline = struct {
             const draft_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
             const draft_step: DraftStep = if (use_resident_draft) blk: {
                 const activation = device_chain_activation orelse mtp_activation.device.?;
+                const target_embedding_on_draft = try self.cachedMtpDraftTargetEmbedding(
+                    draft_pipeline,
+                    mtp_activation,
+                    source_token,
+                );
                 const draft_result = try gemma4_mtp.draftTokenDevice(.{
                     .allocator = allocator,
                     .target_cb = &self.cb,
@@ -4395,6 +4731,7 @@ pub const NativeGenerationPipeline = struct {
                     .draft_config = draft_pipeline.gpt_config,
                     .token_id = source_token,
                     .activation = activation,
+                    .target_embedding_on_draft = target_embedding_on_draft,
                     .decode_context = &assistant_ctx,
                     .debug_top_k = mtp_top_k,
                 });
@@ -4486,18 +4823,37 @@ pub const NativeGenerationPipeline = struct {
         const verify_len = draft_count + 1;
         const verify_seq = seq_len.* + draft_count;
         _ = try decode_runtime.appendGeneratedTokens(draft_count);
-        const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
+        const use_greedy_device_verifier = self.shouldUseGemma4MtpGreedyDeviceVerifier(config, token_table, json_grammar, gbnf_grammar, mtp_top_k);
+        const cached_first_target_choice = if (use_greedy_device_verifier and decode_runtime.kvView() != null)
+            mtp_activation.cached_target_choice
+        else
+            null;
+        mtp_activation.cached_target_choice = null;
+        const target_forward_len = if (cached_first_target_choice != null) draft_count else verify_len;
+        const target_query_len: usize = if (decode_runtime.kvView() != null) target_forward_len else verify_seq;
         const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
-        const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
+        const verify_start = if (target_query_len == verify_seq) 0 else if (cached_first_target_choice != null) seq_len.* else verify_seq - target_query_len;
 
         var verify_result: SpeculativeVerificationResult = undefined;
         var next_host_activation: ?[]f32 = null;
         errdefer if (next_host_activation) |activation| allocator.free(activation);
         var next_device_activation: ?ops.CT = null;
         errdefer if (next_device_activation) |activation| draft_pipeline.cb.free(activation);
-        const accept_bonus = gemma4MtpAcceptBonusEnabled() and
-            (config.speculation_policy != .auto or gemma4MtpTargetReplayLikelyActive());
-        if (self.shouldUseGemma4MtpGreedyDeviceVerifier(config, token_table, json_grammar, gbnf_grammar, mtp_top_k)) {
+        var next_cached_target_choice: ?u32 = null;
+        const accept_bonus = gemma4MtpAcceptBonusEnabled();
+        var used_cached_first_reject = false;
+        if (cached_first_target_choice) |cached_choice| {
+            if (try self.rejectMtpDraftFromCachedFirstChoice(
+                token_ids,
+                seq_len.*,
+                draft_tokens[0..draft_count],
+                cached_choice,
+            )) |cached_reject| {
+                verify_result = cached_reject;
+                used_cached_first_reject = true;
+            }
+        }
+        if (use_greedy_device_verifier and !used_cached_first_reject) {
             var used_fused_verify = false;
             {
                 const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
@@ -4516,19 +4872,86 @@ pub const NativeGenerationPipeline = struct {
 
                 const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
                 const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
-                const logit_base_row = target_query_len - verify_len;
+                const target_lm_rows = if (cached_first_target_choice != null) draft_count else verify_len;
+                const logit_base_row = target_query_len - target_lm_rows;
                 var lm_input = target_hidden.hidden;
                 var lm_input_owned = false;
                 defer if (lm_input_owned) self.cb.free(lm_input);
-                if (logit_base_row != 0 or target_hidden.rows != verify_len) {
-                    lm_input = try self.cb.sliceRows2D(self.allocator, target_hidden.hidden, logit_base_row, verify_len, hidden_size);
+                if (logit_base_row != 0 or target_hidden.rows != target_lm_rows) {
+                    lm_input = try self.cb.sliceRows2D(self.allocator, target_hidden.hidden, logit_base_row, target_lm_rows, hidden_size);
                     lm_input_owned = true;
                 }
 
                 const lm_w = try self.graphWeight("lm_head.weight");
                 defer self.cb.free(lm_w);
                 const suppress_token_ids = self.gpt_config.suppressTokenIds();
-                if (gemma4MtpDedicatedRuntimeEnabled()) {
+                if (cached_first_target_choice) |cached_choice| {
+                    const target_tail_choices = (try self.cb.linearNoBiasArgmaxRowsSuppress(
+                        lm_input,
+                        lm_w,
+                        target_lm_rows,
+                        hidden_size,
+                        vocab_size_usize,
+                        suppress_token_ids,
+                        allocator,
+                    )) orelse return error.UnsupportedBackend;
+                    defer allocator.free(target_tail_choices);
+                    if (target_tail_choices.len < target_lm_rows) return error.InvalidTensorShape;
+                    var combined_choices_buf: [17]u32 = undefined;
+                    if (verify_len > combined_choices_buf.len) return error.InvalidSpeculativeK;
+                    combined_choices_buf[0] = cached_choice;
+                    for (target_tail_choices[0..target_lm_rows], 0..) |choice, idx| {
+                        combined_choices_buf[idx + 1] = choice;
+                    }
+                    const combined_choices = combined_choices_buf[0..verify_len];
+                    verify_result = try self.acceptVerifiedDraftTokenChoicesGreedy(
+                        token_ids,
+                        seq_len.*,
+                        draft_tokens[0..draft_count],
+                        combined_choices,
+                        &round_penalties,
+                        accept_bonus,
+                    );
+                    if (mtp_profile.sync_enabled) {
+                        self.cb.evalTensor(target_hidden.hidden) catch {};
+                        if (target_hidden.pre_norm_hidden) |pre_norm| self.cb.evalTensor(pre_norm) catch {};
+                    }
+                    if (mtp_profile.enabled) {
+                        mtp_profile.target_verify_calls += 1;
+                        mtp_profile.target_verify_rows += target_query_len;
+                        mtp_profile.target_verify_argmax_calls += 1;
+                        mtp_profile.target_verify_argmax_rows += verify_len;
+                        mtp_profile.target_verify_argmax_batched_calls += 1;
+                        mtp_profile.target_verify_argmax_syncs += 1;
+                        mtp_profile.target_choice_downloads += 1;
+                        mtp_profile.target_verify_ns +|= mtpProfileElapsedNs(true, self.io, verify_started_at);
+                    }
+                    if (!verify_result.correction_added and !verify_result.had_bonus and verify_result.accepted > 0 and verify_result.accepted < verify_len) {
+                        next_cached_target_choice = combined_choices[verify_result.accepted];
+                    }
+
+                    if (verify_result.accepted > 0 and
+                        !verify_result.hit_eos and
+                        !verify_result.hit_grammar_stop and
+                        !verify_result.correction_added and
+                        !verify_result.had_bonus)
+                    {
+                        const row = logit_base_row + verify_result.accepted - 1;
+                        const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
+                        if (use_resident_draft) {
+                            next_device_activation = (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, &draft_pipeline.cb)) orelse return error.UnsupportedBackend;
+                            if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(next_device_activation.?) catch {};
+                        } else {
+                            next_host_activation = try self.dupeMtpTargetHiddenRowFromHiddenDevice(&target_hidden, row, hidden_source);
+                        }
+                        if (mtp_profile.enabled) {
+                            mtp_profile.activation_copies += 1;
+                            mtp_profile.accepted_hidden_reuse_rows += 1;
+                            mtp_profile.activation_copy_ns +|= mtpProfileElapsedNs(true, self.io, activation_started_at);
+                        }
+                    }
+                    used_fused_verify = true;
+                } else if (gemma4MtpDedicatedRuntimeEnabled()) {
                     var eos_token_ids_buf: [1 + gpt_mod.max_extra_eos_token_ids]i32 = [_]i32{-1} ** (1 + gpt_mod.max_extra_eos_token_ids);
                     var eos_token_ids_len: usize = 0;
                     if (self.gpt_config.eos_token_id >= 0) {
@@ -4585,8 +5008,13 @@ pub const NativeGenerationPipeline = struct {
                             mtp_profile.target_verify_ns +|= mtpProfileElapsedNs(true, self.io, verify_started_at);
                         }
 
-                        if (runtime_result.accepted_hidden_row) |runtime_row| {
-                            const row = logit_base_row + runtime_row;
+                        if (verify_result.accepted > 0 and
+                            !verify_result.hit_eos and
+                            !verify_result.hit_grammar_stop and
+                            !verify_result.correction_added and
+                            !verify_result.had_bonus)
+                        {
+                            const row = logit_base_row + verify_result.accepted - 1;
                             const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                             if (use_resident_draft) {
                                 next_device_activation = (try self.copyMtpTargetHiddenRowFromHiddenToBackend(&target_hidden, row, hidden_source, &draft_pipeline.cb)) orelse return error.UnsupportedBackend;
@@ -4596,6 +5024,7 @@ pub const NativeGenerationPipeline = struct {
                             }
                             if (mtp_profile.enabled) {
                                 mtp_profile.activation_copies += 1;
+                                mtp_profile.accepted_hidden_reuse_rows += 1;
                                 mtp_profile.activation_copy_ns +|= mtpProfileElapsedNs(true, self.io, activation_started_at);
                             }
                         }
@@ -4626,6 +5055,9 @@ pub const NativeGenerationPipeline = struct {
                             &round_penalties,
                             accept_bonus,
                         );
+                        if (!verify_result.correction_added and !verify_result.had_bonus and verify_result.accepted > 0 and verify_result.accepted < verify_len) {
+                            next_cached_target_choice = target_choices[verify_result.accepted];
+                        }
                         if (mtp_profile.sync_enabled) {
                             self.cb.evalTensor(target_hidden.hidden) catch {};
                             if (target_hidden.pre_norm_hidden) |pre_norm| self.cb.evalTensor(pre_norm) catch {};
@@ -4641,7 +5073,12 @@ pub const NativeGenerationPipeline = struct {
                             mtp_profile.target_verify_ns +|= mtpProfileElapsedNs(true, self.io, verify_started_at);
                         }
 
-                        if (verify_result.accepted > 0 and !verify_result.correction_added and !verify_result.had_bonus) {
+                        if (verify_result.accepted > 0 and
+                            !verify_result.hit_eos and
+                            !verify_result.hit_grammar_stop and
+                            !verify_result.correction_added and
+                            !verify_result.had_bonus)
+                        {
                             const row = logit_base_row + verify_result.accepted - 1;
                             const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                             if (use_resident_draft) {
@@ -4694,7 +5131,12 @@ pub const NativeGenerationPipeline = struct {
                     mtp_profile.target_verify_ns +|= mtpProfileElapsedNs(true, self.io, verify_started_at);
                 }
 
-                if (verify_result.accepted > 0 and !verify_result.correction_added and !verify_result.had_bonus) {
+                if (verify_result.accepted > 0 and
+                    !verify_result.hit_eos and
+                    !verify_result.hit_grammar_stop and
+                    !verify_result.correction_added and
+                    !verify_result.had_bonus)
+                {
                     const row = verify_result.accepted - 1;
                     const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                     if (use_resident_draft) {
@@ -4710,7 +5152,7 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
             }
-        } else {
+        } else if (!used_cached_first_reject) {
             const verify_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
             var target_result = self.forwardAllLogitsAndHiddenHost(
                 token_ids[verify_start..verify_seq],
@@ -4757,7 +5199,12 @@ pub const NativeGenerationPipeline = struct {
                 mtp_profile.target_verify_ns +|= mtpProfileElapsedNs(true, self.io, verify_started_at);
             }
 
-            if (verify_result.accepted > 0 and !verify_result.correction_added and !verify_result.had_bonus) {
+            if (verify_result.accepted > 0 and
+                !verify_result.hit_eos and
+                !verify_result.hit_grammar_stop and
+                !verify_result.correction_added and
+                !verify_result.had_bonus)
+            {
                 const row = verify_result.accepted - 1;
                 const activation_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
                 next_host_activation = try self.dupeMtpTargetHiddenRow(&target_result, row, hidden_source);
@@ -4790,30 +5237,38 @@ pub const NativeGenerationPipeline = struct {
             const accepted_seq_len = seq_len.* + accepted;
             const materialization_started_at = mtpProfileTimestamp(mtp_profile.enabled, self.io);
             const hidden_only_materialize = gemma4MtpHiddenOnlyMaterializeEnabled();
-            if (use_resident_draft) {
-                const materialized_hidden = (try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
-                    token_ids,
-                    accepted_seq_len,
-                    decode_state,
-                    hidden_source,
-                    &draft_pipeline.cb,
-                )) orelse return error.UnsupportedBackend;
-                if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(materialized_hidden) catch {};
-                if (next_device_activation) |old| draft_pipeline.cb.free(old);
-                next_device_activation = materialized_hidden;
-                if (next_host_activation) |old| {
-                    allocator.free(old);
-                    next_host_activation = null;
-                }
+            const have_predictor_activation = next_device_activation != null or next_host_activation != null;
+            if (have_predictor_activation) {
+                next_cached_target_choice = try self.materializeAcceptedTokenKvForMtp(token_ids, accepted_seq_len, decode_state, hidden_source);
             } else {
-                const materialized_hidden = try self.materializeAcceptedTokenKvAndReturnHidden(
-                    token_ids,
-                    accepted_seq_len,
-                    decode_state,
-                    hidden_source,
-                );
-                if (next_host_activation) |old| allocator.free(old);
-                next_host_activation = materialized_hidden;
+                if (use_resident_draft) {
+                    const materialized = try self.materializeAcceptedTokenKvAndCopyHiddenToBackend(
+                        token_ids,
+                        accepted_seq_len,
+                        decode_state,
+                        hidden_source,
+                        &draft_pipeline.cb,
+                    );
+                    const materialized_hidden = materialized.activation orelse return error.UnsupportedBackend;
+                    if (mtp_profile.sync_enabled) draft_pipeline.cb.evalTensor(materialized_hidden) catch {};
+                    if (next_device_activation) |old| draft_pipeline.cb.free(old);
+                    next_device_activation = materialized_hidden;
+                    next_cached_target_choice = materialized.next_target_choice;
+                    if (next_host_activation) |old| {
+                        allocator.free(old);
+                        next_host_activation = null;
+                    }
+                } else {
+                    const materialized = try self.materializeAcceptedTokenKvAndReturnHidden(
+                        token_ids,
+                        accepted_seq_len,
+                        decode_state,
+                        hidden_source,
+                    );
+                    if (next_host_activation) |old| allocator.free(old);
+                    next_host_activation = materialized.activation;
+                    next_cached_target_choice = materialized.next_target_choice;
+                }
             }
             if (mtp_profile.enabled) {
                 mtp_profile.materializations += 1;
@@ -4838,6 +5293,7 @@ pub const NativeGenerationPipeline = struct {
             mtp_activation.replaceHost(activation);
             next_host_activation = null;
         }
+        mtp_activation.cached_target_choice = next_cached_target_choice;
         seq_len.* += accepted;
         try penalty_state.noteTokens(allocator, token_ids[round_start..seq_len.*]);
 
@@ -4896,6 +5352,34 @@ pub const NativeGenerationPipeline = struct {
         if (token_table != null or json_grammar.* != null or gbnf_grammar != null) return false;
         if (!gpt_arch.canUseFastGreedyArgmaxForConfig(self.gpt_config)) return false;
         return true;
+    }
+
+    fn rejectMtpDraftFromCachedFirstChoice(
+        self: *const NativeGenerationPipeline,
+        token_ids: []i64,
+        seq_len: usize,
+        draft_tokens: []const i64,
+        cached_choice: u32,
+    ) !?SpeculativeVerificationResult {
+        if (draft_tokens.len == 0) return null;
+        const first_draft_raw = draft_tokens[0];
+        if (first_draft_raw < 0) return error.InvalidModelOutput;
+        const first_draft: usize = @intCast(first_draft_raw);
+        const target_choice: usize = @intCast(cached_choice);
+        if (target_choice == first_draft) return null;
+        if (seq_len >= token_ids.len) return error.InvalidTensorShape;
+
+        token_ids[seq_len] = @intCast(cached_choice);
+        return .{
+            .matched_drafts = 0,
+            .accepted = 1,
+            .hit_eos = self.gpt_config.isEosToken(target_choice),
+            .hit_grammar_stop = false,
+            .correction_added = true,
+            .had_bonus = false,
+            .bonus_skipped = false,
+            .mtp_quality = classifyGemma4MtpMismatchWithoutTargetLogits(first_draft_raw, target_choice),
+        };
     }
 
     fn argmaxDeviceLogitRow(
@@ -5367,29 +5851,77 @@ pub const NativeGenerationPipeline = struct {
         self.allocator.free(logits);
     }
 
-    fn materializeAcceptedTokenKvAndReturnHidden(
+    fn greedyTargetChoiceFromFinalHiddenDevice(
+        self: *NativeGenerationPipeline,
+        final_hidden: ops.CT,
+    ) !?u32 {
+        const lm_w = try self.graphWeight("lm_head.weight");
+        defer self.cb.free(lm_w);
+        const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
+        const vocab_size: usize = @intCast(self.gpt_config.vocab_size);
+        const suppress_token_ids = self.gpt_config.suppressTokenIds();
+        if (suppress_token_ids.len == 0) {
+            if (try self.cb.linearNoBiasArgmaxLastRow(
+                final_hidden,
+                lm_w,
+                1,
+                hidden_size,
+                vocab_size,
+            )) |token| {
+                return token;
+            }
+        }
+        if (try self.cb.linearNoBiasArgmaxRowsSuppress(
+            final_hidden,
+            lm_w,
+            1,
+            hidden_size,
+            vocab_size,
+            suppress_token_ids,
+            self.allocator,
+        )) |choices| {
+            defer self.allocator.free(choices);
+            if (choices.len == 0) return error.InvalidModelOutput;
+            return choices[0];
+        }
+        return null;
+    }
+
+    fn materializeAcceptedTokenKvForMtp(
         self: *NativeGenerationPipeline,
         token_ids: []const i64,
         total_seq_len: usize,
         decode_state: *NativeDecodeState,
         hidden_source: Gemma4MtpTargetHiddenSource,
-    ) ![]f32 {
+    ) !?u32 {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        if (decode_state.requiresFullRecompute()) return error.MissingMaterializedHiddenState;
+        if (decode_state.requiresFullRecompute()) {
+            _ = try decode_runtime.appendGeneratedToken();
+            return null;
+        }
         _ = try decode_runtime.appendGeneratedToken();
         errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
         const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
         if (gemma4MtpHiddenOnlyMaterializeEnabled()) {
-            var result = try self.forwardMtpTargetHiddenDevice(
-                token_ids[total_seq_len - 1 .. total_seq_len],
-                1,
-                total_seq_len,
-                &decode_context,
-                hidden_source,
-                "gpt.mtp_commit_final_hidden",
-            );
+            var result = if (gemma4MtpMaterializeReplayEnabled())
+                try self.forwardMtpTargetHiddenDevice(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                    "gpt.mtp_materialize_choice_hidden",
+                )
+            else
+                try self.forwardMtpTargetHiddenDeviceNoReplay(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                );
             defer result.deinit();
-            return try self.dupeMtpTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            return try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
         }
         var result = try self.forwardAllLogitsAndHiddenDevice(
             token_ids[total_seq_len - 1 .. total_seq_len],
@@ -5398,8 +5930,71 @@ pub const NativeGenerationPipeline = struct {
             &decode_context,
         );
         defer result.deinit();
-        return try self.dupeMtpTargetHiddenRowFromDevice(&result, 0, hidden_source);
+        return try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden);
     }
+
+    const MtpMaterializedHostActivation = struct {
+        activation: []f32,
+        next_target_choice: ?u32 = null,
+    };
+
+    fn materializeAcceptedTokenKvAndReturnHidden(
+        self: *NativeGenerationPipeline,
+        token_ids: []const i64,
+        total_seq_len: usize,
+        decode_state: *NativeDecodeState,
+        hidden_source: Gemma4MtpTargetHiddenSource,
+    ) !MtpMaterializedHostActivation {
+        var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
+        if (decode_state.requiresFullRecompute()) return error.MissingMaterializedHiddenState;
+        _ = try decode_runtime.appendGeneratedToken();
+        errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
+        const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
+        if (gemma4MtpHiddenOnlyMaterializeEnabled()) {
+            var result = if (gemma4MtpMaterializeReplayEnabled())
+                try self.forwardMtpTargetHiddenDevice(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                    "gpt.mtp_materialize_host_hidden",
+                )
+            else
+                try self.forwardMtpTargetHiddenDeviceNoReplay(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                );
+            defer result.deinit();
+            const activation = try self.dupeMtpTargetHiddenRowFromHiddenDevice(&result, 0, hidden_source);
+            errdefer self.allocator.free(activation);
+            return .{
+                .activation = activation,
+                .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+            };
+        }
+        var result = try self.forwardAllLogitsAndHiddenDevice(
+            token_ids[total_seq_len - 1 .. total_seq_len],
+            1,
+            total_seq_len,
+            &decode_context,
+        );
+        defer result.deinit();
+        const activation = try self.dupeMtpTargetHiddenRowFromDevice(&result, 0, hidden_source);
+        errdefer self.allocator.free(activation);
+        return .{
+            .activation = activation,
+            .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+        };
+    }
+
+    const MtpMaterializedDeviceActivation = struct {
+        activation: ?ops.CT,
+        next_target_choice: ?u32 = null,
+    };
 
     fn materializeAcceptedTokenKvAndCopyHiddenToBackend(
         self: *NativeGenerationPipeline,
@@ -5408,23 +6003,37 @@ pub const NativeGenerationPipeline = struct {
         decode_state: *NativeDecodeState,
         hidden_source: Gemma4MtpTargetHiddenSource,
         dst_cb: *const ComputeBackend,
-    ) !?ops.CT {
+    ) !MtpMaterializedDeviceActivation {
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
-        if (decode_state.requiresFullRecompute()) return null;
+        if (decode_state.requiresFullRecompute()) return .{ .activation = null };
         _ = try decode_runtime.appendGeneratedToken();
         errdefer decode_runtime.truncateGeneratedTokens(1) catch {};
         const decode_context = decode_runtime.makeDecodeContext(total_seq_len, 1);
         if (gemma4MtpHiddenOnlyMaterializeEnabled()) {
-            var result = try self.forwardMtpTargetHiddenDevice(
-                token_ids[total_seq_len - 1 .. total_seq_len],
-                1,
-                total_seq_len,
-                &decode_context,
-                hidden_source,
-                "gpt.mtp_commit_final_hidden",
-            );
+            var result = if (gemma4MtpMaterializeReplayEnabled())
+                try self.forwardMtpTargetHiddenDevice(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                    "gpt.mtp_materialize_device_hidden",
+                )
+            else
+                try self.forwardMtpTargetHiddenDeviceNoReplay(
+                    token_ids[total_seq_len - 1 .. total_seq_len],
+                    1,
+                    total_seq_len,
+                    &decode_context,
+                    hidden_source,
+                );
             defer result.deinit();
-            return try self.copyMtpTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            const activation = try self.copyMtpTargetHiddenRowFromHiddenToBackend(&result, 0, hidden_source, dst_cb);
+            errdefer if (activation) |tensor| dst_cb.free(tensor);
+            return .{
+                .activation = activation,
+                .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+            };
         }
         var result = try self.forwardAllLogitsAndHiddenDevice(
             token_ids[total_seq_len - 1 .. total_seq_len],
@@ -5433,7 +6042,12 @@ pub const NativeGenerationPipeline = struct {
             &decode_context,
         );
         defer result.deinit();
-        return try self.copyMtpTargetHiddenRowToBackend(&result, 0, hidden_source, dst_cb);
+        const activation = try self.copyMtpTargetHiddenRowToBackend(&result, 0, hidden_source, dst_cb);
+        errdefer if (activation) |tensor| dst_cb.free(tensor);
+        return .{
+            .activation = activation,
+            .next_target_choice = try self.greedyTargetChoiceFromFinalHiddenDevice(result.hidden),
+        };
     }
 
     pub fn deinit(self: *NativeGenerationPipeline) void {
@@ -7098,6 +7712,12 @@ test "mixed batch decode context keeps single item on direct kv cache path" {
 }
 
 test "gemma4 mtp assistant position mode computes target absolute positions" {
+    try std.testing.expectEqual(Gemma4MtpPositionMode.target_constant, parseGemma4MtpPositionMode(null));
+    try std.testing.expectEqual(Gemma4MtpPositionMode.target_constant, parseGemma4MtpPositionMode("unknown"));
+    try std.testing.expectEqual(Gemma4MtpPositionMode.target_constant, parseGemma4MtpPositionMode("block_constant"));
+    try std.testing.expectEqual(Gemma4MtpPositionMode.target_absolute, parseGemma4MtpPositionMode("target_absolute"));
+    try std.testing.expectEqual(Gemma4MtpPositionMode.legacy_one, parseGemma4MtpPositionMode("legacy_one"));
+
     try std.testing.expectEqual(
         @as(usize, 21),
         gemma4MtpAssistantTotalSequenceLen(.target_absolute, 21, 0),
@@ -7105,6 +7725,10 @@ test "gemma4 mtp assistant position mode computes target absolute positions" {
     try std.testing.expectEqual(
         @as(usize, 23),
         gemma4MtpAssistantTotalSequenceLen(.target_absolute, 21, 2),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 21),
+        gemma4MtpAssistantTotalSequenceLen(.target_constant, 21, 2),
     );
     try std.testing.expectEqual(
         @as(usize, 1),
@@ -7373,6 +7997,42 @@ test "speculative verification can skip target bonus token" {
     try std.testing.expectEqual(false, result.had_bonus);
     try std.testing.expectEqual(true, result.bonus_skipped);
     try std.testing.expectEqual(@as(i64, 0), token_ids[2]);
+}
+
+test "gemma4 mtp cached first choice rejects mismatched draft" {
+    const allocator = std.testing.allocator;
+    var pipeline = NativeGenerationPipeline{
+        .allocator = allocator,
+        .cb = undefined,
+        .gpt_config = .{ .vocab_size = 16, .eos_token_id = 7 },
+        .tokenizer = undefined,
+    };
+
+    var matching_tokens = [_]i64{ 2, 0, 0 };
+    const matching = try pipeline.rejectMtpDraftFromCachedFirstChoice(
+        matching_tokens[0..],
+        1,
+        &.{4},
+        4,
+    );
+    try std.testing.expect(matching == null);
+    try std.testing.expectEqual(@as(i64, 0), matching_tokens[1]);
+
+    var rejected_tokens = [_]i64{ 2, 0, 0 };
+    const rejected = (try pipeline.rejectMtpDraftFromCachedFirstChoice(
+        rejected_tokens[0..],
+        1,
+        &.{4},
+        7,
+    )) orelse return error.TestExpectedNonNull;
+
+    try std.testing.expectEqual(@as(usize, 0), rejected.matched_drafts);
+    try std.testing.expectEqual(@as(usize, 1), rejected.accepted);
+    try std.testing.expectEqual(true, rejected.correction_added);
+    try std.testing.expectEqual(false, rejected.had_bonus);
+    try std.testing.expectEqual(true, rejected.hit_eos);
+    try std.testing.expectEqual(@as(i64, 7), rejected_tokens[1]);
+    try std.testing.expectEqual(@as(usize, 1), rejected.mtp_quality.mismatches);
 }
 
 test "gemma4 mtp verify-commit adapter handles correction metadata" {

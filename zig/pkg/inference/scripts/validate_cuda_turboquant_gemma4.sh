@@ -11,10 +11,13 @@ Environment overrides:
   ZIG_BIN                 path to Zig 0.16 binary
   ANTFLY_BIN              path to antfly-inference binary
   OUT_DIR                 output directory for logs/json timing
-  E2B_MODEL               Gemma4 E2B model path
+  E2B_MODEL               Gemma4 E2B model directory
   GEMMA12B_Q4_MODEL       Gemma4 12B Q4 model path/directory
-  REAL_BENCH_MODEL        model path for the 128-token real CLI benchmark
+  REAL_BENCH_MODEL        model directory for the 128-token real CLI benchmark
   REAL_BENCH_PROMPT       prompt for the real CLI benchmark
+  TURBOQUANT_BENEFIT_CHECK 1 to compare f32 vs requested turbo3 (default: 1)
+  TURBOQUANT_BENCH_TOKENS generated tokens for benefit check (default: 256)
+  TURBOQUANT_MIN_SPEED_RATIO requested turbo3 tok/s floor vs f32 (default: 1.0)
 USAGE
 }
 
@@ -49,10 +52,13 @@ antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inferen
 out_dir="${OUT_DIR:-/tmp/antfly-cuda-turboquant-gate-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$out_dir"
 
-e2b_model="${E2B_MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf}"
+e2b_model="${E2B_MODEL:-$repo_root/.models/unsloth/gemma-4-E2B-it-qat-GGUF}"
 gemma12b_q4_model="${GEMMA12B_Q4_MODEL:-$repo_root/.models/google/gemma-4-12B-it-q4_k}"
 real_bench_model="${REAL_BENCH_MODEL:-$e2b_model}"
 real_bench_prompt="${REAL_BENCH_PROMPT:-Give a one sentence summary of Korean history.}"
+turboquant_benefit_check="${TURBOQUANT_BENEFIT_CHECK:-1}"
+turboquant_bench_tokens="${TURBOQUANT_BENCH_TOKENS:-256}"
+turboquant_min_speed_ratio="${TURBOQUANT_MIN_SPEED_RATIO:-1.0}"
 
 summary="$out_dir/summary.txt"
 : > "$summary"
@@ -112,6 +118,43 @@ run_generate() {
   } >> "$summary"
 }
 
+check_turboquant_benefit() {
+  local f32_json="$1"
+  local turbo_json="$2"
+  python3 - "$f32_json" "$turbo_json" "$turboquant_min_speed_ratio" <<'PY'
+import json
+import sys
+
+f32_path, turbo_path, min_ratio_raw = sys.argv[1:4]
+min_ratio = float(min_ratio_raw)
+
+with open(f32_path, "r", encoding="utf-8") as f:
+    f32 = json.load(f)
+with open(turbo_path, "r", encoding="utf-8") as f:
+    turbo = json.load(f)
+
+f32_tps = float(f32.get("decode_tok_per_s", 0.0))
+turbo_tps = float(turbo.get("decode_tok_per_s", 0.0))
+errors = []
+if f32_tps <= 0:
+    errors.append(f"f32 decode_tok_per_s={f32_tps}, expected > 0")
+if turbo_tps <= 0:
+    errors.append(f"turboquant decode_tok_per_s={turbo_tps}, expected > 0")
+if f32_tps > 0 and turbo_tps > 0 and turbo_tps < f32_tps * min_ratio:
+    errors.append(
+        f"turboquant decode_tok_per_s={turbo_tps:.3f} below f32 floor "
+        f"{f32_tps * min_ratio:.3f} (f32={f32_tps:.3f}, ratio={min_ratio:.3f})"
+    )
+
+if errors:
+    for error in errors:
+        print(error, file=sys.stderr)
+    sys.exit(1)
+
+print(f"PASS turboquant_benefit: f32_tok_s={f32_tps:.3f} turboquant_tok_s={turbo_tps:.3f} ratio={turbo_tps / f32_tps:.3f}")
+PY
+}
+
 require_path "zig binary" "$zig_bin"
 require_path "antfly-inference binary" "$antfly_bin"
 
@@ -132,6 +175,14 @@ if [ "$mode" != "bench-only" ]; then
     --combined-budget-mb 12000 --backend-budget-mb 9000 --kv-budget-mb 256 --scratch-budget-mb 512
   run_generate e2b_turbo3_8 "$e2b_model" "Write one sentence about ants." turbo3 8 \
     --combined-budget-mb 12000 --backend-budget-mb 9000 --kv-budget-mb 256 --scratch-budget-mb 512
+fi
+
+if [ "$turboquant_benefit_check" = "1" ]; then
+  run_generate e2b_turboquant_f32_benefit "$e2b_model" "Write one sentence about ants." f32 "$turboquant_bench_tokens" \
+    --combined-budget-mb 12000 --backend-budget-mb 9000 --kv-budget-mb 512 --scratch-budget-mb 1024
+  run_generate e2b_turboquant_on_benefit "$e2b_model" "Write one sentence about ants." turbo3 "$turboquant_bench_tokens" \
+    --combined-budget-mb 12000 --backend-budget-mb 9000 --kv-budget-mb 512 --scratch-budget-mb 1024
+  check_turboquant_benefit "$out_dir/e2b_turboquant_f32_benefit.json" "$out_dir/e2b_turboquant_on_benefit.json" | tee -a "$summary"
 fi
 
 if [ "$mode" = "full" ]; then
