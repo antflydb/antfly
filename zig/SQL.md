@@ -443,6 +443,10 @@ Current implementation status:
   tags for `ANY`, `SOME`, `ALL`, `BETWEEN`, `IN`, `NOT`, `IS`, boolean atoms,
   quantifier matching, parenthesized null tests, and tail conjunctions instead
   of maintaining local case-insensitive operator scans.
+- Aggregate filter/having boolean literal probes, JSON-path filter literal
+  checks, coalesce/row-expression field guards, and parenthesized expression
+  condition probes use token keyword metadata for `IS`, `NOT`, `AND`, `NULL`,
+  `TRUE`, and `FALSE`.
 - DML conflict, assignment, and merge expression-start helpers share the same
   keyword metadata for boolean atoms, `DEFAULT`, `NOT`, `OR`, and
   parenthesized conjunction/disjunction probes.

@@ -2129,15 +2129,15 @@ pub fn parseScalarBooleanIsNotIntoOrBranchesAlloc(
         };
     };
     defer alloc.free(parsed_field);
-    if (!parser.matchKeyword(tokens, pos, "is")) {
+    if (!parser.matchKeywordTag(tokens, pos, .is)) {
         pos.* = saved_pos;
         return false;
     }
-    if (!parser.matchKeyword(tokens, pos, "not")) {
+    if (!parser.matchKeywordTag(tokens, pos, .not)) {
         pos.* = saved_pos;
         return false;
     }
-    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) {
+    if (!(parser.peekKeywordTag(tokens, pos.*, .true) or parser.peekKeywordTag(tokens, pos.*, .false))) {
         pos.* = saved_pos;
         return false;
     }
@@ -9220,11 +9220,12 @@ pub fn aggregateJsonPathEqFilterCanStartAt(tokens: []const Token, pos: usize) bo
         .string, .placeholder => true,
         .number, .minus => as_text,
         .identifier => as_text and
-            !sqlKeywordIsAnyOrSome(rhs.text) and
-            !std.ascii.eqlIgnoreCase(rhs.text, "all") and
-            (std.ascii.eqlIgnoreCase(rhs.text, "null") or
-                std.ascii.eqlIgnoreCase(rhs.text, "true") or
-                std.ascii.eqlIgnoreCase(rhs.text, "false")),
+            !rhs.matchesKeywordTag(.any) and
+            !rhs.matchesKeywordTag(.some) and
+            !rhs.matchesKeywordTag(.all) and
+            (rhs.matchesKeywordTag(.null) or
+                rhs.matchesKeywordTag(.true) or
+                rhs.matchesKeywordTag(.false)),
         else => false,
     };
 }
@@ -9494,15 +9495,15 @@ pub fn parseAggregateHavingBooleanIsNotGroups(
         };
     };
     defer alloc.free(field);
-    if (!parser.matchKeyword(tokens, pos, "is")) {
+    if (!parser.matchKeywordTag(tokens, pos, .is)) {
         pos.* = saved_pos;
         return false;
     }
-    if (!parser.matchKeyword(tokens, pos, "not")) {
+    if (!parser.matchKeywordTag(tokens, pos, .not)) {
         pos.* = saved_pos;
         return false;
     }
-    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) {
+    if (!(parser.peekKeywordTag(tokens, pos.*, .true) or parser.peekKeywordTag(tokens, pos.*, .false))) {
         pos.* = saved_pos;
         return false;
     }
@@ -9540,15 +9541,15 @@ pub fn parseAggregateFilterBooleanIsNotGroupsAlloc(
         };
     };
     defer alloc.free(parsed_field);
-    if (!parser.matchKeyword(tokens, pos, "is")) {
+    if (!parser.matchKeywordTag(tokens, pos, .is)) {
         pos.* = saved_pos;
         return false;
     }
-    if (!parser.matchKeyword(tokens, pos, "not")) {
+    if (!parser.matchKeywordTag(tokens, pos, .not)) {
         pos.* = saved_pos;
         return false;
     }
-    if (!(parser.peekKeyword(tokens, pos.*, "true") or parser.peekKeyword(tokens, pos.*, "false"))) {
+    if (!(parser.peekKeywordTag(tokens, pos.*, .true) or parser.peekKeywordTag(tokens, pos.*, .false))) {
         pos.* = saved_pos;
         return false;
     }
@@ -9676,7 +9677,7 @@ pub fn parseAggregateFilterNotGroupAlloc(
         );
         try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
     if (groups.items.len == 0) return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .rparen);
@@ -10270,7 +10271,7 @@ pub fn peekParenthesizedExpressionCondition(tokens: []const Token, pos: usize) b
                     const next = tokens[i + 1];
                     return switch (next.kind) {
                         .eq, .neq, .gt, .gte, .lt, .lte => true,
-                        .identifier => std.ascii.eqlIgnoreCase(next.text, "is"),
+                        .identifier => next.matchesKeywordTag(.is),
                         else => false,
                     };
                 }
@@ -19157,9 +19158,9 @@ pub fn parseCoalesceFieldOperandOrNullOwnedAlloc(
     defer_row_expression_field_validation: bool,
 ) !?db_mod.types.RelationalRowsCoalesceOperand {
     if (!parser.peekKind(tokens, pos.*, .identifier) or
-        parser.peekKeyword(tokens, pos.*, "null") or
-        parser.peekKeyword(tokens, pos.*, "true") or
-        parser.peekKeyword(tokens, pos.*, "false"))
+        parser.peekKeywordTag(tokens, pos.*, .null) or
+        parser.peekKeywordTag(tokens, pos.*, .true) or
+        parser.peekKeywordTag(tokens, pos.*, .false))
     {
         return null;
     }
@@ -21023,9 +21024,9 @@ pub fn parseRowExpressionFieldOperandOrNullAlloc(
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
 ) !?db_mod.types.RelationalRowsExpression {
     if (!parser.peekKind(tokens, pos.*, .identifier) or
-        parser.peekKeyword(tokens, pos.*, "null") or
-        parser.peekKeyword(tokens, pos.*, "true") or
-        parser.peekKeyword(tokens, pos.*, "false"))
+        parser.peekKeywordTag(tokens, pos.*, .null) or
+        parser.peekKeywordTag(tokens, pos.*, .true) or
+        parser.peekKeywordTag(tokens, pos.*, .false))
     {
         return null;
     }
@@ -21115,7 +21116,7 @@ pub fn peekAggregateHavingExpression(tokens: []const Token, pos: usize) bool {
         if (pos + 1 >= tokens.len) return false;
         const next = tokens[pos + 1];
         if (next.kind == .eq or next.kind == .neq or next.kind == .gt or next.kind == .gte or next.kind == .lt or next.kind == .lte) return false;
-        if (next.kind == .identifier and std.ascii.eqlIgnoreCase(next.text, "is")) return false;
+        if (next.matchesKeywordTag(.is)) return false;
         return true;
     }
     return token.kind == .minus or
