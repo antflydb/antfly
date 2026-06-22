@@ -1948,7 +1948,7 @@ fn openDirectoryHandle(
 ) capi.ErrorCode {
     const out = out_handle orelse return .invalid_argument;
     out.* = null;
-    if (create and !liteOpenModeCanWrite(resolved.open_mode)) return .invalid_argument;
+    if (create) return .invalid_argument;
     const alloc = std.heap.c_allocator;
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
@@ -7619,6 +7619,8 @@ test "capi lite open options validate and configure ttl cleanup" {
     cleanupTestDir(dir_path);
     defer cleanupTestDir(dir_path);
     var directory_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_create_with_options(dir_path, &generic_defaults, &directory_handle));
+    try std.testing.expectEqual(@as(?*anyopaque, null), directory_handle);
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dir_path, &generic_defaults, &directory_handle));
     const generic_writes = [_]capi.WriteIntent{.{
         .key = .{ .ptr = "doc:generic", .len = "doc:generic".len },

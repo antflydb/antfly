@@ -39,6 +39,11 @@ The primary embedded open surface is storage-neutral:
 Directory storage is the default for the generic open APIs. Lite-specific
 helpers such as `antfly_lite_open_with_options` remain source-compatible
 wrappers that set `storage_kind` to Lite and use the same handle model.
+`antfly_db_create_with_options` currently provides exclusive create semantics
+for `ANTFLY_STORAGE_KIND_LITE` only. Directory storage should use
+`antfly_db_open_with_options`, which preserves the existing directory
+open-or-create behavior until the directory backend exposes an exclusive create
+primitive.
 
 ## Read-Only Modes
 

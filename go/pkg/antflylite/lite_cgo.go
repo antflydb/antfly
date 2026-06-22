@@ -412,6 +412,7 @@ func (db *DB) CopyStableSnapshotJSON(destPath string, replace bool) ([]byte, err
 	if err != nil {
 		return nil, err
 	}
+	defer runtime.KeepAlive(db)
 	cDest := C.CString(destPath)
 	defer C.free(unsafe.Pointer(cDest))
 
@@ -446,6 +447,7 @@ func (db *DB) Batch(writes []WriteIntent, timestampNS uint64) error {
 	if err != nil {
 		return err
 	}
+	defer runtime.KeepAlive(db)
 	cWrites, cleanup, err := makeCWriteIntents(writes)
 	if err != nil {
 		return err
@@ -504,6 +506,7 @@ func (db *DB) RunUntilIdle() error {
 	if err != nil {
 		return err
 	}
+	defer runtime.KeepAlive(db)
 	return check(C.antfly_lite_run_until_idle(handle))
 }
 
@@ -542,6 +545,7 @@ func (db *DB) DeleteIndex(name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer runtime.KeepAlive(db)
 	input, cleanup := makeCStringSlice([]byte(name))
 	defer cleanup()
 
@@ -573,6 +577,7 @@ func (db *DB) DeleteEnrichment(kind, name string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer runtime.KeepAlive(db)
 	cKind, cleanupKind := makeCStringSlice([]byte(kind))
 	defer cleanupKind()
 	cName, cleanupName := makeCStringSlice([]byte(name))
@@ -728,6 +733,7 @@ func (db *DB) readBuffer(fn func(unsafe.Pointer, *C.antfly_buffer) C.antfly_erro
 	if err != nil {
 		return nil, err
 	}
+	defer runtime.KeepAlive(db)
 	var out C.antfly_buffer
 	if err := check(fn(handle, &out)); err != nil {
 		return nil, err
@@ -740,6 +746,7 @@ func (db *DB) withInput(input []byte, fn func(unsafe.Pointer, C.antfly_slice) C.
 	if err != nil {
 		return err
 	}
+	defer runtime.KeepAlive(db)
 	cInput, cleanup := makeCStringSlice(input)
 	defer cleanup()
 	return check(fn(handle, cInput))
@@ -750,6 +757,7 @@ func (db *DB) withInputOutput(input []byte, fn func(unsafe.Pointer, C.antfly_sli
 	if err != nil {
 		return nil, err
 	}
+	defer runtime.KeepAlive(db)
 	cInput, cleanup := makeCStringSlice(input)
 	defer cleanup()
 
@@ -769,6 +777,7 @@ func (db *DB) graphLookup(indexName, key, edgeType string, direction uint8, fn f
 	if err != nil {
 		return nil, err
 	}
+	defer runtime.KeepAlive(db)
 	cIndex, cleanupIndex := makeCStringSlice([]byte(indexName))
 	defer cleanupIndex()
 	cKey, cleanupKey := makeCStringSlice([]byte(key))

@@ -1955,7 +1955,7 @@ fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !st
 }
 
 fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !std.Io.File {
-    const lock_path = try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
+    const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
     return std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
@@ -1969,6 +1969,36 @@ fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !std.Io
         }),
         else => return err,
     };
+}
+
+fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
+    const canonical_data_path = realPathAlloc(allocator, io, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (canonical_data_path) |canonical| {
+        defer allocator.free(canonical);
+        return appendLockSuffix(allocator, canonical);
+    }
+
+    const dirname = std.fs.path.dirname(path) orelse ".";
+    const basename = std.fs.path.basename(path);
+    const canonical_parent = try realPathAlloc(allocator, io, dirname);
+    defer allocator.free(canonical_parent);
+    const canonical_missing_path = try std.fs.path.join(allocator, &.{ canonical_parent, basename });
+    defer allocator.free(canonical_missing_path);
+    return appendLockSuffix(allocator, canonical_missing_path);
+}
+
+fn realPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+}
+
+fn appendLockSuffix(allocator: Allocator, path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}.lock", .{path});
 }
 
 fn acquireDataRewriteLock(io: std.Io, path: []const u8) !std.Io.File {
@@ -2992,6 +3022,23 @@ test "lite native file active writer permits readers but blocks second writer" {
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
 
     try std.testing.expectError(error.WouldBlock, writer.vacuum());
+}
+
+test "lite native file canonicalizes writer lock path spellings" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-writer-lock-canonical.aflite");
+    defer allocator.free(path);
+
+    var writer = try NativeFile.create(allocator, path);
+    defer writer.close();
+
+    const alternate_path = try std.fmt.allocPrint(allocator, "./{s}", .{path});
+    defer allocator.free(alternate_path);
+    try std.testing.expectError(error.WouldBlock, NativeFile.open(allocator, alternate_path, false));
 }
 
 test "lite native file detects corrupted page payload" {

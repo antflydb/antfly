@@ -16,7 +16,10 @@ package antflylite
 */
 import "C"
 
-import "unsafe"
+import (
+	"runtime"
+	"unsafe"
+)
 
 // TxnID is the stable 16-byte transaction identifier used by the C ABI.
 type TxnID [16]byte
@@ -36,6 +39,7 @@ func (db *DB) BeginTransaction(txnID TxnID, timestampNS uint64, participants []s
 	if err != nil {
 		return err
 	}
+	defer runtime.KeepAlive(db)
 	cParticipants, cleanup, err := makeCParticipantSlices(participants)
 	if err != nil {
 		return err
@@ -57,6 +61,7 @@ func (db *DB) WriteTransaction(txnID TxnID, writes []WriteIntent) error {
 	if err != nil {
 		return err
 	}
+	defer runtime.KeepAlive(db)
 	cWrites, cleanup, err := makeCWriteIntents(writes)
 	if err != nil {
 		return err
@@ -79,6 +84,7 @@ func (db *DB) ResolveTransaction(txnID TxnID, status TxnStatus, commitVersion ui
 	if err != nil {
 		return err
 	}
+	defer runtime.KeepAlive(db)
 	return check(C.antfly_db_resolve_intents(
 		handle,
 		cTxnIDPtr(txnID),
@@ -93,6 +99,7 @@ func (db *DB) TransactionStatus(txnID TxnID) (TxnStatus, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer runtime.KeepAlive(db)
 	var status C.uint8_t
 	if err := check(C.antfly_db_get_transaction_status(handle, cTxnIDPtr(txnID), &status)); err != nil {
 		return 0, err
@@ -106,6 +113,7 @@ func (db *DB) CommitVersion(txnID TxnID) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer runtime.KeepAlive(db)
 	var version C.uint64_t
 	if err := check(C.antfly_db_get_commit_version(handle, cTxnIDPtr(txnID), &version)); err != nil {
 		return 0, err

@@ -258,7 +258,9 @@ antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *option
  * Storage-neutral embedded opens. ANTFLY_STORAGE_KIND_DIRECTORY opens a normal
  * single-node Antfly directory. ANTFLY_STORAGE_KIND_LITE opens a v1 .aflite
  * single-file database. The antfly_lite_* helpers below are convenience
- * wrappers over ANTFLY_STORAGE_KIND_LITE.
+ * wrappers over ANTFLY_STORAGE_KIND_LITE. antfly_db_create_with_options has
+ * exclusive-create semantics for ANTFLY_STORAGE_KIND_LITE; directory storage
+ * should use antfly_db_open_with_options.
  */
 antfly_error_code antfly_db_open(const char *path, void **out_handle);
 antfly_error_code antfly_db_open_with_options(
