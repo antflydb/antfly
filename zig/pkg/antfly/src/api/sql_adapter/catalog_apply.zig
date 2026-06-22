@@ -19,8 +19,10 @@ const catalog_resources = @import("../catalog_resources.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
+const mem_backend = @import("../../storage/mem_backend.zig");
 const parser_context = @import("parser_context.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const schema_api = @import("../../schema/mod.zig");
 const schema_json = @import("schema_json.zig");
 const schema_mutation = @import("schema_mutation.zig");
 const tokenized = @import("tokenized.zig");
@@ -1602,6 +1604,903 @@ fn lowerDdlPlanForCatalogApplyTestAlloc(
     });
 }
 
+fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected: []const ddl_plan.AppliedDdlWorkAction) !void {
+    try std.testing.expectEqual(expected.len, applied.work_items.len);
+    for (expected, 0..) |action, i| {
+        try std.testing.expectEqual(action, applied.work_items[i].action);
+        try std.testing.expectEqual(ddl_plan.AppliedDdlWorkSubject.table, applied.work_items[i].subject);
+        switch (action) {
+            .rebuild => try std.testing.expectEqual(ddl_plan.AppliedDdlWorkReason.derived_artifacts, applied.work_items[i].reason),
+            .validate => try std.testing.expectEqual(ddl_plan.AppliedDdlWorkReason.constraints, applied.work_items[i].reason),
+            .rewrite => try std.testing.expectEqual(ddl_plan.AppliedDdlWorkReason.row_images, applied.work_items[i].reason),
+        }
+    }
+}
+
+test "catalog apply applies incremental ddl plans to public schema json" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, account_id text, email text, status text, deleted_at timestamptz, updated_at_ns bigint);",
+    );
+    defer create.deinit(alloc);
+    var created = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create);
+    defer created.deinit(alloc);
+
+    var multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_account_email_idx ON users (account_id, email);",
+    );
+    defer multi_column_index.deinit(alloc);
+    var multi_column_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, multi_column_index);
+    defer multi_column_indexed.deinit(alloc);
+    try std.testing.expect(multi_column_indexed.requires_rebuild);
+    try std.testing.expect(!multi_column_indexed.validation_required);
+    var parsed_multi_column_indexed = try schema_api.parseValidatedTableSchema(alloc, multi_column_indexed.schema_json);
+    defer parsed_multi_column_indexed.deinit(alloc);
+    const multi_column_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_multi_column_indexed);
+    defer runtime_schema.freeSchema(alloc, multi_column_runtime);
+    const multi_account = binder.relationalColumnForField(multi_column_runtime, "account_id", null) orelse return error.TestUnexpectedResult;
+    const multi_email = binder.relationalColumnForField(multi_column_runtime, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(multi_account.index_name != null);
+    try std.testing.expect(multi_email.index_name != null);
+    try std.testing.expectEqualStrings("users_account_email_idx", multi_account.index_name.?);
+    try std.testing.expectEqualStrings("users_account_email_idx", multi_email.index_name.?);
+    try std.testing.expectEqual(multi_account.index_generation, multi_email.index_generation);
+
+    var drop_multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_account_email_idx;");
+    defer drop_multi_column_index.deinit(alloc);
+    var multi_column_dropped = try applyDdlPlanToSchemaJsonAlloc(alloc, multi_column_indexed.schema_json, drop_multi_column_index);
+    defer multi_column_dropped.deinit(alloc);
+    try std.testing.expect(!multi_column_dropped.requires_rebuild);
+    try std.testing.expect(!multi_column_dropped.validation_required);
+    var parsed_multi_column_dropped = try schema_api.parseValidatedTableSchema(alloc, multi_column_dropped.schema_json);
+    defer parsed_multi_column_dropped.deinit(alloc);
+    const multi_column_dropped_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_multi_column_dropped);
+    defer runtime_schema.freeSchema(alloc, multi_column_dropped_runtime);
+    const dropped_multi_account = binder.relationalColumnForField(multi_column_dropped_runtime, "account_id", null) orelse return error.TestUnexpectedResult;
+    const dropped_multi_email = binder.relationalColumnForField(multi_column_dropped_runtime, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(dropped_multi_account.index_name == null);
+    try std.testing.expect(dropped_multi_email.index_name == null);
+
+    var status_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_status_idx ON users (status);",
+    );
+    defer status_index.deinit(alloc);
+    var status_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, status_index);
+    defer status_indexed.deinit(alloc);
+    try std.testing.expect(status_indexed.requires_rebuild);
+    try std.testing.expect(!status_indexed.validation_required);
+    try expectAppliedDdlWorkActions(status_indexed, &.{.rebuild});
+
+    var status_index_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX IF NOT EXISTS users_status_idx ON users (status);",
+    );
+    defer status_index_if_not_exists.deinit(alloc);
+    var status_index_noop = try applyDdlPlanToSchemaJsonAlloc(alloc, status_indexed.schema_json, status_index_if_not_exists);
+    defer status_index_noop.deinit(alloc);
+    try std.testing.expect(!status_index_noop.requires_rebuild);
+    try std.testing.expect(!status_index_noop.validation_required);
+
+    var upper_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_upper_email_idx ON users (upper(email));",
+    );
+    defer upper_expression_index.deinit(alloc);
+    var upper_expression_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, status_indexed.schema_json, upper_expression_index);
+    defer upper_expression_indexed.deinit(alloc);
+    try std.testing.expect(upper_expression_indexed.requires_rebuild);
+    try std.testing.expect(!upper_expression_indexed.validation_required);
+    var parsed_upper_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, upper_expression_indexed.schema_json);
+    defer parsed_upper_expression_indexed.deinit(alloc);
+    const upper_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_upper_expression_indexed);
+    defer runtime_schema.freeSchema(alloc, upper_expression_runtime);
+    const upper_expression = binder.relationalColumnForField(upper_expression_runtime, "users_upper_email_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(upper_expression.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, upper_expression.generated.?.op);
+    try std.testing.expectEqualStrings("email", upper_expression.generated.?.field.?);
+    try std.testing.expect(upper_expression.index_name != null);
+    try std.testing.expectEqualStrings("users_upper_email_idx", upper_expression.index_name.?);
+
+    var concat_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tenant_status_idx ON users (concat(tenant_id, ':', status));",
+    );
+    defer concat_expression_index.deinit(alloc);
+    var concat_expression_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, upper_expression_indexed.schema_json, concat_expression_index);
+    defer concat_expression_indexed.deinit(alloc);
+    try std.testing.expect(concat_expression_indexed.requires_rebuild);
+    try std.testing.expect(!concat_expression_indexed.validation_required);
+    var parsed_concat_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, concat_expression_indexed.schema_json);
+    defer parsed_concat_expression_indexed.deinit(alloc);
+    const concat_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_concat_expression_indexed);
+    defer runtime_schema.freeSchema(alloc, concat_expression_runtime);
+    const concat_expression = binder.relationalColumnForField(concat_expression_runtime, "users_tenant_status_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(concat_expression.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, concat_expression.generated.?.op);
+    try std.testing.expectEqual(@as(usize, 2), concat_expression.generated.?.fields.len);
+    try std.testing.expectEqualStrings("tenant_id", concat_expression.generated.?.fields[0]);
+    try std.testing.expectEqualStrings("status", concat_expression.generated.?.fields[1]);
+    try std.testing.expectEqualStrings(":", concat_expression.generated.?.separator);
+    try std.testing.expect(concat_expression.index_name != null);
+    try std.testing.expectEqualStrings("users_tenant_status_idx", concat_expression.index_name.?);
+
+    var md5_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_md5_email_idx ON users (md5(email));",
+    );
+    defer md5_expression_index.deinit(alloc);
+    var md5_expression_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, concat_expression_indexed.schema_json, md5_expression_index);
+    defer md5_expression_indexed.deinit(alloc);
+    try std.testing.expect(md5_expression_indexed.requires_rebuild);
+    try std.testing.expect(!md5_expression_indexed.validation_required);
+    var parsed_md5_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, md5_expression_indexed.schema_json);
+    defer parsed_md5_expression_indexed.deinit(alloc);
+    const md5_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_md5_expression_indexed);
+    defer runtime_schema.freeSchema(alloc, md5_expression_runtime);
+    const md5_expression = binder.relationalColumnForField(md5_expression_runtime, "users_md5_email_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(md5_expression.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, md5_expression.generated.?.op);
+    try std.testing.expectEqualStrings("email", md5_expression.generated.?.field.?);
+    try std.testing.expect(md5_expression.index_name != null);
+    try std.testing.expectEqualStrings("users_md5_email_idx", md5_expression.index_name.?);
+
+    var rich_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_status_replace_idx ON users (replace(status, 'old', 'new'));",
+    );
+    defer rich_expression_index.deinit(alloc);
+    var rich_expression_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, md5_expression_indexed.schema_json, rich_expression_index);
+    defer rich_expression_indexed.deinit(alloc);
+    try std.testing.expect(rich_expression_indexed.requires_rebuild);
+    try std.testing.expect(!rich_expression_indexed.validation_required);
+    var parsed_rich_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, rich_expression_indexed.schema_json);
+    defer parsed_rich_expression_indexed.deinit(alloc);
+    const rich_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_rich_expression_indexed);
+    defer runtime_schema.freeSchema(alloc, rich_expression_runtime);
+    const rich_expression = binder.relationalColumnForField(rich_expression_runtime, "users_status_replace_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rich_expression.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, rich_expression.generated.?.op);
+    const rich_expression_ast = rich_expression.generated.?.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_expression_ast.kind);
+    try std.testing.expectEqual(@as(usize, 3), rich_expression_ast.operands.len);
+    try std.testing.expect(rich_expression.index_name != null);
+    try std.testing.expectEqualStrings("users_status_replace_idx", rich_expression.index_name.?);
+
+    var index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_lower_email_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;",
+    );
+    defer index.deinit(alloc);
+    var indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, status_indexed.schema_json, index);
+    defer indexed.deinit(alloc);
+    try std.testing.expect(indexed.requires_rebuild);
+    try std.testing.expect(indexed.validation_required);
+    try expectAppliedDdlWorkActions(indexed, &.{ .rebuild, .validate });
+
+    var unique_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_email_cover_key ON users (email) INCLUDE (tenant_id, status);",
+    );
+    defer unique_covering_index.deinit(alloc);
+    var unique_covering_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, unique_covering_index);
+    defer unique_covering_indexed.deinit(alloc);
+    try std.testing.expect(unique_covering_indexed.requires_rebuild);
+    try std.testing.expect(unique_covering_indexed.validation_required);
+    var parsed_unique_covering_indexed = try schema_api.parseValidatedTableSchema(alloc, unique_covering_indexed.schema_json);
+    defer parsed_unique_covering_indexed.deinit(alloc);
+    const unique_covering_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_unique_covering_indexed);
+    defer runtime_schema.freeSchema(alloc, unique_covering_runtime);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering_runtime.unique_constraints.len);
+    const unique_covering = unique_covering_runtime.unique_constraints[1];
+    try std.testing.expectEqualStrings("users_email_cover_key", unique_covering.name);
+    try std.testing.expectEqual(@as(usize, 1), unique_covering.columns.len);
+    try std.testing.expectEqualStrings("email", unique_covering.columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering.include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", unique_covering.include_columns[0]);
+    try std.testing.expectEqualStrings("status", unique_covering.include_columns[1]);
+
+    var expression_where_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';",
+    );
+    defer expression_where_unique_index.deinit(alloc);
+    var expression_where_unique_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, expression_where_unique_index);
+    defer expression_where_unique_indexed.deinit(alloc);
+    try std.testing.expect(expression_where_unique_indexed.requires_rebuild);
+    try std.testing.expect(expression_where_unique_indexed.validation_required);
+    var parsed_expression_where_unique_indexed = try schema_api.parseValidatedTableSchema(alloc, expression_where_unique_indexed.schema_json);
+    defer parsed_expression_where_unique_indexed.deinit(alloc);
+    const expression_where_unique_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_expression_where_unique_indexed);
+    defer runtime_schema.freeSchema(alloc, expression_where_unique_runtime);
+    try std.testing.expectEqual(@as(usize, 2), expression_where_unique_runtime.unique_constraints.len);
+    const expression_where_unique = expression_where_unique_runtime.unique_constraints[1];
+    try std.testing.expectEqualStrings("users_tenant_lower_email_active_expr_key", expression_where_unique.name);
+    try std.testing.expectEqual(@as(usize, 1), expression_where_unique.expressions.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_where_unique.where.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_where_unique.where_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_where_unique.where_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", expression_where_unique.where_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"active\"", expression_where_unique.where_expressions[0].rhs[0].value_json);
+
+    var temporal_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc,
+        \\CREATE TABLE prices (
+        \\  id uuid PRIMARY KEY,
+        \\  sku text NOT NULL,
+        \\  valid_from numeric NOT NULL,
+        \\  valid_to numeric NOT NULL,
+        \\  price numeric,
+        \\  PERIOD FOR valid_time (valid_from, valid_to)
+        \\);
+    );
+    defer temporal_create.deinit(alloc);
+    var temporal_created = try applyDdlPlanToSchemaJsonAlloc(alloc, "", temporal_create);
+    defer temporal_created.deinit(alloc);
+
+    var temporal_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
+    );
+    defer temporal_unique_index.deinit(alloc);
+    var temporal_unique_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, temporal_created.schema_json, temporal_unique_index);
+    defer temporal_unique_indexed.deinit(alloc);
+    try std.testing.expect(temporal_unique_indexed.requires_rebuild);
+    try std.testing.expect(temporal_unique_indexed.validation_required);
+    var parsed_temporal_unique_indexed = try schema_api.parseValidatedTableSchema(alloc, temporal_unique_indexed.schema_json);
+    defer parsed_temporal_unique_indexed.deinit(alloc);
+    const temporal_unique_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_temporal_unique_indexed);
+    defer runtime_schema.freeSchema(alloc, temporal_unique_runtime);
+    try std.testing.expectEqual(@as(usize, 1), temporal_unique_runtime.unique_constraints.len);
+    try std.testing.expectEqualStrings("prices_sku_valid_time_key", temporal_unique_runtime.unique_constraints[0].name);
+    try std.testing.expectEqualStrings("valid_time", temporal_unique_runtime.unique_constraints[0].without_overlaps_period.?);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal_unique_runtime.unique_constraints[0].validation_state);
+
+    var md5_unique_expression_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_md5_email_key ON users (md5(email));",
+    );
+    defer md5_unique_expression_index.deinit(alloc);
+    var md5_unique_expression_indexed = try applyDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, md5_unique_expression_index);
+    defer md5_unique_expression_indexed.deinit(alloc);
+    try std.testing.expect(md5_unique_expression_indexed.requires_rebuild);
+    try std.testing.expect(md5_unique_expression_indexed.validation_required);
+    try expectAppliedDdlWorkActions(md5_unique_expression_indexed, &.{ .rebuild, .validate });
+    var parsed_md5_unique_expression_indexed = try schema_api.parseValidatedTableSchema(alloc, md5_unique_expression_indexed.schema_json);
+    defer parsed_md5_unique_expression_indexed.deinit(alloc);
+    const md5_unique_expression_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_md5_unique_expression_indexed);
+    defer runtime_schema.freeSchema(alloc, md5_unique_expression_runtime);
+    try std.testing.expectEqual(@as(usize, 2), md5_unique_expression_runtime.unique_constraints.len);
+    const md5_unique_expression = md5_unique_expression_runtime.unique_constraints[1];
+    try std.testing.expectEqualStrings("users_md5_email_key", md5_unique_expression.name);
+    try std.testing.expectEqual(@as(usize, 1), md5_unique_expression.expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.md5, md5_unique_expression.expressions[0].op);
+    try std.testing.expectEqualStrings("email", md5_unique_expression.expressions[0].field);
+
+    var alter = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        \\ALTER TABLE users
+        \\  ADD COLUMN tenant_status_key text GENERATED ALWAYS AS (concat(tenant_id, ':', status)) STORED,
+        \\  ADD CONSTRAINT users_account_fkey FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE RESTRICT,
+        \\  ADD CONSTRAINT users_status_check CHECK (status != 'deleted');
+        ,
+    );
+    defer alter.deinit(alloc);
+    var altered = try applyDdlPlanToSchemaJsonAlloc(alloc, indexed.schema_json, alter);
+    defer altered.deinit(alloc);
+    try std.testing.expect(altered.requires_rebuild);
+    try std.testing.expect(altered.validation_required);
+
+    var create_no_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE TABLE usage_records (tenant_id text NOT NULL, id uuid NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, status text);",
+    );
+    defer create_no_pk.deinit(alloc);
+    var no_pk = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create_no_pk);
+    defer no_pk.deinit(alloc);
+    var parsed_no_pk = try schema_api.parseValidatedTableSchema(alloc, no_pk.schema_json);
+    defer parsed_no_pk.deinit(alloc);
+    const no_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_no_pk);
+    defer runtime_schema.freeSchema(alloc, no_pk_runtime);
+    try std.testing.expect(no_pk_runtime.primary_key == null);
+    try std.testing.expectEqual(@as(usize, 5), no_pk_runtime.relational_columns.len);
+
+    var add_primary_key = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        \\ALTER TABLE usage_records
+        \\  ADD PERIOD FOR valid_time (valid_from, valid_to),
+        \\  ADD CONSTRAINT usage_records_pk PRIMARY KEY (tenant_id, id, valid_time WITHOUT OVERLAPS) INCLUDE (status);
+        ,
+    );
+    defer add_primary_key.deinit(alloc);
+    var primary_keyed = try applyDdlPlanToSchemaJsonAlloc(alloc, no_pk.schema_json, add_primary_key);
+    defer primary_keyed.deinit(alloc);
+    try std.testing.expect(primary_keyed.requires_rebuild);
+    try std.testing.expect(primary_keyed.validation_required);
+    try std.testing.expect(!primary_keyed.rewrite_required);
+    var parsed_primary_keyed = try schema_api.parseValidatedTableSchema(alloc, primary_keyed.schema_json);
+    defer parsed_primary_keyed.deinit(alloc);
+    const primary_keyed_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_primary_keyed);
+    defer runtime_schema.freeSchema(alloc, primary_keyed_runtime);
+    try std.testing.expect(primary_keyed_runtime.primary_key != null);
+    try std.testing.expectEqualStrings("usage_records_pk", primary_keyed_runtime.primary_key.?.name.?);
+    try std.testing.expectEqualStrings("tenant_id", primary_keyed_runtime.primary_key.?.columns[0]);
+    try std.testing.expectEqualStrings("id", primary_keyed_runtime.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), primary_keyed_runtime.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("status", primary_keyed_runtime.primary_key.?.include_columns[0]);
+    try std.testing.expectEqualStrings("valid_time", primary_keyed_runtime.primary_key.?.without_overlaps_period.?);
+    try std.testing.expectEqual(@as(usize, 1), primary_keyed_runtime.periods.len);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, primary_keyed.schema_json, add_primary_key));
+
+    var add_temporal = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        \\ALTER TABLE users
+        \\  ADD COLUMN valid_from numeric NOT NULL,
+        \\  ADD COLUMN valid_to numeric NOT NULL,
+        \\  ADD PERIOD FOR valid_time (valid_from, valid_to),
+        \\  ADD CONSTRAINT users_tenant_valid_key UNIQUE (tenant_id, valid_time WITHOUT OVERLAPS);
+        ,
+    );
+    defer add_temporal.deinit(alloc);
+    var temporal = try applyDdlPlanToSchemaJsonAlloc(alloc, altered.schema_json, add_temporal);
+    defer temporal.deinit(alloc);
+    try std.testing.expect(temporal.requires_rebuild);
+    try std.testing.expect(temporal.validation_required);
+    try std.testing.expect(temporal.rewrite_required);
+    try expectAppliedDdlWorkActions(temporal, &.{ .rebuild, .validate, .rewrite });
+    var parsed_temporal = try schema_api.parseValidatedTableSchema(alloc, temporal.schema_json);
+    defer parsed_temporal.deinit(alloc);
+    const temporal_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_temporal);
+    defer runtime_schema.freeSchema(alloc, temporal_runtime);
+    try std.testing.expectEqual(@as(usize, 1), temporal_runtime.periods.len);
+    try std.testing.expectEqualStrings("valid_time", temporal_runtime.periods[0].name);
+    try std.testing.expectEqual(@as(usize, 2), temporal_runtime.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_valid_key", temporal_runtime.unique_constraints[1].name);
+    try std.testing.expectEqualStrings("valid_time", temporal_runtime.unique_constraints[1].without_overlaps_period.?);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal_runtime.unique_constraints[1].validation_state);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, temporal.schema_json, add_temporal));
+
+    var not_valid = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE users ADD CONSTRAINT users_status_known_check CHECK (status != 'unknown') NOT VALID;",
+    );
+    defer not_valid.deinit(alloc);
+    var with_unvalidated_check = try applyDdlPlanToSchemaJsonAlloc(alloc, altered.schema_json, not_valid);
+    defer with_unvalidated_check.deinit(alloc);
+    try std.testing.expect(with_unvalidated_check.validation_required);
+
+    var validate = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE ONLY users VALIDATE CONSTRAINT users_status_known_check;",
+    );
+    defer validate.deinit(alloc);
+    var validated = try applyDdlPlanToSchemaJsonAlloc(alloc, with_unvalidated_check.schema_json, validate);
+    defer validated.deinit(alloc);
+    try std.testing.expect(validated.validation_required);
+
+    var validate_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE ONLY users VALIDATE CONSTRAINT users_pkey;",
+    );
+    defer validate_default_pk.deinit(alloc);
+    var validated_default_pk = try applyDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, validate_default_pk);
+    defer validated_default_pk.deinit(alloc);
+    var parsed_validated_default_pk = try schema_api.parseValidatedTableSchema(alloc, validated_default_pk.schema_json);
+    defer parsed_validated_default_pk.deinit(alloc);
+    const validated_default_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_validated_default_pk);
+    defer runtime_schema.freeSchema(alloc, validated_default_pk_runtime);
+    try std.testing.expect(validated_default_pk_runtime.primary_key != null);
+    try std.testing.expect(validated_default_pk_runtime.primary_key.?.name == null);
+
+    var rename_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE users RENAME CONSTRAINT users_pkey TO users_id_pk;",
+    );
+    defer rename_default_pk.deinit(alloc);
+    var renamed_default_pk = try applyDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, rename_default_pk);
+    defer renamed_default_pk.deinit(alloc);
+    var parsed_renamed_default_pk = try schema_api.parseValidatedTableSchema(alloc, renamed_default_pk.schema_json);
+    defer parsed_renamed_default_pk.deinit(alloc);
+    const renamed_default_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_renamed_default_pk);
+    defer runtime_schema.freeSchema(alloc, renamed_default_pk_runtime);
+    try std.testing.expectEqualStrings("users_id_pk", renamed_default_pk_runtime.primary_key.?.name.?);
+
+    var rename_default_pk_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE users RENAME CONSTRAINT users_pkey TO users_tenant_lower_email_key;",
+    );
+    defer rename_default_pk_duplicate.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, rename_default_pk_duplicate));
+
+    var drop_default_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE users DROP CONSTRAINT users_pkey;",
+    );
+    defer drop_default_pk.deinit(alloc);
+    var without_default_pk = try applyDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, drop_default_pk);
+    defer without_default_pk.deinit(alloc);
+    try std.testing.expect(without_default_pk.requires_rebuild);
+    try std.testing.expect(!without_default_pk.validation_required);
+    try std.testing.expect(without_default_pk.rewrite_required);
+    var parsed_without_default_pk = try schema_api.parseValidatedTableSchema(alloc, without_default_pk.schema_json);
+    defer parsed_without_default_pk.deinit(alloc);
+    const without_default_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_default_pk);
+    defer runtime_schema.freeSchema(alloc, without_default_pk_runtime);
+    try std.testing.expect(without_default_pk_runtime.primary_key == null);
+
+    var drop_named_pk = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "ALTER TABLE users DROP CONSTRAINT users_id_pk;",
+    );
+    defer drop_named_pk.deinit(alloc);
+    var without_named_pk = try applyDdlPlanToSchemaJsonAlloc(alloc, renamed_default_pk.schema_json, drop_named_pk);
+    defer without_named_pk.deinit(alloc);
+    try std.testing.expect(without_named_pk.requires_rebuild);
+    try std.testing.expect(!without_named_pk.validation_required);
+    try std.testing.expect(without_named_pk.rewrite_required);
+    var parsed_without_named_pk = try schema_api.parseValidatedTableSchema(alloc, without_named_pk.schema_json);
+    defer parsed_without_named_pk.deinit(alloc);
+    const without_named_pk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_named_pk);
+    defer runtime_schema.freeSchema(alloc, without_named_pk_runtime);
+    try std.testing.expect(without_named_pk_runtime.primary_key == null);
+
+    var trigger = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE TRIGGER users_updated_at BEFORE UPDATE ON users EXECUTE FUNCTION touch_updated_at('updated_at_ns');",
+    );
+    defer trigger.deinit(alloc);
+    var updated = try applyDdlPlanToSchemaJsonAlloc(alloc, validated.schema_json, trigger);
+    defer updated.deinit(alloc);
+    try std.testing.expect(!updated.requires_rebuild);
+    try std.testing.expect(!updated.validation_required);
+
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, updated.schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@as(usize, 8), runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 1), runtime.unique_constraints.len);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, runtime.unique_constraints[0].validation_state);
+    try std.testing.expectEqual(@as(usize, 1), runtime.foreign_keys.len);
+    try std.testing.expectEqualStrings("users_account_fkey", runtime.foreign_keys[0].name);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyValidationState.unvalidated, runtime.foreign_keys[0].validation_state);
+    try std.testing.expectEqual(@as(usize, 2), runtime.checks.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, runtime.checks[0].validation_state);
+    try std.testing.expectEqualStrings("users_status_known_check", runtime.checks[1].name);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.enforced, runtime.checks[1].validation_state);
+    const status = binder.relationalColumnForField(runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, status.index_lifecycle);
+    try std.testing.expect(status.index_generation != 0);
+    try std.testing.expect(status.index_name != null);
+    try std.testing.expectEqualStrings("users_status_idx", status.index_name.?);
+    const generated = binder.relationalColumnForField(runtime, "tenant_status_key", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated.generated != null);
+    const updated_at = binder.relationalColumnForField(runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(updated_at.on_update_value != null);
+
+    var drop_trigger = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TRIGGER users_updated_at ON users;");
+    defer drop_trigger.deinit(alloc);
+    var update_policy_dropped = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_trigger);
+    defer update_policy_dropped.deinit(alloc);
+    try std.testing.expect(!update_policy_dropped.requires_rebuild);
+    try std.testing.expect(!update_policy_dropped.validation_required);
+    var parsed_update_policy_dropped = try schema_api.parseValidatedTableSchema(alloc, update_policy_dropped.schema_json);
+    defer parsed_update_policy_dropped.deinit(alloc);
+    const update_policy_dropped_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_update_policy_dropped);
+    defer runtime_schema.freeSchema(alloc, update_policy_dropped_runtime);
+    const update_policy_dropped_column = binder.relationalColumnForField(update_policy_dropped_runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(update_policy_dropped_column.on_update_value == null);
+
+    var drop_status_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_status_idx;");
+    defer drop_status_index.deinit(alloc);
+    var status_index_dropped = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_status_index);
+    defer status_index_dropped.deinit(alloc);
+    try std.testing.expect(!status_index_dropped.requires_rebuild);
+    try std.testing.expect(!status_index_dropped.validation_required);
+    var parsed_status_index_dropped = try schema_api.parseValidatedTableSchema(alloc, status_index_dropped.schema_json);
+    defer parsed_status_index_dropped.deinit(alloc);
+    const status_index_dropped_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_status_index_dropped);
+    defer runtime_schema.freeSchema(alloc, status_index_dropped_runtime);
+    const dropped_json_status = binder.relationalColumnForField(status_index_dropped_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!dropped_json_status.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.ready, dropped_json_status.index_lifecycle);
+    try std.testing.expectEqual(@as(u64, 0), dropped_json_status.index_generation);
+    try std.testing.expect(dropped_json_status.index_name == null);
+
+    var drop_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_lower_email_key;");
+    defer drop_unique_index.deinit(alloc);
+    var unique_index_dropped = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_unique_index);
+    defer unique_index_dropped.deinit(alloc);
+    var parsed_unique_index_dropped = try schema_api.parseValidatedTableSchema(alloc, unique_index_dropped.schema_json);
+    defer parsed_unique_index_dropped.deinit(alloc);
+    const unique_index_dropped_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_unique_index_dropped);
+    defer runtime_schema.freeSchema(alloc, unique_index_dropped_runtime);
+    try std.testing.expectEqual(@as(usize, 0), unique_index_dropped_runtime.unique_constraints.len);
+
+    var set_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'pending';");
+    defer set_default.deinit(alloc);
+    var defaulted = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_default);
+    defer defaulted.deinit(alloc);
+    try std.testing.expect(!defaulted.requires_rebuild);
+    try std.testing.expect(!defaulted.validation_required);
+    var parsed_defaulted = try schema_api.parseValidatedTableSchema(alloc, defaulted.schema_json);
+    defer parsed_defaulted.deinit(alloc);
+    const defaulted_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_defaulted);
+    defer runtime_schema.freeSchema(alloc, defaulted_runtime);
+    const defaulted_status = binder.relationalColumnForField(defaulted_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(defaulted_status.default_value != null);
+    try std.testing.expectEqualStrings("\"pending\"", defaulted_status.default_value.?.value_json);
+
+    var set_casted_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns SET DEFAULT '7'::numeric;");
+    defer set_casted_numeric_default.deinit(alloc);
+    var casted_numeric_defaulted = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_casted_numeric_default);
+    defer casted_numeric_defaulted.deinit(alloc);
+    var parsed_casted_numeric_defaulted = try schema_api.parseValidatedTableSchema(alloc, casted_numeric_defaulted.schema_json);
+    defer parsed_casted_numeric_defaulted.deinit(alloc);
+    const casted_numeric_defaulted_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_casted_numeric_defaulted);
+    defer runtime_schema.freeSchema(alloc, casted_numeric_defaulted_runtime);
+    const casted_numeric_updated_at = binder.relationalColumnForField(casted_numeric_defaulted_runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(casted_numeric_updated_at.default_value != null);
+    try std.testing.expectEqualStrings("7", casted_numeric_updated_at.default_value.?.value_json);
+
+    var set_text_cast_numeric_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns SET DEFAULT '7'::text;");
+    defer set_text_cast_numeric_default.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_text_cast_numeric_default));
+
+    var drop_default = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status DROP DEFAULT;");
+    defer drop_default.deinit(alloc);
+    var undefaulted = try applyDdlPlanToSchemaJsonAlloc(alloc, defaulted.schema_json, drop_default);
+    defer undefaulted.deinit(alloc);
+    try std.testing.expect(!undefaulted.requires_rebuild);
+    try std.testing.expect(!undefaulted.validation_required);
+    var parsed_undefaulted = try schema_api.parseValidatedTableSchema(alloc, undefaulted.schema_json);
+    defer parsed_undefaulted.deinit(alloc);
+    const undefaulted_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_undefaulted);
+    defer runtime_schema.freeSchema(alloc, undefaulted_runtime);
+    const undefaulted_status = binder.relationalColumnForField(undefaulted_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(undefaulted_status.default_value == null);
+
+    var set_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status SET NOT NULL;");
+    defer set_not_null.deinit(alloc);
+    var required_status_schema = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, set_not_null);
+    defer required_status_schema.deinit(alloc);
+    try std.testing.expect(!required_status_schema.requires_rebuild);
+    try std.testing.expect(required_status_schema.validation_required);
+    var parsed_required_status = try schema_api.parseValidatedTableSchema(alloc, required_status_schema.schema_json);
+    defer parsed_required_status.deinit(alloc);
+    const required_status_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_required_status);
+    defer runtime_schema.freeSchema(alloc, required_status_runtime);
+    const required_json_status = binder.relationalColumnForField(required_status_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!required_json_status.nullable);
+
+    var drop_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status DROP NOT NULL;");
+    defer drop_not_null.deinit(alloc);
+    var nullable_status_schema = try applyDdlPlanToSchemaJsonAlloc(alloc, required_status_schema.schema_json, drop_not_null);
+    defer nullable_status_schema.deinit(alloc);
+    try std.testing.expect(!nullable_status_schema.requires_rebuild);
+    try std.testing.expect(!nullable_status_schema.validation_required);
+    var parsed_nullable_status = try schema_api.parseValidatedTableSchema(alloc, nullable_status_schema.schema_json);
+    defer parsed_nullable_status.deinit(alloc);
+    const nullable_status_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_nullable_status);
+    defer runtime_schema.freeSchema(alloc, nullable_status_runtime);
+    const nullable_json_status = binder.relationalColumnForField(nullable_status_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(nullable_json_status.nullable);
+
+    var drop_pk_not_null = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN id DROP NOT NULL;");
+    defer drop_pk_not_null.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_pk_not_null));
+
+    var alter_type = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN updated_at_ns TYPE timestamptz USING (updated_at_ns)::timestamptz;");
+    defer alter_type.deinit(alloc);
+    var typed = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, alter_type);
+    defer typed.deinit(alloc);
+    try std.testing.expect(typed.requires_rebuild);
+    try std.testing.expect(typed.validation_required);
+    try std.testing.expect(typed.rewrite_required);
+    var parsed_typed = try schema_api.parseValidatedTableSchema(alloc, typed.schema_json);
+    defer parsed_typed.deinit(alloc);
+    const typed_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_typed);
+    defer runtime_schema.freeSchema(alloc, typed_runtime);
+    const typed_updated_at = binder.relationalColumnForField(typed_runtime, "updated_at_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, typed_updated_at.field_type);
+    try std.testing.expect(typed_updated_at.on_update_value != null);
+
+    var alter_status_collated = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status TYPE text COLLATE \"C\";");
+    defer alter_status_collated.deinit(alloc);
+    var collated = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, alter_status_collated);
+    defer collated.deinit(alloc);
+    try std.testing.expect(collated.requires_rebuild);
+    try std.testing.expect(collated.validation_required);
+    try std.testing.expect(collated.rewrite_required);
+    var parsed_collated = try schema_api.parseValidatedTableSchema(alloc, collated.schema_json);
+    defer parsed_collated.deinit(alloc);
+    const collated_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_collated);
+    defer runtime_schema.freeSchema(alloc, collated_runtime);
+    const collated_status = binder.relationalColumnForField(collated_runtime, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, collated_status.field_type);
+    try std.testing.expectEqualStrings("C", collated_status.collation.?);
+
+    var alter_collated_status_to_numeric = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN status TYPE numeric;");
+    defer alter_collated_status_to_numeric.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, collated.schema_json, alter_collated_status_to_numeric));
+
+    var alter_generated_type = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ALTER COLUMN tenant_status_key TYPE text;");
+    defer alter_generated_type.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, alter_generated_type));
+
+    var rename_status = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN status TO state;");
+    defer rename_status.deinit(alloc);
+    var renamed = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_status);
+    defer renamed.deinit(alloc);
+    try std.testing.expect(renamed.requires_rebuild);
+    try std.testing.expect(renamed.validation_required);
+    try std.testing.expect(renamed.rewrite_required);
+    var parsed_renamed = try schema_api.parseValidatedTableSchema(alloc, renamed.schema_json);
+    defer parsed_renamed.deinit(alloc);
+    const renamed_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_renamed);
+    defer runtime_schema.freeSchema(alloc, renamed_runtime);
+    try std.testing.expect(binder.relationalColumnForField(renamed_runtime, "status", null) == null);
+    const state = binder.relationalColumnForField(renamed_runtime, "state", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("state", state.path);
+    const renamed_generated = binder.relationalColumnForField(renamed_runtime, "tenant_status_key", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("state", renamed_generated.generated.?.fields[1]);
+    try std.testing.expectEqualStrings("state", renamed_runtime.checks[0].field);
+
+    var rename_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME COLUMN status TO tenant_id;");
+    defer rename_duplicate.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_duplicate));
+
+    var rename_unique_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_tenant_lower_email_key TO users_tenant_email_ci_key;");
+    defer rename_unique_constraint.deinit(alloc);
+    var renamed_unique = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_unique_constraint);
+    defer renamed_unique.deinit(alloc);
+    try std.testing.expect(!renamed_unique.requires_rebuild);
+    try std.testing.expect(!renamed_unique.validation_required);
+    var parsed_renamed_unique = try schema_api.parseValidatedTableSchema(alloc, renamed_unique.schema_json);
+    defer parsed_renamed_unique.deinit(alloc);
+    const renamed_unique_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_renamed_unique);
+    defer runtime_schema.freeSchema(alloc, renamed_unique_runtime);
+    try std.testing.expectEqualStrings("users_tenant_email_ci_key", renamed_unique_runtime.unique_constraints[0].name);
+
+    var rename_fk_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_account_fkey TO users_account_fk;");
+    defer rename_fk_constraint.deinit(alloc);
+    var renamed_fk = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_fk_constraint);
+    defer renamed_fk.deinit(alloc);
+    var parsed_renamed_fk = try schema_api.parseValidatedTableSchema(alloc, renamed_fk.schema_json);
+    defer parsed_renamed_fk.deinit(alloc);
+    const renamed_fk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_renamed_fk);
+    defer runtime_schema.freeSchema(alloc, renamed_fk_runtime);
+    try std.testing.expectEqualStrings("users_account_fk", renamed_fk_runtime.foreign_keys[0].name);
+
+    var rename_check_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_status_check TO users_state_check;");
+    defer rename_check_constraint.deinit(alloc);
+    var renamed_check = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_check_constraint);
+    defer renamed_check.deinit(alloc);
+    var parsed_renamed_check = try schema_api.parseValidatedTableSchema(alloc, renamed_check.schema_json);
+    defer parsed_renamed_check.deinit(alloc);
+    const renamed_check_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_renamed_check);
+    defer runtime_schema.freeSchema(alloc, renamed_check_runtime);
+    try std.testing.expectEqualStrings("users_state_check", renamed_check_runtime.checks[0].name);
+
+    var rename_constraint_duplicate = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users RENAME CONSTRAINT users_status_check TO users_tenant_lower_email_key;");
+    defer rename_constraint_duplicate.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, rename_constraint_duplicate));
+
+    var drop_check = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT users_status_known_check;");
+    defer drop_check.deinit(alloc);
+    var without_check = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_check);
+    defer without_check.deinit(alloc);
+    var parsed_without_check = try schema_api.parseValidatedTableSchema(alloc, without_check.schema_json);
+    defer parsed_without_check.deinit(alloc);
+    const without_check_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_check);
+    defer runtime_schema.freeSchema(alloc, without_check_runtime);
+    try std.testing.expectEqual(@as(usize, 1), without_check_runtime.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 1), without_check_runtime.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), without_check_runtime.checks.len);
+
+    var drop_unique = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT users_tenant_lower_email_key;");
+    defer drop_unique.deinit(alloc);
+    var without_unique = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_unique);
+    defer without_unique.deinit(alloc);
+    var parsed_without_unique = try schema_api.parseValidatedTableSchema(alloc, without_unique.schema_json);
+    defer parsed_without_unique.deinit(alloc);
+    const without_unique_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_unique);
+    defer runtime_schema.freeSchema(alloc, without_unique_runtime);
+    try std.testing.expectEqual(@as(usize, 0), without_unique_runtime.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 1), without_unique_runtime.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), without_unique_runtime.checks.len);
+
+    var drop_fk = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_fkey;");
+    defer drop_fk.deinit(alloc);
+    var without_fk = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_fk);
+    defer without_fk.deinit(alloc);
+    var parsed_without_fk = try schema_api.parseValidatedTableSchema(alloc, without_fk.schema_json);
+    defer parsed_without_fk.deinit(alloc);
+    const without_fk_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_without_fk);
+    defer runtime_schema.freeSchema(alloc, without_fk_runtime);
+    try std.testing.expectEqual(@as(usize, 1), without_fk_runtime.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 0), without_fk_runtime.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), without_fk_runtime.checks.len);
+
+    var drop_missing_constraint_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT IF EXISTS missing_constraint;");
+    defer drop_missing_constraint_if_exists.deinit(alloc);
+    var unchanged_constraints = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_missing_constraint_if_exists);
+    defer unchanged_constraints.deinit(alloc);
+    var parsed_unchanged_constraints = try schema_api.parseValidatedTableSchema(alloc, unchanged_constraints.schema_json);
+    defer parsed_unchanged_constraints.deinit(alloc);
+    const unchanged_constraints_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_unchanged_constraints);
+    defer runtime_schema.freeSchema(alloc, unchanged_constraints_runtime);
+    try std.testing.expectEqual(@as(usize, 1), unchanged_constraints_runtime.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 1), unchanged_constraints_runtime.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 2), unchanged_constraints_runtime.checks.len);
+
+    var drop_missing_constraint = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP CONSTRAINT missing_constraint;");
+    defer drop_missing_constraint.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_missing_constraint));
+
+    var drop_status = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN status;");
+    defer drop_status.deinit(alloc);
+    var dropped = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_status);
+    defer dropped.deinit(alloc);
+    try std.testing.expect(dropped.requires_rebuild);
+    try std.testing.expect(dropped.validation_required);
+    try std.testing.expect(dropped.rewrite_required);
+    var parsed_dropped = try schema_api.parseValidatedTableSchema(alloc, dropped.schema_json);
+    defer parsed_dropped.deinit(alloc);
+    const dropped_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_dropped);
+    defer runtime_schema.freeSchema(alloc, dropped_runtime);
+    try std.testing.expect(binder.relationalColumnForField(dropped_runtime, "status", null) == null);
+    try std.testing.expect(binder.relationalColumnForField(dropped_runtime, "tenant_status_key", null) == null);
+    try std.testing.expectEqual(@as(usize, 1), dropped_runtime.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_lower_email_key", dropped_runtime.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), dropped_runtime.foreign_keys.len);
+    try std.testing.expectEqual(@as(usize, 0), dropped_runtime.checks.len);
+
+    var drop_missing_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN IF EXISTS missing_column;");
+    defer drop_missing_if_exists.deinit(alloc);
+    var unchanged = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_missing_if_exists);
+    defer unchanged.deinit(alloc);
+    var parsed_unchanged = try schema_api.parseValidatedTableSchema(alloc, unchanged.schema_json);
+    defer parsed_unchanged.deinit(alloc);
+    const unchanged_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_unchanged);
+    defer runtime_schema.freeSchema(alloc, unchanged_runtime);
+    try std.testing.expectEqual(@as(usize, 8), unchanged_runtime.relational_columns.len);
+
+    var drop_status_restrict = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN status RESTRICT;");
+    defer drop_status_restrict.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_status_restrict));
+
+    var drop_primary_key = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users DROP COLUMN id;");
+    defer drop_primary_key.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, drop_primary_key));
+
+    var duplicate_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE users ADD COLUMN IF NOT EXISTS status text REFERENCES accounts(id);");
+    defer duplicate_if_not_exists.deinit(alloc);
+    var unchanged_existing = try applyDdlPlanToSchemaJsonAlloc(alloc, updated.schema_json, duplicate_if_not_exists);
+    defer unchanged_existing.deinit(alloc);
+    var parsed_unchanged_existing = try schema_api.parseValidatedTableSchema(alloc, unchanged_existing.schema_json);
+    defer parsed_unchanged_existing.deinit(alloc);
+    const unchanged_existing_runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed_unchanged_existing);
+    defer runtime_schema.freeSchema(alloc, unchanged_existing_runtime);
+    try std.testing.expectEqual(@as(usize, 8), unchanged_existing_runtime.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, 1), unchanged_existing_runtime.foreign_keys.len);
+
+    var missing_table_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE IF EXISTS missing_users ADD COLUMN status text;");
+    defer missing_table_if_exists.deinit(alloc);
+    var missing_noop = try applyDdlPlanToSchemaJsonAlloc(alloc, "", missing_table_if_exists);
+    defer missing_noop.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), missing_noop.schema_json.len);
+    try std.testing.expect(!missing_noop.requires_rebuild);
+    try std.testing.expect(!missing_noop.validation_required);
+
+    var missing_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE missing_users ADD COLUMN status text;");
+    defer missing_table.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, "", missing_table));
+
+    var missing_drop_index_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX IF EXISTS missing_users_status_idx;");
+    defer missing_drop_index_if_exists.deinit(alloc);
+    var missing_drop_noop = try applyDdlPlanToSchemaJsonAlloc(alloc, "", missing_drop_index_if_exists);
+    defer missing_drop_noop.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), missing_drop_noop.schema_json.len);
+
+    var drop_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE users;");
+    defer drop_table.deinit(alloc);
+    var dropped_table = try applyDdlPlanToSchemaJsonAlloc(alloc, created.schema_json, drop_table);
+    defer dropped_table.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), dropped_table.schema_json.len);
+    try std.testing.expect(!dropped_table.requires_rebuild);
+    try std.testing.expect(!dropped_table.validation_required);
+    try std.testing.expect(!dropped_table.rewrite_required);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, "", drop_table));
+
+    var drop_table_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP TABLE IF EXISTS users;");
+    defer drop_table_if_exists.deinit(alloc);
+    var missing_drop_table_noop = try applyDdlPlanToSchemaJsonAlloc(alloc, "", drop_table_if_exists);
+    defer missing_drop_table_noop.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), missing_drop_table_noop.schema_json.len);
+}
+
+test "catalog apply executes prepared transaction recovery intents" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "sql-prepared-txn" });
+    defer runtime_store.deinit();
+
+    var prepare = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    defer prepare.deinit(alloc);
+    const prepare_plan = switch (prepare) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const expected_txn_id = preparedTransactionTxnIdFromGid("usage_batch");
+    const prepared = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, prepare_plan, 1_000);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.register_prepared, prepared.operation);
+    try std.testing.expectEqualStrings("usage_batch", prepared.gid);
+    try std.testing.expectEqualSlices(u8, &expected_txn_id, &prepared.txn_id);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, prepared.status);
+    try std.testing.expect(prepared.coordinator_recovery_log);
+
+    var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
+    defer manager.deinit();
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try manager.getTransactionStatus(expected_txn_id));
+    try std.testing.expectError(error.PreparedTransactionAlreadyExists, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, prepare_plan, 1_001));
+
+    var commit = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer commit.deinit(alloc);
+    const commit_plan = switch (commit) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const committed = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, commit_plan, 2_000);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, committed.operation);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, committed.status);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(expected_txn_id));
+    const committed_retry = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, commit_plan, 2_500);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, committed_retry.operation);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, committed_retry.status);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(expected_txn_id));
+
+    var rollback_committed = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
+    defer rollback_committed.deinit(alloc);
+    const rollback_committed_plan = switch (rollback_committed) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.PreparedTransactionDecisionConflict, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_committed_plan, 3_000));
+
+    var rollback = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "PREPARE TRANSACTION 'usage_abort';");
+    defer rollback.deinit(alloc);
+    const rollback_prepare_plan = switch (rollback) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    _ = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepare_plan, 4_000);
+
+    var rollback_prepared = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ROLLBACK PREPARED 'usage_abort';");
+    defer rollback_prepared.deinit(alloc);
+    const rollback_prepared_plan = switch (rollback_prepared) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    const aborted = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepared_plan, 5_000);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_rollback, aborted.operation);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, aborted.status);
+    const aborted_retry = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, rollback_prepared_plan, 5_500);
+    try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_rollback, aborted_retry.operation);
+    try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, aborted_retry.status);
+
+    var missing_commit = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "COMMIT PREPARED 'missing_gid';");
+    defer missing_commit.deinit(alloc);
+    const missing_commit_plan = switch (missing_commit) {
+        .prepared_transaction => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectError(error.PreparedTransactionNotFound, executePreparedTransactionRecoveryPlan(alloc, &runtime_store, missing_commit_plan, 6_000));
+}
+
 test "catalog apply applies create table ddl plan to owned runtime schema" {
     const alloc = std.testing.allocator;
     var lowered = try lowerDdlPlanForCatalogApplyTestAlloc(
@@ -2045,6 +2944,487 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     var missing_table = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "ALTER TABLE missing_usage ADD COLUMN status text;");
     defer missing_table.deinit(alloc);
     try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, missing_table));
+}
+
+test "catalog apply applies create index ddl plan to runtime schema" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, email text, amount numeric, status text, deleted_at timestamptz, metadata jsonb, tags text[]);",
+    );
+    defer create.deinit(alloc);
+    const schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, create);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var partial_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_status_active_idx ON users (status DESC NULLS LAST) WHERE deleted_at IS NULL;",
+    );
+    defer partial_index.deinit(alloc);
+    const indexed = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, partial_index);
+    defer runtime_schema.freeSchema(alloc, indexed);
+    const status = binder.relationalColumnForField(indexed, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(status.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, status.index_lifecycle);
+    try std.testing.expect(status.index_generation != 0);
+    try std.testing.expect(status.index_name != null);
+    try std.testing.expectEqualStrings("users_status_active_idx", status.index_name.?);
+    try std.testing.expectEqual(@as(usize, 1), status.index_where.len);
+    try std.testing.expectEqualStrings("deleted_at", status.index_where[0].field);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, indexed, partial_index));
+
+    var partial_index_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX IF NOT EXISTS users_status_active_idx ON users (status) WHERE deleted_at IS NULL;",
+    );
+    defer partial_index_if_not_exists.deinit(alloc);
+    const indexed_noop = try applyDdlPlanToRuntimeSchemaAlloc(alloc, indexed, partial_index_if_not_exists);
+    defer runtime_schema.freeSchema(alloc, indexed_noop);
+    const status_noop = binder.relationalColumnForField(indexed_noop, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(status.index_generation, status_noop.index_generation);
+    try std.testing.expect(status_noop.index_name != null);
+    try std.testing.expectEqualStrings("users_status_active_idx", status_noop.index_name.?);
+
+    const indexed_again = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, partial_index);
+    defer runtime_schema.freeSchema(alloc, indexed_again);
+    const status_again = binder.relationalColumnForField(indexed_again, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(status.index_generation, status_again.index_generation);
+
+    var covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_email_cover_idx ON users (email) INCLUDE (tenant_id, amount);",
+    );
+    defer covering_index.deinit(alloc);
+    const covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, covering_index);
+    defer runtime_schema.freeSchema(alloc, covering_schema);
+    const covered_email = binder.relationalColumnForField(covering_schema, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(covered_email.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, covered_email.index_lifecycle);
+    try std.testing.expect(covered_email.index_generation != 0);
+    try std.testing.expect(covered_email.index_name != null);
+    try std.testing.expectEqualStrings("users_email_cover_idx", covered_email.index_name.?);
+    try std.testing.expectEqual(@as(usize, 2), covered_email.index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", covered_email.index_include_columns[0]);
+    try std.testing.expectEqualStrings("amount", covered_email.index_include_columns[1]);
+    const covered_tenant = binder.relationalColumnForField(covering_schema, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), covered_tenant.index_include_columns.len);
+
+    var drop_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_email_cover_idx;");
+    defer drop_covering_index.deinit(alloc);
+    const covering_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, covering_schema, drop_covering_index);
+    defer runtime_schema.freeSchema(alloc, covering_dropped);
+    const dropped_email_cover = binder.relationalColumnForField(covering_dropped, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!dropped_email_cover.indexed);
+    try std.testing.expect(dropped_email_cover.index_name == null);
+    try std.testing.expectEqual(@as(usize, 0), dropped_email_cover.index_include_columns.len);
+
+    var generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_lower_email_idx ON users (lower(email));",
+    );
+    defer generated_index.deinit(alloc);
+    const generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, indexed, generated_index);
+    defer runtime_schema.freeSchema(alloc, generated_schema);
+    const generated = binder.relationalColumnForField(generated_schema, "users_lower_email_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, generated.index_lifecycle);
+    try std.testing.expect(generated.index_generation != 0);
+    try std.testing.expect(generated.index_name != null);
+    try std.testing.expectEqualStrings("users_lower_email_idx", generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated.generated.?.op);
+    try std.testing.expectEqualStrings("email", generated.generated.?.field.?);
+
+    var generated_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_lower_email_cover_idx ON users (lower(email)) INCLUDE (tenant_id, amount);",
+    );
+    defer generated_covering_index.deinit(alloc);
+    const generated_covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, generated_covering_index);
+    defer runtime_schema.freeSchema(alloc, generated_covering_schema);
+    const generated_covering = binder.relationalColumnForField(generated_covering_schema, "users_lower_email_cover_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(generated_covering.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, generated_covering.generated.?.op);
+    try std.testing.expectEqual(@as(usize, 2), generated_covering.index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", generated_covering.index_include_columns[0]);
+    try std.testing.expectEqualStrings("amount", generated_covering.index_include_columns[1]);
+
+    var gin_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_metadata_gin_cover_idx ON users USING gin (metadata jsonb_path_ops) INCLUDE (tenant_id);",
+    );
+    defer gin_covering_index.deinit(alloc);
+    const gin_covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, gin_covering_index);
+    defer runtime_schema.freeSchema(alloc, gin_covering_schema);
+    const gin_covering = binder.relationalColumnForField(gin_covering_schema, "metadata", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(gin_covering.indexed);
+    try std.testing.expectEqualStrings("users_metadata_gin_cover_idx", gin_covering.index_name.?);
+    try std.testing.expectEqual(@as(usize, 1), gin_covering.index_include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", gin_covering.index_include_columns[0]);
+
+    var wrapped_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_lower_email_wrapped_idx ON users ((lower(email)));",
+    );
+    defer wrapped_generated_index.deinit(alloc);
+    const wrapped_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, wrapped_generated_index);
+    defer runtime_schema.freeSchema(alloc, wrapped_generated_schema);
+    const wrapped_generated = binder.relationalColumnForField(wrapped_generated_schema, "users_lower_email_wrapped_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(wrapped_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, wrapped_generated.generated.?.op);
+    try std.testing.expectEqualStrings("email", wrapped_generated.generated.?.field.?);
+
+    var upper_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_upper_email_idx ON users (upper(email));",
+    );
+    defer upper_generated_index.deinit(alloc);
+    const upper_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, upper_generated_index);
+    defer runtime_schema.freeSchema(alloc, upper_generated_schema);
+    const upper_generated = binder.relationalColumnForField(upper_generated_schema, "users_upper_email_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(upper_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, upper_generated.index_lifecycle);
+    try std.testing.expect(upper_generated.index_generation != 0);
+    try std.testing.expect(upper_generated.index_name != null);
+    try std.testing.expectEqualStrings("users_upper_email_idx", upper_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, upper_generated.generated.?.op);
+    try std.testing.expectEqualStrings("email", upper_generated.generated.?.field.?);
+
+    var md5_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_md5_email_idx ON users (md5(email));",
+    );
+    defer md5_generated_index.deinit(alloc);
+    const md5_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_generated_schema, md5_generated_index);
+    defer runtime_schema.freeSchema(alloc, md5_generated_schema);
+    const md5_generated = binder.relationalColumnForField(md5_generated_schema, "users_md5_email_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(md5_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, md5_generated.index_lifecycle);
+    try std.testing.expect(md5_generated.index_generation != 0);
+    try std.testing.expect(md5_generated.index_name != null);
+    try std.testing.expectEqualStrings("users_md5_email_idx", md5_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, md5_generated.generated.?.op);
+    try std.testing.expectEqualStrings("email", md5_generated.generated.?.field.?);
+
+    var concat_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tenant_status_idx ON users (concat(tenant_id, ':', status));",
+    );
+    defer concat_generated_index.deinit(alloc);
+    const concat_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_generated_schema, concat_generated_index);
+    defer runtime_schema.freeSchema(alloc, concat_generated_schema);
+    const concat_generated = binder.relationalColumnForField(concat_generated_schema, "users_tenant_status_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(concat_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, concat_generated.index_lifecycle);
+    try std.testing.expect(concat_generated.index_generation != 0);
+    try std.testing.expect(concat_generated.index_name != null);
+    try std.testing.expectEqualStrings("users_tenant_status_idx", concat_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat, concat_generated.generated.?.op);
+    try std.testing.expectEqual(@as(usize, 2), concat_generated.generated.?.fields.len);
+    try std.testing.expectEqualStrings("tenant_id", concat_generated.generated.?.fields[0]);
+    try std.testing.expectEqualStrings("status", concat_generated.generated.?.fields[1]);
+    try std.testing.expectEqualStrings(":", concat_generated.generated.?.separator);
+
+    var concat_ws_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tenant_status_ws_idx ON users (concat_ws(':', tenant_id, status));",
+    );
+    defer concat_ws_generated_index.deinit(alloc);
+    const concat_ws_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, concat_generated_schema, concat_ws_generated_index);
+    defer runtime_schema.freeSchema(alloc, concat_ws_generated_schema);
+    const concat_ws_generated = binder.relationalColumnForField(concat_ws_generated_schema, "users_tenant_status_ws_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(concat_ws_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, concat_ws_generated.index_lifecycle);
+    try std.testing.expect(concat_ws_generated.index_generation != 0);
+    try std.testing.expect(concat_ws_generated.index_name != null);
+    try std.testing.expectEqualStrings("users_tenant_status_ws_idx", concat_ws_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.concat_ws, concat_ws_generated.generated.?.op);
+    try std.testing.expectEqual(@as(usize, 2), concat_ws_generated.generated.?.fields.len);
+    try std.testing.expectEqualStrings("tenant_id", concat_ws_generated.generated.?.fields[0]);
+    try std.testing.expectEqualStrings("status", concat_ws_generated.generated.?.fields[1]);
+    try std.testing.expectEqualStrings(":", concat_ws_generated.generated.?.separator);
+
+    var rich_expression_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_status_replace_idx ON users (replace(status, 'old', 'new'));",
+    );
+    defer rich_expression_generated_index.deinit(alloc);
+    const rich_expression_generated_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, concat_ws_generated_schema, rich_expression_generated_index);
+    defer runtime_schema.freeSchema(alloc, rich_expression_generated_schema);
+    const rich_expression_generated = binder.relationalColumnForField(rich_expression_generated_schema, "users_status_replace_idx", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rich_expression_generated.generated != null);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, rich_expression_generated.index_lifecycle);
+    try std.testing.expect(rich_expression_generated.index_generation != 0);
+    try std.testing.expect(rich_expression_generated.index_name != null);
+    try std.testing.expectEqualStrings("users_status_replace_idx", rich_expression_generated.index_name.?);
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.expression, rich_expression_generated.generated.?.op);
+    const rich_expression = rich_expression_generated.generated.?.expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), rich_expression.operands.len);
+
+    var unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_lower_email_key ON users (tenant_id, lower(email)) WHERE deleted_at IS NULL;",
+    );
+    defer unique_index.deinit(alloc);
+    const unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, generated_schema, unique_index);
+    defer runtime_schema.freeSchema(alloc, unique_schema);
+    try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_lower_email_key", unique_schema.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), unique_schema.unique_constraints[0].expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, unique_schema.unique_constraints[0].validation_state);
+
+    var unique_covering_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_email_cover_key ON users (email) INCLUDE (tenant_id, status);",
+    );
+    defer unique_covering_index.deinit(alloc);
+    const unique_covering_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, unique_covering_index);
+    defer runtime_schema.freeSchema(alloc, unique_covering_schema);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_email_cover_key", unique_covering_schema.unique_constraints[1].name);
+    try std.testing.expectEqual(@as(usize, 1), unique_covering_schema.unique_constraints[1].columns.len);
+    try std.testing.expectEqualStrings("email", unique_covering_schema.unique_constraints[1].columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), unique_covering_schema.unique_constraints[1].include_columns.len);
+    try std.testing.expectEqualStrings("tenant_id", unique_covering_schema.unique_constraints[1].include_columns[0]);
+    try std.testing.expectEqualStrings("status", unique_covering_schema.unique_constraints[1].include_columns[1]);
+
+    var upper_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_upper_email_key ON users (upper(email));",
+    );
+    defer upper_unique_index.deinit(alloc);
+    const upper_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, upper_unique_index);
+    defer runtime_schema.freeSchema(alloc, upper_unique_schema);
+    try std.testing.expectEqual(@as(usize, 2), upper_unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_upper_email_key", upper_unique_schema.unique_constraints[1].name);
+    try std.testing.expectEqual(@as(usize, 1), upper_unique_schema.unique_constraints[1].expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.upper, upper_unique_schema.unique_constraints[1].expressions[0].op);
+    try std.testing.expectEqualStrings("email", upper_unique_schema.unique_constraints[1].expressions[0].field);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, upper_unique_schema.unique_constraints[1].validation_state);
+
+    var md5_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_md5_email_key ON users (md5(email));",
+    );
+    defer md5_unique_index.deinit(alloc);
+    const md5_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, md5_unique_index);
+    defer runtime_schema.freeSchema(alloc, md5_unique_schema);
+    try std.testing.expectEqual(@as(usize, 3), md5_unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_md5_email_key", md5_unique_schema.unique_constraints[2].name);
+    try std.testing.expectEqual(@as(usize, 1), md5_unique_schema.unique_constraints[2].expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.md5, md5_unique_schema.unique_constraints[2].expressions[0].op);
+    try std.testing.expectEqualStrings("email", md5_unique_schema.unique_constraints[2].expressions[0].field);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, md5_unique_schema.unique_constraints[2].validation_state);
+
+    var rich_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_status_replace_key ON users (replace(status, 'old', 'new'));",
+    );
+    defer rich_unique_index.deinit(alloc);
+    const rich_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, md5_unique_schema, rich_unique_index);
+    defer runtime_schema.freeSchema(alloc, rich_unique_schema);
+    try std.testing.expectEqual(@as(usize, 4), rich_unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_status_replace_key", rich_unique_schema.unique_constraints[3].name);
+    try std.testing.expectEqual(@as(usize, 1), rich_unique_schema.unique_constraints[3].expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.expression, rich_unique_schema.unique_constraints[3].expressions[0].op);
+    const rich_unique_expression = rich_unique_schema.unique_constraints[3].expressions[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.replace, rich_unique_expression.kind);
+    try std.testing.expectEqual(@as(usize, 3), rich_unique_expression.operands.len);
+    try std.testing.expectEqualStrings("status", rich_unique_expression.operands[0].field);
+    try std.testing.expectEqualStrings("\"old\"", rich_unique_expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("\"new\"", rich_unique_expression.operands[2].value_json);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, rich_unique_schema.unique_constraints[3].validation_state);
+
+    var temporal_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc,
+        \\CREATE TABLE prices (
+        \\  id uuid PRIMARY KEY,
+        \\  sku text NOT NULL,
+        \\  valid_from numeric NOT NULL,
+        \\  valid_to numeric NOT NULL,
+        \\  price numeric,
+        \\  PERIOD FOR valid_time (valid_from, valid_to)
+        \\);
+    );
+    defer temporal_create.deinit(alloc);
+    const temporal_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, temporal_create);
+    defer runtime_schema.freeSchema(alloc, temporal_schema);
+
+    var temporal_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX prices_sku_valid_time_key ON prices (sku, valid_time WITHOUT OVERLAPS);",
+    );
+    defer temporal_unique_index.deinit(alloc);
+    const temporal_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, temporal_schema, temporal_unique_index);
+    defer runtime_schema.freeSchema(alloc, temporal_unique_schema);
+    try std.testing.expectEqual(@as(usize, 1), temporal_unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("prices_sku_valid_time_key", temporal_unique_schema.unique_constraints[0].name);
+    try std.testing.expectEqualStrings("sku", temporal_unique_schema.unique_constraints[0].columns[0]);
+    try std.testing.expectEqualStrings("valid_time", temporal_unique_schema.unique_constraints[0].without_overlaps_period.?);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal_unique_schema.unique_constraints[0].validation_state);
+
+    var wrapped_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_wrapped_lower_email_key ON users (tenant_id, (lower(email))) WHERE deleted_at IS NULL;",
+    );
+    defer wrapped_unique_index.deinit(alloc);
+    const wrapped_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, md5_unique_schema, wrapped_unique_index);
+    defer runtime_schema.freeSchema(alloc, wrapped_unique_schema);
+    try std.testing.expectEqual(@as(usize, 4), wrapped_unique_schema.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_wrapped_lower_email_key", wrapped_unique_schema.unique_constraints[3].name);
+    try std.testing.expectEqual(@as(usize, 1), wrapped_unique_schema.unique_constraints[3].expressions.len);
+    try std.testing.expectEqual(runtime_schema.UniqueExpressionOp.lower, wrapped_unique_schema.unique_constraints[3].expressions[0].op);
+    try std.testing.expectEqualStrings("email", wrapped_unique_schema.unique_constraints[3].expressions[0].field);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, wrapped_unique_schema.unique_constraints[3].validation_state);
+
+    var expression_where_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE UNIQUE INDEX users_tenant_lower_email_active_expr_key ON users (tenant_id, lower(email)) WHERE lower(status) = 'active';",
+    );
+    defer expression_where_unique_index.deinit(alloc);
+    const expression_where_unique_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, wrapped_unique_schema, expression_where_unique_index);
+    defer runtime_schema.freeSchema(alloc, expression_where_unique_schema);
+    try std.testing.expectEqual(@as(usize, 5), expression_where_unique_schema.unique_constraints.len);
+    const expression_where_unique = expression_where_unique_schema.unique_constraints[4];
+    try std.testing.expectEqualStrings("users_tenant_lower_email_active_expr_key", expression_where_unique.name);
+    try std.testing.expectEqual(@as(usize, 1), expression_where_unique.expressions.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_where_unique.where.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_where_unique.where_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_where_unique.where_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", expression_where_unique.where_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"active\"", expression_where_unique.where_expressions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, expression_where_unique.validation_state);
+
+    var gin_json_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_metadata_gin ON users USING gin (metadata jsonb_path_ops);",
+    );
+    defer gin_json_index.deinit(alloc);
+    const json_indexed_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, gin_json_index);
+    defer runtime_schema.freeSchema(alloc, json_indexed_schema);
+    const metadata = binder.relationalColumnForField(json_indexed_schema, "metadata", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(metadata.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, metadata.index_lifecycle);
+    try std.testing.expect(metadata.index_generation != 0);
+    try std.testing.expect(metadata.index_name != null);
+    try std.testing.expectEqualStrings("users_metadata_gin", metadata.index_name.?);
+
+    var gin_array_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tags_gin ON users USING gin (tags array_ops);",
+    );
+    defer gin_array_index.deinit(alloc);
+    const array_indexed_schema = try applyDdlPlanToRuntimeSchemaAlloc(alloc, json_indexed_schema, gin_array_index);
+    defer runtime_schema.freeSchema(alloc, array_indexed_schema);
+    const tags = binder.relationalColumnForField(array_indexed_schema, "tags", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(tags.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, tags.index_lifecycle);
+    try std.testing.expect(tags.index_generation != 0);
+    try std.testing.expect(tags.index_name != null);
+    try std.testing.expectEqualStrings("users_tags_gin", tags.index_name.?);
+
+    var invalid_gin_scalar = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_status_gin ON users USING gin (status);",
+    );
+    defer invalid_gin_scalar.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, invalid_gin_scalar));
+
+    var invalid_gin_json_opclass = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_metadata_bad_gin ON users USING gin (metadata array_ops);",
+    );
+    defer invalid_gin_json_opclass.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, invalid_gin_json_opclass));
+
+    var invalid_gin_array_opclass = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_tags_bad_gin ON users USING gin (tags jsonb_path_ops);",
+    );
+    defer invalid_gin_array_opclass.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, invalid_gin_array_opclass));
+
+    var drop_ordinary_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_status_active_idx;");
+    defer drop_ordinary_index.deinit(alloc);
+    const ordinary_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, upper_unique_schema, drop_ordinary_index);
+    defer runtime_schema.freeSchema(alloc, ordinary_dropped);
+    const dropped_status = binder.relationalColumnForField(ordinary_dropped, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!dropped_status.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.ready, dropped_status.index_lifecycle);
+    try std.testing.expectEqual(@as(u64, 0), dropped_status.index_generation);
+    try std.testing.expect(dropped_status.index_name == null);
+    try std.testing.expectEqual(@as(usize, 0), dropped_status.index_where.len);
+
+    var concurrent_status_index = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        "CREATE INDEX users_status_concurrent_idx ON users (status);",
+    );
+    defer concurrent_status_index.deinit(alloc);
+    const concurrent_indexed = try applyDdlPlanToRuntimeSchemaAlloc(alloc, ordinary_dropped, concurrent_status_index);
+    defer runtime_schema.freeSchema(alloc, concurrent_indexed);
+    var drop_concurrent_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX CONCURRENTLY users_status_concurrent_idx;");
+    defer drop_concurrent_index.deinit(alloc);
+    const concurrent_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, concurrent_indexed, drop_concurrent_index);
+    defer runtime_schema.freeSchema(alloc, concurrent_dropped);
+    const concurrent_dropped_status = binder.relationalColumnForField(concurrent_dropped, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!concurrent_dropped_status.indexed);
+    try std.testing.expect(concurrent_dropped_status.index_name == null);
+
+    var drop_generated_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_lower_email_idx;");
+    defer drop_generated_index.deinit(alloc);
+    const generated_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_generated_index);
+    defer runtime_schema.freeSchema(alloc, generated_dropped);
+    try std.testing.expect(binder.relationalColumnForField(generated_dropped, "users_lower_email_idx", null) == null);
+
+    var drop_unique_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_lower_email_key;");
+    defer drop_unique_index.deinit(alloc);
+    const unique_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_unique_index);
+    defer runtime_schema.freeSchema(alloc, unique_dropped);
+    try std.testing.expectEqual(@as(usize, 0), unique_dropped.unique_constraints.len);
+
+    var drop_missing_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX missing_idx;");
+    defer drop_missing_index.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_missing_index));
+
+    var drop_missing_if_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX IF EXISTS missing_idx;");
+    defer drop_missing_if_exists.deinit(alloc);
+    const unchanged_drop = try applyDdlPlanToRuntimeSchemaAlloc(alloc, unique_schema, drop_missing_if_exists);
+    defer runtime_schema.freeSchema(alloc, unchanged_drop);
+    try std.testing.expectEqual(@as(usize, unique_schema.relational_columns.len), unchanged_drop.relational_columns.len);
+    try std.testing.expectEqual(@as(usize, unique_schema.unique_constraints.len), unchanged_drop.unique_constraints.len);
+
+    const empty_drop_noop = try applyDdlPlanToRuntimeSchemaAlloc(alloc, .{}, drop_missing_if_exists);
+    defer runtime_schema.freeSchema(alloc, empty_drop_noop);
+    try std.testing.expectEqual(runtime_schema.StorageMode.document, empty_drop_noop.storage_mode);
+    try std.testing.expectEqual(@as(usize, 0), empty_drop_noop.relational_columns.len);
+
+    var multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE INDEX users_tenant_status_idx ON users (tenant_id, status);");
+    defer multi_column_index.deinit(alloc);
+    const multi_indexed = try applyDdlPlanToRuntimeSchemaAlloc(alloc, schema, multi_column_index);
+    defer runtime_schema.freeSchema(alloc, multi_indexed);
+    const indexed_tenant = binder.relationalColumnForField(multi_indexed, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    const indexed_status = binder.relationalColumnForField(multi_indexed, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(indexed_tenant.indexed);
+    try std.testing.expect(indexed_status.indexed);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, indexed_tenant.index_lifecycle);
+    try std.testing.expectEqual(runtime_schema.RelationalIndexLifecycle.building, indexed_status.index_lifecycle);
+    try std.testing.expectEqual(indexed_tenant.index_generation, indexed_status.index_generation);
+    try std.testing.expect(indexed_tenant.index_generation != 0);
+    try std.testing.expect(indexed_tenant.index_name != null);
+    try std.testing.expect(indexed_status.index_name != null);
+    try std.testing.expectEqualStrings("users_tenant_status_idx", indexed_tenant.index_name.?);
+    try std.testing.expectEqualStrings("users_tenant_status_idx", indexed_status.index_name.?);
+
+    var drop_multi_column_index = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "DROP INDEX users_tenant_status_idx;");
+    defer drop_multi_column_index.deinit(alloc);
+    const multi_dropped = try applyDdlPlanToRuntimeSchemaAlloc(alloc, multi_indexed, drop_multi_column_index);
+    defer runtime_schema.freeSchema(alloc, multi_dropped);
+    const dropped_tenant = binder.relationalColumnForField(multi_dropped, "tenant_id", null) orelse return error.TestUnexpectedResult;
+    const dropped_multi_status = binder.relationalColumnForField(multi_dropped, "status", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!dropped_tenant.indexed);
+    try std.testing.expect(!dropped_multi_status.indexed);
+    try std.testing.expect(dropped_tenant.index_name == null);
+    try std.testing.expect(dropped_multi_status.index_name == null);
 }
 
 test "catalog apply applies updated-at trigger ddl plan to runtime schema" {

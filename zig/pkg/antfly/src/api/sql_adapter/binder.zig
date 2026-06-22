@@ -752,7 +752,18 @@ pub fn lowerReadPlanWithCatalogSourceSchemaAlloc(
     catalog: table_catalog.CatalogSource,
     hooks: ReadPlanCatalogLoweringHooks,
 ) !plan_mod.LoweredReadPlan {
-    var resolved = try resolveReadPlanCatalogSourceSchemaAlloc(alloc, sql, catalog);
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    return try lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(alloc, tokens.items, catalog, hooks);
+}
+
+pub fn lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    catalog: table_catalog.CatalogSource,
+    hooks: ReadPlanCatalogLoweringHooks,
+) !plan_mod.LoweredReadPlan {
+    var resolved = try resolveReadPlanCatalogSourceSchemaFromTokensAlloc(alloc, tokens, catalog);
     defer resolved.deinit(alloc);
     if (resolved.source_schema) |source_schema| return try hooks.lower_with_source_schema(hooks.ptr, source_schema);
     return try hooks.lower_without_source_schema(hooks.ptr);
@@ -765,7 +776,19 @@ pub fn lowerWritePlanWithCatalogOptionsAlloc(
     catalog: table_catalog.CatalogSource,
     hooks: WritePlanCatalogLoweringHooks,
 ) !plan_mod.LoweredWritePlan {
-    var resolved = try resolveWritePlanCatalogOptionsAlloc(alloc, sql, options, catalog);
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    return try lowerWritePlanWithCatalogOptionsFromTokensAlloc(alloc, tokens.items, options, catalog, hooks);
+}
+
+pub fn lowerWritePlanWithCatalogOptionsFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    hooks: WritePlanCatalogLoweringHooks,
+) !plan_mod.LoweredWritePlan {
+    var resolved = try resolveWritePlanCatalogOptionsFromTokensAlloc(alloc, tokens, options, catalog);
     defer resolved.deinit(alloc);
     return try hooks.lower_with_options(hooks.ptr, resolved.options);
 }
@@ -795,10 +818,14 @@ const CteSourceBinding = struct {
 pub fn insertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "with")) return try insertSourceTableNamesFromWithAlloc(alloc, tokens.items);
-    if (!std.ascii.eqlIgnoreCase(tokens.items[0].text, "insert")) return null;
-    return try insertSourceTableNamesFromInsertAlloc(alloc, tokens.items, 0);
+    return try insertSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+}
+
+pub fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try insertSourceTableNamesFromWithAlloc(alloc, tokens);
+    if (!std.ascii.eqlIgnoreCase(tokens[0].text, "insert")) return null;
+    return try insertSourceTableNamesFromInsertAlloc(alloc, tokens, 0);
 }
 
 pub fn recursiveInsertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
@@ -853,15 +880,29 @@ pub fn recursiveInsertSourceTableNamesFromTokensAlloc(
 pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "with")) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens.items);
+    return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+}
 
-    return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens.items, 0);
+pub fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens);
+    return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, 0);
 }
 
 pub fn resolveWritePlanCatalogOptionsAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !CatalogBoundWritePlanOptions {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    return try resolveWritePlanCatalogOptionsFromTokensAlloc(alloc, tokens.items, options, catalog);
+}
+
+pub fn resolveWritePlanCatalogOptionsFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !CatalogBoundWritePlanOptions {
@@ -872,7 +913,7 @@ pub fn resolveWritePlanCatalogOptionsAlloc(
     var resolved_recursive_insert_source = false;
 
     if (out.options.insert_source_schema == null) {
-        if (try recursiveInsertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+        if (try recursiveInsertSourceTableNamesFromTokensAlloc(alloc, tokens)) |resolved_tables| {
             var tables = resolved_tables;
             defer tables.deinit(alloc);
             resolved_recursive_insert_source = true;
@@ -880,7 +921,7 @@ pub fn resolveWritePlanCatalogOptionsAlloc(
                 out.owned_insert_source_schema = try runtimeSchemaForCatalogTableAlloc(alloc, catalog, tables.source);
                 out.options.insert_source_schema = out.owned_insert_source_schema.?;
             }
-        } else if (try insertSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+        } else if (try insertSourceTableNamesFromTokensAlloc(alloc, tokens)) |resolved_tables| {
             var tables = resolved_tables;
             defer tables.deinit(alloc);
             if (!std.mem.eql(u8, tables.target, tables.source)) {
@@ -891,7 +932,7 @@ pub fn resolveWritePlanCatalogOptionsAlloc(
     }
 
     if (!resolved_recursive_insert_source and out.options.joined_source_schema == null) {
-        if (joinedWriteSourceTableNamesAlloc(alloc, sql)) |maybe_resolved_tables| {
+        if (joinedWriteSourceTableNamesFromTokensAlloc(alloc, tokens)) |maybe_resolved_tables| {
             if (maybe_resolved_tables) |resolved_tables| {
                 var tables = resolved_tables;
                 defer tables.deinit(alloc);
@@ -914,9 +955,19 @@ pub fn resolveReadPlanCatalogSourceSchemaAlloc(
     sql: []const u8,
     catalog: table_catalog.CatalogSource,
 ) !CatalogBoundReadPlanSourceSchema {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+    return try resolveReadPlanCatalogSourceSchemaFromTokensAlloc(alloc, tokens.items, catalog);
+}
+
+pub fn resolveReadPlanCatalogSourceSchemaFromTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    catalog: table_catalog.CatalogSource,
+) !CatalogBoundReadPlanSourceSchema {
     var out = CatalogBoundReadPlanSourceSchema{};
     errdefer out.deinit(alloc);
-    if (try readSourceTableNamesAlloc(alloc, sql)) |resolved_tables| {
+    if (try readSourceTableNamesFromTokensAlloc(alloc, tokens)) |resolved_tables| {
         var tables = resolved_tables;
         defer tables.deinit(alloc);
         if (!std.mem.eql(u8, tables.left, tables.source)) {
@@ -1113,10 +1164,14 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
 pub fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?ReadSourceTableNames {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "with")) return try readSourceTableNamesFromWithAlloc(alloc, tokens.items);
-    if (!std.ascii.eqlIgnoreCase(tokens.items[0].text, "select")) return null;
-    return try readSourceTableNamesFromSelectAlloc(alloc, tokens.items, 0);
+    return try readSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+}
+
+pub fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try readSourceTableNamesFromWithAlloc(alloc, tokens);
+    if (!std.ascii.eqlIgnoreCase(tokens[0].text, "select")) return null;
+    return try readSourceTableNamesFromSelectAlloc(alloc, tokens, 0);
 }
 
 fn readSourceTableNamesFromSelectAlloc(
@@ -1489,6 +1544,40 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     defer lateral.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", lateral.left);
     try std.testing.expectEqualStrings("balance_records", lateral.source);
+}
+
+test "sql adapter binder resolves catalog prebind table names from shared tokens" {
+    const alloc = std.testing.allocator;
+
+    var read_tokens = try lexer.tokenizeAlloc(
+        alloc,
+        "WITH open_orders AS (SELECT id, tenant, customer_id FROM usage_records), active_customers AS (SELECT id, tenant, name FROM customer_records) SELECT o.id, c.name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.tenant = c.tenant",
+    );
+    defer lexer.freeTokens(alloc, &read_tokens);
+    var read = (try readSourceTableNamesFromTokensAlloc(alloc, read_tokens.items)).?;
+    defer read.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", read.left);
+    try std.testing.expectEqualStrings("customer_records", read.source);
+
+    var insert_tokens = try lexer.tokenizeAlloc(
+        alloc,
+        "WITH source_rows AS (SELECT id, status FROM incoming_usage) INSERT INTO usage_records (id, status) SELECT id, status FROM source_rows",
+    );
+    defer lexer.freeTokens(alloc, &insert_tokens);
+    var insert_source = (try insertSourceTableNamesFromTokensAlloc(alloc, insert_tokens.items)).?;
+    defer insert_source.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", insert_source.target);
+    try std.testing.expectEqualStrings("incoming_usage", insert_source.source);
+
+    var update_tokens = try lexer.tokenizeAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.status FROM incoming_usage AS source WHERE source.id = usage_records.id",
+    );
+    defer lexer.freeTokens(alloc, &update_tokens);
+    var joined_write = (try joinedWriteSourceTableNamesFromTokensAlloc(alloc, update_tokens.items)).?;
+    defer joined_write.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", joined_write.target);
+    try std.testing.expectEqualStrings("incoming_usage", joined_write.source);
 }
 
 test "sql adapter binder rejects ambiguous physical cte read source tables" {

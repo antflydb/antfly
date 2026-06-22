@@ -291,10 +291,13 @@ Current implementation status:
 - `ParsedSql` wraps `TokenizedSql` with a raw statement view and byte-source
   span. DDL lowering, catalog-apply test lowering, read statement dispatch, and
   write statement dispatch now use that shared wrapper as the top-level SQL
-  object. EXPLAIN and write-plan dispatch have parsed lowering overloads.
-  Existing lowerer callbacks still accept SQL text for compatibility; migrating
-  those callbacks to borrowed `ParsedSql`/token slices is the next mechanical
-  step toward zero selected-lowerer re-tokenization.
+  object. EXPLAIN and write-plan dispatch have parsed lowering overloads,
+  selected read/write lowerer callbacks consume borrowed `ParsedSql`, and
+  catalog-backed read/write prebinding resolves source schemas from the shared
+  token stream. Remaining wrapper callbacks for catalog, EXPLAIN, and relation
+  population entrypoints still accept SQL text for compatibility; migrating
+  those wrappers to borrowed `ParsedSql`/token slices is the next mechanical
+  step toward zero re-tokenization across nested entrypoints.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source
