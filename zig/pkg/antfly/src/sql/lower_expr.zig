@@ -22992,7 +22992,7 @@ pub fn parseLateralWhereAlloc(
         }
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
             if (lhs_side != .right) return error.UnsupportedSqlShape;
-            const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+            const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
@@ -23000,7 +23000,7 @@ pub fn parseLateralWhereAlloc(
         if (parser.matchKeyword(tokens, pos, "not")) {
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-                const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+                const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
@@ -23412,6 +23412,40 @@ pub fn parseScalarWherePredicateAlloc(
     };
 }
 
+fn expressionStartKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.abs) or
+        token.matchesKeywordTag(.array_append) or
+        token.matchesKeywordTag(.array_cat) or
+        token.matchesKeywordTag(.array_prepend) or
+        token.matchesKeywordTag(.array_remove) or
+        token.matchesKeywordTag(.array_replace) or
+        token.matchesKeywordTag(.array_to_string) or
+        token.matchesKeywordTag(.ascii) or
+        token.matchesKeywordTag(.bit_length) or
+        token.matchesKeywordTag(.case) or
+        token.matchesKeywordTag(.cast) or
+        token.matchesKeywordTag(.chr) or
+        token.matchesKeywordTag(.coalesce) or
+        token.matchesKeywordTag(.concat) or
+        token.matchesKeywordTag(.concat_ws) or
+        token.matchesKeywordTag(.convert_from) or
+        token.matchesKeywordTag(.current_date) or
+        token.matchesKeywordTag(.current_timestamp) or
+        token.matchesKeywordTag(.false) or
+        token.matchesKeywordTag(.length) or
+        token.matchesKeywordTag(.lower) or
+        token.matchesKeywordTag(.now) or
+        token.matchesKeywordTag(.null) or
+        token.matchesKeywordTag(.nullif) or
+        token.matchesKeywordTag(.octet_length) or
+        token.matchesKeywordTag(.replace) or
+        token.matchesKeywordTag(.round) or
+        token.matchesKeywordTag(.string_to_array) or
+        token.matchesKeywordTag(.trim) or
+        token.matchesKeywordTag(.true) or
+        token.matchesKeywordTag(.upper);
+}
+
 pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
     if (index >= tokens.len) return false;
     const token = tokens[index];
@@ -23420,44 +23454,17 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
     if (token.kind != .identifier) return false;
     if (functionCallStartsAtIf(tokens, index, sqlKeywordIsArrayLengthFunction) or
         functionCallStartsAtIf(tokens, index, sqlKeywordIsArrayPositionFunction) or
-        token.matchesKeywordTag(.case) or
-        token.matchesKeywordTag(.cast) or
-        token.matchesKeywordTag(.coalesce) or
-        std.ascii.eqlIgnoreCase(token.text, "concat") or
-        std.ascii.eqlIgnoreCase(token.text, "concat_ws") or
-        std.ascii.eqlIgnoreCase(token.text, "convert_from") or
-        std.ascii.eqlIgnoreCase(token.text, "current_date") or
-        std.ascii.eqlIgnoreCase(token.text, "current_timestamp") or
+        expressionStartKeywordToken(token) or
         functionCallStartsAt(tokens, index, "gen_random_uuid") or
         functionCallStartsAt(tokens, index, "uuid_generate_v4") or
-        token.matchesKeywordTag(.false) or
-        std.ascii.eqlIgnoreCase(token.text, "abs") or
-        std.ascii.eqlIgnoreCase(token.text, "ascii") or
         functionCallStartsAt(tokens, index, "floor") or
         functionCallStartsAt(tokens, index, "ceil") or
         functionCallStartsAt(tokens, index, "sqrt") or
         functionCallStartsAt(tokens, index, "sign") or
         functionCallStartsAt(tokens, index, "mod") or
         functionCallStartsAt(tokens, index, "power") or
-        std.ascii.eqlIgnoreCase(token.text, "chr") or
-        std.ascii.eqlIgnoreCase(token.text, "length") or
-        std.ascii.eqlIgnoreCase(token.text, "bit_length") or
-        std.ascii.eqlIgnoreCase(token.text, "lower") or
-        std.ascii.eqlIgnoreCase(token.text, "now") or
-        token.matchesKeywordTag(.null) or
-        token.matchesKeywordTag(.nullif) or
-        std.ascii.eqlIgnoreCase(token.text, "octet_length") or
         sqlKeywordIsOverlayFunction(token.text) or
-        std.ascii.eqlIgnoreCase(token.text, "round") or
         functionCallStartsAt(tokens, index, "trunc") or
-        std.ascii.eqlIgnoreCase(token.text, "array_append") or
-        std.ascii.eqlIgnoreCase(token.text, "array_prepend") or
-        std.ascii.eqlIgnoreCase(token.text, "array_cat") or
-        std.ascii.eqlIgnoreCase(token.text, "array_remove") or
-        std.ascii.eqlIgnoreCase(token.text, "array_replace") or
-        std.ascii.eqlIgnoreCase(token.text, "array_to_string") or
-        std.ascii.eqlIgnoreCase(token.text, "string_to_array") or
-        std.ascii.eqlIgnoreCase(token.text, "trim") or
         sqlKeywordIsTrimVariantFunction(token.text) or
         sqlKeywordIsPadFunction(token.text) or
         sqlKeywordIsRepeatFunction(token.text) or
@@ -23473,15 +23480,12 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
         (sqlKeywordIsJsonTypeofFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
         (sqlKeywordIsJsonArrayLengthFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
         (sqlKeywordIsJsonBuildObjectFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
-        (std.ascii.eqlIgnoreCase(token.text, "to_jsonb") and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
+        (token.matchesKeywordTag(.to_jsonb) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
         sqlKeywordIsRegexpMatchFunction(token.text) or
         sqlKeywordIsRegexpCountFunction(token.text) or
         sqlKeywordIsRegexpSubstrFunction(token.text) or
         sqlKeywordIsRegexpInstrFunction(token.text) or
-        std.ascii.eqlIgnoreCase(token.text, "replace") or
-        sqlKeywordIsTranslateFunction(token.text) or
-        token.matchesKeywordTag(.true) or
-        std.ascii.eqlIgnoreCase(token.text, "upper"))
+        sqlKeywordIsTranslateFunction(token.text))
     {
         return true;
     }
@@ -24101,6 +24105,19 @@ test "sql adapter expression keyword predicates classify function and tail token
     try std.testing.expect(rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "THEN", .keyword = .then }));
     try std.testing.expect(rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "ELSE", .keyword = .@"else" }));
     try std.testing.expect(rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "END", .keyword = .end }));
+
+    const tagged_expression_starts = [_]Token{
+        .{ .kind = .identifier, .text = "CONCAT_WS", .keyword = .concat_ws },
+        .{ .kind = .identifier, .text = "STRING_TO_ARRAY", .keyword = .string_to_array },
+        .{ .kind = .identifier, .text = "CURRENT_TIMESTAMP", .keyword = .current_timestamp },
+        .{ .kind = .identifier, .text = "REPLACE", .keyword = .replace },
+    };
+    for (tagged_expression_starts) |start| {
+        try std.testing.expect(expressionStartKeywordToken(start));
+        try std.testing.expect(expressionCanStartAt(&.{start}, 0));
+    }
+    const quoted_expression_name = Token{ .kind = .identifier, .text = "concat_ws", .source_start = 0, .source_end = 11 };
+    try std.testing.expect(!expressionStartKeywordToken(quoted_expression_name));
 
     const unsupported_tail_tokens = [_]Token{.{ .kind = .identifier, .text = "LATERAL", .keyword = .lateral }};
     try std.testing.expect(nextIsUnsupportedQueryKeyword(unsupported_tail_tokens[0..], 0));

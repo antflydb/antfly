@@ -735,6 +735,12 @@ Current implementation status:
 - Query-function app-parity assertions expose a parsed entrypoint, and the
   integration corpus runner uses that parsed route instead of reparsing fixture
   SQL inside the assertion helper.
+- The integration corpus runner constructs `ParsedSql` once per entry and
+  shares it across read, write, explain, DDL, invalid, unsupported,
+  relation-population, adapter-noop, and query-function assertion branches.
+- Common expression-start function names now carry compact token keyword
+  metadata, and expression classifier probes consume those tags instead of
+  repeating local case-insensitive string checks.
 - HTTP relational SQL DDL execution, source-backed DDL application, bulk SQL,
   and auth-catalog DDL helpers construct `ParsedSql` once at ingress before
   lowering DDL/session control plans, and transaction-boundary session cleanup

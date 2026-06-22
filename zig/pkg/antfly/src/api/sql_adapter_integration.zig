@@ -671,43 +671,41 @@ const writePlanFingerprintAlloc = sql_adapter.writePlanFingerprintAlloc;
 const explainPlanFingerprintAlloc = sql_adapter.explainPlanFingerprintAlloc;
 const invalidPlanFingerprintAlloc = sql_adapter.invalidPlanFingerprintAlloc;
 
-fn lowerAppParityReadPlanAlloc(
+fn lowerAppParityReadPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
 ) !LoweredReadPlan {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
         return try lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
             alloc,
-            &parsed_sql,
+            parsed_sql,
             effective_schema,
             entry.params,
             catalog.iface(),
             .{},
         );
     }
-    return try lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{});
+    return try lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{});
 }
 
-fn lowerAppParityExplainPlanAlloc(
+fn lowerAppParityExplainPlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredExplainPlan {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
         return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
             alloc,
-            &parsed_sql,
+            parsed_sql,
             effective_schema,
             entry.params,
             .{
@@ -720,7 +718,7 @@ fn lowerAppParityExplainPlanAlloc(
     }
     return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
         alloc,
-        &parsed_sql,
+        parsed_sql,
         effective_schema,
         entry.params,
         .{
@@ -736,8 +734,9 @@ fn expectAppParityReadPlanEntry(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
 ) !void {
-    var lowered = try lowerAppParityReadPlanAlloc(alloc, effective_schema, entry);
+    var lowered = try lowerAppParityReadPlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql);
     defer lowered.deinit(alloc);
     try expectAppParityReadSummary(entry.summary, lowered);
 
@@ -816,24 +815,23 @@ fn appParityPlanFamilyIsSupportedRead(family: AppParityCorpusPlanFamily) bool {
     };
 }
 
-fn lowerAppParityWritePlanAlloc(
+fn lowerAppParityWritePlanParsedSqlAlloc(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !LoweredWritePlan {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, &parsed_sql);
+    var catalog_opt = try sql_adapter.appParityCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql);
     if (catalog_opt) |*catalog| {
         defer catalog.deinit(alloc);
-        return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{
+        return try lowerWritePlanWithCatalogParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
             .unique_resolver = unique_resolver,
             .row_claim = row_claim,
         }, catalog.iface());
     }
-    return try lowerWritePlanParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{
+    return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
         .unique_resolver = unique_resolver,
         .row_claim = row_claim,
     });
@@ -843,10 +841,11 @@ fn expectAppParityWritePlanEntry(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
-    var lowered = try lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, unique_resolver, row_claim);
+    var lowered = try lowerAppParityWritePlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql, unique_resolver, row_claim);
     defer lowered.deinit(alloc);
     try expectAppParityWriteSummary(entry.summary, lowered);
 
@@ -993,24 +992,22 @@ fn expectAppParityUnsupportedPlanEntry(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-
     switch (entry.family) {
-        .unsupported => try expectFailClosedUnsupported(lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{})),
-        .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{})),
-        .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql)),
-        .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, unique_resolver, row_claim)),
-        .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
-        .unsupported_update => try expectFailClosedUnsupported(lowerUpdateParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
-        .unsupported_update_source => try expectFailClosedUnsupported(lowerUpdateMutationSourceParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, row_claim)),
-        .unsupported_delete => try expectFailClosedUnsupported(lowerDeleteParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
-        .unsupported_update_joined_source => try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
-        .unsupported_delete_joined_source => try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
-        .unsupported_merge_mutation => try expectFailClosedUnsupported(lowerMergeMutationPlanParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params)),
+        .unsupported => try expectFailClosedUnsupported(lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
+        .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
+        .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql)),
+        .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql, unique_resolver, row_claim)),
+        .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update => try expectFailClosedUnsupported(lowerUpdateParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update_source => try expectFailClosedUnsupported(lowerUpdateMutationSourceParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, row_claim)),
+        .unsupported_delete => try expectFailClosedUnsupported(lowerDeleteParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update_joined_source => try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
+        .unsupported_delete_joined_source => try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
+        .unsupported_merge_mutation => try expectFailClosedUnsupported(lowerMergeMutationPlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, effective_schema, entry.params)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -1028,19 +1025,17 @@ fn expectAppParityInvalidPlanEntry(
     alloc: std.mem.Allocator,
     effective_schema: runtime_schema.TableSchema,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-
     switch (entry.family) {
-        .invalid_read => try expectTypedInvalid(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{})),
-        .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
-        .invalid_update => try expectTypedInvalid(lowerUpdateStrictParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
-        .invalid_delete => try expectTypedInvalid(lowerDeleteParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
-        .invalid_update_source => try expectTypedInvalid(lowerUpdateMutationSourceParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, row_claim)),
-        .invalid_update_joined_source => try expectTypedInvalid(lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
+        .invalid_read => try expectTypedInvalid(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
+        .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_update => try expectTypedInvalid(lowerUpdateStrictParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_delete => try expectTypedInvalid(lowerDeleteParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_update_source => try expectTypedInvalid(lowerUpdateMutationSourceParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, row_claim)),
+        .invalid_update_joined_source => try expectTypedInvalid(lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -1088,28 +1083,27 @@ fn expectAppParityCorpusEntry(
     else
         unique_resolver;
 
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+
     if (appParityPlanFamilyIsSupportedRead(entry.family)) {
-        return try expectAppParityReadPlanEntry(alloc, effective_schema, entry);
+        return try expectAppParityReadPlanEntry(alloc, effective_schema, entry, &parsed_sql);
     }
     if (appParityPlanFamilyIsSupportedWrite(entry.family)) {
-        return try expectAppParityWritePlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
+        return try expectAppParityWritePlanEntry(alloc, effective_schema, entry, &parsed_sql, effective_unique_resolver, row_claim);
     }
     if (sql_adapter.corpusPlanFamilyIsUnsupported(entry.family)) {
-        return try expectAppParityUnsupportedPlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
+        return try expectAppParityUnsupportedPlanEntry(alloc, effective_schema, entry, &parsed_sql, effective_unique_resolver, row_claim);
     }
     if (sql_adapter.corpusPlanFamilyIsInvalid(entry.family)) {
-        return try expectAppParityInvalidPlanEntry(alloc, effective_schema, entry, effective_unique_resolver, row_claim);
+        return try expectAppParityInvalidPlanEntry(alloc, effective_schema, entry, &parsed_sql, effective_unique_resolver, row_claim);
     }
     if (entry.family == .query_function) {
-        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-        defer parsed_sql.deinit(alloc);
         return try sql_adapter.expectAppParityQueryFunctionParsedSqlEntry(alloc, entry, &parsed_sql);
     }
 
     switch (entry.family) {
         .ddl => {
-            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-            defer parsed_sql.deinit(alloc);
             var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
             defer lowered.deinit(alloc);
             try expectDdlSummary(entry.summary, lowered);
@@ -1121,7 +1115,7 @@ fn expectAppParityCorpusEntry(
         },
         .query_function => return error.TestUnexpectedResult,
         .read => {
-            var lowered = try lowerAppParityReadPlanAlloc(alloc, effective_schema, entry);
+            var lowered = try lowerAppParityReadPlanParsedSqlAlloc(alloc, effective_schema, entry, &parsed_sql);
             defer lowered.deinit(alloc);
             try expectAppParityReadSummary(entry.summary, lowered);
             const fingerprint = try readPlanFingerprintAlloc(alloc, lowered);
@@ -1135,10 +1129,11 @@ fn expectAppParityCorpusEntry(
         .window,
         => return error.TestUnexpectedResult,
         .explain => {
-            var lowered = try lowerAppParityExplainPlanAlloc(
+            var lowered = try lowerAppParityExplainPlanParsedSqlAlloc(
                 alloc,
                 effective_schema,
                 entry,
+                &parsed_sql,
                 effective_unique_resolver,
                 row_claim,
             );
@@ -1149,8 +1144,6 @@ fn expectAppParityCorpusEntry(
             try expectAppParityPlan(entry.plan, fingerprint);
         },
         .relation_population => {
-            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-            defer parsed_sql.deinit(alloc);
             var lowered = try lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, null, .{});
             defer lowered.deinit(alloc);
             try expectOptionalTableName(entry.summary.table_name, lowered.target_table_name);
@@ -1171,8 +1164,6 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-            defer parsed_sql.deinit(alloc);
             if (lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql)) |lowered_value| {
                 var lowered = lowered_value;
                 defer lowered.deinit(alloc);
