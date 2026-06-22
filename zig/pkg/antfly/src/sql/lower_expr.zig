@@ -32,6 +32,7 @@ const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
 pub const Token = token_mod.Token;
+pub const TokenKeyword = token_mod.TokenKeyword;
 pub const TokenKind = token_mod.TokenKind;
 pub const max_scalar_or_expanded_branches: usize = 32;
 
@@ -18656,6 +18657,141 @@ pub fn sqlKeywordIsRegexpInstrFunction(text: []const u8) bool {
     return std.ascii.eqlIgnoreCase(text, "regexp_instr");
 }
 
+fn tokenMatchesKeywordTags(token: Token, comptime tags: []const TokenKeyword) bool {
+    inline for (tags) |tag| {
+        if (token.matchesKeywordTag(tag)) return true;
+    }
+    return false;
+}
+
+pub fn sqlTokenIsLengthFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .length, .char_length, .character_length });
+}
+
+pub fn sqlTokenIsOctetLengthFunction(token: Token) bool {
+    return token.matchesKeywordTag(.octet_length);
+}
+
+pub fn sqlTokenIsBitLengthFunction(token: Token) bool {
+    return token.matchesKeywordTag(.bit_length);
+}
+
+pub fn sqlTokenIsJsonArrayLengthFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .json_array_length, .jsonb_array_length });
+}
+
+pub fn sqlTokenIsCardinalityFunction(token: Token) bool {
+    return token.matchesKeywordTag(.cardinality);
+}
+
+pub fn sqlTokenIsArrayLengthFunction(token: Token) bool {
+    return token.matchesKeywordTag(.array_length) or sqlTokenIsCardinalityFunction(token);
+}
+
+pub fn sqlTokenIsArrayPositionFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .array_position, .array_positions });
+}
+
+pub fn sqlTokenIsJsonTypeofFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .json_typeof, .jsonb_typeof });
+}
+
+pub fn sqlTokenIsJsonExtractPathFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .json_extract_path, .json_extract_path_text, .jsonb_extract_path, .jsonb_extract_path_text });
+}
+
+pub fn sqlTokenIsJsonBuildObjectFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .json_build_object, .jsonb_build_object });
+}
+
+pub fn sqlTokenIsSubstringFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .substring, .substr });
+}
+
+pub fn sqlTokenIsOverlayFunction(token: Token) bool {
+    return token.matchesKeywordTag(.overlay);
+}
+
+pub fn sqlTokenIsTranslateFunction(token: Token) bool {
+    return token.matchesKeywordTag(.translate);
+}
+
+pub fn sqlTokenIsSplitPartFunction(token: Token) bool {
+    return token.matchesKeywordTag(.split_part);
+}
+
+pub fn sqlTokenIsStrposFunction(token: Token) bool {
+    return token.matchesKeywordTag(.strpos);
+}
+
+pub fn sqlTokenIsLeftRightFunction(token: Token) bool {
+    return token.matchesKeywordTag(.left) or token.matchesKeywordTag(.right);
+}
+
+pub fn sqlTokenIsPadFunction(token: Token) bool {
+    return token.matchesKeywordTag(.lpad) or token.matchesKeywordTag(.rpad);
+}
+
+pub fn sqlTokenIsRepeatFunction(token: Token) bool {
+    return token.matchesKeywordTag(.repeat);
+}
+
+pub fn sqlTokenIsReverseFunction(token: Token) bool {
+    return token.matchesKeywordTag(.reverse);
+}
+
+pub fn sqlTokenIsInitcapFunction(token: Token) bool {
+    return token.matchesKeywordTag(.initcap);
+}
+
+pub fn sqlTokenIsMd5Function(token: Token) bool {
+    return token.matchesKeywordTag(.md5);
+}
+
+pub fn sqlTokenIsStartsWithFunction(token: Token) bool {
+    return token.matchesKeywordTag(.starts_with);
+}
+
+pub fn sqlTokenIsEndsWithFunction(token: Token) bool {
+    return token.matchesKeywordTag(.ends_with);
+}
+
+pub fn sqlTokenIsDateTruncFunction(token: Token) bool {
+    return token.matchesKeywordTag(.date_trunc);
+}
+
+pub fn sqlTokenIsDateBinFunction(token: Token) bool {
+    return token.matchesKeywordTag(.date_bin);
+}
+
+pub fn sqlTokenIsDatePartFunction(token: Token) bool {
+    return token.matchesKeywordTag(.date_part) or token.matchesKeywordTag(.extract);
+}
+
+pub fn sqlTokenIsTrimVariantFunction(token: Token) bool {
+    return tokenMatchesKeywordTags(token, &.{ .btrim, .ltrim, .rtrim });
+}
+
+pub fn sqlTokenIsUuidV4Function(token: Token) bool {
+    return token.matchesKeywordTag(.gen_random_uuid) or token.matchesKeywordTag(.uuid_generate_v4);
+}
+
+pub fn sqlTokenIsRegexpMatchFunction(token: Token) bool {
+    return token.matchesKeywordTag(.regexp_match) or token.matchesKeywordTag(.regexp_like);
+}
+
+pub fn sqlTokenIsRegexpCountFunction(token: Token) bool {
+    return token.matchesKeywordTag(.regexp_count);
+}
+
+pub fn sqlTokenIsRegexpSubstrFunction(token: Token) bool {
+    return token.matchesKeywordTag(.regexp_substr);
+}
+
+pub fn sqlTokenIsRegexpInstrFunction(token: Token) bool {
+    return token.matchesKeywordTag(.regexp_instr);
+}
+
 pub fn matchAnyOrSomeKeyword(tokens: []const Token, pos: *usize) bool {
     if (pos.* >= tokens.len) return false;
     const token = tokens[pos.*];
@@ -18697,11 +18833,11 @@ pub fn matchTextLengthFunctionKind(tokens: []const Token, pos: *usize) ?db_mod.t
     if (pos.* >= tokens.len) return null;
     const token = tokens[pos.*];
     if (token.kind != .identifier) return null;
-    const kind: db_mod.types.RelationalRowsExpressionKind = if (sqlKeywordIsLengthFunction(token.text))
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (sqlTokenIsLengthFunction(token))
         .length
-    else if (sqlKeywordIsOctetLengthFunction(token.text))
+    else if (sqlTokenIsOctetLengthFunction(token))
         .octet_length
-    else if (sqlKeywordIsBitLengthFunction(token.text))
+    else if (sqlTokenIsBitLengthFunction(token))
         .bit_length
     else
         return null;
@@ -18757,21 +18893,20 @@ pub fn matchCaseFoldFunctionKind(tokens: []const Token, pos: *usize) ?db_mod.typ
     if (pos.* >= tokens.len) return null;
     const token = tokens[pos.*];
     if (token.kind != .identifier) return null;
-    const kind: db_mod.types.RelationalRowsExpressionKind = if (std.ascii.eqlIgnoreCase(token.text, "lower"))
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (token.matchesKeywordTag(.lower))
         .lower
-    else if (std.ascii.eqlIgnoreCase(token.text, "upper"))
+    else if (token.matchesKeywordTag(.upper))
         .upper
-    else if (sqlKeywordIsInitcapFunction(token.text))
+    else if (token.matchesKeywordTag(.initcap))
         .initcap
-    else if (std.ascii.eqlIgnoreCase(token.text, "trim"))
+    else if (token.matchesKeywordTag(.trim))
         .trim
-    else if (sqlKeywordIsTrimVariantFunction(token.text))
-        if (std.ascii.eqlIgnoreCase(token.text, "ltrim"))
-            .ltrim
-        else if (std.ascii.eqlIgnoreCase(token.text, "rtrim"))
-            .rtrim
-        else
-            .trim
+    else if (token.matchesKeywordTag(.ltrim))
+        .ltrim
+    else if (token.matchesKeywordTag(.rtrim))
+        .rtrim
+    else if (token.matchesKeywordTag(.btrim))
+        .trim
     else
         return null;
     pos.* += 1;
@@ -18811,30 +18946,30 @@ pub fn parseRegexpReplaceFunctionCallStart(tokens: []const Token, pos: *usize) !
 }
 
 pub fn parseJsonArrayLengthFunctionCallStart(tokens: []const Token, pos: *usize) !void {
-    _ = matchFunctionKeywordText(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) orelse return error.UnsupportedSqlShape;
+    _ = matchFunctionKeywordToken(tokens, pos, sqlTokenIsJsonArrayLengthFunction) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
 }
 
 pub fn parseJsonTypeofFunctionCallStart(tokens: []const Token, pos: *usize) !void {
-    _ = matchFunctionKeywordText(tokens, pos, sqlKeywordIsJsonTypeofFunction) orelse return error.UnsupportedSqlShape;
+    _ = matchFunctionKeywordToken(tokens, pos, sqlTokenIsJsonTypeofFunction) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
 }
 
 pub fn parseJsonBuildObjectFunctionCallStart(tokens: []const Token, pos: *usize) !void {
-    _ = matchFunctionKeywordText(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) orelse return error.UnsupportedSqlShape;
+    _ = matchFunctionKeywordToken(tokens, pos, sqlTokenIsJsonBuildObjectFunction) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
 }
 
 pub fn parseArrayLengthFunctionCallStart(tokens: []const Token, pos: *usize) ![]const u8 {
-    const keyword = matchFunctionKeywordText(tokens, pos, sqlKeywordIsArrayLengthFunction) orelse return error.UnsupportedSqlShape;
+    const keyword = (matchFunctionKeywordToken(tokens, pos, sqlTokenIsArrayLengthFunction) orelse return error.UnsupportedSqlShape).text;
     try parser.expectToken(tokens, pos, .lparen);
     return keyword;
 }
 
 pub fn parseArrayPositionFunctionCallStart(tokens: []const Token, pos: *usize) !db_mod.types.RelationalRowsExpressionKind {
-    const keyword = matchFunctionKeywordText(tokens, pos, sqlKeywordIsArrayPositionFunction) orelse return error.UnsupportedSqlShape;
+    const token = matchFunctionKeywordToken(tokens, pos, sqlTokenIsArrayPositionFunction) orelse return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .lparen);
-    return if (std.ascii.eqlIgnoreCase(keyword, "array_positions")) .array_positions else .array_position;
+    return if (token.matchesKeywordTag(.array_positions)) .array_positions else .array_position;
 }
 
 pub fn parseStringToArrayFunctionCallStart(tokens: []const Token, pos: *usize) !void {
@@ -18894,29 +19029,45 @@ fn fixedBinaryFunctionKeyword(kind: db_mod.types.RelationalRowsExpressionKind) ?
 pub fn matchLeftRightFunctionKind(tokens: []const Token, pos: *usize) ?db_mod.types.RelationalRowsExpressionKind {
     if (pos.* >= tokens.len) return null;
     const token = tokens[pos.*];
-    if (token.kind != .identifier or !sqlKeywordIsLeftRightFunction(token.text)) return null;
+    if (token.kind != .identifier) return null;
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (token.matchesKeywordTag(.left))
+        .left
+    else if (token.matchesKeywordTag(.right))
+        .right
+    else
+        return null;
     pos.* += 1;
-    if (std.ascii.eqlIgnoreCase(token.text, "left")) return .left;
-    return .right;
+    return kind;
 }
 
 pub fn matchPadFunctionKind(tokens: []const Token, pos: *usize) ?db_mod.types.RelationalRowsExpressionKind {
     if (pos.* >= tokens.len) return null;
     const token = tokens[pos.*];
-    if (token.kind != .identifier or !sqlKeywordIsPadFunction(token.text)) return null;
+    if (token.kind != .identifier) return null;
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (token.matchesKeywordTag(.lpad))
+        .lpad
+    else if (token.matchesKeywordTag(.rpad))
+        .rpad
+    else
+        return null;
     pos.* += 1;
-    if (std.ascii.eqlIgnoreCase(token.text, "lpad")) return .lpad;
-    return .rpad;
+    return kind;
 }
 
 pub fn matchTrimVariantFunctionKind(tokens: []const Token, pos: *usize) ?db_mod.types.RelationalRowsExpressionKind {
     if (pos.* >= tokens.len) return null;
     const token = tokens[pos.*];
-    if (token.kind != .identifier or !sqlKeywordIsTrimVariantFunction(token.text)) return null;
+    if (token.kind != .identifier) return null;
+    const kind: db_mod.types.RelationalRowsExpressionKind = if (token.matchesKeywordTag(.ltrim))
+        .ltrim
+    else if (token.matchesKeywordTag(.rtrim))
+        .rtrim
+    else if (token.matchesKeywordTag(.btrim))
+        .trim
+    else
+        return null;
     pos.* += 1;
-    if (std.ascii.eqlIgnoreCase(token.text, "ltrim")) return .ltrim;
-    if (std.ascii.eqlIgnoreCase(token.text, "rtrim")) return .rtrim;
-    return .trim;
+    return kind;
 }
 
 pub fn matchFunctionKeyword(
@@ -18934,6 +19085,18 @@ pub fn matchFunctionKeywordText(
 ) ?[]const u8 {
     const token = parser.Cursor.init(tokens, pos).matchIdentifierIf(predicate) orelse return null;
     return token.text;
+}
+
+pub fn matchFunctionKeywordToken(
+    tokens: []const Token,
+    pos: *usize,
+    comptime predicate: fn (Token) bool,
+) ?Token {
+    if (pos.* >= tokens.len) return null;
+    const token = tokens[pos.*];
+    if (token.kind != .identifier or !predicate(token)) return null;
+    pos.* += 1;
+    return token;
 }
 
 pub fn parseFunctionCallStartIf(
@@ -19003,6 +19166,16 @@ pub fn functionCallStartsAtIf(
     return parser.Cursor.init(tokens, &pos).functionCallStartsAtIf(index, predicate);
 }
 
+pub fn functionCallStartsAtTokenIf(
+    tokens: []const Token,
+    index: usize,
+    comptime predicate: fn (Token) bool,
+) bool {
+    if (index + 1 >= tokens.len) return false;
+    const token = tokens[index];
+    return token.kind == .identifier and predicate(token) and tokens[index + 1].kind == .lparen;
+}
+
 pub fn peekFunctionCall(tokens: []const Token, pos: usize, keyword: []const u8) bool {
     return functionCallStartsAt(tokens, pos, keyword);
 }
@@ -19015,12 +19188,20 @@ pub fn peekFunctionCallIf(
     return functionCallStartsAtIf(tokens, pos, predicate);
 }
 
+pub fn peekFunctionCallTokenIf(
+    tokens: []const Token,
+    pos: usize,
+    comptime predicate: fn (Token) bool,
+) bool {
+    return functionCallStartsAtTokenIf(tokens, pos, predicate);
+}
+
 pub fn peekCaseFoldFunctionCall(tokens: []const Token, pos: usize) bool {
     return peekFunctionCall(tokens, pos, "lower") or
         peekFunctionCall(tokens, pos, "upper") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsInitcapFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsInitcapFunction) or
         peekFunctionCall(tokens, pos, "trim") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction);
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction);
 }
 
 pub fn peekCaseExpressionSyntax(tokens: []const Token, pos: usize) bool {
@@ -19116,27 +19297,27 @@ pub fn peekTextLengthFunctionKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     const token = tokens[pos];
     return token.kind == .identifier and
-        (sqlKeywordIsLengthFunction(token.text) or
-            sqlKeywordIsOctetLengthFunction(token.text) or
-            sqlKeywordIsBitLengthFunction(token.text));
+        (sqlTokenIsLengthFunction(token) or
+            sqlTokenIsOctetLengthFunction(token) or
+            sqlTokenIsBitLengthFunction(token));
 }
 
 pub fn peekSubstringFunctionKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     const token = tokens[pos];
-    return token.kind == .identifier and sqlKeywordIsSubstringFunction(token.text);
+    return token.kind == .identifier and sqlTokenIsSubstringFunction(token);
 }
 
 pub fn peekSplitPartFunctionKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     const token = tokens[pos];
-    return token.kind == .identifier and sqlKeywordIsSplitPartFunction(token.text);
+    return token.kind == .identifier and sqlTokenIsSplitPartFunction(token);
 }
 
 pub fn peekStrposFunctionKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     const token = tokens[pos];
-    return token.kind == .identifier and sqlKeywordIsStrposFunction(token.text);
+    return token.kind == .identifier and sqlTokenIsStrposFunction(token);
 }
 
 pub fn peekUnsupportedSimpleFieldTail(tokens: []const Token, pos: usize) bool {
@@ -24186,15 +24367,38 @@ test "sql adapter expression keyword predicates classify function and tail token
     try std.testing.expect(peekGreatestLeastFunctionCall(greatest_tokens[0..], 0));
 
     const case_fold_start_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "ltrim" },
+        .{ .kind = .identifier, .text = "LTRIM", .keyword = .ltrim },
         .{ .kind = .lparen, .text = "(" },
     };
     var case_fold_start_pos: usize = 0;
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ltrim, try parseCaseFoldFunctionCallStart(case_fold_start_tokens[0..], &case_fold_start_pos));
     try std.testing.expectEqual(@as(usize, 2), case_fold_start_pos);
+    const quoted_case_fold_start_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "ltrim", .source_start = 0, .source_end = 7 },
+        .{ .kind = .lparen, .text = "(" },
+    };
+    var quoted_case_fold_start_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseCaseFoldFunctionCallStart(quoted_case_fold_start_tokens[0..], &quoted_case_fold_start_pos));
+
+    const left_right_tokens = [_]Token{.{ .kind = .identifier, .text = "RIGHT", .keyword = .right }};
+    var left_right_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.right, matchLeftRightFunctionKind(left_right_tokens[0..], &left_right_pos).?);
+    try std.testing.expectEqual(@as(usize, 1), left_right_pos);
+    const quoted_left_right_tokens = [_]Token{.{ .kind = .identifier, .text = "right", .source_start = 0, .source_end = 7 }};
+    var quoted_left_right_pos: usize = 0;
+    try std.testing.expect(matchLeftRightFunctionKind(quoted_left_right_tokens[0..], &quoted_left_right_pos) == null);
+
+    const pad_tokens = [_]Token{.{ .kind = .identifier, .text = "RPAD", .keyword = .rpad }};
+    var pad_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.rpad, matchPadFunctionKind(pad_tokens[0..], &pad_pos).?);
+    try std.testing.expectEqual(@as(usize, 1), pad_pos);
+    const trim_variant_tokens = [_]Token{.{ .kind = .identifier, .text = "BTRIM", .keyword = .btrim }};
+    var trim_variant_pos: usize = 0;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.trim, matchTrimVariantFunctionKind(trim_variant_tokens[0..], &trim_variant_pos).?);
+    try std.testing.expectEqual(@as(usize, 1), trim_variant_pos);
 
     const case_fold_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "upper" },
+        .{ .kind = .identifier, .text = "UPPER", .keyword = .upper },
         .{ .kind = .lparen, .text = "(" },
     };
     try std.testing.expect(peekCaseFoldFunctionCall(case_fold_tokens[0..], 0));

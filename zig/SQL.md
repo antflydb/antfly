@@ -751,6 +751,12 @@ Current implementation status:
   case-insensitive token-text checks.
 - Window-clause discovery and JSON extraction membership probes use token
   keyword tags for `WINDOW`, `ANY`, `SOME`, and `ALL`.
+- Scalar expression function classifiers now have compact token metadata for
+  broader text, JSON, array, regex, datetime, and numeric function families.
+  Length, JSON-type/extract/build, array-length/position, case-fold/trim,
+  substring/split/strpos, left/right, and pad parser helpers consume token tags
+  directly instead of rechecking identifier text, while quoted identifiers stay
+  outside keyword classification.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.
