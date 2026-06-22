@@ -3978,6 +3978,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower expr lowers qualified generated read-source predicates",
             "sql adapter lower expr lowers scalar function expressions",
             "sql adapter lower expr lowers case-fold expression predicates",
+            "sql adapter lower expr lowers direct select set operation query plans",
             "sql adapter lower expr reconciles set operation output shape",
             "sql adapter lower expr assembles boolean predicate groups",
             "sql adapter lower expr names every row expression kind",

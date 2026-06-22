@@ -24668,6 +24668,525 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     );
 }
 
+test "sql adapter lower expr lowers direct select set operation query plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var disjoint_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' ORDER BY id ASC LIMIT 5 OFFSET 2",
+        schema,
+        &.{},
+    );
+    defer disjoint_union.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", disjoint_union.table_name);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_union.plan.ctes.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_union.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_union.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("status", disjoint_union.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_union.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_union.plan.query.or_predicates[1].predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), disjoint_union.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("id", disjoint_union.plan.query.order_by[0].field);
+    try std.testing.expectEqual(@as(u32, 5), disjoint_union.plan.query.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), disjoint_union.plan.query.offset);
+
+    var disjoint_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_or_union.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", disjoint_or_union.table_name);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_or_union.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_or_union.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_or_union.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_or_union.plan.query.or_predicates[1].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_or_union.plan.query.or_predicates[2].predicates[0].value_json.?);
+
+    var disjoint_in_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_in_union.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", disjoint_in_union.table_name);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_union.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_union.plan.query.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_in_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), disjoint_in_union.plan.query.access_or_predicates[0].in_predicates.len);
+    try std.testing.expectEqualStrings("status", disjoint_in_union.plan.query.access_or_predicates[0].in_predicates[0].field);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", disjoint_in_union.plan.query.access_or_predicates[0].in_predicates[0].values_json);
+    try std.testing.expectEqual(@as(usize, 1), disjoint_in_union.plan.query.access_or_predicates[1].predicates.len);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_in_union.plan.query.access_or_predicates[1].predicates[0].value_json.?);
+
+    var disjoint_or_in_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'closed' OR status = 'archived' UNION ALL SELECT id FROM usage_records WHERE status IN ('open', 'pending')",
+        schema,
+        &.{},
+    );
+    defer disjoint_or_in_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_or_in_union.plan.query.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_or_in_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_or_in_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_or_in_union.plan.query.access_or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"archived\"", disjoint_or_in_union.plan.query.access_or_predicates[1].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", disjoint_or_in_union.plan.query.access_or_predicates[2].in_predicates[0].values_json);
+
+    var disjoint_in_expression_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_in_expression_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_expression_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_expression_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_in_expression_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_union.plan.query.expression_or_predicates[1].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_in_expression_union.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_union.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_in_expression_union.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+
+    var disjoint_in_expression_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_in_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_expression_or_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_in_expression_or_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 5), disjoint_in_expression_or_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_in_expression_or_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_in_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_in_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_in_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_in_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_in_expression_or_union.plan.query.expression_or_predicates[4].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_in_expression_or_union.plan.query.expression_or_predicates[4].conditions[0].rhs[0].value_json);
+
+    var expression_disjoint_in_expression_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        schema,
+        &.{},
+    );
+    defer expression_disjoint_in_expression_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_disjoint_in_expression_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_disjoint_in_expression_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), expression_disjoint_in_expression_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", expression_disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", expression_disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", expression_disjoint_in_expression_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_disjoint_in_expression_union.plan.query.expression_or_predicates[2].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"closed\"", expression_disjoint_in_expression_union.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+
+    var disjoint_expression_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_expression_or_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_expression_or_union.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_expression_or_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), disjoint_expression_or_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_expression_or_union.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+
+    var disjoint_mixed_expression_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION ALL SELECT id FROM usage_records WHERE lower(status) = 'closed'",
+        schema,
+        &.{},
+    );
+    defer disjoint_mixed_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), disjoint_mixed_expression_or_union.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), disjoint_mixed_expression_or_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"active\"", disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[1].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"closed\"", disjoint_mixed_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+
+    var distinct_in_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION SELECT id FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+    );
+    defer distinct_in_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), distinct_in_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), distinct_in_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", distinct_in_union.plan.query.access_or_predicates[0].in_predicates[0].values_json);
+    try std.testing.expectEqualStrings("\"closed\"", distinct_in_union.plan.query.access_or_predicates[1].predicates[0].value_json.?);
+
+    var in_expression_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_expression_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_union.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), in_expression_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_union.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_union.plan.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_union.plan.query.expression_or_predicates[1].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", in_expression_union.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", in_expression_union.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+
+    var in_expression_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_union.plan.query.access_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 5), in_expression_or_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_or_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", in_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", in_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", in_expression_or_union.plan.query.expression_or_predicates[4].conditions[0].lhs.field);
+
+    var expression_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_or_union.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_or_union.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), expression_or_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_union.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", expression_or_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", expression_or_union.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", expression_or_union.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+
+    var mixed_expression_or_union = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending') UNION SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_or_union.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), mixed_expression_or_union.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), mixed_expression_or_union.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"active\"", mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", mixed_expression_or_union.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", mixed_expression_or_union.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", mixed_expression_or_union.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+
+    var in_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_intersect.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_intersect.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", in_intersect.plan.query.in_predicates[0].values_json);
+    try std.testing.expectEqualStrings("enabled", in_intersect.plan.query.predicates[0].field);
+
+    var in_expression_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') AND lower(status) = 'open' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer in_expression_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_intersect.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_intersect.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_intersect.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", in_expression_intersect.plan.query.in_predicates[0].values_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_intersect.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_intersect.plan.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", in_expression_intersect.plan.query.predicates[0].field);
+
+    var in_expression_or_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending'",
+        schema,
+        &.{},
+    );
+    defer in_expression_or_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_intersect.plan.query.in_predicates.len);
+    try std.testing.expectEqual(@as(usize, 4), in_expression_or_intersect.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_or_intersect.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", in_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", in_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_or_intersect.plan.query.expression_or_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"pending\"", in_expression_or_intersect.plan.query.expression_or_predicates[2].conditions[0].rhs[0].value_json);
+
+    var or_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' INTERSECT SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer or_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), or_intersect.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), or_intersect.plan.query.or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), or_intersect.plan.query.or_predicates[0].predicates.len);
+    try std.testing.expectEqualStrings("\"open\"", or_intersect.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("enabled", or_intersect.plan.query.or_predicates[0].predicates[1].field);
+    try std.testing.expectEqualStrings("\"pending\"", or_intersect.plan.query.or_predicates[1].predicates[0].value_json.?);
+
+    var except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records EXCEPT SELECT id FROM usage_records WHERE status = 'deleted'",
+        schema,
+        &.{},
+    );
+    defer except.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", except.table_name);
+    try std.testing.expectEqual(@as(usize, 1), except.plan.query.not_predicates.len);
+    try std.testing.expectEqualStrings("status", except.plan.query.not_predicates[0].predicates[0].field);
+    try std.testing.expectEqualStrings("\"deleted\"", except.plan.query.not_predicates[0].predicates[0].value_json.?);
+
+    var mixed_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' AND lower(status) = 'archived'",
+        schema,
+        &.{},
+    );
+    defer mixed_except.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", mixed_except.table_name);
+    try std.testing.expectEqual(@as(usize, 1), mixed_except.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", mixed_except.plan.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 0), mixed_except.plan.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), mixed_except.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_except.plan.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", mixed_except.plan.query.expression_not_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", mixed_except.plan.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_except.plan.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"archived\"", mixed_except.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+
+    var in_expression_or_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
+        schema,
+        &.{},
+    );
+    defer in_expression_or_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_or_except.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_except.plan.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_or_except.plan.query.access_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 4), in_expression_or_except.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_or_except.plan.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", in_expression_or_except.plan.query.expression_not_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", in_expression_or_except.plan.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_or_except.plan.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"deleted\"", in_expression_or_except.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_or_except.plan.query.expression_not_predicates[2].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"archived\"", in_expression_or_except.plan.query.expression_not_predicates[2].conditions[0].rhs[0].value_json);
+
+    var in_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived')",
+        schema,
+        &.{},
+    );
+    defer in_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_except.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), in_except.plan.query.not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_except.plan.query.access_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), in_except.plan.query.access_not_predicates[0].in_predicates.len);
+    try std.testing.expectEqualStrings("[\"deleted\",\"archived\"]", in_except.plan.query.access_not_predicates[0].in_predicates[0].values_json);
+
+    var or_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' OR status = 'archived'",
+        schema,
+        &.{},
+    );
+    defer or_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), or_except.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), or_except.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("enabled", or_except.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), or_except.plan.query.not_predicates.len);
+    try std.testing.expectEqualStrings("\"deleted\"", or_except.plan.query.not_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("\"archived\"", or_except.plan.query.not_predicates[1].predicates[0].value_json.?);
+
+    var expression_or_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'",
+        schema,
+        &.{},
+    );
+    defer expression_or_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_or_except.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_or_except.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqualStrings("enabled", expression_or_except.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_except.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_except.plan.query.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"deleted\"", expression_or_except.plan.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"archived\"", expression_or_except.plan.query.expression_not_predicates[1].conditions[0].rhs[0].value_json);
+
+    var mixed_expression_or_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status = 'deleted' AND (lower(status) = 'deleted' OR lower(status) = 'archived')",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_or_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_expression_or_except.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", mixed_expression_or_except.plan.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_except.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_except.plan.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("status", mixed_expression_or_except.plan.query.expression_not_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", mixed_expression_or_except.plan.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_or_except.plan.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"deleted\"", mixed_expression_or_except.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"archived\"", mixed_expression_or_except.plan.query.expression_not_predicates[1].conditions[1].rhs[0].value_json);
+
+    var in_expression_except = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status IN ('deleted', 'archived') AND lower(status) = 'archived'",
+        schema,
+        &.{},
+    );
+    defer in_expression_except.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), in_expression_except.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("enabled", in_expression_except.plan.query.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 0), in_expression_except.plan.query.access_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_except.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), in_expression_except.plan.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, in_expression_except.plan.query.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"archived\"", in_expression_except.plan.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", in_expression_except.plan.query.expression_not_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", in_expression_except.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"archived\"", in_expression_except.plan.query.expression_not_predicates[1].conditions[1].rhs[0].value_json);
+
+    var expression_or_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE lower(status) = 'deleted' OR lower(status) = 'archived'",
+        schema,
+        &.{},
+    );
+    defer expression_or_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_or_intersect.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_intersect.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_intersect.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("enabled", expression_or_intersect.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_intersect.plan.query.expression_or_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("\"deleted\"", expression_or_intersect.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"archived\"", expression_or_intersect.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+
+    var mixed_expression_or_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE INTERSECT SELECT id FROM usage_records WHERE status = 'active' AND (lower(status) = 'open' OR lower(status) = 'pending')",
+        schema,
+        &.{},
+    );
+    defer mixed_expression_or_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), mixed_expression_or_intersect.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), mixed_expression_or_intersect.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 3), mixed_expression_or_intersect.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqualStrings("enabled", mixed_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("status", mixed_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"active\"", mixed_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[2].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", mixed_expression_or_intersect.plan.query.expression_or_predicates[0].conditions[2].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", mixed_expression_or_intersect.plan.query.expression_or_predicates[1].conditions[2].rhs[0].value_json);
+
+    var expression_projection_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT lower(status) AS status_key FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer expression_projection_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), expression_projection_intersect.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_projection_intersect.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_projection_intersect.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("status_key", expression_projection_intersect.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_projection_intersect.plan.query.expressions[0].expression.kind);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' OR status = 'pending' UNION ALL SELECT id FROM usage_records WHERE status = 'pending'",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN ('open', 'pending') UNION ALL SELECT id FROM usage_records WHERE status = 'pending'",
+        schema,
+        &.{},
+    ));
+    var expression_or_in_intersect = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending' INTERSECT SELECT id FROM usage_records WHERE status IN ('deleted')",
+        schema,
+        &.{},
+    );
+    defer expression_or_in_intersect.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_or_in_intersect.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_or_in_intersect.plan.query.select.len);
+    try std.testing.expectEqualStrings("id", expression_or_in_intersect.plan.query.select[0]);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_in_intersect.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_or_in_intersect.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_or_in_intersect.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", expression_or_in_intersect.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("status", expression_or_in_intersect.plan.query.expression_or_predicates[0].conditions[1].lhs.field);
+    try std.testing.expectEqualStrings("\"deleted\"", expression_or_in_intersect.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", expression_or_in_intersect.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE enabled IS TRUE EXCEPT SELECT id FROM usage_records WHERE status NOT IN ('deleted') AND lower(status) = 'archived'",
+        schema,
+        &.{},
+    ));
+}
+
 test "sql adapter lower expr reconciles set operation output shape" {
     const alloc = std.testing.allocator;
     const schema_json =
