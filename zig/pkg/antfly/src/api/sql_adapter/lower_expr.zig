@@ -23045,8 +23045,8 @@ pub fn joinedMutationExpressionSideAt(
             },
             .semicolon => if (depth == 0) break,
             .identifier => {
-                if (depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "and") or
-                    std.ascii.eqlIgnoreCase(token.text, "or") or
+                if (depth == 0 and (token.matchesKeywordTag(.@"and") or
+                    token.matchesKeywordTag(.@"or") or
                     sqlWhereTailClauseKeywordToken(token)))
                 {
                     break;
@@ -23108,23 +23108,21 @@ pub fn peekConflictExistingFieldIncrement(
 pub fn peekSimpleScalarSetPredicate(tokens: []const Token, pos: usize) bool {
     if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier) return false;
     if (pos + 2 < tokens.len and
-        tokens[pos + 1].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[pos + 1].text, "not") and
-        tokens[pos + 2].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[pos + 2].text, "in"))
+        tokens[pos + 1].matchesKeywordTag(.not) and
+        tokens[pos + 2].matchesKeywordTag(.in))
     {
         return true;
     }
-    if (tokens[pos + 1].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[pos + 1].text, "in")) return true;
+    if (tokens[pos + 1].matchesKeywordTag(.in)) return true;
     if (pos + 2 >= tokens.len) return false;
     if (tokens[pos + 1].kind != .eq and tokens[pos + 1].kind != .neq) return false;
-    return tokens[pos + 2].kind == .identifier and
-        (sqlKeywordIsAnyOrSome(tokens[pos + 2].text) or
-            std.ascii.eqlIgnoreCase(tokens[pos + 2].text, "all"));
+    return tokens[pos + 2].matchesKeywordTag(.any) or
+        tokens[pos + 2].matchesKeywordTag(.some) or
+        tokens[pos + 2].matchesKeywordTag(.all);
 }
 
 pub fn canParseScalarNotWhere(tokens: []const Token, pos: usize) bool {
-    if (!parser.peekKeyword(tokens, pos, "not") or pos + 1 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
+    if (!parser.peekKeywordTag(tokens, pos, .not) or pos + 1 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
     var i = pos + 2;
     var depth: usize = 1;
     while (i < tokens.len) : (i += 1) {
@@ -23137,17 +23135,17 @@ pub fn canParseScalarNotWhere(tokens: []const Token, pos: usize) bool {
             },
             .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question => return false,
             .identifier => {
-                if (std.ascii.eqlIgnoreCase(token.text, "any") or
-                    std.ascii.eqlIgnoreCase(token.text, "some") or
-                    std.ascii.eqlIgnoreCase(token.text, "between") or
-                    std.ascii.eqlIgnoreCase(token.text, "in") or
-                    std.ascii.eqlIgnoreCase(token.text, "exists"))
+                if (token.matchesKeywordTag(.any) or
+                    token.matchesKeywordTag(.some) or
+                    token.matchesKeywordTag(.between) or
+                    token.matchesKeywordTag(.in) or
+                    token.matchesKeywordTag(.exists))
                 {
                     return false;
                 }
-                if (std.ascii.eqlIgnoreCase(token.text, "not")) {
+                if (token.matchesKeywordTag(.not)) {
                     if (i == 0 or tokens[i - 1].kind != .identifier or
-                        !std.ascii.eqlIgnoreCase(tokens[i - 1].text, "is"))
+                        !tokens[i - 1].matchesKeywordTag(.is))
                     {
                         return false;
                     }
@@ -23375,9 +23373,9 @@ pub fn canParseBareBooleanWhereExpression(tokens: []const Token, pos: usize, sch
             .identifier => {
                 if (depth == 0 and sqlWhereTailClauseKeywordToken(token)) break;
                 if (sqlKeywordStartsScalarPredicate(token.text)) return false;
-                if (std.ascii.eqlIgnoreCase(token.text, "and") or
-                    std.ascii.eqlIgnoreCase(token.text, "or") or
-                    std.ascii.eqlIgnoreCase(token.text, "not"))
+                if (token.matchesKeywordTag(.@"and") or
+                    token.matchesKeywordTag(.@"or") or
+                    token.matchesKeywordTag(.not))
                 {
                     saw_boolean_syntax = true;
                 }
@@ -23442,13 +23440,13 @@ fn singleBooleanExpressionCanStartAt(tokens: []const Token, index: usize, schema
     if (index >= tokens.len) return false;
     const token = tokens[index];
     if (token.kind != .identifier) return false;
-    return std.ascii.eqlIgnoreCase(token.text, "not") or
-        std.ascii.eqlIgnoreCase(token.text, "true") or
-        std.ascii.eqlIgnoreCase(token.text, "false") or
-        std.ascii.eqlIgnoreCase(token.text, "case") or
-        std.ascii.eqlIgnoreCase(token.text, "cast") or
-        std.ascii.eqlIgnoreCase(token.text, "coalesce") or
-        std.ascii.eqlIgnoreCase(token.text, "nullif") or
+    return token.matchesKeywordTag(.not) or
+        token.matchesKeywordTag(.true) or
+        token.matchesKeywordTag(.false) or
+        token.matchesKeywordTag(.case) or
+        token.matchesKeywordTag(.cast) or
+        token.matchesKeywordTag(.coalesce) or
+        token.matchesKeywordTag(.nullif) or
         sqlKeywordIsRegexpMatchFunction(token.text) or
         sqlKeywordIsStartsWithFunction(token.text) or
         binder.relationalColumnForField(schema, token.text, null) != null;
@@ -23578,10 +23576,10 @@ pub fn canParseExpressionWhereCondition(
                 if (binder.relationalColumnForField(schema, tokens[pos].text, null) != null) return false;
                 return true;
             },
-            else => if (std.ascii.eqlIgnoreCase(tokens[pos + 1].text, "is") or
-                std.ascii.eqlIgnoreCase(tokens[pos + 1].text, "not") or
-                std.ascii.eqlIgnoreCase(tokens[pos + 1].text, "in") or
-                std.ascii.eqlIgnoreCase(tokens[pos + 1].text, "between"))
+            else => if (tokens[pos + 1].matchesKeywordTag(.is) or
+                tokens[pos + 1].matchesKeywordTag(.not) or
+                tokens[pos + 1].matchesKeywordTag(.in) or
+                tokens[pos + 1].matchesKeywordTag(.between))
             {
                 if (binder.relationalColumnForField(schema, tokens[pos].text, null) != null) return false;
                 return true;
@@ -23760,21 +23758,17 @@ fn parenthesizedBooleanIsPredicateCanStartAt(
     if (!booleanExpressionCanStartAt(tokens, inner, schema)) return false;
     const close = parser.findMatchingRParenIndex(tokens, index) orelse return false;
     if (close + 2 >= tokens.len) return false;
-    if (tokens[close + 1].kind != .identifier or
-        !std.ascii.eqlIgnoreCase(tokens[close + 1].text, "is"))
-    {
+    if (!tokens[close + 1].matchesKeywordTag(.is)) {
         return false;
     }
     var value_index = close + 2;
-    if (tokens[value_index].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[value_index].text, "not"))
-    {
+    if (tokens[value_index].matchesKeywordTag(.not)) {
         value_index += 1;
     }
     if (value_index >= tokens.len or tokens[value_index].kind != .identifier) return false;
-    return std.ascii.eqlIgnoreCase(tokens[value_index].text, "true") or
-        std.ascii.eqlIgnoreCase(tokens[value_index].text, "false") or
-        std.ascii.eqlIgnoreCase(tokens[value_index].text, "unknown");
+    return tokens[value_index].matchesKeywordTag(.true) or
+        tokens[value_index].matchesKeywordTag(.false) or
+        tokens[value_index].matchesKeywordTag(.unknown);
 }
 
 pub fn expressionPredicateCanStartAt(tokens: []const Token, index: usize) bool {
@@ -23792,12 +23786,12 @@ pub fn expressionPredicateCanStartAt(tokens: []const Token, index: usize) bool {
     const next = tokens[index + 1];
     return switch (next.kind) {
         .eq, .neq, .gt, .gte, .lt, .lte => true,
-        .identifier => std.ascii.eqlIgnoreCase(next.text, "is") or
-            std.ascii.eqlIgnoreCase(next.text, "in") or
-            std.ascii.eqlIgnoreCase(next.text, "not") or
-            std.ascii.eqlIgnoreCase(next.text, "between") or
-            std.ascii.eqlIgnoreCase(next.text, "like") or
-            std.ascii.eqlIgnoreCase(next.text, "ilike"),
+        .identifier => next.matchesKeywordTag(.is) or
+            next.matchesKeywordTag(.in) or
+            next.matchesKeywordTag(.not) or
+            next.matchesKeywordTag(.between) or
+            next.matchesKeywordTag(.like) or
+            next.matchesKeywordTag(.ilike),
         else => false,
     };
 }
@@ -23898,20 +23892,20 @@ fn tokenContinuesScalarExpressionPredicate(tokens: []const Token, index: usize) 
     switch (token.kind) {
         .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json => return true,
         .identifier => {
-            if (std.ascii.eqlIgnoreCase(token.text, "is") or
-                std.ascii.eqlIgnoreCase(token.text, "like") or
-                std.ascii.eqlIgnoreCase(token.text, "ilike") or
-                std.ascii.eqlIgnoreCase(token.text, "in") or
-                std.ascii.eqlIgnoreCase(token.text, "between"))
+            if (token.matchesKeywordTag(.is) or
+                token.matchesKeywordTag(.like) or
+                token.matchesKeywordTag(.ilike) or
+                token.matchesKeywordTag(.in) or
+                token.matchesKeywordTag(.between))
             {
                 return true;
             }
-            if (std.ascii.eqlIgnoreCase(token.text, "not") and index + 1 < tokens.len and tokens[index + 1].kind == .identifier) {
-                const after_not = tokens[index + 1].text;
-                if (std.ascii.eqlIgnoreCase(after_not, "like") or
-                    std.ascii.eqlIgnoreCase(after_not, "ilike") or
-                    std.ascii.eqlIgnoreCase(after_not, "in") or
-                    std.ascii.eqlIgnoreCase(after_not, "between"))
+            if (token.matchesKeywordTag(.not) and index + 1 < tokens.len and tokens[index + 1].kind == .identifier) {
+                const after_not = tokens[index + 1];
+                if (after_not.matchesKeywordTag(.like) or
+                    after_not.matchesKeywordTag(.ilike) or
+                    after_not.matchesKeywordTag(.in) or
+                    after_not.matchesKeywordTag(.between))
                 {
                     return true;
                 }

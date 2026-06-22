@@ -439,6 +439,10 @@ Current implementation status:
   predicates, joined mutation-source semijoin shapes, joined-source
   regex/array/JSON expression coverage, and row-lock invalid cases, now use
   parsed token predicates instead of raw SQL substring probes.
+- Expression predicate membership and boolean-start helpers also use keyword
+  tags for `ANY`, `SOME`, `ALL`, `BETWEEN`, `IN`, `NOT`, `IS`, boolean atoms,
+  and tail conjunctions instead of maintaining local case-insensitive operator
+  scans.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
