@@ -38,9 +38,20 @@ pub const DocumentProjection = struct {
     }
 };
 
+pub const DocumentIndexQuery = struct {
+    full_text_query: ?[]const u8 = null,
+    filter_query_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.full_text_query) |query| alloc.free(@constCast(query));
+        if (self.filter_query_json) |query| alloc.free(@constCast(query));
+        self.* = undefined;
+    }
+};
+
 pub const DocumentProducer = union(enum) {
     id_lookup: []const []const u8,
-    full_text: []const u8,
+    indexed_query: DocumentIndexQuery,
     bounded_scan: u32,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -49,7 +60,7 @@ pub const DocumentProducer = union(enum) {
                 for (ids) |id| alloc.free(@constCast(id));
                 if (ids.len > 0) alloc.free(ids);
             },
-            .full_text => |query| alloc.free(@constCast(query)),
+            .indexed_query => |*query| query.deinit(alloc),
             .bounded_scan => {},
         }
         self.* = undefined;
@@ -106,7 +117,7 @@ pub fn lowerDocumentReadPlanParsedSqlAlloc(
 
     const limit = if (limit_index) |idx| try parseLimit(tokens, idx) else null;
     const producer = if (where_index) |idx|
-        try parseWhereProducerAlloc(alloc, tokens, idx, limit_index orelse tokens.len)
+        try parseWhereProducerAlloc(alloc, tokens, idx, limit_index orelse tokens.len, schema)
     else blk: {
         const bounded = limit orelse return error.DocumentSqlRequiresBoundedScan;
         break :blk DocumentProducer{ .bounded_scan = bounded };
@@ -208,9 +219,11 @@ fn parseWhereProducerAlloc(
     tokens: []const Token,
     where_index: usize,
     end_index: usize,
+    schema: runtime_schema.TableSchema,
 ) !DocumentProducer {
     const where_tokens = tokens[where_index + 1 .. end_index];
     if (try parseFullTextProducerAlloc(alloc, where_tokens)) |producer| return producer;
+    if (try parseScalarFilterProducerAlloc(alloc, where_tokens, schema)) |producer| return producer;
     if (where_tokens.len != 3) return error.UnsupportedSqlShape;
     if (where_tokens[0].kind != .identifier or !std.mem.eql(u8, where_tokens[0].text, "_id")) return error.UnsupportedSqlShape;
     if (where_tokens[1].kind != .eq) return error.UnsupportedSqlShape;
@@ -231,7 +244,49 @@ fn parseFullTextProducerAlloc(alloc: std.mem.Allocator, tokens: []const Token) !
         return null;
     }
     if (tokens[1].kind != .lparen or tokens[2].kind != .string or tokens[3].kind != .rparen) return error.UnsupportedSqlShape;
-    return .{ .full_text = try alloc.dupe(u8, tokens[2].text) };
+    return .{ .indexed_query = .{ .full_text_query = try alloc.dupe(u8, tokens[2].text) } };
+}
+
+fn parseScalarFilterProducerAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+) !?DocumentProducer {
+    if (tokens.len != 3) return null;
+    if (tokens[0].kind != .identifier or tokens[1].kind != .eq) return null;
+    if (std.mem.eql(u8, tokens[0].text, "_id")) return null;
+    const column = documentFieldColumn(schema, tokens[0].text) orelse return error.InvalidSqlCatalog;
+    if (!column.indexed or column.index_lifecycle != .ready) return error.DocumentSqlIndexUnavailable;
+    const value_json = try tokenLiteralJsonAlloc(alloc, tokens[2]);
+    defer alloc.free(value_json);
+    const path = try documentFilterPathAlloc(alloc, column.path);
+    defer alloc.free(path);
+    const filter_query_json = try std.fmt.allocPrint(
+        alloc,
+        "{{\"term\":{{\"path\":{f},\"value\":{s}}}}}",
+        .{ std.json.fmt(path, .{}), value_json },
+    );
+    return .{ .indexed_query = .{ .filter_query_json = filter_query_json } };
+}
+
+fn tokenLiteralJsonAlloc(alloc: std.mem.Allocator, token: Token) ![]u8 {
+    return switch (token.kind) {
+        .string => try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(token.text, .{})}),
+        .number => try alloc.dupe(u8, token.text),
+        .identifier => blk: {
+            if (std.ascii.eqlIgnoreCase(token.text, "true")) break :blk try alloc.dupe(u8, "true");
+            if (std.ascii.eqlIgnoreCase(token.text, "false")) break :blk try alloc.dupe(u8, "false");
+            if (std.ascii.eqlIgnoreCase(token.text, "null")) break :blk try alloc.dupe(u8, "null");
+            break :blk try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(token.text, .{})});
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn documentFilterPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len == 0) return error.InvalidSqlCatalog;
+    if (path[0] == '/') return try alloc.dupe(u8, path);
+    return try std.fmt.allocPrint(alloc, "/{s}", .{path});
 }
 
 fn parseLimit(tokens: []const Token, limit_index: usize) !u32 {
@@ -250,10 +305,14 @@ fn validateFromTail(tokens: []const Token) !void {
 }
 
 fn documentFieldExists(schema: runtime_schema.TableSchema, field: []const u8) bool {
+    return documentFieldColumn(schema, field) != null;
+}
+
+fn documentFieldColumn(schema: runtime_schema.TableSchema, field: []const u8) ?runtime_schema.RelationalColumn {
     for (schema.relational_columns) |column| {
-        if (std.mem.eql(u8, column.name, field)) return true;
+        if (std.mem.eql(u8, column.name, field)) return column;
     }
-    return false;
+    return null;
 }
 
 fn freeProjection(alloc: std.mem.Allocator, projection: []DocumentProjection) void {
@@ -324,8 +383,24 @@ test "document SQL lowers full text producer" {
     defer parsed.deinit(alloc);
     var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
     defer lowered.deinit(alloc);
-    try std.testing.expectEqualStrings("title:alpha", lowered.producer.full_text);
+    try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
     try std.testing.expectEqual(@as(?u32, 5), lowered.limit);
+}
+
+test "document SQL lowers scalar equality to indexed filter producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE status = 'active' LIMIT 10");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.filter_query_json.?);
+    try std.testing.expectEqual(@as(?u32, 10), lowered.limit);
 }
 
 test "document SQL requires bounded scan without id predicate" {

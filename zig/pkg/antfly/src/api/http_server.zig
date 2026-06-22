@@ -5553,7 +5553,7 @@ pub const ApiHttpServer = struct {
             function_bindings,
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+            error.DocumentSqlIndexUnavailable, error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             else => return err,
         };
@@ -5571,7 +5571,7 @@ pub const ApiHttpServer = struct {
             .read_index,
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid sql request"),
+            error.DocumentSqlIndexUnavailable, error.DocumentSqlRequiresBoundedScan, error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return try textResponse(self.alloc, 400, "invalid sql request"),
             error.RelationalRowsCteSpillRequired => return try textResponse(self.alloc, 429, "sql read backpressured"),
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),

@@ -49,6 +49,7 @@ pub const DocumentSqlCapabilities = struct {
     indexed_scalar_filters: bool = false,
     full_text_filters: bool = false,
     vector_filters: bool = false,
+    algebraic_aggregates: bool = false,
     bounded_scan: ?BoundedScanPolicy = null,
 };
 

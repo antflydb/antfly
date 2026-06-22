@@ -651,6 +651,29 @@ Anything not safely pushdown-capable should fail closed or require an explicit
 bounded scan contract. The adapter should not silently run broad document scans
 because a SQL BI client submitted a relational-looking query.
 
+Antfly's default document index should be treated as more than a literal
+full-text search feature. It is the native document query surface for indexed
+term, boolean, prefix, wildcard, range, geo, and text predicates. SQL lowering
+should therefore map simple indexed document predicates such as:
+
+```sql
+SELECT _id, status FROM docs WHERE status = 'active' LIMIT 100;
+```
+
+to the same native indexed query/filter contract used by REST, SDK, MCP, A2A,
+and CLI callers, not to residual document scans. `_id` equality remains a direct
+lookup. A declared document field predicate should lower only when the field's
+index is available and ready; otherwise the planner should fail closed or
+require an explicit bounded scan policy.
+
+The same rule applies to aggregate-style SQL. When an algebraic index can answer
+`COUNT`, grouped counts/facets, selected `DISTINCT`/top-k queries, or numeric
+summaries from indexed state, the document planner should use an index-backed
+aggregate producer. It should not hydrate every matching document merely because
+the request is written as SQL. Residual aggregate work is acceptable only after a
+selective native producer has established a bounded candidate set, or after the
+caller opted into an explicit bounded scan.
+
 Residual filters are allowed only after an explicit bounded producer. For
 example, residual JSON expression evaluation can run after an `_id IN (...)`
 lookup, a selective index query, or a limit-governed scan. It should not become
@@ -694,6 +717,7 @@ const DocumentProducer = union(enum) {
     indexed_query: DocumentIndexQuery,
     text_query: DocumentTextQuery,
     vector_query: DocumentVectorQuery,
+    algebraic_aggregate: DocumentAlgebraicAggregate,
     bounded_scan: BoundedDocumentScan,
 };
 ```

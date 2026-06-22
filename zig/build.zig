@@ -4464,6 +4464,7 @@ pub fn build(b: *std.Build) void {
             "lowered sql insert source plans build batches from routed scans",
             "lowered sql merge mutation plans build batches from routed scans",
             "lowered relation population plans execute routed typed read sources",
+            "lowered document sql read plans execute native lookup and bounded scan",
             "parseRemoteSearchResult preserves fused index scores",
             "hosted remote temporal unique owner lookup resolves point interval",
         },

@@ -31,6 +31,7 @@ const usermgr = @import("../usermgr/mod.zig");
 // storage-backed execution helpers keep their current owning modules.
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
+pub const DocumentIndexQuery = sql_adapter.DocumentIndexQuery;
 pub const DocumentProjection = sql_adapter.DocumentProjection;
 pub const DocumentReadPlan = sql_adapter.DocumentReadPlan;
 pub const SqlValue = sql_adapter.SqlValue;
