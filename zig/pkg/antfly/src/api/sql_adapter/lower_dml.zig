@@ -11340,6 +11340,18 @@ pub fn sqlJsonSegmentsConflictDottedPath(json_path: []const []const u8, dotted_p
     return offset == dotted_path.len;
 }
 
+fn expectSqlUuidV4StringForDmlTest(value: std.json.Value) !void {
+    if (value != .string) return error.TestUnexpectedResult;
+    const text = value.string;
+    try std.testing.expectEqual(@as(usize, 36), text.len);
+    try std.testing.expectEqual(@as(u8, '-'), text[8]);
+    try std.testing.expectEqual(@as(u8, '-'), text[13]);
+    try std.testing.expectEqual(@as(u8, '-'), text[18]);
+    try std.testing.expectEqual(@as(u8, '-'), text[23]);
+    try std.testing.expectEqual(@as(u8, '4'), text[14]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, "89ab", text[19]) != null);
+}
+
 fn runtimeSchemaFromJsonForDmlTestAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !runtime_schema.TableSchema {
     const schema_api = @import("../../schema/mod.zig");
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
@@ -14225,6 +14237,56 @@ test "sql adapter lower dml lowers array updates into typed transforms" {
         &.{.{ .string = "u1" }},
         resolver_ctx.resolver(),
     ));
+}
+
+test "sql adapter lower dml lowers uuid generation update values and conflict actions" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"request_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"request_id\":\"old\"}", .version = 42 };
+
+    var updated = try lowerUpdateForTestAlloc(
+        alloc,
+        "UPDATE usage_records SET request_id = gen_random_uuid() WHERE id = $1 RETURNING request_id",
+        schema,
+        &.{.{ .string = "u1" }},
+        resolver_ctx.resolver(),
+    );
+    defer updated.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), updated.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), updated.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, updated.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("request_id", updated.batch.transforms[0].operations[0].path);
+    var updated_value = try std.json.parseFromSlice(std.json.Value, alloc, updated.batch.transforms[0].operations[0].value_json.?, .{});
+    defer updated_value.deinit();
+    try expectSqlUuidV4StringForDmlTest(updated_value.value);
+    var updated_returned = try std.json.parseFromSlice(std.json.Value, alloc, updated.batch.returning_rows[0], .{});
+    defer updated_returned.deinit();
+    try expectSqlUuidV4StringForDmlTest(updated_returned.value.object.get("request_id") orelse return error.TestUnexpectedResult);
+
+    var conflict = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, request_id) VALUES ('u1', 'proposed') ON CONFLICT (id) DO UPDATE SET request_id = uuid_generate_v4() RETURNING request_id",
+        schema,
+        &.{},
+        resolver_ctx.resolver(),
+    );
+    defer conflict.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), conflict.batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), conflict.batch.transforms[0].operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, conflict.batch.transforms[0].operations[0].op);
+    try std.testing.expectEqualStrings("request_id", conflict.batch.transforms[0].operations[0].path);
+    var conflict_value = try std.json.parseFromSlice(std.json.Value, alloc, conflict.batch.transforms[0].operations[0].value_json.?, .{});
+    defer conflict_value.deinit();
+    try expectSqlUuidV4StringForDmlTest(conflict_value.value);
+    var conflict_returned = try std.json.parseFromSlice(std.json.Value, alloc, conflict.batch.returning_rows[0], .{});
+    defer conflict_returned.deinit();
+    try expectSqlUuidV4StringForDmlTest(conflict_returned.value.object.get("request_id") orelse return error.TestUnexpectedResult);
 }
 
 test "sql adapter lower dml lowers now and current_timestamp update values" {

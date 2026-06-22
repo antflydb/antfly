@@ -16338,58 +16338,6 @@ test "postgres sql adapter lowers routine expression bindings into row expressio
     try std.testing.expectEqualStrings("status", routine_policy_expression.lhs.operands[0].field);
 }
 
-test "postgres sql adapter lowers uuid generation update values and conflict actions" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"request_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
-    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"request_id\":\"old\"}", .version = 42 };
-
-    var updated = try lowerUpdateAlloc(
-        alloc,
-        "UPDATE usage_records SET request_id = gen_random_uuid() WHERE id = $1 RETURNING request_id",
-        schema,
-        &.{.{ .string = "u1" }},
-        resolver_ctx.resolver(),
-    );
-    defer updated.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u32, 1), updated.batch.transformed);
-    try std.testing.expectEqual(@as(usize, 1), updated.batch.transforms[0].operations.len);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.set, updated.batch.transforms[0].operations[0].op);
-    try std.testing.expectEqualStrings("request_id", updated.batch.transforms[0].operations[0].path);
-    var updated_value = try std.json.parseFromSlice(std.json.Value, alloc, updated.batch.transforms[0].operations[0].value_json.?, .{});
-    defer updated_value.deinit();
-    try expectSqlUuidV4String(updated_value.value);
-    var updated_returned = try std.json.parseFromSlice(std.json.Value, alloc, updated.batch.returning_rows[0], .{});
-    defer updated_returned.deinit();
-    try expectSqlUuidV4String(updated_returned.value.object.get("request_id") orelse return error.TestUnexpectedResult);
-
-    var conflict = try lowerInsertWithResolverAlloc(
-        alloc,
-        "INSERT INTO usage_records (id, request_id) VALUES ('u1', 'proposed') ON CONFLICT (id) DO UPDATE SET request_id = uuid_generate_v4() RETURNING request_id",
-        schema,
-        &.{},
-        resolver_ctx.resolver(),
-    );
-    defer conflict.deinit(alloc);
-
-    try std.testing.expectEqual(@as(u32, 1), conflict.batch.transformed);
-    try std.testing.expectEqual(@as(usize, 1), conflict.batch.transforms[0].operations.len);
-    try std.testing.expectEqual(db_mod.types.TransformOpType.set, conflict.batch.transforms[0].operations[0].op);
-    try std.testing.expectEqualStrings("request_id", conflict.batch.transforms[0].operations[0].path);
-    var conflict_value = try std.json.parseFromSlice(std.json.Value, alloc, conflict.batch.transforms[0].operations[0].value_json.?, .{});
-    defer conflict_value.deinit();
-    try expectSqlUuidV4String(conflict_value.value);
-    var conflict_returned = try std.json.parseFromSlice(std.json.Value, alloc, conflict.batch.returning_rows[0], .{});
-    defer conflict_returned.deinit();
-    try expectSqlUuidV4String(conflict_returned.value.object.get("request_id") orelse return error.TestUnexpectedResult);
-}
-
 const TestPrimaryResolver = struct {
     row_json: []const u8,
     version: u64,

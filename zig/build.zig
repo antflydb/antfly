@@ -3903,6 +3903,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml evaluates now returning expression from typed plan",
             "sql adapter lower dml lowers arithmetic updates into typed increments",
             "sql adapter lower dml lowers array updates into typed transforms",
+            "sql adapter lower dml lowers uuid generation update values and conflict actions",
             "sql adapter lower dml lowers now and current_timestamp update values",
             "sql adapter lower dml lowers interval arithmetic update values",
             "sql adapter lower dml applies server update policies",
