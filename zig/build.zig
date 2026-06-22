@@ -3924,6 +3924,8 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower expr lowers nullif projections",
             "sql adapter lower expr lowers numeric function projections",
             "sql adapter lower expr lowers unary minus projections",
+            "sql adapter lower expr lowers current time projections",
+            "sql adapter lower expr lowers arithmetic projections",
             "sql adapter lower expr reconciles set operation output shape",
             "sql adapter lower expr assembles boolean predicate groups",
             "sql adapter lower expr names every row expression kind",
