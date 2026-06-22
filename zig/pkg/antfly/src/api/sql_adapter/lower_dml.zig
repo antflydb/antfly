@@ -12373,17 +12373,6 @@ pub const lowerWritePlanAlloc = lowerWritePlanForDmlTestAlloc;
 pub const lowerWritePlanParsedSqlAlloc = lowerWritePlanParsedSqlForDmlTestAlloc;
 pub const lowerWritePlanWithCatalogAlloc = lowerWritePlanWithCatalogForDmlTestAlloc;
 
-fn unsupportedRecursiveInsertSourceForDmlTestAlloc(
-    _: std.mem.Allocator,
-    _: *const tokenized.ParsedSql,
-    _: runtime_schema.TableSchema,
-    _: runtime_schema.TableSchema,
-    _: []const sql_value.SqlValue,
-    _: relational_rows.UniqueSelectorResolver,
-) anyerror!plan_mod.LoweredRecursiveInsertSource {
-    return error.UnsupportedSqlShape;
-}
-
 fn unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc(
     _: std.mem.Allocator,
     _: *const tokenized.ParsedSql,
