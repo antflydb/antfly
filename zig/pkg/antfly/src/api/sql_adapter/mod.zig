@@ -664,6 +664,7 @@ pub const SqlAdapterEdgeCaseLoweringCallbacks = edge_case_runner.SqlAdapterEdgeC
 pub const lowerExplainPlanWithHooksAlloc = plan.lowerExplainPlanWithHooksAlloc;
 pub const lowerExplainPlanWithParsedSqlAlloc = plan.lowerExplainPlanWithParsedSqlAlloc;
 pub const lowerRelationPopulationPlanWithHooksAlloc = plan.lowerRelationPopulationPlanWithHooksAlloc;
+pub const lowerRelationPopulationPlanWithParsedSqlAlloc = plan.lowerRelationPopulationPlanWithParsedSqlAlloc;
 pub const lowerReadPlanWithHooks = plan.lowerReadPlanWithHooks;
 pub const lowerWritePlanWithHooksAlloc = plan.lowerWritePlanWithHooksAlloc;
 pub const lowerWritePlanWithParsedSqlAlloc = plan.lowerWritePlanWithParsedSqlAlloc;
