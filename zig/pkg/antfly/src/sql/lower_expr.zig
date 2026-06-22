@@ -19183,6 +19183,11 @@ pub fn functionCallStartsAt(tokens: []const Token, index: usize, keyword: []cons
     return parser.Cursor.init(tokens, &pos).functionCallStartsAt(index, keyword);
 }
 
+pub fn functionCallStartsAtTag(tokens: []const Token, index: usize, keyword: parser.TokenKeyword) bool {
+    var pos: usize = 0;
+    return parser.Cursor.init(tokens, &pos).functionCallStartsAtTag(index, keyword);
+}
+
 pub fn functionCallStartsAtIf(
     tokens: []const Token,
     index: usize,
@@ -19206,6 +19211,10 @@ pub fn peekFunctionCall(tokens: []const Token, pos: usize, keyword: []const u8) 
     return functionCallStartsAt(tokens, pos, keyword);
 }
 
+pub fn peekFunctionCallTag(tokens: []const Token, pos: usize, keyword: parser.TokenKeyword) bool {
+    return functionCallStartsAtTag(tokens, pos, keyword);
+}
+
 pub fn peekFunctionCallIf(
     tokens: []const Token,
     pos: usize,
@@ -19223,10 +19232,10 @@ pub fn peekFunctionCallTokenIf(
 }
 
 pub fn peekCaseFoldFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "lower") or
-        peekFunctionCall(tokens, pos, "upper") or
+    return peekFunctionCallTag(tokens, pos, .lower) or
+        peekFunctionCallTag(tokens, pos, .upper) or
         peekFunctionCallTokenIf(tokens, pos, sqlTokenIsInitcapFunction) or
-        peekFunctionCall(tokens, pos, "trim") or
+        peekFunctionCallTag(tokens, pos, .trim) or
         peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction);
 }
 
@@ -19235,7 +19244,7 @@ pub fn peekCaseExpressionSyntax(tokens: []const Token, pos: usize) bool {
 }
 
 pub fn peekCastExpressionSyntax(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "cast");
+    return peekFunctionCallTag(tokens, pos, .cast);
 }
 
 pub fn peekBooleanNotExpressionSyntax(tokens: []const Token, pos: usize) bool {
@@ -19251,40 +19260,40 @@ pub fn peekParenthesizedExpressionSyntax(tokens: []const Token, pos: usize) bool
 }
 
 pub fn peekReplaceFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "replace");
+    return peekFunctionCallTag(tokens, pos, .replace);
 }
 
 pub fn peekRegexpReplaceFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "regexp_replace");
+    return peekFunctionCallTag(tokens, pos, .regexp_replace);
 }
 
 pub fn peekConcatFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "concat") or
-        peekFunctionCall(tokens, pos, "concat_ws");
+    return peekFunctionCallTag(tokens, pos, .concat) or
+        peekFunctionCallTag(tokens, pos, .concat_ws);
 }
 
 pub fn peekCoalesceFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "coalesce");
+    return peekFunctionCallTag(tokens, pos, .coalesce);
 }
 
 pub fn peekNullifFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "nullif");
+    return peekFunctionCallTag(tokens, pos, .nullif);
 }
 
 pub fn peekArrayElementTransformFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "array_append") or
-        peekFunctionCall(tokens, pos, "array_prepend") or
-        peekFunctionCall(tokens, pos, "array_cat") or
-        peekFunctionCall(tokens, pos, "array_remove") or
-        peekFunctionCall(tokens, pos, "array_replace");
+    return peekFunctionCallTag(tokens, pos, .array_append) or
+        peekFunctionCallTag(tokens, pos, .array_prepend) or
+        peekFunctionCallTag(tokens, pos, .array_cat) or
+        peekFunctionCallTag(tokens, pos, .array_remove) or
+        peekFunctionCallTag(tokens, pos, .array_replace);
 }
 
 pub fn peekArrayToStringFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "array_to_string");
+    return peekFunctionCallTag(tokens, pos, .array_to_string);
 }
 
 pub fn peekStringToArrayFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "string_to_array");
+    return peekFunctionCallTag(tokens, pos, .string_to_array);
 }
 
 pub fn peekFixedUnaryFunctionCall(tokens: []const Token, pos: usize, kind: db_mod.types.RelationalRowsExpressionKind) bool {
@@ -19298,25 +19307,25 @@ pub fn peekFixedBinaryFunctionCall(tokens: []const Token, pos: usize, kind: db_m
 }
 
 pub fn peekGreatestLeastFunctionCall(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "greatest") or
-        peekFunctionCall(tokens, pos, "least");
+    return peekFunctionCallTag(tokens, pos, .greatest) or
+        peekFunctionCallTag(tokens, pos, .least);
 }
 
 pub fn peekPositionFunctionSyntax(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "position");
+    return peekFunctionCallTag(tokens, pos, .position);
 }
 
 pub fn peekSqlNowExpressionSyntax(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCall(tokens, pos, "now") or
-        parser.peekKeyword(tokens, pos, "current_timestamp");
+    return peekFunctionCallTag(tokens, pos, .now) or
+        parser.peekKeywordTag(tokens, pos, .current_timestamp);
 }
 
 pub fn peekSqlCurrentDateExpressionSyntax(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "current_date");
+    return parser.peekKeywordTag(tokens, pos, .current_date);
 }
 
 pub fn peekSqlIntervalExpressionSyntax(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "interval");
+    return parser.peekKeywordTag(tokens, pos, .interval);
 }
 
 pub fn peekTextLengthFunctionKeyword(tokens: []const Token, pos: usize) bool {
@@ -19528,13 +19537,13 @@ pub fn peekSimpleReturningField(tokens: []const Token, pos: usize) bool {
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
-        peekFunctionCall(tokens, pos, "trunc") or
-        peekFunctionCall(tokens, pos, "floor") or
-        peekFunctionCall(tokens, pos, "ceil") or
-        peekFunctionCall(tokens, pos, "sqrt") or
-        peekFunctionCall(tokens, pos, "sign") or
-        peekFunctionCall(tokens, pos, "mod") or
-        peekFunctionCall(tokens, pos, "power") or
+        peekFunctionCallTag(tokens, pos, .trunc) or
+        peekFunctionCallTag(tokens, pos, .floor) or
+        peekFunctionCallTag(tokens, pos, .ceil) or
+        peekFunctionCallTag(tokens, pos, .sqrt) or
+        peekFunctionCallTag(tokens, pos, .sign) or
+        peekFunctionCallTag(tokens, pos, .mod) or
+        peekFunctionCallTag(tokens, pos, .power) or
         parser.peekKeyword(tokens, pos, "case") or
         parser.peekKeyword(tokens, pos, "cast"))
     {
@@ -19729,13 +19738,13 @@ pub fn peekAggregateExpressionFilter(tokens: []const Token, pos: usize) bool {
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
-        peekFunctionCall(tokens, pos, "trunc") or
-        peekFunctionCall(tokens, pos, "floor") or
-        peekFunctionCall(tokens, pos, "ceil") or
-        peekFunctionCall(tokens, pos, "sqrt") or
-        peekFunctionCall(tokens, pos, "sign") or
-        peekFunctionCall(tokens, pos, "mod") or
-        peekFunctionCall(tokens, pos, "power") or
+        peekFunctionCallTag(tokens, pos, .trunc) or
+        peekFunctionCallTag(tokens, pos, .floor) or
+        peekFunctionCallTag(tokens, pos, .ceil) or
+        peekFunctionCallTag(tokens, pos, .sqrt) or
+        peekFunctionCallTag(tokens, pos, .sign) or
+        peekFunctionCallTag(tokens, pos, .mod) or
+        peekFunctionCallTag(tokens, pos, .power) or
         parser.peekKeyword(tokens, pos, "greatest") or
         parser.peekKeyword(tokens, pos, "least") or
         peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction) or
@@ -19744,9 +19753,9 @@ pub fn peekAggregateExpressionFilter(tokens: []const Token, pos: usize) bool {
         peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction) or
         functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction) or
         functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction) or
-        parser.peekKeyword(tokens, pos, "now") or
-        parser.peekKeyword(tokens, pos, "current_timestamp") or
-        parser.peekKeyword(tokens, pos, "current_date"))
+        parser.peekKeywordTag(tokens, pos, .now) or
+        parser.peekKeywordTag(tokens, pos, .current_timestamp) or
+        parser.peekKeywordTag(tokens, pos, .current_date))
     {
         return true;
     }
@@ -19813,13 +19822,13 @@ pub fn peekAggregateOutputOrderExpression(tokens: []const Token, pos: usize) boo
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
-        peekFunctionCall(tokens, pos, "trunc") or
-        peekFunctionCall(tokens, pos, "floor") or
-        peekFunctionCall(tokens, pos, "ceil") or
-        peekFunctionCall(tokens, pos, "sqrt") or
-        peekFunctionCall(tokens, pos, "sign") or
-        peekFunctionCall(tokens, pos, "mod") or
-        peekFunctionCall(tokens, pos, "power") or
+        peekFunctionCallTag(tokens, pos, .trunc) or
+        peekFunctionCallTag(tokens, pos, .floor) or
+        peekFunctionCallTag(tokens, pos, .ceil) or
+        peekFunctionCallTag(tokens, pos, .sqrt) or
+        peekFunctionCallTag(tokens, pos, .sign) or
+        peekFunctionCallTag(tokens, pos, .mod) or
+        peekFunctionCallTag(tokens, pos, .power) or
         parser.peekKeyword(tokens, pos, "greatest") or
         parser.peekKeyword(tokens, pos, "least"))
     {
@@ -21511,13 +21520,13 @@ pub fn peekAggregateHavingExpression(tokens: []const Token, pos: usize) bool {
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
-        peekFunctionCall(tokens, pos, "trunc") or
-        peekFunctionCall(tokens, pos, "floor") or
-        peekFunctionCall(tokens, pos, "ceil") or
-        peekFunctionCall(tokens, pos, "sqrt") or
-        peekFunctionCall(tokens, pos, "sign") or
-        peekFunctionCall(tokens, pos, "mod") or
-        peekFunctionCall(tokens, pos, "power") or
+        peekFunctionCallTag(tokens, pos, .trunc) or
+        peekFunctionCallTag(tokens, pos, .floor) or
+        peekFunctionCallTag(tokens, pos, .ceil) or
+        peekFunctionCallTag(tokens, pos, .sqrt) or
+        peekFunctionCallTag(tokens, pos, .sign) or
+        peekFunctionCallTag(tokens, pos, .mod) or
+        peekFunctionCallTag(tokens, pos, .power) or
         parser.peekKeyword(tokens, pos, "greatest") or
         parser.peekKeyword(tokens, pos, "least");
 }
@@ -23663,16 +23672,16 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
     if (functionCallStartsAtTokenIf(tokens, index, sqlTokenIsArrayLengthFunction) or
         functionCallStartsAtTokenIf(tokens, index, sqlTokenIsArrayPositionFunction) or
         expressionStartKeywordToken(token) or
-        functionCallStartsAt(tokens, index, "gen_random_uuid") or
-        functionCallStartsAt(tokens, index, "uuid_generate_v4") or
-        functionCallStartsAt(tokens, index, "floor") or
-        functionCallStartsAt(tokens, index, "ceil") or
-        functionCallStartsAt(tokens, index, "sqrt") or
-        functionCallStartsAt(tokens, index, "sign") or
-        functionCallStartsAt(tokens, index, "mod") or
-        functionCallStartsAt(tokens, index, "power") or
+        functionCallStartsAtTag(tokens, index, .gen_random_uuid) or
+        functionCallStartsAtTag(tokens, index, .uuid_generate_v4) or
+        functionCallStartsAtTag(tokens, index, .floor) or
+        functionCallStartsAtTag(tokens, index, .ceil) or
+        functionCallStartsAtTag(tokens, index, .sqrt) or
+        functionCallStartsAtTag(tokens, index, .sign) or
+        functionCallStartsAtTag(tokens, index, .mod) or
+        functionCallStartsAtTag(tokens, index, .power) or
         sqlTokenIsOverlayFunction(token) or
-        functionCallStartsAt(tokens, index, "trunc") or
+        functionCallStartsAtTag(tokens, index, .trunc) or
         sqlTokenIsTrimVariantFunction(token) or
         sqlTokenIsPadFunction(token) or
         sqlTokenIsRepeatFunction(token) or
@@ -24020,13 +24029,13 @@ pub fn canParseExpressionWhereCondition(
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
-        peekFunctionCall(tokens, pos, "trunc") or
-        peekFunctionCall(tokens, pos, "floor") or
-        peekFunctionCall(tokens, pos, "ceil") or
-        peekFunctionCall(tokens, pos, "sqrt") or
-        peekFunctionCall(tokens, pos, "sign") or
-        peekFunctionCall(tokens, pos, "mod") or
-        peekFunctionCall(tokens, pos, "power") or
+        peekFunctionCallTag(tokens, pos, .trunc) or
+        peekFunctionCallTag(tokens, pos, .floor) or
+        peekFunctionCallTag(tokens, pos, .ceil) or
+        peekFunctionCallTag(tokens, pos, .sqrt) or
+        peekFunctionCallTag(tokens, pos, .sign) or
+        peekFunctionCallTag(tokens, pos, .mod) or
+        peekFunctionCallTag(tokens, pos, .power) or
         parser.peekKeyword(tokens, pos, "greatest") or
         parser.peekKeyword(tokens, pos, "least")) return true;
     if (expressionNullSafeDistinctPredicateCanStartAt(tokens, pos)) return true;

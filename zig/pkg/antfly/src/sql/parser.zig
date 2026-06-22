@@ -122,6 +122,12 @@ pub const Cursor = struct {
             self.tokens[index + 1].kind == .lparen;
     }
 
+    pub fn functionCallStartsAtTag(self: Cursor, index: usize, keyword: TokenKeyword) bool {
+        if (index + 1 >= self.tokens.len) return false;
+        return self.tokens[index].matchesKeywordTag(keyword) and
+            self.tokens[index + 1].kind == .lparen;
+    }
+
     pub fn functionCallStartsAtIf(self: Cursor, index: usize, comptime predicate: fn ([]const u8) bool) bool {
         if (index + 1 >= self.tokens.len) return false;
         const token = self.tokens[index];
@@ -140,6 +146,10 @@ pub const Cursor = struct {
 
     pub fn peekFunctionCall(self: Cursor, keyword: []const u8) bool {
         return self.functionCallStartsAt(self.pos.*, keyword);
+    }
+
+    pub fn peekFunctionCallTag(self: Cursor, keyword: TokenKeyword) bool {
+        return self.functionCallStartsAtTag(self.pos.*, keyword);
     }
 
     pub fn peekFunctionCallIf(self: Cursor, comptime predicate: fn ([]const u8) bool) bool {
@@ -474,6 +484,7 @@ test "sql adapter parser cursor tracks shared token position" {
     try std.testing.expect(cursor.peekIdentifierIf(testKeywordIsFrom));
     try std.testing.expect(cursor.matchIdentifierIf(testKeywordIsFrom) != null);
     try std.testing.expect(cursor.peekFunctionCall("lower"));
+    try std.testing.expect(cursor.peekFunctionCallTag(.lower));
     try std.testing.expect(cursor.peekFunctionCallIf(testKeywordIsLower));
     try cursor.advance(2);
     try std.testing.expect(cursor.atEnd());

@@ -852,6 +852,9 @@ Current implementation status:
 - Read, join, lateral, window, aggregate, and lowerer test adapters classify
   CTE-shaped parsed statements from token keyword metadata instead of the
   compatibility string helper.
+- Expression helper function-call probes use token keyword metadata for common
+  scalar, array, text, UUID, datetime, and math function families instead of
+  rechecking function-name text.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

@@ -10767,13 +10767,13 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
         keywordAt(tokens, pos, "position") or
         keywordTagAt(tokens, pos, .abs) or
         keywordTagAt(tokens, pos, .round) or
-        lower_expr.peekFunctionCall(tokens, pos, "trunc") or
-        lower_expr.peekFunctionCall(tokens, pos, "floor") or
-        lower_expr.peekFunctionCall(tokens, pos, "ceil") or
-        lower_expr.peekFunctionCall(tokens, pos, "sqrt") or
-        lower_expr.peekFunctionCall(tokens, pos, "sign") or
-        lower_expr.peekFunctionCall(tokens, pos, "mod") or
-        lower_expr.peekFunctionCall(tokens, pos, "power") or
+        lower_expr.peekFunctionCallTag(tokens, pos, .trunc) or
+        lower_expr.peekFunctionCallTag(tokens, pos, .floor) or
+        lower_expr.peekFunctionCallTag(tokens, pos, .ceil) or
+        lower_expr.peekFunctionCallTag(tokens, pos, .sqrt) or
+        lower_expr.peekFunctionCallTag(tokens, pos, .sign) or
+        lower_expr.peekFunctionCallTag(tokens, pos, .mod) or
+        lower_expr.peekFunctionCallTag(tokens, pos, .power) or
         keywordTagAt(tokens, pos, .greatest) or
         keywordTagAt(tokens, pos, .least) or
         lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction) or
