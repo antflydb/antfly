@@ -23012,14 +23012,14 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"key\":\"document-key-field\"}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"key\":\"document-key-field\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
         },
         .sync_level = .full_index,
     });
 
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
-        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"key":{"type":"keyword"}},"additionalProperties":true}}}}
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"key":{"type":"keyword"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
     );
     defer parsed_schema.deinit(alloc);
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
@@ -23062,7 +23062,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
 
     var lookup_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
         alloc,
-        "SELECT _id, title, key FROM docs WHERE _id = 'doc:a'",
+        "SELECT _id, title, key, metadata->>'status' AS status, metadata#>>'{billing,plan}' AS plan FROM docs WHERE _id = 'doc:a'",
         schema,
         &.{},
     );
@@ -23081,7 +23081,7 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         .document_query => |query| {
             try std.testing.expectEqual(@as(u32, 1), query.total);
             try std.testing.expectEqual(@as(usize, 1), query.rows.len);
-            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\",\"key\":\"document-key-field\"}", query.rows[0]);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\",\"key\":\"document-key-field\",\"status\":\"active\",\"plan\":\"pro\"}", query.rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }

@@ -252,36 +252,99 @@ fn parseJsonPathProjectionItemAlloc(
     output: ?[]const u8,
     schema: runtime_schema.TableSchema,
 ) !?DocumentProjection {
+    var expression = (try parseDocumentJsonPathExpressionAlloc(alloc, tokens, schema)) orelse return null;
+    errdefer expression.deinit(alloc);
+    const owned_output = try alloc.dupe(u8, output orelse expression.last_segment);
+    errdefer alloc.free(owned_output);
+    return .{
+        .kind = .field,
+        .field = expression.takePath(),
+        .output = owned_output,
+    };
+}
+
+fn documentJsonArrowKind(kind: token_mod.TokenKind) bool {
+    return kind == .arrow_json or kind == .arrow_text or kind == .path_arrow_json or kind == .path_arrow_text;
+}
+
+fn documentJsonPathArrowKind(kind: token_mod.TokenKind) bool {
+    return kind == .path_arrow_json or kind == .path_arrow_text;
+}
+
+const DocumentJsonPathExpression = struct {
+    root_column: runtime_schema.RelationalColumn,
+    path: []u8,
+    last_segment: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.path.len > 0) alloc.free(self.path);
+        self.* = undefined;
+    }
+
+    fn takePath(self: *@This()) []u8 {
+        const path = self.path;
+        self.path = "";
+        return path;
+    }
+};
+
+fn parseDocumentJsonPathExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+) !?DocumentJsonPathExpression {
     if (tokens.len < 3 or tokens[0].kind != .identifier or !documentJsonArrowKind(tokens[1].kind)) return null;
     const root = tokens[0].text;
     if (std.mem.eql(u8, root, "_id") or std.mem.eql(u8, root, "_doc")) return error.UnsupportedSqlShape;
     const column = documentFieldColumn(schema, root) orelse return error.InvalidSqlCatalog;
     var path = try documentFilterPathAlloc(alloc, column.path);
     errdefer alloc.free(path);
+
     var last_segment: []const u8 = root;
     var pos: usize = 1;
     while (pos < tokens.len) {
         if (pos + 1 >= tokens.len or !documentJsonArrowKind(tokens[pos].kind)) return error.UnsupportedSqlShape;
         const segment_token = tokens[pos + 1];
         if (segment_token.kind != .string and segment_token.kind != .identifier) return error.UnsupportedSqlShape;
-        if (segment_token.text.len == 0 or std.mem.indexOfScalar(u8, segment_token.text, '/') != null) return error.UnsupportedSqlShape;
-        const next = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, segment_token.text });
-        alloc.free(path);
-        path = next;
-        last_segment = segment_token.text;
+        if (documentJsonPathArrowKind(tokens[pos].kind)) {
+            last_segment = try appendDocumentJsonPathLiteralAlloc(alloc, &path, segment_token.text);
+        } else {
+            try appendDocumentJsonPathSegmentAlloc(alloc, &path, segment_token.text);
+            last_segment = segment_token.text;
+        }
         pos += 2;
     }
-    const owned_output = try alloc.dupe(u8, output orelse last_segment);
-    errdefer alloc.free(owned_output);
+
     return .{
-        .kind = .field,
-        .field = path,
-        .output = owned_output,
+        .root_column = column,
+        .path = path,
+        .last_segment = last_segment,
     };
 }
 
-fn documentJsonArrowKind(kind: token_mod.TokenKind) bool {
-    return kind == .arrow_json or kind == .arrow_text;
+fn appendDocumentJsonPathLiteralAlloc(alloc: std.mem.Allocator, path: *[]u8, literal: []const u8) ![]const u8 {
+    if (literal.len == 0) return error.UnsupportedSqlShape;
+    const body = if (literal.len >= 2 and literal[0] == '{' and literal[literal.len - 1] == '}')
+        literal[1 .. literal.len - 1]
+    else
+        literal;
+    var parts = std.mem.splitScalar(u8, body, ',');
+    var count: usize = 0;
+    var last_segment: []const u8 = "";
+    while (parts.next()) |part| {
+        try appendDocumentJsonPathSegmentAlloc(alloc, path, part);
+        last_segment = part;
+        count += 1;
+    }
+    if (count == 0) return error.UnsupportedSqlShape;
+    return last_segment;
+}
+
+fn appendDocumentJsonPathSegmentAlloc(alloc: std.mem.Allocator, path: *[]u8, segment: []const u8) !void {
+    if (segment.len == 0 or std.mem.indexOfScalar(u8, segment, '/') != null) return error.UnsupportedSqlShape;
+    const next = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path.*, segment });
+    alloc.free(path.*);
+    path.* = next;
 }
 
 fn parseWhereProducerAlloc(
@@ -377,29 +440,107 @@ fn parseScalarFilterClauseAlloc(
     schema: runtime_schema.TableSchema,
 ) !?[]const u8 {
     if (tokens.len < 3) return null;
-    if (tokens[0].kind != .identifier) return null;
-    if (std.mem.eql(u8, tokens[0].text, "_id")) return null;
-    const column = documentFieldColumn(schema, tokens[0].text) orelse return error.InvalidSqlCatalog;
-    if (!column.indexed or column.index_lifecycle != .ready) return error.DocumentSqlIndexUnavailable;
-    const path = try documentFilterPathAlloc(alloc, column.path);
-    defer alloc.free(path);
-    if (tokens.len == 3 and tokens[1].kind == .eq) {
-        const value_json = try tokenLiteralJsonAlloc(alloc, tokens[2]);
+    const op_index = findTopLevelScalarFilterOperator(tokens) orelse return null;
+    if (op_index == 0) return null;
+    var field = (try documentFilterFieldForExpressionAlloc(alloc, tokens[0..op_index], schema)) orelse return null;
+    defer field.deinit(alloc);
+    if (tokens.len == op_index + 2 and tokens[op_index].kind == .eq) {
+        const value_json = try tokenLiteralJsonAlloc(alloc, tokens[op_index + 1]);
         defer alloc.free(value_json);
         return try std.fmt.allocPrint(
             alloc,
             "{{\"term\":{{\"path\":{f},\"value\":{s}}}}}",
-            .{ std.json.fmt(path, .{}), value_json },
+            .{ std.json.fmt(field.path, .{}), value_json },
         );
     }
-    if (tokens.len >= 5 and tokens[1].matchesKeywordTag(.in)) {
-        const values_json = try tokenLiteralListJsonAlloc(alloc, tokens[2..]);
+    if (tokens.len >= op_index + 4 and tokens[op_index].matchesKeywordTag(.in)) {
+        const values_json = try tokenLiteralListJsonAlloc(alloc, tokens[op_index + 1 ..]);
         defer alloc.free(values_json);
         return try std.fmt.allocPrint(
             alloc,
             "{{\"terms\":{{\"path\":{f},\"values\":{s}}}}}",
-            .{ std.json.fmt(path, .{}), values_json },
+            .{ std.json.fmt(field.path, .{}), values_json },
         );
+    }
+    return null;
+}
+
+const DocumentFilterField = struct {
+    path: []u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.path.len > 0) alloc.free(self.path);
+        self.* = undefined;
+    }
+};
+
+fn documentFilterFieldForExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+) !?DocumentFilterField {
+    if (tokens.len == 1 and tokens[0].kind == .identifier) {
+        if (std.mem.eql(u8, tokens[0].text, "_id")) return null;
+        const column = documentFieldColumn(schema, tokens[0].text) orelse return error.InvalidSqlCatalog;
+        if (!documentColumnIndexReady(column)) return error.DocumentSqlIndexUnavailable;
+        return .{ .path = try documentFilterPathAlloc(alloc, column.path) };
+    }
+
+    var expression = (try parseDocumentJsonPathExpressionAlloc(alloc, tokens, schema)) orelse return null;
+    defer expression.deinit(alloc);
+    if (!documentFilterPathIndexReady(schema, expression.path, expression.root_column)) return error.DocumentSqlIndexUnavailable;
+    return .{ .path = try alloc.dupe(u8, expression.path) };
+}
+
+fn documentColumnIndexReady(column: runtime_schema.RelationalColumn) bool {
+    return column.indexed and column.index_lifecycle == .ready;
+}
+
+fn documentFilterPathIndexReady(
+    schema: runtime_schema.TableSchema,
+    path: []const u8,
+    root_column: runtime_schema.RelationalColumn,
+) bool {
+    if (documentColumnForPath(schema, path)) |column| {
+        if (documentColumnIndexReady(column)) return true;
+    }
+    return root_column.field_type == .json and
+        documentColumnIndexReady(root_column) and
+        documentPathContainsPath(root_column.path, path);
+}
+
+fn documentColumnForPath(schema: runtime_schema.TableSchema, path: []const u8) ?runtime_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (documentPathEquals(column.path, path)) return column;
+    }
+    return null;
+}
+
+fn documentPathEquals(column_path: []const u8, filter_path: []const u8) bool {
+    const normalized_column = if (column_path.len > 0 and column_path[0] == '/') column_path[1..] else column_path;
+    const normalized_filter = if (filter_path.len > 0 and filter_path[0] == '/') filter_path[1..] else filter_path;
+    return std.mem.eql(u8, normalized_column, normalized_filter);
+}
+
+fn documentPathContainsPath(parent_path: []const u8, child_path: []const u8) bool {
+    const parent = if (parent_path.len > 0 and parent_path[0] == '/') parent_path[1..] else parent_path;
+    const child = if (child_path.len > 0 and child_path[0] == '/') child_path[1..] else child_path;
+    return std.mem.eql(u8, parent, child) or
+        (child.len > parent.len and std.mem.startsWith(u8, child, parent) and child[parent.len] == '/');
+}
+
+fn findTopLevelScalarFilterOperator(tokens: []const Token) ?usize {
+    var depth: usize = 0;
+    for (tokens, 0..) |token, i| {
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth > 0) depth -= 1;
+            },
+            .eq => if (depth == 0) return i,
+            .identifier => if (depth == 0 and token.matchesKeywordTag(.in)) return i,
+            else => {},
+        }
     }
     return null;
 }
@@ -608,6 +749,25 @@ test "document SQL lowers id in lookup projection" {
     try std.testing.expectEqualStrings("doc:b", lowered.producer.id_lookup[1]);
 }
 
+test "document SQL lowers json path projection" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "metadata", .path = "metadata", .field_type = .json },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, metadata->>'status' AS status, metadata#>>'{billing,plan}' AS plan FROM docs WHERE _id = 'doc:a'");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), lowered.projection.len);
+    try std.testing.expectEqualStrings("/metadata/status", lowered.projection[1].field);
+    try std.testing.expectEqualStrings("status", lowered.projection[1].output);
+    try std.testing.expectEqualStrings("/metadata/billing/plan", lowered.projection[2].field);
+    try std.testing.expectEqualStrings("plan", lowered.projection[2].output);
+}
+
 test "document SQL lowers full text producer" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
@@ -638,6 +798,22 @@ test "document SQL lowers scalar equality to indexed filter producer" {
     defer lowered.deinit(alloc);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.filter_query_json.?);
     try std.testing.expectEqual(@as(?u32, 10), lowered.limit);
+}
+
+test "document SQL lowers json path equality to indexed filter producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "metadata", .path = "metadata", .field_type = .json, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, metadata->>'status' AS status FROM docs WHERE metadata->>'status' = 'active' LIMIT 10");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("/metadata/status", lowered.projection[1].field);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/metadata/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.filter_query_json.?);
 }
 
 test "document SQL lowers scalar in and conjunction to indexed filter producer" {

@@ -8752,7 +8752,7 @@ pub const AppParityCorpusCoverage = struct {
             },
             .explain => {
                 self.explain = true;
-                self.explain_write = self.explain_write or sql_adapter.explainPlanHasKind(entry.plan, "write");
+                self.explain_write = self.explain_write or corpusExplainSubjectMatches(entry, "write");
                 self.explain_options = self.explain_options or
                     sql_adapter.planHasStringToken(entry.plan, ":format=") or
                     sql_adapter.planUsizeTokenValue(entry.plan, ":verbose=") != null or
