@@ -526,6 +526,10 @@ side-table schemas without parsing SQL text or sampling result rows. Public
 `rows/query`, `rows/aggregate`, `rows/window`, `rows/join`, and `rows/lateral`
 responses include this metadata as `result_schema`, and the OpenAPI/SDK structs
 expose the shared `RowsResultColumn` shape alongside returned rows.
+`RowsResultColumn.name` is the unique JSON result-object key. SQL-facing
+adapters may also populate `display_name` with the original output label; that
+label is presentation metadata and may be non-unique, so clients must not use it
+as the row-object key.
 Source-backed text and keyword outputs also carry optional `collation`
 metadata from the relational column catalog. Derived expression, aggregate, and
 window outputs omit collation metadata unless a typed expression node can prove
@@ -2354,8 +2358,10 @@ aggregate result fail during request validation.
 Join and lateral result ordering use that same emitted-output binding model.
 They can order by projected output names, ordinals, null-placement keys, or
 typed expressions over projected outputs such as
-`ORDER BY (right_metric - left_metric)`, while duplicate output names continue to
-fail closed. Native read join/lateral requests expose the same output-bound
+`ORDER BY (right_metric - left_metric)`. Result rows keep unique JSON object
+keys, while `result_schema.display_name` can preserve a non-unique SQL label for
+presentation; adapter lowering still fails closed until it can prove a unique
+field key for references such as `ORDER BY name`. Native read join/lateral requests expose the same output-bound
 `order_by` shape; joined mutation-source requests keep target-side row ordering
 for deterministic target claiming.
 Left joins preserve side-local `ON` predicates by lowering
@@ -4088,7 +4094,9 @@ lowered projection list before planning reaches storage; the stored plan carries
 the resulting field key or cloned typed expression key, not the ordinal. SQL
 output aliases such as `ORDER BY email_key` follow the same path: a unique
 projected alias resolves to the underlying field key or typed expression key,
-while duplicate output names fail closed instead of guessing.
+while duplicate output labels fail closed for references instead of guessing;
+row response metadata may carry those labels separately as
+`result_schema.display_name` while retaining unique `name` keys.
 Text-pattern predicates are native row-query predicates, not SQL strings. The
 REST/SDK shape is:
 
@@ -6139,10 +6147,12 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    typed output names rather than carrying SQL source text into result metadata:
    for example `lower(status)` projects as `lower`, `coalesce(...)` as
    `coalesce`, and `row_number() OVER (...)` as `row_number`. Explicit `AS`
-   aliases remain the public way to choose a stable application-facing name.
-   When a canonical or explicit name collides with a selected column or another
-   computed output, lowering fails closed instead of suffixing or widening the
-   result schema implicitly.
+   aliases remain the public way to choose a stable application-facing
+   result-object key. SQL adapters preserve presentation labels through
+   `result_schema.display_name`; when a canonical or explicit label collides
+   with a selected column or another computed output, lowering must either pick
+   a unique durable `name` key and retain the repeated display label there, or
+   fail closed for ambiguous output references instead of guessing.
 
 4. **Index and conflict-target completeness.**
    Keep ordinary, partial, and expression indexes as durable typed metadata.

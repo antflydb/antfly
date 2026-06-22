@@ -18,6 +18,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const query_contract = @import("../query_contract.zig");
 const lexer_mod = @import("lexer.zig");
 const token_mod = @import("token.zig");
+const tokenized = @import("tokenized.zig");
 
 const Token = token_mod.Token;
 const TokenKind = token_mod.TokenKind;
@@ -318,16 +319,23 @@ pub fn lowerAntflyQueryFunctionSqlAlloc(
     semantic_resolver: ?query_contract.SemanticResolver,
     sql: []const u8,
 ) !query_contract.OwnedQueryRequest {
-    var tokens = try lexer_mod.tokenizeAlloc(alloc, sql);
-    defer lexer_mod.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
+}
 
+pub fn lowerAntflyQueryFunctionParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    parsed_sql: *const tokenized.ParsedSql,
+) !query_contract.OwnedQueryRequest {
     var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
     defer {
         deinitAntflyQueryFunctionArgs(alloc, args.items);
         args.deinit(alloc);
     }
     var pos: usize = 0;
-    const function = try parseAntflyQueryFunctionCall(alloc, tokens.items, &pos, &args);
+    const function = try parseAntflyQueryFunctionCall(alloc, parsed_sql.items(), &pos, &args);
 
     return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
 }
@@ -337,18 +345,25 @@ pub fn lowerAntflyQueryFunctionExpressionSqlAlloc(
     semantic_resolver: ?query_contract.SemanticResolver,
     sql: []const u8,
 ) !query_contract.OwnedQueryRequest {
-    var tokens = try lexer_mod.tokenizeAlloc(alloc, sql);
-    defer lexer_mod.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerAntflyQueryFunctionExpressionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
+}
 
+pub fn lowerAntflyQueryFunctionExpressionParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    parsed_sql: *const tokenized.ParsedSql,
+) !query_contract.OwnedQueryRequest {
     var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
     defer {
         deinitAntflyQueryFunctionArgs(alloc, args.items);
         args.deinit(alloc);
     }
     var pos: usize = 0;
-    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, tokens.items, &pos, &args);
-    _ = matchSqlToken(tokens.items, &pos, .semicolon);
-    if (pos != tokens.items.len) return error.UnsupportedSqlShape;
+    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, parsed_sql.items(), &pos, &args);
+    _ = matchSqlToken(parsed_sql.items(), &pos, .semicolon);
+    if (pos != parsed_sql.items().len) return error.UnsupportedSqlShape;
 
     return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
 }

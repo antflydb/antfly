@@ -13,6 +13,7 @@
 // limitations.
 
 pub const ast = @import("ast.zig");
+pub const app_parity_fixture = @import("app_parity_fixture.zig");
 pub const binder = @import("binder.zig");
 pub const bulk_io = @import("bulk_io.zig");
 pub const catalog_apply = @import("catalog_apply.zig");
@@ -123,7 +124,9 @@ pub const antflyQueryFunctionBoolArg = query_function.antflyQueryFunctionBoolArg
 pub const antflyQueryFunctionFromSqlName = query_function.antflyQueryFunctionFromSqlName;
 pub const antflyQueryFunctionNumberArg = query_function.antflyQueryFunctionNumberArg;
 pub const antflyQueryFunctionStringArg = query_function.antflyQueryFunctionStringArg;
+pub const lowerAntflyQueryFunctionParsedSqlAlloc = query_function.lowerAntflyQueryFunctionParsedSqlAlloc;
 pub const lowerAntflyQueryFunctionSqlAlloc = query_function.lowerAntflyQueryFunctionSqlAlloc;
+pub const lowerAntflyQueryFunctionExpressionParsedSqlAlloc = query_function.lowerAntflyQueryFunctionExpressionParsedSqlAlloc;
 pub const lowerAntflyQueryFunctionExpressionSqlAlloc = query_function.lowerAntflyQueryFunctionExpressionSqlAlloc;
 pub const lowerAntflyGraphTableFunctionTokensAlloc = query_function.lowerAntflyGraphTableFunctionTokensAlloc;
 pub const parseAntflyQueryFunctionCall = query_function.parseAntflyQueryFunctionCall;
@@ -204,6 +207,8 @@ pub const AppParityCorpusCoverage = corpus.AppParityCorpusCoverage;
 pub const AppParityCoverageRequirements = corpus.AppParityCoverageRequirements;
 pub const AppParityCoverageRequirementsRoot = corpus.AppParityCoverageRequirementsRoot;
 pub const AppParityExternalSourceCorpus = corpus.AppParityExternalSourceCorpus;
+pub const AppParityFixtureGenerationCallbacks = app_parity_fixture.AppParityFixtureGenerationCallbacks;
+pub const AppParityFixtureMetadataCallbacks = app_parity_fixture.AppParityFixtureMetadataCallbacks;
 pub const AppParityFixtureEncodedEntry = corpus.AppParityFixtureEncodedEntry;
 pub const AppParityFixtureGateMode = corpus.AppParityFixtureGateMode;
 pub const AppParityCorpusPlanFamily = corpus.AppParityCorpusPlanFamily;
@@ -217,6 +222,10 @@ pub const SqlAdapterEdgeCaseAction = corpus.SqlAdapterEdgeCaseAction;
 pub const SqlAdapterEdgeCaseDdlTag = corpus.SqlAdapterEdgeCaseDdlTag;
 pub const SqlAdapterEdgeCaseRoot = corpus.SqlAdapterEdgeCaseRoot;
 pub const app_parity_default_schema_json = corpus.app_parity_default_schema_json;
+pub const appParityFixtureJsonAlloc = app_parity_fixture.fixtureJsonAlloc;
+pub const maybeCheckOrPromoteAppParityFixture = app_parity_fixture.maybeCheckOrPromoteFixture;
+pub const validateAppParityFixtureMetadata = app_parity_fixture.validateAppParityFixtureMetadata;
+pub const validateAppParityFixtureMetadataWithBaseSchema = app_parity_fixture.validateAppParityFixtureMetadataWithBaseSchema;
 pub const appParitySourceTableNameAlloc = corpus.appParitySourceTableNameAlloc;
 pub const appParitySourceTableNameParsedSqlAlloc = corpus.appParitySourceTableNameParsedSqlAlloc;
 pub const appParityCatalogForEntryAlloc = corpus.appParityCatalogForEntryAlloc;

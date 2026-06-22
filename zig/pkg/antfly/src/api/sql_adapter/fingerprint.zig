@@ -17,12 +17,12 @@ const std = @import("std");
 const corpus = @import("corpus.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const diagnostics = @import("diagnostics.zig");
-const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser_context = @import("parser_context.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const schema_api = @import("../../schema/mod.zig");
 const schema_json = @import("schema_json.zig");
+const tokenized = @import("tokenized.zig");
 
 const AlterTablePlan = ddl_plan.AlterTablePlan;
 const AppliedDdlSchemaJson = ddl_plan.AppliedDdlSchemaJson;
@@ -1772,14 +1772,20 @@ fn lowerDdlPlanForFingerprintTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
 ) !LoweredDdlPlan {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerDdlPlanParsedSqlForFingerprintTestAlloc(alloc, &parsed_sql);
+}
 
+fn lowerDdlPlanParsedSqlForFingerprintTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) !LoweredDdlPlan {
     var state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = parsed_sql.items(),
     };
-    return try ddl_plan.parseDdlPlanAlloc(alloc, tokens.items, &state.pos, .{
+    return try ddl_plan.parseDdlPlanAlloc(alloc, parsed_sql.items(), &state.pos, .{
         .schema = state.schema,
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,

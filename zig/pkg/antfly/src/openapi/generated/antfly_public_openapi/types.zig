@@ -1268,8 +1268,10 @@ pub const RowsLateralCorrelation = struct {
 
 /// Typed column metadata emitted by a native relational read plan.
 pub const RowsResultColumn = struct {
-    /// Public result-object field name.
+    /// Unique public result-object field name.
     name: []const u8,
+    /// Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key.
+    display_name: ?[]const u8 = null,
     /// Source path represented by this result field.
     path: []const u8,
     /// Antfly scalar/container type for the result field.

@@ -3708,7 +3708,9 @@ fn expectAppParityQueryFunctionEntry(
         .ptr = &resolver_state,
         .vtable = &.{ .resolve_dense_query = appParityResolveDenseQuery },
     };
-    var lowered = try lowerAntflyQueryFunctionSqlAlloc(alloc, semantic_resolver, entry.sql);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    var lowered = try sql_adapter.lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
     defer lowered.deinit(alloc);
     const fingerprint = try queryFunctionFingerprintAlloc(alloc, lowered);
     defer alloc.free(fingerprint);
@@ -3891,43 +3893,9 @@ fn appParityAppliedDdlPlanAlloc(
     return try ddlAppliedFingerprintAlloc(alloc, applied);
 }
 
-fn appParityFixtureJsonAlloc(
-    alloc: std.mem.Allocator,
-    schema_json: []const u8,
-    source_sha256: []const u8,
-    corpus: []const AppParityCorpusEntry,
-) ![]u8 {
-    var entries = std.ArrayListUnmanaged(sql_adapter.AppParityFixtureEncodedEntry).empty;
-    defer entries.deinit(alloc);
-    var skipped_entries = std.ArrayListUnmanaged([]const u8).empty;
-    defer skipped_entries.deinit(alloc);
-    var owned_applied_plans = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (owned_applied_plans.items) |applied_plan| alloc.free(applied_plan);
-        owned_applied_plans.deinit(alloc);
-    }
-
-    for (corpus) |entry| {
-        var applied_plan = entry.applied_plan;
-        if (applied_plan.len == 0 and try sql_adapter.corpusDdlFixtureRequiresAppliedPlan(entry)) {
-            const derived_applied_plan = appParityAppliedDdlPlanAlloc(alloc, schema_json, entry) catch |err| switch (err) {
-                error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
-                    try skipped_entries.append(alloc, entry.name);
-                    continue;
-                },
-                else => return err,
-            };
-            try owned_applied_plans.append(alloc, derived_applied_plan);
-            applied_plan = derived_applied_plan;
-        }
-
-        try entries.append(alloc, .{
-            .entry = entry,
-            .applied_plan = applied_plan,
-        });
-    }
-    return try sql_adapter.fixtureJsonAlloc(alloc, schema_json, source_sha256, corpus.len, entries.items, skipped_entries.items);
-}
+const app_parity_fixture_generation_callbacks = sql_adapter.AppParityFixtureGenerationCallbacks{
+    .applied_ddl_plan = appParityAppliedDdlPlanAlloc,
+};
 
 fn maybeCheckOrPromoteAppParityFixture(
     alloc: std.mem.Allocator,
@@ -3935,40 +3903,19 @@ fn maybeCheckOrPromoteAppParityFixture(
     source_sha256: []const u8,
     corpus: []const AppParityCorpusEntry,
 ) !void {
-    const mode = try sql_adapter.fixtureGateModeFromEnvAlloc(alloc);
-    defer sql_adapter.freeFixtureGateMode(alloc, mode);
-    if (mode == .none) return;
-
-    const encoded = try appParityFixtureJsonAlloc(alloc, schema_json, source_sha256, corpus);
-    defer alloc.free(encoded);
-    try sql_adapter.checkOrPromoteFixtureJson(alloc, mode, encoded);
+    return sql_adapter.maybeCheckOrPromoteAppParityFixture(
+        alloc,
+        schema_json,
+        source_sha256,
+        corpus,
+        app_parity_fixture_generation_callbacks,
+    );
 }
 
-fn appParitySetupSqlIsValid(alloc: std.mem.Allocator, setup_sql: []const []const u8) !bool {
-    for (setup_sql) |sql| {
-        if (sql.len == 0) return false;
-    }
-    const schema_json = schemaJsonFromSetupSqlAlloc(alloc, setup_sql) catch return false;
-    defer alloc.free(schema_json);
-    return true;
-}
-
-fn appParityFixtureAppliedPlanMatchesDerived(
-    alloc: std.mem.Allocator,
-    base_schema_json: []const u8,
-    entry: AppParityCorpusEntry,
-) !bool {
-    if (entry.applied_plan.len == 0) return true;
-    const derived = appParityAppliedDdlPlanAlloc(alloc, base_schema_json, entry) catch |err| switch (err) {
-        error.InvalidSqlCatalog,
-        error.UnsupportedSqlShape,
-        error.InvalidSchemaUpdateRequest,
-        => return false,
-        else => return err,
-    };
-    defer alloc.free(derived);
-    return std.mem.eql(u8, entry.applied_plan, derived);
-}
+const app_parity_fixture_metadata_callbacks = sql_adapter.AppParityFixtureMetadataCallbacks{
+    .schema_json_from_setup_sql = schemaJsonFromSetupSqlAlloc,
+    .applied_ddl_plan = appParityAppliedDdlPlanAlloc,
+};
 
 fn validateAppParityFixtureMetadataWithBaseSchema(
     entry: AppParityCorpusEntry,
@@ -3976,55 +3923,13 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
     seen_names: *std.StringHashMapUnmanaged(void),
     alloc: std.mem.Allocator,
 ) !void {
-    try sql_adapter.validateFixtureMetadataCore(entry);
-    var owned_applied_base_schema_json: ?[]u8 = null;
-    defer if (owned_applied_base_schema_json) |schema_json| alloc.free(schema_json);
-    const applied_base_schema_json = if (base_schema_json.len > 0)
-        base_schema_json
-    else if (entry.apply_setup_sql.len > 0) blk: {
-        owned_applied_base_schema_json = schemaJsonFromSetupSqlAlloc(alloc, entry.apply_setup_sql) catch return error.TestUnexpectedResult;
-        break :blk owned_applied_base_schema_json.?;
-    } else "";
-    if (entry.applied_plan.len > 0) {
-        if (!(try appParityFixtureAppliedPlanMatchesDerived(alloc, applied_base_schema_json, entry))) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
-        return error.TestUnexpectedResult;
-    }
-    if (entry.source_schema_json.len > 0 and !(try sql_adapter.fixtureSchemaJsonIsRelationalTableAlloc(alloc, entry.source_schema_json))) {
-        return error.TestUnexpectedResult;
-    }
-    for (entry.catalog_tables) |catalog_table| {
-        if (!(try sql_adapter.fixtureSchemaJsonIsRelationalTableAlloc(alloc, catalog_table.schema_json))) {
-            return error.TestUnexpectedResult;
-        }
-        if (entry.summary.table_name) |target_table_name| {
-            if (std.mem.eql(u8, catalog_table.name, target_table_name)) return error.TestUnexpectedResult;
-        }
-    }
-    if (entry.source_schema_json.len > 0) {
-        var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
-        defer parsed_sql.deinit(alloc);
-        const source_table_name = (sql_adapter.appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
-        defer alloc.free(@constCast(source_table_name));
-        if (source_table_name.len == 0) return error.TestUnexpectedResult;
-        if (entry.summary.table_name) |target_table_name| {
-            if (std.mem.eql(u8, source_table_name, target_table_name)) return error.TestUnexpectedResult;
-        }
-        if (!sql_adapter.corpusFixturePlanMatchesSourceTable(entry, source_table_name)) {
-            return error.TestUnexpectedResult;
-        }
-    }
-    for (entry.returning_rows) |returning_row| {
-        if (!(try sql_adapter.fixtureJsonTextIsObjectAlloc(alloc, returning_row))) return error.TestUnexpectedResult;
-    }
-    if (entry.resolver_row_json.len > 0 and !(try sql_adapter.fixtureJsonTextIsObjectAlloc(alloc, entry.resolver_row_json))) {
-        return error.TestUnexpectedResult;
-    }
-    if (seen_names.contains(entry.name)) return error.TestUnexpectedResult;
-    try seen_names.put(alloc, entry.name, {});
+    return sql_adapter.validateAppParityFixtureMetadataWithBaseSchema(
+        alloc,
+        entry,
+        base_schema_json,
+        seen_names,
+        app_parity_fixture_metadata_callbacks,
+    );
 }
 
 fn validateAppParityFixtureMetadata(
@@ -4032,7 +3937,12 @@ fn validateAppParityFixtureMetadata(
     seen_names: *std.StringHashMapUnmanaged(void),
     alloc: std.mem.Allocator,
 ) !void {
-    return validateAppParityFixtureMetadataWithBaseSchema(entry, "", seen_names, alloc);
+    return sql_adapter.validateAppParityFixtureMetadata(
+        alloc,
+        entry,
+        seen_names,
+        app_parity_fixture_metadata_callbacks,
+    );
 }
 
 test "postgres sql adapter validates app parity fixture metadata with applied schema context" {

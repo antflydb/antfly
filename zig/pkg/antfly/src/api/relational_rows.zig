@@ -5940,16 +5940,29 @@ pub fn encodeRowsQueryResponseAlloc(alloc: std.mem.Allocator, result: OwnedRowsQ
     return try encodeRowsQueryResponseWithSchemaAlloc(alloc, result, &.{});
 }
 
+pub const RowsResultColumn = struct {
+    column: runtime_schema.RelationalColumn,
+    display_name: ?[]const u8 = null,
+};
+
 pub fn encodeRowsQueryResponseWithSchemaAlloc(
     alloc: std.mem.Allocator,
     result: OwnedRowsQueryResult,
     result_schema: []const runtime_schema.RelationalColumn,
 ) ![]u8 {
+    return try encodeRowsQueryResponseWithResultSchemaAlloc(alloc, result, result_schema);
+}
+
+pub fn encodeRowsQueryResponseWithResultSchemaAlloc(
+    alloc: std.mem.Allocator,
+    result: OwnedRowsQueryResult,
+    result_schema: anytype,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.print("{{\"total\":{d}", .{result.total});
-    try appendRowsResultSchemaJson(writer, result_schema);
+    try appendRowsResultColumnsJson(writer, result_schema);
     try writer.writeAll(",\"rows\":[");
     for (result.rows, 0..) |row, i| {
         if (i != 0) try writer.writeByte(',');
@@ -5966,11 +5979,21 @@ fn encodeRowsResultWithTotalFieldAlloc(
     rows: []const []const u8,
     result_schema: []const runtime_schema.RelationalColumn,
 ) ![]u8 {
+    return try encodeRowsResultWithTotalFieldAndResultSchemaAlloc(alloc, total_field, total, rows, result_schema);
+}
+
+fn encodeRowsResultWithTotalFieldAndResultSchemaAlloc(
+    alloc: std.mem.Allocator,
+    total_field: []const u8,
+    total: u32,
+    rows: []const []const u8,
+    result_schema: anytype,
+) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.print("{{{f}:{d}", .{ std.json.fmt(total_field, .{}), total });
-    try appendRowsResultSchemaJson(writer, result_schema);
+    try appendRowsResultColumnsJson(writer, result_schema);
     try writer.writeAll(",\"rows\":[");
     for (rows, 0..) |row, i| {
         if (i != 0) try writer.writeByte(',');
@@ -5995,6 +6018,14 @@ pub fn encodeRowsAggregateResponseWithSchemaAlloc(
     return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_groups", result.total_groups, result.rows, result_schema);
 }
 
+pub fn encodeRowsAggregateResponseWithResultSchemaAlloc(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.RelationalRowsAggregateResult,
+    result_schema: []const RowsResultColumn,
+) ![]u8 {
+    return try encodeRowsResultWithTotalFieldAndResultSchemaAlloc(alloc, "total_groups", result.total_groups, result.rows, result_schema);
+}
+
 pub fn encodeRowsWindowResponseAlloc(
     alloc: std.mem.Allocator,
     result: db_mod.types.RelationalRowsWindowResult,
@@ -6010,6 +6041,14 @@ pub fn encodeRowsWindowResponseWithSchemaAlloc(
     return try encodeRowsResultWithTotalFieldAlloc(alloc, "total_rows", result.total_rows, result.rows, result_schema);
 }
 
+pub fn encodeRowsWindowResponseWithResultSchemaAlloc(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.RelationalRowsWindowResult,
+    result_schema: []const RowsResultColumn,
+) ![]u8 {
+    return try encodeRowsResultWithTotalFieldAndResultSchemaAlloc(alloc, "total_rows", result.total_rows, result.rows, result_schema);
+}
+
 pub fn encodeRowsJoinResponseAlloc(
     alloc: std.mem.Allocator,
     result: db_mod.types.RelationalRowsJoinResult,
@@ -6021,6 +6060,14 @@ pub fn encodeRowsJoinResponseWithSchemaAlloc(
     alloc: std.mem.Allocator,
     result: db_mod.types.RelationalRowsJoinResult,
     result_schema: []const runtime_schema.RelationalColumn,
+) ![]u8 {
+    return try encodeRowsJoinResponseWithResultSchemaAlloc(alloc, result, result_schema);
+}
+
+pub fn encodeRowsJoinResponseWithResultSchemaAlloc(
+    alloc: std.mem.Allocator,
+    result: db_mod.types.RelationalRowsJoinResult,
+    result_schema: anytype,
 ) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -6035,7 +6082,7 @@ pub fn encodeRowsJoinResponseWithSchemaAlloc(
             },
         );
     }
-    try appendRowsResultSchemaJson(writer, result_schema);
+    try appendRowsResultColumnsJson(writer, result_schema);
     try writer.writeAll(",\"rows\":[");
     for (result.rows, 0..) |row, i| {
         if (i != 0) try writer.writeByte(',');
@@ -6045,12 +6092,15 @@ pub fn encodeRowsJoinResponseWithSchemaAlloc(
     return try out.toOwnedSlice();
 }
 
-fn appendRowsResultSchemaJson(
-    writer: *std.Io.Writer,
-    result_schema: []const runtime_schema.RelationalColumn,
-) !void {
+fn appendRowsResultColumnsJson(writer: *std.Io.Writer, result_schema: anytype) !void {
     try writer.writeAll(",\"result_schema\":[");
-    for (result_schema, 0..) |column, i| {
+    for (result_schema, 0..) |item, i| {
+        const result_column = switch (@TypeOf(item)) {
+            runtime_schema.RelationalColumn => RowsResultColumn{ .column = item },
+            RowsResultColumn => item,
+            else => @compileError("unsupported rows result schema item type"),
+        };
+        const column = result_column.column;
         if (i != 0) try writer.writeByte(',');
         try writer.print(
             "{{\"name\":{f},\"path\":{f},\"type\":{f}",
@@ -6066,9 +6116,47 @@ fn appendRowsResultSchemaJson(
         if (column.collation) |collation| {
             try writer.print(",\"collation\":{f}", .{std.json.fmt(collation, .{})});
         }
+        if (result_column.display_name) |display_name| {
+            try writer.print(",\"display_name\":{f}", .{std.json.fmt(display_name, .{})});
+        }
         try writer.print(",\"nullable\":{}}}", .{column.nullable});
     }
     try writer.writeByte(']');
+}
+
+test "relational rows result schema can carry non-unique display labels" {
+    const alloc = std.testing.allocator;
+    const result_schema = [_]RowsResultColumn{
+        .{
+            .column = .{
+                .name = "id",
+                .path = "id",
+                .field_type = .keyword,
+                .nullable = false,
+            },
+            .display_name = "id",
+        },
+        .{
+            .column = .{
+                .name = "id_2",
+                .path = "row_number",
+                .field_type = .numeric,
+                .nullable = false,
+            },
+            .display_name = "id",
+        },
+    };
+    const response = try encodeRowsQueryResponseWithResultSchemaAlloc(alloc, .{ .rows = &.{}, .total = 0 }, result_schema[0..]);
+    defer alloc.free(response);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const columns = parsed.value.object.get("result_schema").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqualStrings("id", columns[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("id", columns[0].object.get("display_name").?.string);
+    try std.testing.expectEqualStrings("id_2", columns[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("id", columns[1].object.get("display_name").?.string);
 }
 
 pub fn encodeRowsGetResponseAlloc(

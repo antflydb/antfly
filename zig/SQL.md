@@ -316,8 +316,12 @@ Current implementation status:
   resolve unqualified catalog names against non-default search paths. Public
   facade wrappers for direct select, insert, strict insert/update, and aggregate
   lowering now delegate through parsed helper variants instead of owning
-  separate tokenization paths. DML adapter write-plan regression callbacks also
-  consume borrowed parsed tokens instead of round-tripping through SQL text.
+  separate tokenization paths. DML adapter write-plan regression callbacks and
+  direct DML test facades also consume borrowed parsed tokens instead of
+  round-tripping through SQL text. DDL fingerprint regression helpers parse once
+  through `ParsedSql` before computing structured fingerprints. Antfly query
+  function lowering has parsed entrypoints, and app-parity query-function
+  checks reuse `ParsedSql` instead of tokenizing fixture SQL directly.
   Parsed-only lowering context construction does not require a raw SQL field.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.

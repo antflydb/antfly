@@ -5674,7 +5674,11 @@ components:
       properties:
         name:
           type: string
-          description: Public result-object field name.
+          description: Unique public result-object field name.
+        display_name:
+          type: string
+          nullable: true
+          description: Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key.
         path:
           type: string
           description: Source path represented by this result field.

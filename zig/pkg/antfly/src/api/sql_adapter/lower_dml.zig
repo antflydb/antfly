@@ -11618,23 +11618,9 @@ fn lowerInsertForTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredInsert {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-    };
-    return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerInsertParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params);
 }
 
 fn lowerInsertWithResolverForTestAlloc(
@@ -11644,24 +11630,9 @@ fn lowerInsertWithResolverForTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsert {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerInsertWithResolverParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, unique_resolver);
 }
 
 fn lowerUpdateForTestAlloc(
@@ -11671,24 +11642,9 @@ fn lowerUpdateForTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseUpdate(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerUpdateParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, unique_resolver);
 }
 
 fn lowerDeleteForTestAlloc(
@@ -11698,24 +11654,9 @@ fn lowerDeleteForTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parser_context.ParserState.ContextAccessors.parseDelete(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerDeleteParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, unique_resolver);
 }
 
 fn lowerUpdateMutationSourceForTestAlloc(
@@ -11725,24 +11666,9 @@ fn lowerUpdateMutationSourceForTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, row_claim);
 }
 
 fn lowerDeleteMutationSourceForTestAlloc(
@@ -11752,24 +11678,9 @@ fn lowerDeleteMutationSourceForTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseDeleteMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, row_claim);
 }
 
 fn lowerUpdateJoinedMutationSourceForDmlTestAlloc(
@@ -11790,33 +11701,9 @@ fn lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parseJoinedMutationSourceAlloc(
-        alloc,
-        tokens.items,
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params, row_claim);
 }
 
 fn lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
@@ -11827,33 +11714,9 @@ fn lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parseJoinedMutationSourceAlloc(
-        alloc,
-        tokens.items,
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params, row_claim);
 }
 
 fn lowerTruncateMutationSourceForTestAlloc(
@@ -11862,24 +11725,9 @@ fn lowerTruncateMutationSourceForTestAlloc(
     schema: runtime_schema.TableSchema,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseTruncateMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, row_claim);
 }
 
 fn lowerInsertSourceWithResolverForDmlTestAlloc(
@@ -11889,30 +11737,9 @@ fn lowerInsertSourceWithResolverForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsertSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = schema,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parseInsertSourceAlloc(
-        alloc,
-        tokens.items,
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, unique_resolver);
 }
 
 fn lowerInsertSourceWithSchemasForDmlTestAlloc(
@@ -11923,33 +11750,9 @@ fn lowerInsertSourceWithSchemasForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsertSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .insert_source_allows_different_table = true,
-        .params = params,
-        .unique_resolver = unique_resolver,
-    };
-    return parseInsertSourceAlloc(
-        alloc,
-        tokens.items,
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
-    ) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params, unique_resolver);
 }
 
 fn lowerMergeMutationPlanForDmlTestAlloc(
@@ -11959,28 +11762,9 @@ fn lowerMergeMutationPlanForDmlTestAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredMergeMutationPlan {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-    };
-    return try parseMergeMutationPlanAlloc(
-        alloc,
-        tokens.items,
-        &parser_state.pos,
-        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
-        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
-    );
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerMergeMutationPlanParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params);
 }
 
 fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
@@ -11991,27 +11775,9 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params, row_claim);
 }
 
 fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
@@ -12022,27 +11788,9 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-        .mutation_claim = row_claim,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params, row_claim);
 }
 
 fn lowerRecursiveMergeMutationWithSchemasForDmlTestAlloc(
@@ -12052,25 +11800,9 @@ fn lowerRecursiveMergeMutationWithSchemasForDmlTestAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredRecursiveMergeMutation {
-    const lexer = @import("lexer.zig");
-    const parser_context = @import("parser_context.zig");
-
-    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
-    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-
-    var parser_state = parser_context.ParserState{
-        .alloc = alloc,
-        .tokens = tokens.items,
-        .schema = target_schema,
-        .joined_source_schema = source_schema,
-        .params = params,
-    };
-    return parser_context.ParserState.ContextAccessors.parseRecursiveMergeMutation(&parser_state) catch |err| switch (err) {
-        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
-        else => return err,
-    };
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params);
 }
 
 fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
@@ -12089,6 +11821,27 @@ fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
         .schema = schema,
         .params = params,
         .unique_resolver = unique_resolver,
+    };
+    return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
+fn lowerInsertParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+) !plan_mod.LoweredInsert {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
     };
     return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
         error.InvalidRowsRequest => return error.UnsupportedSqlShape,
@@ -12450,30 +12203,9 @@ fn lowerWritePlanForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
-    var context = lowering_context.WritePlanLoweringContext{
-        .alloc = alloc,
-        .sql = sql,
-        .schema = schema,
-        .params = params,
-        .callbacks = .{
-            .lower_recursive_insert_source_with_schemas = unsupportedRecursiveInsertSourceForDmlTestAlloc,
-            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlForDmlTestAlloc,
-            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc,
-            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_update_with_resolver = lowerUpdateParsedSqlForDmlTestAlloc,
-            .lower_update_source = lowerUpdateMutationSourceParsedSqlForDmlTestAlloc,
-            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
-            .lower_delete_with_resolver = lowerDeleteParsedSqlForDmlTestAlloc,
-            .lower_delete_source = lowerDeleteMutationSourceParsedSqlForDmlTestAlloc,
-            .lower_truncate_source = lowerTruncateMutationSourceParsedSqlForDmlTestAlloc,
-            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanParsedSqlForDmlTestAlloc,
-        },
-    };
-    return try context.lower(options);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options);
 }
 
 fn lowerWritePlanParsedSqlForDmlTestAlloc(
@@ -12516,16 +12248,17 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !plan_mod.LoweredWritePlan {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
-        .sql = sql,
         .schema = schema,
         .params = params,
         .callbacks = .{
             .lower_with_options = lowerWritePlanParsedSqlForDmlTestAlloc,
         },
     };
-    return try context.lower(options, catalog);
+    return try context.lowerParsed(&parsed_sql, options, catalog);
 }
 
 fn unsupportedRecursiveInsertSourceForDmlTestAlloc(
