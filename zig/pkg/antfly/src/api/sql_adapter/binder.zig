@@ -32,6 +32,7 @@ const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 
 const Token = token_mod.Token;
+const TokenKeyword = token_mod.TokenKeyword;
 
 pub const ResolvedRowExpressionField = struct {
     field: []const u8,
@@ -1080,8 +1081,8 @@ pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed
 
 fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try insertSourceTableNamesFromWithAlloc(alloc, tokens);
-    if (!std.ascii.eqlIgnoreCase(tokens[0].text, "insert")) return null;
+    if (tokens[0].matchesKeywordTag(.with)) return try insertSourceTableNamesFromWithAlloc(alloc, tokens);
+    if (!tokens[0].matchesKeywordTag(.insert)) return null;
     return try insertSourceTableNamesFromInsertAlloc(alloc, tokens, 0);
 }
 
@@ -1109,33 +1110,33 @@ fn recursiveInsertSourceTableNamesFromTokensAlloc(
     tokens: []const Token,
 ) !?InsertSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (!std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return null;
+    if (!tokens[0].matchesKeywordTag(.with)) return null;
     var index: usize = 1;
-    if (!consumeKeyword(tokens, &index, "recursive")) return null;
+    if (!consumeKeyword(tokens, &index, .recursive)) return null;
     if (index >= tokens.len or tokens[index].kind != .identifier) return null;
     index += 1;
     if (index < tokens.len and tokens[index].kind == .lparen) {
         index = (findMatchingRParenIndex(tokens, index) orelse return null) + 1;
     }
-    if (!consumeKeyword(tokens, &index, "as")) return null;
+    if (!consumeKeyword(tokens, &index, .as)) return null;
     parser.consumeCteMaterializationHint(tokens, &index) catch return null;
     if (index >= tokens.len or tokens[index].kind != .lparen) return null;
 
     const body_start = index + 1;
     const body_end = findMatchingRParenIndex(tokens, index) orelse return null;
     const body = tokens[body_start..body_end];
-    const from_index = findTopLevelKeyword(body, "from") orelse return null;
+    const from_index = findTopLevelKeyword(body, .from) orelse return null;
     var source_index = body_start + from_index + 1;
-    _ = consumeKeyword(tokens, &source_index, "only");
+    _ = consumeKeyword(tokens, &source_index, .only);
     if (source_index >= body_end or tokens[source_index].kind != .identifier) return null;
     const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
     var source_transferred = false;
     defer if (!source_transferred) alloc.free(source);
 
     index = body_end + 1;
-    if (!consumeKeyword(tokens, &index, "insert")) return null;
-    if (!consumeKeyword(tokens, &index, "into")) return null;
-    _ = consumeKeyword(tokens, &index, "only");
+    if (!consumeKeyword(tokens, &index, .insert)) return null;
+    if (!consumeKeyword(tokens, &index, .into)) return null;
+    _ = consumeKeyword(tokens, &index, .only);
     if (index >= tokens.len or tokens[index].kind != .identifier) return null;
     const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
     errdefer alloc.free(target);
@@ -1176,7 +1177,7 @@ pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, p
 
 fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens);
+    if (tokens[0].matchesKeywordTag(.with)) return try joinedWriteSourceTableNamesFromWithAlloc(alloc, tokens);
     return try joinedWriteSourceTableNamesFromStatementAlloc(alloc, tokens, 0);
 }
 
@@ -1368,16 +1369,16 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
     statement_index: usize,
 ) !?InsertSourceTableNames {
     if (statement_index >= tokens.len or tokens[statement_index].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens[statement_index].text, "update")) {
+    if (tokens[statement_index].matchesKeywordTag(.update)) {
         var target_index: usize = statement_index + 1;
-        _ = consumeKeyword(tokens, &target_index, "only");
+        _ = consumeKeyword(tokens, &target_index, .only);
         if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
         const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(target);
 
-        const from_index = findTopLevelKeyword(tokens[target_index + 1 ..], "from") orelse {
-            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], "where") orelse {
+        const from_index = findTopLevelKeyword(tokens[target_index + 1 ..], .from) orelse {
+            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], .where) orelse {
                 alloc.free(target);
                 return null;
             };
@@ -1391,7 +1392,7 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
             return .{ .target = target, .source = source };
         };
         var source_index = target_index + 1 + from_index + 1;
-        _ = consumeKeyword(tokens, &source_index, "only");
+        _ = consumeKeyword(tokens, &source_index, .only);
         if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
         const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         errdefer alloc.free(source);
@@ -1400,17 +1401,17 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
         return .{ .target = target, .source = source };
     }
 
-    if (std.ascii.eqlIgnoreCase(tokens[statement_index].text, "delete")) {
+    if (tokens[statement_index].matchesKeywordTag(.delete)) {
         var target_index: usize = statement_index + 1;
-        if (!consumeKeyword(tokens, &target_index, "from")) return null;
-        _ = consumeKeyword(tokens, &target_index, "only");
+        if (!consumeKeyword(tokens, &target_index, .from)) return null;
+        _ = consumeKeyword(tokens, &target_index, .only);
         if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
         const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(target);
 
-        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], "using") orelse {
-            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], "where") orelse {
+        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], .using) orelse {
+            const where_index = findTopLevelKeyword(tokens[target_index + 1 ..], .where) orelse {
                 alloc.free(target);
                 return null;
             };
@@ -1424,7 +1425,7 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
             return .{ .target = target, .source = source };
         };
         var source_index = target_index + 1 + using_index + 1;
-        _ = consumeKeyword(tokens, &source_index, "only");
+        _ = consumeKeyword(tokens, &source_index, .only);
         if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
         const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         errdefer alloc.free(source);
@@ -1433,21 +1434,21 @@ fn joinedWriteSourceTableNamesFromStatementAlloc(
         return .{ .target = target, .source = source };
     }
 
-    if (std.ascii.eqlIgnoreCase(tokens[statement_index].text, "merge")) {
+    if (tokens[statement_index].matchesKeywordTag(.merge)) {
         var target_index: usize = statement_index + 1;
-        if (!consumeKeyword(tokens, &target_index, "into")) return null;
-        _ = consumeKeyword(tokens, &target_index, "only");
+        if (!consumeKeyword(tokens, &target_index, .into)) return null;
+        _ = consumeKeyword(tokens, &target_index, .only);
         if (target_index >= tokens.len or tokens[target_index].kind != .identifier) return error.UnsupportedSqlShape;
         const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[target_index].text);
         var target_transferred = false;
         errdefer if (!target_transferred) alloc.free(target);
 
-        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], "using") orelse {
+        const using_index = findTopLevelKeyword(tokens[target_index + 1 ..], .using) orelse {
             alloc.free(target);
             return null;
         };
         var source_index = target_index + 1 + using_index + 1;
-        _ = consumeKeyword(tokens, &source_index, "only");
+        _ = consumeKeyword(tokens, &source_index, .only);
         if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
         const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         errdefer alloc.free(source);
@@ -1470,14 +1471,14 @@ fn joinedWriteSemiJoinSourceTableAlloc(
         if (token.kind != .lparen) continue;
 
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
-        const is_exists = index > 0 and tokens[index - 1].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[index - 1].text, "exists");
-        const is_in = index > 0 and tokens[index - 1].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[index - 1].text, "in");
+        const is_exists = index > 0 and tokens[index - 1].matchesKeywordTag(.exists);
+        const is_in = index > 0 and tokens[index - 1].matchesKeywordTag(.in);
         if (is_exists or is_in) {
             const body = tokens[index + 1 .. close_index];
-            if (body.len > 0 and body[0].kind == .identifier and std.ascii.eqlIgnoreCase(body[0].text, "select")) {
-                const from_index = findTopLevelKeyword(body, "from") orelse return error.UnsupportedSqlShape;
+            if (body.len > 0 and body[0].matchesKeywordTag(.select)) {
+                const from_index = findTopLevelKeyword(body, .from) orelse return error.UnsupportedSqlShape;
                 var source_index = from_index + 1;
-                _ = consumeKeyword(body, &source_index, "only");
+                _ = consumeKeyword(body, &source_index, .only);
                 if (source_index >= body.len or body[source_index].kind != .identifier) return error.UnsupportedSqlShape;
                 return try normalizeSqlObjectIdentifierAlloc(alloc, body[source_index].text);
             }
@@ -1493,7 +1494,7 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
     tokens: []const Token,
 ) !?InsertSourceTableNames {
     var index: usize = 1;
-    if (consumeKeyword(tokens, &index, "recursive")) return error.UnsupportedSqlShape;
+    if (consumeKeyword(tokens, &index, .recursive)) return error.UnsupportedSqlShape;
 
     var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
     defer {
@@ -1512,7 +1513,7 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
         if (index < tokens.len and tokens[index].kind == .lparen) {
             index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
         }
-        if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+        if (!consumeKeyword(tokens, &index, .as)) return error.UnsupportedSqlShape;
         try parser.consumeCteMaterializationHint(tokens, &index);
         if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
@@ -1562,8 +1563,8 @@ pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_s
 
 fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
-    if (std.ascii.eqlIgnoreCase(tokens[0].text, "with")) return try readSourceTableNamesFromWithAlloc(alloc, tokens);
-    if (!std.ascii.eqlIgnoreCase(tokens[0].text, "select")) return null;
+    if (tokens[0].matchesKeywordTag(.with)) return try readSourceTableNamesFromWithAlloc(alloc, tokens);
+    if (!tokens[0].matchesKeywordTag(.select)) return null;
     return try readSourceTableNamesFromSelectAlloc(alloc, tokens, 0);
 }
 
@@ -1587,20 +1588,20 @@ fn selectReadTableNamesAlloc(
     tokens: []const Token,
     select_index: usize,
 ) !?SelectReadTableNames {
-    if (select_index >= tokens.len or tokens[select_index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[select_index].text, "select")) return null;
+    if (select_index >= tokens.len or !tokens[select_index].matchesKeywordTag(.select)) return null;
 
-    const from_index = if (findTopLevelKeyword(tokens[select_index..], "from")) |relative|
+    const from_index = if (findTopLevelKeyword(tokens[select_index..], .from)) |relative|
         select_index + relative
     else
         return null;
     var left_index = from_index + 1;
-    _ = consumeKeyword(tokens, &left_index, "only");
+    _ = consumeKeyword(tokens, &left_index, .only);
     if (left_index >= tokens.len or tokens[left_index].kind != .identifier) return error.UnsupportedSqlShape;
     const left = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[left_index].text);
     var left_transferred = false;
     errdefer if (!left_transferred) alloc.free(left);
 
-    const join_index = if (findTopLevelKeyword(tokens[left_index + 1 ..], "join")) |relative|
+    const join_index = if (findTopLevelKeyword(tokens[left_index + 1 ..], .join)) |relative|
         left_index + 1 + relative
     else {
         if (try selectSetOperationSourceTableNameAlloc(alloc, tokens, left_index + 1)) |source| {
@@ -1611,13 +1612,13 @@ fn selectReadTableNamesAlloc(
         return .{ .left = left };
     };
     var source_index = join_index + 1;
-    if (consumeKeyword(tokens, &source_index, "lateral")) {
+    if (consumeKeyword(tokens, &source_index, .lateral)) {
         if (source_index >= tokens.len or tokens[source_index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, source_index) orelse return error.UnsupportedSqlShape;
-        const inner_from = findTopLevelKeyword(tokens[source_index + 1 .. close_index], "from") orelse return error.UnsupportedSqlShape;
+        const inner_from = findTopLevelKeyword(tokens[source_index + 1 .. close_index], .from) orelse return error.UnsupportedSqlShape;
         source_index = source_index + 1 + inner_from + 1;
     }
-    _ = consumeKeyword(tokens, &source_index, "only");
+    _ = consumeKeyword(tokens, &source_index, .only);
     if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
     const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
     errdefer alloc.free(source);
@@ -1642,21 +1643,19 @@ fn selectSetOperationSourceTableNameAlloc(
                 depth -= 1;
             },
             .identifier => {
-                if (depth != 0 or !selectSetOperationKeyword(token.text)) continue;
+                if (depth != 0 or !selectSetOperationKeyword(token)) continue;
                 var select_index = i + 1;
-                if (std.ascii.eqlIgnoreCase(token.text, "union")) {
-                    _ = consumeKeyword(tokens, &select_index, "all") or consumeKeyword(tokens, &select_index, "distinct");
+                if (token.matchesKeywordTag(.@"union")) {
+                    _ = consumeKeyword(tokens, &select_index, .all) or consumeKeyword(tokens, &select_index, .distinct);
                 } else {
-                    _ = consumeKeyword(tokens, &select_index, "distinct");
+                    _ = consumeKeyword(tokens, &select_index, .distinct);
                 }
-                if (select_index >= tokens.len or tokens[select_index].kind != .identifier or
-                    !std.ascii.eqlIgnoreCase(tokens[select_index].text, "select"))
-                {
+                if (select_index >= tokens.len or !tokens[select_index].matchesKeywordTag(.select)) {
                     return error.UnsupportedSqlShape;
                 }
-                const from_relative = findTopLevelKeyword(tokens[select_index + 1 ..], "from") orelse return error.UnsupportedSqlShape;
+                const from_relative = findTopLevelKeyword(tokens[select_index + 1 ..], .from) orelse return error.UnsupportedSqlShape;
                 var source_index = select_index + 1 + from_relative + 1;
-                _ = consumeKeyword(tokens, &source_index, "only");
+                _ = consumeKeyword(tokens, &source_index, .only);
                 if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
                 return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
             },
@@ -1666,10 +1665,10 @@ fn selectSetOperationSourceTableNameAlloc(
     return null;
 }
 
-fn selectSetOperationKeyword(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "union") or
-        std.ascii.eqlIgnoreCase(text, "intersect") or
-        std.ascii.eqlIgnoreCase(text, "except");
+fn selectSetOperationKeyword(token: Token) bool {
+    return token.matchesKeywordTag(.@"union") or
+        token.matchesKeywordTag(.intersect) or
+        token.matchesKeywordTag(.except);
 }
 
 fn readSourceTableNamesFromWithAlloc(
@@ -1677,7 +1676,7 @@ fn readSourceTableNamesFromWithAlloc(
     tokens: []const Token,
 ) !?ReadSourceTableNames {
     var index: usize = 1;
-    if (consumeKeyword(tokens, &index, "recursive")) return error.UnsupportedSqlShape;
+    if (consumeKeyword(tokens, &index, .recursive)) return error.UnsupportedSqlShape;
 
     var cte_bindings = std.ArrayListUnmanaged(CteSourceBinding).empty;
     defer {
@@ -1696,7 +1695,7 @@ fn readSourceTableNamesFromWithAlloc(
         if (index < tokens.len and tokens[index].kind == .lparen) {
             index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
         }
-        if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+        if (!consumeKeyword(tokens, &index, .as)) return error.UnsupportedSqlShape;
         try parser.consumeCteMaterializationHint(tokens, &index);
         if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
@@ -1743,24 +1742,24 @@ fn insertSourceTableNamesFromInsertAlloc(
     tokens: []const Token,
     insert_index: usize,
 ) !?InsertSourceTableNames {
-    if (insert_index >= tokens.len or tokens[insert_index].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[insert_index].text, "insert")) return null;
+    if (insert_index >= tokens.len or !tokens[insert_index].matchesKeywordTag(.insert)) return null;
     var index: usize = insert_index + 1;
-    if (!consumeKeyword(tokens, &index, "into")) return null;
-    _ = consumeKeyword(tokens, &index, "only");
+    if (!consumeKeyword(tokens, &index, .into)) return null;
+    _ = consumeKeyword(tokens, &index, .only);
     if (index >= tokens.len or tokens[index].kind != .identifier) return error.UnsupportedSqlShape;
     const target = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[index].text);
     var target_transferred = false;
     errdefer if (!target_transferred) alloc.free(target);
     index += 1;
 
-    const select_index = findTopLevelKeyword(tokens[index..], "select") orelse {
+    const select_index = findTopLevelKeyword(tokens[index..], .select) orelse {
         alloc.free(target);
         return null;
     };
     const absolute_select = index + select_index;
-    const from_index = findTopLevelKeyword(tokens[absolute_select + 1 ..], "from") orelse return error.UnsupportedSqlShape;
+    const from_index = findTopLevelKeyword(tokens[absolute_select + 1 ..], .from) orelse return error.UnsupportedSqlShape;
     var source_index = absolute_select + 1 + from_index + 1;
-    _ = consumeKeyword(tokens, &source_index, "only");
+    _ = consumeKeyword(tokens, &source_index, .only);
     if (source_index >= tokens.len or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
     const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
     errdefer alloc.free(source);
@@ -1774,7 +1773,7 @@ fn insertSourceTableNamesFromWithAlloc(
     tokens: []const Token,
 ) !?InsertSourceTableNames {
     var index: usize = 1;
-    if (consumeKeyword(tokens, &index, "recursive")) return error.UnsupportedSqlShape;
+    if (consumeKeyword(tokens, &index, .recursive)) return error.UnsupportedSqlShape;
 
     var cte_names = std.ArrayListUnmanaged([]const u8).empty;
     defer {
@@ -1797,13 +1796,13 @@ fn insertSourceTableNamesFromWithAlloc(
         if (index < tokens.len and tokens[index].kind == .lparen) {
             index = (findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape) + 1;
         }
-        if (!consumeKeyword(tokens, &index, "as")) return error.UnsupportedSqlShape;
+        if (!consumeKeyword(tokens, &index, .as)) return error.UnsupportedSqlShape;
         try parser.consumeCteMaterializationHint(tokens, &index);
         if (index >= tokens.len or tokens[index].kind != .lparen) return error.UnsupportedSqlShape;
         const close_index = findMatchingRParenIndex(tokens, index) orelse return error.UnsupportedSqlShape;
-        const from_index = findTopLevelKeyword(tokens[index + 1 .. close_index], "from") orelse return error.UnsupportedSqlShape;
+        const from_index = findTopLevelKeyword(tokens[index + 1 .. close_index], .from) orelse return error.UnsupportedSqlShape;
         var source_index = index + 1 + from_index + 1;
-        _ = consumeKeyword(tokens, &source_index, "only");
+        _ = consumeKeyword(tokens, &source_index, .only);
         if (source_index >= close_index or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
         const source = try normalizeSqlObjectIdentifierAlloc(alloc, tokens[source_index].text);
         var source_transferred = false;
@@ -1878,12 +1877,12 @@ fn cteBindingIndex(bindings: []const CteSourceBinding, name: []const u8) ?usize 
     return null;
 }
 
-fn consumeKeyword(tokens: []const Token, index: *usize, keyword: []const u8) bool {
-    return parser.matchKeyword(tokens, index, keyword);
+fn consumeKeyword(tokens: []const Token, index: *usize, keyword: TokenKeyword) bool {
+    return parser.matchKeywordTag(tokens, index, keyword);
 }
 
-fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
-    return parser.findTopLevelKeyword(tokens, keyword);
+fn findTopLevelKeyword(tokens: []const Token, keyword: TokenKeyword) ?usize {
+    return parser.findTopLevelKeywordTag(tokens, keyword);
 }
 
 fn findMatchingRParenIndex(tokens: []const Token, lparen_index: usize) ?usize {

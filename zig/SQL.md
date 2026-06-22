@@ -394,7 +394,10 @@ Current implementation status:
   private binder implementation details. Source-table discovery for corpus
   fixtures also enters through parsed source-table helpers instead of public
   token-slice adapters, and those helpers now validate the parsed statement
-  family/kind before scanning source-table tokens.
+  family/kind before scanning source-table tokens. Catalog prebinding
+  source-table scanners now use token keyword metadata for statement heads,
+  top-level clauses, set-operation tails, and optional `ONLY`/`AS`/`LATERAL`
+  modifiers instead of local string-keyword checks.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
@@ -416,8 +419,9 @@ Current implementation status:
   coverage checks instead of raw substring probes. More corpus coverage buckets,
   including pagination tails, temporal range constructors/operators, set
   operation tails, joined-source returning expressions, CTE mutation markers,
-  and row-lock invalid cases, now use parsed token predicates instead of raw
-  SQL substring probes.
+  mutation-source row assignments, temporal `FOR PORTION` clauses, boolean
+  `IS [NOT]` predicates, and row-lock invalid cases, now use parsed token
+  predicates instead of raw SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

@@ -6543,6 +6543,15 @@ fn appParityTokensHaveKeywordSequence(tokens: []const tokenized.Token, keywords:
     return false;
 }
 
+fn appParityTokensHaveKeywordThenKind(tokens: []const tokenized.Token, keyword: token_mod.TokenKeyword, kind: token_mod.TokenKind) bool {
+    if (tokens.len < 2) return false;
+    var index: usize = 0;
+    while (index + 1 < tokens.len) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(keyword) and tokens[index + 1].kind == kind) return true;
+    }
+    return false;
+}
+
 fn appParityTokensStartWithKeyword(tokens: []const tokenized.Token, keyword: token_mod.TokenKeyword) bool {
     return tokens.len > 0 and tokens[0].matchesKeywordTag(keyword);
 }
@@ -7624,52 +7633,53 @@ pub const AppParityCorpusCoverage = struct {
             entry.summary.ddl_tag == .create_index and
             sql_adapter.planHasExactStringToken(entry.plan, ":generated_op=", "expression"));
         self.schema_temporal_portion_update = self.schema_temporal_portion_update or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
             sql_adapter.planHasExactStringToken(entry.plan, "update_source:table=", "prices") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_portion_delete = self.schema_temporal_portion_delete or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
             sql_adapter.planHasExactStringToken(entry.plan, "delete_source:table=", "prices") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_column_portion_update = self.schema_temporal_range_column_portion_update or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF valid_at") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
+            appParityTokensHaveIdentifier(sql_tokens, "valid_at") and
             sql_adapter.planHasExactStringToken(entry.plan, "update_source:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_column_portion_delete = self.schema_temporal_range_column_portion_delete or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "FOR PORTION OF valid_at") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
+            appParityTokensHaveIdentifier(sql_tokens, "valid_at") and
             sql_adapter.planHasExactStringToken(entry.plan, "delete_source:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.update_source_row_assignment = self.update_source_row_assignment or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
+            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_row_assignment_default = self.update_source_row_assignment_default or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
-            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
+            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+            appParityTokensHaveKeyword(sql_tokens, .default) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_row_assignment_constructor = self.update_source_row_assignment_constructor or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "SET (status, priority)") != null and
-            std.mem.indexOf(u8, entry.sql, " = ROW(") != null and
+            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+            appParityTokensHaveFunctionCall(sql_tokens, "row") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_boolean_is_not_predicate = self.update_source_boolean_is_not_predicate or (entry.family == .update_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_or=") and
-            (std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null or
-                std.mem.indexOf(u8, entry.sql, " IS NOT FALSE") != null));
+            (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }) or
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .false })));
         self.delete_source_fetch_pagination = self.delete_source_fetch_pagination or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "FETCH") != null and
+            appParityTokensHaveKeyword(sql_tokens, .fetch) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_offset="));
         self.delete_source_nullable_pagination = self.delete_source_nullable_pagination or (entry.family == .delete_source and
-            std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
-            std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
             sql_adapter.planHasExactStringToken(entry.plan, ":source_limit=", "-1") and
             sql_adapter.planTokenAbsent(entry.plan, ":source_offset="));
         self.delete_source_boolean_unknown_predicate = self.delete_source_boolean_unknown_predicate or (entry.family == .delete_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_pred=") and
-            (std.mem.indexOf(u8, entry.sql, " IS UNKNOWN") != null or
-                std.mem.indexOf(u8, entry.sql, " IS NOT UNKNOWN") != null));
+            (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .unknown }) or
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .unknown })));
         self.delete_source_returning_expression = self.delete_source_returning_expression or (entry.family == .delete_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.joined_source_ordered_pagination = self.joined_source_ordered_pagination or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
@@ -7801,17 +7811,17 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
+            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_row_assignment_default = self.update_joined_source_row_assignment_default or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
-            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
+            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+            appParityTokensHaveKeyword(sql_tokens, .default) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_row_assignment_constructor = self.update_joined_source_row_assignment_constructor or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET (quantity, status)") != null and
-            std.mem.indexOf(u8, entry.sql, " = ROW(") != null and
+            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+            appParityTokensHaveFunctionCall(sql_tokens, "row") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_boolean_expression_update = self.update_joined_source_boolean_expression_update or (is_update_joined_source and
