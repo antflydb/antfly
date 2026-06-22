@@ -13268,44 +13268,6 @@ test "postgres sql adapter lowers qualified single table select outputs" {
     try std.testing.expectEqual(@as(u32, 5), expression_distinct.query.limit.?);
 }
 
-test "postgres sql adapter lowers nullif projection into expression AST" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
-
-    var lowered = try lowerSelectAlloc(
-        alloc,
-        "SELECT nullif(lower(email), 'blocked@example.test') AS usable_email FROM users WHERE id = $1",
-        schema,
-        &.{.{ .string = "u1" }},
-    );
-    defer lowered.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 0), lowered.query.select.len);
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions.len);
-    try std.testing.expectEqualStrings("usable_email", lowered.query.expressions[0].output);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.nullif, lowered.query.expressions[0].expression.kind);
-    try std.testing.expectEqual(@as(usize, 2), lowered.query.expressions[0].expression.operands.len);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.query.expressions[0].expression.operands[0].kind);
-    try std.testing.expectEqualStrings("email", lowered.query.expressions[0].expression.operands[0].operands[0].field);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, lowered.query.expressions[0].expression.operands[1].kind);
-    try std.testing.expectEqualStrings("\"blocked@example.test\"", lowered.query.expressions[0].expression.operands[1].value_json);
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.predicates.len);
-    try std.testing.expectEqualStrings("id", lowered.query.predicates[0].field);
-
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
-        alloc,
-        "SELECT nullif(email, 3) AS bad_email FROM users WHERE id = $1",
-        schema,
-        &.{.{ .string = "u1" }},
-    ));
-}
-
 test "postgres sql adapter lowers greatest least abs round trunc floor ceil sqrt sign and power into expression AST" {
     const alloc = std.testing.allocator;
     const schema_json =

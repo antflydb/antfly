@@ -17817,9 +17817,14 @@ pub fn setOperationColumnsCompatible(
 ) bool {
     if (lhs.len == 0 or lhs.len != rhs.len) return false;
     for (lhs, rhs) |left, right| {
-        if (!std.mem.eql(u8, left.name, right.name)) return false;
-        if (left.field_type != right.field_type) return false;
-        if (left.array_item_type != right.array_item_type) return false;
+        if (left.field_type == .array or right.field_type == .array) {
+            if (left.field_type != .array or right.field_type != .array) return false;
+            const left_item = left.array_item_type orelse .json;
+            const right_item = right.array_item_type orelse .json;
+            if (!sqlExpressionTypesComparable(left_item, right_item)) return false;
+        } else if (!sqlExpressionTypesComparable(left.field_type, right.field_type)) {
+            return false;
+        }
     }
     return true;
 }
@@ -24150,6 +24155,30 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     return lowered;
 }
 
+fn lowerAggregateForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredAggregate {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+    };
+    return parser_context.ParserState.ContextAccessors.parseAggregate(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
 fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -24178,6 +24207,46 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
         false,
         parser_context.ParserState.ContextAccessors.setOperationParserHooks(&parser_state),
     );
+}
+
+test "sql adapter lower expr reconciles set operation output shape" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"body":{"type":"text"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var text_like = try lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' UNION ALL SELECT body AS body_text FROM usage_records WHERE status = 'closed'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer text_like.deinit(alloc);
+    try std.testing.expectEqual(plan_mod.SelectSetOperation.union_all, text_like.operation);
+    try std.testing.expectEqual(@as(usize, 1), text_like.output_columns.len);
+    try std.testing.expectEqualStrings("status_key", text_like.output_columns[0].name);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, text_like.output_columns[0].field_type);
+    try std.testing.expectEqual(@as(usize, 1), text_like.left.plan.query.expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), text_like.right.plan.query.select.len);
+    try std.testing.expectEqualStrings("body", text_like.right.plan.query.select[0]);
+
+    if (lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open' INTERSECT SELECT amount AS status_key FROM usage_records WHERE amount > 0",
+        schema,
+        &.{},
+        .{},
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
 }
 
 test "sql adapter lower expr lowers routine expression bindings into row expressions" {
@@ -24553,6 +24622,42 @@ test "sql adapter lower expr lowers boolean projection operators" {
         "SELECT enabled AND status AS bad FROM users",
         schema,
         &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers nullif projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT nullif(lower(email), 'blocked@example.test') AS usable_email FROM users WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("usable_email", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.nullif, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("email", lowered.plan.query.expressions[0].expression.operands[0].operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, lowered.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("\"blocked@example.test\"", lowered.plan.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT nullif(email, 3) AS bad_email FROM users WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
     ));
 }
 
@@ -25681,7 +25786,11 @@ test "sql adapter lower expr compares query projection and set operation surface
     const mismatched_outputs = [_]ast.SelectOutputRef{.{ .kind = .expression, .index = 0 }};
     const left_columns = [_]runtime_schema.RelationalColumn{.{ .name = "status", .path = "status", .field_type = .keyword }};
     const right_columns = [_]runtime_schema.RelationalColumn{.{ .name = "status", .path = "status", .field_type = .keyword }};
+    const right_text_alias_columns = [_]runtime_schema.RelationalColumn{.{ .name = "body_text", .path = "body_text", .field_type = .text }};
+    const left_array_columns = [_]runtime_schema.RelationalColumn{.{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword }};
+    const right_array_columns = [_]runtime_schema.RelationalColumn{.{ .name = "labels", .path = "labels", .field_type = .array, .array_item_type = .text }};
     const incompatible_columns = [_]runtime_schema.RelationalColumn{.{ .name = "status", .path = "status", .field_type = .numeric }};
+    const incompatible_array_columns = [_]runtime_schema.RelationalColumn{.{ .name = "amounts", .path = "amounts", .field_type = .array, .array_item_type = .numeric }};
 
     try std.testing.expect(queryHasOnlySimpleUnionPredicateSurface(simple_query));
     try std.testing.expect(queryHasOnlySimpleIntersectExceptPredicateSurface(simple_query));
@@ -25699,7 +25808,10 @@ test "sql adapter lower expr compares query projection and set operation surface
     try std.testing.expect(simpleSelectProjectionsEqual(simple_query, same_query, &left_outputs, &right_outputs));
     try std.testing.expect(!simpleSelectProjectionsEqual(simple_query, same_query, &left_outputs, &mismatched_outputs));
     try std.testing.expect(setOperationColumnsCompatible(&left_columns, &right_columns));
+    try std.testing.expect(setOperationColumnsCompatible(&left_columns, &right_text_alias_columns));
+    try std.testing.expect(setOperationColumnsCompatible(&left_array_columns, &right_array_columns));
     try std.testing.expect(!setOperationColumnsCompatible(&left_columns, &incompatible_columns));
+    try std.testing.expect(!setOperationColumnsCompatible(&left_array_columns, &incompatible_array_columns));
 }
 
 test "sql adapter lower expr proves simple predicate disjointness" {

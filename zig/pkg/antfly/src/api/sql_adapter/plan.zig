@@ -1456,7 +1456,7 @@ pub fn parseSetOperationPlanAlloc(
         if (tail.order_by.len > 0) alloc.free(tail.order_by);
     };
     if (!std.mem.eql(u8, left.table_name, right.table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
-    if (!setOperationColumnsCompatible(left_columns, right_columns)) return error.UnsupportedSqlShape;
+    if (!reconcileSetOperationOutputColumns(left_columns, right_columns)) return error.UnsupportedSqlShape;
 
     const left_table_name = left.table_name;
     left.table_name = "";
@@ -1512,17 +1512,51 @@ fn parseSetOperationSelectWithContext(
     return try hooks.parse_select(hooks.ptr);
 }
 
-fn setOperationColumnsCompatible(
-    lhs: []const runtime_schema.RelationalColumn,
+fn reconcileSetOperationOutputColumns(
+    lhs: []runtime_schema.RelationalColumn,
     rhs: []const runtime_schema.RelationalColumn,
 ) bool {
     if (lhs.len == 0 or lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (!std.mem.eql(u8, left.name, right.name)) return false;
-        if (left.field_type != right.field_type) return false;
-        if (left.array_item_type != right.array_item_type) return false;
+    for (lhs, rhs) |*left, right| {
+        const common = setOperationCommonColumnType(left.*, right) orelse return false;
+        left.field_type = common.field_type;
+        left.array_item_type = common.array_item_type;
+        left.nullable = left.nullable or right.nullable;
     }
     return true;
+}
+
+const SetOperationCommonColumnType = struct {
+    field_type: runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType = null,
+};
+
+fn setOperationCommonColumnType(
+    left: runtime_schema.RelationalColumn,
+    right: runtime_schema.RelationalColumn,
+) ?SetOperationCommonColumnType {
+    if (left.field_type == .array or right.field_type == .array) {
+        if (left.field_type != .array or right.field_type != .array) return null;
+        const left_item = left.array_item_type orelse .json;
+        const right_item = right.array_item_type orelse .json;
+        if (!setOperationScalarTypesCompatible(left_item, right_item)) return null;
+        return .{ .field_type = .array, .array_item_type = left.array_item_type orelse right.array_item_type };
+    }
+    if (!setOperationScalarTypesCompatible(left.field_type, right.field_type)) return null;
+    return .{ .field_type = left.field_type };
+}
+
+fn setOperationScalarTypesCompatible(lhs: runtime_schema.AntflyType, rhs: runtime_schema.AntflyType) bool {
+    if (setOperationTypeIsTextLike(lhs) and setOperationTypeIsTextLike(rhs)) return true;
+    if ((lhs == .datetime and rhs == .numeric) or (lhs == .numeric and rhs == .datetime)) return true;
+    return lhs == rhs;
+}
+
+fn setOperationTypeIsTextLike(field_type: runtime_schema.AntflyType) bool {
+    return switch (field_type) {
+        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => true,
+        else => false,
+    };
 }
 
 pub fn parseRecursiveCteMemberPlanAlloc(
