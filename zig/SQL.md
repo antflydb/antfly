@@ -405,6 +405,8 @@ Current implementation status:
   Relation-population parsing and update-source alias inference in the grammar
   also use keyword tags for statement heads, `FROM`/`AS`, set-operation tails,
   `WITH [NO] DATA`, and DDL unique-predicate delimiters and null-test atoms.
+  JSON and expression null-safe distinct, null-test, membership, and expression
+  negation helpers use keyword tags for SQL operator words.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
@@ -431,8 +433,9 @@ Current implementation status:
   aggregate boolean `HAVING`/`FILTER` clauses, query scalar-function expression
   families, JSON/array expression helpers, datetime and interval expression
   helpers, postfix null tests, `ORDER BY ... USING` tails, array-overlap access
-  predicates, and row-lock invalid cases, now use parsed token predicates
-  instead of raw SQL substring probes.
+  predicates, joined mutation-source semijoin shapes, joined-source
+  regex/array/JSON expression coverage, and row-lock invalid cases, now use
+  parsed token predicates instead of raw SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

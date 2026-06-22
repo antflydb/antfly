@@ -7776,94 +7776,120 @@ pub const AppParityCorpusCoverage = struct {
             appParityTokensHaveFunctionCall(sql_tokens, "lower") and
             appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
         self.update_joined_source_non_primary_semijoin = self.update_joined_source_non_primary_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
+            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .in, .select, .from }) and
+            appParityTokensHaveIdentifier(sql_tokens, "organization_id") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 1));
         self.delete_joined_source_non_primary_semijoin = self.delete_joined_source_non_primary_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
+            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .in, .select, .from }) and
+            appParityTokensHaveIdentifier(sql_tokens, "organization_id") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 1));
         self.update_joined_source_correlated_semijoin = self.update_joined_source_correlated_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.delete_joined_source_correlated_semijoin = self.delete_joined_source_correlated_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.update_joined_source_correlated_filtered_semijoin = self.update_joined_source_correlated_filtered_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = 'o1'") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
+            appParityTokensHaveStringLiteral(sql_tokens, "o1") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 2));
         self.delete_joined_source_correlated_filtered_semijoin = self.delete_joined_source_correlated_filtered_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = 'o1'") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.status = usage_records.status") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
+            appParityTokensHaveStringLiteral(sql_tokens, "o1") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 2));
         self.update_joined_source_semijoin_match_expression = self.update_joined_source_semijoin_match_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.delete_joined_source_semijoin_match_expression = self.delete_joined_source_semijoin_match_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.update_joined_source_exists_semijoin = self.update_joined_source_exists_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = usage_records.id") != null and
+            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.id") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 1));
         self.delete_joined_source_exists_semijoin = self.delete_joined_source_exists_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "archived_records.organization_id = usage_records.id") != null and
+            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.id") and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 1));
         self.update_joined_source_exists_match_expression = self.update_joined_source_exists_match_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
+            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.delete_joined_source_exists_match_expression = self.delete_joined_source_exists_match_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE EXISTS") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(archived_records.status) = lower(usage_records.status)") != null and
+            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.update_joined_source_row_value_semijoin = self.update_joined_source_row_value_semijoin or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
+            appParityTokensHaveKeyword(sql_tokens, .where) and
+            appParityTokensHaveKindSequence(sql_tokens, &.{ .lparen, .identifier, .comma, .identifier, .rparen }) and
+            appParityTokensHaveKeyword(sql_tokens, .in) and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.delete_joined_source_row_value_semijoin = self.delete_joined_source_row_value_semijoin or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "WHERE (id, status) IN") != null and
+            appParityTokensHaveKeyword(sql_tokens, .where) and
+            appParityTokensHaveKindSequence(sql_tokens, &.{ .lparen, .identifier, .comma, .identifier, .rparen }) and
+            appParityTokensHaveKeyword(sql_tokens, .in) and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.update_joined_source_modulo_expression = self.update_joined_source_modulo_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "MOD(source.quantity + usage_records.quantity, 7)") != null and
-            std.mem.indexOf(u8, entry.sql, "quantity % 2") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "mod") and
+            appParityTokensHaveKind(sql_tokens, .percent) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_regexp_expression = self.update_joined_source_regexp_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_count(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_instr(source.status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.delete_joined_source_regexp_expression = self.delete_joined_source_regexp_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "regexp_like(source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "regexp_substr(source.status") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") and
+            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_array_expression = self.update_joined_source_array_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "array_append(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_append") and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_position") and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_to_string") and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.delete_joined_source_array_expression = self.delete_joined_source_array_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "array_position(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "array_to_string(source.tags") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_position") and
+            appParityTokensHaveFunctionCall(sql_tokens, "array_to_string") and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_json_expression = self.update_joined_source_json_expression or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "jsonb_build_object('status', source.status") != null and
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "jsonb_extract_path_text(source.metadata") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object") and
+            appParityTokensHaveStringLiteral(sql_tokens, "status") and
+            appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") and
+            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_extract_path_text") and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.delete_joined_source_json_expression = self.delete_joined_source_json_expression or (is_delete_joined_source and
-            std.mem.indexOf(u8, entry.sql, "jsonb_build_object('source'") != null and
-            std.mem.indexOf(u8, entry.sql, "to_jsonb(source.tags") != null and
-            std.mem.indexOf(u8, entry.sql, "jsonb_extract_path_text(source.metadata") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object") and
+            appParityTokensHaveStringLiteral(sql_tokens, "source") and
+            appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") and
+            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_extract_path_text") and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
@@ -7881,7 +7907,11 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_boolean_expression_update = self.update_joined_source_boolean_expression_update or (is_update_joined_source and
-            std.mem.indexOf(u8, entry.sql, "SET enabled = usage_records.enabled OR source.enabled") != null and
+            appParityTokensHaveKeyword(sql_tokens, .set) and
+            appParityTokensHaveIdentifier(sql_tokens, "enabled") and
+            appParityTokensHaveIdentifier(sql_tokens, "usage_records.enabled") and
+            appParityTokensHaveIdentifier(sql_tokens, "source.enabled") and
+            appParityTokensHaveKeyword(sql_tokens, .@"or") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_patch_expression = self.update_source_patch_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_boolean_expression_update = self.update_source_boolean_expression_update or (entry.family == .update_source and

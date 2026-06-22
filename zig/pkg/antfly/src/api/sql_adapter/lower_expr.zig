@@ -7237,52 +7237,40 @@ pub fn jsonExtractExpressionPredicateCanStartAt(tokens: []const Token, index: us
 pub fn jsonExtractNullSafeDistinctPredicateCanStartAt(tokens: []const Token, index: usize) bool {
     if (index + 5 >= tokens.len) return false;
     if (!jsonExtractExpressionCanStartAt(tokens, index)) return false;
-    if (tokens[index + 3].kind != .identifier or
-        !std.ascii.eqlIgnoreCase(tokens[index + 3].text, "is"))
-    {
+    if (!tokens[index + 3].matchesKeywordTag(.is)) {
         return false;
     }
     var distinct_index = index + 4;
-    if (tokens[distinct_index].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[distinct_index].text, "not"))
-    {
+    if (tokens[distinct_index].matchesKeywordTag(.not)) {
         distinct_index += 1;
     }
     return distinct_index + 1 < tokens.len and
-        tokens[distinct_index].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[distinct_index].text, "distinct") and
-        tokens[distinct_index + 1].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[distinct_index + 1].text, "from");
+        tokens[distinct_index].matchesKeywordTag(.distinct) and
+        tokens[distinct_index + 1].matchesKeywordTag(.from);
 }
 
 pub fn jsonExtractNullTestPredicateCanStartAt(tokens: []const Token, index: usize) bool {
     if (index + 4 >= tokens.len) return false;
     if (!jsonExtractExpressionCanStartAt(tokens, index)) return false;
-    if (tokens[index + 3].kind != .identifier or
-        !std.ascii.eqlIgnoreCase(tokens[index + 3].text, "is"))
-    {
+    if (!tokens[index + 3].matchesKeywordTag(.is)) {
         return false;
     }
     var null_index = index + 4;
-    if (tokens[null_index].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[null_index].text, "not"))
-    {
+    if (tokens[null_index].matchesKeywordTag(.not)) {
         null_index += 1;
     }
     return null_index < tokens.len and
-        tokens[null_index].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[null_index].text, "null");
+        tokens[null_index].matchesKeywordTag(.null);
 }
 
 pub fn jsonExtractMembershipPredicateCanStartAt(tokens: []const Token, index: usize) bool {
     if (index + 3 >= tokens.len) return false;
     if (!jsonExtractExpressionCanStartAt(tokens, index)) return false;
     const op = tokens[index + 3];
-    if (op.kind == .identifier and std.ascii.eqlIgnoreCase(op.text, "in")) return true;
-    if (op.kind == .identifier and std.ascii.eqlIgnoreCase(op.text, "not")) {
+    if (op.matchesKeywordTag(.in)) return true;
+    if (op.matchesKeywordTag(.not)) {
         return index + 4 < tokens.len and
-            tokens[index + 4].kind == .identifier and
-            std.ascii.eqlIgnoreCase(tokens[index + 4].text, "in");
+            tokens[index + 4].matchesKeywordTag(.in);
     }
     if (op.kind == .eq or op.kind == .neq) {
         return index + 4 < tokens.len and
@@ -23516,19 +23504,14 @@ pub fn expressionNullSafeDistinctPredicateCanStartAt(tokens: []const Token, inde
                 if (depth == 0) return false;
                 depth -= 1;
             },
-            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "is")) {
+            .identifier => if (depth == 0 and token.matchesKeywordTag(.is)) {
                 var distinct_index = i + 1;
-                if (distinct_index < tokens.len and
-                    tokens[distinct_index].kind == .identifier and
-                    std.ascii.eqlIgnoreCase(tokens[distinct_index].text, "not"))
-                {
+                if (distinct_index < tokens.len and tokens[distinct_index].matchesKeywordTag(.not)) {
                     distinct_index += 1;
                 }
                 return distinct_index + 1 < tokens.len and
-                    tokens[distinct_index].kind == .identifier and
-                    std.ascii.eqlIgnoreCase(tokens[distinct_index].text, "distinct") and
-                    tokens[distinct_index + 1].kind == .identifier and
-                    std.ascii.eqlIgnoreCase(tokens[distinct_index + 1].text, "from");
+                    tokens[distinct_index].matchesKeywordTag(.distinct) and
+                    tokens[distinct_index + 1].matchesKeywordTag(.from);
             } else if (depth == 0 and rowExpressionBoundaryKeyword(token.text)) {
                 return false;
             },
@@ -23540,7 +23523,7 @@ pub fn expressionNullSafeDistinctPredicateCanStartAt(tokens: []const Token, inde
 }
 
 pub fn canParseExpressionNotWhere(tokens: []const Token, pos: usize) bool {
-    if (!parser.peekKeyword(tokens, pos, "not") or pos + 2 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
+    if (!parser.peekKeywordTag(tokens, pos, .not) or pos + 2 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
     const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos + 1);
     return expressionCanStartAt(tokens, inner) or
         jsonKeySetExpressionCanStartAt(tokens, inner) or
