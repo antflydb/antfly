@@ -6073,6 +6073,33 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .name = "malformed explain prefix", .family = .explain, .plan = "explain:kind=write:inner=insert:table=usage_records", .sql = "EXPLAIN INSERT INTO usage_records VALUES ('1')" }, ":inner=insert"));
     try std.testing.expect(!corpusExplainWriteInnerHasPrefix(.{ .name = "explain read insert token", .family = .explain, .plan = "explain:kind=read:inner=insert:table=usage_records", .sql = "EXPLAIN SELECT * FROM usage_records" }, ":inner=insert:"));
 
+    var parsed_expression_selector = try tokenized.ParsedSql.initAlloc(std.testing.allocator, "UPDATE usage_records SET status = 'disabled' WHERE email = $1 AND tenant_id = 't1' AND status = 'active' RETURNING id, status");
+    defer parsed_expression_selector.deinit(std.testing.allocator);
+    try std.testing.expect(appParityPointWriteHasExpressionPartialUniqueSelector(.{
+        .name = "renamed fixture still proves selector coverage",
+        .family = .update,
+        .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
+        .apply_setup_sql = &.{
+            "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, status text);",
+            "CREATE UNIQUE INDEX usage_records_active_tenant_email_key ON usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';",
+            "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_tenant_email_key;",
+        },
+        .resolver_row_json = "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
+        .sql = parsed_expression_selector.sql(),
+    }, parsed_expression_selector.items(), .update));
+    try std.testing.expect(!appParityPointWriteHasExpressionPartialUniqueSelector(.{
+        .name = "field partial selector does not prove expression selector coverage",
+        .family = .update,
+        .plan = "update:table=usage_records:transforms=1:ops=1:returning_rows=1:returning_expr=0:op_set=1",
+        .apply_setup_sql = &.{
+            "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
+            "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';",
+            "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_email_key;",
+        },
+        .resolver_row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
+        .sql = parsed_expression_selector.sql(),
+    }, parsed_expression_selector.items(), .update));
+
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records", ":having_expr=", 0));
     try std.testing.expect(corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records:having_expr=2", ":having_expr=", 2));
     try std.testing.expect(!corpusOptionalZeroSummaryMatchesPlan("aggregate:table=usage_records:having_expr=2", ":having_expr=", 0));
@@ -6853,6 +6880,39 @@ fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bo
         if (std.mem.indexOf(u8, value, needle) != null) return true;
     }
     return false;
+}
+
+fn appParityPointWriteHasExpressionPartialUniqueSelector(
+    entry: AppParityCorpusEntry,
+    sql_tokens: []const tokenized.Token,
+    family: AppParityCorpusPlanFamily,
+) bool {
+    if (entry.family != family or entry.apply_setup_sql.len == 0 or entry.resolver_row_json.len == 0) return false;
+    if (!appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") or
+        !appParityAnyStringContains(entry.apply_setup_sql, " WHERE ") or
+        !appParityAnyStringContains(entry.apply_setup_sql, "VALIDATE CONSTRAINT"))
+    {
+        return false;
+    }
+    if (!appParityTokensHaveIdentifier(sql_tokens, "email")) return false;
+
+    const point_write_matches = switch (family) {
+        .update => corpusPlanMatchesFamily(.update, entry.plan) and
+            planHasExactStringToken(entry.plan, "update:table=", "usage_records") and
+            planHasNonZeroToken(entry.plan, ":ops="),
+        .delete => corpusPlanMatchesFamily(.delete, entry.plan) and
+            planHasExactStringToken(entry.plan, "delete:table=", "usage_records") and
+            planHasNonZeroToken(entry.plan, ":deletes="),
+        else => false,
+    };
+    if (!point_write_matches) return false;
+
+    const concat_ws_partial = appParityAnyStringContains(entry.apply_setup_sql, "concat_ws(") and
+        appParityTokensHaveIdentifier(sql_tokens, "tenant_id") and
+        appParityTokensHaveIdentifier(sql_tokens, "status");
+    const inequality_partial = appParityAnyStringContains(entry.apply_setup_sql, " > ") and
+        appParityTokensHaveIdentifier(sql_tokens, "amount");
+    return concat_ws_partial or inequality_partial;
 }
 
 pub const AppParityCorpusCoverage = struct {
@@ -9715,9 +9775,9 @@ pub const AppParityCorpusCoverage = struct {
                 appParityTokensHaveIdentifier(sql_tokens, "timestamptz");
         }
         self.point_update_expression_partial_unique_selector = self.point_update_expression_partial_unique_selector or
-            (entry.family == .update and std.mem.indexOf(u8, entry.name, "expression partial unique selector") != null);
+            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, .update);
         self.point_delete_expression_partial_unique_selector = self.point_delete_expression_partial_unique_selector or
-            (entry.family == .delete and std.mem.indexOf(u8, entry.name, "expression partial unique selector") != null);
+            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, .delete);
         self.insert_source_cross_table_source_schema = self.insert_source_cross_table_source_schema or
             (entry.family == .insert_source and
                 appParityEntryHasCatalogSchemas(entry) and
