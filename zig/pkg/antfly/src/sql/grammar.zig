@@ -16,12 +16,12 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const classifier = @import("classifier.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
-const runtime_schema = @import("../../storage/schema.zig");
+const runtime_schema = @import("../storage/schema.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const sql_value = @import("value.zig");

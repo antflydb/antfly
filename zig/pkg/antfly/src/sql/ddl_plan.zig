@@ -14,14 +14,14 @@
 
 const std = @import("std");
 const binder = @import("binder.zig");
-const catalog_resources = @import("../catalog_resources.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const parser_context = @import("parser_context.zig");
-const runtime_schema = @import("../../storage/schema.zig");
+const runtime_schema = @import("../storage/schema.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 

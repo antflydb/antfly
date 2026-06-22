@@ -16,18 +16,18 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const corpus = @import("corpus.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const lowering_context = @import("lowering_context.zig");
 const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
-const relational_rows = @import("../relational_rows.zig");
-const runtime_schema = @import("../../storage/schema.zig");
+const relational_rows = @import("../api/relational_rows.zig");
+const runtime_schema = @import("../storage/schema.zig");
 const strings = @import("strings.zig");
 const test_support = @import("test_support.zig");
-const table_catalog = @import("../table_catalog.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const sql_value = @import("value.zig");
 const tokenized = @import("tokenized.zig");
 
@@ -11685,7 +11685,7 @@ fn expectSqlUuidV4StringForDmlTest(value: std.json.Value) !void {
 }
 
 fn runtimeSchemaFromJsonForDmlTestAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !runtime_schema.TableSchema {
-    const schema_api = @import("../../schema/mod.zig");
+    const schema_api = @import("../schema/mod.zig");
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     return try schema_api.deriveRuntimeTableSchema(alloc, parsed);

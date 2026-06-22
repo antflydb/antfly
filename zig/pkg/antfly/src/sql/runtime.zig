@@ -14,21 +14,21 @@
 
 const std = @import("std");
 
-const catalog_resources = @import("catalog_resources.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const relational_rows = @import("relational_rows.zig");
+const relational_rows = @import("../api/relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
-const sql_adapter = @import("sql_adapter/mod.zig");
-const table_catalog = @import("table_catalog.zig");
+const sql_adapter = @import("mod.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
 
 // Runtime SQL adapter bridge for storage and API execution callers.
 //
-// New SQL parser, binder, lowerer, diagnostic, fixture, and catalog behavior
-// belongs in api/sql_adapter. Keep this module focused on runtime execution bridges until all
-// storage-backed helpers have clear owning modules.
+// sql/mod.zig owns pure SQL language and planning APIs. This bridge is
+// intentionally allowed to depend on API and storage modules while
+// storage-backed execution helpers keep their current owning modules.
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const SqlValue = sql_adapter.SqlValue;

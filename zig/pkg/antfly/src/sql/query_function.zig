@@ -14,8 +14,8 @@
 
 const std = @import("std");
 
-const db_mod = @import("../../storage/db/mod.zig");
-const query_contract = @import("../query_contract.zig");
+const db_mod = @import("../storage/db/mod.zig");
+const query_contract = @import("../api/query_contract.zig");
 const lexer_mod = @import("lexer.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
@@ -1872,7 +1872,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     try expectMergeWeight(helper_merge.weights, "graph_metric_rerank", 0.15);
 }
 
-fn expectMergeWeight(weights: []const @import("../../search/fusion.zig").NamedWeight, name: []const u8, expected: f64) !void {
+fn expectMergeWeight(weights: []const @import("../search/fusion.zig").NamedWeight, name: []const u8, expected: f64) !void {
     for (weights) |weight| {
         if (std.mem.eql(u8, weight.name, name)) {
             try std.testing.expectApproxEqAbs(expected, weight.weight, 0.0001);

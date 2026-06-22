@@ -31,7 +31,7 @@ const full_text_indexes = @import("full_text_indexes.zig");
 const indexes_api = @import("indexes.zig");
 const json_helpers = @import("json_helpers.zig");
 const catalog_resources = @import("catalog_resources.zig");
-const sql_adapter = @import("sql_adapter/mod.zig");
+const sql_adapter = @import("../sql/mod.zig");
 const table_reads = @import("table_reads.zig");
 
 pub const default_full_text_index_name = full_text_indexes.default_full_text_index_name;

@@ -17,19 +17,19 @@ const sql_adapter = @This();
 
 const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
 const lower_expr = @import("lower_expr.zig");
-const metadata_api = @import("../../metadata/api.zig");
-const metadata_table_manager = @import("../../metadata/table_manager.zig");
-const metadata_transition_state = @import("../../metadata/transition_state.zig");
+const metadata_api = @import("../metadata/api.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
+const metadata_transition_state = @import("../metadata/transition_state.zig");
 const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
-const query_contract = @import("../query_contract.zig");
-const raft_reconciler = @import("../../raft/reconciler.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const schema_api = @import("../../schema/mod.zig");
-const table_catalog = @import("../table_catalog.zig");
+const query_contract = @import("../api/query_contract.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const schema_api = @import("../schema/mod.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
@@ -627,7 +627,7 @@ pub const AppParityExternalSourceCorpus = struct {
 };
 
 pub fn parseAppParityExternalSourceCorpusAlloc(alloc: std.mem.Allocator) !AppParityExternalSourceCorpus {
-    const source_json = @embedFile("../fixtures/sql_api_parity_source_corpus.json");
+    const source_json = @embedFile("../api/fixtures/sql_api_parity_source_corpus.json");
     const source_sha256 = try sourceCorpusSha256HexAlloc(alloc, source_json);
     errdefer alloc.free(source_sha256);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
@@ -654,7 +654,7 @@ pub const AppParityCoverageRequirements = struct {
 };
 
 pub fn parseAppParityCoverageRequirementsAlloc(alloc: std.mem.Allocator) !AppParityCoverageRequirements {
-    const coverage_json = @embedFile("../fixtures/sql_api_required_coverage.json");
+    const coverage_json = @embedFile("../api/fixtures/sql_api_required_coverage.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
     errdefer parsed.deinit();
 
@@ -703,7 +703,7 @@ pub fn freeNativeRequirementRoot(
 }
 
 pub fn parseAppParityNativeRequirementsAlloc(alloc: std.mem.Allocator) !AppParityNativeRequirements {
-    const requirement_json = @embedFile("../fixtures/sql_api_required_native_requirements.json");
+    const requirement_json = @embedFile("../api/fixtures/sql_api_required_native_requirements.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, requirement_json, .{});
     errdefer parsed.deinit();
 
@@ -783,7 +783,7 @@ pub fn freeResolvedRequirementRoot(
 }
 
 pub fn parseAppParityResolvedRequirementsAlloc(alloc: std.mem.Allocator) !AppParityResolvedRequirements {
-    const requirement_json = @embedFile("../fixtures/sql_api_resolved_native_requirements.json");
+    const requirement_json = @embedFile("../api/fixtures/sql_api_resolved_native_requirements.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, requirement_json, .{});
     errdefer parsed.deinit();
 
@@ -889,7 +889,7 @@ pub fn freeSummaryAssertionRequirementsRoot(
 }
 
 pub fn parseAppParitySummaryAssertionRequirementsAlloc(alloc: std.mem.Allocator) !AppParitySummaryAssertionRequirements {
-    const assertion_json = @embedFile("../fixtures/sql_api_summary_required_assertions.json");
+    const assertion_json = @embedFile("../api/fixtures/sql_api_summary_required_assertions.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, assertion_json, .{});
     errdefer parsed.deinit();
 
@@ -1559,7 +1559,7 @@ pub fn freeCoverageRegressionRequirementsRoot(
 }
 
 pub fn parseAppParityCoverageRegressionRequirementsAlloc(alloc: std.mem.Allocator) !AppParityCoverageRegressionRequirements {
-    const coverage_json = @embedFile("../fixtures/sql_api_coverage_regression_required_buckets.json");
+    const coverage_json = @embedFile("../api/fixtures/sql_api_coverage_regression_required_buckets.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
     errdefer parsed.deinit();
 
@@ -1752,7 +1752,7 @@ pub fn freeSqlAdapterEdgeCaseCoverageRequirementsRoot(
 }
 
 pub fn parseSqlAdapterEdgeCaseCoverageRequirementsAlloc(alloc: std.mem.Allocator) !SqlAdapterEdgeCaseCoverageRequirements {
-    const coverage_json = @embedFile("../fixtures/sql_api_adapter_edge_required_coverage.json");
+    const coverage_json = @embedFile("../api/fixtures/sql_api_adapter_edge_required_coverage.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, coverage_json, .{});
     errdefer parsed.deinit();
 
@@ -5464,7 +5464,7 @@ test "sql adapter corpus parses fixture root metadata and owns skipped list" {
 
 test "sql adapter corpus parses source corpus root entries" {
     const alloc = std.testing.allocator;
-    const source_json = @embedFile("../fixtures/sql_api_parity_source_corpus.json");
+    const source_json = @embedFile("../api/fixtures/sql_api_parity_source_corpus.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, source_json, .{});
     defer parsed.deinit();
 
@@ -6354,7 +6354,7 @@ test "sql adapter corpus exact-token helpers reject ddl submode suffixes" {
 
 test "sql adapter corpus data-driven summary regressions" {
     const alloc = std.testing.allocator;
-    const fixture_json = @embedFile("../fixtures/sql_api_summary_regressions.json");
+    const fixture_json = @embedFile("../api/fixtures/sql_api_summary_regressions.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed.deinit();
     var required_assertions = try parseAppParitySummaryAssertionRequirementsAlloc(alloc);
@@ -6415,7 +6415,7 @@ test "sql adapter corpus validates summary assertion requirements" {
 
 test "sql adapter corpus data-driven coverage regressions" {
     const alloc = std.testing.allocator;
-    const fixture_json = @embedFile("../fixtures/sql_api_coverage_regressions.json");
+    const fixture_json = @embedFile("../api/fixtures/sql_api_coverage_regressions.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed.deinit();
     var required_buckets = try parseAppParityCoverageRegressionRequirementsAlloc(alloc);
@@ -6479,7 +6479,7 @@ test "sql adapter corpus validates coverage regression bucket requirements" {
 
 test "sql adapter corpus parses data-driven coverage requirements" {
     const alloc = std.testing.allocator;
-    const fixture_json = @embedFile("../fixtures/sql_api_required_coverage.json");
+    const fixture_json = @embedFile("../api/fixtures/sql_api_required_coverage.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed.deinit();
 
@@ -6530,7 +6530,7 @@ test "sql adapter corpus parses data-driven coverage requirements" {
 
 test "sql adapter corpus parses adapter edge case fixtures" {
     const alloc = std.testing.allocator;
-    const fixture_json = @embedFile("../fixtures/sql_api_adapter_edge_cases.json");
+    const fixture_json = @embedFile("../api/fixtures/sql_api_adapter_edge_cases.json");
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, fixture_json, .{});
     defer parsed.deinit();
 

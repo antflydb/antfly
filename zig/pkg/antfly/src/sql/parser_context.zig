@@ -18,9 +18,9 @@ const ddl_plan = @import("ddl_plan.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan = @import("plan.zig");
-const relational_rows = @import("../relational_rows.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const relational_rows = @import("../api/relational_rows.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const token_mod = @import("token.zig");
 const value_mod = @import("value.zig");
 

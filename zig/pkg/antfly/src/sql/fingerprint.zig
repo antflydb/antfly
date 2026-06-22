@@ -19,8 +19,8 @@ const ddl_plan = @import("ddl_plan.zig");
 const diagnostics = @import("diagnostics.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser_context = @import("parser_context.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const schema_api = @import("../../schema/mod.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const schema_api = @import("../schema/mod.zig");
 const schema_json = @import("schema_json.zig");
 const tokenized = @import("tokenized.zig");
 

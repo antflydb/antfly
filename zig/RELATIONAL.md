@@ -1097,10 +1097,18 @@ state and is not an execution model; it exists only to resolve syntax, names,
 parameters, and error classification before lowering into Antfly-native typed
 plans.
 
-The maintainable code shape is a small facade plus adapter-internal compiler
-modules rather than one growing parser file. The existing
-`api/relational_sql.zig` entrypoints should remain stable while implementation
-moves behind a `api/sql_adapter/` package:
+The maintainable code shape is now a SQL-owned compiler/runtime package plus
+API-owned integration coverage rather than one growing parser file. The
+PostgreSQL-compatible SQL language surface lives under `pkg/antfly/src/sql/`.
+`sql/mod.zig` is the facade for pure parser, binder, lowerer, diagnostic,
+fixture, and catalog-plan APIs. `sql/runtime.zig` is the storage/API execution
+bridge and is intentionally allowed to depend on API and storage modules until
+the remaining storage-backed helpers have clearer owning modules. API parity,
+HTTP, app-parity, and storage execution tests stay beside the API surface in
+`api/sql_adapter_integration.zig`. Older migration notes in this section that
+refer to `api/relational_sql.zig` or `api/sql_adapter/` describe the path that
+led to this split; new work should target `src/sql/` unless it is explicitly
+API/storage integration.
 
 - `mod.zig`: public facade for the existing SQL lowering entrypoints and shared
   deinit helpers.

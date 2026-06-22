@@ -14,15 +14,15 @@
 
 const std = @import("std");
 
-const metadata_api = @import("../../metadata/api.zig");
-const metadata_table_manager = @import("../../metadata/table_manager.zig");
-const metadata_transition_state = @import("../../metadata/transition_state.zig");
-const raft_reconciler = @import("../../raft/reconciler.zig");
-const db_mod = @import("../../storage/db/mod.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const schema_api = @import("../../schema/mod.zig");
-const catalog_resources = @import("../catalog_resources.zig");
-const table_catalog = @import("../table_catalog.zig");
+const metadata_api = @import("../metadata/api.zig");
+const metadata_table_manager = @import("../metadata/table_manager.zig");
+const metadata_transition_state = @import("../metadata/transition_state.zig");
+const raft_reconciler = @import("../raft/reconciler.zig");
+const db_mod = @import("../storage/db/mod.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const schema_api = @import("../schema/mod.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
+const table_catalog = @import("../api/table_catalog.zig");
 const classifier = @import("classifier.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");

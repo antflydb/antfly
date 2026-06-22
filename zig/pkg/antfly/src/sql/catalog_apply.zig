@@ -15,20 +15,20 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
-const catalog_resources = @import("../catalog_resources.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const catalog_resources = @import("../api/catalog_resources.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const fingerprint = @import("fingerprint.zig");
 const lower_expr = @import("lower_expr.zig");
-const mem_backend = @import("../../storage/mem_backend.zig");
+const mem_backend = @import("../storage/mem_backend.zig");
 const parser_context = @import("parser_context.zig");
-const runtime_schema = @import("../../storage/schema.zig");
-const schema_api = @import("../../schema/mod.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const schema_api = @import("../schema/mod.zig");
 const schema_json = @import("schema_json.zig");
 const schema_mutation = @import("schema_mutation.zig");
 const tokenized = @import("tokenized.zig");
-const transactions_mod = @import("../../storage/transactions.zig");
-const usermgr = @import("../../usermgr/mod.zig");
+const transactions_mod = @import("../storage/transactions.zig");
+const usermgr = @import("../usermgr/mod.zig");
 
 pub const PreparedTransactionRecoveryOperation = enum {
     register_prepared,

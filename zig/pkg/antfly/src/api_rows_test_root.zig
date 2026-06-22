@@ -14,7 +14,7 @@
 
 const http_server = @import("api/http_server.zig");
 const relational_rows = @import("api/relational_rows.zig");
-const sql_adapter_runtime = @import("api/sql_adapter_runtime.zig");
+const sql_adapter_runtime = @import("sql/runtime.zig");
 const table_reads = @import("api/table_reads.zig");
 
 test {

@@ -16,13 +16,13 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const classifier = @import("classifier.zig");
-const db_mod = @import("../../storage/db/mod.zig");
+const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const parser = @import("parser.zig");
 const query_function = @import("query_function.zig");
-const relational_rows = @import("../relational_rows.zig");
-const runtime_schema = @import("../../storage/schema.zig");
+const relational_rows = @import("../api/relational_rows.zig");
+const runtime_schema = @import("../storage/schema.zig");
 const strings = @import("strings.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");

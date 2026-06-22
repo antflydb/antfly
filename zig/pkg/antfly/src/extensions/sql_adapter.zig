@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const extension_domain = @import("mod.zig");
-const sql_adapter = @import("../api/sql_adapter/mod.zig");
+const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
