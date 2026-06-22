@@ -20,6 +20,7 @@ const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+const TokenKeyword = token_mod.TokenKeyword;
 pub const SourceSpan = token_mod.SourceSpan;
 
 pub const TokenRange = struct {
@@ -286,7 +287,7 @@ fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Toke
 
 fn parseExplainStatement(raw_statement: RawSqlStatement, tokens: []const Token) !ParsedExplainStatement {
     var index = raw_statement.token_start;
-    if (!matchKeyword(tokens, &index, raw_statement.token_end, "explain")) return error.UnsupportedSqlShape;
+    if (!matchKeywordTag(tokens, &index, raw_statement.token_end, .explain)) return error.UnsupportedSqlShape;
     if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
 
     var statement = ParsedExplainStatement{ .raw = raw_statement };
@@ -295,7 +296,7 @@ fn parseExplainStatement(raw_statement: RawSqlStatement, tokens: []const Token) 
         if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
     }
 
-    if (matchKeyword(tokens, &index, raw_statement.token_end, "analyze")) {
+    if (matchKeywordTag(tokens, &index, raw_statement.token_end, .analyze)) {
         statement.analyze = true;
         if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
     }
@@ -313,29 +314,29 @@ fn parseExplainOptions(
 ) !void {
     while (true) {
         if (index.* >= end) return error.UnsupportedSqlShape;
-        if (matchKeyword(tokens, index, end, "format")) {
-            if (matchKeyword(tokens, index, end, "json")) {
+        if (matchKeywordTag(tokens, index, end, .format)) {
+            if (matchKeywordTag(tokens, index, end, .json)) {
                 statement.format = .json;
-            } else if (matchKeyword(tokens, index, end, "text")) {
+            } else if (matchKeywordTag(tokens, index, end, .text)) {
                 statement.format = .text;
             } else {
                 return error.UnsupportedSqlShape;
             }
-        } else if (matchKeyword(tokens, index, end, "verbose")) {
+        } else if (matchKeywordTag(tokens, index, end, .verbose)) {
             statement.verbose = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "costs")) {
+        } else if (matchKeywordTag(tokens, index, end, .costs)) {
             statement.costs = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "analyze")) {
+        } else if (matchKeywordTag(tokens, index, end, .analyze)) {
             statement.analyze = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "buffers")) {
+        } else if (matchKeywordTag(tokens, index, end, .buffers)) {
             statement.buffers = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "timing")) {
+        } else if (matchKeywordTag(tokens, index, end, .timing)) {
             statement.timing = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "summary")) {
+        } else if (matchKeywordTag(tokens, index, end, .summary)) {
             statement.summary = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "settings")) {
+        } else if (matchKeywordTag(tokens, index, end, .settings)) {
             statement.settings = parseOptionalExplainBool(tokens, index, end, true);
-        } else if (matchKeyword(tokens, index, end, "wal")) {
+        } else if (matchKeywordTag(tokens, index, end, .wal)) {
             statement.wal = parseOptionalExplainBool(tokens, index, end, true);
         } else {
             return error.UnsupportedSqlShape;
@@ -349,16 +350,16 @@ fn parseExplainOptions(
 
 fn parseOptionalExplainBool(tokens: []const Token, index: *usize, end: usize, default_value: bool) bool {
     const before = index.*;
-    if (matchKeyword(tokens, index, end, "true") or
-        matchKeyword(tokens, index, end, "on") or
-        matchKeyword(tokens, index, end, "yes"))
+    if (matchKeywordTag(tokens, index, end, .true) or
+        matchKeywordTag(tokens, index, end, .on) or
+        matchKeywordTag(tokens, index, end, .yes))
     {
         return true;
     }
     index.* = before;
-    if (matchKeyword(tokens, index, end, "false") or
-        matchKeyword(tokens, index, end, "off") or
-        matchKeyword(tokens, index, end, "no"))
+    if (matchKeywordTag(tokens, index, end, .false) or
+        matchKeywordTag(tokens, index, end, .off) or
+        matchKeywordTag(tokens, index, end, .no))
     {
         return false;
     }
@@ -366,9 +367,9 @@ fn parseOptionalExplainBool(tokens: []const Token, index: *usize, end: usize, de
     return default_value;
 }
 
-fn matchKeyword(tokens: []const Token, index: *usize, end: usize, keyword: []const u8) bool {
+fn matchKeywordTag(tokens: []const Token, index: *usize, end: usize, keyword: TokenKeyword) bool {
     if (index.* >= end or index.* >= tokens.len) return false;
-    if (!tokens[index.*].matchesKeyword(keyword)) return false;
+    if (!tokens[index.*].matchesKeywordTag(keyword)) return false;
     index.* += 1;
     return true;
 }

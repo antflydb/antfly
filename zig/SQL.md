@@ -784,6 +784,9 @@ Current implementation status:
 - Parser cursors expose token-predicate identifier/function-call helpers, and
   DDL generated-expression plus DML boolean-start probes use them for
   generated/hash and text-pattern functions instead of local string callbacks.
+- `ParsedSql` EXPLAIN subject and option parsing uses token keyword tags for
+  option names, formats, and boolean aliases, so parse-time statement metadata
+  no longer keeps a local case-insensitive keyword scanner for EXPLAIN.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.
