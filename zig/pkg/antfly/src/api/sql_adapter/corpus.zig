@@ -7656,24 +7656,28 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planTokenAbsent(entry.plan, ":offset="));
         self.cte_set_operation_tail = self.cte_set_operation_tail or
             ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, "WITH scoped AS") != null and
-                std.mem.indexOf(u8, entry.sql, " UNION ") != null and
+                appParityTokensStartWithKeyword(sql_tokens, .with) and
+                appParityTokensHaveIdentifier(sql_tokens, "scoped") and
+                appParityTokensHaveKeyword(sql_tokens, .@"union") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.set_operation_numeric_range_disjoint = self.set_operation_numeric_range_disjoint or
             ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                (std.mem.indexOf(u8, entry.sql, "amount < 5") != null or std.mem.indexOf(u8, entry.sql, "amount <= 5") != null) and
-                (std.mem.indexOf(u8, entry.sql, "amount >= 5") != null or std.mem.indexOf(u8, entry.sql, "amount > 5") != null) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
+                appParityTokensHaveIdentifier(sql_tokens, "amount") and
+                (appParityTokensHaveKind(sql_tokens, .lt) or appParityTokensHaveKind(sql_tokens, .lte)) and
+                (appParityTokensHaveKind(sql_tokens, .gt) or appParityTokensHaveKind(sql_tokens, .gte)) and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.set_operation_expression_numeric_range_disjoint = self.set_operation_expression_numeric_range_disjoint or
             ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                std.mem.indexOf(u8, entry.sql, "amount + quantity") != null and
-                (std.mem.indexOf(u8, entry.sql, "< 5") != null or std.mem.indexOf(u8, entry.sql, "<= 5") != null) and
-                (std.mem.indexOf(u8, entry.sql, ">= 5") != null or std.mem.indexOf(u8, entry.sql, "> 5") != null) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
+                appParityTokensHaveIdentifier(sql_tokens, "amount") and
+                appParityTokensHaveIdentifier(sql_tokens, "quantity") and
+                appParityTokensHaveKind(sql_tokens, .plus) and
+                (appParityTokensHaveKind(sql_tokens, .lt) or appParityTokensHaveKind(sql_tokens, .lte)) and
+                (appParityTokensHaveKind(sql_tokens, .gt) or appParityTokensHaveKind(sql_tokens, .gte)) and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":expr_or="));
         self.schema_temporal_fk_ddl = self.schema_temporal_fk_ddl or (entry.family == .ddl and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal_fk=") and
@@ -8066,12 +8070,22 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":left_json_contains=") or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":right_json_exists=");
                 self.join_on_side_predicate = self.join_on_side_predicate or
-                    std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND c.kind = 'customer'") != null;
+                    appParityTokensHaveIdentifier(sql_tokens, "o.customer_id") and
+                        appParityTokensHaveIdentifier(sql_tokens, "c.id") and
+                        appParityTokensHaveIdentifier(sql_tokens, "c.kind") and
+                        appParityTokensHaveStringLiteral(sql_tokens, "customer");
                 self.join_on_preserved_side_predicate = self.join_on_preserved_side_predicate or
-                    std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND o.kind = 'order'") != null and
+                    appParityTokensHaveIdentifier(sql_tokens, "o.customer_id") and
+                        appParityTokensHaveIdentifier(sql_tokens, "c.id") and
+                        appParityTokensHaveIdentifier(sql_tokens, "o.kind") and
+                        appParityTokensHaveStringLiteral(sql_tokens, "order") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":on_expr_pred=");
                 self.join_on_computed_predicate = self.join_on_computed_predicate or
-                    std.mem.indexOf(u8, entry.sql, "ON o.customer_id = c.id AND lower(o.kind) = lower(c.kind)") != null and
+                    appParityTokensHaveIdentifier(sql_tokens, "o.customer_id") and
+                        appParityTokensHaveIdentifier(sql_tokens, "c.id") and
+                        appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+                        appParityTokensHaveIdentifier(sql_tokens, "o.kind") and
+                        appParityTokensHaveIdentifier(sql_tokens, "c.kind") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":on_expr_pred=");
                 self.join_computed_pattern_side_filter = self.join_computed_pattern_side_filter or
                     uses_computed_pattern and
@@ -8286,13 +8300,14 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "customer_records"));
                 self.read_graph_table_function_cte_join = self.read_graph_table_function_cte_join or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
-                        std.mem.startsWith(u8, entry.sql, "WITH ") and
-                        std.mem.indexOf(u8, entry.sql, "antfly.graph_match") != null and
+                        appParityTokensStartWithKeyword(sql_tokens, .with) and
+                        appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_graph_table_function_inline_join = self.read_graph_table_function_inline_join or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
-                        std.mem.indexOf(u8, entry.sql, "JOIN antfly.graph_match") != null and
+                        appParityTokensHaveKeyword(sql_tokens, .join) and
+                        appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
@@ -8324,17 +8339,17 @@ pub const AppParityCorpusCoverage = struct {
         if (entry.family == .unsupported_read) {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
-                    std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);
+                    appParityTokensHaveKeyword(sql_tokens, .intersect));
         } else if (entry.family == .merge_mutation) {
             self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
-                (std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
+                (appParityTokensHaveKeyword(sql_tokens, .default) and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":matched_update_expr=") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
         } else if (entry.family == .recursive_insert_source) {
             self.recursive_insert_source = self.recursive_insert_source or
                 (std.mem.startsWith(u8, entry.plan, "recursive_insert_source:") and
-                    std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
-                    std.mem.indexOf(u8, entry.sql, " INSERT INTO ") != null);
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .with, .recursive }) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .insert, .into }));
         } else if (entry.family == .truncate_source) {
             self.truncate_continue_identity = self.truncate_continue_identity or
                 (std.mem.indexOf(u8, entry.sql, "CONTINUE IDENTITY") != null and

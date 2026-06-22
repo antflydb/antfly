@@ -454,6 +454,11 @@ Current implementation status:
   tokens for function calls, keyword sequences, JSONB concatenation, row
   assignment, boolean update, and regex expression buckets instead of raw SQL
   substring probes.
+- Read join side-predicate coverage, graph table-function CTE/join coverage,
+  set-operation tail coverage, unsupported set-operation output-shape coverage,
+  merge default-expression coverage, and recursive insert-source coverage also
+  use parsed token predicates plus plan summary evidence instead of raw SQL
+  substring checks.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
