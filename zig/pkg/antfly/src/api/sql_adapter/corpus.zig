@@ -7648,7 +7648,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_insert = self.schema_temporal_tsrange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01 09:00,2025-01-01 17:00)") and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01 00:00:00,2025-01-02 00:00:00)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_constructor_insert = self.schema_temporal_tsrange_constructor_insert or (entry.family == .insert and
@@ -7656,7 +7656,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_insert = self.schema_temporal_tstzrange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01T09:00:00Z,2025-01-01T17:00:00Z)") and
+            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_constructor_insert = self.schema_temporal_tstzrange_constructor_insert or (entry.family == .insert and
@@ -8079,12 +8079,15 @@ pub const AppParityCorpusCoverage = struct {
                 self.aggregate_mode = self.aggregate_mode or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":mode=");
                 self.aggregate_duplicate_output_label = self.aggregate_duplicate_output_label or
-                    (std.mem.indexOf(u8, entry.sql, "COUNT(*) AS customer_id") != null and
+                    (appParityTokensHaveFunctionCall(sql_tokens, "count") and
+                        appParityTokensHaveKeyword(sql_tokens, .as) and
+                        appParityTokensHaveIdentifier(sql_tokens, "customer_id") and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":group=", 1) and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":aggs=", 1));
                 self.aggregate_group_expression = self.aggregate_group_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=") and
-                    std.mem.indexOf(u8, entry.sql, "GROUP BY status_key") != null);
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .group, .by }) and
+                    appParityTokensHaveIdentifier(sql_tokens, "status_key"));
                 self.aggregate_having_expression = self.aggregate_having_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":having_expr=");
                 self.aggregate_having_any = self.aggregate_having_any or sql_adapter.planHasNonZeroToken(entry.plan, ":having_any=");
                 self.aggregate_boolean_having_predicate = self.aggregate_boolean_having_predicate or
@@ -8352,8 +8355,10 @@ pub const AppParityCorpusCoverage = struct {
                 self.read_window = self.read_window or is_read_window;
                 self.read_window_duplicate_output_label = self.read_window_duplicate_output_label or
                     (is_read_window and
-                        std.mem.indexOf(u8, entry.sql, "row_number() OVER") != null and
-                        std.mem.indexOf(u8, entry.sql, " AS id") != null);
+                        appParityTokensHaveFunctionCall(sql_tokens, "row_number") and
+                        appParityTokensHaveKeyword(sql_tokens, .over) and
+                        appParityTokensHaveKeyword(sql_tokens, .as) and
+                        appParityTokensHaveIdentifier(sql_tokens, "id"));
                 self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
                         appParityEntryHasCatalogSchemas(entry) and

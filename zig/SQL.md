@@ -548,6 +548,12 @@ Current implementation status:
 - Temporal/schema DDL coverage now uses parsed keyword sequences for
   `PERIOD`, `FOREIGN KEY`, `SYSTEM VERSIONING`, temporal foreign-key actions,
   and `UNIQUE NULLS NOT DISTINCT` instead of raw SQL substring probes.
+- Temporal range-literal coverage now uses lexed string-literal tokens plus
+  typed plan/table evidence for range bounds and inclusivity instead of
+  scanning the raw SQL source.
+- Aggregate and window duplicate-label coverage now uses parsed function calls,
+  keyword tags, identifiers, and plan aggregate/window evidence instead of raw
+  SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
