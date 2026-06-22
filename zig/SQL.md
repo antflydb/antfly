@@ -142,9 +142,15 @@ lower them to Antfly row plans. The HTTP handler resolves the logical SQL
 session's database/search path, loads the table schema from the catalog, lowers
 `SELECT`, set-operation, recursive CTE, aggregate, window, join, and lateral
 plans into the shared typed read executor, and returns the normal JSON
-relational rows response under a SQL session envelope. Write statements remain
-fail-closed until SQL mutation lowering calls the same row batch, trigger,
-row-filter, claim, and 2PC paths as the public JSON APIs.
+relational rows response under a SQL session envelope.
+
+Point write statements are also routed through that ingress when they lower to a
+single typed row-batch mutation: `INSERT ... VALUES`, primary-key `UPDATE`, and
+primary-key `DELETE` use the same row-batch validation, row-filter checks,
+transaction commit path, and `RETURNING` projection encoder as the public JSON
+rows APIs. Source, joined, recursive, merge, and truncate writes remain
+fail-closed until their SQL executor wiring can share the native row-claim,
+session staging, side-table read, mutation-source, trigger, and 2PC paths.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable

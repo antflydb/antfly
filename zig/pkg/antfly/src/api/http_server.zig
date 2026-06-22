@@ -4447,6 +4447,212 @@ pub const ApiHttpServer = struct {
         return try out.toOwnedSlice();
     }
 
+    fn encodePublicSqlRowsBatchResultAlloc(
+        self: *ApiHttpServer,
+        session_id: u64,
+        statement_kind: []const u8,
+        rows_batch: relational_rows_api.OwnedRowsBatchRequest,
+    ) ![]u8 {
+        const result_body = try relational_rows_api.encodeRowsBatchResponseAlloc(self.alloc, rows_batch);
+        defer self.alloc.free(result_body);
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.print(
+            "{{\"kind\":\"write\",\"session_id\":{d},\"statement_kind\":{f},\"result\":",
+            .{ session_id, std.json.fmt(statement_kind, .{}) },
+        );
+        try writer.writeAll(result_body);
+        try writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
+    fn sqlObjectIdentifierTailAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
+        if (identifier.len == 0) return error.UnsupportedSqlShape;
+        if (std.mem.lastIndexOfScalar(u8, identifier, '.')) |dot| {
+            if (dot + 1 >= identifier.len) return error.UnsupportedSqlShape;
+            return try alloc.dupe(u8, identifier[dot + 1 ..]);
+        }
+        return try alloc.dupe(u8, identifier);
+    }
+
+    fn publicSqlWriteTargetTableNameAlloc(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) ![]const u8 {
+        const statement_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
+        const tokens = parsed_sql.items();
+        const raw = parsed_sql.statement.raw();
+        if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return error.UnsupportedSqlShape;
+        var pos = raw.token_start;
+        switch (statement_kind) {
+            .insert, .insert_source => {
+                if (!tokens[pos].matchesKeywordTag(.insert)) return error.UnsupportedSqlShape;
+                pos += 1;
+                if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
+                pos += 1;
+            },
+            .update, .update_source, .update_joined_source => {
+                if (!tokens[pos].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
+                pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
+            },
+            .delete, .delete_source, .delete_joined_source => {
+                if (!tokens[pos].matchesKeywordTag(.delete)) return error.UnsupportedSqlShape;
+                pos += 1;
+                if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+                pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
+            },
+            .truncate => {
+                if (!tokens[pos].matchesKeywordTag(.truncate)) return error.UnsupportedSqlShape;
+                pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
+            },
+            .merge => {
+                if (!tokens[pos].matchesKeywordTag(.merge)) return error.UnsupportedSqlShape;
+                pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.into)) pos += 1;
+            },
+        }
+        if (pos >= raw.token_end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
+        return try sqlObjectIdentifierTailAlloc(self.alloc, tokens[pos].text);
+    }
+
+    fn applyLoweredPublicSqlRowsBatch(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        schema: runtime_schema_mod.TableSchema,
+        rows_batch: relational_rows_api.OwnedRowsBatchRequest,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !?http_common.HttpResponse {
+        const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
+
+        if (rows_batch.writes.len == 0 and rows_batch.deletes.len == 0 and rows_batch.transforms.len == 0 and rows_batch.predicates.len == 0) return null;
+
+        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(tables_api.default_database_name, table_name, null, rows_batch, authenticated_identity) catch |err| switch (err) {
+            error.PermissionDenied => return try textResponse(self.alloc, 403, "row filter rejected sql write"),
+            else => return err,
+        };
+
+        var committed_via_txn = false;
+        if (schema.storage_mode == .relational) {
+            const txn_writes = try self.alloc.alloc(db_mod.types.TransactionWrite, rows_batch.writes.len);
+            defer self.alloc.free(txn_writes);
+            for (rows_batch.writes, 0..) |write, i| {
+                txn_writes[i] = .{ .key = write.key, .value = write.value };
+            }
+            const txn_tables = [_]distributed_txn.TableCommitRequest{.{
+                .table_name = table_name,
+                .writes = txn_writes,
+                .deletes = rows_batch.deletes,
+                .transforms = rows_batch.transforms,
+                .predicates = rows_batch.predicates,
+            }};
+            if (source.commitTransaction(self.alloc, txn_tables[0..], rows_batch.req.sync_level) catch |err| switch (err) {
+                error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
+                error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TopologyChanged => return try textResponse(self.alloc, 503, "topology changed"),
+                error.TableNotFound, error.UnknownGroup => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                error.UnsupportedOperation => null,
+                else => {
+                    std.log.err("public sql write transaction failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "sql write failed");
+                },
+            }) |outcome| {
+                switch (outcome) {
+                    .committed => committed_via_txn = true,
+                    .conflict => return try textResponse(self.alloc, 409, "version conflict"),
+                }
+            }
+        }
+
+        if (!committed_via_txn) {
+            _ = (source.batch(self.alloc, table_name, rows_batch.req) catch |err| switch (err) {
+                error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return try textResponse(self.alloc, 400, "invalid sql write"),
+                error.VersionConflict, error.IntentConflict => return try textResponse(self.alloc, 409, "version conflict"),
+                error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+                error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+                error.EnrichmentRetryInProgress => return try textResponse(self.alloc, 429, "table backpressured"),
+                else => {
+                    std.log.err("public sql write batch failed table={s} err={}", .{ table_name, err });
+                    return try textResponse(self.alloc, 500, "sql write failed");
+                },
+            }) orelse return try textResponse(self.alloc, 404, "not found");
+        }
+        return null;
+    }
+
+    fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        const statement_start_ns = platform_time.monotonicNs();
+        const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+        var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            else => return err,
+        };
+        defer parsed_sql.deinit(self.alloc);
+        const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
+        switch (statement_kind) {
+            .insert, .update, .delete => {},
+            else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+        }
+
+        const target_table = self.publicSqlWriteTargetTableNameAlloc(&parsed_sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            else => return err,
+        };
+        defer self.alloc.free(target_table);
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
+            self.alloc,
+            self.catalogSource(),
+            target_table,
+            session.session(),
+        ) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+
+        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        var lowered = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc(
+            self.alloc,
+            &parsed_sql,
+            schema,
+            &.{},
+            .{
+                .unique_resolver = unique_resolver_ctx.resolver(),
+            },
+            self.catalogSource(),
+        ) catch |err| switch (err) {
+            error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return try textResponse(self.alloc, 400, "invalid sql write"),
+            error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
+            else => return err,
+        };
+        defer lowered.deinit(self.alloc);
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+        const rows_batch = switch (lowered) {
+            .insert => |insert| insert.batch,
+            .update => |update| update.batch,
+            .delete => |delete| delete.batch,
+            else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+        };
+        if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, rows_batch, authenticated_identity)) |failure| return failure;
+        try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+        const response_body = try self.encodePublicSqlRowsBatchResultAlloc(
+            self.ensureSqlProtocolSessionId(session),
+            @tagName(statement_kind),
+            rows_batch,
+        );
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
     fn handlePublicSqlRead(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -4527,7 +4733,7 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
-    pub fn handlePublicSql(self: *ApiHttpServer, body: []const u8, _: ?AuthenticatedIdentity) !http_common.HttpResponse {
+    pub fn handlePublicSql(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         var parsed = std.json.parseFromSlice(PublicSqlRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
@@ -4542,7 +4748,15 @@ pub const ApiHttpServer = struct {
         defer session.deinit(self.alloc);
 
         var applied = self.applyRelationalSqlDdlWithSession(parsed.value.sql, &session) catch |err| switch (err) {
-            error.UnsupportedSqlShape => return try self.handlePublicSqlRead(parsed.value.sql, &session),
+            error.UnsupportedSqlShape => {
+                var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, parsed.value.sql) catch |parse_err| switch (parse_err) {
+                    error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+                    else => return parse_err,
+                };
+                defer parsed_sql.deinit(self.alloc);
+                if (parsed_sql.writeStatementKind() != null) return try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
+                return try self.handlePublicSqlRead(parsed.value.sql, &session);
+            },
             error.StatementTimeout => return try textResponse(self.alloc, 408, "sql statement timeout"),
             error.InvalidSqlSession,
             error.PreparedStatementAlreadyExists,
@@ -23406,6 +23620,133 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
     try std.testing.expectEqualStrings("u1", rows[1].object.get("id").?.string);
     try std.testing.expectEqual(@as(i64, 10), rows[1].object.get("amount").?.integer);
+}
+
+test "api http server executes SQL point writes through typed row batch ingress" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-sql-write", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("usage_records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("usage_records", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "usage_records",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+
+    var insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('u1', 'open', 10) RETURNING id, status;\"}",
+    });
+    defer insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), insert_resp.status);
+    var parsed_insert = try std.json.parseFromSlice(std.json.Value, alloc, insert_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_insert.deinit();
+    try std.testing.expectEqualStrings("write", parsed_insert.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("insert", parsed_insert.value.object.get("statement_kind").?.string);
+    const insert_result = parsed_insert.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), insert_result.get("inserted").?.integer);
+    try std.testing.expectEqualStrings("u1", insert_result.get("returning").?.array.items[0].object.get("id").?.string);
+
+    var update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"UPDATE usage_records SET status = 'closed', amount = amount + 5 WHERE id = 'u1' RETURNING id, status, amount;\"}",
+    });
+    defer update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), update_resp.status);
+    var parsed_update = try std.json.parseFromSlice(std.json.Value, alloc, update_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_update.deinit();
+    try std.testing.expectEqualStrings("write", parsed_update.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("update", parsed_update.value.object.get("statement_kind").?.string);
+    const update_result = parsed_update.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), update_result.get("transformed").?.integer);
+    const update_row = update_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1", update_row.get("id").?.string);
+    try std.testing.expectEqualStrings("closed", update_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 15), update_row.get("amount").?.integer);
+
+    var delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"DELETE FROM usage_records WHERE id = 'u1' RETURNING id, status;\"}",
+    });
+    defer delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), delete_resp.status);
+    var parsed_delete = try std.json.parseFromSlice(std.json.Value, alloc, delete_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_delete.deinit();
+    try std.testing.expectEqualStrings("write", parsed_delete.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("delete", parsed_delete.value.object.get("statement_kind").?.string);
+    const delete_result = parsed_delete.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), delete_result.get("deleted").?.integer);
+    const delete_row = delete_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1", delete_row.get("id").?.string);
+    try std.testing.expectEqualStrings("closed", delete_row.get("status").?.string);
+
+    var query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE id = 'u1';\"}",
+    });
+    defer query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_query.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_query.value.object.get("result").?.object.get("total").?.integer);
 }
 
 test "api http server executes SQL notification channel plans through native runtime" {

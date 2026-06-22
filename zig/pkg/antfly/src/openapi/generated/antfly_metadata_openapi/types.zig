@@ -24,16 +24,16 @@ pub const SqlStatementRequest = struct {
     namespace: ?[]const u8 = null,
 };
 
-/// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs.
+/// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs. Point write statements lower through the typed row-batch mutation path.
 pub const SqlStatementResponse = struct {
     kind: []const u8,
     session_id: i64,
     noop: ?bool = null,
     /// Applied DDL/session result record.
     applied: ?std.json.Value = null,
-    /// Lowered read statement family for read responses.
+    /// Lowered read or write statement family for data responses.
     statement_kind: ?[]const u8 = null,
-    /// Typed relational row-plan response for read statements.
+    /// Typed relational row-plan or row-batch response for data statements.
     result: ?std.json.Value = null,
 };
 

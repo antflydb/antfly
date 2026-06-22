@@ -4998,18 +4998,23 @@ by parsing SQL through the adapter grammar, resolving catalog/schema state from
 the logical SQL session, lowering into the shared typed row-plan executor used
 by the public JSON endpoints, and returning the same
 row-query/aggregate/window/join/lateral response envelopes under a SQL session
-response. SQL writes should join that endpoint only after there is a shared
-statement executor that lowers mutations to the same typed row batch, trigger,
-row-filter, claim, and 2PC paths used by the public JSON endpoints. Prepared
+response. Point `INSERT ... VALUES`, primary-key `UPDATE`, and primary-key
+`DELETE` now join that endpoint by lowering through the same DML adapter into
+typed row-batch mutations, applying row-filter checks, committing through the
+same row-batch transaction path, and returning the normal row-batch counts plus
+`RETURNING` rows under a SQL session response. Source, joined, recursive, merge,
+and truncate writes should remain fail-closed until their SQL executor wiring
+can use the typed row-claim/session staging, side-table read, mutation-source,
+trigger, and 2PC paths already used by the public JSON endpoints. Prepared
 statements and cursors remain session state rather than REST resources;
 cursor-backed fetches and asynchronous `202` statement jobs are later protocol
 extensions once portal lifetime, page tokens, cancellation, result retention,
 and cleanup semantics are native.
-While the endpoint supports typed catalog/session/control statements and typed
-reads, it should require database-admin permission on the default database when
-authentication is enabled. SQL reads and writes should relax to statement-level
-table permissions only after the shared executor derives required permissions
-from the lowered typed plan before execution.
+While the endpoint supports typed catalog/session/control statements, typed
+reads, and point row-batch writes, it should require database-admin permission
+on the default database when authentication is enabled. SQL reads and writes
+should relax to statement-level table permissions only after the shared executor
+derives required permissions from the lowered typed plan before execution.
 
 `DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]

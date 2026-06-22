@@ -8161,13 +8161,16 @@ components:
 
         statements lower through the same typed row-plan executor used by the
 
-        JSON relational rows APIs.
+        JSON relational rows APIs. Point write statements lower through the
+
+        typed row-batch mutation path.
       properties:
         kind:
           type: string
           enum:
             - ddl
             - read
+            - write
         session_id:
           type: integer
           format: int64
@@ -8181,12 +8184,12 @@ components:
         statement_kind:
           type: string
           nullable: true
-          description: Lowered read statement family for read responses.
+          description: Lowered read or write statement family for data responses.
         result:
           type: object
           additionalProperties: true
           nullable: true
-          description: Typed relational row-plan response for read statements.
+          description: Typed relational row-plan or row-batch response for data statements.
       required:
         - kind
         - session_id
