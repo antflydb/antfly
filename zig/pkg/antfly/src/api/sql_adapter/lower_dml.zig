@@ -12716,7 +12716,7 @@ test "sql adapter lower dml routes write sql through typed plan families" {
         lowered.deinit(alloc);
         return error.TestUnexpectedResult;
     } else |err| {
-        try std.testing.expect(plan_mod.sqlWritePlanFallbackAllowed(err));
+        try std.testing.expectEqual(error.UnsupportedSqlShape, err);
     }
 
     var row_value_semijoin_update_plan = try lowerWritePlanForDmlTestAlloc(
@@ -12991,7 +12991,7 @@ test "sql adapter lower dml routes write sql through typed plan families" {
         lowered.deinit(alloc);
         return error.TestUnexpectedResult;
     } else |err| {
-        try std.testing.expect(plan_mod.sqlWritePlanFallbackAllowed(err));
+        try std.testing.expectEqual(error.UnsupportedSqlShape, err);
     }
 
     var row_value_semijoin_delete_plan = try lowerWritePlanForDmlTestAlloc(

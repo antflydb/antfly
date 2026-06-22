@@ -22,6 +22,7 @@ const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const query_contract = @import("../query_contract.zig");
 const query_function = @import("query_function.zig");
+const tokenized = @import("tokenized.zig");
 
 pub fn expectOptionalUsize(expected: ?usize, actual: usize) !void {
     if (expected) |value| try std.testing.expectEqual(value, actual);
@@ -107,7 +108,9 @@ pub fn expectAppParityQueryFunctionEntry(
         .ptr = &resolver_state,
         .vtable = &.{ .resolve_dense_query = appParityResolveDenseQuery },
     };
-    var lowered = try query_function.lowerAntflyQueryFunctionSqlAlloc(alloc, semantic_resolver, entry.sql);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    var lowered = try query_function.lowerAntflyQueryFunctionParsedSqlAlloc(alloc, semantic_resolver, &parsed_sql);
     defer lowered.deinit(alloc);
     const fingerprint = try corpus.queryFunctionFingerprintAlloc(alloc, lowered);
     defer alloc.free(fingerprint);

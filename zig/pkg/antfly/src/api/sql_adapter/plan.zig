@@ -679,20 +679,6 @@ fn loweredWritePlanWithSyncLevel(plan: LoweredWritePlan, sync_level: db_mod.type
     return owned;
 }
 
-pub fn sqlWritePlanFallbackAllowed(err: anyerror) bool {
-    return err == error.UnsupportedSqlShape or
-        err == error.UnsupportedRowsSelector or
-        err == error.UnsupportedRowsQuery or
-        err == error.InvalidSqlCatalog;
-}
-
-pub fn writePlanFallbackError(primary_err: ?anyerror, fallback_err: anyerror) anyerror {
-    if (primary_err) |err| {
-        if (err != error.UnsupportedSqlShape) return err;
-    }
-    return fallback_err;
-}
-
 pub const MutationSelectorKind = enum {
     point,
     source,
@@ -2310,40 +2296,23 @@ fn lowerExplainPlanWithParsedPrefixAlloc(
     );
     defer inner_sql.deinit(alloc);
 
-    var read_err: ?anyerror = null;
-    if (hooks.lower_read(hooks.ptr, &inner_sql)) |read| {
-        return .{
-            .analyze = parsed.analyze,
-            .format = parsed.format,
-            .verbose = parsed.verbose,
-            .costs = parsed.costs,
-            .buffers = parsed.buffers,
-            .timing = parsed.timing,
-            .summary = parsed.summary,
-            .settings = parsed.settings,
-            .wal = parsed.wal,
-            .subject = .{ .read = read },
-        };
-    } else |err| {
-        if (!sqlWritePlanFallbackAllowed(err)) return err;
-        read_err = err;
-    }
-    if (hooks.lower_write(hooks.ptr, &inner_sql)) |write| {
-        return .{
-            .analyze = parsed.analyze,
-            .format = parsed.format,
-            .verbose = parsed.verbose,
-            .costs = parsed.costs,
-            .buffers = parsed.buffers,
-            .timing = parsed.timing,
-            .summary = parsed.summary,
-            .settings = parsed.settings,
-            .wal = parsed.wal,
-            .subject = .{ .write = write },
-        };
-    } else |write_err| {
-        return writePlanFallbackError(read_err, write_err);
-    }
+    const subject: LoweredExplainSubject = switch (inner_sql.statement) {
+        .read => .{ .read = try hooks.lower_read(hooks.ptr, &inner_sql) },
+        .write => .{ .write = try hooks.lower_write(hooks.ptr, &inner_sql) },
+        else => return error.UnsupportedSqlShape,
+    };
+    return .{
+        .analyze = parsed.analyze,
+        .format = parsed.format,
+        .verbose = parsed.verbose,
+        .costs = parsed.costs,
+        .buffers = parsed.buffers,
+        .timing = parsed.timing,
+        .summary = parsed.summary,
+        .settings = parsed.settings,
+        .wal = parsed.wal,
+        .subject = subject,
+    };
 }
 
 fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {

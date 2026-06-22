@@ -2036,8 +2036,6 @@ fn lowerWritePlanWithCatalogParsedSqlAlloc(
     return try context.lowerParsed(parsed_sql, options, catalog);
 }
 
-const sqlWritePlanFallbackAllowed = sql_adapter.sqlWritePlanFallbackAllowed;
-
 pub fn lowerAggregateAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,

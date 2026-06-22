@@ -292,8 +292,10 @@ Current implementation status:
   tokenizing separately from classification. Syntactic mutation-source forms
   such as row-claimed, ordered/paginated, and temporal `FOR PORTION` `UPDATE`
   and `DELETE` statements classify directly as `update_source` / `delete_source`
-  variants; ambiguous non-unique selectors still need binder-owned selector
-  proof before the point-write fallback can be removed completely.
+  variants. Ordinary `UPDATE` and `DELETE` planning now uses explicit selector
+  classification before invoking point or mutation-source lowerers, so
+  non-unique selectors route to claimed mutation-source planning and point
+  selectors fail closed when no resolver is available.
 - `ParsedSql` wraps `TokenizedSql` with a raw statement view and byte-source
   span. DDL lowering, catalog-apply test lowering, read statement dispatch, and
   write statement dispatch now use that shared wrapper as the top-level SQL
