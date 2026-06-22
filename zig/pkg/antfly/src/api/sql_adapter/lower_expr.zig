@@ -1595,7 +1595,7 @@ pub fn parenthesizedWhereHasTopLevelOr(tokens: []const Token, pos: usize) bool {
             .rparen => if (depth == 0) return false else {
                 depth -= 1;
             },
-            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(tokens[index].text, "or")) return true,
+            .identifier => if (depth == 0 and tokens[index].matchesKeywordTag(.@"or")) return true,
             else => {},
         }
     }
@@ -1630,7 +1630,7 @@ pub fn whereTopLevelOrHasExpressionPredicateStart(tokens: []const Token, pos: us
             .semicolon => if (depth == 0) return false,
             .identifier => if (depth == 0) {
                 if (sqlWhereTailClauseKeywordToken(token)) return false;
-                if (std.ascii.eqlIgnoreCase(token.text, "and") or std.ascii.eqlIgnoreCase(token.text, "or")) {
+                if (token.matchesKeywordTag(.@"and") or token.matchesKeywordTag(.@"or")) {
                     expect_predicate_start = true;
                     continue;
                 }
@@ -1677,15 +1677,14 @@ pub fn whereTopLevelOrHasAccessPredicate(tokens: []const Token, pos: usize) bool
             .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question => return true,
             .identifier => {
                 if (depth == 0 and sqlWhereTailClauseKeywordToken(token)) return false;
-                if (std.ascii.eqlIgnoreCase(token.text, "like") or
-                    std.ascii.eqlIgnoreCase(token.text, "ilike"))
+                if (token.matchesKeywordTag(.like) or
+                    token.matchesKeywordTag(.ilike))
                 {
                     return true;
                 }
                 if (index + 2 < tokens.len and
                     (tokens[index + 1].kind == .eq or tokens[index + 1].kind == .neq) and
-                    tokens[index + 2].kind == .identifier and
-                    std.ascii.eqlIgnoreCase(tokens[index + 2].text, "array"))
+                    tokens[index + 2].matchesKeywordTag(.array))
                 {
                     return true;
                 }
@@ -23472,15 +23471,14 @@ pub fn textPatternSetPredicateCanStartAt(tokens: []const Token, index: usize) bo
             },
             .semicolon, .comma => if (depth == 0) return false,
             .identifier => if (depth == 0) {
-                if (std.ascii.eqlIgnoreCase(token.text, "like") or
-                    std.ascii.eqlIgnoreCase(token.text, "ilike"))
+                if (token.matchesKeywordTag(.like) or
+                    token.matchesKeywordTag(.ilike))
                 {
                     return tokenAtIsAnySomeOrAll(tokens, i + 1);
                 }
-                if (std.ascii.eqlIgnoreCase(token.text, "not") and i + 2 < tokens.len and
-                    tokens[i + 1].kind == .identifier and
-                    (std.ascii.eqlIgnoreCase(tokens[i + 1].text, "like") or
-                        std.ascii.eqlIgnoreCase(tokens[i + 1].text, "ilike")))
+                if (token.matchesKeywordTag(.not) and i + 2 < tokens.len and
+                    (tokens[i + 1].matchesKeywordTag(.like) or
+                        tokens[i + 1].matchesKeywordTag(.ilike)))
                 {
                     return tokenAtIsAnySomeOrAll(tokens, i + 2);
                 }
@@ -23532,7 +23530,7 @@ pub fn canParseExpressionNotWhere(tokens: []const Token, pos: usize) bool {
 }
 
 pub fn canParseAccessNotWhere(tokens: []const Token, pos: usize) bool {
-    if (!parser.peekKeyword(tokens, pos, "not")) return false;
+    if (!parser.peekKeywordTag(tokens, pos, .not)) return false;
     var i = pos + 1;
     while (i < tokens.len and tokens[i].kind == .lparen) : (i += 1) {}
     if (i >= tokens.len) return false;
@@ -23548,15 +23546,14 @@ pub fn canParseAccessNotWhere(tokens: []const Token, pos: usize) bool {
             },
             .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question => return true,
             .identifier => {
-                if (std.ascii.eqlIgnoreCase(token.text, "like") or
-                    std.ascii.eqlIgnoreCase(token.text, "ilike"))
+                if (token.matchesKeywordTag(.like) or
+                    token.matchesKeywordTag(.ilike))
                 {
                     return true;
                 }
                 if (i + 2 < tokens.len and
                     (tokens[i + 1].kind == .eq or tokens[i + 1].kind == .neq) and
-                    tokens[i + 2].kind == .identifier and
-                    std.ascii.eqlIgnoreCase(tokens[i + 2].text, "array"))
+                    tokens[i + 2].matchesKeywordTag(.array))
                 {
                     return true;
                 }
