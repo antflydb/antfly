@@ -24966,6 +24966,507 @@ test "sql adapter lower expr lowers arithmetic projections" {
     ));
 }
 
+test "sql adapter lower expr lowers interval arithmetic projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"datetime"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT created_at_ns + INTERVAL '1 hour 30 minutes' AS expires_at_ns FROM invoices WHERE created_at_ns + INTERVAL '1 hour' > $1 ORDER BY created_at_ns - INTERVAL '7 days' ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 3_600_000_000_000 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("expires_at_ns", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("created_at_ns", lowered.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, lowered.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("5400000000000", lowered.plan.query.expressions[0].expression.operands[1].operands[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, lowered.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, lowered.plan.query.expression_predicates[0].lhs.operands[1].kind);
+    try std.testing.expectEqualStrings("3600000000000", lowered.plan.query.expression_predicates[0].lhs.operands[1].operands[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, lowered.plan.query.order_by[0].expression.?.operands[1].kind);
+    try std.testing.expectEqualStrings("604800000000000", lowered.plan.query.order_by[0].expression.?.operands[1].operands[0].value_json);
+
+    var calendar = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT created_at_ns + INTERVAL '1 month' AS next_cycle FROM invoices WHERE id = $1",
+        schema,
+        &.{.{ .string = "inv1" }},
+    );
+    defer calendar.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), calendar.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("next_cycle", calendar.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, calendar.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_months, calendar.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("1", calendar.plan.query.expressions[0].expression.operands[1].operands[0].value_json);
+
+    var yearly = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT created_at_ns - INTERVAL '1 year' AS prior_cycle FROM invoices WHERE id = $1",
+        schema,
+        &.{.{ .string = "inv1" }},
+    );
+    defer yearly.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), yearly.plan.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, yearly.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_months, yearly.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("12", yearly.plan.query.expressions[0].expression.operands[1].operands[0].value_json);
+
+    var mixed = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT created_at_ns + INTERVAL '1 month 1 day' AS next_cycle_plus_day FROM invoices WHERE id = $1",
+        schema,
+        &.{.{ .string = "inv1" }},
+    );
+    defer mixed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), mixed.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("next_cycle_plus_day", mixed.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, mixed.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, mixed.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_months, mixed.plan.query.expressions[0].expression.operands[0].operands[1].kind);
+    try std.testing.expectEqualStrings("1", mixed.plan.query.expressions[0].expression.operands[0].operands[1].operands[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, mixed.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("86400000000000", mixed.plan.query.expressions[0].expression.operands[1].operands[0].value_json);
+
+    var zero_months = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT created_at_ns + INTERVAL '0 months 1 day' AS next_day FROM invoices WHERE id = $1",
+        schema,
+        &.{.{ .string = "inv1" }},
+    );
+    defer zero_months.deinit(alloc);
+
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, zero_months.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.interval_ns, zero_months.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("86400000000000", zero_months.plan.query.expressions[0].expression.operands[1].operands[0].value_json);
+}
+
+test "sql adapter lower expr lowers case projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CASE WHEN email IS NULL THEN 'missing' WHEN email = 'blocked@example.test' THEN 'blocked' ELSE lower(status) END AS email_bucket FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("email_bucket", lowered.plan.query.expressions[0].output);
+    const expression = lowered.plan.query.expressions[0].expression;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), expression.case_branches.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, expression.case_branches[0].when.op);
+    try std.testing.expectEqual(@as(usize, 0), expression.case_branches[0].when.rhs.len);
+    try std.testing.expectEqualStrings("\"missing\"", expression.case_branches[0].then.value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, expression.case_branches[1].when.op);
+    try std.testing.expectEqualStrings("email", expression.case_branches[1].when.lhs.field);
+    try std.testing.expectEqual(@as(usize, 1), expression.case_branches[1].when.rhs.len);
+    try std.testing.expectEqualStrings("\"blocked@example.test\"", expression.case_branches[1].when.rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression.case_else[0].kind);
+    try std.testing.expectEqualStrings("status", expression.case_else[0].operands[0].field);
+
+    var null_test_projection = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT (email IS NULL) AS email_missing, (email IS NOT NULL) AS email_present FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer null_test_projection.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), null_test_projection.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 2), null_test_projection.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("email_missing", null_test_projection.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, null_test_projection.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, null_test_projection.plan.query.expressions[0].expression.case_branches[0].when.op);
+    try std.testing.expectEqualStrings("email", null_test_projection.plan.query.expressions[0].expression.case_branches[0].when.lhs.field);
+    try std.testing.expectEqualStrings("true", null_test_projection.plan.query.expressions[0].expression.case_branches[0].then.value_json);
+    try std.testing.expectEqualStrings("false", null_test_projection.plan.query.expressions[0].expression.case_else[0].value_json);
+    try std.testing.expectEqualStrings("email_present", null_test_projection.plan.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, null_test_projection.plan.query.expressions[1].expression.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, null_test_projection.plan.query.expressions[1].expression.case_branches[0].when.op);
+
+    var null_first_case = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CASE WHEN email IS NULL THEN NULL ELSE email END AS maybe_email FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer null_first_case.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.case, null_first_case.plan.query.expressions[0].expression.kind);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CASE WHEN email = 3 THEN 'bad' ELSE status END AS bad_case FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CASE WHEN email IS NULL THEN 'missing' ELSE amount END AS bad_case FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    ));
+}
+
+test "sql adapter lower expr lowers cast projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"active":{"type":"boolean"},"created_at_ns":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CAST(id AS text) AS id_text, CAST(amount AS text) AS amount_text, CAST(active AS bool) AS active_bool, CAST(amount + 1 AS text) AS next_amount_text, CAST(created_at_ns AS timestamptz) AS created_at FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 5), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("id_text", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, lowered.plan.query.expressions[0].expression.cast_type.?);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("amount_text", lowered.plan.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, lowered.plan.query.expressions[1].expression.cast_type.?);
+    try std.testing.expectEqualStrings("active_bool", lowered.plan.query.expressions[2].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.bool, lowered.plan.query.expressions[2].expression.cast_type.?);
+    try std.testing.expectEqualStrings("next_amount_text", lowered.plan.query.expressions[3].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.cast, lowered.plan.query.expressions[3].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.text, lowered.plan.query.expressions[3].expression.cast_type.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, lowered.plan.query.expressions[3].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("created_at", lowered.plan.query.expressions[4].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionCastType.datetime, lowered.plan.query.expressions[4].expression.cast_type.?);
+    try std.testing.expectEqualStrings("created_at_ns", lowered.plan.query.expressions[4].expression.operands[0].field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT CAST(id AS uuid) AS bad FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    ));
+}
+
+test "sql adapter lower expr ignores harmless identifier casts" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT \"id\"::text AS id_text FROM users WHERE id::text = $1 ORDER BY \"status\"::text DESC",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.field_aliases.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("id_text", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.expressions[0].expression.field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"u1\"", lowered.plan.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("status", lowered.plan.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.plan.query.order_by[0].direction);
+}
+
+test "sql adapter lower expr lowers arithmetic predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"discount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE amount * quantity - discount > $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 10 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    const condition = lowered.plan.query.expression_predicates[0];
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, condition.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, condition.lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, condition.lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("amount", condition.lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("quantity", condition.lhs.operands[0].operands[1].field);
+    try std.testing.expectEqualStrings("discount", condition.lhs.operands[1].field);
+    try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
+    try std.testing.expectEqualStrings("10", condition.rhs[0].value_json);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE amount * quantity - discount > 'bad'",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers coalesce predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE coalesce(status, 'pending') = $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .string = "active" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    const condition = lowered.plan.query.expression_predicates[0];
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, condition.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, condition.lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), condition.lhs.operands.len);
+    try std.testing.expectEqualStrings("status", condition.lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"pending\"", condition.lhs.operands[1].value_json);
+    try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
+    try std.testing.expectEqualStrings("\"active\"", condition.rhs[0].value_json);
+
+    var null_first = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE coalesce(NULL, amount, 0) > $1",
+        schema,
+        &.{.{ .integer = 3 }},
+    );
+    defer null_first.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, null_first.plan.query.expression_predicates[0].lhs.kind);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE coalesce(status, amount) = $1",
+        schema,
+        &.{.{ .string = "active" }},
+    ));
+}
+
+test "sql adapter lower expr lowers array length predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) > $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 0 }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    const condition = lowered.plan.query.expression_predicates[0];
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, condition.op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, condition.lhs.kind);
+    try std.testing.expectEqual(@as(usize, 1), condition.lhs.operands.len);
+    try std.testing.expectEqualStrings("tags", condition.lhs.operands[0].field);
+    try std.testing.expectEqual(@as(usize, 1), condition.rhs.len);
+    try std.testing.expectEqualStrings("0", condition.rhs[0].value_json);
+
+    var cardinality = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE cardinality(tags) > $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 0 }},
+    );
+    defer cardinality.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), cardinality.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), cardinality.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, cardinality.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, cardinality.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("tags", cardinality.plan.query.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("0", cardinality.plan.query.expression_predicates[0].rhs[0].value_json);
+
+    var ranged = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN 1 AND $1 ORDER BY id ASC LIMIT 5",
+        schema,
+        &.{.{ .integer = 3 }},
+    );
+    defer ranged.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), ranged.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), ranged.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, ranged.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, ranged.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", ranged.plan.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, ranged.plan.query.expression_predicates[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, ranged.plan.query.expression_predicates[1].lhs.kind);
+    try std.testing.expectEqualStrings("3", ranged.plan.query.expression_predicates[1].rhs[0].value_json);
+
+    var explicit_asymmetric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN ASYMMETRIC 1 AND 3",
+        schema,
+        &.{},
+    );
+    defer explicit_asymmetric.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), explicit_asymmetric.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), explicit_asymmetric.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, explicit_asymmetric.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, explicit_asymmetric.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", explicit_asymmetric.plan.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, explicit_asymmetric.plan.query.expression_predicates[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, explicit_asymmetric.plan.query.expression_predicates[1].lhs.kind);
+    try std.testing.expectEqualStrings("3", explicit_asymmetric.plan.query.expression_predicates[1].rhs[0].value_json);
+
+    var not_ranged = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN 1 AND 3",
+        schema,
+        &.{},
+    );
+    defer not_ranged.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), not_ranged.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), not_ranged.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_ranged.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_ranged.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_ranged.plan.query.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_ranged.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", not_ranged.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), not_ranged.plan.query.expression_or_predicates[1].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_ranged.plan.query.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_ranged.plan.query.expression_or_predicates[1].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("3", not_ranged.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+
+    var not_asymmetric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN ASYMMETRIC 1 AND 3",
+        schema,
+        &.{},
+    );
+    defer not_asymmetric.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), not_asymmetric.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), not_asymmetric.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_asymmetric.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), not_asymmetric.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_asymmetric.plan.query.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_asymmetric.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", not_asymmetric.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), not_asymmetric.plan.query.expression_or_predicates[1].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_asymmetric.plan.query.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, not_asymmetric.plan.query.expression_or_predicates[1].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("3", not_asymmetric.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+
+    var symmetric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) BETWEEN SYMMETRIC 3 AND 1",
+        schema,
+        &.{},
+    );
+    defer symmetric.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), symmetric.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), symmetric.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), symmetric.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, symmetric.plan.query.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("3", symmetric.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, symmetric.plan.query.expression_or_predicates[0].conditions[1].op);
+    try std.testing.expectEqualStrings("1", symmetric.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 2), symmetric.plan.query.expression_or_predicates[1].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, symmetric.plan.query.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqualStrings("1", symmetric.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, symmetric.plan.query.expression_or_predicates[1].conditions[1].op);
+    try std.testing.expectEqualStrings("3", symmetric.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+
+    var not_symmetric = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) NOT BETWEEN SYMMETRIC 3 AND 1",
+        schema,
+        &.{},
+    );
+    defer not_symmetric.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), not_symmetric.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_symmetric.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), not_symmetric.plan.query.expression_or_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_symmetric.plan.query.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("3", not_symmetric.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_symmetric.plan.query.expression_or_predicates[0].conditions[1].op);
+    try std.testing.expectEqualStrings("1", not_symmetric.plan.query.expression_or_predicates[0].conditions[1].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 2), not_symmetric.plan.query.expression_or_predicates[1].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_symmetric.plan.query.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqualStrings("3", not_symmetric.plan.query.expression_or_predicates[1].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, not_symmetric.plan.query.expression_or_predicates[1].conditions[1].op);
+    try std.testing.expectEqualStrings("1", not_symmetric.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE array_length(tags, 1) IN (1, 'bad')",
+        schema,
+        &.{},
+    ));
+
+    var negated_condition = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT (array_length(tags, 1) BETWEEN 1 AND 3)",
+        schema,
+        &.{},
+    );
+    defer negated_condition.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), negated_condition.plan.query.predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), negated_condition.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), negated_condition.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), negated_condition.plan.query.expression_not_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), negated_condition.plan.query.expression_not_predicates[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, negated_condition.plan.query.expression_not_predicates[0].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, negated_condition.plan.query.expression_not_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", negated_condition.plan.query.expression_not_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, negated_condition.plan.query.expression_not_predicates[0].conditions[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, negated_condition.plan.query.expression_not_predicates[0].conditions[1].lhs.kind);
+    try std.testing.expectEqualStrings("3", negated_condition.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+}
+
 test "sql adapter lower expr assembles boolean predicate groups" {
     const alloc = std.testing.allocator;
 
