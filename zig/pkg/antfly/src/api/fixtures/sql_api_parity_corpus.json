@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "45e2446c26212c4d383fa2c98ecd2602bb0a064a232cdfcb751146b048ad6cb0",
-  "source_entry_count": 1020,
-  "entry_count": 1020,
+  "source_sha256": "fa22d85c9ff05ec58be54ad3b8416018f957fc984112aafb8d8f497c451d5f30",
+  "source_entry_count": 1025,
+  "entry_count": 1025,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -242,6 +242,24 @@
       "sql": "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b', max_results => 5, limit => 5)"
     },
     {
+      "name": "query function graph traverse request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=1:graph_metric=0:fields=0:limit=11",
+      "sql": "SELECT * FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', edge_types => 'cites, references', max_depth => 2, max_results => 11, metrics => 'pagerank', freshness => 'fresh', include_metric_status => true, include_paths => true, limit => 11)"
+    },
+    {
+      "name": "query function graph shortest path request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=1:graph_metric=0:fields=0:limit=4",
+      "sql": "SELECT * FROM antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', direction => 'both', max_depth => 4, weight_mode => 'min_weight', limit => 4)"
+    },
+    {
+      "name": "query function graph k shortest paths request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=1:graph_metric=0:fields=0:limit=3",
+      "sql": "SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'docs', index => 'docs_edge_graph', result_ref => '$full_text_results', target_result_ref => '$graph_results.targets', start_limit => 5, target_limit => 2, k => 3, max_depth => 6, limit => 3)"
+    },
+    {
       "name": "query function graph metric request",
       "family": "query_function",
       "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=0:graph_metric=1:fields=0:limit=2",
@@ -258,6 +276,18 @@
       "family": "query_function",
       "plan": "query_function:text=1:full_text_queries=0:dense=1:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=9:primary_text_index=1:graph_metric_rerank=1:merge=1",
       "sql": "SELECT * FROM antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9)"
+    },
+    {
+      "name": "query function structured hybrid sources json request",
+      "family": "query_function",
+      "plan": "query_function:text=1:full_text_queries=0:dense=1:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=9:primary_text_index=1:graph_metric_rerank=1:merge=1",
+      "sql": "SELECT * FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources_json => '[{\"kind\":\"full_text\",\"index\":\"docs_body_fts\",\"field\":\"body\",\"weight\":0.25},{\"kind\":\"semantic\",\"index\":\"docs_body_semantic\",\"weight\":0.6},{\"kind\":\"graph_metric\",\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\",\"weight\":0.15,\"base_weight\":0.5,\"missing_score\":0.1,\"freshness\":\"fresh\"}]', limit => 9)"
+    },
+    {
+      "name": "query function structured hybrid source helpers request",
+      "family": "query_function",
+      "plan": "query_function:text=1:full_text_queries=0:dense=1:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=9:primary_text_index=1:graph_metric_rerank=1:merge=1",
+      "sql": "SELECT * FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources => ARRAY[antfly.source('docs_body_fts', field => 'body', weight => 0.25), antfly.source('docs_body_semantic', weight => 0.6), antfly.source('docs_edge_graph', metric => 'pagerank', weight => 0.15, base_weight => 0.5, missing_score => 0.1, freshness => 'fresh')], limit => 9)"
     },
     {
       "name": "execute prepared statement protocol plan",

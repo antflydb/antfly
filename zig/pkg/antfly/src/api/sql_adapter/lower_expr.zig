@@ -15301,14 +15301,13 @@ fn cloneTableAliasAlloc(alloc: std.mem.Allocator, value: plan_mod.TableAlias) !p
     return .{ .name = name, .alias = alias };
 }
 
-fn parseDirectGraphTableFunctionSourceAlloc(
+fn parseGraphTableFunctionSourceAtAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
-    select_body_pos: usize,
+    function_start: usize,
+    default_alias: []const u8,
     available_ctes: []const db_mod.types.RelationalRowsCte,
 ) !?DirectGraphTableFunctionSource {
-    const from_index = parser.findTopLevelKeywordFromIndex(tokens, select_body_pos, "from") orelse return null;
-    const function_start = from_index + 1;
     if (function_start + 1 >= tokens.len) return null;
     if (tokens[function_start].kind != .identifier or tokens[function_start + 1].kind != .lparen) return null;
     const function = query_function.antflyQueryFunctionFromSqlName(tokens[function_start].text) orelse return null;
@@ -15333,7 +15332,7 @@ fn parseDirectGraphTableFunctionSourceAlloc(
         const alias = tokens[alias_pos].text;
         alias_pos += 1;
         break :blk alias;
-    } else "__antfly_graph_table_function";
+    } else default_alias;
 
     if (plan_mod.findCteByName(available_ctes, alias_source) != null) return error.UnsupportedSqlShape;
     var wrapped = std.ArrayListUnmanaged(Token).empty;
@@ -15376,6 +15375,16 @@ fn parseDirectGraphTableFunctionSourceAlloc(
         .function_start = function_start,
         .source_end = alias_pos,
     };
+}
+
+fn parseDirectGraphTableFunctionSourceAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    select_body_pos: usize,
+    available_ctes: []const db_mod.types.RelationalRowsCte,
+) !?DirectGraphTableFunctionSource {
+    const from_index = parser.findTopLevelKeywordFromIndex(tokens, select_body_pos, "from") orelse return null;
+    return try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, from_index + 1, "__antfly_graph_table_function", available_ctes);
 }
 
 pub fn parseSelectAlloc(
@@ -16394,18 +16403,42 @@ pub fn parseJoinAlloc(
         break :blk .inner;
     };
 
-    const right_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
+    var right_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join", options.available_ctes);
+    var right_graph_source_transferred = false;
+    defer if (!right_graph_source_transferred) {
+        if (right_graph_source) |*source| source.deinit(alloc);
+    };
+    const right_table = if (right_graph_source) |source| table_ref: {
+        pos.* = source.source_end;
+        break :table_ref try cloneTableAliasAlloc(alloc, source.table_ref);
+    } else try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer plan_mod.freeTableAlias(alloc, right_table);
     if (std.mem.eql(u8, left_table.alias, right_table.alias)) return error.UnsupportedSqlShape;
+    if (right_graph_source) |source| {
+        const graph_table_name = switch (source.cte.table_function.?) {
+            .graph_query => |graph_query| graph_query.table_name,
+        };
+        if (!std.mem.eql(u8, left_table.name, graph_table_name)) return error.UnsupportedSqlShape;
+    }
 
     const initial_context = options.context_hooks.get_context(options.context_hooks.ptr);
     defer options.context_hooks.set_context(options.context_hooks.ptr, initial_context);
     var current_context = initial_context;
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
     defer relational_rows.freeRowsPlannedCtes(alloc, planned_ctes);
-    if (options.available_ctes.len != 0) {
+    var available_ctes = options.available_ctes;
+    var available_ctes_owned = false;
+    defer if (available_ctes_owned) alloc.free(available_ctes);
+    if (right_graph_source) |source| {
+        const combined = try alloc.alloc(db_mod.types.RelationalRowsCte, options.available_ctes.len + 1);
+        @memcpy(combined[0..options.available_ctes.len], options.available_ctes);
+        combined[options.available_ctes.len] = source.cte;
+        available_ctes = combined;
+        available_ctes_owned = true;
+    }
+    if (available_ctes.len != 0) {
         const cte_base_schema = initial_context.joined_source_schema orelse initial_context.schema;
-        planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, cte_base_schema, options.available_ctes);
+        planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, cte_base_schema, available_ctes);
     }
     current_context.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, left_table.name) orelse initial_context.schema;
     current_context.joined_source_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, right_table.name) orelse initial_context.joined_source_schema orelse initial_context.schema;
@@ -16681,9 +16714,15 @@ pub fn parseJoinAlloc(
     const left_table_name = try alloc.dupe(u8, left_table.name);
     var left_table_name_transferred = false;
     errdefer if (!left_table_name_transferred) alloc.free(left_table_name);
-    const right_table_name = try alloc.dupe(u8, right_table.name);
+    const right_table_name_source = if (right_graph_source) |source| switch (source.cte.table_function.?) {
+        .graph_query => |graph_query| graph_query.table_name,
+    } else right_table.name;
+    const right_table_name = try alloc.dupe(u8, right_table_name_source);
     var right_table_name_transferred = false;
     errdefer if (!right_table_name_transferred) alloc.free(right_table_name);
+    const right_source_cte = if (right_graph_source) |source| try alloc.dupe(u8, source.cte.name) else "";
+    var right_source_cte_transferred = false;
+    errdefer if (!right_source_cte_transferred and right_source_cte.len > 0) alloc.free(right_source_cte);
 
     const join_request = db_mod.types.RelationalRowsJoinRequest{
         .left = .{
@@ -16701,6 +16740,7 @@ pub fn parseJoinAlloc(
             .select_all = true,
         },
         .right = .{
+            .source_cte = right_source_cte,
             .predicates = try right_predicates.toOwnedSlice(alloc),
             .json_contains = try right_json_contains.toOwnedSlice(alloc),
             .json_path_exists = try right_json_path_exists.toOwnedSlice(alloc),
@@ -16731,9 +16771,20 @@ pub fn parseJoinAlloc(
     };
     left_table_name_transferred = true;
     right_table_name_transferred = true;
+    right_source_cte_transferred = true;
+    const ctes = if (right_graph_source) |*source| ctes: {
+        const out = try alloc.alloc(db_mod.types.RelationalRowsCte, 1);
+        out[0] = source.cte;
+        source.cte = .{ .name = "" };
+        plan_mod.freeTableAlias(alloc, source.table_ref);
+        source.table_ref = .{ .name = "", .alias = "" };
+        right_graph_source_transferred = true;
+        break :ctes out;
+    } else &.{};
     return .{
         .left_table_name = left_table_name,
         .right_table_name = right_table_name,
+        .ctes = ctes,
         .join = join_request,
     };
 }
@@ -24662,6 +24713,60 @@ test "sql adapter lower expr lowers uuid generation projections" {
     }
 }
 
+test "sql adapter lower expr lowers pipe concat operator expressions" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"first_name":{"type":"keyword"},"last_name":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT first_name || ' ' || last_name || ' <' || lower(email) || '>' AS display_label FROM users WHERE status || ':' || id = $1 ORDER BY first_name || ' ' || last_name ASC",
+        schema,
+        &.{.{ .string = "active:u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("display_label", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 6), lowered.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqualStrings("first_name", lowered.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqualStrings("\" \"", lowered.plan.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqualStrings("last_name", lowered.plan.query.expressions[0].expression.operands[2].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.expressions[0].expression.operands[4].kind);
+    try std.testing.expectEqualStrings("email", lowered.plan.query.expressions[0].expression.operands[4].operands[0].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, lowered.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", lowered.plan.query.expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("\"active:u1\"", lowered.plan.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
+    try std.testing.expect(lowered.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, lowered.plan.query.order_by[0].expression.?.kind);
+
+    var nested_case_fold = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(first_name || ' ' || last_name) AS display_label FROM users WHERE lower(status || ':' || id) = $1 ORDER BY upper(first_name || last_name) ASC",
+        schema,
+        &.{.{ .string = "active:u1" }},
+    );
+    defer nested_case_fold.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), nested_case_fold.plan.query.expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, nested_case_fold.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, nested_case_fold.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), nested_case_fold.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, nested_case_fold.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, nested_case_fold.plan.query.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(@as(usize, 1), nested_case_fold.plan.query.order_by.len);
+    try std.testing.expect(nested_case_fold.plan.query.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.upper, nested_case_fold.plan.query.order_by[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, nested_case_fold.plan.query.order_by[0].expression.?.operands[0].kind);
+}
+
 test "sql adapter lower expr lowers concat projections" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -25616,6 +25721,1229 @@ test "sql adapter lower expr lowers array length predicates" {
     try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, negated_condition.plan.query.expression_not_predicates[0].conditions[1].op);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, negated_condition.plan.query.expression_not_predicates[0].conditions[1].lhs.kind);
     try std.testing.expectEqualStrings("3", negated_condition.plan.query.expression_not_predicates[0].conditions[1].rhs[0].value_json);
+}
+
+test "sql adapter lower expr lowers grouped aggregate queries" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(1) AS order_count, SUM(amount) AS amount_sum, AVG(amount) AS amount_avg FROM usage_records WHERE status = $1 GROUP BY 1 HAVING amount_sum > 10 ORDER BY 3 DESC LIMIT 10",
+        schema,
+        &.{.{ .string = "open" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", lowered.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 3), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("order_count", lowered.aggregate.aggregations[0].name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
+    try std.testing.expect(lowered.aggregate.aggregations[0].field == null);
+    try std.testing.expectEqualStrings("amount_sum", lowered.aggregate.aggregations[1].name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[1].op);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.avg, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.source.predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.source.predicates[0].field);
+    try std.testing.expectEqualStrings("\"open\"", lowered.aggregate.source.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("amount_sum", lowered.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, lowered.aggregate.having_predicates[0].op);
+    try std.testing.expectEqualStrings("10", lowered.aggregate.having_predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("amount_sum", lowered.aggregate.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 10), lowered.aggregate.limit.?);
+
+    var modulo_inputs = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, SUM(amount % 7) AS amount_remainder, SUM(MOD(amount + 1, 7)) AS shifted_remainder FROM usage_records GROUP BY customer ORDER BY shifted_remainder DESC",
+        schema,
+        &.{},
+    );
+    defer modulo_inputs.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), modulo_inputs.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("amount_remainder", modulo_inputs.aggregate.aggregations[0].name);
+    try std.testing.expect(modulo_inputs.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_inputs.aggregate.aggregations[0].expression.?.kind);
+    try std.testing.expectEqualStrings("amount", modulo_inputs.aggregate.aggregations[0].expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("7", modulo_inputs.aggregate.aggregations[0].expression.?.operands[1].value_json);
+    try std.testing.expectEqualStrings("shifted_remainder", modulo_inputs.aggregate.aggregations[1].name);
+    try std.testing.expect(modulo_inputs.aggregate.aggregations[1].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_inputs.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, modulo_inputs.aggregate.aggregations[1].expression.?.operands[0].kind);
+    try std.testing.expectEqualStrings("shifted_remainder", modulo_inputs.aggregate.order_by[0].field);
+
+    var interleaved = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, status FROM usage_records GROUP BY 1, 3 ORDER BY order_count DESC",
+        schema,
+        &.{},
+    );
+    defer interleaved.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), interleaved.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", interleaved.aggregate.group_by[0]);
+    try std.testing.expectEqualStrings("status", interleaved.aggregate.group_by[1]);
+    try std.testing.expectEqual(@as(usize, 1), interleaved.aggregate.aggregations.len);
+
+    var boolean_folded = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, BOOL_OR(enabled) AS any_enabled, BOOL_AND(starts_with(status, 'op')) AS all_openish FROM usage_records GROUP BY customer HAVING any_enabled IS TRUE ORDER BY all_openish DESC",
+        schema,
+        &.{},
+    );
+    defer boolean_folded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), boolean_folded.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.bool_or, boolean_folded.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("enabled", boolean_folded.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.bool_and, boolean_folded.aggregate.aggregations[1].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, boolean_folded.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(@as(usize, 1), boolean_folded.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("any_enabled", boolean_folded.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), boolean_folded.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("all_openish", boolean_folded.aggregate.order_by[0].field);
+
+    var bare_boolean_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, BOOL_OR(enabled) AS any_enabled, BOOL_AND(starts_with(status, 'op')) AS all_openish FROM usage_records GROUP BY customer HAVING any_enabled AND NOT all_openish",
+        schema,
+        &.{},
+    );
+    defer bare_boolean_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), bare_boolean_having.aggregate.having_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), bare_boolean_having.aggregate.having_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, bare_boolean_having.aggregate.having_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("any_enabled", bare_boolean_having.aggregate.having_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_not, bare_boolean_having.aggregate.having_expressions[0].lhs.operands[1].kind);
+    try std.testing.expectEqualStrings("all_openish", bare_boolean_having.aggregate.having_expressions[0].lhs.operands[1].operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, bare_boolean_having.aggregate.having_expressions[0].op);
+    try std.testing.expectEqualStrings("true", bare_boolean_having.aggregate.having_expressions[0].rhs[0].value_json);
+
+    var bare_boolean_having_or = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, BOOL_OR(enabled) AS any_enabled, BOOL_AND(starts_with(status, 'op')) AS all_openish FROM usage_records GROUP BY customer HAVING any_enabled OR all_openish",
+        schema,
+        &.{},
+    );
+    defer bare_boolean_having_or.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), bare_boolean_having_or.aggregate.having_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, bare_boolean_having_or.aggregate.having_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("any_enabled", bare_boolean_having_or.aggregate.having_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("all_openish", bare_boolean_having_or.aggregate.having_expressions[0].lhs.operands[1].field);
+
+    var qualified = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT u.customer, COUNT(u.id) FILTER (WHERE u.status = 'open') AS open_count, SUM(u.amount) AS amount_sum FROM usage_records AS u WHERE u.status = $1 GROUP BY u.customer HAVING amount_sum > 10 ORDER BY amount_sum DESC LIMIT 10",
+        schema,
+        &.{.{ .string = "open" }},
+    );
+    defer qualified.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", qualified.table_name);
+    try std.testing.expectEqual(@as(usize, 1), qualified.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", qualified.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 2), qualified.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("open_count", qualified.aggregate.aggregations[0].name);
+    try std.testing.expectEqualStrings("id", qualified.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(@as(usize, 1), qualified.aggregate.aggregations[0].filter_predicates.len);
+    try std.testing.expectEqualStrings("status", qualified.aggregate.aggregations[0].filter_predicates[0].field);
+    try std.testing.expectEqualStrings("amount_sum", qualified.aggregate.aggregations[1].name);
+    try std.testing.expectEqualStrings("amount", qualified.aggregate.aggregations[1].field.?);
+    try std.testing.expectEqual(@as(usize, 1), qualified.aggregate.source.predicates.len);
+    try std.testing.expectEqualStrings("status", qualified.aggregate.source.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), qualified.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("amount_sum", qualified.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), qualified.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("amount_sum", qualified.aggregate.order_by[0].field);
+
+    var json_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT u.customer, COUNT(*) FILTER (WHERE u.metadata->>'source' = 'api') AS api_count FROM usage_records AS u GROUP BY u.customer ORDER BY api_count DESC",
+        schema,
+        &.{},
+    );
+    defer json_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), json_filter.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 0), json_filter.aggregate.aggregations[0].filter_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), json_filter.aggregate.aggregations[0].filter_expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), json_filter.aggregate.aggregations[0].filter_json_path_eq.len);
+    try std.testing.expectEqualStrings("metadata", json_filter.aggregate.aggregations[0].filter_json_path_eq[0].field);
+    try std.testing.expectEqualStrings("source", json_filter.aggregate.aggregations[0].filter_json_path_eq[0].path);
+    try std.testing.expectEqualStrings("\"api\"", json_filter.aggregate.aggregations[0].filter_json_path_eq[0].value_json);
+
+    var direct_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer HAVING COUNT(*) > 0 AND SUM(amount) >= 10",
+        schema,
+        &.{},
+    );
+    defer direct_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), direct_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("order_count", direct_having.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, direct_having.aggregate.having_predicates[0].op);
+    try std.testing.expectEqualStrings("0", direct_having.aggregate.having_predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("amount_sum", direct_having.aggregate.having_predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, direct_having.aggregate.having_predicates[1].op);
+    try std.testing.expectEqualStrings("10", direct_having.aggregate.having_predicates[1].value_json.?);
+
+    var expression_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer HAVING amount_sum - order_count > 10",
+        schema,
+        &.{},
+    );
+    defer expression_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_having.aggregate.having_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_having.aggregate.having_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, expression_having.aggregate.having_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount_sum", expression_having.aggregate.having_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("order_count", expression_having.aggregate.having_expressions[0].lhs.operands[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, expression_having.aggregate.having_expressions[0].op);
+
+    var parenthesized_expression_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer HAVING (amount_sum - order_count) > 10",
+        schema,
+        &.{},
+    );
+    defer parenthesized_expression_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), parenthesized_expression_having.aggregate.having_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), parenthesized_expression_having.aggregate.having_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, parenthesized_expression_having.aggregate.having_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount_sum", parenthesized_expression_having.aggregate.having_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("order_count", parenthesized_expression_having.aggregate.having_expressions[0].lhs.operands[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, parenthesized_expression_having.aggregate.having_expressions[0].op);
+
+    var boolean_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer HAVING amount_sum > 10 OR COUNT(*) > 2 OR amount_sum - order_count > 5",
+        schema,
+        &.{},
+    );
+    defer boolean_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), boolean_having.aggregate.having_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), boolean_having.aggregate.having_expressions.len);
+    try std.testing.expectEqual(@as(usize, 3), boolean_having.aggregate.having_any.len);
+    try std.testing.expectEqualStrings("amount_sum", boolean_having.aggregate.having_any[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, boolean_having.aggregate.having_any[0].conditions[0].op);
+    try std.testing.expectEqualStrings("order_count", boolean_having.aggregate.having_any[1].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, boolean_having.aggregate.having_any[1].conditions[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, boolean_having.aggregate.having_any[2].conditions[0].lhs.kind);
+
+    var parenthesized_boolean_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer HAVING (amount_sum - order_count) > 5 OR order_count > 2",
+        schema,
+        &.{},
+    );
+    defer parenthesized_boolean_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), parenthesized_boolean_having.aggregate.having_predicates.len);
+    try std.testing.expectEqual(@as(usize, 0), parenthesized_boolean_having.aggregate.having_expressions.len);
+    try std.testing.expectEqual(@as(usize, 2), parenthesized_boolean_having.aggregate.having_any.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, parenthesized_boolean_having.aggregate.having_any[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount_sum", parenthesized_boolean_having.aggregate.having_any[0].conditions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("order_count", parenthesized_boolean_having.aggregate.having_any[0].conditions[0].lhs.operands[1].field);
+    try std.testing.expectEqualStrings("order_count", parenthesized_boolean_having.aggregate.having_any[1].conditions[0].lhs.field);
+
+    var not_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer HAVING NOT (amount_sum < 0 AND order_count = 0)",
+        schema,
+        &.{},
+    );
+    defer not_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), not_having.aggregate.having_not.len);
+    try std.testing.expectEqual(@as(usize, 2), not_having.aggregate.having_not[0].conditions.len);
+    try std.testing.expectEqualStrings("amount_sum", not_having.aggregate.having_not[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, not_having.aggregate.having_not[0].conditions[0].op);
+    try std.testing.expectEqualStrings("order_count", not_having.aggregate.having_not[0].conditions[1].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, not_having.aggregate.having_not[0].conditions[1].op);
+
+    var boolean_is_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled, COUNT(*) AS row_count FROM usage_records GROUP BY enabled HAVING enabled IS TRUE",
+        schema,
+        &.{},
+    );
+    defer boolean_is_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_is_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("enabled", boolean_is_having.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, boolean_is_having.aggregate.having_predicates[0].op);
+    try std.testing.expectEqualStrings("true", boolean_is_having.aggregate.having_predicates[0].value_json.?);
+
+    var boolean_unknown_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled, COUNT(*) AS row_count FROM usage_records GROUP BY enabled HAVING enabled IS UNKNOWN",
+        schema,
+        &.{},
+    );
+    defer boolean_unknown_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_unknown_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("enabled", boolean_unknown_having.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_unknown_having.aggregate.having_predicates[0].op);
+    try std.testing.expect(boolean_unknown_having.aggregate.having_predicates[0].value_json == null);
+
+    var boolean_not_unknown_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled, COUNT(*) AS row_count FROM usage_records GROUP BY enabled HAVING enabled IS NOT UNKNOWN",
+        schema,
+        &.{},
+    );
+    defer boolean_not_unknown_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_not_unknown_having.aggregate.having_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, boolean_not_unknown_having.aggregate.having_predicates[0].op);
+
+    var bare_boolean_is_not_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled, COUNT(*) AS row_count FROM usage_records GROUP BY enabled HAVING enabled IS NOT TRUE",
+        schema,
+        &.{},
+    );
+    defer bare_boolean_is_not_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), bare_boolean_is_not_having.aggregate.having_any.len);
+    try std.testing.expectEqual(@as(usize, 1), bare_boolean_is_not_having.aggregate.having_any[0].conditions.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, bare_boolean_is_not_having.aggregate.having_any[0].conditions[0].op);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, bare_boolean_is_not_having.aggregate.having_any[1].conditions[0].op);
+
+    var boolean_is_not_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled, COUNT(*) AS row_count FROM usage_records GROUP BY enabled HAVING enabled IS NOT TRUE AND row_count > 0",
+        schema,
+        &.{},
+    );
+    defer boolean_is_not_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), boolean_is_not_having.aggregate.having_any.len);
+    try std.testing.expectEqual(@as(usize, 2), boolean_is_not_having.aggregate.having_any[0].conditions.len);
+    try std.testing.expectEqualStrings("enabled", boolean_is_not_having.aggregate.having_any[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, boolean_is_not_having.aggregate.having_any[0].conditions[0].op);
+    try std.testing.expectEqualStrings("true", boolean_is_not_having.aggregate.having_any[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("row_count", boolean_is_not_having.aggregate.having_any[0].conditions[1].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, boolean_is_not_having.aggregate.having_any[0].conditions[1].op);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_is_not_having.aggregate.having_any[1].conditions[0].op);
+
+    var direct_order = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer ORDER BY SUM(amount) DESC, COUNT(*) ASC",
+        schema,
+        &.{},
+    );
+    defer direct_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), direct_order.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("amount_sum", direct_order.aggregate.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, direct_order.aggregate.order_by[0].direction);
+    try std.testing.expectEqualStrings("order_count", direct_order.aggregate.order_by[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, direct_order.aggregate.order_by[1].direction);
+
+    var filtered_direct_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records GROUP BY customer HAVING COUNT(*) FILTER (WHERE status = 'open') > 0",
+        schema,
+        &.{},
+    );
+    defer filtered_direct_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered_direct_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("open_count", filtered_direct_having.aggregate.having_predicates[0].field);
+
+    var filtered_direct_order = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count FROM usage_records GROUP BY customer ORDER BY COUNT(*) FILTER (WHERE status = 'open') DESC",
+        schema,
+        &.{},
+    );
+    defer filtered_direct_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered_direct_order.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("open_count", filtered_direct_order.aggregate.order_by[0].field);
+
+    var boolean_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open' OR amount > 10) AS active_count FROM usage_records GROUP BY customer HAVING COUNT(*) FILTER (WHERE status = 'open' OR amount > 10) > 0",
+        schema,
+        &.{},
+    );
+    defer boolean_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), boolean_filter.aggregate.aggregations[0].filter_any.len);
+    try std.testing.expectEqual(@as(usize, 1), boolean_filter.aggregate.aggregations[0].filter_any[0].conditions.len);
+    try std.testing.expectEqual(@as(usize, 1), boolean_filter.aggregate.aggregations[0].filter_any[1].conditions.len);
+    try std.testing.expectEqualStrings("status", boolean_filter.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("amount", boolean_filter.aggregate.aggregations[0].filter_any[1].conditions[0].lhs.field);
+    try std.testing.expectEqual(@as(usize, 1), boolean_filter.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("active_count", boolean_filter.aggregate.having_predicates[0].field);
+
+    var boolean_is_not_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE enabled IS NOT TRUE) AS disabled_or_unknown_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer boolean_is_not_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), boolean_is_not_filter.aggregate.aggregations[0].filter_any.len);
+    try std.testing.expectEqual(@as(usize, 1), boolean_is_not_filter.aggregate.aggregations[0].filter_any[0].conditions.len);
+    try std.testing.expectEqualStrings("enabled", boolean_is_not_filter.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, boolean_is_not_filter.aggregate.aggregations[0].filter_any[0].conditions[0].op);
+    try std.testing.expectEqualStrings("true", boolean_is_not_filter.aggregate.aggregations[0].filter_any[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("enabled", boolean_is_not_filter.aggregate.aggregations[0].filter_any[1].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_is_not_filter.aggregate.aggregations[0].filter_any[1].conditions[0].op);
+    try std.testing.expectEqual(@as(usize, 0), boolean_is_not_filter.aggregate.aggregations[0].filter_any[1].conditions[0].rhs.len);
+
+    var boolean_is_not_filter_or = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE enabled IS NOT FALSE OR status = 'queued') AS enabled_or_queued_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer boolean_is_not_filter_or.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), boolean_is_not_filter_or.aggregate.aggregations[0].filter_any.len);
+    try std.testing.expectEqualStrings("enabled", boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[0].conditions[0].op);
+    try std.testing.expectEqualStrings("false", boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[1].conditions[0].op);
+    try std.testing.expectEqualStrings("status", boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[2].conditions[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[2].conditions[0].op);
+    try std.testing.expectEqualStrings("\"queued\"", boolean_is_not_filter_or.aggregate.aggregations[0].filter_any[2].conditions[0].rhs[0].value_json);
+
+    var parenthesized_boolean_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE (amount - 1) > 10 OR status = 'open') AS active_count FROM usage_records GROUP BY customer ORDER BY active_count DESC",
+        schema,
+        &.{},
+    );
+    defer parenthesized_boolean_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), parenthesized_boolean_filter.aggregate.aggregations[0].filter_any.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, parenthesized_boolean_filter.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount", parenthesized_boolean_filter.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.operands[0].field);
+    try std.testing.expectEqualStrings("status", parenthesized_boolean_filter.aggregate.aggregations[0].filter_any[1].conditions[0].lhs.field);
+
+    var parenthesized_expression_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE (amount - 1) > 10) AS adjusted_count FROM usage_records GROUP BY customer ORDER BY adjusted_count DESC",
+        schema,
+        &.{},
+    );
+    defer parenthesized_expression_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parenthesized_expression_filter.aggregate.aggregations[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, parenthesized_expression_filter.aggregate.aggregations[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqualStrings("amount", parenthesized_expression_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, parenthesized_expression_filter.aggregate.aggregations[0].filter_expressions[0].op);
+
+    var not_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE NOT (status = 'closed' AND amount = 0)) AS active_count FROM usage_records GROUP BY customer ORDER BY COUNT(*) FILTER (WHERE NOT (status = 'closed' AND amount = 0)) DESC",
+        schema,
+        &.{},
+    );
+    defer not_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), not_filter.aggregate.aggregations[0].filter_not.len);
+    try std.testing.expectEqual(@as(usize, 2), not_filter.aggregate.aggregations[0].filter_not[0].conditions.len);
+    try std.testing.expectEqualStrings("status", not_filter.aggregate.aggregations[0].filter_not[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("amount", not_filter.aggregate.aggregations[0].filter_not[0].conditions[1].lhs.field);
+    try std.testing.expectEqual(@as(usize, 1), not_filter.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("active_count", not_filter.aggregate.order_by[0].field);
+
+    var expression_direct_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, SUM(amount + 1) AS adjusted_amount FROM usage_records GROUP BY customer HAVING SUM(amount + 1) > 10",
+        schema,
+        &.{},
+    );
+    defer expression_direct_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_direct_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("adjusted_amount", expression_direct_having.aggregate.having_predicates[0].field);
+
+    var expression_direct_order = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, SUM(amount + 1) AS adjusted_amount FROM usage_records GROUP BY customer ORDER BY SUM(amount + 1) DESC",
+        schema,
+        &.{},
+    );
+    defer expression_direct_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_direct_order.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("adjusted_amount", expression_direct_order.aggregate.order_by[0].field);
+
+    var output_expression_order = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, SUM(amount) AS amount_sum FROM usage_records GROUP BY customer ORDER BY (amount_sum - order_count) DESC",
+        schema,
+        &.{},
+    );
+    defer output_expression_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), output_expression_order.aggregate.order_by.len);
+    try std.testing.expect(output_expression_order.aggregate.order_by[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, output_expression_order.aggregate.order_by[0].expression.?.kind);
+    try std.testing.expectEqualStrings("amount_sum", output_expression_order.aggregate.order_by[0].expression.?.operands[0].field);
+    try std.testing.expectEqualStrings("order_count", output_expression_order.aggregate.order_by[0].expression.?.operands[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, output_expression_order.aggregate.order_by[0].direction);
+
+    var duplicate_direct_having = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, COUNT(*) AS duplicate_count FROM usage_records GROUP BY customer HAVING COUNT(*) > 0",
+        schema,
+        &.{},
+    );
+    defer duplicate_direct_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_direct_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("order_count", duplicate_direct_having.aggregate.having_predicates[0].field);
+
+    var duplicate_direct_order = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count, COUNT(*) AS duplicate_count FROM usage_records GROUP BY customer ORDER BY COUNT(*) DESC",
+        schema,
+        &.{},
+    );
+    defer duplicate_direct_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_direct_order.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("order_count", duplicate_direct_order.aggregate.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, duplicate_direct_order.aggregate.order_by[0].direction);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer ORDER BY customer",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer ORDER BY 2",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, customer, COUNT(*) AS order_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, lower(status) AS customer, COUNT(*) AS order_count FROM usage_records GROUP BY customer, lower(status)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key, upper(status) AS status_key, COUNT(*) AS order_count FROM usage_records GROUP BY lower(status), upper(status)",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer HAVING customer > 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count FROM usage_records GROUP BY customer HAVING missing_alias > 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count FROM usage_records GROUP BY 0",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS order_count FROM usage_records GROUP BY 2",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers select distinct to group-only aggregate" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"created_at":{"type":"numeric"}},"required":["id","status","customer"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT DISTINCT customer, status FROM usage_records WHERE status = $1 ORDER BY customer ASC NULLS LAST, status DESC NULLS FIRST LIMIT 5 OFFSET 2",
+        schema,
+        &.{.{ .string = "open" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", lowered.aggregate.group_by[0]);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.group_by[1]);
+    try std.testing.expectEqual(@as(usize, 0), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.source.predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.source.predicates[0].field);
+    try std.testing.expectEqualStrings("\"open\"", lowered.aggregate.source.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 4), lowered.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("customer", lowered.aggregate.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, lowered.aggregate.order_by[0].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.aggregate.order_by[0].direction);
+    try std.testing.expectEqualStrings("customer", lowered.aggregate.order_by[1].field);
+    try std.testing.expect(lowered.aggregate.order_by[1].null_test == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, lowered.aggregate.order_by[1].direction);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.order_by[2].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, lowered.aggregate.order_by[2].null_test.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.order_by[2].direction);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.order_by[3].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.order_by[3].direction);
+    try std.testing.expectEqual(@as(u32, 5), lowered.aggregate.limit.?);
+    try std.testing.expectEqual(@as(u32, 2), lowered.aggregate.offset);
+
+    var expression_distinct = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT DISTINCT lower(status) AS status_key FROM usage_records WHERE status = $1 ORDER BY status_key ASC LIMIT 4",
+        schema,
+        &.{.{ .string = "open" }},
+    );
+    defer expression_distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_distinct.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_distinct.aggregate.group_expressions.len);
+    try std.testing.expectEqualStrings("status_key", expression_distinct.aggregate.group_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_distinct.aggregate.group_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 0), expression_distinct.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("status_key", expression_distinct.aggregate.order_by[0].field);
+    try std.testing.expectEqual(@as(u32, 4), expression_distinct.aggregate.limit.?);
+
+    var expression_grouped = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(status) HAVING status_key = 'open' ORDER BY 1",
+        schema,
+        &.{},
+    );
+    defer expression_grouped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_grouped.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_grouped.aggregate.group_expressions.len);
+    try std.testing.expectEqualStrings("status_key", expression_grouped.aggregate.group_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_grouped.aggregate.group_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression_grouped.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("row_count", expression_grouped.aggregate.aggregations[0].name);
+    try std.testing.expectEqual(@as(usize, 1), expression_grouped.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("status_key", expression_grouped.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), expression_grouped.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("status_key", expression_grouped.aggregate.order_by[0].field);
+
+    var expression_alias_grouped = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS status_key, COUNT(*) AS row_count FROM usage_records GROUP BY status_key HAVING status_key = 'open' ORDER BY status_key ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer expression_alias_grouped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_alias_grouped.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_alias_grouped.aggregate.group_expressions.len);
+    try std.testing.expectEqualStrings("status_key", expression_alias_grouped.aggregate.group_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_alias_grouped.aggregate.group_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression_alias_grouped.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("row_count", expression_alias_grouped.aggregate.aggregations[0].name);
+
+    var field_alias_grouped = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer AS customer_key, COUNT(*) AS row_count FROM usage_records GROUP BY customer_key ORDER BY customer_key ASC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer field_alias_grouped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), field_alias_grouped.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 1), field_alias_grouped.aggregate.group_expressions.len);
+    try std.testing.expectEqualStrings("customer_key", field_alias_grouped.aggregate.group_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, field_alias_grouped.aggregate.group_expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("customer", field_alias_grouped.aggregate.group_expressions[0].expression.field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(status) AS customer, COUNT(*) AS row_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    ));
+
+    var distinct_on = try lowerSelectAlloc(
+        alloc,
+        "SELECT DISTINCT ON (customer) customer, id FROM usage_records WHERE status = 'open' ORDER BY customer ASC, created_at DESC LIMIT 3",
+        schema,
+        &.{},
+    );
+    defer distinct_on.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", distinct_on.table_name);
+    try std.testing.expectEqual(@as(usize, 1), distinct_on.query.distinct_on_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, distinct_on.query.distinct_on_expressions[0].kind);
+    try std.testing.expectEqualStrings("customer", distinct_on.query.distinct_on_expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 2), distinct_on.query.select.len);
+    try std.testing.expectEqual(@as(usize, 2), distinct_on.query.order_by.len);
+    try std.testing.expectEqual(@as(u32, 3), distinct_on.query.limit.?);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT DISTINCT ON (customer) customer FROM usage_records",
+        schema,
+        &.{},
+    ));
+    var distinct_grouped_aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT DISTINCT customer, COUNT(*) AS row_count FROM usage_records GROUP BY customer HAVING COUNT(*) > 0 ORDER BY COUNT(*) DESC",
+        schema,
+        &.{},
+    );
+    defer distinct_grouped_aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), distinct_grouped_aggregate.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", distinct_grouped_aggregate.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 1), distinct_grouped_aggregate.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("row_count", distinct_grouped_aggregate.aggregate.aggregations[0].name);
+    try std.testing.expectEqual(@as(usize, 1), distinct_grouped_aggregate.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("row_count", distinct_grouped_aggregate.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), distinct_grouped_aggregate.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("row_count", distinct_grouped_aggregate.aggregate.order_by[0].field);
+
+    var distinct_global_aggregate = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT DISTINCT COUNT(*) AS row_count FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer distinct_global_aggregate.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), distinct_global_aggregate.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 0), distinct_global_aggregate.aggregate.group_expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), distinct_global_aggregate.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("row_count", distinct_global_aggregate.aggregate.aggregations[0].name);
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+        alloc,
+        "SELECT DISTINCT ON (customer) customer, id FROM usage_records ORDER BY created_at DESC",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT DISTINCT customer FROM usage_records HAVING customer = 'c1'",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers filtered aggregate predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"scope":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status = 'open') AS open_count, SUM(amount) FILTER (WHERE status = 'open' AND amount > 10) AS open_amount_sum, COUNT(*) FILTER (WHERE lower(status) = 'open') AS open_lower_count, COUNT(*) FILTER (WHERE coalesce(status, 'missing') = 'open') AS open_coalesced_count, SUM(amount) FILTER (WHERE greatest(amount, 0) > 10) AS positive_amount_sum, COUNT(*) FILTER (WHERE array_length(tags, 1) > 0) AS tagged_count, COUNT(*) FILTER (WHERE string_to_array(scope, ' ') @> $1) AS writable_count, COUNT(*) FILTER (WHERE metadata @> '{\"source\":\"api\"}'::jsonb) AS api_count, COUNT(*) FILTER (WHERE metadata ? 'flags') AS flagged_count, COUNT(*) FILTER (WHERE metadata ? $5::text) AS dynamic_flag_count, COUNT(*) FILTER (WHERE metadata->'flags' = $4::jsonb) AS rated_count, COUNT(*) FILTER (WHERE tags @> $2) AS hot_count, COUNT(*) FILTER (WHERE 'hot' = ANY(tags)) AS any_hot_count, COUNT(*) FILTER (WHERE tags = $3) AS exact_tags_count, COUNT(*) FILTER (WHERE status IN ('open', 'pending')) AS openish_count, COUNT(*) FILTER (WHERE status ILIKE 'op%') AS status_prefix_count FROM usage_records GROUP BY customer ORDER BY open_amount_sum DESC LIMIT 10",
+        schema,
+        &.{ .{ .json = "[\"write\"]" }, .{ .json = "[\"hot\"]" }, .{ .json = "[\"hot\",\"new\"]" }, .{ .json = "[\"rated\"]" }, .{ .string = "flags" } },
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 16), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].filter_predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].filter_predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.aggregate.aggregations[0].filter_predicates[0].op);
+    try std.testing.expectEqualStrings("\"open\"", lowered.aggregate.aggregations[0].filter_predicates[0].value_json.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[1].op);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].field.?);
+    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations[1].filter_predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[1].filter_predicates[0].field);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].filter_predicates[1].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, lowered.aggregate.aggregations[1].filter_predicates[1].op);
+    try std.testing.expectEqualStrings("10", lowered.aggregate.aggregations[1].filter_predicates[1].value_json.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqual(@as(usize, 0), lowered.aggregate.aggregations[2].filter_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[2].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.aggregate.aggregations[2].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.aggregate.aggregations[2].filter_expressions[0].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[3].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.aggregate.aggregations[3].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.aggregate.aggregations[3].filter_expressions[0].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[4].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.greatest, lowered.aggregate.aggregations[4].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, lowered.aggregate.aggregations[4].filter_expressions[0].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[5].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.aggregate.aggregations[5].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, lowered.aggregate.aggregations[5].filter_expressions[0].op);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[6].filter_expression_array_contains.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.string_to_array, lowered.aggregate.aggregations[6].filter_expression_array_contains[0].expression.kind);
+    try std.testing.expectEqualStrings("[\"write\"]", lowered.aggregate.aggregations[6].filter_expression_array_contains[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[7].filter_json_contains.len);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[7].filter_json_contains[0].field);
+    try std.testing.expectEqualStrings("{\"source\":\"api\"}", lowered.aggregate.aggregations[7].filter_json_contains[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[8].filter_json_path_exists.len);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[8].filter_json_path_exists[0].field);
+    try std.testing.expectEqualStrings("flags", lowered.aggregate.aggregations[8].filter_json_path_exists[0].path);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[9].filter_json_path_exists.len);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[9].filter_json_path_exists[0].field);
+    try std.testing.expectEqualStrings("flags", lowered.aggregate.aggregations[9].filter_json_path_exists[0].path);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[10].filter_json_path_eq.len);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[10].filter_json_path_eq[0].field);
+    try std.testing.expectEqualStrings("flags", lowered.aggregate.aggregations[10].filter_json_path_eq[0].path);
+    try std.testing.expectEqualStrings("[\"rated\"]", lowered.aggregate.aggregations[10].filter_json_path_eq[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[11].filter_array_contains.len);
+    try std.testing.expectEqualStrings("tags", lowered.aggregate.aggregations[11].filter_array_contains[0].field);
+    try std.testing.expectEqualStrings("[\"hot\"]", lowered.aggregate.aggregations[11].filter_array_contains[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[12].filter_array_any.len);
+    try std.testing.expectEqualStrings("tags", lowered.aggregate.aggregations[12].filter_array_any[0].field);
+    try std.testing.expectEqualStrings("\"hot\"", lowered.aggregate.aggregations[12].filter_array_any[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[13].filter_array_eq.len);
+    try std.testing.expectEqualStrings("tags", lowered.aggregate.aggregations[13].filter_array_eq[0].field);
+    try std.testing.expectEqualStrings("[\"hot\",\"new\"]", lowered.aggregate.aggregations[13].filter_array_eq[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[14].filter_in_predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[14].filter_in_predicates[0].field);
+    try std.testing.expectEqualStrings("[\"open\",\"pending\"]", lowered.aggregate.aggregations[14].filter_in_predicates[0].values_json);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[15].filter_text_patterns.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[15].filter_text_patterns[0].field);
+    try std.testing.expectEqualStrings("op%", lowered.aggregate.aggregations[15].filter_text_patterns[0].pattern);
+    try std.testing.expect(lowered.aggregate.aggregations[15].filter_text_patterns[0].case_insensitive);
+
+    var escaped_pattern = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status LIKE 'op!_%' ESCAPE '!') AS escaped_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer escaped_pattern.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), escaped_pattern.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), escaped_pattern.aggregate.aggregations[0].filter_text_patterns.len);
+    try std.testing.expectEqualStrings("status", escaped_pattern.aggregate.aggregations[0].filter_text_patterns[0].field);
+    try std.testing.expectEqualStrings("op\\_%", escaped_pattern.aggregate.aggregations[0].filter_text_patterns[0].pattern);
+
+    var computed_pattern_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) ILIKE 'op!_%' ESCAPE '!') AS computed_pattern_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_filter.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_filter.aggregate.aggregations[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.ilike, computed_pattern_filter.aggregate.aggregations[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("\"op\\\\_%\"", computed_pattern_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_pattern_filter.aggregate.aggregations[0].filter_expressions[0].rhs[0].value_json);
+
+    var computed_pattern_set_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) LIKE ANY(ARRAY['op%', 'ready%'])) AS computed_pattern_set_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_set_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_set_filter.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"op%\"", computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_pattern_set_filter.aggregate.aggregations[0].filter_expressions[0].rhs[0].value_json);
+
+    var computed_pattern_some_filter = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) LIKE SOME(ARRAY['op%', 'ready%'])) AS computed_pattern_set_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer computed_pattern_some_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_some_filter.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("\"op%\"", computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_pattern_some_filter.aggregate.aggregations[0].filter_expressions[0].rhs[0].value_json);
+
+    var constructor_arrays = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE tags @> ARRAY['hot']) AS hot_count, COUNT(*) FILTER (WHERE tags = ARRAY['hot','new']::text[]) AS exact_tags_count FROM usage_records GROUP BY customer ORDER BY hot_count DESC LIMIT 10",
+        schema,
+        &.{},
+    );
+    defer constructor_arrays.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), constructor_arrays.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 1), constructor_arrays.aggregate.aggregations[0].filter_array_contains.len);
+    try std.testing.expectEqualStrings("tags", constructor_arrays.aggregate.aggregations[0].filter_array_contains[0].field);
+    try std.testing.expectEqualStrings("[\"hot\"]", constructor_arrays.aggregate.aggregations[0].filter_array_contains[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), constructor_arrays.aggregate.aggregations[1].filter_array_eq.len);
+    try std.testing.expectEqualStrings("tags", constructor_arrays.aggregate.aggregations[1].filter_array_eq[0].field);
+    try std.testing.expectEqualStrings("[\"hot\",\"new\"]", constructor_arrays.aggregate.aggregations[1].filter_array_eq[0].value_json);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE tags @> $1) AS bad_tags FROM usage_records GROUP BY customer",
+        schema,
+        &.{.{ .json = "[\"hot\",3]" }},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE string_to_array(scope, ' ') @> $1) AS bad_scope FROM usage_records GROUP BY customer",
+        schema,
+        &.{.{ .json = "[\"write\",3]" }},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) = 3) AS bad_lower_status FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE status IN ('open', 3)) AS bad_status FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    ));
+
+    var expression_membership = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) IN ('open', 'pending')) AS lower_openish, COUNT(*) FILTER (WHERE array_length(tags, 1) = ANY($1)) AS tag_bucket FROM usage_records GROUP BY customer",
+        schema,
+        &.{.{ .json = "[1,2]" }},
+    );
+    defer expression_membership.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), expression_membership.aggregate.aggregations.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_membership.aggregate.aggregations[0].filter_any.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_membership.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("\"open\"", expression_membership.aggregate.aggregations[0].filter_any[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("\"pending\"", expression_membership.aggregate.aggregations[0].filter_any[1].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 2), expression_membership.aggregate.aggregations[1].filter_any.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, expression_membership.aggregate.aggregations[1].filter_any[0].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("1", expression_membership.aggregate.aggregations[1].filter_any[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqualStrings("2", expression_membership.aggregate.aggregations[1].filter_any[1].conditions[0].rhs[0].value_json);
+
+    var expression_membership_or = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) IN ('open', 'pending') OR status = 'queued') AS routed_count FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer expression_membership_or.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), expression_membership_or.aggregate.aggregations[0].filter_any.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_membership_or.aggregate.aggregations[0].filter_any[0].conditions[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_membership_or.aggregate.aggregations[0].filter_any[1].conditions[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", expression_membership_or.aggregate.aggregations[0].filter_any[2].conditions[0].lhs.field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE lower(status) IN ('open', 3)) AS bad_lower_status FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) FILTER (WHERE array_length(tags, 1) = ANY($1)) AS bad_tag_bucket FROM usage_records GROUP BY customer",
+        schema,
+        &.{.{ .json = "[1,\"bad\"]" }},
+    ));
+}
+
+test "sql adapter lower expr lowers distinct aggregate specs" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(DISTINCT status) AS status_count, SUM(DISTINCT amount) FILTER (WHERE status = 'open') AS open_amount_sum FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
+    try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[0].distinct_max_items);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[1].op);
+    try std.testing.expect(lowered.aggregate.aggregations[1].distinct);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[1].distinct_max_items);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].field.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[1].filter_predicates.len);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[1].filter_predicates[0].field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT COUNT(DISTINCT *) AS row_count FROM usage_records",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers aggregate expression inputs" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"tags":{"type":"array","items":{"type":"keyword"}},"metadata":{"type":"json"}},"required":["id","status","customer","amount","discount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(DISTINCT lower(status)) AS status_count, SUM(amount - discount) AS net_amount, COUNT(DISTINCT coalesce(status, 'missing')) AS status_bucket_count, SUM(coalesce(amount, 0)) AS amount_total, SUM(array_length(tags, 1)) AS tag_total, SUM(octet_length(status)) AS status_bytes, SUM(bit_length(status)) AS status_bits, SUM(regexp_count(status, '[0-9]+')) AS status_digit_groups, SUM(regexp_instr(status, '[A-Z]+')) AS status_letter_offsets, COUNT(DISTINCT regexp_substr(status, '[A-Z]+')) AS status_token_count, COUNT(DISTINCT metadata->>'source') AS source_count, ARRAY_AGG(metadata->'flags') AS flag_sets FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 12), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
+    try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expect(lowered.aggregate.aggregations[0].field == null);
+    try std.testing.expect(lowered.aggregate.aggregations[0].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.aggregate.aggregations[0].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[1].op);
+    try std.testing.expect(lowered.aggregate.aggregations[1].field == null);
+    try std.testing.expect(lowered.aggregate.aggregations[1].expression != null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[2].op);
+    try std.testing.expect(lowered.aggregate.aggregations[2].distinct);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.aggregate.aggregations[2].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[3].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.coalesce, lowered.aggregate.aggregations[3].expression.?.kind);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[3].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[4].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.array_length, lowered.aggregate.aggregations[4].expression.?.kind);
+    try std.testing.expectEqualStrings("tags", lowered.aggregate.aggregations[4].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[5].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.octet_length, lowered.aggregate.aggregations[5].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[5].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[6].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bit_length, lowered.aggregate.aggregations[6].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[6].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[7].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_count, lowered.aggregate.aggregations[7].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[7].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.sum, lowered.aggregate.aggregations[8].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_instr, lowered.aggregate.aggregations[8].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[8].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[9].op);
+    try std.testing.expect(lowered.aggregate.aggregations[9].distinct);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.regexp_substr, lowered.aggregate.aggregations[9].expression.?.kind);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[9].expression.?.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[10].op);
+    try std.testing.expect(lowered.aggregate.aggregations[10].distinct);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.aggregate.aggregations[10].expression.?.kind);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[10].expression.?.operands[0].field);
+    try std.testing.expect(lowered.aggregate.aggregations[10].expression.?.json_as_text);
+    try std.testing.expectEqualStrings("source", lowered.aggregate.aggregations[10].expression.?.json_path);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.aggregate.aggregations[11].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.json_extract, lowered.aggregate.aggregations[11].expression.?.kind);
+    try std.testing.expectEqualStrings("metadata", lowered.aggregate.aggregations[11].expression.?.operands[0].field);
+    try std.testing.expect(!lowered.aggregate.aggregations[11].expression.?.json_as_text);
+    try std.testing.expectEqualStrings("flags", lowered.aggregate.aggregations[11].expression.?.json_path);
+}
+
+test "sql adapter lower expr lowers bounded array aggregate specs" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"metadata":{"type":"json"}},"required":["id","status","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, ARRAY_AGG(DISTINCT status ORDER BY amount DESC) FILTER (WHERE amount > 10) AS statuses FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, lowered.aggregate.aggregations[0].op);
+    try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[0].distinct_max_items);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(default_array_agg_max_items, lowered.aggregate.aggregations[0].array_max_items);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].array_order_by.len);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].array_order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.aggregations[0].array_order_by[0].direction);
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].filter_predicates.len);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].filter_predicates[0].field);
+
+    var json_lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, ARRAY_AGG(metadata) AS metadata_values FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer json_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), json_lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, json_lowered.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("metadata", json_lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(default_array_agg_max_items, json_lowered.aggregate.aggregations[0].array_max_items);
+
+    var string_lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, string_agg(DISTINCT status, '|' ORDER BY amount DESC) AS status_text FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer string_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), string_lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.string_agg, string_lowered.aggregate.aggregations[0].op);
+    try std.testing.expect(string_lowered.aggregate.aggregations[0].distinct);
+    try std.testing.expectEqualStrings("status", string_lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqualStrings("|", string_lowered.aggregate.aggregations[0].string_delimiter.?);
+    try std.testing.expectEqual(default_array_agg_max_items, string_lowered.aggregate.aggregations[0].array_max_items);
+    try std.testing.expectEqual(@as(usize, 1), string_lowered.aggregate.aggregations[0].array_order_by.len);
+    try std.testing.expectEqualStrings("amount", string_lowered.aggregate.aggregations[0].array_order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, string_lowered.aggregate.aggregations[0].array_order_by[0].direction);
+}
+
+test "sql adapter lower expr lowers exact percentile continuous aggregates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer":{"type":"keyword"},"amount":{"type":"numeric"},"discount":{"type":"numeric"},"status":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id","customer","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount, percentile_cont(0.9) WITHIN GROUP (ORDER BY amount - discount DESC) AS p90_net, percentile_disc(0.75) WITHIN GROUP (ORDER BY amount DESC) AS p75_amount FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", lowered.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 3), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, lowered.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("median_amount", lowered.aggregate.aggregations[0].name);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(@as(f64, 0.5), lowered.aggregate.aggregations[0].percentile.?);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_percentile_max_items, lowered.aggregate.aggregations[0].percentile_max_items);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, lowered.aggregate.aggregations[1].op);
+    try std.testing.expectEqualStrings("p90_net", lowered.aggregate.aggregations[1].name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.sub, lowered.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(@as(f64, 0.9), lowered.aggregate.aggregations[1].percentile.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.aggregations[1].percentile_order);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_disc, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqualStrings("p75_amount", lowered.aggregate.aggregations[2].name);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[2].field.?);
+    try std.testing.expectEqual(@as(f64, 0.75), lowered.aggregate.aggregations[2].percentile.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.aggregations[2].percentile_order);
+
+    var explicit_nulls = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount NULLS LAST) AS median_amount FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer explicit_nulls.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), explicit_nulls.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, explicit_nulls.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("amount", explicit_nulls.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(@as(f64, 0.5), explicit_nulls.aggregate.aggregations[0].percentile.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, explicit_nulls.aggregate.aggregations[0].percentile_order);
+
+    var multi_fraction = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT percentile_cont(ARRAY[0.25, 0.5, 0.75]) WITHIN GROUP (ORDER BY amount) AS amount_percentiles FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer multi_fraction.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), multi_fraction.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, multi_fraction.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("amount_percentiles", multi_fraction.aggregate.aggregations[0].name);
+    try std.testing.expectEqualStrings("amount", multi_fraction.aggregate.aggregations[0].field.?);
+    try std.testing.expect(multi_fraction.aggregate.aggregations[0].percentile == null);
+    try std.testing.expectEqual(@as(usize, 3), multi_fraction.aggregate.aggregations[0].percentiles.len);
+    try std.testing.expectEqual(@as(f64, 0.25), multi_fraction.aggregate.aggregations[0].percentiles[0]);
+    try std.testing.expectEqual(@as(f64, 0.5), multi_fraction.aggregate.aggregations[0].percentiles[1]);
+    try std.testing.expectEqual(@as(f64, 0.75), multi_fraction.aggregate.aggregations[0].percentiles[2]);
+
+    var mode_lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, mode() WITHIN GROUP (ORDER BY status) AS modal_status, mode() WITHIN GROUP (ORDER BY lower(status) DESC) AS modal_status_key FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer mode_lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mode_lowered.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 2), mode_lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.mode, mode_lowered.aggregate.aggregations[0].op);
+    try std.testing.expectEqualStrings("modal_status", mode_lowered.aggregate.aggregations[0].name);
+    try std.testing.expectEqualStrings("status", mode_lowered.aggregate.aggregations[0].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, mode_lowered.aggregate.aggregations[0].percentile_order);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.mode, mode_lowered.aggregate.aggregations[1].op);
+    try std.testing.expectEqualStrings("modal_status_key", mode_lowered.aggregate.aggregations[1].name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mode_lowered.aggregate.aggregations[1].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, mode_lowered.aggregate.aggregations[1].percentile_order);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT percentile_cont([0.25, 0.75]) WITHIN GROUP (ORDER BY amount) AS bad FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY status) AS bad FROM usage_records",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT mode() WITHIN GROUP (ORDER BY metadata) AS bad FROM usage_records",
+        schema,
+        &.{},
+    ));
+}
+
+test "sql adapter lower expr lowers global aggregate queries" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"status":{"type":"keyword"},"created_at":{"type":"datetime"},"metadata":{"type":"json"}},"required":["id","amount"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT COUNT(*) AS row_count, MIN(amount) AS min_amount, MAX(amount) AS max_amount, MIN(status) AS first_status, MAX(lower(status)) AS last_status_key, MAX(created_at) AS latest_created_at FROM usage_records",
+        schema,
+        &.{},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.aggregate.group_by.len);
+    try std.testing.expectEqual(@as(usize, 6), lowered.aggregate.aggregations.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.count, lowered.aggregate.aggregations[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.min, lowered.aggregate.aggregations[1].op);
+    try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[1].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.max, lowered.aggregate.aggregations[2].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.min, lowered.aggregate.aggregations[3].op);
+    try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[3].field.?);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.max, lowered.aggregate.aggregations[4].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.aggregate.aggregations[4].expression.?.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.max, lowered.aggregate.aggregations[5].op);
+    try std.testing.expectEqualStrings("created_at", lowered.aggregate.aggregations[5].field.?);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT MIN(metadata) AS first_metadata FROM usage_records",
+        schema,
+        &.{},
+    ));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, COUNT(*) AS row_count FROM usage_records",
+        schema,
+        &.{},
+    ));
 }
 
 test "sql adapter lower expr lowers select all with named extra projections" {

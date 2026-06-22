@@ -6074,8 +6074,9 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    adapter-level syntax for native typed query requests rather than relational
    row-plan fragments. The parity corpus treats them as a first-class
    `query_function` family and gates full-text, dense, graph-search,
-   graph-metric, graph-rerank, and hybrid request production from data-driven
-   fixture entries. PL/pgSQL
+   graph traversal/path, graph-metric, graph-rerank, simple hybrid, and
+   structured hybrid source-list request production from data-driven fixture
+   entries. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

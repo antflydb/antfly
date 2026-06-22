@@ -14994,6 +14994,28 @@ test "sql adapter lower dml lowers update jsonb concat into json set operations"
     try std.testing.expectEqualStrings("{\"source_text\":\"old\",\"flags_json\":[\"rated\"]}", lowered.batch.returning_rows[0]);
 }
 
+test "sql adapter lower dml evaluates concat returning expression from typed plan" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"first_name":{"type":"keyword"},"last_name":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"first_name\":\"Ada\",\"last_name\":\"Lovelace\",\"email\":\"ada@example.test\",\"status\":\"pending\"}", .version = 7 };
+
+    var mutation = try lowerUpdateForTestAlloc(
+        alloc,
+        "UPDATE users SET status = $1 WHERE id = $2 RETURNING status || ':' || id AS status_key",
+        schema,
+        &.{ .{ .string = "active" }, .{ .string = "u1" } },
+        resolver_ctx.resolver(),
+    );
+    defer mutation.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), mutation.batch.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"status_key\":\"active:u1\"}", mutation.batch.returning_rows[0]);
+}
+
 test "sql adapter lower dml evaluates now returning expression from typed plan" {
     const alloc = std.testing.allocator;
     const schema_json =
