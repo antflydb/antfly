@@ -14,7 +14,6 @@
 
 const std = @import("std");
 
-const classifier = @import("classifier.zig");
 const corpus = @import("corpus.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const plan = @import("plan.zig");
@@ -202,7 +201,7 @@ fn expectSqlAdapterEdgeCaseClassifyWrite(
 ) !void {
     try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
     const expected_kind = edge_case.expected_write_kind orelse return error.TestUnexpectedResult;
-    const actual = parsed_sql.writeStatementKind() orelse classifier.classifyWriteStatement(parsed_sql.items()) orelse return error.TestUnexpectedResult;
+    const actual = parsed_sql.writeStatementKind() orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(expected_kind, actual);
 }
 

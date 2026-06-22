@@ -2090,10 +2090,6 @@ pub const ReadPlanLoweringHooks = struct {
     lower_set_operation: *const fn (*anyopaque) anyerror!LoweredSetOperationPlan,
 };
 
-const ReadPlanDispatchState = struct {
-    saw_invalid_catalog: bool = false,
-};
-
 fn lowerReadPlanKindWithHooks(hooks: ReadPlanLoweringHooks, kind: classifier.SqlReadStatementKind) !LoweredReadPlan {
     return switch (kind) {
         .lateral => .{ .lateral = try hooks.lower_lateral(hooks.ptr) },
@@ -2102,57 +2098,15 @@ fn lowerReadPlanKindWithHooks(hooks: ReadPlanLoweringHooks, kind: classifier.Sql
         .recursive_cte => .{ .recursive_cte = try hooks.lower_recursive_cte(hooks.ptr) },
         .join => .{ .join = try hooks.lower_join(hooks.ptr) },
         .query => .{ .query = try hooks.lower_query(hooks.ptr) },
-        .set_operation => blk: {
-            if (hooks.lower_query(hooks.ptr)) |lowered| {
-                break :blk .{ .query = lowered };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
-            }
-            break :blk .{ .set_operation = try hooks.lower_set_operation(hooks.ptr) };
-        },
+        .set_operation => .{ .set_operation = try hooks.lower_set_operation(hooks.ptr) },
     };
 }
 
-fn tryLowerReadPlanKindWithHooks(
-    hooks: ReadPlanLoweringHooks,
-    kind: classifier.SqlReadStatementKind,
-    state: *ReadPlanDispatchState,
-) !?LoweredReadPlan {
-    if (lowerReadPlanKindWithHooks(hooks, kind)) |lowered| {
-        return lowered;
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => return null,
-        error.InvalidSqlCatalog => {
-            state.saw_invalid_catalog = true;
-            return null;
-        },
-        else => return err,
-    }
-}
-
 pub fn lowerReadPlanWithHooks(hooks: ReadPlanLoweringHooks) !LoweredReadPlan {
-    var state = ReadPlanDispatchState{};
-
     if (hooks.statement_kind) |kind| {
         return try lowerReadPlanKindWithHooks(hooks, kind);
     }
 
-    const fallback_order = [_]classifier.SqlReadStatementKind{
-        .lateral,
-        .window,
-        .aggregate,
-        .recursive_cte,
-        .join,
-        .query,
-        .set_operation,
-    };
-    for (fallback_order) |kind| {
-        if (hooks.statement_kind != null and hooks.statement_kind.? == kind) continue;
-        if (try tryLowerReadPlanKindWithHooks(hooks, kind, &state)) |lowered| return lowered;
-    }
-
-    if (state.saw_invalid_catalog) return error.InvalidSqlCatalog;
     return error.UnsupportedSqlShape;
 }
 

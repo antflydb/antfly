@@ -282,10 +282,10 @@ Current implementation status:
 - `classifier.zig` classifies read families (`query`, `set_operation`,
   `recursive_cte`, `aggregate`, `join`, `lateral`, and `window`) and write
   families from the shared token stream.
-- Read lowering dispatches through the classified statement family before
-  falling back to the legacy probe order for unclassified or future shapes. Set
-  operation-shaped SQL still tries the query optimizer first so existing
-  predicate-rewrite plans remain available before the native set-operation plan.
+- Parsed read lowering dispatches strictly through the parsed statement
+  variant. The lower-level hook API fails closed when a caller does not supply
+  a statement kind. Set-operation-shaped SQL routes through its native
+  set-operation variant rather than a query-first probe.
 - Write lowering consumes `TokenizedSql` for write-family selection instead of
   tokenizing separately from classification.
 - `ParsedSql` wraps `TokenizedSql` with a raw statement view and byte-source
