@@ -1885,12 +1885,13 @@ scalar key into one target. Catalog-backed MERGE lowering resolves a
 cross-table source schema from the table catalog before validating source-field
 assignments, so SQL text cannot smuggle source columns past the typed
 source/target schema boundary. Public `/db/v1/sql` execution now uses this shape
-for direct table-source MERGE and recursive CTE-backed MERGE: it collects typed
-preimages through public read sources, builds an owned row-batch mutation, and
-applies that batch through the ordinary public row-batch authorization, trigger,
-transaction, and commit path. Non-recursive source-CTE MERGE and
-data-modifying-CTE MERGE producers remain fail-closed until their materialized
-source rows can enter the same preimage-to-row-batch boundary. Remaining
+for direct table-source MERGE, non-recursive source-CTE MERGE, and recursive
+CTE-backed MERGE: it collects typed preimages through public read sources,
+materializes source CTEs through the typed row-query planner, builds an owned
+row-batch mutation, and applies that batch through the ordinary public row-batch
+authorization, trigger, transaction, and commit path. Data-modifying-CTE MERGE
+producers remain fail-closed until their materialized write output can be bound
+to row claims and enter the same preimage-to-row-batch boundary. Remaining
 production MERGE work is owner-group topology hardening: provisioned/hosted
 write execution needs broader chaos coverage around matched target intents and
 unmatched target inserts while range movement races collection, staging,

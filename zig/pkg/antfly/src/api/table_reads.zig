@@ -5659,7 +5659,16 @@ pub fn rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
     )) orelse return null;
     defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_rows);
 
-    var source_rows = (try collectMergeSourceRowsFromRoutedScansAlloc(
+    var source_rows = if (plan.ctes.len != 0 or source_query.source_cte.len != 0) blk: {
+        if (plan.data_modifying_ctes.len != 0 or source_ranges.len != 0) return error.UnsupportedSqlShape;
+        break :blk (try source.rowsQueryPlan(
+            alloc,
+            source_table_name,
+            source_schema,
+            .{ .ctes = plan.ctes, .query = source_query },
+            consistency,
+        )) orelse return null;
+    } else (try collectMergeSourceRowsFromRoutedScansAlloc(
         alloc,
         source,
         source_table_name,
@@ -7549,16 +7558,6 @@ const RoutedMergeScanRows = struct {
     }
 };
 
-const RoutedMergeSourceRows = struct {
-    rows: [][]const u8,
-
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        for (self.rows) |row| alloc.free(@constCast(row));
-        if (self.rows.len > 0) alloc.free(self.rows);
-        self.* = undefined;
-    }
-};
-
 fn collectMergeTargetRowsFromRoutedScansAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
@@ -7592,7 +7591,7 @@ fn collectMergeSourceRowsFromRoutedScansAlloc(
     req: db_mod.types.RelationalRowsQueryRequest,
     ranges: []const db_mod.types.RelationalRowsDocKeyRange,
     consistency: raft_mod.ReadConsistency,
-) !?RoutedMergeSourceRows {
+) !?db_mod.types.RelationalRowsQueryResult {
     var scanned = (try collectMergeScanRowsFromRoutedScansAlloc(alloc, source, table_name, schema, ranges, consistency)) orelse return null;
     defer scanned.deinit(alloc);
 
@@ -7605,7 +7604,7 @@ fn collectMergeSourceRowsFromRoutedScansAlloc(
         rows[i] = row.json;
         row.json = "";
     }
-    return .{ .rows = rows };
+    return .{ .rows = rows, .total = std.math.cast(u32, rows.len) orelse return error.InvalidRowsRequest };
 }
 
 fn collectMergeScanRowsFromRoutedScansAlloc(

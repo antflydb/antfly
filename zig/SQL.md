@@ -171,13 +171,14 @@ executor wiring can share the native cross-table catalog barrier, identity
 allocator, and 2PC paths. Recursive CTE-backed claimed update/delete statements
 execute by materializing the bounded recursive producer through the typed read
 planner, filtering the referenced CTE output, and feeding those rows into the
-same joined mutation-source autocommit path. Direct table-source MERGE and
-recursive CTE-backed MERGE execute by collecting typed target/source preimages,
-building the deterministic row-batch mutation, and applying that batch through
-the ordinary public row-batch authorization, trigger, transaction, and commit
-path. Non-recursive source-CTE and data-modifying-CTE MERGE producers remain
-fail-closed until their materialized source rows can be fed through the same
-batch boundary without adding a SQL-text execution path.
+same joined mutation-source autocommit path. Direct table-source MERGE,
+non-recursive source-CTE MERGE, and recursive CTE-backed MERGE execute by
+collecting typed target/source preimages, building the deterministic row-batch
+mutation, and applying that batch through the ordinary public row-batch
+authorization, trigger, transaction, and commit path. Data-modifying-CTE MERGE
+producers remain fail-closed until their materialized write output can be bound
+to row claims and fed through the same batch boundary without adding a SQL-text
+execution path.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
@@ -849,6 +850,14 @@ Current implementation status:
   tags for statement heads, query-tail clauses, recursive write guards, row
   claim clauses, and returning clauses; selectors and assignments remain typed
   binder/expression/value work.
+- Point-selector classification, conflict-target parsing, and semijoin
+  mutation-source parsing use token keyword tags for structural statement
+  heads, `FROM`, `WHERE`, `IN`, `SELECT`, `FOR`, and `RETURNING` clauses.
+- Lower-DML fixed keyword parsing now uses token keyword metadata throughout
+  insert-source CTE lookup, conflict/joined assignment parsing, joined
+  predicate conjunctions, temporal `FOR PORTION`, `MERGE ... VALUES`, and
+  `jsonb_set` assignment helpers; the remaining dynamic operator-table probe is
+  intentionally semantic dispatch.
 - Read, join, lateral, window, aggregate, and lowerer test adapters classify
   CTE-shaped parsed statements from token keyword metadata instead of the
   compatibility string helper.

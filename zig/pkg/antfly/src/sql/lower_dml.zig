@@ -1413,9 +1413,9 @@ pub fn insertSourceSelectSourceCteSchema(
     planned_ctes: []const relational_rows.RowsPlannedCte,
 ) !?runtime_schema.TableSchema {
     if (planned_ctes.len == 0) return null;
-    const from_index = parser.findTopLevelKeyword(tokens[start..end], "from") orelse return null;
+    const from_index = parser.findTopLevelKeywordTag(tokens[start..end], .from) orelse return null;
     var source_index = start + from_index + 1;
-    _ = parser.matchKeyword(tokens, &source_index, "only");
+    _ = parser.matchKeywordTag(tokens, &source_index, .only);
     if (source_index >= end or tokens[source_index].kind != .identifier) return error.UnsupportedSqlShape;
     return relational_rows.rowsPlannedCteSchema(planned_ctes, tokens[source_index].text);
 }
@@ -2262,7 +2262,7 @@ pub fn parsePointWhereJsonAlloc(
         });
         field_transferred = true;
         value_transferred = true;
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
 
     if (lower_expr.fieldValuesMatchColumns(values.items, primary_key.columns)) {
@@ -2289,7 +2289,7 @@ pub fn parsePointWhereJsonAlloc(
 fn pointSelectorTailComplete(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return true;
     if (tokens[pos].kind == .semicolon) return pos + 1 == tokens.len;
-    return tokens[pos].matchesKeyword("returning");
+    return tokens[pos].matchesKeywordTag(.returning);
 }
 
 fn classifyParsedPointWhereAlloc(
@@ -2319,11 +2319,11 @@ pub fn classifyUpdateSelectorParsedSqlAlloc(
 ) !plan_mod.MutationSelectorKind {
     const tokens = parsed_sql.items();
     var pos: usize = 0;
-    try parser.expectKeyword(tokens, &pos, "update");
+    try parser.expectKeywordTag(tokens, &pos, .update);
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
     defer plan_mod.freeTableAlias(alloc, target_table);
 
-    const where_index = parser.findTopLevelKeywordFromIndex(tokens, pos, "where") orelse return .source;
+    const where_index = parser.findTopLevelKeywordTagFromIndex(tokens, pos, .where) orelse return .source;
     pos = where_index + 1;
     const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     const where_json = parsePointWhereJsonAlloc(alloc, tokens, &pos, params, schema, &selector_qualifiers, 0) catch |err| switch (err) {
@@ -2344,12 +2344,12 @@ pub fn classifyDeleteSelectorParsedSqlAlloc(
 ) !plan_mod.MutationSelectorKind {
     const tokens = parsed_sql.items();
     var pos: usize = 0;
-    try parser.expectKeyword(tokens, &pos, "delete");
-    try parser.expectKeyword(tokens, &pos, "from");
+    try parser.expectKeywordTag(tokens, &pos, .delete);
+    try parser.expectKeywordTag(tokens, &pos, .from);
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
     defer plan_mod.freeTableAlias(alloc, target_table);
 
-    const where_index = parser.findTopLevelKeywordFromIndex(tokens, pos, "where") orelse return .source;
+    const where_index = parser.findTopLevelKeywordTagFromIndex(tokens, pos, .where) orelse return .source;
     pos = where_index + 1;
     const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
     const where_json = parsePointWhereJsonAlloc(alloc, tokens, &pos, params, schema, &selector_qualifiers, 0) catch |err| switch (err) {
@@ -2669,7 +2669,7 @@ fn parseConflictUpdateRowAssignmentAlloc(
 }
 
 fn expectConflictRowAssignmentRhsStart(tokens: []const Token, pos: *usize) !void {
-    _ = parser.matchKeyword(tokens, pos, "row");
+    _ = parser.matchKeywordTag(tokens, pos, .row);
     try parser.expectToken(tokens, pos, .lparen);
 }
 
@@ -2762,7 +2762,7 @@ pub fn parseConflictUpdateAssignmentValueAlloc(
     field_transferred: *bool,
     hooks: ConflictUpdateAssignmentValueParserOptions,
 ) !void {
-    if (parser.matchKeyword(tokens, pos, "jsonb_set")) {
+    if (parser.matchKeywordTag(tokens, pos, .jsonb_set)) {
         if (column.field_type != .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const json_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
@@ -2777,7 +2777,7 @@ pub fn parseConflictUpdateAssignmentValueAlloc(
         var value_transferred = false;
         errdefer if (!value_transferred) freeJsonSetParsedValue(alloc, value);
         if (parser.matchToken(tokens, pos, .comma) != null) {
-            if (!parser.matchKeyword(tokens, pos, "true") and !parser.matchKeyword(tokens, pos, "false")) return error.UnsupportedSqlShape;
+            if (!parser.matchKeywordTag(tokens, pos, .true) and !parser.matchKeywordTag(tokens, pos, .false)) return error.UnsupportedSqlShape;
         }
         try parser.expectToken(tokens, pos, .rparen);
         try json_set.append(alloc, .{
@@ -2913,7 +2913,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
     target_transferred: *bool,
     options: JoinedMutationAssignmentValueParserOptions,
 ) !void {
-    if (parser.matchKeyword(tokens, pos, "jsonb_set")) {
+    if (parser.matchKeywordTag(tokens, pos, .jsonb_set)) {
         if (target_column.field_type != .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const json_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
@@ -2930,7 +2930,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
         var value_transferred = false;
         errdefer if (!value_transferred) freeJsonSetParsedValue(alloc, value);
         if (parser.matchToken(tokens, pos, .comma) != null) {
-            if (!parser.matchKeyword(tokens, pos, "true") and !parser.matchKeyword(tokens, pos, "false")) return error.UnsupportedSqlShape;
+            if (!parser.matchKeywordTag(tokens, pos, .true) and !parser.matchKeywordTag(tokens, pos, .false)) return error.UnsupportedSqlShape;
         }
         try parser.expectToken(tokens, pos, .rparen);
         try json_set.append(alloc, .{
@@ -3115,7 +3115,7 @@ fn parseJoinedMutationRowAssignmentAlloc(
     try grammar.validateSqlIdentifierListUnique(targets.items);
     try parser.expectToken(tokens, pos, .rparen);
     try parser.expectToken(tokens, pos, .eq);
-    _ = parser.matchKeyword(tokens, pos, "row");
+    _ = parser.matchKeywordTag(tokens, pos, .row);
     try parser.expectToken(tokens, pos, .lparen);
 
     const primary_key = schema.primary_key orelse return error.InvalidSqlCatalog;
@@ -3467,7 +3467,7 @@ pub fn parseMergeAssignmentExpressionAlloc(
     source_table: TableAlias,
     options: MergeAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (parser.matchKeyword(tokens, pos, "default")) {
+    if (parser.matchKeywordTag(tokens, pos, .default)) {
         const default_value = column.default_value orelse return error.UnsupportedSqlShape;
         const value_json = try relational_rows.relationalDefaultValueJsonAlloc(alloc, default_value);
         var value_transferred = false;
@@ -4445,7 +4445,7 @@ pub fn parseConflictActionWhereClause(
 ) !void {
     if (schema.relational_columns.len == 0) return error.InvalidSqlCatalog;
     const column = schema.relational_columns[0];
-    if (parser.matchKeyword(tokens, pos, "not")) {
+    if (parser.matchKeywordTag(tokens, pos, .not)) {
         try parser.expectToken(tokens, pos, .lparen);
         while (true) {
             const branch_groups = try parseConflictActionWhereBranchGroupsAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options, dispatch_options);
@@ -4457,7 +4457,7 @@ pub fn parseConflictActionWhereClause(
             try where_not.appendSlice(alloc, branch_groups);
             branch_groups_transferred = true;
             alloc.free(branch_groups);
-            if (!parser.matchKeyword(tokens, pos, "or")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"or")) break;
         }
         try parser.expectToken(tokens, pos, .rparen);
         return;
@@ -4480,7 +4480,7 @@ pub fn parseConflictActionWhereClause(
         try groups.appendSlice(alloc, branch_groups);
         branch_groups_transferred = true;
         alloc.free(branch_groups);
-        if (!parser.matchKeyword(tokens, pos, "or")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"or")) break;
     }
     if (wrapped_disjunction) try parser.expectToken(tokens, pos, .rparen);
 
@@ -4547,7 +4547,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
         );
         try lower_expr.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
 
     if (groups.items.len == 0) return error.UnsupportedSqlShape;
@@ -5190,7 +5190,7 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
                     try operands.append(alloc, length_operand);
                     length_transferred = true;
                 }
-            } else if (parser.matchKeyword(tokens, pos, "from")) {
+            } else if (parser.matchKeywordTag(tokens, pos, .from)) {
                 const start_operand = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
                 var start_transferred = false;
                 errdefer if (!start_transferred) freeExpression(alloc, start_operand);
@@ -5198,7 +5198,7 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
                 try operands.append(alloc, start_operand);
                 start_transferred = true;
 
-                if (parser.matchKeyword(tokens, pos, "for")) {
+                if (parser.matchKeywordTag(tokens, pos, .@"for")) {
                     const length_operand = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
                     var length_transferred = false;
                     errdefer if (!length_transferred) freeExpression(alloc, length_operand);
@@ -5216,7 +5216,7 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
             try operands.append(alloc, source_operand);
             source_transferred = true;
 
-            try parser.expectKeyword(tokens, pos, "placing");
+            try parser.expectKeywordTag(tokens, pos, .placing);
             const replacement_operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             var replacement_transferred = false;
             errdefer if (!replacement_transferred) freeExpression(alloc, replacement_operand);
@@ -5224,7 +5224,7 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
             try operands.append(alloc, replacement_operand);
             replacement_transferred = true;
 
-            try parser.expectKeyword(tokens, pos, "from");
+            try parser.expectKeywordTag(tokens, pos, .from);
             const start_operand = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
             var start_transferred = false;
             errdefer if (!start_transferred) freeExpression(alloc, start_operand);
@@ -5232,7 +5232,7 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
             try operands.append(alloc, start_operand);
             start_transferred = true;
 
-            if (parser.matchKeyword(tokens, pos, "for")) {
+            if (parser.matchKeywordTag(tokens, pos, .@"for")) {
                 const length_operand = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
                 var length_transferred = false;
                 errdefer if (!length_transferred) freeExpression(alloc, length_operand);
@@ -5327,14 +5327,14 @@ pub fn parseConflictStrposExpressionAlloc(
         source_transferred = true;
         needle_transferred = true;
         return expression;
-    } else if (parser.matchKeyword(tokens, pos, "position")) {
+    } else if (parser.matchKeywordTag(tokens, pos, .position)) {
         try parser.expectToken(tokens, pos, .lparen);
         const needle = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
         var needle_transferred = false;
         errdefer if (!needle_transferred) freeExpression(alloc, needle);
         try type_context.validateTextRowExpression(needle);
 
-        try parser.expectKeyword(tokens, pos, "in");
+        try parser.expectKeywordTag(tokens, pos, .in);
         const source = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
         var source_transferred = false;
         errdefer if (!source_transferred) freeExpression(alloc, source);
@@ -6292,7 +6292,7 @@ pub fn parseMergeInsertMappingsAlloc(
     defer strings.freeStringSlice(alloc, target_fields);
     if (target_fields.len == 0) return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .rparen);
-    try parser.expectKeyword(tokens, pos, "values");
+    try parser.expectKeywordTag(tokens, pos, .values);
     try parser.expectToken(tokens, pos, .lparen);
     for (target_fields, 0..) |target_field, i| {
         if (i != 0) try parser.expectToken(tokens, pos, .comma);
@@ -6553,7 +6553,7 @@ pub fn parseJoinedMutationWhereAlloc(
                 source_alias,
                 expression_where_options,
             );
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
 
@@ -6586,7 +6586,7 @@ pub fn parseJoinedMutationWhereAlloc(
             }
             field_transferred = true;
             value_transferred = true;
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
         if (parser.matchToken(tokens, pos, .question) != null) {
@@ -6600,38 +6600,38 @@ pub fn parseJoinedMutationWhereAlloc(
             try lhs_json_path_exists.append(alloc, .{ .field = field, .path = path });
             field_transferred = true;
             path_transferred = true;
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
-        if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
+        if (parser.matchKeywordTag(tokens, pos, .like) or parser.matchKeywordTag(tokens, pos, .ilike)) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, false, realtime_ns);
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
-        if (parser.matchKeyword(tokens, pos, "not")) {
-            if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
+        if (parser.matchKeywordTag(tokens, pos, .not)) {
+            if (parser.matchKeywordTag(tokens, pos, .like) or parser.matchKeywordTag(tokens, pos, .ilike)) {
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, true, realtime_ns);
-                if (!parser.matchKeyword(tokens, pos, "and")) break;
+                if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                 continue;
             }
-            try parser.expectKeyword(tokens, pos, "in");
+            try parser.expectKeywordTag(tokens, pos, .in);
             const values_json = try sql_value.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
             errdefer if (!values_transferred) alloc.free(values_json);
             try appendJoinedMutationInPredicate(alloc, lhs_in_predicates, lhs.field, lhs_column, values_json, true);
             values_transferred = true;
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
-        if (parser.matchKeyword(tokens, pos, "in")) {
+        if (parser.matchKeywordTag(tokens, pos, .in)) {
             const values_json = try sql_value.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
             errdefer if (!values_transferred) alloc.free(values_json);
             try appendJoinedMutationInPredicate(alloc, lhs_in_predicates, lhs.field, lhs_column, values_json, false);
             values_transferred = true;
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
 
@@ -6652,7 +6652,7 @@ pub fn parseJoinedMutationWhereAlloc(
                     if (lhs_column.field_type != .boolean) return error.InvalidSqlCatalog;
                     if (is_tail.boolean_negated) {
                         try lower_expr.appendBooleanIsNotExpressionGroups(alloc, lhs_expression_or_predicates, lhs.field, is_tail.boolean_value);
-                        if (!parser.matchKeyword(tokens, pos, "and")) break;
+                        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                         continue;
                     }
                     const value_json = try alloc.dupe(u8, sql_value.booleanJson(is_tail.boolean_value));
@@ -6669,7 +6669,7 @@ pub fn parseJoinedMutationWhereAlloc(
                     });
                     field_transferred = true;
                     value_transferred = true;
-                    if (!parser.matchKeyword(tokens, pos, "and")) break;
+                    if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                     continue;
                 },
             }
@@ -6683,7 +6683,7 @@ pub fn parseJoinedMutationWhereAlloc(
             try parser.expectToken(tokens, pos, .rparen);
             try appendJoinedMutationInPredicate(alloc, lhs_in_predicates, lhs.field, lhs_column, values_json, false);
             values_transferred = true;
-        } else if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
+        } else if (op == .ne and parser.matchKeywordTag(tokens, pos, .all)) {
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try sql_value.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -6727,14 +6727,14 @@ pub fn parseJoinedMutationWhereAlloc(
                 try lhs_array_eq.append(alloc, .{ .field = field, .value_json = value_json.? });
                 field_transferred = true;
                 value_transferred = true;
-                if (!parser.matchKeyword(tokens, pos, "and")) break;
+                if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                 continue;
             }
             try lhs_predicates.append(alloc, .{ .name = "", .field = field, .op = op, .value_json = value_json });
             field_transferred = true;
             value_transferred = true;
         }
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
 }
 
@@ -6801,8 +6801,8 @@ pub fn parseConflictTargetAlloc(
     options: ConflictTargetParserOptions,
 ) !ConflictTarget {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (cursor.matchKeyword("on")) {
-        try cursor.expectKeyword("constraint");
+    if (cursor.matchKeywordTag(.on)) {
+        try cursor.expectKeywordTag(.constraint);
         const constraint_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
         defer alloc.free(constraint_name);
         return try conflictTargetForNamedConstraintAlloc(alloc, schema, table_name, constraint_name);
@@ -6851,7 +6851,7 @@ pub fn parseConflictTargetAlloc(
         freeExpressionConditions(alloc, where_expressions);
         if (where_expressions.len > 0) alloc.free(where_expressions);
     }
-    if (cursor.matchKeyword("where")) {
+    if (cursor.matchKeywordTag(.where)) {
         const where_start = cursor.checkpoint();
         where_json = grammar.parseDdlUniquePredicateWhereJsonAlloc(alloc, tokens, pos, schema.relational_columns) catch |err| switch (err) {
             error.UnsupportedSqlShape, error.InvalidSqlCatalog => blk: {
@@ -7034,12 +7034,12 @@ pub fn parseSemiJoinSourceSubqueryHeaderAlloc(
         );
         errdefer alloc.free(parsed_source_field);
         try parsed_source_fields.append(alloc, parsed_source_field);
-        if (parser.peekKeyword(tokens, pos.*, "from")) break;
+        if (parser.peekKeywordTag(tokens, pos.*, .from)) break;
         try parser.expectToken(tokens, pos, .comma);
     }
     if (parsed_source_fields.items.len != target_fields.len) return error.UnsupportedSqlShape;
 
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .from);
     const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     errdefer freeTableAlias(alloc, source_table);
 
@@ -7074,7 +7074,7 @@ pub fn parseExistsSemiJoinSourceTableAlloc(
     var saw_select_item = false;
     var depth: usize = 0;
     while (!parser.atEnd(tokens, pos.*)) {
-        if (depth == 0 and parser.peekKeyword(tokens, pos.*, "from")) break;
+        if (depth == 0 and parser.peekKeywordTag(tokens, pos.*, .from)) break;
         const token = tokens[pos.*];
         switch (token.kind) {
             .lparen => depth += 1,
@@ -7089,7 +7089,7 @@ pub fn parseExistsSemiJoinSourceTableAlloc(
         pos.* += 1;
     }
     if (!saw_select_item) return error.UnsupportedSqlShape;
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .from);
     return try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
 }
 
@@ -7103,9 +7103,9 @@ pub fn parseExistsSemiJoinMutationTailAlloc(
     var row_claim = options.row_claim;
     errdefer if (row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
 
-    try parser.expectKeyword(tokens, pos, "exists");
+    try parser.expectKeywordTag(tokens, pos, .exists);
     try parser.expectToken(tokens, pos, .lparen);
-    try parser.expectKeyword(tokens, pos, "select");
+    try parser.expectKeywordTag(tokens, pos, .select);
 
     const source_table = try parseExistsSemiJoinSourceTableAlloc(alloc, tokens, pos);
     var source_table_transferred = false;
@@ -7150,10 +7150,10 @@ pub fn parseExistsSemiJoinMutationTailAlloc(
     var saw_returning = false;
 
     while (!parser.atEnd(tokens, pos.*)) {
-        if (parser.matchKeyword(tokens, pos, "for")) {
+        if (parser.matchKeywordTag(tokens, pos, .@"for")) {
             if (saw_returning) return error.UnsupportedSqlShape;
             lower_expr.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
-        } else if (parser.matchKeyword(tokens, pos, "returning")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             saw_returning = true;
             returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &target_qualifiers, options.returning_hooks);
@@ -7213,9 +7213,9 @@ pub fn parseSemiJoinMutationSourceAlloc(
     var target_fields_transferred = false;
     errdefer if (!target_fields_transferred) strings.freeStringSlice(alloc, target_fields);
 
-    try parser.expectKeyword(tokens, pos, "in");
+    try parser.expectKeywordTag(tokens, pos, .in);
     try parser.expectToken(tokens, pos, .lparen);
-    try parser.expectKeyword(tokens, pos, "select");
+    try parser.expectKeywordTag(tokens, pos, .select);
 
     const source_table = try parseSemiJoinSourceSubqueryHeaderAlloc(
         alloc,
@@ -7263,10 +7263,10 @@ pub fn parseSemiJoinMutationSourceAlloc(
     var saw_returning = false;
 
     while (!parser.atEnd(tokens, pos.*)) {
-        if (parser.matchKeyword(tokens, pos, "for")) {
+        if (parser.matchKeywordTag(tokens, pos, .@"for")) {
             if (saw_returning) return error.UnsupportedSqlShape;
             lower_expr.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
-        } else if (parser.matchKeyword(tokens, pos, "returning")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             saw_returning = true;
             returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &target_qualifiers, options.returning_hooks);
@@ -8945,19 +8945,19 @@ pub fn parseOptionalTemporalPortionAlloc(
     params: []const sql_value.SqlValue,
     realtime_ns: u64,
 ) !?ParsedTemporalPortion {
-    if (!parser.matchKeyword(tokens, pos, "for")) return null;
-    try parser.expectKeyword(tokens, pos, "portion");
-    try parser.expectKeyword(tokens, pos, "of");
+    if (!parser.matchKeywordTag(tokens, pos, .@"for")) return null;
+    try parser.expectKeywordTag(tokens, pos, .portion);
+    try parser.expectKeywordTag(tokens, pos, .of);
     const period = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
     errdefer alloc.free(period);
     const period_catalog = binder.relationalPeriodForDdl(schema.periods, period) orelse return error.InvalidSqlCatalog;
     const start_column = binder.relationalColumnForField(schema, period_catalog.start_column, null) orelse return error.InvalidSqlCatalog;
     const end_column = binder.relationalColumnForField(schema, period_catalog.end_column, null) orelse return error.InvalidSqlCatalog;
     if (start_column.field_type != end_column.field_type or !binder.relationalPeriodColumnType(start_column.field_type)) return error.InvalidSqlCatalog;
-    try parser.expectKeyword(tokens, pos, "from");
+    try parser.expectKeywordTag(tokens, pos, .from);
     const from_json = try lower_expr.parseSqlRangeConstructorEndpointJsonAlloc(alloc, tokens, pos, params, start_column.field_type, realtime_ns);
     errdefer alloc.free(from_json);
-    try parser.expectKeyword(tokens, pos, "to");
+    try parser.expectKeywordTag(tokens, pos, .to);
     const to_json = try lower_expr.parseSqlRangeConstructorEndpointJsonAlloc(alloc, tokens, pos, params, end_column.field_type, realtime_ns);
     errdefer alloc.free(to_json);
     return .{

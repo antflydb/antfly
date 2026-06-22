@@ -2534,6 +2534,7 @@ pub fn corpusFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) 
 pub fn corpusFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .ddl,
+        .explain,
         .insert,
         .insert_source,
         .recursive_insert_source,
@@ -3175,6 +3176,10 @@ pub fn corpusFixtureOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, ex
         .recursive_insert_source,
         => planHasExactUsizeToken(entry.plan, ":assignments=", expected),
         .merge_mutation => planHasExactUsizeToken(entry.plan, ":matched_update=", expected),
+        .explain => (corpusExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") and planHasExactUsizeToken(entry.plan, ":assignments=", expected)) or
+            (corpusExplainWriteInnerHasPrefix(entry, ":inner=recursive_insert_source:") and planHasExactUsizeToken(entry.plan, ":assignments=", expected)) or
+            (corpusExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") and planHasExactUsizeToken(entry.plan, ":ops=", expected)) or
+            (corpusExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:") and planHasExactUsizeToken(entry.plan, ":matched_update=", expected)),
         else => false,
     };
 }

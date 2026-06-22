@@ -5131,7 +5131,7 @@ pub const ApiHttpServer = struct {
         batch: relational_rows_api.OwnedRowsBatchRequest,
     } {
         const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
-        if (lowered.ctes.len != 0 or lowered.data_modifying_ctes.len != 0 or lowered.source.source_cte.len != 0) {
+        if (lowered.data_modifying_ctes.len != 0) {
             return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") };
         }
 
@@ -5171,7 +5171,12 @@ pub const ApiHttpServer = struct {
         };
         defer if (source_filter) |*value| value.deinit(self.alloc);
         if (source_filter) |active| {
-            try self.applyRowsAuthFilterToQuery(source_schema, active, &lowered.source);
+            for (@constCast(lowered.ctes)) |*cte| {
+                try self.applyRowsAuthFilterToQuery(source_schema, active, &cte.query);
+            }
+            if (lowered.source.source_cte.len == 0) {
+                try self.applyRowsAuthFilterToQuery(source_schema, active, &lowered.source);
+            }
         }
 
         var batch = (table_reads.rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
@@ -24805,6 +24810,51 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("merged", merge_rows[1].object.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 44), merge_rows[1].object.get("amount").?.integer);
 
+    var cte_merge_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('cte-merge-target', 'old', 1), ('cte-merge-source-update', 'cte-merge-target', 64), ('cte-merge-source-insert', 'cte-merge-inserted', 65);\"}",
+    });
+    defer cte_merge_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), cte_merge_seed_resp.status);
+
+    var cte_merge_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"WITH source_rows AS (SELECT id, status, amount FROM usage_records WHERE id IN ('cte-merge-source-update', 'cte-merge-source-insert')) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.status WHEN MATCHED THEN UPDATE SET status = 'cte-merged', amount = source.amount WHEN NOT MATCHED AND source.id = 'cte-merge-source-insert' THEN INSERT (id, status, amount) VALUES (source.status, 'cte-inserted', source.amount) RETURNING target.id, target.status, target.amount;\"}",
+    });
+    defer cte_merge_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), cte_merge_resp.status);
+    var parsed_cte_merge = try std.json.parseFromSlice(std.json.Value, alloc, cte_merge_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_cte_merge.deinit();
+    try std.testing.expectEqualStrings("write", parsed_cte_merge.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("merge", parsed_cte_merge.value.object.get("statement_kind").?.string);
+    const cte_merge_result = parsed_cte_merge.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), cte_merge_result.get("inserted").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), cte_merge_result.get("transformed").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), cte_merge_result.get("returning").?.array.items.len);
+
+    var cte_merge_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records WHERE id IN ('cte-merge-inserted', 'cte-merge-target') ORDER BY id ASC;\"}",
+    });
+    defer cte_merge_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), cte_merge_query_resp.status);
+    var parsed_cte_merge_query = try std.json.parseFromSlice(std.json.Value, alloc, cte_merge_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_cte_merge_query.deinit();
+    const cte_merge_rows = parsed_cte_merge_query.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), cte_merge_rows.len);
+    try std.testing.expectEqualStrings("cte-merge-inserted", cte_merge_rows[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("cte-inserted", cte_merge_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 65), cte_merge_rows[0].object.get("amount").?.integer);
+    try std.testing.expectEqualStrings("cte-merge-target", cte_merge_rows[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("cte-merged", cte_merge_rows[1].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 64), cte_merge_rows[1].object.get("amount").?.integer);
+
     var recursive_merge_seed_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -24871,8 +24921,8 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("write", parsed_truncate.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate.value.object.get("statement_kind").?.string);
     const truncate_result = parsed_truncate.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 13), truncate_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 13), truncate_result.get("staged").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), truncate_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), truncate_result.get("staged").?.integer);
 
     var truncated_query_resp = try server.handle(.{
         .method = .POST,

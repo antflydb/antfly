@@ -172,6 +172,7 @@ pub const TokenKeyword = enum {
     jsonb_build_object,
     jsonb_extract_path,
     jsonb_extract_path_text,
+    jsonb_set,
     jsonb_typeof,
     key,
     kind,
@@ -218,6 +219,7 @@ pub const TokenKeyword = enum {
     percentile_cont,
     percentile_disc,
     period,
+    placing,
     portion,
     position,
     power,
@@ -405,6 +407,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);
+    try std.testing.expectEqual(TokenKeyword.placing, keywordFromIdentifier("PLACING").?);
     try std.testing.expectEqual(TokenKeyword.right, keywordFromIdentifier("RIGHT").?);
     try std.testing.expectEqual(TokenKeyword.row, keywordFromIdentifier("ROW").?);
     try std.testing.expectEqual(TokenKeyword.rows, keywordFromIdentifier("ROWS").?);
@@ -412,6 +415,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.rtrim, keywordFromIdentifier("RTRIM").?);
     try std.testing.expectEqual(TokenKeyword.char_length, keywordFromIdentifier("CHAR_LENGTH").?);
     try std.testing.expectEqual(TokenKeyword.jsonb_extract_path_text, keywordFromIdentifier("JSONB_EXTRACT_PATH_TEXT").?);
+    try std.testing.expectEqual(TokenKeyword.jsonb_set, keywordFromIdentifier("JSONB_SET").?);
     try std.testing.expectEqual(TokenKeyword.regexp_substr, keywordFromIdentifier("REGEXP_SUBSTR").?);
     try std.testing.expectEqual(TokenKeyword.settings, keywordFromIdentifier("SETTINGS").?);
     try std.testing.expectEqual(TokenKeyword.string_to_array, keywordFromIdentifier("STRING_TO_ARRAY").?);
