@@ -164,11 +164,12 @@ update/delete sources (`UPDATE ... FROM` and `DELETE ... USING`) use the same
 typed path: SQL executes the side-table read as a row plan, feeds the materialized
 source rows into the joined mutation-source planner/stager, and autocommits or
 aborts the SQL-owned row-claim transaction before returning mutation-source
-counts and `RETURNING` rows. Plain single-table `TRUNCATE` uses the typed
-table-emptying mutation-source path with the SQL-owned row claim; multi-table
-truncate, `CASCADE`, and `RESTART IDENTITY` remain fail-closed until their
-executor wiring can share the native cross-table catalog barrier, identity
-allocator, and 2PC paths. Recursive CTE-backed claimed update/delete statements
+counts and `RETURNING` rows. Plain single-table `TRUNCATE` and explicit
+`TRUNCATE ... CONTINUE IDENTITY RESTRICT` use the typed table-emptying
+mutation-source path with the SQL-owned row claim; multi-table truncate,
+`CASCADE`, and `RESTART IDENTITY` remain fail-closed until their executor
+wiring can share the native cross-table catalog barrier, identity allocator,
+and 2PC paths. Recursive CTE-backed claimed update/delete statements
 execute by materializing the bounded recursive producer through the typed read
 planner, filtering the referenced CTE output, and feeding those rows into the
 same joined mutation-source autocommit path. Direct table-source MERGE,
@@ -478,6 +479,133 @@ The SQL adapter should never pass a provider-specific SQL string into storage
 execution. Foreign-source queries, lake reads, backup/restore, provisioned
 tables, hosted tables, and local tables all receive typed catalog targets and
 typed row plans.
+
+## Document Table SQL
+
+Today the executable SQL read/write path is relational-only: SQL lowerers require
+`storage_mode = relational` and a declared primary key before they produce typed
+row plans. Non-relational document tables continue to use the native document,
+query, lookup, index, and retrieval APIs.
+
+The long-term SQL shape should add a separate document-table source binding
+instead of weakening relational invariants. MongoDB's SQL Interface is a useful
+precedent: it exposes live, read-only SQL access to document data through
+ODBC/JDBC, derives and stores schema mappings, and supports nested-object and
+array transformations such as flattening and unwinding. Antfly should use the
+same broad product shape for document tables: SQL as a compatibility/query
+frontend over document storage, not a second storage format and not an
+unstructured write path. See MongoDB's SQL Interface overview:
+https://www.mongodb.com/docs/sql-interface/.
+
+The planner should introduce an explicit source-binding layer:
+
+```zig
+const SqlSourceBinding = union(enum) {
+    relational: RelationalBinding,
+    document: DocumentBinding,
+    lake: LakeBinding,
+};
+```
+
+Binding chooses the source family from the resolved table catalog record and
+schema. Relational bindings continue through the existing typed row lowerers.
+Document bindings route to a new document SQL lowerer that can produce native
+document/query/index plans. Lake bindings route to the lake-native source plans
+described in [LAKES.md](LAKES.md). The review rule is that no lowerer should
+probe another source family by trial-and-error; the binder selects the family
+once from catalog facts.
+
+The first document SQL milestone should be read-only. SQL writes over schemaless
+documents raise too many durable semantics questions for the first cut: missing
+fields, partial update behavior, JSON merge semantics, array mutation, generated
+fields, constraint interaction, and row-filter checks. A later write surface can
+be added only through explicit document semantics such as `INSERT INTO docs
+(_id, _doc) VALUES (...)` or typed JSON patch operations lowered into the same
+native document write path as REST/SDK callers.
+
+Document SQL needs a virtual SQL schema. The minimum projection should expose:
+
+- `_id` as the document key;
+- `_doc` as the full JSON document;
+- declared document-schema fields when the table has a schema;
+- indexed or statistically observed top-level fields as optional projected
+  columns;
+- explicit JSON-path projections for nested fields.
+
+For example:
+
+```sql
+SELECT _id, title, metadata->>'status'
+FROM docs
+WHERE metadata->>'status' = 'active'
+LIMIT 10;
+```
+
+The virtual schema should be built from durable Antfly facts in priority order:
+
+1. declared document schema;
+2. index definitions and derived-index field paths;
+3. explicit SQL view definitions over document tables;
+4. observed field statistics as an advisory fallback.
+
+Sampling can help user experience, but it must not become the durable semantic
+contract. If a field needs stable BI or agent access, the table schema, an index
+definition, or a SQL view should record that mapping explicitly.
+
+Document SQL lowering should push down only behavior that Antfly can execute
+natively:
+
+- `_id` equality and `IN` predicates lower to lookup/doc-id filters;
+- scalar equality/range predicates lower to existing query/index filters when a
+  declared or indexed field path can prove type compatibility;
+- full-text predicates lower to full-text query plans;
+- vector or hybrid predicates can later lower to the existing vector, hybrid,
+  and reranking paths through explicit SQL functions;
+- projection, `LIMIT`, simple `ORDER BY`, and residual filters execute only over
+  bounded result sets with explicit cost limits.
+
+Anything not safely pushdown-capable should fail closed or require an explicit
+bounded scan contract. The adapter should not silently run broad document scans
+because a SQL BI client submitted a relational-looking query.
+
+Arrays must be explicit. Document tables should not pretend nested arrays are
+ordinary scalar columns. The SQL surface should require `UNNEST` or an
+Antfly-named equivalent for array expansion:
+
+```sql
+SELECT d._id, tag
+FROM docs AS d, UNNEST(d.tags) AS tag
+WHERE tag = 'urgent';
+```
+
+This gives agents and BI tools predictable cardinality and cost behavior while
+still allowing Mongo-style flatten/unwind workflows over document data.
+
+The document SQL result contract should remain the same SQL response envelope as
+relational reads (`kind = read`, `statement_kind = query`, `result.rows = ...`),
+but the inner plan family should identify that it came from a document source.
+That keeps CLI, HTTP, SQL wire, MCP, and A2A clients uniform while preserving
+source-family-specific planning and diagnostics.
+
+Implementation should be scaffolded in small steps:
+
+1. Add `SqlSourceBinding` and route relational SQL through it without behavior
+   change.
+2. Add document virtual-schema construction from declared document schemas and
+   `_id` / `_doc`.
+3. Add document read lowering for `_id` lookup, projection, `LIMIT`, and simple
+   scalar field predicates.
+4. Add JSON-path expression nodes shared with relational `json` / `jsonb`
+   columns.
+5. Add explicit bounded-scan and residual-filter limits.
+6. Add array expansion through `UNNEST`.
+7. Add full-text/vector/hybrid SQL functions that lower to native derived-index
+   plans.
+8. Add optional SQL view definitions as stable document-to-SQL schema mappings.
+9. Add e2e parity showing SQL document reads and native document query APIs
+   reach the same storage/query path.
+10. Consider explicit document writes only after the read path, authorization,
+    row filters, and audit semantics are shared with native document writes.
 
 ## Expressions
 
@@ -875,6 +1003,9 @@ Current implementation status:
   lowering DDL/session control plans, and transaction-boundary session cleanup
   now uses parsed statement-start keyword tags instead of a raw SQL prefix
   probe.
+- SQL routine trigger DDL runtime helpers accept `ParsedSql` directly, and the
+  HTTP DDL fallback path reuses the parsed statement when installing or
+  dropping trigger metadata instead of spinning up a private tokenizer.
 - DDL plan lowering now lives behind `sql_adapter` exports; auth role/row
   security execution, catalog jobs, notifications, and extension lifecycle use
   adapter-native plan types instead of importing the broader relational SQL

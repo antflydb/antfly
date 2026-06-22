@@ -187,7 +187,13 @@ pub const Runtime = struct {
     }
 
     pub fn applyTriggerDdlAlloc(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !bool {
-        var parsed = parseTriggerDdlAlloc(alloc, sql) catch |err| switch (err) {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        return try self.applyTriggerDdlParsedSqlAlloc(alloc, &parsed_sql);
+    }
+
+    pub fn applyTriggerDdlParsedSqlAlloc(self: *@This(), alloc: std.mem.Allocator, parsed_sql: *const sql_adapter.ParsedSql) !bool {
+        var parsed = parseTriggerDdlParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
             error.NotTriggerDdl, error.UnsupportedSqlShape => return false,
             else => return err,
         };
@@ -203,7 +209,13 @@ pub const Runtime = struct {
     }
 
     pub fn applyCatalogedTriggerDropDdlAlloc(self: *@This(), alloc: std.mem.Allocator, sql: []const u8) !bool {
-        var parsed = parseTriggerDdlAlloc(alloc, sql) catch |err| switch (err) {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        return try self.applyCatalogedTriggerDropDdlParsedSqlAlloc(alloc, &parsed_sql);
+    }
+
+    pub fn applyCatalogedTriggerDropDdlParsedSqlAlloc(self: *@This(), alloc: std.mem.Allocator, parsed_sql: *const sql_adapter.ParsedSql) !bool {
+        var parsed = parseTriggerDdlParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
             error.NotTriggerDdl, error.UnsupportedSqlShape => return false,
             else => return err,
         };
@@ -739,17 +751,17 @@ const TriggerParser = struct {
     pos: usize = 0,
 
     fn parse(self: *@This()) !TriggerDdlPlan {
-        if (self.matchKeyword("create")) {
+        if (self.matchKeywordTag(.create)) {
             var replace_existing = false;
-            if (self.matchKeyword("or")) {
-                try self.expectKeyword("replace");
+            if (self.matchKeywordTag(.@"or")) {
+                try self.expectKeywordTag(.replace);
                 replace_existing = true;
             }
-            if (!self.matchKeyword("trigger")) return error.NotTriggerDdl;
+            if (!self.matchKeywordTag(.trigger)) return error.NotTriggerDdl;
             return .{ .create = try self.parseCreateTriggerTail(replace_existing) };
         }
-        if (self.matchKeyword("drop")) {
-            if (!self.matchKeyword("trigger")) return error.NotTriggerDdl;
+        if (self.matchKeywordTag(.drop)) {
+            if (!self.matchKeywordTag(.trigger)) return error.NotTriggerDdl;
             return .{ .drop = try self.parseDropTriggerTail() };
         }
         return error.NotTriggerDdl;
@@ -760,20 +772,20 @@ const TriggerParser = struct {
         var trigger_transferred = false;
         errdefer if (!trigger_transferred) self.alloc.free(trigger_name);
 
-        try self.expectKeyword("before");
+        try self.expectKeywordTag(.before);
         const event = try self.parseTriggerEvent();
-        try self.expectKeyword("on");
+        try self.expectKeywordTag(.on);
         const table_name = try self.parseObjectIdentifierOwned();
         var table_transferred = false;
         errdefer if (!table_transferred) self.alloc.free(table_name);
 
-        if (self.matchKeyword("for")) {
-            try self.expectKeyword("each");
-            try self.expectKeyword("row");
+        if (self.matchKeywordTag(.@"for")) {
+            try self.expectKeywordTag(.each);
+            try self.expectKeywordTag(.row);
         }
 
-        try self.expectKeyword("execute");
-        if (!(self.matchKeyword("function") or self.matchKeyword("procedure"))) return error.UnsupportedSqlShape;
+        try self.expectKeywordTag(.execute);
+        if (!(self.matchKeywordTag(.function) or self.matchKeywordTag(.procedure))) return error.UnsupportedSqlShape;
         const function_name = try self.parseObjectIdentifierOwned();
         var function_transferred = false;
         errdefer if (!function_transferred) self.alloc.free(function_name);
@@ -795,23 +807,23 @@ const TriggerParser = struct {
 
     fn parseDropTriggerTail(self: *@This()) !DropTriggerPlan {
         var if_exists = false;
-        if (self.matchKeyword("if")) {
-            try self.expectKeyword("exists");
+        if (self.matchKeywordTag(.@"if")) {
+            try self.expectKeywordTag(.exists);
             if_exists = true;
         }
         const trigger_name = try self.parseIdentifierOwned();
         var trigger_transferred = false;
         errdefer if (!trigger_transferred) self.alloc.free(trigger_name);
-        try self.expectKeyword("on");
-        _ = self.matchKeyword("only");
+        try self.expectKeywordTag(.on);
+        _ = self.matchKeywordTag(.only);
         const table_name = try self.parseObjectIdentifierOwned();
         var table_transferred = false;
         errdefer if (!table_transferred) self.alloc.free(table_name);
         var cascade = false;
-        if (self.matchKeyword("cascade")) {
+        if (self.matchKeywordTag(.cascade)) {
             cascade = true;
         } else {
-            _ = self.matchKeyword("restrict");
+            _ = self.matchKeywordTag(.restrict);
         }
         try self.expectStatementEnd();
         trigger_transferred = true;
@@ -825,12 +837,12 @@ const TriggerParser = struct {
     }
 
     fn parseTriggerEvent(self: *@This()) !TriggerEvent {
-        if (self.matchKeyword("insert")) return .insert;
-        if (self.matchKeyword("update")) {
-            if (self.matchKeyword("of")) return error.UnsupportedSqlShape;
+        if (self.matchKeywordTag(.insert)) return .insert;
+        if (self.matchKeywordTag(.update)) {
+            if (self.matchKeywordTag(.of)) return error.UnsupportedSqlShape;
             return .update;
         }
-        if (self.matchKeyword("delete")) return .delete;
+        if (self.matchKeywordTag(.delete)) return .delete;
         return error.UnsupportedSqlShape;
     }
 
@@ -867,16 +879,16 @@ const TriggerParser = struct {
         self.pos += 1;
     }
 
-    fn matchKeyword(self: *@This(), keyword: []const u8) bool {
+    fn matchKeywordTag(self: *@This(), keyword: sql_adapter.TokenKeyword) bool {
         if (self.pos >= self.tokens.len) return false;
         const token = self.tokens[self.pos];
-        if (token.kind != .identifier or !std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
+        if (!token.matchesKeywordTag(keyword)) return false;
         self.pos += 1;
         return true;
     }
 
-    fn expectKeyword(self: *@This(), keyword: []const u8) !void {
-        if (!self.matchKeyword(keyword)) return error.UnsupportedSqlShape;
+    fn expectKeywordTag(self: *@This(), keyword: sql_adapter.TokenKeyword) !void {
+        if (!self.matchKeywordTag(keyword)) return error.UnsupportedSqlShape;
     }
 
     fn expectStatementEnd(self: *@This()) !void {
@@ -886,9 +898,13 @@ const TriggerParser = struct {
 };
 
 fn parseTriggerDdlAlloc(alloc: std.mem.Allocator, sql: []const u8) !TriggerDdlPlan {
-    var tokens = try sql_adapter.tokenizeAlloc(alloc, sql);
-    defer sql_adapter.freeTokens(alloc, &tokens);
-    var parser = TriggerParser{ .alloc = alloc, .tokens = tokens.items };
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try parseTriggerDdlParsedSqlAlloc(alloc, &parsed_sql);
+}
+
+fn parseTriggerDdlParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const sql_adapter.ParsedSql) !TriggerDdlPlan {
+    var parser = TriggerParser{ .alloc = alloc, .tokens = parsed_sql.items() };
     return try parser.parse();
 }
 
@@ -1975,10 +1991,12 @@ test "sql routine runtime persists safe row trigger catalog records" {
             else => return error.TestUnexpectedResult,
         });
 
-        try std.testing.expect(try runtime.applyTriggerDdlAlloc(
+        var parsed_trigger_sql = try sql_adapter.ParsedSql.initAlloc(
             alloc,
             "CREATE TRIGGER audit_insert BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_body();",
-        ));
+        );
+        defer parsed_trigger_sql.deinit(alloc);
+        try std.testing.expect(try runtime.applyTriggerDdlParsedSqlAlloc(alloc, &parsed_trigger_sql));
         try std.testing.expectEqual(@as(usize, 1), runtime.triggerCountForTest());
         const function_name = (try runtime.triggerFunctionForTableEventAlloc(alloc, "usage_records", .insert)) orelse return error.TestUnexpectedResult;
         defer alloc.free(function_name);

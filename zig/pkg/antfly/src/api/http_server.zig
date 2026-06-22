@@ -4273,7 +4273,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         var plan = sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(self.alloc, &parsed_sql, function_bindings) catch |err| switch (err) {
             error.UnsupportedSqlShape => {
-                if (try self.applySqlRoutineTriggerDdlAlloc(sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
+                if (try self.applySqlRoutineTriggerDdlParsedSqlAlloc(&parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
                 return err;
             },
             else => return err,
@@ -4364,7 +4364,7 @@ pub const ApiHttpServer = struct {
         }
 
         if (loweredDdlPlanMayDropTrigger(plan)) {
-            if (try self.applyCatalogedSqlRoutineTriggerDropDdlAlloc(sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
+            if (try self.applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(&parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
         }
 
         if (self.cfg.user_manager) |manager| {
@@ -4491,12 +4491,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn sqlObjectIdentifierTailAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
-        if (identifier.len == 0) return error.UnsupportedSqlShape;
-        if (std.mem.lastIndexOfScalar(u8, identifier, '.')) |dot| {
-            if (dot + 1 >= identifier.len) return error.UnsupportedSqlShape;
-            return try alloc.dupe(u8, identifier[dot + 1 ..]);
-        }
-        return try alloc.dupe(u8, identifier);
+        return try sql_adapter.normalizeSqlObjectIdentifierAlloc(alloc, identifier);
     }
 
     fn publicSqlWithFinalStatementIndex(tokens: []const sql_adapter.Token, start: usize, end: usize) ?usize {
@@ -4559,6 +4554,7 @@ pub const ApiHttpServer = struct {
                 pos += 1;
                 if (pos >= raw.token_end or !tokens[pos].matchesKeywordTag(.into)) return error.UnsupportedSqlShape;
                 pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
             },
             .update, .update_source, .update_joined_source => {
                 if (!tokens[pos].matchesKeywordTag(.update)) return error.UnsupportedSqlShape;
@@ -4575,12 +4571,14 @@ pub const ApiHttpServer = struct {
             .truncate => {
                 if (!tokens[pos].matchesKeywordTag(.truncate)) return error.UnsupportedSqlShape;
                 pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.table)) pos += 1;
                 if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
             },
             .merge => {
                 if (!tokens[pos].matchesKeywordTag(.merge)) return error.UnsupportedSqlShape;
                 pos += 1;
                 if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.into)) pos += 1;
+                if (pos < raw.token_end and tokens[pos].matchesKeywordTag(.only)) pos += 1;
             },
         }
         if (pos >= raw.token_end or tokens[pos].kind != .identifier) return error.UnsupportedSqlShape;
@@ -5615,13 +5613,13 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn applySqlRoutineTriggerDdlAlloc(
+    fn applySqlRoutineTriggerDdlParsedSqlAlloc(
         self: *ApiHttpServer,
-        sql: []const u8,
+        parsed_sql: *const sql_adapter.ParsedSql,
         statement_timeout_ns: ?u64,
         statement_start_ns: u64,
     ) !?tables_api.AppliedRelationalSqlDdlRecord {
-        if (!try self.sql_routine_runtime.applyTriggerDdlAlloc(self.alloc, sql)) return null;
+        if (!try self.sql_routine_runtime.applyTriggerDdlParsedSqlAlloc(self.alloc, parsed_sql)) return null;
         var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
         errdefer applied.deinit(self.alloc);
         applied.noop = true;
@@ -5707,13 +5705,13 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn applyCatalogedSqlRoutineTriggerDropDdlAlloc(
+    fn applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(
         self: *ApiHttpServer,
-        sql: []const u8,
+        parsed_sql: *const sql_adapter.ParsedSql,
         statement_timeout_ns: ?u64,
         statement_start_ns: u64,
     ) !?tables_api.AppliedRelationalSqlDdlRecord {
-        if (!try self.sql_routine_runtime.applyCatalogedTriggerDropDdlAlloc(self.alloc, sql)) return null;
+        if (!try self.sql_routine_runtime.applyCatalogedTriggerDropDdlParsedSqlAlloc(self.alloc, parsed_sql)) return null;
         var applied = try tables_api.emptyAppliedRelationalSqlDdlRecordAlloc(self.alloc);
         errdefer applied.deinit(self.alloc);
         applied.noop = true;
@@ -24935,6 +24933,31 @@ test "api http server executes SQL point writes through typed row batch ingress"
     var parsed_truncated_query = try std.json.parseFromSlice(std.json.Value, alloc, truncated_query_resp.body, .{ .allocate = .alloc_always });
     defer parsed_truncated_query.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_truncated_query.value.object.get("result").?.object.get("total").?.integer);
+
+    var truncate_continue_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('truncate-continue-a', 'drop', 1), ('truncate-continue-b', 'drop', 2);\"}",
+    });
+    defer truncate_continue_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), truncate_continue_seed_resp.status);
+
+    var truncate_continue_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"TRUNCATE TABLE ONLY public.usage_records CONTINUE IDENTITY RESTRICT;\"}",
+    });
+    defer truncate_continue_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), truncate_continue_resp.status);
+    var parsed_truncate_continue = try std.json.parseFromSlice(std.json.Value, alloc, truncate_continue_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_truncate_continue.deinit();
+    try std.testing.expectEqualStrings("write", parsed_truncate_continue.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("truncate", parsed_truncate_continue.value.object.get("statement_kind").?.string);
+    const truncate_continue_result = parsed_truncate_continue.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), truncate_continue_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), truncate_continue_result.get("staged").?.integer);
 
     var truncate_cascade_resp = try server.handle(.{
         .method = .POST,
