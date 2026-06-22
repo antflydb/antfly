@@ -300,6 +300,7 @@ Current implementation status:
   lowering now delegate through parsed helper variants instead of owning
   separate tokenization paths. DML adapter write-plan regression callbacks also
   consume borrowed parsed tokens instead of round-tripping through SQL text.
+  Parsed-only lowering context construction does not require a raw SQL field.
 - Identifier tokens carry optional compact keyword metadata, and the shared
   parser/classifier helpers use it before falling back to text comparison.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source

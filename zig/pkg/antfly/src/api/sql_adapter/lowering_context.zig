@@ -85,7 +85,7 @@ pub const ReadPlanLoweringCallbacks = struct {
 
 pub const ReadPlanLoweringContext = struct {
     alloc: std.mem.Allocator,
-    sql: []const u8,
+    sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
@@ -184,7 +184,7 @@ pub const CatalogReadPlanLoweringCallbacks = struct {
 
 pub const CatalogReadPlanLoweringContext = struct {
     alloc: std.mem.Allocator,
-    sql: []const u8,
+    sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
     function_bindings: lower_expr.SqlFunctionBindings,
@@ -288,7 +288,6 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(
 ) !plan.LoweredReadPlan {
     var context = ReadPlanLoweringContext{
         .alloc = alloc,
-        .sql = parsed_sql.sql(),
         .schema = schema,
         .source_schema = source_schema,
         .params = params,
@@ -592,7 +591,7 @@ pub const CatalogWritePlanLoweringCallbacks = struct {
 
 pub const CatalogWritePlanLoweringContext = struct {
     alloc: std.mem.Allocator,
-    sql: []const u8,
+    sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
     callbacks: CatalogWritePlanLoweringCallbacks,
@@ -748,7 +747,7 @@ pub const WritePlanLoweringCallbacks = struct {
 
 pub const WritePlanLoweringContext = struct {
     alloc: std.mem.Allocator,
-    sql: []const u8,
+    sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
     callbacks: WritePlanLoweringCallbacks,

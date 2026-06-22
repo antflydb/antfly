@@ -12236,7 +12236,6 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
 ) !plan_mod.LoweredWritePlan {
     var context = lowering_context.WritePlanLoweringContext{
         .alloc = alloc,
-        .sql = parsed_sql.sql(),
         .schema = schema,
         .params = params,
         .callbacks = .{

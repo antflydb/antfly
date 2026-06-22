@@ -16,10 +16,6 @@ const std = @import("std");
 
 const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const metadata_api = @import("../metadata/api.zig");
-const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_transition_state = @import("../metadata/transition_state.zig");
-const raft_reconciler = @import("../raft/reconciler.zig");
 const query_contract = @import("query_contract.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -845,7 +841,6 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
 ) !LoweredReadPlan {
     var context = sql_adapter.ReadPlanLoweringContext{
         .alloc = alloc,
-        .sql = parsed_sql.sql(),
         .schema = schema,
         .source_schema = source_schema,
         .params = params,
@@ -1024,7 +1019,6 @@ fn lowerReadPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
 ) !LoweredReadPlan {
     var context = sql_adapter.CatalogReadPlanLoweringContext{
         .alloc = alloc,
-        .sql = parsed_sql.sql(),
         .schema = schema,
         .params = params,
         .function_bindings = function_bindings,
@@ -1957,7 +1951,6 @@ fn lowerWritePlanParsedSqlAlloc(
 ) !LoweredWritePlan {
     var context = sql_adapter.WritePlanLoweringContext{
         .alloc = alloc,
-        .sql = parsed_sql.sql(),
         .schema = schema,
         .params = params,
         .callbacks = .{
@@ -2004,7 +1997,6 @@ fn lowerWritePlanWithCatalogParsedSqlAlloc(
 ) !LoweredWritePlan {
     var context = sql_adapter.CatalogWritePlanLoweringContext{
         .alloc = alloc,
-        .sql = parsed_sql.sql(),
         .schema = schema,
         .params = params,
         .callbacks = .{
