@@ -3863,6 +3863,8 @@ pub fn build(b: *std.Build) void {
             "sql adapter binder resolves catalog prebind table names from shared tokens",
             "sql adapter binder validates relational catalog lookups",
             "sql adapter binder resolves join projection bindings",
+            "sql adapter lowering context lowers catalog-backed equality join read plans",
+            "sql adapter lowering context lowers catalog-backed bounded left join lateral read plans",
             "sql adapter diagnostics accept only stable known classification reasons",
             "sql adapter diagnostics map unsupported classifications to native requirements",
             "sql adapter corpus owns fixture family policies",

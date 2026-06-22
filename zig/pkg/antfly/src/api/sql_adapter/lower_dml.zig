@@ -11831,7 +11831,20 @@ fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsert {
-    return try lowerInsertWithResolverForTestAlloc(alloc, parsed_sql.sql(), schema, params, unique_resolver);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parser_context.ParserState.ContextAccessors.parseInsert(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(
@@ -11841,7 +11854,26 @@ fn lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsertSource {
-    return try lowerInsertSourceWithResolverForDmlTestAlloc(alloc, parsed_sql.sql(), schema, params, unique_resolver);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parseInsertSourceAlloc(
+        alloc,
+        parsed_sql.items(),
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -11852,7 +11884,29 @@ fn lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredInsertSource {
-    return try lowerInsertSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, unique_resolver);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .insert_source_allows_different_table = true,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parseInsertSourceAlloc(
+        alloc,
+        parsed_sql.items(),
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.insertSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -11863,7 +11917,29 @@ fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    return try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parseJoinedMutationSourceAlloc(
+        alloc,
+        parsed_sql.items(),
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
 }
 
 fn lowerUpdateParsedSqlForDmlTestAlloc(
@@ -11873,7 +11949,20 @@ fn lowerUpdateParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    return try lowerUpdateForTestAlloc(alloc, parsed_sql.sql(), schema, params, unique_resolver);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parser_context.ParserState.ContextAccessors.parseUpdate(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(
@@ -11883,7 +11972,20 @@ fn lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    return try lowerUpdateMutationSourceForTestAlloc(alloc, parsed_sql.sql(), schema, params, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseUpdateMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
 }
 
 fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -11894,7 +11996,29 @@ fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredJoinedMutationSource {
-    return try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parseJoinedMutationSourceAlloc(
+        alloc,
+        parsed_sql.items(),
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
 }
 
 fn lowerDeleteParsedSqlForDmlTestAlloc(
@@ -11904,7 +12028,20 @@ fn lowerDeleteParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
 ) !plan_mod.LoweredMutation {
-    return try lowerDeleteForTestAlloc(alloc, parsed_sql.sql(), schema, params, unique_resolver);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parser_context.ParserState.ContextAccessors.parseDelete(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(
@@ -11914,7 +12051,20 @@ fn lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    return try lowerDeleteMutationSourceForTestAlloc(alloc, parsed_sql.sql(), schema, params, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseDeleteMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
 }
 
 fn lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(
@@ -11923,7 +12073,20 @@ fn lowerTruncateMutationSourceParsedSqlForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredMutationSource {
-    return try lowerTruncateMutationSourceForTestAlloc(alloc, parsed_sql.sql(), schema, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = schema,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseTruncateMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerMergeMutationPlanParsedSqlForDmlTestAlloc(
@@ -11933,7 +12096,24 @@ fn lowerMergeMutationPlanParsedSqlForDmlTestAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredMergeMutationPlan {
-    return try lowerMergeMutationPlanForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    return try parseMergeMutationPlanAlloc(
+        alloc,
+        parsed_sql.items(),
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&parser_state),
+    );
 }
 
 fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -11944,7 +12124,23 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveUpdateJoinedMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
@@ -11955,7 +12151,23 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
-    return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params, row_claim);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveDeleteJoinedMutationSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(
@@ -11965,7 +12177,21 @@ fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
 ) !plan_mod.LoweredRecursiveMergeMutation {
-    return try lowerRecursiveMergeMutationWithSchemasForDmlTestAlloc(alloc, parsed_sql.sql(), target_schema, source_schema, params);
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveMergeMutation(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
 }
 
 fn lowerWritePlanForDmlTestAlloc(
@@ -12008,7 +12234,30 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
-    return try lowerWritePlanForDmlTestAlloc(alloc, parsed_sql.sql(), schema, params, options);
+    var context = lowering_context.WritePlanLoweringContext{
+        .alloc = alloc,
+        .sql = parsed_sql.sql(),
+        .schema = schema,
+        .params = params,
+        .callbacks = .{
+            .lower_recursive_insert_source_with_schemas = unsupportedRecursiveInsertSourceForDmlTestAlloc,
+            .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_insert_with_resolver = lowerInsertWithResolverParsedSqlForDmlTestAlloc,
+            .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc,
+            .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_update_with_resolver = lowerUpdateParsedSqlForDmlTestAlloc,
+            .lower_update_source = lowerUpdateMutationSourceParsedSqlForDmlTestAlloc,
+            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .lower_delete_with_resolver = lowerDeleteParsedSqlForDmlTestAlloc,
+            .lower_delete_source = lowerDeleteMutationSourceParsedSqlForDmlTestAlloc,
+            .lower_truncate_source = lowerTruncateMutationSourceParsedSqlForDmlTestAlloc,
+            .lower_merge_mutation_with_schemas = lowerMergeMutationPlanParsedSqlForDmlTestAlloc,
+        },
+    };
+    return try context.lowerParsed(parsed_sql, options);
 }
 
 fn lowerWritePlanWithCatalogForDmlTestAlloc(

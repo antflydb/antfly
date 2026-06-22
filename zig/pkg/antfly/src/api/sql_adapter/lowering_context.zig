@@ -18,10 +18,17 @@ const binder = @import("binder.zig");
 const classifier = @import("classifier.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const lower_expr = @import("lower_expr.zig");
+const metadata_api = @import("../../metadata/api.zig");
+const metadata_table_manager = @import("../../metadata/table_manager.zig");
+const metadata_transition_state = @import("../../metadata/transition_state.zig");
+const parser_mod = @import("parser.zig");
+const parser_context = @import("parser_context.zig");
 const plan = @import("plan.zig");
+const raft_reconciler = @import("../../raft/reconciler.zig");
 const relational_rows = @import("../relational_rows.zig");
 const table_catalog = @import("../table_catalog.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const schema_api = @import("../../schema/mod.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
@@ -222,6 +229,356 @@ pub const CatalogReadPlanLoweringContext = struct {
         return try self.callbacks.lower_without_source_schema(self.alloc, self.parsed_sql.?, self.schema, self.params, self.function_bindings);
     }
 };
+
+fn runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !runtime_schema.TableSchema {
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+}
+
+fn lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    catalog: table_catalog.CatalogSource,
+) !plan.LoweredReadPlan {
+    var context = CatalogReadPlanLoweringContext{
+        .alloc = alloc,
+        .sql = sql,
+        .schema = schema,
+        .params = params,
+        .function_bindings = .{},
+        .callbacks = .{
+            .lower_with_source_schema = lowerReadPlanWithSourceSchemaParsedSqlForLoweringContextTestAlloc,
+            .lower_without_source_schema = lowerReadPlanParsedSqlForLoweringContextTestAlloc,
+        },
+    };
+    return try context.lower(catalog);
+}
+
+fn lowerReadPlanWithSourceSchemaParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan.LoweredReadPlan {
+    return try lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(alloc, parsed_sql, schema, source_schema, params, function_bindings);
+}
+
+fn lowerReadPlanParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan.LoweredReadPlan {
+    return try lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(alloc, parsed_sql, schema, null, params, function_bindings);
+}
+
+fn lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !plan.LoweredReadPlan {
+    var context = ReadPlanLoweringContext{
+        .alloc = alloc,
+        .sql = parsed_sql.sql(),
+        .schema = schema,
+        .source_schema = source_schema,
+        .params = params,
+        .function_bindings = function_bindings,
+        .callbacks = .{
+            .lower_lateral_with_schemas = lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_window = unsupportedWindowParsedSqlForLoweringContextTestAlloc,
+            .lower_aggregate_plan = unsupportedAggregateParsedSqlForLoweringContextTestAlloc,
+            .lower_recursive_cte_plan = unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc,
+            .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc,
+            .lower_query_plan = unsupportedQueryParsedSqlForLoweringContextTestAlloc,
+            .lower_set_operation_optional_source_schema = unsupportedSetOperationParsedSqlForLoweringContextTestAlloc,
+        },
+    };
+    return try context.lowerParsed(parsed_sql);
+}
+
+fn lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan.LoweredJoin {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    var lowered = plan.parseJoinPlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.joinPlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsJoinPlanCteOutputAlloc(alloc, schema, lowered.asPlan()) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan.LoweredLateralPlan {
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    const tokens = parsed_sql.items();
+    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens,
+        .schema = schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+    };
+    var lowered = plan.parseLateralPlanAlloc(
+        alloc,
+        tokens,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.cteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.lateralPlanParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    errdefer lowered.deinit(alloc);
+    relational_rows.validateRowsLateralPlanCteOutputAlloc(alloc, schema, lowered.plan) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog => if (cte_adapter_shape) return error.UnsupportedSqlShape else return err,
+        else => return err,
+    };
+    return lowered;
+}
+
+fn unsupportedWindowParsedSqlForLoweringContextTestAlloc(
+    _: std.mem.Allocator,
+    _: *const tokenized.ParsedSql,
+    _: runtime_schema.TableSchema,
+    _: []const value_mod.SqlValue,
+) anyerror!plan.LoweredWindowPlan {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedAggregateParsedSqlForLoweringContextTestAlloc(
+    _: std.mem.Allocator,
+    _: *const tokenized.ParsedSql,
+    _: runtime_schema.TableSchema,
+    _: []const value_mod.SqlValue,
+) anyerror!plan.LoweredAggregatePlan {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedRecursiveCteParsedSqlForLoweringContextTestAlloc(
+    _: std.mem.Allocator,
+    _: *const tokenized.ParsedSql,
+    _: runtime_schema.TableSchema,
+    _: []const value_mod.SqlValue,
+    _: lower_expr.SqlFunctionBindings,
+) anyerror!plan.LoweredRecursiveCtePlan {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedQueryParsedSqlForLoweringContextTestAlloc(
+    _: std.mem.Allocator,
+    _: *const tokenized.ParsedSql,
+    _: runtime_schema.TableSchema,
+    _: []const value_mod.SqlValue,
+    _: lower_expr.SqlFunctionBindings,
+) anyerror!plan.LoweredQueryPlan {
+    return error.UnsupportedSqlShape;
+}
+
+fn unsupportedSetOperationParsedSqlForLoweringContextTestAlloc(
+    _: std.mem.Allocator,
+    _: *const tokenized.ParsedSql,
+    _: runtime_schema.TableSchema,
+    _: ?runtime_schema.TableSchema,
+    _: []const value_mod.SqlValue,
+    _: lower_expr.SqlFunctionBindings,
+) anyerror!plan.LoweredSetOperationPlan {
+    return error.UnsupportedSqlShape;
+}
+
+test "sql adapter lowering context lowers catalog-backed equality join read plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"name":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"enabled":{"type":"boolean"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const customer_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"name":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{
+                        .table_id = 11,
+                        .name = "usage_records",
+                        .placement_role = "data",
+                        .schema_json = schema_json,
+                    },
+                    .{
+                        .table_id = 12,
+                        .name = "customers",
+                        .placement_role = "data",
+                        .schema_json = customer_schema_json,
+                    },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog_plan = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM public.usage_records AS o LEFT JOIN public.customers AS c ON o.customer_id = c.id WHERE c.enabled IS TRUE ORDER BY 1 ASC LIMIT 2",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer catalog_plan.deinit(alloc);
+    switch (catalog_plan) {
+        .join => |catalog_join| {
+            try std.testing.expectEqualStrings("usage_records", catalog_join.left_table_name);
+            try std.testing.expectEqualStrings("customers", catalog_join.right_table_name);
+            const catalog_join_plan = catalog_join.asPlan();
+            try std.testing.expectEqualStrings("usage_records", catalog_join_plan.left_table);
+            try std.testing.expectEqualStrings("customers", catalog_join_plan.right_table);
+            try std.testing.expectEqual(@as(usize, 1), catalog_join.join.right.predicates.len);
+            try std.testing.expectEqualStrings("enabled", catalog_join.join.right.predicates[0].field);
+            try std.testing.expectEqualStrings("true", catalog_join.join.right.predicates[0].value_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter lowering context lowers catalog-backed bounded left join lateral read plans" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"kind":{"type":"keyword"},"tenant":{"type":"keyword"},"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"scope":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"},"enabled":{"type":"boolean"}},"required":["kind","tenant","id"],"additionalProperties":false}}},"primary_key":{"columns":["kind","tenant","id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const balance_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"organization_id":{"type":"keyword"},"kind":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"numeric"}},"required":["id","organization_id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{
+                        .table_id = 21,
+                        .name = "usage_records",
+                        .placement_role = "data",
+                        .schema_json = schema_json,
+                    },
+                    .{
+                        .table_id = 22,
+                        .name = "balance_records",
+                        .placement_role = "data",
+                        .schema_json = balance_schema_json,
+                    },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var catalog_plan = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM public.usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM public.balance_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY latest_amount DESC LIMIT 10",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer catalog_plan.deinit(alloc);
+    switch (catalog_plan) {
+        .lateral => |catalog_lateral| {
+            try std.testing.expectEqualStrings("usage_records", catalog_lateral.left_table_name);
+            try std.testing.expectEqualStrings("balance_records", catalog_lateral.right_table_name);
+            try std.testing.expectEqualStrings("usage_records", catalog_lateral.plan.left_table);
+            try std.testing.expectEqualStrings("balance_records", catalog_lateral.plan.right_table);
+            try std.testing.expectEqual(@as(usize, 1), catalog_lateral.plan.lateral.right.predicates.len);
+            try std.testing.expectEqualStrings("kind", catalog_lateral.plan.lateral.right.predicates[0].field);
+            try std.testing.expectEqualStrings("\"balance\"", catalog_lateral.plan.lateral.right.predicates[0].value_json.?);
+            try std.testing.expectEqual(@as(usize, 1), catalog_lateral.plan.lateral.correlations.len);
+            try std.testing.expectEqualStrings("organization_id", catalog_lateral.plan.lateral.correlations[0].right_field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
 
 pub const CatalogWritePlanLoweringCallbacks = struct {
     lower_with_options: *const fn (
