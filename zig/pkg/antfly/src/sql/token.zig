@@ -185,6 +185,7 @@ pub const TokenKeyword = enum {
     lpad,
     ltrim,
     materialized,
+    matched,
     md5,
     merge,
     metric,
@@ -399,6 +400,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.length, keywordFromIdentifier("LENGTH").?);
     try std.testing.expectEqual(TokenKeyword.lpad, keywordFromIdentifier("LPAD").?);
     try std.testing.expectEqual(TokenKeyword.ltrim, keywordFromIdentifier("LTRIM").?);
+    try std.testing.expectEqual(TokenKeyword.matched, keywordFromIdentifier("MATCHED").?);
     try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);

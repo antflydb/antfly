@@ -980,7 +980,7 @@ pub fn parseMergeMutationPlanAlloc(
     cte_hooks: plan_mod.CteSelectParserHooks,
     parser_options: MergeMutationParserOptions,
 ) !plan_mod.LoweredMergeMutationPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseMergeMutationBodyAlloc(alloc, tokens, pos, parser_options, .{
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) return try parseMergeMutationBodyAlloc(alloc, tokens, pos, parser_options, .{
         .ctes = &.{},
         .base_table_name = null,
     });
@@ -1030,7 +1030,7 @@ fn parseMergeCtesForPlanAlloc(
     parser_options: MergeMutationParserOptions,
 ) !ParsedMergeCtes {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("with");
+    try cursor.expectKeywordTag(.with);
     var read_ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
     errdefer {
         for (read_ctes.items) |cte| {
@@ -1055,11 +1055,11 @@ fn parseMergeCtesForPlanAlloc(
         if (plan_mod.findCteByName(read_ctes.items, cte_name) != null or findDataModifyingCteByName(data_ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
         const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
         defer strings.freeStringSlice(alloc, cte_column_aliases);
-        try cursor.expectKeyword("as");
+        try cursor.expectKeywordTag(.as);
         try parser.consumeCteMaterializationHint(tokens, pos);
         try cursor.expectToken(.lparen);
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
-        if (parser.peekKeyword(tokens, pos.*, "update") or parser.peekKeyword(tokens, pos.*, "delete")) {
+        if (parser.peekKeywordTag(tokens, pos.*, .update) or parser.peekKeywordTag(tokens, pos.*, .delete)) {
             if (cte_column_aliases.len != 0) return error.UnsupportedSqlShape;
             var inner_pos: usize = 0;
             var lowered = try parseDataModifyingCteMutationSourceAlloc(alloc, tokens[pos.*..close_index], &inner_pos, parser_options);
@@ -1123,8 +1123,8 @@ fn parseDataModifyingCteMutationSourceAlloc(
     parser_options: MergeMutationParserOptions,
 ) !plan_mod.LoweredMutationSource {
     const options = try dataModifyingCteMutationSourceParserOptionsAlloc(alloc, parser_options);
-    if (parser.peekKeyword(tokens, pos.*, "update")) return try parseUpdateMutationSourceAlloc(alloc, tokens, pos, options);
-    if (parser.peekKeyword(tokens, pos.*, "delete")) return try parseDeleteMutationSourceAlloc(alloc, tokens, pos, options);
+    if (parser.peekKeywordTag(tokens, pos.*, .update)) return try parseUpdateMutationSourceAlloc(alloc, tokens, pos, options);
+    if (parser.peekKeywordTag(tokens, pos.*, .delete)) return try parseDeleteMutationSourceAlloc(alloc, tokens, pos, options);
     if (options.row_claim.owner_id.len > 0) alloc.free(options.row_claim.owner_id);
     return error.UnsupportedSqlShape;
 }
@@ -1228,11 +1228,11 @@ pub fn parseMergeMutationBodyAlloc(
     parser_options: MergeMutationParserOptions,
     options: MergeMutationBodyOptions,
 ) !plan_mod.LoweredMergeMutationPlan {
-    try parser.expectKeyword(tokens, pos, "merge");
-    try parser.expectKeyword(tokens, pos, "into");
+    try parser.expectKeywordTag(tokens, pos, .merge);
+    try parser.expectKeywordTag(tokens, pos, .into);
     const target_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer plan_mod.freeTableAlias(alloc, target_table);
-    try parser.expectKeyword(tokens, pos, "using");
+    try parser.expectKeywordTag(tokens, pos, .using);
     const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, pos);
     defer plan_mod.freeTableAlias(alloc, source_table);
     if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.UnsupportedSqlShape;
@@ -1320,7 +1320,7 @@ pub fn parseJoinedMutationSourceAlloc(
     cte_hooks: plan_mod.CteSelectParserHooks,
     hooks: JoinedMutationSourceParserHooks,
 ) !plan_mod.LoweredJoinedMutationSource {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try hooks.parse_joined_mutation_source(hooks.ptr, &.{}, null);
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) return try hooks.parse_joined_mutation_source(hooks.ptr, &.{}, null);
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
@@ -3274,7 +3274,7 @@ pub fn parseMergeMatchFieldsAlloc(
     target_table: TableAlias,
     source_table: TableAlias,
 ) ![]const MergeFieldMapping {
-    try parser.expectKeyword(tokens, pos, "on");
+    try parser.expectKeywordTag(tokens, pos, .on);
     var match_fields = std.ArrayListUnmanaged(MergeFieldMapping).empty;
     errdefer {
         freeMergeFieldMappingValues(alloc, match_fields.items);
@@ -3283,7 +3283,7 @@ pub fn parseMergeMatchFieldsAlloc(
     while (true) {
         const mapping = try parseMergeQualifiedSourceMappingAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table);
         try match_fields.append(alloc, mapping);
-        if (!parser.matchKeyword(tokens, pos, "and")) break;
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
     if (match_fields.items.len == 0) return error.UnsupportedSqlShape;
     return try match_fields.toOwnedSlice(alloc);
@@ -3319,8 +3319,8 @@ pub fn parseMergeMutationClausesAlloc(
         not_matched_arms.deinit(alloc);
     }
 
-    while (parser.matchKeyword(tokens, pos, "when")) {
-        if (parser.matchKeyword(tokens, pos, "matched")) {
+    while (parser.matchKeywordTag(tokens, pos, .when)) {
+        if (parser.matchKeywordTag(tokens, pos, .matched)) {
             const arm = try parseMergeMatchedArmAlloc(
                 alloc,
                 tokens,
@@ -3338,7 +3338,7 @@ pub fn parseMergeMutationClausesAlloc(
             errdefer if (!arm_transferred) freeMergeMatchedArmValue(alloc, arm);
             try matched_arms.append(alloc, arm);
             arm_transferred = true;
-        } else if (parser.matchKeyword(tokens, pos, "not")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .not)) {
             const arm = try parseMergeNotMatchedArmAlloc(
                 alloc,
                 tokens,
@@ -3367,7 +3367,7 @@ pub fn parseMergeMutationClausesAlloc(
     clauses.not_matched_arms = try not_matched_arms.toOwnedSlice(alloc);
     not_matched_arms = .empty;
 
-    if (parser.matchKeyword(tokens, pos, "returning")) {
+    if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         clauses.returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, schema, &returning_qualifiers, returning_hooks);
     }
@@ -6005,7 +6005,7 @@ pub fn parseMergeMatchedArmAlloc(
         freeExpressionPredicateGroups(alloc, expression_not_predicates.items);
         expression_not_predicates.deinit(alloc);
     }
-    if (parser.matchKeyword(tokens, pos, "and")) {
+    if (parser.matchKeywordTag(tokens, pos, .@"and")) {
         while (true) {
             try parseMergeArmConditionAlloc(
                 alloc,
@@ -6024,10 +6024,10 @@ pub fn parseMergeMatchedArmAlloc(
                 &expression_not_predicates,
                 condition_options,
             );
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
         }
     }
-    try parser.expectKeyword(tokens, pos, "then");
+    try parser.expectKeywordTag(tokens, pos, .then);
     var update = std.ArrayListUnmanaged(MergeFieldMapping).empty;
     errdefer {
         freeMergeFieldMappingValues(alloc, update.items);
@@ -6040,8 +6040,8 @@ pub fn parseMergeMatchedArmAlloc(
     }
     var matched_delete = false;
     var matched_do_nothing = false;
-    if (parser.matchKeyword(tokens, pos, "update")) {
-        try parser.expectKeyword(tokens, pos, "set");
+    if (parser.matchKeywordTag(tokens, pos, .update)) {
+        try parser.expectKeywordTag(tokens, pos, .set);
         while (true) {
             const assignment = try parseMergeUpdateAssignmentAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, assignment_options);
             switch (assignment) {
@@ -6051,10 +6051,10 @@ pub fn parseMergeMatchedArmAlloc(
             if (parser.matchToken(tokens, pos, .comma) == null) break;
         }
         if (update.items.len == 0 and update_expressions.items.len == 0) return error.UnsupportedSqlShape;
-    } else if (parser.matchKeyword(tokens, pos, "delete")) {
+    } else if (parser.matchKeywordTag(tokens, pos, .delete)) {
         matched_delete = true;
-    } else if (parser.matchKeyword(tokens, pos, "do")) {
-        try parser.expectKeyword(tokens, pos, "nothing");
+    } else if (parser.matchKeywordTag(tokens, pos, .do)) {
+        try parser.expectKeywordTag(tokens, pos, .nothing);
         matched_do_nothing = true;
     } else {
         return error.UnsupportedSqlShape;
@@ -6087,7 +6087,7 @@ pub fn parseMergeNotMatchedArmAlloc(
     condition_options: MergeArmConditionParserOptions,
     assignment_options: MergeAssignmentParserOptions,
 ) !MergeNotMatchedArm {
-    try parser.expectKeyword(tokens, pos, "matched");
+    try parser.expectKeywordTag(tokens, pos, .matched);
     var predicates = std.ArrayListUnmanaged(MergeArmPredicate).empty;
     errdefer {
         freeMergeArmPredicateValues(alloc, predicates.items);
@@ -6108,7 +6108,7 @@ pub fn parseMergeNotMatchedArmAlloc(
         freeExpressionPredicateGroups(alloc, expression_not_predicates.items);
         expression_not_predicates.deinit(alloc);
     }
-    if (parser.matchKeyword(tokens, pos, "and")) {
+    if (parser.matchKeywordTag(tokens, pos, .@"and")) {
         while (true) {
             try parseMergeArmConditionAlloc(
                 alloc,
@@ -6127,10 +6127,10 @@ pub fn parseMergeNotMatchedArmAlloc(
                 &expression_not_predicates,
                 condition_options,
             );
-            if (!parser.matchKeyword(tokens, pos, "and")) break;
+            if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
         }
     }
-    try parser.expectKeyword(tokens, pos, "then");
+    try parser.expectKeywordTag(tokens, pos, .then);
     var insert = std.ArrayListUnmanaged(MergeFieldMapping).empty;
     errdefer {
         freeMergeFieldMappingValues(alloc, insert.items);
@@ -6142,10 +6142,10 @@ pub fn parseMergeNotMatchedArmAlloc(
         insert_expressions.deinit(alloc);
     }
     var not_matched_do_nothing = false;
-    if (parser.matchKeyword(tokens, pos, "insert")) {
+    if (parser.matchKeywordTag(tokens, pos, .insert)) {
         try parseMergeInsertMappingsAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, &insert, &insert_expressions, assignment_options);
-    } else if (parser.matchKeyword(tokens, pos, "do")) {
-        try parser.expectKeyword(tokens, pos, "nothing");
+    } else if (parser.matchKeywordTag(tokens, pos, .do)) {
+        try parser.expectKeywordTag(tokens, pos, .nothing);
         not_matched_do_nothing = true;
     } else {
         return error.UnsupportedSqlShape;

@@ -837,6 +837,10 @@ Current implementation status:
   `INSERT ... SELECT`, `ON CONFLICT`, `DO UPDATE`, `WHERE`, and `RETURNING`
   structural clauses; semantic column, table, and value comparisons remain
   ordinary binder/value work.
+- MERGE, joined mutation-source, and data-modifying CTE parsing use token
+  keyword tags for structural statement heads, CTE wrappers, match arms, action
+  clauses, and returning clauses; source/target table identity stays in binder
+  and plan resolution.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.
