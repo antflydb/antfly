@@ -31735,6 +31735,142 @@ test "sql adapter lower expr lowers case-fold expression predicates" {
     try std.testing.expectEqualStrings("\"SYSTEM@EXAMPLE.TEST\"", all_expression_or.plan.query.expression_or_predicates[1].conditions[1].rhs[0].value_json);
 }
 
+test "sql adapter lower expr lowers temporal range predicates and bound projections" {
+    const alloc = std.testing.allocator;
+    const date_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"product_id":{"type":"numeric"},"product_name":{"type":"keyword"},"price":{"type":"numeric"},"valid_at_start":{"type":"datetime"},"valid_at_end":{"type":"datetime"}},"required":["product_id","product_name"],"additionalProperties":false}}},"periods":[{"name":"valid_at","start_column":"valid_at_start","end_column":"valid_at_end","range_type":"daterange"}],"primary_key":{"columns":["product_id"],"without_overlaps_period":"valid_at"}}
+    ;
+    const date_schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, date_schema_json);
+    defer runtime_schema.freeSchema(alloc, date_schema);
+
+    var date_contains = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT product_id FROM products WHERE valid_at @> '2025-02-15'::date ORDER BY product_id ASC LIMIT 5",
+        date_schema,
+        &.{},
+    );
+    defer date_contains.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), date_contains.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("valid_at_start", date_contains.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, date_contains.plan.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("1739577600000000000", date_contains.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("valid_at_end", date_contains.plan.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, date_contains.plan.query.or_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("1739577600000000000", date_contains.plan.query.or_predicates[1].predicates[0].value_json.?);
+
+    var date_overlap = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT product_id FROM products WHERE valid_at && daterange('2025-02-01'::date, '2025-04-01'::date) ORDER BY product_id ASC LIMIT 5",
+        date_schema,
+        &.{},
+    );
+    defer date_overlap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), date_overlap.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("valid_at_start", date_overlap.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, date_overlap.plan.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("1743465600000000000", date_overlap.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("valid_at_end", date_overlap.plan.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, date_overlap.plan.query.or_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("1738368000000000000", date_overlap.plan.query.or_predicates[1].predicates[0].value_json.?);
+
+    var inclusive_date_overlap = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT product_id FROM products WHERE valid_at && daterange('2025-02-01'::date, '2025-04-01'::date, '[]') ORDER BY product_id ASC LIMIT 5",
+        date_schema,
+        &.{},
+    );
+    defer inclusive_date_overlap.deinit(alloc);
+    try std.testing.expectEqualStrings("1743552000000000000", inclusive_date_overlap.plan.query.or_predicates[0].predicates[0].value_json.?);
+
+    const numeric_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"price":{"type":"numeric"},"valid_at_start":{"type":"numeric"},"valid_at_end":{"type":"numeric"}},"required":["sku"],"additionalProperties":false}}},"periods":[{"name":"valid_at","start_column":"valid_at_start","end_column":"valid_at_end","range_type":"numrange"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_at"}}
+    ;
+    const numeric_schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, numeric_schema_json);
+    defer runtime_schema.freeSchema(alloc, numeric_schema);
+
+    var bound_query = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT lower(p.valid_at) AS valid_start, upper(p.valid_at) AS valid_end FROM price_intervals AS p WHERE lower(p.valid_at) >= 1 AND upper(p.valid_at) IS NOT NULL ORDER BY upper(p.valid_at) DESC LIMIT 5",
+        numeric_schema,
+        &.{},
+    );
+    defer bound_query.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), bound_query.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("valid_start", bound_query.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, bound_query.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("valid_at_start", bound_query.plan.query.expressions[0].expression.field);
+    try std.testing.expectEqualStrings("valid_end", bound_query.plan.query.expressions[1].output);
+    try std.testing.expectEqualStrings("valid_at_end", bound_query.plan.query.expressions[1].expression.field);
+    try std.testing.expectEqual(@as(usize, 2), bound_query.plan.query.expression_predicates.len);
+    try std.testing.expectEqualStrings("valid_at_start", bound_query.plan.query.expression_predicates[0].lhs.field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, bound_query.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqualStrings("1", bound_query.plan.query.expression_predicates[0].rhs[0].value_json);
+    try std.testing.expectEqual(@as(usize, 1), bound_query.plan.query.order_by.len);
+    try std.testing.expectEqualStrings("valid_at_end", bound_query.plan.query.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, bound_query.plan.query.order_by[0].direction);
+
+    var period_contains = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT sku FROM price_intervals WHERE valid_at @> 7 ORDER BY sku ASC LIMIT 5",
+        numeric_schema,
+        &.{},
+    );
+    defer period_contains.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), period_contains.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("valid_at_start", period_contains.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lte, period_contains.plan.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("7", period_contains.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("valid_at_end", period_contains.plan.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, period_contains.plan.query.or_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("7", period_contains.plan.query.or_predicates[1].predicates[0].value_json.?);
+
+    var period_overlap = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT sku FROM price_intervals WHERE valid_at && numrange(5, 9) ORDER BY sku ASC LIMIT 5",
+        numeric_schema,
+        &.{},
+    );
+    defer period_overlap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), period_overlap.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("valid_at_start", period_overlap.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, period_overlap.plan.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("9", period_overlap.plan.query.or_predicates[0].predicates[0].value_json.?);
+    try std.testing.expectEqualStrings("valid_at_end", period_overlap.plan.query.or_predicates[1].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, period_overlap.plan.query.or_predicates[1].predicates[0].op);
+    try std.testing.expectEqualStrings("5", period_overlap.plan.query.or_predicates[1].predicates[0].value_json.?);
+
+    var unbounded_overlap = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT sku FROM price_intervals WHERE valid_at && '[,9)'::numrange",
+        numeric_schema,
+        &.{},
+    );
+    defer unbounded_overlap.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), unbounded_overlap.plan.query.or_predicates.len);
+    try std.testing.expectEqualStrings("valid_at_start", unbounded_overlap.plan.query.or_predicates[0].predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.lt, unbounded_overlap.plan.query.or_predicates[0].predicates[0].op);
+    try std.testing.expectEqualStrings("9", unbounded_overlap.plan.query.or_predicates[0].predicates[0].value_json.?);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT sku FROM price_intervals WHERE NOT (valid_at @> 7)",
+        numeric_schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT sku FROM price_intervals WHERE NOT (valid_at && numrange(5, 9))",
+        numeric_schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT sku FROM price_intervals WHERE valid_at && numrange(5, 5)",
+        numeric_schema,
+        &.{},
+    ));
+}
+
 test "sql adapter lower expr assembles boolean predicate groups" {
     const alloc = std.testing.allocator;
 

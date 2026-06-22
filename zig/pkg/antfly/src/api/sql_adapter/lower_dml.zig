@@ -15986,6 +15986,140 @@ test "sql adapter lower dml lowers now and current_timestamp insert values" {
     try std.testing.expectEqualStrings("{\"created_at_ns\":1735689600000000000}", lowered_typed_literal.batch.returning_rows[0]);
 }
 
+test "sql adapter lower dml lowers range insert values into period columns" {
+    const alloc = std.testing.allocator;
+    const products_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"product_id":{"type":"numeric"},"product_name":{"type":"keyword"},"price":{"type":"numeric"},"valid_at_start":{"type":"datetime"},"valid_at_end":{"type":"datetime"}},"required":["product_id","product_name"],"additionalProperties":false}}},"periods":[{"name":"valid_at","start_column":"valid_at_start","end_column":"valid_at_end","range_type":"daterange"}],"primary_key":{"columns":["product_id"],"without_overlaps_period":"valid_at"}}
+    ;
+    const products_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, products_schema_json);
+    defer runtime_schema.freeSchema(alloc, products_schema);
+
+    var closed_open = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (1, 'widget', 19.5, '[2025-01-01,2025-07-01)'::daterange) RETURNING *",
+        products_schema,
+        &.{},
+    );
+    defer closed_open.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), closed_open.batch.inserted);
+    var closed_open_row = try std.json.parseFromSlice(std.json.Value, alloc, closed_open.batch.returning_rows[0], .{});
+    defer closed_open_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1), closed_open_row.value.object.get("product_id").?.integer);
+    try std.testing.expectEqualStrings("widget", closed_open_row.value.object.get("product_name").?.string);
+    try std.testing.expectEqual(@as(i64, 1_735_689_600_000_000_000), closed_open_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_751_328_000_000_000_000), closed_open_row.value.object.get("valid_at_end").?.integer);
+
+    var open_upper = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (2, 'gadget', 24.5, '[2026-01-01,)'::daterange) RETURNING *",
+        products_schema,
+        &.{},
+    );
+    defer open_upper.deinit(alloc);
+    var open_upper_row = try std.json.parseFromSlice(std.json.Value, alloc, open_upper.batch.returning_rows[0], .{});
+    defer open_upper_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1_767_225_600_000_000_000), open_upper_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expect(open_upper_row.value.object.get("valid_at_end").? == .null);
+
+    var open_lower = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (3, 'legacy', 21.5, '(,2026-01-01)'::daterange) RETURNING *",
+        products_schema,
+        &.{},
+    );
+    defer open_lower.deinit(alloc);
+    var open_lower_row = try std.json.parseFromSlice(std.json.Value, alloc, open_lower.batch.returning_rows[0], .{});
+    defer open_lower_row.deinit();
+    try std.testing.expect(open_lower_row.value.object.get("valid_at_start").? == .null);
+    try std.testing.expectEqual(@as(i64, 1_767_225_600_000_000_000), open_lower_row.value.object.get("valid_at_end").?.integer);
+
+    var constructor = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (4, 'constructor', 26.5, daterange(DATE '2025-02-01', DATE '2025-03-01')) RETURNING *",
+        products_schema,
+        &.{},
+    );
+    defer constructor.deinit(alloc);
+    var constructor_row = try std.json.parseFromSlice(std.json.Value, alloc, constructor.batch.returning_rows[0], .{});
+    defer constructor_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1_738_368_000_000_000_000), constructor_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_740_787_200_000_000_000), constructor_row.value.object.get("valid_at_end").?.integer);
+
+    var parameterized_constructor = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (5, 'open-constructor', 27.5, daterange($1::date, null, '[)')) RETURNING *",
+        products_schema,
+        &.{.{ .string = "2025-04-01" }},
+    );
+    defer parameterized_constructor.deinit(alloc);
+    var parameterized_constructor_row = try std.json.parseFromSlice(std.json.Value, alloc, parameterized_constructor.batch.returning_rows[0], .{});
+    defer parameterized_constructor_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1_743_465_600_000_000_000), parameterized_constructor_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expect(parameterized_constructor_row.value.object.get("valid_at_end").? == .null);
+
+    var inclusive_literal = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (6, 'literal-inclusive', 29.5, '[2025-01-01,2025-02-01]'::daterange) RETURNING *",
+        products_schema,
+        &.{},
+    );
+    defer inclusive_literal.deinit(alloc);
+    var inclusive_literal_row = try std.json.parseFromSlice(std.json.Value, alloc, inclusive_literal.batch.returning_rows[0], .{});
+    defer inclusive_literal_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1_735_689_600_000_000_000), inclusive_literal_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_738_454_400_000_000_000), inclusive_literal_row.value.object.get("valid_at_end").?.integer);
+
+    var lower_exclusive_literal = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO products (product_id, product_name, price, valid_at) VALUES (7, 'literal-lower-exclusive', 31.5, '(2025-01-01,2025-02-01]'::daterange) RETURNING *",
+        products_schema,
+        &.{},
+    );
+    defer lower_exclusive_literal.deinit(alloc);
+    var lower_exclusive_literal_row = try std.json.parseFromSlice(std.json.Value, alloc, lower_exclusive_literal.batch.returning_rows[0], .{});
+    defer lower_exclusive_literal_row.deinit();
+    try std.testing.expectEqual(@as(i64, 1_735_776_000_000_000_000), lower_exclusive_literal_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 1_738_454_400_000_000_000), lower_exclusive_literal_row.value.object.get("valid_at_end").?.integer);
+
+    const numeric_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"price":{"type":"numeric"},"valid_at_start":{"type":"numeric"},"valid_at_end":{"type":"numeric"}},"required":["sku"],"additionalProperties":false}}},"periods":[{"name":"valid_at","start_column":"valid_at_start","end_column":"valid_at_end","range_type":"numrange"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_at"}}
+    ;
+    const numeric_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, numeric_schema_json);
+    defer runtime_schema.freeSchema(alloc, numeric_schema);
+
+    var numeric_range = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO price_intervals (sku, valid_at, price) VALUES ('sku:a', '[1,10)'::numrange, 12.5) RETURNING *",
+        numeric_schema,
+        &.{},
+    );
+    defer numeric_range.deinit(alloc);
+    var numeric_range_row = try std.json.parseFromSlice(std.json.Value, alloc, numeric_range.batch.returning_rows[0], .{});
+    defer numeric_range_row.deinit();
+    try std.testing.expectEqualStrings("sku:a", numeric_range_row.value.object.get("sku").?.string);
+    try std.testing.expectEqual(@as(i64, 1), numeric_range_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), numeric_range_row.value.object.get("valid_at_end").?.integer);
+
+    var numeric_constructor = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO price_intervals (sku, valid_at, price) VALUES ('sku:b', numrange(-5, $1::numeric), 9) RETURNING *",
+        numeric_schema,
+        &.{.{ .integer = 15 }},
+    );
+    defer numeric_constructor.deinit(alloc);
+    var numeric_constructor_row = try std.json.parseFromSlice(std.json.Value, alloc, numeric_constructor.batch.returning_rows[0], .{});
+    defer numeric_constructor_row.deinit();
+    try std.testing.expectEqual(@as(i64, -5), numeric_constructor_row.value.object.get("valid_at_start").?.integer);
+    try std.testing.expectEqual(@as(i64, 15), numeric_constructor_row.value.object.get("valid_at_end").?.integer);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO price_intervals (sku, valid_at, price) VALUES ('sku:c', '(1,10]'::numrange, 9) RETURNING *",
+        numeric_schema,
+        &.{},
+    ));
+}
+
 test "sql adapter lower dml lowers explicit default insert values" {
     const alloc = std.testing.allocator;
     const schema_json =

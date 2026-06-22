@@ -71,7 +71,7 @@ pub const ParsedSql = struct {
         errdefer tokenized_sql.deinit(alloc);
         return .{
             .tokenized_sql = tokenized_sql,
-            .raw_statement = parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family),
+            .raw_statement = try parseRawStatement(tokenized_sql.items(), tokenized_sql.statement_family),
         };
     }
 
@@ -93,9 +93,9 @@ pub const ParsedSql = struct {
     }
 };
 
-fn parseRawStatement(tokens: []const Token, family: ?classifier.SqlStatementFamily) RawSqlStatement {
+fn parseRawStatement(tokens: []const Token, family: ?classifier.SqlStatementFamily) !RawSqlStatement {
     if (tokens.len == 0) return .{ .family = family };
-    var token_end = tokens.len;
+    var token_end = try rawStatementTokenEnd(tokens);
     while (token_end > 0 and tokens[token_end - 1].kind == .semicolon) token_end -= 1;
     if (token_end == 0) return .{ .family = family };
     return .{
@@ -107,6 +107,26 @@ fn parseRawStatement(tokens: []const Token, family: ?classifier.SqlStatementFami
             .end = tokens[token_end - 1].source_end,
         },
     };
+}
+
+fn rawStatementTokenEnd(tokens: []const Token) !usize {
+    var depth: usize = 0;
+    for (tokens, 0..) |token, i| {
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .semicolon => if (depth == 0) {
+                var next = i + 1;
+                while (next < tokens.len and tokens[next].kind == .semicolon) next += 1;
+                if (next < tokens.len) return error.UnsupportedSqlShape;
+                return i;
+            },
+            else => {},
+        }
+    }
+    return tokens.len;
 }
 
 test "sql adapter tokenized sql classifies read and write statements once" {
@@ -140,4 +160,17 @@ test "sql adapter parsed sql exposes raw statement source spans" {
     try std.testing.expectEqualStrings("SELECT id FROM usage_records", parsed.statementSql());
     try std.testing.expectEqual(@as(usize, 2), parsed.raw_statement.source_span.start);
     try std.testing.expectEqual(@as(usize, 30), parsed.raw_statement.source_span.end);
+
+    var trailing_semicolons = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records;;");
+    defer trailing_semicolons.deinit(alloc);
+    try std.testing.expectEqualStrings("SELECT id FROM usage_records", trailing_semicolons.statementSql());
+
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records; DROP TABLE usage_records"),
+    );
+
+    var nested_semicolon = try ParsedSql.initAlloc(alloc, "SELECT ';' AS separator");
+    defer nested_semicolon.deinit(alloc);
+    try std.testing.expectEqualStrings("SELECT ';' AS separator", nested_semicolon.statementSql());
 }
