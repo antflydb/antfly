@@ -126,6 +126,74 @@ Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
 expression behavior, lower it to the shared row-expression AST first.
 
+## Production Design Decision
+
+The production architecture should treat SQL as a typed compiler frontend, not
+as an alternate control plane. PostgreSQL syntax is the compatibility language,
+but the durable source of truth is the same Antfly-native catalog, storage,
+role, extension, job, lake, backup, and derived-index model used by every other
+API surface.
+
+The design decision is:
+
+```text
+external SQL text
+  -> one TokenizedSql
+  -> one ParsedSql
+  -> one BoundSqlStatement
+  -> one LogicalSqlPlan
+  -> shared Antfly service owner
+```
+
+Only the first step should know about raw request text. After `ParsedSql`,
+internal APIs should carry typed parser nodes, source spans, resolved catalog
+targets, session state, authorization results, and native lifecycle or row plans.
+Compatibility wrappers may remain at HTTP, SQL wire, CLI, MCP, A2A, fixture,
+and test ingress points, but they should immediately construct or receive
+`ParsedSql` and then delegate to the shared binder/planner path.
+
+The SQL adapter owns syntax, spans, session interpretation, binding, and
+lowering. It does not own durable behavior. Durable effects are owned by the
+same services that serve non-SQL callers:
+
+- catalog/database/namespace/table/tablespace DDL goes through the catalog
+  lifecycle service;
+- row reads and writes go through typed row plans and storage vtables;
+- role SQL goes through Antfly user and role management;
+- extension SQL goes through extension package lifecycle;
+- index SQL goes through derived-index lifecycle and artifact jobs;
+- backup/restore and lake or foreign-source SQL goes through typed storage and
+  source services;
+- long-running `ALTER` work goes through the shared durable job system admitted
+  by the catalog or metadata owner.
+
+The metadata leader, or the component that owns the equivalent consensus-backed
+catalog transition, is the only place that should commit metadata state changes
+or durable lifecycle job records. SQL may validate and prepare the request, but
+it should not independently persist catalog state, schedule background work, or
+write placement metadata.
+
+New SQL work should meet these production rules before it is considered
+complete:
+
+- parse once and preserve source byte spans through diagnostics;
+- dispatch by typed statement-family variants, not by lowerer probe order;
+- bind catalog-aware statements through explicit SQL session state, catalog
+  snapshots, object versions, dependency checks, and role authorization;
+- lower durable effects into Antfly-native request structs, never durable SQL
+  fragments;
+- return phase-aware parse, bind, plan, or execute diagnostics that name the
+  missing native model for unsupported shapes;
+- validate fixtures and parity through structured summaries or coverage bits
+  emitted by parser, binder, planner, and lowerer phases, not substring scans
+  that behave like a second parser.
+
+This shape is intentionally stricter than accepting PostgreSQL-looking syntax.
+A statement family is production-ready only when SQL and the equivalent REST,
+SDK, MCP, A2A, CLI, internal job, or automation path reach the same native
+service contract with the same authorization, idempotency, audit, retry, and
+failure semantics.
+
 ## Catalog and Session Semantics
 
 SQL object names resolve through the same `database / namespace / table` model
@@ -463,6 +531,13 @@ Current implementation status:
   parsed tokens for named constraints, column targets, partial targets, and
   expression targets, including temporal named-constraint upserts, instead of
   scanning SQL text.
+- ALTER TABLE coverage now uses parsed keyword tags for add/drop/rename column
+  and constraint forms, defaults, not-null toggles, type changes, validation,
+  and trigger-backed update-policy drops while retaining applied-plan
+  rebuild/validation/rewrite evidence.
+- Adapter no-op transaction/session coverage now uses parsed statement-start
+  keyword tags for `COMMIT`, `ROLLBACK`, `RESET`, `SHOW`, and `DISCARD`
+  instead of case-insensitive raw SQL prefix probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

@@ -8970,8 +8970,7 @@ pub const AppParityCorpusCoverage = struct {
                 .alter_table => {
                     self.ddl_alter_table = true;
                     self.ddl_add_column_default_rewrite = self.ddl_add_column_default_rewrite or
-                        std.mem.indexOf(u8, entry.sql, "ADD COLUMN") != null and
-                            std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
+                        appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .add, .column, .default }) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
@@ -8984,29 +8983,35 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_add_deferrable_unique_constraint = self.ddl_add_deferrable_unique_constraint or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":unique_deferrable=") and
                             sql_adapter.planHasNonZeroToken(entry.plan, ":unique_deferred=");
-                    self.ddl_validate_constraint = self.ddl_validate_constraint or std.mem.indexOf(u8, entry.sql, "VALIDATE CONSTRAINT") != null;
-                    self.ddl_drop_constraint = self.ddl_drop_constraint or std.mem.indexOf(u8, entry.sql, "DROP CONSTRAINT") != null;
-                    self.ddl_drop_column = self.ddl_drop_column or std.mem.indexOf(u8, entry.sql, "DROP COLUMN") != null;
-                    self.ddl_alter_column_default = self.ddl_alter_column_default or std.mem.indexOf(u8, entry.sql, "SET DEFAULT") != null or std.mem.indexOf(u8, entry.sql, "DROP DEFAULT") != null;
+                    self.ddl_validate_constraint = self.ddl_validate_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .validate, .constraint });
+                    self.ddl_drop_constraint = self.ddl_drop_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .constraint });
+                    self.ddl_drop_column = self.ddl_drop_column or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .column });
+                    self.ddl_alter_column_default = self.ddl_alter_column_default or
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .default }) or
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .default });
                     self.ddl_drop_column_default = self.ddl_drop_column_default or
-                        std.mem.indexOf(u8, entry.sql, "DROP DEFAULT") != null and
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .default }) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
-                    self.ddl_alter_column_not_null = self.ddl_alter_column_not_null or std.mem.indexOf(u8, entry.sql, "SET NOT NULL") != null or std.mem.indexOf(u8, entry.sql, "DROP NOT NULL") != null;
+                    self.ddl_alter_column_not_null = self.ddl_alter_column_not_null or
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .not, .null }) or
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .not, .null });
                     self.ddl_drop_column_not_null = self.ddl_drop_column_not_null or
-                        std.mem.indexOf(u8, entry.sql, "DROP NOT NULL") != null and
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .not, .null }) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
-                    self.ddl_alter_column_type = self.ddl_alter_column_type or std.mem.indexOf(u8, entry.sql, " TYPE ") != null or std.mem.indexOf(u8, entry.sql, " SET DATA TYPE ") != null;
+                    self.ddl_alter_column_type = self.ddl_alter_column_type or
+                        appParityTokensHaveKeyword(sql_tokens, .type) or
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .data, .type });
                     self.ddl_alter_column_rewrite_expression = self.ddl_alter_column_rewrite_expression or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":alter_type_rewrite_expr=") and
                             std.mem.indexOf(u8, entry.applied_plan, "rewrite/table/row_images(target=") != null and
                             std.mem.indexOf(u8, entry.applied_plan, ":expr=") != null;
-                    self.ddl_rename_column = self.ddl_rename_column or std.mem.indexOf(u8, entry.sql, "RENAME COLUMN") != null;
-                    self.ddl_rename_constraint = self.ddl_rename_constraint or std.mem.indexOf(u8, entry.sql, "RENAME CONSTRAINT") != null;
-                    self.ddl_drop_update_policy = self.ddl_drop_update_policy or std.mem.indexOf(u8, entry.sql, "DROP TRIGGER") != null;
+                    self.ddl_rename_column = self.ddl_rename_column or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .column });
+                    self.ddl_rename_constraint = self.ddl_rename_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .constraint });
+                    self.ddl_drop_update_policy = self.ddl_drop_update_policy or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .trigger });
                 },
                 .create_update_policy => self.ddl_create_update_policy = true,
             }
@@ -9014,19 +9019,19 @@ pub const AppParityCorpusCoverage = struct {
             self.adapter_noop_transaction = self.adapter_noop_transaction or std.mem.eql(u8, entry.classification_reason, "transaction_control");
             self.adapter_noop_transaction_commit = self.adapter_noop_transaction_commit or
                 std.mem.eql(u8, entry.classification_reason, "transaction_control") and
-                    std.ascii.startsWithIgnoreCase(entry.sql, "COMMIT");
+                    appParityTokensStartWithKeyword(sql_tokens, .commit);
             self.adapter_noop_transaction_rollback = self.adapter_noop_transaction_rollback or
                 std.mem.eql(u8, entry.classification_reason, "transaction_control") and
-                    std.ascii.startsWithIgnoreCase(entry.sql, "ROLLBACK");
+                    appParityTokensStartWithKeyword(sql_tokens, .rollback);
             self.adapter_noop_session = self.adapter_noop_session or std.mem.eql(u8, entry.classification_reason, "session_setting");
             self.adapter_noop_session_probe = self.adapter_noop_session_probe or
                 std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    (std.ascii.startsWithIgnoreCase(entry.sql, "RESET") or std.ascii.startsWithIgnoreCase(entry.sql, "SHOW"));
+                    (appParityTokensStartWithKeyword(sql_tokens, .reset) or appParityTokensStartWithKeyword(sql_tokens, .show));
             self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or std.mem.eql(u8, entry.classification_reason, "schema_namespace");
             self.adapter_noop_extension = self.adapter_noop_extension or std.mem.eql(u8, entry.classification_reason, "extension");
             self.session_discard = self.session_discard or
                 std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    std.ascii.startsWithIgnoreCase(entry.sql, "DISCARD");
+                    appParityTokensStartWithKeyword(sql_tokens, .discard);
         }
 
         self.scalar_membership = self.scalar_membership or sql_adapter.planHasAnyNonZeroToken(entry.plan, &.{
