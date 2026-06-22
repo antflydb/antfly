@@ -6067,7 +6067,15 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    metadata snapshot. Binding-aware SQL read-plan lowering can project those
    ready extension functions as typed native expression nodes, so SQL-visible
    extension functions execute through Antfly hooks instead of opaque package
-   metadata or parser-local string dispatch. PL/pgSQL
+   metadata or parser-local string dispatch. Antfly-owned SQL table functions
+   such as `antfly.full_text_search`, `antfly.semantic_search`,
+   `antfly.vector_search`, `antfly.graph_match`, `antfly.graph_metric`,
+   `antfly.graph_metric_rerank`, and `antfly.hybrid_search` are also
+   adapter-level syntax for native typed query requests rather than relational
+   row-plan fragments. The parity corpus treats them as a first-class
+   `query_function` family and gates full-text, dense, graph-search,
+   graph-metric, graph-rerank, and hybrid request production from data-driven
+   fixture entries. PL/pgSQL
    helper functions, dump-only syntax, and Postgres catalog bookkeeping are
    adapter concerns that lower to explicit metadata or are ignored only when
    proven semantic no-ops. Golden migration-equivalence tests should compile intended

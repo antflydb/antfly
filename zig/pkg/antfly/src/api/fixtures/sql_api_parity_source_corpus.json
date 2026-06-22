@@ -216,6 +216,48 @@
       "sql": "SELECT lower(status) AS status_key, COUNT(*) AS row_count FROM usage_records GROUP BY lower(status) HAVING status_key = 'open' ORDER BY status_key ASC LIMIT 5"
     },
     {
+      "name": "query function full text search request",
+      "family": "query_function",
+      "plan": "query_function:text=1:full_text_queries=0:dense=0:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=5:primary_text_index=1",
+      "sql": "SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5)"
+    },
+    {
+      "name": "query function semantic search request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=1:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=7",
+      "sql": "SELECT * FROM antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7)"
+    },
+    {
+      "name": "query function vector search request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=1:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=3",
+      "sql": "SELECT * FROM antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[1.0,0.0,0.5]', limit => 3)"
+    },
+    {
+      "name": "query function graph match request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=1:graph_metric=0:fields=0:limit=5",
+      "sql": "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b', max_results => 5, limit => 5)"
+    },
+    {
+      "name": "query function graph metric request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=0:graph_metric=1:fields=0:limit=2",
+      "sql": "SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh', limit => 2)"
+    },
+    {
+      "name": "query function graph metric rerank request",
+      "family": "query_function",
+      "plan": "query_function:text=1:full_text_queries=0:dense=0:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=6:primary_text_index=1:graph_metric_rerank=1",
+      "sql": "SELECT * FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25, limit => 6)"
+    },
+    {
+      "name": "query function hybrid search request",
+      "family": "query_function",
+      "plan": "query_function:text=1:full_text_queries=0:dense=1:sparse=0:graph_search=0:graph_metric=0:fields=0:limit=9:primary_text_index=1:graph_metric_rerank=1:merge=1",
+      "sql": "SELECT * FROM antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9)"
+    },
+    {
       "name": "execute prepared statement protocol plan",
       "family": "ddl",
       "summary": {

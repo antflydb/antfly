@@ -43,6 +43,7 @@ pub const UnsupportedPlanFamily = enum {
 
 pub const AppParityCorpusPlanFamily = enum {
     ddl,
+    query_function,
     read,
     query,
     aggregate,
@@ -2284,6 +2285,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
 
     const prefix = switch (family) {
         .ddl => "ddl:",
+        .query_function => "query_function:",
         .read => "read:",
         .query => "query:",
         .aggregate => "aggregate:",
@@ -2351,6 +2353,7 @@ pub fn corpusFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) b
 pub fn corpusFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .ddl,
+        .query_function,
         .read,
         .query,
         .aggregate,
@@ -2414,6 +2417,7 @@ pub fn corpusFixtureFamilyAllowsResolverHint(family: AppParityCorpusPlanFamily) 
         .insert,
         .update,
         .delete,
+        .query_function,
         .invalid_insert,
         .invalid_update,
         .unsupported_insert,
@@ -5938,6 +5942,14 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_routine_option: bool = false,
     unsupported_ddl_routine_procedure_body: bool = false,
     ddl_system_versioned_table: bool = false,
+    query_function: bool = false,
+    query_function_full_text: bool = false,
+    query_function_semantic: bool = false,
+    query_function_vector: bool = false,
+    query_function_graph_search: bool = false,
+    query_function_graph_metric: bool = false,
+    query_function_graph_metric_rerank: bool = false,
+    query_function_hybrid: bool = false,
     unsupported_write: bool = false,
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
@@ -6405,6 +6417,28 @@ pub const AppParityCorpusCoverage = struct {
                 else => {},
             }
         }
+        if (entry.family == .query_function) {
+            self.query_function = true;
+            self.query_function_full_text = self.query_function_full_text or
+                sql_adapter.planHasNonZeroToken(entry.plan, ":text=");
+            self.query_function_semantic = self.query_function_semantic or
+                (std.mem.indexOf(u8, entry.sql, "antfly.semantic_search") != null and
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":dense="));
+            self.query_function_vector = self.query_function_vector or
+                (std.mem.indexOf(u8, entry.sql, "antfly.vector_search") != null and
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":dense="));
+            self.query_function_graph_search = self.query_function_graph_search or
+                sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search=");
+            self.query_function_graph_metric = self.query_function_graph_metric or
+                sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric=");
+            self.query_function_graph_metric_rerank = self.query_function_graph_metric_rerank or
+                sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric_rerank=");
+            self.query_function_hybrid = self.query_function_hybrid or
+                (sql_adapter.planHasNonZeroToken(entry.plan, ":merge=") and
+                    (sql_adapter.planHasNonZeroToken(entry.plan, ":text=") or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":dense=") or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric_rerank=")));
+        }
         self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or std.mem.indexOf(u8, entry.sql, "to_jsonb(") != null;
         self.to_jsonb_dynamic_expression = self.to_jsonb_dynamic_expression or
             std.mem.indexOf(u8, entry.sql, "to_jsonb(lower(") != null or
@@ -6822,6 +6856,7 @@ pub const AppParityCorpusCoverage = struct {
         }
         switch (entry.family) {
             .ddl => self.ddl = true,
+            .query_function => {},
             .query => {
                 self.query = true;
                 self.cte_query = self.cte_query or uses_cte_stream;
