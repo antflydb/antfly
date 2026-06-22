@@ -2337,7 +2337,9 @@ fn expectAppliedDdlCorpusPlan(
 
     if (entry.apply_setup_sql.len > 0) current_schema_json = "";
     for (entry.apply_setup_sql) |setup_sql| {
-        var setup_plan = try lowerDdlPlanAlloc(alloc, setup_sql);
+        var parsed_setup_sql = try sql_adapter.ParsedSql.initAlloc(alloc, setup_sql);
+        defer parsed_setup_sql.deinit(alloc);
+        var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_setup_sql);
         defer setup_plan.deinit(alloc);
         var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
@@ -2394,7 +2396,9 @@ fn schemaJsonFromSetupSqlAlloc(
     errdefer if (owned_current_schema_json) |schema_json| alloc.free(schema_json);
 
     for (setup_sql) |sql| {
-        var setup_plan = try lowerDdlPlanAlloc(alloc, sql);
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
         defer setup_plan.deinit(alloc);
         var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
@@ -3366,7 +3370,9 @@ fn expectAppParityCorpusEntry(
 
     switch (entry.family) {
         .ddl => {
-            var lowered = try lowerDdlPlanAlloc(alloc, entry.sql);
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+            defer parsed_sql.deinit(alloc);
+            var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
             defer lowered.deinit(alloc);
             try expectDdlSummary(entry.summary, lowered);
             const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
@@ -3405,7 +3411,9 @@ fn expectAppParityCorpusEntry(
             try expectAppParityPlan(entry.plan, fingerprint);
         },
         .relation_population => {
-            var lowered = try lowerRelationPopulationPlanAlloc(alloc, entry.sql, effective_schema, entry.params);
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+            defer parsed_sql.deinit(alloc);
+            var lowered = try lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, null, .{});
             defer lowered.deinit(alloc);
             try expectOptionalTableName(entry.summary.table_name, lowered.target_table_name);
             const fingerprint = try relationPopulationFingerprintAlloc(alloc, lowered);
@@ -3425,7 +3433,9 @@ fn expectAppParityCorpusEntry(
         .merge_mutation,
         => return error.TestUnexpectedResult,
         .adapter_noop_ddl => {
-            if (lowerDdlPlanAlloc(alloc, entry.sql)) |lowered_value| {
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+            defer parsed_sql.deinit(alloc);
+            if (lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql)) |lowered_value| {
                 var lowered = lowered_value;
                 defer lowered.deinit(alloc);
                 switch (lowered) {
@@ -3478,7 +3488,9 @@ fn appParityAppliedDdlPlanAlloc(
 
     if (entry.apply_setup_sql.len > 0) current_schema_json = "";
     for (entry.apply_setup_sql) |setup_sql| {
-        var setup_plan = try lowerDdlPlanAlloc(alloc, setup_sql);
+        var parsed_setup_sql = try sql_adapter.ParsedSql.initAlloc(alloc, setup_sql);
+        defer parsed_setup_sql.deinit(alloc);
+        var setup_plan = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_setup_sql);
         defer setup_plan.deinit(alloc);
         var setup_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, setup_plan);
         defer setup_applied.deinit(alloc);
@@ -3488,7 +3500,9 @@ fn appParityAppliedDdlPlanAlloc(
         current_schema_json = next_schema_json;
     }
 
-    var lowered = try lowerDdlPlanAlloc(alloc, entry.sql);
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+    var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
     defer lowered.deinit(alloc);
     var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, lowered);
     defer applied.deinit(alloc);
