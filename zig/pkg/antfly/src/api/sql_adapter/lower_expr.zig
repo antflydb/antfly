@@ -24466,6 +24466,96 @@ test "sql adapter lower expr lowers concat projections" {
     try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
 }
 
+test "sql adapter lower expr lowers boolean projection operators" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"enabled":{"type":"boolean"},"verified":{"type":"boolean"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled AND NOT verified AS active_unverified, (enabled OR starts_with(status, 'op')) AS eligible FROM users WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 2), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("active_unverified", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("enabled", lowered.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_not, lowered.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("verified", lowered.plan.query.expressions[0].expression.operands[1].operands[0].field);
+    try std.testing.expectEqualStrings("eligible", lowered.plan.query.expressions[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, lowered.plan.query.expressions[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, lowered.plan.query.expressions[1].expression.operands[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
+
+    var expression_is_true = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE starts_with(status, 'op') IS TRUE ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer expression_is_true.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_is_true.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, expression_is_true.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, expression_is_true.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqualStrings("true", expression_is_true.plan.query.expression_predicates[0].rhs[0].value_json);
+
+    var expression_is_not_false = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE (enabled AND NOT verified) IS NOT FALSE ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer expression_is_not_false.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_is_not_false.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), expression_is_not_false.plan.query.expression_or_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, expression_is_not_false.plan.query.expression_or_predicates[0].conditions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, expression_is_not_false.plan.query.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("false", expression_is_not_false.plan.query.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_and, expression_is_not_false.plan.query.expression_or_predicates[1].conditions[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, expression_is_not_false.plan.query.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqual(@as(usize, 0), expression_is_not_false.plan.query.expression_or_predicates[1].conditions[0].rhs.len);
+
+    var expression_is_unknown = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE starts_with(status, 'op') IS UNKNOWN ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer expression_is_unknown.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_is_unknown.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.starts_with, expression_is_unknown.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, expression_is_unknown.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqual(@as(usize, 0), expression_is_unknown.plan.query.expression_predicates[0].rhs.len);
+
+    var expression_postfix_notnull = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM users WHERE lower(status) NOTNULL ORDER BY id",
+        schema,
+        &.{},
+    );
+    defer expression_postfix_notnull.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), expression_postfix_notnull.plan.query.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_postfix_notnull.plan.query.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, expression_postfix_notnull.plan.query.expression_predicates[0].op);
+    try std.testing.expectEqual(@as(usize, 0), expression_postfix_notnull.plan.query.expression_predicates[0].rhs.len);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT enabled AND status AS bad FROM users",
+        schema,
+        &.{},
+    ));
+}
+
 test "sql adapter lower expr assembles boolean predicate groups" {
     const alloc = std.testing.allocator;
 
