@@ -4074,6 +4074,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter grammar parses table partition catalog tails",
             "sql adapter grammar parses view catalog tails",
             "sql adapter grammar parses truncate mutation-source syntax",
+            "sql adapter ddl fingerprint owns catalog-only ddl surfaces",
             "sql routine runtime",
             "api http server recovers durable SQL routine catalog",
             "api http server routes routine-backed SQL trigger DDL through routine runtime",

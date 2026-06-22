@@ -1,0 +1,1829 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const std = @import("std");
+
+const corpus = @import("corpus.zig");
+const ddl_plan = @import("ddl_plan.zig");
+const diagnostics = @import("diagnostics.zig");
+const lexer = @import("lexer.zig");
+const lower_expr = @import("lower_expr.zig");
+const parser_context = @import("parser_context.zig");
+const runtime_schema = @import("../../storage/schema.zig");
+const schema_api = @import("../../schema/mod.zig");
+const schema_json = @import("schema_json.zig");
+
+const AlterTablePlan = ddl_plan.AlterTablePlan;
+const AppliedDdlSchemaJson = ddl_plan.AppliedDdlSchemaJson;
+const AppliedDdlWorkAction = ddl_plan.AppliedDdlWorkAction;
+const AppliedDdlWorkItem = ddl_plan.AppliedDdlWorkItem;
+const AppliedDdlWorkReason = ddl_plan.AppliedDdlWorkReason;
+const AppliedDdlWorkSubject = ddl_plan.AppliedDdlWorkSubject;
+const BulkIoDirection = ddl_plan.BulkIoDirection;
+const BulkIoEndpointKind = ddl_plan.BulkIoEndpointKind;
+const BulkIoLogVerbosity = ddl_plan.BulkIoLogVerbosity;
+const BulkIoOnErrorPolicy = ddl_plan.BulkIoOnErrorPolicy;
+const BulkIoPlan = ddl_plan.BulkIoPlan;
+const CreateIndexPlan = ddl_plan.CreateIndexPlan;
+const CreateRoutinePlan = ddl_plan.CreateRoutinePlan;
+const CreateTablePlan = ddl_plan.CreateTablePlan;
+const EnumValuePosition = ddl_plan.EnumValuePosition;
+const IdentityAllocatorKind = ddl_plan.IdentityAllocatorKind;
+const LoweredDdlPlan = ddl_plan.LoweredDdlPlan;
+const RelationLifetimeKind = ddl_plan.RelationLifetimeKind;
+const RoutineBodyKind = ddl_plan.RoutineBodyKind;
+const RoutineExecutionHook = ddl_plan.RoutineExecutionHook;
+const RoutineKind = ddl_plan.RoutineKind;
+const RoutineNullInput = ddl_plan.RoutineNullInput;
+const RoutineParallelSafety = ddl_plan.RoutineParallelSafety;
+const RoutineSecurity = ddl_plan.RoutineSecurity;
+const RoutineVolatility = ddl_plan.RoutineVolatility;
+const SequenceOptions = ddl_plan.SequenceOptions;
+const TablePartitionMethod = ddl_plan.TablePartitionMethod;
+const TransactionAccessMode = ddl_plan.TransactionAccessMode;
+const TransactionIsolationLevel = ddl_plan.TransactionIsolationLevel;
+
+const antflyTypeSchemaName = ddl_plan.antflyTypeSchemaName;
+const appendNonZeroUsizeFingerprintAlloc = corpus.appendNonZeroUsizeFingerprintAlloc;
+const appendStringFingerprintAlloc = corpus.appendStringFingerprintAlloc;
+const appendTrueBoolFingerprintAlloc = corpus.appendTrueBoolFingerprintAlloc;
+const schemaJsonCommentCountInRoot = schema_json.schemaJsonCommentCountInRoot;
+
+fn adapterNoopFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    family: []const u8,
+    reason: []const u8,
+) ![]u8 {
+    const diagnostic_reason = diagnostics.classificationReasonFromToken(reason) orelse return error.TestUnexpectedResult;
+    return corpus.adapterNoopFingerprintAlloc(alloc, family, diagnostic_reason) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
+        else => return err,
+    };
+}
+
+pub fn createIndexPlanGeneratedExpressionCount(plan: CreateIndexPlan) usize {
+    return if (plan.generated_expression != null) 1 else 0;
+}
+
+fn createIndexPlanGeneratedExpressionOp(plan: CreateIndexPlan) ?[]const u8 {
+    const generated = plan.generated_expression orelse return null;
+    return @tagName(generated.op);
+}
+
+fn createTablePlanPrimaryKeyColumnCount(plan: CreateTablePlan) usize {
+    return if (plan.primary_key) |primary_key| primary_key.columns.len else 0;
+}
+
+fn createTablePlanDefaultColumnCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.columns) |column| {
+        if (column.default_value != null) count += 1;
+    }
+    return count;
+}
+
+fn createTablePlanGeneratedColumnCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.columns) |column| {
+        if (column.generated != null) count += 1;
+    }
+    return count;
+}
+
+fn createTablePlanUpdatePolicyColumnCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.columns) |column| {
+        if (column.on_update_value != null) count += 1;
+    }
+    return count;
+}
+
+const NamedConstraintFingerprintCounts = struct {
+    primary_key: usize = 0,
+    unique: usize = 0,
+    foreign_key: usize = 0,
+    check: usize = 0,
+};
+
+fn countNamedCreateTableConstraints(plan: CreateTablePlan) NamedConstraintFingerprintCounts {
+    var counts: NamedConstraintFingerprintCounts = .{};
+    if (plan.primary_key) |primary_key| {
+        if (primary_key.name != null) counts.primary_key += 1;
+    }
+    for (plan.unique_constraints) |constraint| {
+        if (constraint.name.len > 0) counts.unique += 1;
+    }
+    for (plan.foreign_keys) |foreign_key| {
+        if (foreign_key.name.len > 0) counts.foreign_key += 1;
+    }
+    for (plan.checks) |check| {
+        if (check.name.len > 0) counts.check += 1;
+    }
+    return counts;
+}
+
+fn appendNamedConstraintFingerprintsAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    counts: NamedConstraintFingerprintCounts,
+) ![]u8 {
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, "pk_named", counts.primary_key);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "unique_named", counts.unique);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_named", counts.foreign_key);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "check_named", counts.check);
+}
+
+const ForeignKeyOptionFingerprintCounts = struct {
+    deferrable: usize = 0,
+    deferred: usize = 0,
+    match_full: usize = 0,
+    match_partial: usize = 0,
+};
+
+fn countForeignKeyOptionFingerprints(foreign_keys: []const runtime_schema.ForeignKey) ForeignKeyOptionFingerprintCounts {
+    var counts: ForeignKeyOptionFingerprintCounts = .{};
+    for (foreign_keys) |foreign_key| {
+        if (foreign_key.deferrable) counts.deferrable += 1;
+        if (foreign_key.timing == .deferred) counts.deferred += 1;
+        switch (foreign_key.match) {
+            .simple => {},
+            .full => counts.match_full += 1,
+            .partial => counts.match_partial += 1,
+        }
+    }
+    return counts;
+}
+
+fn addForeignKeyOptionFingerprintCounts(
+    counts: *ForeignKeyOptionFingerprintCounts,
+    foreign_keys: []const runtime_schema.ForeignKey,
+) void {
+    const next = countForeignKeyOptionFingerprints(foreign_keys);
+    counts.deferrable += next.deferrable;
+    counts.deferred += next.deferred;
+    counts.match_full += next.match_full;
+    counts.match_partial += next.match_partial;
+}
+
+fn appendForeignKeyOptionFingerprintsAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    counts: ForeignKeyOptionFingerprintCounts,
+) ![]u8 {
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, "fk_deferrable", counts.deferrable);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_deferred", counts.deferred);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_match_full", counts.match_full);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "fk_match_partial", counts.match_partial);
+}
+
+const ConstraintTimingFingerprintCounts = struct {
+    primary_key_deferrable: usize = 0,
+    primary_key_deferred: usize = 0,
+    unique_deferrable: usize = 0,
+    unique_deferred: usize = 0,
+};
+
+fn addPrimaryKeyTimingFingerprintCount(counts: *ConstraintTimingFingerprintCounts, primary_key: runtime_schema.PrimaryKey) void {
+    if (primary_key.deferrable) counts.primary_key_deferrable += 1;
+    if (primary_key.timing == .deferred) counts.primary_key_deferred += 1;
+}
+
+fn addUniqueTimingFingerprintCounts(counts: *ConstraintTimingFingerprintCounts, unique_constraints: []const runtime_schema.UniqueConstraint) void {
+    for (unique_constraints) |constraint| {
+        if (constraint.deferrable) counts.unique_deferrable += 1;
+        if (constraint.timing == .deferred) counts.unique_deferred += 1;
+    }
+}
+
+fn countCreateTableConstraintTimingFingerprints(plan: CreateTablePlan) ConstraintTimingFingerprintCounts {
+    var counts: ConstraintTimingFingerprintCounts = .{};
+    if (plan.primary_key) |primary_key| addPrimaryKeyTimingFingerprintCount(&counts, primary_key);
+    addUniqueTimingFingerprintCounts(&counts, plan.unique_constraints);
+    return counts;
+}
+
+fn appendConstraintTimingFingerprintsAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    counts: ConstraintTimingFingerprintCounts,
+) ![]u8 {
+    var fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, owned_base, "pk_deferrable", counts.primary_key_deferrable);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "pk_deferred", counts.primary_key_deferred);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "unique_deferrable", counts.unique_deferrable);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "unique_deferred", counts.unique_deferred);
+}
+
+const AlterTablePlanFingerprintCounts = struct {
+    add_column: usize = 0,
+    add_column_if_not_exists: usize = 0,
+    add_column_default: usize = 0,
+    add_column_generated: usize = 0,
+    add_column_update_policy: usize = 0,
+    add_column_unique: usize = 0,
+    add_column_fk: usize = 0,
+    add_column_check: usize = 0,
+    add_period: usize = 0,
+    add_primary_key: usize = 0,
+    rename_column: usize = 0,
+    rename_constraint: usize = 0,
+    drop_column: usize = 0,
+    drop_column_if_exists: usize = 0,
+    drop_constraint: usize = 0,
+    drop_constraint_if_exists: usize = 0,
+    drop_update_policy: usize = 0,
+    drop_update_policy_if_exists: usize = 0,
+    set_default: usize = 0,
+    drop_default: usize = 0,
+    set_not_null: usize = 0,
+    drop_not_null: usize = 0,
+    alter_type: usize = 0,
+    alter_type_rewrite_expr: usize = 0,
+    add_unique: usize = 0,
+    add_foreign_key: usize = 0,
+    add_check: usize = 0,
+    validate_constraint: usize = 0,
+    constraint_timing: ConstraintTimingFingerprintCounts = .{},
+    foreign_key_options: ForeignKeyOptionFingerprintCounts = .{},
+};
+
+fn alterTablePlanFingerprintCounts(plan: AlterTablePlan) AlterTablePlanFingerprintCounts {
+    var counts: AlterTablePlanFingerprintCounts = .{};
+    for (plan.operations) |operation| switch (operation) {
+        .add_column => |add| {
+            counts.add_column += 1;
+            if (add.if_not_exists) counts.add_column_if_not_exists += 1;
+            if (add.column.default_value != null) counts.add_column_default += 1;
+            if (add.column.generated != null) counts.add_column_generated += 1;
+            if (add.column.on_update_value != null) counts.add_column_update_policy += 1;
+            counts.add_column_unique += add.unique_constraints.len;
+            counts.add_column_fk += add.foreign_keys.len;
+            counts.add_column_check += add.checks.len;
+            addUniqueTimingFingerprintCounts(&counts.constraint_timing, add.unique_constraints);
+            addForeignKeyOptionFingerprintCounts(&counts.foreign_key_options, add.foreign_keys);
+        },
+        .add_period => counts.add_period += 1,
+        .add_primary_key => |primary_key| {
+            counts.add_primary_key += 1;
+            addPrimaryKeyTimingFingerprintCount(&counts.constraint_timing, primary_key);
+        },
+        .rename_column => counts.rename_column += 1,
+        .rename_constraint => counts.rename_constraint += 1,
+        .drop_column => |drop| {
+            counts.drop_column += 1;
+            if (drop.if_exists) counts.drop_column_if_exists += 1;
+        },
+        .drop_constraint => |drop| {
+            counts.drop_constraint += 1;
+            if (drop.if_exists) counts.drop_constraint_if_exists += 1;
+        },
+        .drop_update_policy => |drop| {
+            counts.drop_update_policy += 1;
+            if (drop.if_exists) counts.drop_update_policy_if_exists += 1;
+        },
+        .alter_column_default => |alter| {
+            if (alter.default_value != null) {
+                counts.set_default += 1;
+            } else {
+                counts.drop_default += 1;
+            }
+        },
+        .alter_column_nullability => |alter| {
+            if (alter.nullable) {
+                counts.drop_not_null += 1;
+            } else {
+                counts.set_not_null += 1;
+            }
+        },
+        .alter_column_type => |alter| {
+            counts.alter_type += 1;
+            if (alter.rewrite_expression != null) counts.alter_type_rewrite_expr += 1;
+        },
+        .add_unique_constraint => |constraint| {
+            counts.add_unique += 1;
+            addUniqueTimingFingerprintCounts(&counts.constraint_timing, &.{constraint});
+        },
+        .add_foreign_key => |foreign_key| {
+            counts.add_foreign_key += 1;
+            addForeignKeyOptionFingerprintCounts(&counts.foreign_key_options, &.{foreign_key});
+        },
+        .add_check => counts.add_check += 1,
+        .validate_constraint => counts.validate_constraint += 1,
+    };
+    return counts;
+}
+
+fn transactionIsolationLevelName(level: ?TransactionIsolationLevel) []const u8 {
+    return if (level) |value| @tagName(value) else "none";
+}
+
+fn transactionAccessModeName(mode: ?TransactionAccessMode) []const u8 {
+    return if (mode) |value| @tagName(value) else "none";
+}
+
+fn transactionDeferrableName(deferrable: ?bool) []const u8 {
+    return if (deferrable) |value| if (value) "true" else "false" else "none";
+}
+
+pub fn ddlFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredDdlPlan) ![]u8 {
+    return switch (lowered) {
+        .adapter_noop => |plan| try adapterNoopFingerprintAlloc(alloc, "ddl", @tagName(plan.reason)),
+        .session_catalog => |plan| switch (plan) {
+            .set_search_path => |set| try std.fmt.allocPrint(alloc, "ddl:session:set_search_path:namespaces={d}:local={}", .{ set.namespaces.len, set.local }),
+            .set_setting => |set| try std.fmt.allocPrint(alloc, "ddl:session:set_setting:setting={s}:setting_kind={s}:local={}", .{ set.name, @tagName(set.kind), set.local }),
+            .reset_setting => |reset| try std.fmt.allocPrint(alloc, "ddl:session:reset_setting:setting={s}:setting_kind={s}", .{ reset.name, @tagName(reset.kind) }),
+            .reset_search_path => try alloc.dupe(u8, "ddl:session:reset_search_path"),
+            .show_search_path => try alloc.dupe(u8, "ddl:session:show_search_path"),
+            .discard_all => try alloc.dupe(u8, "ddl:session:discard_all"),
+        },
+        .create_table => |plan| blk: {
+            var fingerprint = if (plan.periods.len > 0) temporal: {
+                break :temporal try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_table:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}:periods={d}:temporal_pk={}:temporal_unique={d}:temporal_fk={d}",
+                    .{
+                        plan.table_name,
+                        plan.columns.len,
+                        plan.unique_constraints.len,
+                        plan.foreign_keys.len,
+                        plan.checks.len,
+                        plan.if_not_exists,
+                        plan.periods.len,
+                        createTablePlanHasTemporalPrimaryKey(plan),
+                        createTablePlanTemporalUniqueCount(plan),
+                        createTablePlanTemporalForeignKeyCount(plan),
+                    },
+                );
+            } else if (plan.replace_existing) replace: {
+                break :replace try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_table:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}:replace=true",
+                    .{ plan.table_name, plan.columns.len, plan.unique_constraints.len, plan.foreign_keys.len, plan.checks.len, plan.if_not_exists },
+                );
+            } else try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_table:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}",
+                .{ plan.table_name, plan.columns.len, plan.unique_constraints.len, plan.foreign_keys.len, plan.checks.len, plan.if_not_exists },
+            );
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "pk", createTablePlanPrimaryKeyColumnCount(plan));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "defaults", createTablePlanDefaultColumnCount(plan));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "generated", createTablePlanGeneratedColumnCount(plan));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "system_versioned", plan.system_versioned);
+            fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, countCreateTableConstraintTimingFingerprints(plan));
+            fingerprint = try appendNamedConstraintFingerprintsAlloc(alloc, fingerprint, countNamedCreateTableConstraints(plan));
+            fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, countForeignKeyOptionFingerprints(plan.foreign_keys));
+            break :blk fingerprint;
+        },
+        .table_clone => |plan| try std.fmt.allocPrint(
+            alloc,
+            "ddl:table_clone:table={s}:source={s}:if_not_exists={}:columns={}:defaults={}:generated={}:checks={}:constraints={}:indexes={}:periods={}:update_policies={}",
+            .{
+                plan.table_name,
+                plan.source_table_name,
+                plan.if_not_exists,
+                plan.options.columns,
+                plan.options.defaults,
+                plan.options.generated,
+                plan.options.checks,
+                plan.options.constraints,
+                plan.options.indexes,
+                plan.options.periods,
+                plan.options.update_policies,
+            },
+        ),
+        .view_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_view:view={s}:source={s}:source_fields={d}:fields={d}:replace={}:if_not_exists={}",
+                .{ create.view_name, create.source_table_name, create.source_fields.len, create.output_fields.len, create.replace_existing, create.if_not_exists },
+            ),
+            .rename => |rename| try std.fmt.allocPrint(
+                alloc,
+                "ddl:rename_view:view={s}:new={s}",
+                .{ rename.view_name, rename.new_view_name },
+            ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_view:view={s}:if_exists={}:cascade=true",
+                    .{ drop.view_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_view:view={s}:if_exists={}",
+                    .{ drop.view_name, drop.if_exists },
+                ),
+        },
+        .materialized_view_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_materialized_view:view={s}:source={s}:source_fields={d}:fields={d}:replace={}:if_not_exists={}:populate={}",
+                .{ create.view_name, create.source_table_name, create.source_fields.len, create.output_fields.len, create.replace_existing, create.if_not_exists, create.populate_on_create },
+            ),
+            .refresh => |refresh| try std.fmt.allocPrint(
+                alloc,
+                "ddl:refresh_materialized_view:view={s}:concurrently={}:populate={}",
+                .{ refresh.view_name, refresh.concurrently, refresh.populate },
+            ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_materialized_view:view={s}:if_exists={}:cascade=true",
+                    .{ drop.view_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_materialized_view:view={s}:if_exists={}",
+                    .{ drop.view_name, drop.if_exists },
+                ),
+        },
+        .relation_lifetime => |plan| blk: {
+            const base = try std.fmt.allocPrint(
+                alloc,
+                "ddl:relation_lifetime:kind={s}:table={s}:columns={d}:unique={d}:fk={d}:checks={d}:if_not_exists={}",
+                .{
+                    relationLifetimeKindName(plan.kind),
+                    plan.create_table.table_name,
+                    plan.create_table.columns.len,
+                    plan.create_table.unique_constraints.len,
+                    plan.create_table.foreign_keys.len,
+                    plan.create_table.checks.len,
+                    plan.create_table.if_not_exists,
+                },
+            );
+            break :blk try appendForeignKeyOptionFingerprintsAlloc(alloc, base, countForeignKeyOptionFingerprints(plan.create_table.foreign_keys));
+        },
+        .enum_type_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_enum_type:type={s}:values={d}",
+                .{ create.type_name, create.values.len },
+            ),
+            .add_value => |add| try std.fmt.allocPrint(
+                alloc,
+                "ddl:add_enum_value:type={s}:if_not_exists={}:position={s}",
+                .{ add.type_name, add.if_not_exists, enumValuePositionName(add.position) },
+            ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_enum_type:type={s}:if_exists={}:cascade=true",
+                    .{ drop.type_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_enum_type:type={s}:if_exists={}",
+                    .{ drop.type_name, drop.if_exists },
+                ),
+        },
+        .domain_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_domain:domain={s}:type={s}:checks={d}:not_null={}:default={}",
+                .{
+                    create.domain_name,
+                    ddlTypeFingerprintName(create.field_type, create.array_item_type),
+                    create.checks.len,
+                    create.not_null,
+                    create.default_value != null,
+                },
+            ),
+            .alter => |alter| try std.fmt.allocPrint(
+                alloc,
+                "ddl:alter_domain:domain={s}:ops={d}",
+                .{ alter.domain_name, alter.operations.len },
+            ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_domain:domain={s}:if_exists={}:cascade=true",
+                    .{ drop.domain_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_domain:domain={s}:if_exists={}",
+                    .{ drop.domain_name, drop.if_exists },
+                ),
+        },
+        .sequence_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_sequence:sequence={s}:if_not_exists={}:options={d}",
+                .{ create.sequence_name, create.if_not_exists, sequenceOptionCount(create.options) },
+            ),
+            .alter => |alter| try std.fmt.allocPrint(
+                alloc,
+                "ddl:alter_sequence:sequence={s}:if_exists={}:ops={d}",
+                .{ alter.sequence_name, alter.if_exists, alter.operations.len },
+            ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_sequence:sequence={s}:if_exists={}:cascade=true",
+                    .{ drop.sequence_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_sequence:sequence={s}:if_exists={}",
+                    .{ drop.sequence_name, drop.if_exists },
+                ),
+        },
+        .identity_allocator_catalog => |plan| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "ddl:identity_allocator:table={s}:column={s}:kind={s}:primary={}:columns={d}",
+                .{
+                    plan.table_name,
+                    plan.column.name,
+                    identityAllocatorKindName(plan.kind),
+                    plan.primary_key,
+                    plan.additional_columns.len,
+                },
+            );
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "options", sequenceOptionCount(plan.options));
+            break :blk fingerprint;
+        },
+        .schema_namespace_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_schema_namespace:schema={s}:if_not_exists={}",
+                .{ create.schema_name, create.if_not_exists },
+            ),
+            .rename => |rename| try std.fmt.allocPrint(
+                alloc,
+                "ddl:rename_schema_namespace:schema={s}:new={s}",
+                .{ rename.schema_name, rename.new_schema_name },
+            ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_schema_namespace:schema={s}:if_exists={}:cascade=true",
+                    .{ drop.schema_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_schema_namespace:schema={s}:if_exists={}",
+                    .{ drop.schema_name, drop.if_exists },
+                ),
+        },
+        .extension_catalog => |plan| switch (plan) {
+            .create => |create| if (create.version) |version|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_extension:extension={s}:if_not_exists={}:version={s}",
+                    .{ create.extension_name, create.if_not_exists, version },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_extension:extension={s}:if_not_exists={}",
+                    .{ create.extension_name, create.if_not_exists },
+                ),
+            .update => |update| if (update.target_version) |version|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_extension_update:extension={s}:version={s}",
+                    .{ update.extension_name, version },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_extension_update:extension={s}:version=latest",
+                    .{update.extension_name},
+                ),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_extension:extension={s}:if_exists={}:cascade=true",
+                    .{ drop.extension_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_extension:extension={s}:if_exists={}",
+                    .{ drop.extension_name, drop.if_exists },
+                ),
+        },
+        .function_catalog => |plan| switch (plan) {
+            .create => |create| try createRoutineFingerprintAlloc(alloc, create),
+            .drop => |drop| if (drop.cascade)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_{s}:name={s}:args={d}:if_exists={}:cascade=true",
+                    .{ routineKindName(drop.kind), drop.routine_name, drop.argument_count, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_{s}:name={s}:args={d}:if_exists={}",
+                    .{ routineKindName(drop.kind), drop.routine_name, drop.argument_count, drop.if_exists },
+                ),
+        },
+        .procedure_call => |call| try std.fmt.allocPrint(
+            alloc,
+            "ddl:call_procedure:name={s}:args={d}",
+            .{ call.routine_name, call.argument_count },
+        ),
+        .authorization_catalog => |plan| switch (plan) {
+            .create_role => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_role:role={s}",
+                .{create.role_name},
+            ),
+            .alter_role => |alter| blk: {
+                var fingerprint = if (alter.database_name) |database_name|
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_role:role={s}:database={s}:operation={s}:setting={s}",
+                        .{ alter.role_name, database_name, @tagName(alter.operation), alter.setting_name },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_role:role={s}:operation={s}:setting={s}",
+                        .{ alter.role_name, @tagName(alter.operation), alter.setting_name },
+                    );
+                if (alter.setting_kind != .app) {
+                    fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "setting_kind", @tagName(alter.setting_kind));
+                }
+                if (alter.setting_value) |setting_value| switch (setting_value) {
+                    .literal => {},
+                    .current_setting => fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "value_source", "current_setting"),
+                };
+                break :blk fingerprint;
+            },
+            .drop_role => |drop| try std.fmt.allocPrint(
+                alloc,
+                "ddl:drop_role:role={s}:if_exists={}",
+                .{ drop.role_name, drop.if_exists },
+            ),
+            .grant_privilege => |grant| try std.fmt.allocPrint(
+                alloc,
+                "ddl:grant_privilege:object={s}:{s}:principal={s}:privileges={d}",
+                .{ grant.object_kind, grant.object_name, grant.principal_name, grant.privileges.len },
+            ),
+            .revoke_privilege => |revoke| try std.fmt.allocPrint(
+                alloc,
+                "ddl:revoke_privilege:object={s}:{s}:principal={s}:privileges={d}",
+                .{ revoke.object_kind, revoke.object_name, revoke.principal_name, revoke.privileges.len },
+            ),
+        },
+        .bulk_io => |plan| blk: {
+            const delimiter_hex = try bulkIoByteOptionHexAlloc(alloc, plan.delimiter);
+            defer alloc.free(delimiter_hex);
+            const quote_hex = try bulkIoByteOptionHexAlloc(alloc, plan.quote);
+            defer alloc.free(quote_hex);
+            const escape_hex = try bulkIoByteOptionHexAlloc(alloc, plan.escape);
+            defer alloc.free(escape_hex);
+            const null_marker_hex = try bulkIoStringOptionHexAlloc(alloc, plan.null_marker);
+            defer alloc.free(null_marker_hex);
+            const default_marker_hex = try bulkIoStringOptionHexAlloc(alloc, plan.default_marker);
+            defer alloc.free(default_marker_hex);
+            const encoding_hex = try bulkIoStringOptionHexAlloc(alloc, plan.encoding);
+            defer alloc.free(encoding_hex);
+            const reject_limit = if (plan.reject_limit) |limit|
+                try std.fmt.allocPrint(alloc, "{}", .{limit})
+            else
+                try alloc.dupe(u8, "none");
+            defer alloc.free(reject_limit);
+            break :blk if (plan.format) |format|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:format={s}:header={}:freeze={}:on_error={s}:reject_limit={s}:log_verbosity={s}:force_quote={s}:force_quote_columns={d}:force_not_null_columns={d}:force_null_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:default_marker_hex={s}:encoding_hex={s}:where_expressions={d}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, format, plan.header, plan.freeze, bulkIoOnErrorName(plan.on_error), reject_limit, bulkIoLogVerbosityName(plan.log_verbosity), bulkIoForceQuoteName(plan), plan.force_quote_columns.len, plan.force_not_null_columns.len, plan.force_null_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, default_marker_hex, encoding_hex, plan.where_expressions.len },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:copy_{s}:table={s}:columns={d}:endpoint={s}:header={}:freeze={}:on_error={s}:reject_limit={s}:log_verbosity={s}:force_quote={s}:force_quote_columns={d}:force_not_null_columns={d}:force_null_columns={d}:delimiter_hex={s}:quote_hex={s}:escape_hex={s}:null_marker_hex={s}:default_marker_hex={s}:encoding_hex={s}:where_expressions={d}",
+                    .{ bulkIoDirectionName(plan.direction), plan.table_name, plan.columns.len, plan.endpoint, plan.header, plan.freeze, bulkIoOnErrorName(plan.on_error), reject_limit, bulkIoLogVerbosityName(plan.log_verbosity), bulkIoForceQuoteName(plan), plan.force_quote_columns.len, plan.force_not_null_columns.len, plan.force_null_columns.len, delimiter_hex, quote_hex, escape_hex, null_marker_hex, default_marker_hex, encoding_hex, plan.where_expressions.len },
+                );
+        },
+        .table_partition_catalog => |plan| switch (plan) {
+            .create_partitioned => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_partitioned_table:table={s}:columns={d}:method={s}:keys={d}",
+                .{
+                    create.create_table.table_name,
+                    create.create_table.columns.len,
+                    tablePartitionMethodName(create.method),
+                    create.keys.len,
+                },
+            ),
+            .create_partition => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_table_partition:table={s}:parent={s}:lower={s}:upper={s}",
+                .{ create.table_name, create.parent_table_name, create.bounds.lower_json, create.bounds.upper_json },
+            ),
+            .attach => |attach| try std.fmt.allocPrint(
+                alloc,
+                "ddl:attach_table_partition:parent={s}:partition={s}:lower={s}:upper={s}",
+                .{ attach.parent_table_name, attach.partition_table_name, attach.bounds.lower_json, attach.bounds.upper_json },
+            ),
+            .detach => |detach| try std.fmt.allocPrint(
+                alloc,
+                "ddl:detach_table_partition:parent={s}:partition={s}",
+                .{ detach.parent_table_name, detach.partition_table_name },
+            ),
+        },
+        .row_security_catalog => |plan| switch (plan) {
+            .alter_table => |alter| try std.fmt.allocPrint(
+                alloc,
+                "ddl:{s}_row_security:table={s}",
+                .{ if (alter.enabled) "enable" else "disable", alter.table_name },
+            ),
+            .create_policy => |create| blk: {
+                const predicate_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
+                defer alloc.free(predicate_suffix);
+                var base = try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_row_policy:policy={s}:table={s}:{s}",
+                    .{ create.policy_name, create.table_name, predicate_suffix },
+                );
+                if (create.check_predicate) |check_predicate| {
+                    const check_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    defer alloc.free(check_suffix);
+                    const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
+                    alloc.free(base);
+                    base = with_check;
+                }
+                break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
+            },
+            .alter_policy => |alter| blk: {
+                var base = try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_row_policy:policy={s}:table={s}",
+                    .{ alter.policy_name, alter.table_name },
+                );
+                if (alter.predicate) |predicate| {
+                    const predicate_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, predicate);
+                    defer alloc.free(predicate_suffix);
+                    const with_predicate = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ base, predicate_suffix });
+                    alloc.free(base);
+                    base = with_predicate;
+                }
+                if (alter.check_predicate) |check_predicate| {
+                    const check_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    defer alloc.free(check_suffix);
+                    const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
+                    alloc.free(base);
+                    base = with_check;
+                }
+                if (alter.role_targets_present) break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, alter.role_targets);
+                break :blk base;
+            },
+            .drop_policy => |drop| try std.fmt.allocPrint(
+                alloc,
+                "ddl:drop_row_policy:policy={s}:table={s}:if_exists={}",
+                .{ drop.policy_name, drop.table_name, drop.if_exists },
+            ),
+        },
+        .database_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_database:database={s}",
+                .{create.database_name},
+            ),
+            .alter => |alter| try std.fmt.allocPrint(
+                alloc,
+                "ddl:alter_database:database={s}:ops={d}",
+                .{ alter.database_name, alter.operations.len },
+            ),
+            .drop => |drop| if (drop.force)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_database:database={s}:if_exists={}:force=true",
+                    .{ drop.database_name, drop.if_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_database:database={s}:if_exists={}",
+                    .{ drop.database_name, drop.if_exists },
+                ),
+        },
+        .tablespace_catalog => |plan| switch (plan) {
+            .create => |create| try std.fmt.allocPrint(
+                alloc,
+                "ddl:create_tablespace:tablespace={s}:location=true",
+                .{create.tablespace_name},
+            ),
+            .rename => |rename| try std.fmt.allocPrint(
+                alloc,
+                "ddl:rename_tablespace:tablespace={s}:new={s}",
+                .{ rename.tablespace_name, rename.new_tablespace_name },
+            ),
+            .drop => |drop| try std.fmt.allocPrint(
+                alloc,
+                "ddl:drop_tablespace:tablespace={s}:if_exists={}",
+                .{ drop.tablespace_name, drop.if_exists },
+            ),
+        },
+        .notification_channel => |plan| switch (plan) {
+            .listen => |listen| try std.fmt.allocPrint(
+                alloc,
+                "ddl:listen_notification:channel={s}",
+                .{listen.channel_name},
+            ),
+            .notify => |notify| try std.fmt.allocPrint(
+                alloc,
+                "ddl:notify_notification:channel={s}:payload={}",
+                .{ notify.channel_name, notify.payload_json != null },
+            ),
+            .unlisten => |unlisten| if (unlisten.all)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:unlisten_notification:all=true",
+                    .{},
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:unlisten_notification:channel={s}",
+                    .{unlisten.channel_name orelse return error.TestUnexpectedResult},
+                ),
+        },
+        .logical_replication => |plan| switch (plan) {
+            .publication => |publication| switch (publication) {
+                .create => |create| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_publication:publication={s}:tables={d}:all={}",
+                    .{ create.publication_name, create.table_names.len, create.all_tables },
+                ),
+                .alter => |alter| switch (alter.operation) {
+                    .add_tables => |tables| try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_publication:publication={s}:add_tables={d}",
+                        .{ alter.publication_name, tables.len },
+                    ),
+                },
+                .drop => |drop| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_publication:publication={s}:if_exists={}",
+                    .{ drop.publication_name, drop.if_exists },
+                ),
+            },
+            .subscription => |subscription| switch (subscription) {
+                .create => |create| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_subscription:subscription={s}:connection=true:publications={d}",
+                    .{ create.subscription_name, create.publication_names.len },
+                ),
+                .alter => |alter| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:alter_subscription:subscription={s}:enabled={}",
+                    .{ alter.subscription_name, alter.enabled },
+                ),
+                .drop => |drop| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_subscription:subscription={s}:if_exists={}",
+                    .{ drop.subscription_name, drop.if_exists },
+                ),
+            },
+        },
+        .type_system_catalog => |plan| switch (plan) {
+            .collation => |collation| switch (collation) {
+                .create => |create| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_collation:collation={s}:options={d}",
+                    .{ create.collation_name, create.option_count },
+                ),
+                .rename => |rename| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:rename_collation:collation={s}:new={s}",
+                    .{ rename.collation_name, rename.new_collation_name },
+                ),
+                .drop => |drop| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_collation:collation={s}:if_exists={}",
+                    .{ drop.collation_name, drop.if_exists },
+                ),
+            },
+            .operator => |operator| switch (operator) {
+                .create => |create| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_operator:operator={s}:options={d}",
+                    .{ create.operator_name, create.option_count },
+                ),
+                .drop => |drop| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_operator:operator={s}:args={d}",
+                    .{ drop.operator_name, drop.argument_count },
+                ),
+            },
+            .aggregate => |aggregate| switch (aggregate) {
+                .create => |create| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_aggregate:aggregate={s}:args={d}:options={d}",
+                    .{ create.aggregate_name, create.argument_count, create.option_count },
+                ),
+                .drop => |drop| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_aggregate:aggregate={s}:args={d}",
+                    .{ drop.aggregate_name, drop.argument_count },
+                ),
+            },
+            .cast => |cast| switch (cast) {
+                .create => |create| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_cast:source={s}:target={s}:function={s}:assignment={}",
+                    .{ create.source_type, create.target_type, create.function_name, create.assignment },
+                ),
+                .drop => |drop| try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:drop_cast:source={s}:target={s}",
+                    .{ drop.source_type, drop.target_type },
+                ),
+            },
+        },
+        .maintenance_job => |plan| switch (plan) {
+            .vacuum => |vacuum| try std.fmt.allocPrint(
+                alloc,
+                "ddl:maintenance:kind=vacuum:table={s}:full={}:freeze={}:verbose={}:analyze={}",
+                .{ vacuum.table_name, vacuum.full, vacuum.freeze, vacuum.verbose, vacuum.analyze },
+            ),
+            .analyze => |analyze| try std.fmt.allocPrint(
+                alloc,
+                "ddl:maintenance:kind=analyze:table={s}:verbose={}:columns={d}",
+                .{ analyze.table_name, analyze.verbose, analyze.column_count },
+            ),
+            .reindex => |reindex| try std.fmt.allocPrint(
+                alloc,
+                "ddl:maintenance:kind=reindex:target={s}:name={s}:concurrently={}",
+                .{ @tagName(reindex.target), reindex.name, reindex.concurrently },
+            ),
+            .cluster => |cluster| try std.fmt.allocPrint(
+                alloc,
+                "ddl:maintenance:kind=cluster:table={s}:index={s}:verbose={}",
+                .{ cluster.table_name, cluster.index_name orelse "", cluster.verbose },
+            ),
+        },
+        .prepared_statement => |plan| switch (plan) {
+            .prepare => |prepare| try std.fmt.allocPrint(
+                alloc,
+                "ddl:prepare_statement:name={s}:params={d}:subject={s}:statement={s}",
+                .{ prepare.statement_name, prepare.parameter_count, @tagName(prepare.statement_kind), @tagName(prepare.statement_family) },
+            ),
+            .execute => |execute| try std.fmt.allocPrint(
+                alloc,
+                "ddl:execute_statement:name={s}:args={d}",
+                .{ execute.statement_name, execute.argument_count },
+            ),
+            .deallocate => |deallocate| if (deallocate.all)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:deallocate_statement:all=true",
+                    .{},
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:deallocate_statement:name={s}",
+                    .{deallocate.statement_name orelse return error.TestUnexpectedResult},
+                ),
+        },
+        .prepared_transaction => |plan| try std.fmt.allocPrint(
+            alloc,
+            "ddl:prepared_transaction:action={s}:gid={s}",
+            .{ @tagName(plan.action), plan.gid },
+        ),
+        .cursor_portal => |plan| switch (plan) {
+            .declare => |declare| try std.fmt.allocPrint(
+                alloc,
+                "ddl:declare_cursor:portal={s}:scroll={s}:binary={}:hold={}:subject={s}",
+                .{ declare.portal_name, @tagName(declare.scroll), declare.binary, declare.hold, @tagName(declare.statement_kind) },
+            ),
+            .fetch => |fetch| if (fetch.count) |count|
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:fetch_cursor:portal={s}:direction={s}:count={d}",
+                    .{ fetch.portal_name, @tagName(fetch.direction), count },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:fetch_cursor:portal={s}:direction={s}",
+                    .{ fetch.portal_name, @tagName(fetch.direction) },
+                ),
+            .close => |close| if (close.all)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:close_cursor:all=true",
+                    .{},
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:close_cursor:portal={s}",
+                    .{close.portal_name orelse return error.TestUnexpectedResult},
+                ),
+        },
+        .savepoint_transaction => |plan| switch (plan) {
+            .savepoint => |savepoint| try std.fmt.allocPrint(
+                alloc,
+                "ddl:savepoint:name={s}",
+                .{savepoint.savepoint_name},
+            ),
+            .release => |release| try std.fmt.allocPrint(
+                alloc,
+                "ddl:release_savepoint:name={s}",
+                .{release.savepoint_name},
+            ),
+            .rollback_to => |rollback| try std.fmt.allocPrint(
+                alloc,
+                "ddl:rollback_to_savepoint:name={s}",
+                .{rollback.savepoint_name},
+            ),
+        },
+        .comment_metadata => |plan| if (plan.parent_table_name) |parent_table|
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:comment:kind={s}:object={s}:table={s}:comment={}",
+                .{ @tagName(plan.target), plan.object_name, parent_table, plan.comment_json != null },
+            )
+        else
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:comment:kind={s}:object={s}:comment={}",
+                .{ @tagName(plan.target), plan.object_name, plan.comment_json != null },
+            ),
+        .transaction_control => |plan| switch (plan) {
+            .table_lock => |lock| try std.fmt.allocPrint(
+                alloc,
+                "ddl:transaction_control:kind=table_lock:tables={d}:mode={s}",
+                .{ lock.table_names.len, @tagName(lock.mode) },
+            ),
+            .constraint_mode => |constraints| try std.fmt.allocPrint(
+                alloc,
+                "ddl:transaction_control:kind=constraint_mode:all={}:constraints={d}:mode={s}",
+                .{ constraints.all, constraints.constraint_names.len, @tagName(constraints.mode) },
+            ),
+            .transaction_mode => |transaction| try std.fmt.allocPrint(
+                alloc,
+                "ddl:transaction_control:kind=transaction_mode:starter={s}:isolation={s}:access={s}:deferrable={s}",
+                .{
+                    @tagName(transaction.starter),
+                    transactionIsolationLevelName(transaction.isolation_level),
+                    transactionAccessModeName(transaction.access_mode),
+                    transactionDeferrableName(transaction.deferrable),
+                },
+            ),
+            .advisory_lock => |lock| try std.fmt.allocPrint(
+                alloc,
+                "ddl:transaction_control:kind=advisory_lock:action={s}:keys={d}",
+                .{ @tagName(lock.action), if (lock.key2 != null) @as(usize, 2) else @as(usize, 1) },
+            ),
+        },
+        .create_index => |plan| blk: {
+            const base = if (plan.method == .gin)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_index:table={s}:columns={d}:expr={d}:generated_expr={d}:where={d}:unique={}:if_not_exists={}:method=gin",
+                    .{ plan.table_name, plan.columns.len, plan.expressions.len, createIndexPlanGeneratedExpressionCount(plan), plan.where.len, plan.unique, plan.if_not_exists },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "ddl:create_index:table={s}:columns={d}:expr={d}:generated_expr={d}:where={d}:unique={}:if_not_exists={}",
+                    .{ plan.table_name, plan.columns.len, plan.expressions.len, createIndexPlanGeneratedExpressionCount(plan), plan.where.len, plan.unique, plan.if_not_exists },
+                );
+            const with_generated_op = if (createIndexPlanGeneratedExpressionOp(plan)) |generated_op|
+                try appendStringFingerprintAlloc(alloc, base, "generated_op", generated_op)
+            else
+                base;
+            const with_include = try appendNonZeroUsizeFingerprintAlloc(alloc, with_generated_op, "include", plan.include_columns.len);
+            const with_where_expr = try appendNonZeroUsizeFingerprintAlloc(alloc, with_include, "where_expr", plan.where_expressions.len);
+            const with_temporal = try appendTrueBoolFingerprintAlloc(alloc, with_where_expr, "temporal_unique", plan.without_overlaps_period != null);
+            break :blk try appendTrueBoolFingerprintAlloc(alloc, with_temporal, "nulls_not_distinct", plan.nulls_not_distinct);
+        },
+        .drop_index => |plan| try std.fmt.allocPrint(
+            alloc,
+            "ddl:drop_index:index={s}:if_exists={}",
+            .{ plan.index_name, plan.if_exists },
+        ),
+        .drop_table => |plan| if (plan.cascade)
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:drop_table:table={s}:if_exists={}:cascade=true",
+                .{ plan.table_name, plan.if_exists },
+            )
+        else
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:drop_table:table={s}:if_exists={}",
+                .{ plan.table_name, plan.if_exists },
+            ),
+        .alter_table => |plan| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "ddl:alter_table:table={s}:ops={d}:if_exists={}",
+                .{ plan.table_name, plan.operations.len, plan.if_exists },
+            );
+            const counts = alterTablePlanFingerprintCounts(plan);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col", counts.add_column);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_if_not_exists", counts.add_column_if_not_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_default", counts.add_column_default);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_generated", counts.add_column_generated);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_update_policy", counts.add_column_update_policy);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_unique", counts.add_column_unique);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_fk", counts.add_column_fk);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_col_check", counts.add_column_check);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_period", counts.add_period);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_pk", counts.add_primary_key);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "rename_col", counts.rename_column);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "rename_constraint", counts.rename_constraint);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_col", counts.drop_column);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_col_if_exists", counts.drop_column_if_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_constraint", counts.drop_constraint);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_constraint_if_exists", counts.drop_constraint_if_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_update_policy", counts.drop_update_policy);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_update_policy_if_exists", counts.drop_update_policy_if_exists);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "set_default", counts.set_default);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_default", counts.drop_default);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "set_not_null", counts.set_not_null);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "drop_not_null", counts.drop_not_null);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "alter_type", counts.alter_type);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "alter_type_rewrite_expr", counts.alter_type_rewrite_expr);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_unique", counts.add_unique);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_fk", counts.add_foreign_key);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "add_check", counts.add_check);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "validate", counts.validate_constraint);
+            fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, counts.constraint_timing);
+            fingerprint = try appendForeignKeyOptionFingerprintsAlloc(alloc, fingerprint, counts.foreign_key_options);
+            break :blk fingerprint;
+        },
+        .create_update_policy => |plan| try std.fmt.allocPrint(
+            alloc,
+            "ddl:create_update_policy:table={s}:column={s}",
+            .{ plan.table_name, plan.column_name },
+        ),
+    };
+}
+
+pub fn ddlAppliedFingerprintAlloc(alloc: std.mem.Allocator, applied: AppliedDdlSchemaJson) ![]u8 {
+    if (applied.schema_json.len == 0) {
+        const base = try std.fmt.allocPrint(
+            alloc,
+            "applied:drop_table:rebuild={}:validation={}:rewrite={}",
+            .{ applied.requires_rebuild, applied.validation_required, applied.rewrite_required },
+        );
+        return try appendAppliedDdlWorkItemsFingerprintAlloc(alloc, base, applied.work_items);
+    }
+
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var raw_arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer raw_arena_impl.deinit();
+    var raw_parsed = try std.json.parseFromSlice(std.json.Value, raw_arena_impl.allocator(), applied.schema_json, .{});
+    const raw_root = switch (raw_parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSqlCatalog,
+    };
+    const comments = try schemaJsonCommentCountInRoot(raw_root);
+
+    var building_indexes: usize = 0;
+    var update_policies: usize = 0;
+    for (schema.relational_columns) |column| {
+        if (column.index_lifecycle != .ready) building_indexes += 1;
+        if (column.on_update_value != null) update_policies += 1;
+    }
+
+    var unvalidated_unique: usize = 0;
+    for (schema.unique_constraints) |constraint| {
+        if (constraint.validation_state != .enforced) unvalidated_unique += 1;
+    }
+    var unvalidated_fk: usize = 0;
+    for (schema.foreign_keys) |foreign_key| {
+        if (foreign_key.validation_state != .enforced) unvalidated_fk += 1;
+    }
+    var unvalidated_check: usize = 0;
+    for (schema.checks) |check| {
+        if (check.validation_state != .enforced) unvalidated_check += 1;
+    }
+
+    const base = try std.fmt.allocPrint(
+        alloc,
+        "applied:rebuild={}:validation={}:rewrite={}:building_indexes={d}:unvalidated_unique={d}:unvalidated_fk={d}:unvalidated_check={d}:update_policy={d}",
+        .{
+            applied.requires_rebuild,
+            applied.validation_required,
+            applied.rewrite_required,
+            building_indexes,
+            unvalidated_unique,
+            unvalidated_fk,
+            unvalidated_check,
+            update_policies,
+        },
+    );
+    const with_work = try appendAppliedDdlWorkItemsFingerprintAlloc(alloc, base, applied.work_items);
+    return try appendNonZeroUsizeFingerprintAlloc(alloc, with_work, "comments", comments);
+}
+
+fn appliedDdlWorkActionName(action: AppliedDdlWorkAction) []const u8 {
+    return switch (action) {
+        .rebuild => "rebuild",
+        .validate => "validate",
+        .rewrite => "rewrite",
+    };
+}
+
+fn appliedDdlWorkSubjectName(subject: AppliedDdlWorkSubject) []const u8 {
+    return switch (subject) {
+        .table => "table",
+    };
+}
+
+fn appliedDdlWorkReasonName(reason: AppliedDdlWorkReason) []const u8 {
+    return switch (reason) {
+        .derived_artifacts => "derived_artifacts",
+        .constraints => "constraints",
+        .row_images => "row_images",
+    };
+}
+
+fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdlWorkItem) ![]u8 {
+    const base = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}/{s}",
+        .{
+            appliedDdlWorkActionName(item.action),
+            appliedDdlWorkSubjectName(item.subject),
+            appliedDdlWorkReasonName(item.reason),
+        },
+    );
+    if (item.rewrite_expression) |rewrite| {
+        const expression = try lower_expr.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
+        defer alloc.free(expression);
+        const with_expression = try std.fmt.allocPrint(
+            alloc,
+            "{s}(target={s}:expr={s})",
+            .{ base, rewrite.target_column, expression },
+        );
+        alloc.free(base);
+        return with_expression;
+    }
+    if (!item.row_rewrite_plan.empty()) {
+        var payload = try alloc.dupe(u8, "");
+        defer alloc.free(payload);
+        for (item.row_rewrite_plan.renames) |rename| {
+            const next = try std.fmt.allocPrint(
+                alloc,
+                "{s}:rename({s}->{s})",
+                .{ payload, rename.old_path, rename.new_path },
+            );
+            alloc.free(payload);
+            payload = next;
+        }
+        for (item.row_rewrite_plan.drops) |drop| {
+            const next = try std.fmt.allocPrint(
+                alloc,
+                "{s}:drop({s})",
+                .{ payload, drop },
+            );
+            alloc.free(payload);
+            payload = next;
+        }
+        const with_row_plan = try std.fmt.allocPrint(
+            alloc,
+            "{s}(row_plan={s})",
+            .{ base, payload },
+        );
+        alloc.free(base);
+        return with_row_plan;
+    }
+    return base;
+}
+
+fn appendAppliedDdlWorkItemsFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    work_items: []const AppliedDdlWorkItem,
+) ![]u8 {
+    errdefer alloc.free(owned_base);
+    if (work_items.len == 0) {
+        const fingerprint = try std.fmt.allocPrint(
+            alloc,
+            "{s}:work_items=0:work=none",
+            .{owned_base},
+        );
+        alloc.free(owned_base);
+        return fingerprint;
+    }
+
+    var work = try alloc.dupe(u8, "");
+    defer alloc.free(work);
+    for (work_items, 0..) |item, i| {
+        const item_fingerprint = try appliedDdlWorkItemFingerprintAlloc(alloc, item);
+        defer alloc.free(item_fingerprint);
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}{s}{s}",
+            .{
+                work,
+                if (i == 0) "" else ",",
+                item_fingerprint,
+            },
+        );
+        alloc.free(work);
+        work = next;
+    }
+
+    const fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "{s}:work_items={d}:work={s}",
+        .{ owned_base, work_items.len, work },
+    );
+    alloc.free(owned_base);
+    return fingerprint;
+}
+
+fn createTablePlanHasTemporalPrimaryKey(plan: CreateTablePlan) bool {
+    const primary_key = plan.primary_key orelse return false;
+    return primary_key.without_overlaps_period != null;
+}
+
+fn createTablePlanTemporalUniqueCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.unique_constraints) |constraint| {
+        if (constraint.without_overlaps_period != null) count += 1;
+    }
+    return count;
+}
+
+fn createTablePlanTemporalForeignKeyCount(plan: CreateTablePlan) usize {
+    var count: usize = 0;
+    for (plan.foreign_keys) |foreign_key| {
+        if (foreign_key.child_period != null or foreign_key.parent_period != null) count += 1;
+    }
+    return count;
+}
+
+pub fn relationLifetimeKindName(kind: RelationLifetimeKind) []const u8 {
+    return switch (kind) {
+        .temporary => "temporary",
+        .unlogged => "unlogged",
+    };
+}
+
+fn routineKindName(kind: RoutineKind) []const u8 {
+    return switch (kind) {
+        .function => "function",
+        .procedure => "procedure",
+    };
+}
+
+fn routineVolatilityName(volatility: RoutineVolatility) []const u8 {
+    return switch (volatility) {
+        .immutable => "immutable",
+        .stable => "stable",
+        .@"volatile" => "volatile",
+    };
+}
+
+fn routineSecurityName(security: RoutineSecurity) []const u8 {
+    return switch (security) {
+        .invoker => "invoker",
+        .definer => "definer",
+    };
+}
+
+fn routineNullInputName(null_input: RoutineNullInput) []const u8 {
+    return switch (null_input) {
+        .called => "called",
+        .returns_null => "returns_null",
+    };
+}
+
+fn routineParallelSafetyName(parallel_safety: RoutineParallelSafety) []const u8 {
+    return switch (parallel_safety) {
+        .safe => "safe",
+        .restricted => "restricted",
+        .unsafe => "unsafe",
+    };
+}
+
+fn routineBodyKindName(kind: RoutineBodyKind) []const u8 {
+    return switch (kind) {
+        .sql_expression => "sql_expression",
+        .plpgsql_trigger => "plpgsql_trigger",
+        .plpgsql_procedure => "plpgsql_procedure",
+    };
+}
+
+fn routineExecutionHookName(hook: RoutineExecutionHook) []const u8 {
+    return switch (hook) {
+        .expression => "expression",
+        .trigger_return_new => "trigger_return_new",
+        .trigger_return_old => "trigger_return_old",
+        .trigger_return_null => "trigger_return_null",
+        .procedure_noop => "procedure_noop",
+    };
+}
+
+fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutinePlan) ![]u8 {
+    var base = if (create.language) |language|
+        try std.fmt.allocPrint(
+            alloc,
+            "ddl:create_{s}:name={s}:args={d}:replace={}:returns={s}:language={s}",
+            .{
+                routineKindName(create.kind),
+                create.routine_name,
+                create.argument_count,
+                create.replace_existing,
+                create.returns_type orelse "",
+                language,
+            },
+        )
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "ddl:create_{s}:name={s}:args={d}:replace={}:returns={s}",
+            .{
+                routineKindName(create.kind),
+                create.routine_name,
+                create.argument_count,
+                create.replace_existing,
+                create.returns_type orelse "",
+            },
+        );
+    errdefer alloc.free(base);
+    if (create.volatility) |volatility| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:volatility={s}",
+            .{ base, routineVolatilityName(volatility) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.security) |security| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:security={s}",
+            .{ base, routineSecurityName(security) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.null_input) |null_input| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:null_input={s}",
+            .{ base, routineNullInputName(null_input) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.parallel_safety) |parallel_safety| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:parallel={s}",
+            .{ base, routineParallelSafetyName(parallel_safety) },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.leakproof) {
+        const next = try std.fmt.allocPrint(alloc, "{s}:leakproof=true", .{base});
+        alloc.free(base);
+        base = next;
+    }
+    if (create.window) {
+        const next = try std.fmt.allocPrint(alloc, "{s}:window=true", .{base});
+        alloc.free(base);
+        base = next;
+    }
+    if (create.support_function) |support_function| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:support={s}",
+            .{ base, support_function },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.transform_types.len != 0) {
+        var next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:transforms={d}",
+            .{ base, create.transform_types.len },
+        );
+        alloc.free(base);
+        errdefer alloc.free(next);
+        for (create.transform_types) |transform_type| {
+            const appended = try std.fmt.allocPrint(
+                alloc,
+                "{s}:transform={s}",
+                .{ next, transform_type },
+            );
+            alloc.free(next);
+            next = appended;
+        }
+        base = next;
+    }
+    if (create.settings.len != 0) {
+        var next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:settings={d}",
+            .{ base, create.settings.len },
+        );
+        alloc.free(base);
+        errdefer alloc.free(next);
+        for (create.settings) |setting| {
+            const setting_base = if (setting.from_current)
+                try std.fmt.allocPrint(
+                    alloc,
+                    "{s}:setting={s}:from_current=true",
+                    .{ next, setting.name },
+                )
+            else
+                try std.fmt.allocPrint(
+                    alloc,
+                    "{s}:setting={s}:values={d}",
+                    .{ next, setting.name, setting.values.len },
+                );
+            alloc.free(next);
+            next = setting_base;
+            if (!setting.from_current) {
+                for (setting.values) |value| {
+                    const appended = try std.fmt.allocPrint(
+                        alloc,
+                        "{s}:value={s}",
+                        .{ next, value },
+                    );
+                    alloc.free(next);
+                    next = appended;
+                }
+            }
+        }
+        base = next;
+    }
+    if (create.cost) |cost| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:cost={s}",
+            .{ base, cost },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.rows) |rows| {
+        const next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:rows={s}",
+            .{ base, rows },
+        );
+        alloc.free(base);
+        base = next;
+    }
+    if (create.body) |body| {
+        var next = try std.fmt.allocPrint(
+            alloc,
+            "{s}:body={s}:hook={s}",
+            .{
+                base,
+                routineBodyKindName(body.kind),
+                routineExecutionHookName(body.hook),
+            },
+        );
+        alloc.free(base);
+        if (body.expression) |body_expression| {
+            errdefer alloc.free(next);
+            const expression = try lower_expr.rowRewriteExpressionFingerprintAlloc(alloc, body_expression);
+            defer alloc.free(expression);
+            const with_expression = try std.fmt.allocPrint(
+                alloc,
+                "{s}:expr={s}",
+                .{ next, expression },
+            );
+            alloc.free(next);
+            next = with_expression;
+        }
+        if (body.perform_routines.len != 0) {
+            const with_count = try appendNonZeroUsizeFingerprintAlloc(alloc, next, "perform", body.perform_routines.len);
+            next = with_count;
+            for (body.perform_routines) |routine_name| {
+                const with_routine = try std.fmt.allocPrint(
+                    alloc,
+                    "{s}:perform={s}",
+                    .{ next, routine_name },
+                );
+                alloc.free(next);
+                next = with_routine;
+            }
+        }
+        base = next;
+    }
+    return base;
+}
+
+fn bulkIoDirectionName(direction: BulkIoDirection) []const u8 {
+    return switch (direction) {
+        .from => "from",
+        .to => "to",
+    };
+}
+
+fn bulkIoEndpointKindName(kind: BulkIoEndpointKind) []const u8 {
+    return switch (kind) {
+        .stream => "stream",
+        .file => "file",
+        .program => "program",
+    };
+}
+
+fn bulkIoOnErrorName(policy: BulkIoOnErrorPolicy) []const u8 {
+    return switch (policy) {
+        .stop => "stop",
+        .ignore => "ignore",
+    };
+}
+
+fn bulkIoLogVerbosityName(verbosity: BulkIoLogVerbosity) []const u8 {
+    return switch (verbosity) {
+        .default => "default",
+        .verbose => "verbose",
+        .terse => "terse",
+    };
+}
+
+fn bulkIoForceQuoteName(plan: BulkIoPlan) []const u8 {
+    if (plan.force_quote_all) return "all";
+    if (plan.force_quote_columns.len != 0) return "columns";
+    return "none";
+}
+
+fn bulkIoByteOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {
+    const value = option orelse return try alloc.dupe(u8, "default");
+    if (value.len != 1) return error.UnsupportedSqlShape;
+    return try std.fmt.allocPrint(alloc, "{x:0>2}", .{value[0]});
+}
+
+fn appendRowSecurityRoleTargetsAlloc(
+    alloc: std.mem.Allocator,
+    base: []u8,
+    role_targets: []const []const u8,
+) ![]u8 {
+    if (role_targets.len == 0) return base;
+    var out = try std.fmt.allocPrint(alloc, "{s}:roles={d}", .{ base, role_targets.len });
+    alloc.free(base);
+    errdefer alloc.free(out);
+    for (role_targets) |role| {
+        const next = try std.fmt.allocPrint(alloc, "{s}:role={s}", .{ out, role });
+        alloc.free(out);
+        out = next;
+    }
+    return out;
+}
+
+fn bulkIoStringOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {
+    const value = option orelse return try alloc.dupe(u8, "default");
+    if (value.len == 0) return try alloc.dupe(u8, "empty");
+    const out = try alloc.alloc(u8, value.len * 2);
+    const hex = "0123456789abcdef";
+    for (value, 0..) |byte, i| {
+        out[i * 2] = hex[byte >> 4];
+        out[i * 2 + 1] = hex[byte & 0x0f];
+    }
+    return out;
+}
+
+fn tablePartitionMethodName(method: TablePartitionMethod) []const u8 {
+    return switch (method) {
+        .range => "range",
+    };
+}
+
+fn enumValuePositionName(position: EnumValuePosition) []const u8 {
+    return switch (position) {
+        .none => "none",
+        .before => "before",
+        .after => "after",
+    };
+}
+
+fn identityAllocatorKindName(kind: IdentityAllocatorKind) []const u8 {
+    return switch (kind) {
+        .serial => "serial",
+        .bigserial => "bigserial",
+        .generated_by_default => "generated_by_default",
+        .generated_always => "generated_always",
+    };
+}
+
+fn ddlTypeFingerprintName(field_type: runtime_schema.AntflyType, array_item_type: ?runtime_schema.AntflyType) []const u8 {
+    if (field_type != .array) return antflyTypeSchemaName(field_type);
+    return switch (array_item_type orelse return "array") {
+        .text => "array_text",
+        .keyword => "array_keyword",
+        .numeric => "array_numeric",
+        .embedding => "array_embedding",
+        .boolean => "array_boolean",
+        .datetime => "array_datetime",
+        .geopoint => "array_geopoint",
+        .geoshape => "array_geoshape",
+        .blob => "array_blob",
+        .html => "array_html",
+        .search_as_you_type => "array_search_as_you_type",
+        .json => "array_json",
+        .array => "array_array",
+        .link => "array_link",
+    };
+}
+
+pub fn sequenceOptionCount(options: SequenceOptions) usize {
+    var count: usize = 0;
+    if (options.as_type != null) count += 1;
+    if (options.start_with != null) count += 1;
+    if (options.increment_by != null) count += 1;
+    if (options.min_value_specified) count += 1;
+    if (options.max_value_specified) count += 1;
+    if (options.cache != null) count += 1;
+    if (options.cycle != null) count += 1;
+    if (options.owned_by != null) count += 1;
+    return count;
+}
+
+fn lowerDdlPlanForFingerprintTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !LoweredDdlPlan {
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+    };
+    return try ddl_plan.parseDdlPlanAlloc(alloc, tokens.items, &state.pos, .{
+        .schema = state.schema,
+        .field_expression_qualifiers = state.field_expression_qualifiers,
+        .returning_expression_qualifiers = state.returning_expression_qualifiers,
+        .defer_row_expression_field_validation = state.defer_row_expression_field_validation,
+        .column_definition_options = parser_context.ParserState.ContextAccessors.ddlColumnDefinitionOptions(&state),
+        .domain_options = parser_context.ParserState.ContextAccessors.ddlDomainOptions(&state),
+        .create_index_options = parser_context.ParserState.ContextAccessors.createIndexOptions(&state),
+        .row_security_policy_options = parser_context.ParserState.ContextAccessors.rowSecurityPolicyOptions(&state),
+    });
+}
+
+test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "CREATE VIEW users_v AS SELECT id, email FROM users;",
+            .fingerprint = "ddl:create_view:view=users_v:source=users:source_fields=2:fields=2:replace=false:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS users_mv AS SELECT id, email FROM users WITH NO DATA;",
+            .fingerprint = "ddl:create_materialized_view:view=users_mv:source=users:source_fields=2:fields=2:replace=false:if_not_exists=true:populate=false",
+        },
+        .{
+            .sql = "CREATE TEMPORARY TABLE users_session (id uuid PRIMARY KEY, status text);",
+            .fingerprint = "ddl:relation_lifetime:kind=temporary:table=users_session:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done');",
+            .fingerprint = "ddl:create_enum_type:type=usage_status:values=3",
+        },
+        .{
+            .sql = "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);",
+            .fingerprint = "ddl:create_domain:domain=positive_amount:type=numeric:checks=1:not_null=false:default=false",
+        },
+        .{
+            .sql = "CREATE SEQUENCE IF NOT EXISTS users_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 32 NO CYCLE;",
+            .fingerprint = "ddl:create_sequence:sequence=users_id_seq:if_not_exists=true:options=6",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}

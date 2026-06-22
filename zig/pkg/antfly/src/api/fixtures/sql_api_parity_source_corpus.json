@@ -5126,9 +5126,9 @@
       "sql": "SELECT id FROM usage_records WHERE status = 'queued' FOR KEY SHARE"
     },
     {
-      "name": "unsupported read non-target row lock",
-      "family": "unsupported_read",
-      "plan": "unsupported:read:requires=row_lock_mode_plan",
+      "name": "invalid read non-target row lock",
+      "family": "invalid_read",
+      "plan": "invalid:read:reason=row_lock_mode_plan",
       "classification_reason": "row_lock_mode_plan",
       "sql": "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records"
     },
@@ -6550,16 +6550,16 @@
       "sql": "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'"
     },
     {
-      "name": "unsupported claimed update share row lock mode",
-      "family": "unsupported_update_source",
-      "plan": "unsupported:update_source:requires=row_lock_mode_plan",
+      "name": "invalid claimed update share row lock mode",
+      "family": "invalid_update_source",
+      "plan": "invalid:update_source:reason=row_lock_mode_plan",
       "classification_reason": "row_lock_mode_plan",
       "sql": "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id"
     },
     {
-      "name": "unsupported claimed update non-target row lock",
-      "family": "unsupported_update_source",
-      "plan": "unsupported:update_source:requires=row_lock_mode_plan",
+      "name": "invalid claimed update non-target row lock",
+      "family": "invalid_update_source",
+      "plan": "invalid:update_source:reason=row_lock_mode_plan",
       "classification_reason": "row_lock_mode_plan",
       "sql": "UPDATE usage_records AS u SET status = 'processing' WHERE u.status = 'queued' FOR UPDATE OF archived_records RETURNING u.id"
     },
@@ -7062,9 +7062,9 @@
       "sql": "DELETE FROM usage_records WHERE id IN (SELECT organization_id, status FROM archived_records)"
     },
     {
-      "name": "unsupported joined update non-target row lock",
-      "family": "unsupported_update_joined_source",
-      "plan": "unsupported:update_joined_source:requires=row_lock_mode_plan",
+      "name": "invalid joined update non-target row lock",
+      "family": "invalid_update_joined_source",
+      "plan": "invalid:update_joined_source:reason=row_lock_mode_plan",
       "classification_reason": "row_lock_mode_plan",
       "sql": "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id"
     },

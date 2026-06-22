@@ -64,9 +64,12 @@ pub const AppParityCorpusPlanFamily = enum {
     delete_joined_source,
     merge_mutation,
     adapter_noop_ddl,
+    invalid_read,
     invalid_insert,
     invalid_update,
     invalid_delete,
+    invalid_update_source,
+    invalid_update_joined_source,
     unsupported,
     unsupported_read,
     unsupported_ddl,
@@ -2225,7 +2228,16 @@ pub fn corpusPlanFamilyIsUnsupported(family: AppParityCorpusPlanFamily) bool {
 }
 
 pub fn corpusPlanFamilyIsInvalid(family: AppParityCorpusPlanFamily) bool {
-    return family == .invalid_insert or family == .invalid_update or family == .invalid_delete;
+    return switch (family) {
+        .invalid_read,
+        .invalid_insert,
+        .invalid_update,
+        .invalid_delete,
+        .invalid_update_source,
+        .invalid_update_joined_source,
+        => true,
+        else => false,
+    };
 }
 
 pub fn corpusFixtureFamilyNeedsReason(family: AppParityCorpusPlanFamily) bool {
@@ -2243,9 +2255,12 @@ pub fn corpusReasonHasNativeRequirement(reason: []const u8) bool {
 }
 
 const InvalidPlanFamily = enum {
+    read,
     insert,
     update,
     delete,
+    update_source,
+    update_joined_source,
 };
 
 fn invalidPlanMatchesReason(
@@ -2254,9 +2269,12 @@ fn invalidPlanMatchesReason(
     reason: diagnostics.SqlAdapterClassificationReason,
 ) bool {
     const prefix = switch (family) {
+        .read => "invalid:read:reason=",
         .insert => "invalid:insert:reason=",
         .update => "invalid:update:reason=",
         .delete => "invalid:delete:reason=",
+        .update_source => "invalid:update_source:reason=",
+        .update_joined_source => "invalid:update_joined_source:reason=",
     };
     return std.mem.startsWith(u8, plan, prefix) and
         std.mem.eql(u8, plan[prefix.len..], @tagName(reason));
@@ -2270,9 +2288,12 @@ pub fn corpusPlanMatchesReason(
     const diagnostic_reason = diagnostics.classificationReasonFromToken(reason) orelse return false;
     switch (family) {
         .adapter_noop_ddl => return adapterNoopPlanMatchesReason(plan, "ddl", diagnostic_reason),
+        .invalid_read => return invalidPlanMatchesReason(plan, .read, diagnostic_reason),
         .invalid_insert => return invalidPlanMatchesReason(plan, .insert, diagnostic_reason),
         .invalid_update => return invalidPlanMatchesReason(plan, .update, diagnostic_reason),
         .invalid_delete => return invalidPlanMatchesReason(plan, .delete, diagnostic_reason),
+        .invalid_update_source => return invalidPlanMatchesReason(plan, .update_source, diagnostic_reason),
+        .invalid_update_joined_source => return invalidPlanMatchesReason(plan, .update_joined_source, diagnostic_reason),
         else => if (corpusUnsupportedPlanFamily(family)) |unsupported_family| {
             return unsupportedPlanMatchesReason(plan, unsupported_family, diagnostic_reason);
         } else return true,
@@ -2307,9 +2328,12 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         .delete_joined_source => "delete_joined_source:",
         .merge_mutation => if (std.mem.startsWith(u8, plan, "recursive_merge_mutation:")) return true else "merge_mutation:",
         .adapter_noop_ddl => "adapter_noop:ddl:",
+        .invalid_read => "invalid:read:",
         .invalid_insert => "invalid:insert:",
         .invalid_update => "invalid:update:",
         .invalid_delete => "invalid:delete:",
+        .invalid_update_source => "invalid:update_source:",
+        .invalid_update_joined_source => "invalid:update_joined_source:",
         .unsupported,
         .unsupported_read,
         .unsupported_ddl,
@@ -6041,9 +6065,11 @@ pub const AppParityCorpusCoverage = struct {
     invalid_delete: bool = false,
     invalid_delete_multi_output_subquery_selector: bool = false,
     unsupported_insert: bool = false,
-    unsupported_update_source: bool = false,
-    unsupported_update_joined_source: bool = false,
     unsupported_merge_mutation: bool = false,
+    invalid_read_row_lock_target: bool = false,
+    invalid_update_source_row_lock_mode: bool = false,
+    invalid_update_source_row_lock_target: bool = false,
+    invalid_update_joined_source_row_lock_target: bool = false,
     query_calendar_interval_expression: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
     read_row_lock_nowait: bool = false,
@@ -6059,9 +6085,6 @@ pub const AppParityCorpusCoverage = struct {
     truncate_restart_identity: bool = false,
     update_source_claim_nowait: bool = false,
     update_source_claim_no_key_update: bool = false,
-    unsupported_read_row_lock_target: bool = false,
-    unsupported_update_source_row_lock_target: bool = false,
-    unsupported_update_joined_source_row_lock_target: bool = false,
     update_identity_rewrite: bool = false,
     insert_source_cross_table_source_schema: bool = false,
     joined_source_cross_table_source_schema: bool = false,
@@ -7193,6 +7216,11 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
             },
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
+            .invalid_read => {
+                self.invalid_read_row_lock_target = self.invalid_read_row_lock_target or
+                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
+                        std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
+            },
             .invalid_insert => {
                 self.invalid_insert = true;
                 self.invalid_duplicate_row_batch_target = self.invalid_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
@@ -7209,15 +7237,28 @@ pub const AppParityCorpusCoverage = struct {
                 self.invalid_delete = true;
                 self.invalid_delete_multi_output_subquery_selector = self.invalid_delete_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
             },
+            .invalid_update_source => {
+                self.invalid_update_source_row_lock_mode = self.invalid_update_source_row_lock_mode or
+                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
+                        std.mem.indexOf(u8, entry.sql, "FOR SHARE") != null);
+                self.invalid_update_source_row_lock_target = self.invalid_update_source_row_lock_target or
+                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
+                        std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
+            },
+            .invalid_update_joined_source => {
+                self.invalid_update_joined_source_row_lock_target = self.invalid_update_joined_source_row_lock_target or
+                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
+                        std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
+            },
             .unsupported => {},
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
             .unsupported_write => self.unsupported_write = true,
             .unsupported_insert => self.unsupported_insert = true,
             .unsupported_update => {},
-            .unsupported_update_source => self.unsupported_update_source = true,
+            .unsupported_update_source => {},
             .unsupported_delete => {},
-            .unsupported_update_joined_source => self.unsupported_update_joined_source = true,
+            .unsupported_update_joined_source => {},
             .unsupported_delete_joined_source => {},
             .unsupported_merge_mutation => self.unsupported_merge_mutation = true,
             .read => {
@@ -7291,9 +7332,6 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);
-            self.unsupported_read_row_lock_target = self.unsupported_read_row_lock_target or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
         } else if (entry.family == .merge_mutation) {
             self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
                 (std.mem.indexOf(u8, entry.sql, "DEFAULT") != null and
@@ -7339,14 +7377,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "routine_body_plan") and
                     std.mem.startsWith(u8, entry.sql, "CREATE PROCEDURE ") and
                     std.mem.indexOf(u8, entry.sql, " AS ") != null);
-        } else if (entry.family == .unsupported_update_source) {
-            self.unsupported_update_source_row_lock_target = self.unsupported_update_source_row_lock_target or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
-        } else if (entry.family == .unsupported_update_joined_source) {
-            self.unsupported_update_joined_source_row_lock_target = self.unsupported_update_joined_source_row_lock_target or
-                (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                    std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {

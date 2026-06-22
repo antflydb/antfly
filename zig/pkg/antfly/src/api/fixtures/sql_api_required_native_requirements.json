@@ -12,7 +12,6 @@
     "multi_table_generation_barrier",
     "routine_body_plan",
     "routine_option_plan",
-    "row_lock_mode_plan",
     "set_operation_output_shape"
   ]
 }
