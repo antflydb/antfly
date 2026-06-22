@@ -11,7 +11,7 @@
 package antflylite
 
 /*
-#include "antflylite.h"
+#include "antfly.h"
 #include <stdlib.h>
 */
 import "C"

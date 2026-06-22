@@ -6,7 +6,7 @@
 //
 //     https://www.antfly.io/licensing/ELv2-license
 
-#include "antflylite.h"
+#include "antfly.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -70,8 +70,8 @@ int main(void) {
     (void)remove(missing_path);
     (void)remove(bad_path);
 
-    if (antfly_lite_abi_version() != 1) {
-        fprintf(stderr, "unexpected Lite ABI version: %u\n", antfly_lite_abi_version());
+    if (antfly_abi_version() != 1) {
+        fprintf(stderr, "unexpected Antfly ABI version: %u\n", antfly_abi_version());
         return 1;
     }
     if (antfly_lite_open_options_size() != sizeof(antfly_lite_open_options)) {

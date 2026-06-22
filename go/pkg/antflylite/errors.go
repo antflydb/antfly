@@ -8,7 +8,7 @@
 
 package antflylite
 
-// ErrorCode is a stable Antfly Lite C ABI error code.
+// ErrorCode is a stable Antfly C ABI error code.
 type ErrorCode uint32
 
 const (

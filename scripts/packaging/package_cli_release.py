@@ -79,8 +79,8 @@ def archive_name(version: str, platform: Platform) -> str:
 
 def lite_library_name(platform: Platform) -> str:
     if platform.release_os == "Darwin":
-        return "libantflylite.dylib"
-    return "libantflylite.so"
+        return "libantfly.dylib"
+    return "libantfly.so"
 
 
 def is_packaging_noise(path: Path) -> bool:
@@ -109,9 +109,9 @@ def extract_archive(archive_dir: Path, version: str, platform: Platform, dest: P
     binary = dest / "antfly"
     if not binary.exists():
         raise SystemExit(f"release archive does not contain antfly binary: {archive}")
-    header = dest / "include" / "antflylite.h"
+    header = dest / "include" / "antfly.h"
     if not header.exists():
-        raise SystemExit(f"release archive does not contain antflylite.h: {archive}")
+        raise SystemExit(f"release archive does not contain antfly.h: {archive}")
     lite_lib = dest / "lib" / lite_library_name(platform)
     if not lite_lib.exists():
         raise SystemExit(f"release archive does not contain {lite_lib.name}: {archive}")

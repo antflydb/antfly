@@ -483,8 +483,9 @@ fn snapshotStableAflite(allocator: Allocator, io: std.Io, path: []const u8, out_
 fn copyStableAfliteToPath(allocator: Allocator, io: std.Io, path: []const u8, out_path: []const u8, replace: bool) !antfly.lite.backend.StableSnapshotReport {
     try requireAflitePath(path);
     try requireAflitePath(out_path);
-    if (std.mem.eql(u8, path, out_path)) {
-        cli.fatal("source and output snapshot paths must be different: {s}", .{path});
+    if (std.mem.eql(u8, path, out_path) or try pathsReferToSameExistingFile(allocator, io, path, out_path)) {
+        std.debug.print("error: source and output snapshot paths must be different: {s}\n", .{path});
+        return error.InvalidArguments;
     }
     if (pathExists(io, out_path) and !replace) {
         cli.fatal("output snapshot already exists; pass --replace to overwrite: {s}", .{out_path});
@@ -2586,6 +2587,40 @@ test "lite restore rejects same existing aflite through different path spelling"
     const json = try lookupJson(allocator, &reopened.db, "doc:self", "");
     defer allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"self restore rejected\"") != null);
+}
+
+test "lite snapshot rejects same existing aflite through different path spelling" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const src_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/snapshot-self.aflite", .{tmp.sub_path});
+    defer allocator.free(src_path);
+    const nested_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested", .{tmp.sub_path});
+    defer allocator.free(nested_dir);
+    const alias_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested/../snapshot-self.aflite", .{tmp.sub_path});
+    defer allocator.free(alias_path);
+
+    try fs_paths.createDirPathPortable(io, nested_dir);
+    {
+        var source = try LiteDb.create(allocator, src_path, true);
+        defer source.close();
+        const json = try batchJson(allocator, &source.db, "{\"inserts\":{\"doc:self-snapshot\":{\"title\":\"self snapshot rejected\"}}}");
+        defer allocator.free(json);
+    }
+
+    try std.testing.expectError(error.InvalidArguments, copyStableAfliteToPath(allocator, io, src_path, alias_path, true));
+
+    var reopened = try LiteDb.open(allocator, src_path, .query_readonly);
+    defer reopened.close();
+    const json = try lookupJson(allocator, &reopened.db, "doc:self-snapshot", "");
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"self snapshot rejected\"") != null);
 }
 
 test "lite restore malformed backup leaves target untouched" {

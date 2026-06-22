@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Packaging regression tests for Antfly Lite C ABI artifacts."""
+"""Packaging regression tests for Antfly C ABI artifacts."""
 
 from __future__ import annotations
 
@@ -44,9 +44,9 @@ def write_release_archive(root: Path, version: str, os_name: str, arch: str) -> 
     antfly.write_text("#!/bin/sh\n")
     antfly.chmod(antfly.stat().st_mode | stat.S_IXUSR)
 
-    (stage / "include" / "antflylite.h").write_text("/* lite header */\n")
-    lib_name = "libantflylite.dylib" if os_name == "Darwin" else "libantflylite.so"
-    (stage / "lib" / lib_name).write_text("lite library\n")
+    (stage / "include" / "antfly.h").write_text("/* antfly header */\n")
+    lib_name = "libantfly.dylib" if os_name == "Darwin" else "libantfly.so"
+    (stage / "lib" / lib_name).write_text("antfly library\n")
     (stage / "share" / "antfly" / "asset.txt").write_text("asset\n")
 
     archive = root / f"antfly_{version}_{os_name}_{arch}.tar.gz"
@@ -85,14 +85,14 @@ class LiteCAbiPackagingTests(unittest.TestCase):
             package_cli_release.populate_npm_package(repo, platform, extracted)
 
             npm_package = repo / "ts" / "packages" / "cli-darwin-arm64"
-            self.assertEqual((npm_package / "include" / "antflylite.h").read_text(), "/* lite header */\n")
-            self.assertEqual((npm_package / "lib" / "libantflylite.dylib").read_text(), "lite library\n")
+            self.assertEqual((npm_package / "include" / "antfly.h").read_text(), "/* antfly header */\n")
+            self.assertEqual((npm_package / "lib" / "libantfly.dylib").read_text(), "antfly library\n")
 
             wheel = package_cli_release.package_python_wheel(repo, out, "1.2.3", platform, extracted)
             with zipfile.ZipFile(wheel) as zf:
                 names = set(zf.namelist())
-            self.assertIn("antfly_cli/include/antflylite.h", names)
-            self.assertIn("antfly_cli/lib/libantflylite.dylib", names)
+            self.assertIn("antfly_cli/include/antfly.h", names)
+            self.assertIn("antfly_cli/lib/libantfly.dylib", names)
             self.assertIn("antfly_cli/share/antfly/asset.txt", names)
 
     def test_homebrew_formula_installs_lite_cabi_artifacts(self) -> None:

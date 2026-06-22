@@ -1608,8 +1608,12 @@ pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
     closeHandle(handle);
 }
 
-pub export fn antfly_lite_abi_version() u32 {
+pub export fn antfly_abi_version() u32 {
     return lite_abi_version;
+}
+
+pub export fn antfly_lite_abi_version() u32 {
+    return antfly_abi_version();
 }
 
 pub export fn antfly_lite_open_options_size() u32 {
@@ -6493,7 +6497,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_snapshot_path);
     defer cleanupTestFile(invalid_snapshot_file_path);
 
-    try std.testing.expectEqual(@as(u32, 1), antfly_lite_abi_version());
+    try std.testing.expectEqual(@as(u32, 1), antfly_abi_version());
     try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
     try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
     try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));

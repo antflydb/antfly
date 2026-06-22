@@ -104,9 +104,9 @@ fi
 
 lite_library_name() {
   case "$1" in
-    *macos*) echo "libantflylite.dylib" ;;
-    *windows*) echo "antflylite.dll" ;;
-    *) echo "libantflylite.so" ;;
+    *macos*) echo "libantfly.dylib" ;;
+    *windows*) echo "antfly.dll" ;;
+    *) echo "libantfly.so" ;;
   esac
 }
 
@@ -154,9 +154,9 @@ zig_install_args=(
 )
 
 test -x "$prefix/bin/antfly"
-test -f "$prefix/include/antflylite.h"
+test -f "$prefix/include/antfly.h"
 if [ ! -f "$lite_lib_prefix_path" ]; then
-  echo "missing Lite C ABI library: $lite_lib_prefix_path" >&2
+  echo "missing Antfly C ABI library: $lite_lib_prefix_path" >&2
   find "$prefix" -maxdepth 3 -type f | sort >&2
   exit 1
 fi
@@ -175,6 +175,6 @@ cp "$repo_root/LICENSE" "$stage/LICENSE"
 
 tar -C "$stage" -czf "$out_dir/$archive_name" .
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
-grep -Fx "./include/antflylite.h" "$work_root/archive-contents.txt" >/dev/null
+grep -Fx "./include/antfly.h" "$work_root/archive-contents.txt" >/dev/null
 grep -Fx "$lite_lib_archive_path" "$work_root/archive-contents.txt" >/dev/null
 echo "wrote $out_dir/$archive_name"

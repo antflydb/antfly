@@ -18,12 +18,12 @@ import (
 )
 
 func TestBundledCABIHeaderMatchesSourceTree(t *testing.T) {
-	bundled, err := os.ReadFile(filepath.Join("include", "antflylite.h"))
+	bundled, err := os.ReadFile(filepath.Join("include", "antfly.h"))
 	if err != nil {
 		t.Fatalf("read bundled C ABI header: %v", err)
 	}
 
-	sourcePath := filepath.Join("..", "..", "..", "zig", "pkg", "antfly", "include", "antflylite.h")
+	sourcePath := filepath.Join("..", "..", "..", "zig", "pkg", "antfly", "include", "antfly.h")
 	source, err := os.ReadFile(sourcePath)
 	if os.IsNotExist(err) {
 		t.Skip("source-tree C ABI header is not present in this module checkout")

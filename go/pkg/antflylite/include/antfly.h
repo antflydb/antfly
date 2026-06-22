@@ -6,8 +6,8 @@
 //
 //     https://www.antfly.io/licensing/ELv2-license
 
-#ifndef ANTFLY_LITE_H
-#define ANTFLY_LITE_H
+#ifndef ANTFLY_H
+#define ANTFLY_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -211,6 +211,7 @@ typedef struct antfly_scan_hash_result {
     size_t entry_count;
 } antfly_scan_hash_result;
 
+uint32_t antfly_abi_version(void);
 uint32_t antfly_lite_abi_version(void);
 uint32_t antfly_lite_open_options_size(void);
 const char *antfly_error_code_name(antfly_error_code code);

@@ -141,8 +141,11 @@ The library API should be small and boring:
 - restore/import
 - integrity check
 
-The C ABI should be the long-term stable boundary. Native Zig, Go, Rust,
-Python, Node, and Java bindings can layer on top of it.
+`libantfly` should be the long-term stable C ABI boundary. Antfly Lite should
+not have a separate independently-versioned ABI; `.aflite` is a storage/open
+mode and Lite-specific status, backup, restore, check, and maintenance helpers
+are convenience entrypoints in the same `libantfly` ABI. Native Zig, Go, Rust,
+Python, Node, and Java bindings can layer on top of that common boundary.
 
 The C ABI should expose a single Lite status JSON call that mirrors
 `antfly lite status`: storage identity, DB stats, pending work, and capability
@@ -556,7 +559,8 @@ Packages:
 
 - `antfly` CLI with `antfly lite` subcommands.
 - `antfly-embedded` Zig package.
-- `libantflylite` C ABI artifact.
+- `libantfly` C ABI artifact, with `.aflite` exposed as an embedded storage
+  profile rather than a separate Lite-only ABI.
 - Language bindings generated or hand-written over the C ABI.
 - Optional full package with embedded inference runtime.
 
@@ -649,7 +653,7 @@ query-visible results should match within documented index rebuild semantics.
 
 ### Phase 4: Embedded API Hardening
 
-- Define stable C ABI.
+- Define stable `libantfly` C ABI.
 - Add ownership/error/result conventions.
 - Expose stable error-code names and descriptions for language bindings.
 - Provide a buffer free-and-zero helper for generated bindings while retaining

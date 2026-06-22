@@ -8,7 +8,7 @@
 
 // Package antflylite provides Go bindings for embedded Antfly Lite databases.
 //
-// The package is backed by the stable Antfly Lite C ABI. The Go module carries
-// the matching antflylite.h header; build or install libantflylite before
+// The package is backed by the stable Antfly C ABI. The Go module carries
+// the matching antfly.h header; build or install libantfly before
 // running cgo-backed tests or binaries.
 package antflylite

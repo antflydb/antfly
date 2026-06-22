@@ -8,7 +8,7 @@ writes a portable `.afb` backup.
 
 ## Run
 
-Build the Antfly Lite C ABI first:
+Build the Antfly C ABI first:
 
 ```bash
 cd ../../zig

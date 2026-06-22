@@ -1,11 +1,12 @@
 # Antfly Lite Go Binding
 
-`go/pkg/antflylite` is the first language binding above the stable Zig and C
-Antfly Lite APIs. It wraps the C ABI, so applications embed a live `.aflite`
-database directly instead of talking to the network SDK.
+`go/pkg/antflylite` is the first language binding above the stable Zig APIs and
+the `libantfly` C ABI. It wraps the Lite open/storage profile in that ABI, so
+applications embed a live `.aflite` database directly instead of talking to the
+network SDK.
 
-The Go module includes the matching `antflylite.h` C ABI header. Applications
-still need `libantflylite` at build and runtime. From the source tree, build the
+The Go module includes the matching `antfly.h` C ABI header. Applications
+still need `libantfly` at build and runtime. From the source tree, build the
 C library before running cgo-backed tests:
 
 ```sh
@@ -16,7 +17,7 @@ go test -tags antflylite_capi ./...
 ```
 
 Outside the source tree, install an Antfly CLI release package or archive that
-contains `include/antflylite.h` and `lib/libantflylite.*`, then point cgo and
+contains `include/antfly.h` and `lib/libantfly.*`, then point cgo and
 the dynamic loader at that installation when building your app. For example:
 
 ```sh
@@ -30,12 +31,12 @@ is not already on the loader search path.
 
 Normal `go test ./...` does not run the C ABI smoke test. The
 `antflylite_capi` tag is intentional so package consumers do not need a freshly
-built `libantflylite` unless they are testing the local binding against the
+built `libantfly` unless they are testing the local binding against the
 source-tree C library.
 
 The open helpers call `ValidateABI` before filling C option structures or
 creating handles. Applications can call `ValidateABI` at startup to fail fast
-when the loaded `libantflylite` ABI version or `antfly_lite_open_options` size
+when the loaded `libantfly` ABI version or `antfly_lite_open_options` size
 does not match the header used to build the Go binding.
 
 The binding exposes raw JSON methods such as `StatusJSON` and `CapabilitiesJSON`
@@ -71,7 +72,7 @@ only when the loaded build advertises `LocalInferenceRuntime`.
 
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
-local transaction/OCC path exposed by the Lite C ABI.
+local transaction/OCC path exposed by the Antfly C ABI.
 
 Use `ExportToFile` or `BackupToFile` to write a portable `.afb` archive from an
 open Lite handle. Use `RestoreFile`, `Restore`, `RestoreBackupFile`,
@@ -80,5 +81,5 @@ open Lite handle. Use `RestoreFile`, `Restore`, `RestoreBackupFile`,
 Use `CopyStableSnapshot` or `CopyStableSnapshotFile` when you want a physical
 `.aflite` database snapshot rather than a portable `.afb` backup archive.
 
-The repository-level `zig build lite-core` gate builds `libantflylite` and runs
+The repository-level `zig build lite-core` gate builds `libantfly` and runs
 the Go binding tests against it.

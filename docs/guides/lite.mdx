@@ -414,7 +414,7 @@ The repository includes runnable Lite templates:
   search, hybrid search, status, and portable backup.
 
 Both examples are gated by `zig build lite-core` against the built
-`libantflylite` C ABI.
+`libantfly` C ABI.
 
 ## Build Profiles
 
@@ -429,13 +429,13 @@ zig build lite-dev
 ```
 
 `lite-core` builds the embedded database, CLI, narrow `/lite/v1` serve mode,
-and `libantflylite` without a heavyweight local inference runtime. `lite-full`
+and `libantfly` without a heavyweight local inference runtime. `lite-full`
 builds the full Antfly CLI with Lite support and requires the local inference
 runtime capability flag so Lite status, C ABI, and bindings advertise
 `local_embedded` correctly. `lite-wasm` builds the
 hosted/manual-maintenance Lite profile for `wasm32-freestanding` without
 pulling in the broader server or inference WASM bundle. `lite-package-test`
-checks that release packaging preserves the `libantflylite` header and library
+checks that release packaging preserves the `libantfly` header and library
 artifacts. `lite-dev` runs the broader development and compatibility checks,
 including the Lite WASM profile and packaging regression.
 

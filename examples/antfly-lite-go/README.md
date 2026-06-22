@@ -8,7 +8,7 @@ opening another database handle.
 
 ## Run
 
-Build the Antfly Lite C ABI first:
+Build the Antfly C ABI first:
 
 ```bash
 cd ../../zig

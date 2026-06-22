@@ -9,5 +9,5 @@ antfly --version
 
 This package is separate from `@antfly/sdk`, which contains the TypeScript SDK.
 The CLI package depends on a platform-specific package that carries the native
-`antfly` executable, Antfarm dashboard assets, and the Antfly Lite C ABI
+`antfly` executable, Antfarm dashboard assets, and the Antfly C ABI
 header/library.

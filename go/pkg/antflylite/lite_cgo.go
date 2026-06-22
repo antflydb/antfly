@@ -12,10 +12,10 @@ package antflylite
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/include -I${SRCDIR}/../../../zig/pkg/antfly/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../zig/zig-out/lib -lantflylite
+#cgo LDFLAGS: -L${SRCDIR}/../../../zig/zig-out/lib -lantfly
 #cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../zig/zig-out/lib
 #cgo linux LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../zig/zig-out/lib
-#include "antflylite.h"
+#include "antfly.h"
 #include <stdlib.h>
 */
 import "C"
@@ -27,7 +27,7 @@ import (
 	"unsafe"
 )
 
-// SupportedABIVersion is the Antfly Lite C ABI version this binding expects.
+// SupportedABIVersion is the Antfly C ABI version this binding expects.
 const SupportedABIVersion uint32 = 1
 
 // OpenMode controls how an Antfly Lite file is opened.
@@ -92,9 +92,9 @@ type DB struct {
 	handle unsafe.Pointer
 }
 
-// ABIVersion returns the loaded Antfly Lite C ABI version.
+// ABIVersion returns the loaded Antfly C ABI version.
 func ABIVersion() uint32 {
-	return uint32(C.antfly_lite_abi_version())
+	return uint32(C.antfly_abi_version())
 }
 
 // OpenOptionsSize returns the loaded C ABI size of antfly_lite_open_options.

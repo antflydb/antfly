@@ -2061,14 +2061,14 @@ pub fn build(b: *std.Build) void {
 
     const lite_capi_lib = b.addLibrary(.{
         .linkage = .dynamic,
-        .name = "antflylite",
+        .name = "antfly",
         .root_module = lite_capi_mod,
     });
     const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
     const install_lite_capi_header = b.addInstallFileWithDir(
-        b.path("pkg/antfly/include/antflylite.h"),
+        b.path("pkg/antfly/include/antfly.h"),
         .header,
-        "antflylite.h",
+        "antfly.h",
     );
 
     const capi_step = b.step("capi", "Build the Zig C API shared libraries");
@@ -2076,7 +2076,7 @@ pub fn build(b: *std.Build) void {
     capi_step.dependOn(&install_lite_capi_lib.step);
     capi_step.dependOn(&install_lite_capi_header.step);
 
-    const lite_capi_step = b.step("lite-capi", "Build the libantflylite C ABI shared library");
+    const lite_capi_step = b.step("lite-capi", "Build the libantfly C ABI shared library");
     lite_capi_step.dependOn(&install_lite_capi_lib.step);
     lite_capi_step.dependOn(&install_lite_capi_header.step);
 
@@ -2096,7 +2096,7 @@ pub fn build(b: *std.Build) void {
     });
     lite_capi_smoke.root_module.linkLibrary(lite_capi_lib);
     const run_lite_capi_smoke = b.addRunArtifact(lite_capi_smoke);
-    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantflylite");
+    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     lite_capi_smoke_step.dependOn(&run_lite_capi_smoke.step);
 
     const run_lite_go_tests = b.addSystemCommand(&.{
@@ -2112,7 +2112,7 @@ pub fn build(b: *std.Build) void {
     run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
     run_lite_go_tests.step.dependOn(&install_lite_capi_lib.step);
     run_lite_go_tests.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantflylite");
+    const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
 
     const run_lite_go_example = b.addSystemCommand(&.{
@@ -2158,7 +2158,7 @@ pub fn build(b: *std.Build) void {
         "scripts/packaging/test_lite_cabi_packaging.py",
     });
     run_lite_cabi_packaging_tests.setCwd(b.path(".."));
-    const lite_package_test_step = b.step("lite-package-test", "Run Antfly Lite C ABI release packaging regression tests");
+    const lite_package_test_step = b.step("lite-package-test", "Run Antfly C ABI release packaging regression tests");
     lite_package_test_step.dependOn(&run_lite_cabi_packaging_tests.step);
 
     const capi_default_filters = [_][]const u8{
@@ -6547,7 +6547,7 @@ pub fn build(b: *std.Build) void {
     lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
     const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
 
-    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantflylite C ABI");
+    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
     lite_core_step.dependOn(&install_lite_core_main.step);
     lite_core_step.dependOn(&install_lite_capi_lib.step);
     lite_core_step.dependOn(&install_lite_capi_header.step);
@@ -6559,7 +6559,7 @@ pub fn build(b: *std.Build) void {
     lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
     lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
-    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantflylite C ABI");
+    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantfly C ABI");
     if (!lite_local_inference_runtime) {
         lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
     }
