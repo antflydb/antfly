@@ -9058,12 +9058,19 @@ pub fn planRowsCteOutputsAlloc(
         planned.deinit(alloc);
     }
     for (ctes) |cte| {
+        if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidRowsRequest;
         try validateRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
-        const output_columns = try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, planned.items, cte.query);
+        const output_columns = if (cte.table_function) |table_function|
+            try rowsTableFunctionOutputColumnsAlloc(alloc, table_function, cte.query)
+        else
+            try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, planned.items, cte.query);
         errdefer freeRowsOutputColumns(alloc, output_columns);
         const output_fields = try rowsOutputColumnFieldsAlloc(alloc, output_columns);
         errdefer freeStringSlice(alloc, output_fields);
-        const source_schema = rowsPlannedQuerySourceSchema(schema, planned.items, cte.query) orelse return error.InvalidRowsRequest;
+        const source_schema = if (cte.table_function) |table_function|
+            rowsTableFunctionSchema(table_function)
+        else
+            rowsPlannedQuerySourceSchema(schema, planned.items, cte.query) orelse return error.InvalidRowsRequest;
         try planned.append(alloc, .{
             .name = cte.name,
             .output_fields = output_fields,
@@ -9072,6 +9079,38 @@ pub fn planRowsCteOutputsAlloc(
         });
     }
     return try planned.toOwnedSlice(alloc);
+}
+
+fn rowsTableFunctionSchema(table_function: db_mod.types.RelationalRowsTableFunction) runtime_schema.TableSchema {
+    _ = table_function;
+    return .{
+        .storage_mode = .relational,
+        .relational_columns = rowsGraphTableFunctionColumns(),
+        .primary_key = null,
+    };
+}
+
+fn rowsGraphTableFunctionColumns() []const runtime_schema.RelationalColumn {
+    return &.{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "score", .path = "score", .field_type = .numeric, .nullable = true },
+        .{ .name = "graph_name", .path = "graph_name", .field_type = .keyword, .nullable = false },
+        .{ .name = "node_key", .path = "node_key", .field_type = .keyword, .nullable = true },
+        .{ .name = "depth", .path = "depth", .field_type = .numeric, .nullable = true },
+        .{ .name = "distance", .path = "distance", .field_type = .numeric, .nullable = true },
+        .{ .name = "path_json", .path = "path_json", .field_type = .json, .nullable = true },
+        .{ .name = "match_json", .path = "match_json", .field_type = .json, .nullable = true },
+        .{ .name = "stored_json", .path = "stored_json", .field_type = .json, .nullable = true },
+    };
+}
+
+fn rowsTableFunctionOutputColumnsAlloc(
+    alloc: std.mem.Allocator,
+    table_function: db_mod.types.RelationalRowsTableFunction,
+    req: OwnedRowsQueryRequest,
+) ![]const runtime_schema.RelationalColumn {
+    const schema = rowsTableFunctionSchema(table_function);
+    return try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, &.{}, req);
 }
 
 fn rowsPlannedQueryOutputColumnsAlloc(

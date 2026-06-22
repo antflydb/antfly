@@ -19425,6 +19425,37 @@ pub const DB = struct {
         return try windowRelationalRowsFromSourceRowsAlloc(alloc, req, source_rows.rows);
     }
 
+    fn relationalRowsTableFunctionOutputFieldsAlloc(
+        alloc: Allocator,
+        table_function: types.RelationalRowsTableFunction,
+        req: types.RelationalRowsQueryRequest,
+    ) ![]const []const u8 {
+        _ = table_function;
+        var fields = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (fields.items) |field| alloc.free(@constCast(field));
+            fields.deinit(alloc);
+        }
+        const source_fields = types.relational_rows_graph_table_function_fields[0..];
+        if (req.select_all) {
+            for (source_fields) |field| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+        } else {
+            for (req.select) |field| {
+                if (!relationalRowsOutputFieldExists(source_fields, field)) return error.InvalidQueryRequest;
+                try appendRelationalRowsOutputFieldAlloc(alloc, &fields, field);
+            }
+        }
+        for (req.json_extract) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.array_length) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.coalesce) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.field_aliases) |projection| try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        for (req.expressions) |projection| {
+            if (relationalRowsQueryProjectionOutputAlreadyRendered(req, projection.output)) continue;
+            try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
+        }
+        return try fields.toOwnedSlice(alloc);
+    }
+
     fn appendRelationalRowsMaterializedCtesAlloc(
         self: *DB,
         alloc: Allocator,
@@ -19439,7 +19470,10 @@ pub const DB = struct {
             if (findRelationalRowsMaterializedCte(materialized_ctes.items, cte.name) != null) return error.InvalidQueryRequest;
             if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
 
-            const result = try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, ranges, cte.query);
+            const result = if (cte.table_function) |table_function|
+                try self.queryRelationalRowsTableFunctionCteAlloc(alloc, cte.name, table_function, cte.query)
+            else
+                try self.queryRelationalRowsWithMaterializedCtesAndRangesAlloc(alloc, runtime_schema, materialized_ctes.items, ranges, cte.query);
             var result_transferred = false;
             errdefer {
                 if (!result_transferred) {
@@ -19449,7 +19483,10 @@ pub const DB = struct {
             }
             const materialized_bytes = types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedQueryRequest;
             try admitRelationalRowsCteMaterializationWithPolicy(cte, result.rows.len, materialized_bytes, .allow_spill);
-            const output_fields = try relationalRowsQueryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
+            const output_fields = if (cte.table_function) |table_function|
+                try relationalRowsTableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+            else
+                try relationalRowsQueryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
             var output_fields_transferred = false;
             errdefer if (!output_fields_transferred) freeOwnedConstStringSlice(alloc, output_fields);
             try materialized_ctes.append(alloc, .{
@@ -19478,8 +19515,241 @@ pub const DB = struct {
             {
                 return error.InvalidQueryRequest;
             }
+            if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
             if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
         }
+    }
+
+    fn queryRelationalRowsTableFunctionCteAlloc(
+        self: *DB,
+        alloc: Allocator,
+        cte_name: []const u8,
+        table_function: types.RelationalRowsTableFunction,
+        req: types.RelationalRowsQueryRequest,
+    ) !types.RelationalRowsQueryResult {
+        const rows = switch (table_function) {
+            .graph_query => |graph_query| try self.materializeGraphQueryTableFunctionRowsAlloc(alloc, graph_query),
+        };
+        defer freeOwnedConstStringSlice(alloc, rows);
+        var source_req = req;
+        source_req.source_cte = "";
+        return try self.queryRelationalRowsFromSourceRowsAlloc(alloc, cte_name, rows, source_req);
+    }
+
+    fn materializeGraphQueryTableFunctionRowsAlloc(
+        self: *DB,
+        alloc: Allocator,
+        graph_query: types.NamedGraphQuery,
+    ) ![]const []const u8 {
+        var search_result = try self.search(alloc, .{
+            .graph_queries = &.{graph_query},
+            .include_stored = true,
+        });
+        defer search_result.deinit();
+
+        var rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer freeOwnedConstStringArrayList(alloc, &rows);
+
+        for (search_result.hits) |hit| {
+            try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_query.name, hit, null, null));
+        }
+        for (search_result.graph_results) |graph_result| {
+            for (graph_result.nodes) |node| {
+                try rows.append(alloc, try graphTableFunctionNodeRowJsonAlloc(alloc, graph_result.name, node, null));
+            }
+            for (graph_result.matches) |match| {
+                const match_json = try graphPatternMatchJsonAlloc(alloc, match);
+                defer alloc.free(match_json);
+                if (match.bindings.len == 0) {
+                    try rows.append(alloc, try graphTableFunctionSyntheticRowJsonAlloc(alloc, graph_result.name, match_json));
+                    continue;
+                }
+                for (match.bindings) |binding| {
+                    try rows.append(alloc, try graphTableFunctionNodeRowJsonAlloc(alloc, graph_result.name, binding.node, match_json));
+                }
+            }
+            for (graph_result.hits) |hit| {
+                try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_result.name, hit, null, null));
+            }
+        }
+        return try rows.toOwnedSlice(alloc);
+    }
+
+    fn freeOwnedConstStringArrayList(alloc: Allocator, rows: *std.ArrayListUnmanaged([]const u8)) void {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    fn graphTableFunctionSyntheticRowJsonAlloc(
+        alloc: Allocator,
+        graph_name: []const u8,
+        match_json: []const u8,
+    ) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{\"id\":\"\",\"score\":null,\"graph_name\":");
+        try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
+        try writer.writeAll(",\"node_key\":null,\"depth\":null,\"distance\":null,\"path_json\":null,\"match_json\":");
+        try writer.writeAll(match_json);
+        try writer.writeAll(",\"stored_json\":null}");
+        return try out.toOwnedSlice();
+    }
+
+    fn graphTableFunctionHitRowJsonAlloc(
+        alloc: Allocator,
+        graph_name: []const u8,
+        hit: types.SearchHit,
+        node: ?graph_query_mod.GraphResultNode,
+        match_json: ?[]const u8,
+    ) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(.{ .string = hit.id }, .{}, writer);
+        try writer.writeAll(",\"score\":");
+        if (hit.score) |score| {
+            try writer.print("{d}", .{score});
+        } else {
+            try writer.writeAll("null");
+        }
+        try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, hit.stored_data);
+        return try out.toOwnedSlice();
+    }
+
+    fn graphTableFunctionNodeRowJsonAlloc(
+        alloc: Allocator,
+        graph_name: []const u8,
+        node: graph_query_mod.GraphResultNode,
+        match_json: ?[]const u8,
+    ) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{\"id\":");
+        try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
+        try writer.writeAll(",\"score\":null");
+        try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null);
+        return try out.toOwnedSlice();
+    }
+
+    fn appendGraphTableFunctionTailJson(
+        writer: *std.Io.Writer,
+        graph_name: []const u8,
+        node: ?graph_query_mod.GraphResultNode,
+        match_json: ?[]const u8,
+        stored_json: ?[]const u8,
+    ) !void {
+        try writer.writeAll(",\"graph_name\":");
+        try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
+        try writer.writeAll(",\"node_key\":");
+        if (node) |value| {
+            try std.json.Stringify.value(.{ .string = value.key }, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"depth\":");
+        if (node) |value| {
+            try writer.print("{d}", .{value.depth});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"distance\":");
+        if (node) |value| {
+            try writer.print("{d}", .{value.distance});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"path_json\":");
+        if (node) |value| {
+            try graphPathJson(value.path, value.path_edges, writer);
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"match_json\":");
+        if (match_json) |json| try writer.writeAll(json) else try writer.writeAll("null");
+        try writer.writeAll(",\"stored_json\":");
+        if (stored_json) |json| try writer.writeAll(json) else try writer.writeAll("null");
+        try writer.writeAll("}");
+    }
+
+    fn graphPathJson(
+        path: ?[]const []const u8,
+        path_edges: ?[]const graph_query_mod.PathEdgeInfo,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.writeAll("{\"nodes\":");
+        if (path) |nodes| {
+            try writer.writeAll("[");
+            for (nodes, 0..) |node, i| {
+                if (i > 0) try writer.writeAll(",");
+                try std.json.Stringify.value(.{ .string = node }, .{}, writer);
+            }
+            try writer.writeAll("]");
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\"edges\":");
+        if (path_edges) |edges| {
+            try writer.writeAll("[");
+            for (edges, 0..) |edge, i| {
+                if (i > 0) try writer.writeAll(",");
+                try writer.writeAll("{\"source\":");
+                try std.json.Stringify.value(.{ .string = edge.source }, .{}, writer);
+                try writer.writeAll(",\"target\":");
+                try std.json.Stringify.value(.{ .string = edge.target }, .{}, writer);
+                try writer.writeAll(",\"type\":");
+                try std.json.Stringify.value(.{ .string = edge.edge_type }, .{}, writer);
+                try writer.print(",\"weight\":{d}", .{edge.weight});
+                if (edge.metadata.len > 0) {
+                    try writer.writeAll(",\"metadata\":");
+                    try writer.writeAll(edge.metadata);
+                }
+                try writer.writeAll("}");
+            }
+            try writer.writeAll("]");
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll("}");
+    }
+
+    fn graphPatternMatchJsonAlloc(alloc: Allocator, match: types.GraphPatternMatch) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeAll("{\"bindings\":[");
+        for (match.bindings, 0..) |binding, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("{\"alias\":");
+            try std.json.Stringify.value(.{ .string = binding.alias }, .{}, writer);
+            try writer.writeAll(",\"node\":");
+            try graphNodeJson(binding.node, writer);
+            try writer.writeAll("}");
+        }
+        try writer.writeAll("],\"path\":[");
+        for (match.path, 0..) |edge, i| {
+            if (i > 0) try writer.writeAll(",");
+            try writer.writeAll("{\"source\":");
+            try std.json.Stringify.value(.{ .string = edge.source }, .{}, writer);
+            try writer.writeAll(",\"target\":");
+            try std.json.Stringify.value(.{ .string = edge.target }, .{}, writer);
+            try writer.writeAll(",\"type\":");
+            try std.json.Stringify.value(.{ .string = edge.edge_type }, .{}, writer);
+            try writer.print(",\"weight\":{d}}}", .{edge.weight});
+        }
+        try writer.writeAll("]}");
+        return try out.toOwnedSlice();
+    }
+
+    fn graphNodeJson(node: graph_query_mod.GraphResultNode, writer: *std.Io.Writer) !void {
+        try writer.writeAll("{\"key\":");
+        try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
+        try writer.print(",\"depth\":{d},\"distance\":{d}", .{ node.depth, node.distance });
+        try writer.writeAll(",\"path\":");
+        try graphPathJson(node.path, node.path_edges, writer);
+        try writer.writeAll("}");
     }
 
     fn validateRelationalRowsQueryPlanCteReferences(plan: types.RelationalRowsQueryPlan) !void {
@@ -19800,8 +20070,12 @@ pub const DB = struct {
             planned.deinit(alloc);
         }
         for (ctes) |cte| {
+            if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
             try validateRelationalRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
-            const output_fields = try relationalRowsPlannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
+            const output_fields = if (cte.table_function) |table_function|
+                try relationalRowsTableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+            else
+                try relationalRowsPlannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
             errdefer freeOwnedConstStringSlice(alloc, output_fields);
             try planned.append(alloc, .{
                 .name = cte.name,
@@ -19845,6 +20119,13 @@ pub const DB = struct {
             try appendRelationalRowsOutputFieldAlloc(alloc, &fields, projection.output);
         }
         return try fields.toOwnedSlice(alloc);
+    }
+
+    fn relationalRowsOutputFieldExists(fields: []const []const u8, name: []const u8) bool {
+        for (fields) |field| {
+            if (std.mem.eql(u8, field, name)) return true;
+        }
+        return false;
     }
 
     fn findRelationalRowsPlannedCte(

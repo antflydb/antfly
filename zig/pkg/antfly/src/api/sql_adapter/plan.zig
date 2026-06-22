@@ -21,6 +21,7 @@ const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
+const query_function = @import("query_function.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
@@ -1131,6 +1132,19 @@ pub fn parseCtesForPlanAlloc(
         try parser.consumeCteMaterializationHint(tokens, pos);
         try cursor.expectToken(.lparen);
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
+        if (lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
+            pos.* = close_index + 1;
+            try ctes.append(alloc, .{
+                .name = cte_name,
+                .table_function = table_function,
+            });
+            cte_name_transferred = true;
+            if (cursor.matchToken(.comma) == null) break;
+            continue;
+        } else |err| switch (err) {
+            error.UnsupportedSqlShape => {},
+            else => return err,
+        }
         var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], ctes.items);
         errdefer lowered.deinit(alloc);
         pos.* = close_index + 1;
@@ -1149,6 +1163,13 @@ pub fn parseCtesForPlanAlloc(
     }
 
     return try ctes.toOwnedSlice(alloc);
+}
+
+fn lowerAntflyGraphTableFunctionCteAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !db_mod.types.RelationalRowsTableFunction {
+    return try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, tokens);
 }
 
 pub fn freePlanCtes(alloc: std.mem.Allocator, ctes: []const db_mod.types.RelationalRowsCte) void {

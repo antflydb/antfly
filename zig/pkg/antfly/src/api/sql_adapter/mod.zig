@@ -101,6 +101,7 @@ pub const antflyQueryFunctionNumberArg = query_function.antflyQueryFunctionNumbe
 pub const antflyQueryFunctionStringArg = query_function.antflyQueryFunctionStringArg;
 pub const lowerAntflyQueryFunctionSqlAlloc = query_function.lowerAntflyQueryFunctionSqlAlloc;
 pub const lowerAntflyQueryFunctionExpressionSqlAlloc = query_function.lowerAntflyQueryFunctionExpressionSqlAlloc;
+pub const lowerAntflyGraphTableFunctionTokensAlloc = query_function.lowerAntflyGraphTableFunctionTokensAlloc;
 pub const parseAntflyQueryFunctionCall = query_function.parseAntflyQueryFunctionCall;
 pub const parseAntflyQueryFunctionExpressionAlloc = query_function.parseAntflyQueryFunctionExpressionAlloc;
 pub const requireAntflyQueryFunctionStringArg = query_function.requireAntflyQueryFunctionStringArg;

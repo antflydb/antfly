@@ -1426,6 +1426,7 @@ fn freeRelationalRowsOnConflict(alloc: Allocator, conflict: RelationalRowsOnConf
 pub const RelationalRowsCte = struct {
     name: []const u8,
     query: RelationalRowsQueryRequest = .{},
+    table_function: ?RelationalRowsTableFunction = null,
     max_rows: ?u32 = null,
     max_bytes: ?u64 = null,
     spill_after_bytes: ?u64 = null,
@@ -1433,9 +1434,84 @@ pub const RelationalRowsCte = struct {
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.name);
         self.query.deinit(alloc);
+        if (self.table_function) |*table_function| table_function.deinit(alloc);
         self.* = undefined;
     }
 };
+
+pub const RelationalRowsTableFunctionKind = enum {
+    graph_query,
+};
+
+pub const RelationalRowsTableFunction = union(RelationalRowsTableFunctionKind) {
+    graph_query: NamedGraphQuery,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        switch (self.*) {
+            .graph_query => |*query| freeNamedGraphQuery(alloc, query),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const relational_rows_graph_table_function_fields = [_][]const u8{
+    "id",
+    "score",
+    "graph_name",
+    "node_key",
+    "depth",
+    "distance",
+    "path_json",
+    "match_json",
+    "stored_json",
+};
+
+fn freeNamedGraphQuery(alloc: Allocator, named: *NamedGraphQuery) void {
+    alloc.free(@constCast(named.name));
+    freeGraphQuery(alloc, &named.query);
+    named.* = undefined;
+}
+
+fn freeGraphQuery(alloc: Allocator, query: *graph_query_mod.GraphQuery) void {
+    alloc.free(@constCast(query.index_name));
+    freeGraphNodeSelector(alloc, query.start_nodes);
+    if (query.target_nodes) |target| freeGraphNodeSelector(alloc, target);
+    freeGraphQueryParams(alloc, query.params);
+    for (query.pattern) |step| {
+        alloc.free(@constCast(step.alias));
+        for (step.edge.types) |edge_type| alloc.free(@constCast(edge_type));
+        if (step.edge.types.len > 0) alloc.free(@constCast(step.edge.types));
+        if (step.node_filter.filter_prefix.len > 0) alloc.free(@constCast(step.node_filter.filter_prefix));
+        if (step.node_filter.filter_query_json) |filter| alloc.free(@constCast(filter));
+    }
+    if (query.pattern.len > 0) alloc.free(@constCast(query.pattern));
+    for (query.return_aliases) |alias| alloc.free(@constCast(alias));
+    if (query.return_aliases.len > 0) alloc.free(@constCast(query.return_aliases));
+    for (query.fields) |field| alloc.free(@constCast(field));
+    if (query.fields.len > 0) alloc.free(@constCast(query.fields));
+    for (query.metrics) |metric| alloc.free(@constCast(metric.name));
+    if (query.metrics.len > 0) alloc.free(@constCast(query.metrics));
+    for (query.order_by) |order| alloc.free(@constCast(order.name));
+    if (query.order_by.len > 0) alloc.free(@constCast(query.order_by));
+    for (query.where_metric) |filter| alloc.free(@constCast(filter.name));
+    if (query.where_metric.len > 0) alloc.free(@constCast(query.where_metric));
+    query.* = undefined;
+}
+
+fn freeGraphQueryParams(alloc: Allocator, params: graph_query_mod.QueryParams) void {
+    for (params.edge_types) |edge_type| alloc.free(@constCast(edge_type));
+    if (params.edge_types.len > 0) alloc.free(@constCast(params.edge_types));
+}
+
+fn freeGraphNodeSelector(alloc: Allocator, selector: graph_query_mod.NodeSelector) void {
+    switch (selector) {
+        .keys => |keys| {
+            for (keys) |key| alloc.free(@constCast(key));
+            if (keys.len > 0) alloc.free(@constCast(keys));
+        },
+        .result_ref => |ref| alloc.free(@constCast(ref.ref)),
+    }
+}
 
 pub const default_relational_rows_cte_max_rows: u32 = 65_536;
 pub const default_relational_rows_cte_max_bytes: u64 = 64 * 1024 * 1024;

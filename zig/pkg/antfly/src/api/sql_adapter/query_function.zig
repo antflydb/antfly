@@ -353,6 +353,38 @@ pub fn lowerAntflyQueryFunctionExpressionSqlAlloc(
     return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
 }
 
+pub fn lowerAntflyGraphTableFunctionTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !db_mod.types.RelationalRowsTableFunction {
+    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
+    var pos: usize = 0;
+    const function = try parseAntflyQueryFunctionCall(alloc, tokens, &pos, &args);
+    if (function != .graph_traverse and
+        function != .graph_neighbors and
+        function != .graph_shortest_path and
+        function != .graph_k_shortest_paths and
+        function != .graph_match)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var lowered = try lowerParsedAntflyQueryFunctionAlloc(alloc, null, function, args.items);
+    defer lowered.deinit(alloc);
+    if (lowered.req.graph_queries.len != 1) return error.UnsupportedSqlShape;
+    if (lowered.req.full_text != null or lowered.req.dense != null or lowered.req.sparse != null) return error.UnsupportedSqlShape;
+
+    const graph_queries = lowered.req.graph_queries;
+    const graph_query = graph_queries[0];
+    lowered.req.graph_queries = &.{};
+    if (graph_queries.len > 0) alloc.free(@constCast(graph_queries));
+    return .{ .graph_query = graph_query };
+}
+
 fn lowerParsedAntflyQueryFunctionAlloc(
     alloc: std.mem.Allocator,
     semantic_resolver: ?query_contract.SemanticResolver,

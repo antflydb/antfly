@@ -16052,6 +16052,45 @@ test "sql adapter lower dml lowers temporal portion mutation sources" {
     ));
 }
 
+test "sql adapter lower dml lowers qualified generated mutation-source predicates" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"},"email_key":{"type":"keyword","generated":{"op":"lower","field":"email"}},"tenant_status_key":{"type":"keyword","generated":{"op":"concat","fields":["tenant_id","status"],"separator":":"}}},"required":["id","tenant_id","email","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const txn_id = [_]u8{ 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f };
+    const claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "worker-generated",
+        .txn_id = txn_id,
+    };
+
+    var lowered = try lowerUpdateMutationSourceForTestAlloc(
+        alloc,
+        "UPDATE users AS u SET status = 'processing' WHERE lower(u.email) = $1 ORDER BY concat(u.tenant_id, ':', u.status) DESC LIMIT 2 FOR UPDATE RETURNING u.id",
+        schema,
+        &.{.{ .string = "ada@example.test" }},
+        claim,
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("users", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.source.predicates.len);
+    try std.testing.expectEqualStrings("email_key", lowered.mutation.req.source.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, lowered.mutation.req.source.predicates[0].op);
+    try std.testing.expectEqualStrings("\"ada@example.test\"", lowered.mutation.req.source.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 0), lowered.mutation.req.source.expression_predicates.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.source.order_by.len);
+    try std.testing.expectEqualStrings("tenant_status_key", lowered.mutation.req.source.order_by[0].field);
+    try std.testing.expect(lowered.mutation.req.source.order_by[0].expression == null);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.mutation.req.source.order_by[0].direction);
+    try std.testing.expectEqual(@as(u32, 2), lowered.mutation.req.source.limit.?);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", lowered.mutation.req.returning[0]);
+}
+
 test "sql adapter lower dml lowers claimed update mutation source" {
     const alloc = std.testing.allocator;
     const schema_json =
