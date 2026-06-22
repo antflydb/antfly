@@ -32154,7 +32154,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     var desc_pos: usize = 0;
     const desc_tokens = [_]Token{
         .{ .kind = .identifier, .text = "desc", .source_start = 0, .source_end = 4, .keyword = .desc },
-        .{ .kind = .identifier, .text = "nulls", .source_start = 5, .source_end = 10 },
+        .{ .kind = .identifier, .text = "nulls", .source_start = 5, .source_end = 10, .keyword = .nulls },
         .{ .kind = .identifier, .text = "last", .source_start = 11, .source_end = 15 },
     };
     try std.testing.expectEqual(false, (try parseOrderModifiers(desc_tokens[0..], &desc_pos, &desc_order)).?);
@@ -32165,7 +32165,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     var asc_pos: usize = 0;
     const asc_tokens = [_]Token{
         .{ .kind = .identifier, .text = "asc", .source_start = 0, .source_end = 3, .keyword = .asc },
-        .{ .kind = .identifier, .text = "nulls", .source_start = 4, .source_end = 9 },
+        .{ .kind = .identifier, .text = "nulls", .source_start = 4, .source_end = 9, .keyword = .nulls },
         .{ .kind = .identifier, .text = "first", .source_start = 10, .source_end = 15, .keyword = .first },
     };
     try std.testing.expectEqual(true, (try parseOrderModifiers(asc_tokens[0..], &asc_pos, &asc_order)).?);
