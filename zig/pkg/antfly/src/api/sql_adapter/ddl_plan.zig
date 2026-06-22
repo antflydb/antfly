@@ -10318,6 +10318,129 @@ test "sql adapter ddl plan preserves named inline create table constraints" {
     }
 }
 
+test "sql adapter ddl plan lowers application-time temporal table constraints" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE account_prices (
+        \\  tenant_id text NOT NULL,
+        \\  sku text NOT NULL,
+        \\  valid_from timestamptz NOT NULL,
+        \\  valid_to timestamptz NOT NULL,
+        \\  PERIOD FOR valid_time (valid_from, valid_to),
+        \\  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS),
+        \\  CONSTRAINT account_prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS)
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    const create = switch (lowered) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), create.periods.len);
+    try std.testing.expectEqualStrings("valid_time", create.periods[0].name);
+    try std.testing.expectEqualStrings("valid_from", create.periods[0].start_column);
+    try std.testing.expectEqualStrings("valid_to", create.periods[0].end_column);
+    try std.testing.expect(create.primary_key != null);
+    try std.testing.expectEqual(@as(usize, 2), create.primary_key.?.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", create.primary_key.?.columns[0]);
+    try std.testing.expectEqualStrings("sku", create.primary_key.?.columns[1]);
+    try std.testing.expectEqualStrings("valid_time", create.primary_key.?.without_overlaps_period.?);
+    try std.testing.expectEqual(@as(usize, 1), create.unique_constraints.len);
+    try std.testing.expectEqualStrings("account_prices_sku_time_key", create.unique_constraints[0].name);
+    try std.testing.expectEqualStrings("valid_time", create.unique_constraints[0].without_overlaps_period.?);
+
+    const runtime = try runtimeSchemaFromCreateTablePlanAlloc(alloc, create);
+    defer runtime_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(@as(usize, 1), runtime.periods.len);
+    try std.testing.expectEqualStrings("valid_time", runtime.periods[0].name);
+    try std.testing.expectEqualStrings("valid_time", runtime.primary_key.?.without_overlaps_period.?);
+
+    var child = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE price_adjustments (
+        \\  tenant_id text NOT NULL,
+        \\  sku text NOT NULL,
+        \\  adjustment_id text NOT NULL,
+        \\  valid_from timestamptz NOT NULL,
+        \\  valid_to timestamptz NOT NULL,
+        \\  PERIOD FOR valid_time (valid_from, valid_to),
+        \\  PRIMARY KEY (tenant_id, sku, adjustment_id, valid_time WITHOUT OVERLAPS),
+        \\  CONSTRAINT price_adjustments_price_fkey
+        \\    FOREIGN KEY (tenant_id, sku, PERIOD valid_time)
+        \\    REFERENCES account_prices (tenant_id, sku, PERIOD valid_time)
+        \\    ON DELETE CASCADE
+        \\    ON UPDATE SET NULL
+        \\);
+        ,
+    );
+    defer child.deinit(alloc);
+    const child_create = switch (child) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 1), child_create.foreign_keys.len);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, child_create.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(runtime_schema.ForeignKeyAction.set_null, child_create.foreign_keys[0].on_update);
+    try std.testing.expectEqualStrings("valid_time", child_create.foreign_keys[0].child_period.?);
+    try std.testing.expectEqualStrings("valid_time", child_create.foreign_keys[0].parent_period.?);
+
+    var system_versioned = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE account_prices_history (
+        \\  tenant_id text NOT NULL,
+        \\  sku text NOT NULL,
+        \\  valid_from timestamptz NOT NULL,
+        \\  valid_to timestamptz NOT NULL,
+        \\  PERIOD FOR valid_time (valid_from, valid_to),
+        \\  PRIMARY KEY (tenant_id, sku, valid_time WITHOUT OVERLAPS)
+        \\) WITH SYSTEM VERSIONING;
+        ,
+    );
+    defer system_versioned.deinit(alloc);
+    const system_versioned_create = switch (system_versioned) {
+        .create_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(system_versioned_create.system_versioned);
+    const system_versioned_runtime = try runtimeSchemaFromCreateTablePlanAlloc(alloc, system_versioned_create);
+    defer runtime_schema.freeSchema(alloc, system_versioned_runtime);
+    try std.testing.expect(system_versioned_runtime.system_versioned);
+
+    var alter = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\ALTER TABLE account_prices
+        \\  ADD PERIOD FOR sell_time (valid_from, valid_to),
+        \\  ADD CONSTRAINT account_prices_sku_sell_time_key UNIQUE (sku, sell_time WITHOUT OVERLAPS);
+        ,
+    );
+    defer alter.deinit(alloc);
+    const alter_table = switch (alter) {
+        .alter_table => |plan| plan,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(usize, 2), alter_table.operations.len);
+    switch (alter_table.operations[0]) {
+        .add_period => |period| {
+            try std.testing.expectEqualStrings("sell_time", period.name);
+            try std.testing.expectEqualStrings("valid_from", period.start_column);
+            try std.testing.expectEqualStrings("valid_to", period.end_column);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    switch (alter_table.operations[1]) {
+        .add_unique_constraint => |constraint| {
+            try std.testing.expectEqualStrings("account_prices_sku_sell_time_key", constraint.name);
+            try std.testing.expectEqualStrings("sku", constraint.columns[0]);
+            try std.testing.expectEqualStrings("sell_time", constraint.without_overlaps_period.?);
+            try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "sql adapter ddl plan lowers computed check constraints into native expression checks" {
     const alloc = std.testing.allocator;
     var lowered = try lowerDdlPlanForTestAlloc(

@@ -10938,8 +10938,18 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
     alloc: std.mem.Allocator,
 ) !void {
     try sql_adapter.validateFixtureMetadataCore(entry);
-    if (entry.applied_plan.len > 0 and !(try appParityFixtureAppliedPlanMatchesDerived(alloc, base_schema_json, entry))) {
-        return error.TestUnexpectedResult;
+    var owned_applied_base_schema_json: ?[]u8 = null;
+    defer if (owned_applied_base_schema_json) |schema_json| alloc.free(schema_json);
+    const applied_base_schema_json = if (base_schema_json.len > 0)
+        base_schema_json
+    else if (entry.apply_setup_sql.len > 0) blk: {
+        owned_applied_base_schema_json = schemaJsonFromSetupSqlAlloc(alloc, entry.apply_setup_sql) catch return error.TestUnexpectedResult;
+        break :blk owned_applied_base_schema_json.?;
+    } else "";
+    if (entry.applied_plan.len > 0) {
+        if (!(try appParityFixtureAppliedPlanMatchesDerived(alloc, applied_base_schema_json, entry))) {
+            return error.TestUnexpectedResult;
+        }
     }
     if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
         return error.TestUnexpectedResult;
@@ -10984,7 +10994,7 @@ fn validateAppParityFixtureMetadata(
     return validateAppParityFixtureMetadataWithBaseSchema(entry, "", seen_names, alloc);
 }
 
-test "app parity fixture metadata requires typed summary anchors" {
+test "postgres sql adapter validates app parity fixture metadata with applied schema context" {
     const alloc = std.testing.allocator;
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
@@ -11034,6 +11044,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .create_index, .table_name = "usage_records", .select = 2 },
         .plan = "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=true:if_not_exists=false",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text);"},
         .applied_plan = "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
     }, &seen, alloc);
 
@@ -11588,7 +11599,7 @@ test "app parity fixture metadata requires typed summary anchors" {
         .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'active') ON CONFLICT (id) DO UPDATE SET status = excluded.status",
         .family = .insert,
         .summary = .{ .table_name = "usage_records", .operations = 1, .conflict_where = false },
-        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=0:returning_expr=0:op_set=1",
+        .plan = "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=0:returning_expr=0:op_set=1:conflict_where=1",
     }, &seen, alloc));
 
     try validateAppParityFixtureMetadata(.{
@@ -12428,7 +12439,8 @@ test "app parity fixture metadata requires typed summary anchors" {
         .family = .ddl,
         .summary = .{ .ddl_tag = .drop_table, .table_name = "usage_records" },
         .plan = "ddl:drop_table:table=usage_records:if_exists=false:cascade=false",
-        .applied_plan = "applied:drop_table:rebuild=true:validation=true:rewrite=true:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
+        .apply_setup_sql = &.{"CREATE TABLE usage_records (id text PRIMARY KEY, status text)"},
+        .applied_plan = "applied:drop_table:rebuild=false:validation=false:rewrite=false:work_items=0:work=none",
     }, &seen, alloc);
 
     try validateAppParityFixtureMetadata(.{

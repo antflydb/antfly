@@ -5090,6 +5090,16 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(!corpusFixtureFamilyNeedsTableSummary(.ddl));
     try std.testing.expect(corpusFixtureFamilyAllowsSummary(.join));
     try std.testing.expect(!corpusFixtureFamilyAllowsSummary(.unsupported_read));
+    try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(.{ .name = "insert conflict", .family = .insert, .plan = "insert:table=usage_records:conflict_where=1", .sql = "INSERT INTO usage_records VALUES ('1') ON CONFLICT (id) WHERE status = 'active' DO NOTHING" }));
+    try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(.{ .name = "insert source conflict", .family = .insert_source, .plan = "insert_source:table=usage_records:conflict_where=1", .sql = "INSERT INTO usage_records SELECT * FROM usage_sources ON CONFLICT (id) WHERE status = 'active' DO NOTHING" }));
+    try std.testing.expect(!corpusFixtureAllowsConflictWhereSummary(.{ .name = "delete source conflict", .family = .delete_source, .plan = "delete_source:table=usage_records:source_pred=1", .sql = "DELETE FROM usage_records WHERE status = 'closed'" }));
+    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(.{
+        .name = "delete source conflict summary",
+        .family = .delete_source,
+        .summary = .{ .table_name = "usage_records", .conflict_where = true },
+        .plan = "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
+        .sql = "DELETE FROM usage_records WHERE status = 'closed'",
+    }));
 
     try std.testing.expect(corpusReadPlanHasPrefix(.{ .name = "read query", .family = .read, .plan = "read:query:table=usage_records", .sql = "SELECT * FROM usage_records" }, "read:query:"));
     try std.testing.expect(corpusReadPlanHasPrefix(.{ .name = "explain read", .family = .explain, .plan = "explain:kind=read:inner=read:query:table=usage_records", .sql = "EXPLAIN SELECT * FROM usage_records" }, "read:query:"));
