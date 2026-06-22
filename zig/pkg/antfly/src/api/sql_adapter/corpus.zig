@@ -8527,15 +8527,20 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_sequence_create = true;
                     self.ddl_sequence_create_if_not_exists = self.ddl_sequence_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
                     self.ddl_sequence_create_typed_owned = self.ddl_sequence_create_typed_owned or
-                        (std.mem.indexOf(u8, entry.sql, " AS bigint ") != null and
-                            std.mem.indexOf(u8, entry.sql, " OWNED BY ") != null);
+                        (appParityTokensHaveKeyword(sql_tokens, .as) and
+                            appParityTokensHaveIdentifier(sql_tokens, "bigint") and
+                            appParityTokensHaveIdentifier(sql_tokens, "owned") and
+                            appParityTokensHaveKeyword(sql_tokens, .by));
                 },
                 .alter_sequence => {
                     self.ddl_sequence_alter = true;
                     self.ddl_sequence_alter_if_exists = self.ddl_sequence_alter_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
                     self.ddl_sequence_alter_typed_owned = self.ddl_sequence_alter_typed_owned or
-                        (std.mem.indexOf(u8, entry.sql, " AS integer ") != null and
-                            std.mem.indexOf(u8, entry.sql, " OWNED BY NONE") != null);
+                        (appParityTokensHaveKeyword(sql_tokens, .as) and
+                            appParityTokensHaveIdentifier(sql_tokens, "integer") and
+                            appParityTokensHaveIdentifier(sql_tokens, "owned") and
+                            appParityTokensHaveKeyword(sql_tokens, .by) and
+                            appParityTokensHaveIdentifier(sql_tokens, "none"));
                 },
                 .drop_sequence => {
                     self.ddl_sequence_drop = true;

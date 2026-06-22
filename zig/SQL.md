@@ -554,6 +554,9 @@ Current implementation status:
 - Aggregate and window duplicate-label coverage now uses parsed function calls,
   keyword tags, identifiers, and plan aggregate/window evidence instead of raw
   SQL substring probes.
+- Sequence typed/owned coverage now uses parsed keyword and identifier tokens
+  for `AS`, `bigint`/`integer`, `OWNED BY`, and `NONE` instead of raw SQL
+  substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
