@@ -6569,6 +6569,64 @@ fn appParityTokensStartWithKeyword(tokens: []const tokenized.Token, keyword: tok
     return tokens.len > 0 and tokens[0].matchesKeywordTag(keyword);
 }
 
+fn appParityTokensHaveConflictConstraint(tokens: []const tokenized.Token, name: []const u8) bool {
+    if (tokens.len < 5) return false;
+    var index: usize = 0;
+    while (index + 4 < tokens.len) : (index += 1) {
+        if (tokens[index].matchesKeywordTag(.on) and
+            tokens[index + 1].matchesKeywordTag(.conflict) and
+            tokens[index + 2].matchesKeywordTag(.on) and
+            tokens[index + 3].matchesKeywordTag(.constraint) and
+            tokens[index + 4].kind == .identifier and
+            std.ascii.eqlIgnoreCase(tokens[index + 4].text, name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+const AppParityConflictTargetRange = struct {
+    start: usize,
+    end: usize,
+    after: usize,
+};
+
+fn appParityConflictTargetRange(tokens: []const tokenized.Token) ?AppParityConflictTargetRange {
+    if (tokens.len < 4) return null;
+    var index: usize = 0;
+    while (index + 3 < tokens.len) : (index += 1) {
+        if (!tokens[index].matchesKeywordTag(.on) or
+            !tokens[index + 1].matchesKeywordTag(.conflict) or
+            tokens[index + 2].kind != .lparen)
+        {
+            continue;
+        }
+        const close_index = parser.findMatchingRParenIndex(tokens, index + 2) orelse return null;
+        return .{
+            .start = index + 3,
+            .end = close_index,
+            .after = close_index + 1,
+        };
+    }
+    return null;
+}
+
+fn appParityConflictTargetHasIdentifier(tokens: []const tokenized.Token, identifier: []const u8) bool {
+    const target = appParityConflictTargetRange(tokens) orelse return false;
+    return appParityTokensHaveIdentifier(tokens[target.start..target.end], identifier);
+}
+
+fn appParityConflictTargetHasFunctionCall(tokens: []const tokenized.Token, name: []const u8) bool {
+    const target = appParityConflictTargetRange(tokens) orelse return false;
+    return appParityTokensHaveFunctionCall(tokens[target.start..target.end], name);
+}
+
+fn appParityConflictTargetHasWhere(tokens: []const tokenized.Token) bool {
+    const target = appParityConflictTargetRange(tokens) orelse return false;
+    return target.after < tokens.len and tokens[target.after].matchesKeywordTag(.where);
+}
+
 fn appParityTokensHaveFunctionCall(tokens: []const tokenized.Token, name: []const u8) bool {
     if (tokens.len < 2) return false;
     var index: usize = 0;
@@ -9460,23 +9518,26 @@ pub const AppParityCorpusCoverage = struct {
                     appParityTokensHaveKeyword(sql_tokens, .@"or") and
                     appParityTokensHaveKeyword(sql_tokens, .false);
             self.schema_default_primary_named_conflict_target = self.schema_default_primary_named_conflict_target or
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT usage_records_pkey") != null;
+                appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_pkey");
             self.schema_custom_primary_named_conflict_target = self.schema_custom_primary_named_conflict_target or
                 (appParityAnyStringContains(entry.apply_setup_sql, "RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk") and
-                    std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT usage_records_id_pk") != null);
+                    appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_id_pk"));
             self.schema_unique_conflict_target = self.schema_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "email text UNIQUE") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email)") != null);
+                appParityConflictTargetHasIdentifier(sql_tokens, "email"));
             self.schema_additive_unique_conflict_target = self.schema_additive_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "ADD CONSTRAINT usage_records_email_key UNIQUE") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email)") != null);
+                appParityConflictTargetHasIdentifier(sql_tokens, "email"));
             self.schema_partial_unique_conflict_target = self.schema_partial_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
                 appParityAnyStringContains(entry.apply_setup_sql, " WHERE ") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email) WHERE") != null);
+                appParityConflictTargetHasIdentifier(sql_tokens, "email") and
+                appParityConflictTargetHasWhere(sql_tokens));
             self.schema_expression_unique_conflict_target = self.schema_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
                 (appParityAnyStringContains(entry.apply_setup_sql, "lower(") or appParityAnyStringContains(entry.apply_setup_sql, "upper(")) and
-                (std.mem.indexOf(u8, entry.sql, "ON CONFLICT (lower(") != null or std.mem.indexOf(u8, entry.sql, "ON CONFLICT (upper(") != null));
+                (appParityConflictTargetHasFunctionCall(sql_tokens, "lower") or
+                    appParityConflictTargetHasFunctionCall(sql_tokens, "upper")));
             self.schema_mixed_expression_unique_conflict_target = self.schema_mixed_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
                 appParityAnyStringContains(entry.apply_setup_sql, "tenant_id, lower(") and
-                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (tenant_id, lower(") != null);
+                appParityConflictTargetHasIdentifier(sql_tokens, "tenant_id") and
+                appParityConflictTargetHasFunctionCall(sql_tokens, "lower"));
         }
         if (entry.family == .insert and !uses_insert_conflict) {
             self.multi_row_insert = self.multi_row_insert or uses_multi_row_insert;

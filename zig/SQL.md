@@ -459,6 +459,9 @@ Current implementation status:
   merge default-expression coverage, and recursive insert-source coverage also
   use parsed token predicates plus plan summary evidence instead of raw SQL
   substring checks.
+- Insert conflict-target coverage now extracts `ON CONFLICT` target ranges from
+  parsed tokens for named constraints, column targets, partial targets, and
+  expression targets instead of scanning SQL text.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
