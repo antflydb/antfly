@@ -3934,6 +3934,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower expr lowers arithmetic predicates",
             "sql adapter lower expr lowers coalesce predicates",
             "sql adapter lower expr lowers array length predicates",
+            "sql adapter lower expr lowers case-fold expression predicates",
             "sql adapter lower expr reconciles set operation output shape",
             "sql adapter lower expr assembles boolean predicate groups",
             "sql adapter lower expr names every row expression kind",
