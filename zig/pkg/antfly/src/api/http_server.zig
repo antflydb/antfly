@@ -4468,6 +4468,27 @@ pub const ApiHttpServer = struct {
         return try out.toOwnedSlice();
     }
 
+    fn encodePublicSqlRowsMutationSourceResultAlloc(
+        self: *ApiHttpServer,
+        session_id: u64,
+        statement_kind: []const u8,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
+    ) ![]u8 {
+        const result_body = try relational_rows_api.encodeRowsMutationSourceResponseAlloc(self.alloc, result);
+        defer self.alloc.free(result_body);
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.print(
+            "{{\"kind\":\"write\",\"session_id\":{d},\"statement_kind\":{f},\"result\":",
+            .{ session_id, std.json.fmt(statement_kind, .{}) },
+        );
+        try writer.writeAll(result_body);
+        try writer.writeByte('}');
+        return try out.toOwnedSlice();
+    }
+
     fn sqlObjectIdentifierTailAlloc(alloc: std.mem.Allocator, identifier: []const u8) ![]const u8 {
         if (identifier.len == 0) return error.UnsupportedSqlShape;
         if (std.mem.lastIndexOfScalar(u8, identifier, '.')) |dot| {
@@ -4583,6 +4604,95 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    fn applyLoweredPublicSqlInsertSource(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: sql_adapter.LoweredInsertSource,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
+    } {
+        const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+
+        const source_table_name = rowsPlanEffectiveSideTable(target_table_name, lowered.insert_source.req.source_table);
+        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+            error.PermissionDenied => return .{ .failure = try textResponse(self.alloc, 403, "forbidden") },
+        };
+
+        const source_schema = self.runtimeSchemaForPublicRows(source_table_name) catch |err| switch (err) {
+            error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.InvalidRowsRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, source_schema);
+
+        var filter = self.rowsAuthFilterPlanForIdentity(source_table_name, authenticated_identity, source_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (filter) |*value| value.deinit(self.alloc);
+        if (filter) |active| {
+            for (@constCast(lowered.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(source_schema, active, &cte.query);
+            if (lowered.insert_source.req.source.source_cte.len == 0) try self.applyRowsAuthFilterToQuery(source_schema, active, &lowered.insert_source.req.source);
+        }
+
+        var source_result = (read_source.rowsQueryPlan(
+            self.alloc,
+            source_table_name,
+            source_schema,
+            .{
+                .ctes = lowered.ctes,
+                .query = lowered.insert_source.req.source,
+            },
+            .read_index,
+        ) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+            error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            else => {
+                std.log.err("public sql insert source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        defer source_result.deinit(self.alloc);
+
+        const planned_ctes = relational_rows_api.planRowsCteOutputsAlloc(self.alloc, source_schema, lowered.ctes) catch |err| switch (err) {
+            error.InvalidRowsRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            else => return err,
+        };
+        defer relational_rows_api.freeRowsPlannedCtes(self.alloc, planned_ctes);
+        const effective_source_schema = relational_rows_api.rowsPlannedQuerySourceSchema(source_schema, planned_ctes, lowered.insert_source.req.source) orelse return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") };
+
+        var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        var rows_batch = relational_rows_api.buildRowsInsertSourceBatchWithSchemasAlloc(
+            self.alloc,
+            target_table_name,
+            target_schema,
+            effective_source_schema,
+            lowered.insert_source.req,
+            source_result.rows,
+            unique_resolver_ctx.resolver(),
+        ) catch |err| switch (err) {
+            error.UnsupportedRowsSelector => return .{ .failure = try textResponse(self.alloc, 400, "unsupported rows selector") },
+            error.RowSelectorNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "unique owner unavailable") },
+            error.InvalidRowsRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            else => {
+                std.log.err("public sql insert source plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        };
+        defer rows_batch.deinit(self.alloc);
+        rows_batch.req.sync_level = lowered.sync_level;
+
+        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, rows_batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        return .{ .result = try rowsInsertSourceMutationResultAlloc(self.alloc, source_result.rows.len, rows_batch) };
+    }
+
     fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -4595,7 +4705,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
         switch (statement_kind) {
-            .insert, .update, .delete => {},
+            .insert, .insert_source, .update, .delete => {},
             else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
         }
 
@@ -4634,6 +4744,23 @@ pub const ApiHttpServer = struct {
         };
         defer lowered.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+        if (lowered == .insert_source) {
+            var insert_source_result = switch (try self.applyLoweredPublicSqlInsertSource(target_table, schema, lowered.insert_source, authenticated_identity)) {
+                .failure => |failure| return failure,
+                .result => |result| result,
+            };
+            defer insert_source_result.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsMutationSourceResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                insert_source_result,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
 
         const rows_batch = switch (lowered) {
             .insert => |insert| insert.batch,
@@ -23718,6 +23845,26 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("closed", update_row.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 15), update_row.get("amount").?.integer);
 
+    var insert_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) SELECT concat(id, '-copy') AS id, lower(status) AS status, amount + 1 AS amount FROM usage_records WHERE id = 'u1' RETURNING id, status, amount;\"}",
+    });
+    defer insert_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), insert_source_resp.status);
+    var parsed_insert_source = try std.json.parseFromSlice(std.json.Value, alloc, insert_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_insert_source.deinit();
+    try std.testing.expectEqualStrings("write", parsed_insert_source.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("insert_source", parsed_insert_source.value.object.get("statement_kind").?.string);
+    const insert_source_result = parsed_insert_source.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), insert_source_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), insert_source_result.get("staged").?.integer);
+    const insert_source_row = insert_source_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1-copy", insert_source_row.get("id").?.string);
+    try std.testing.expectEqualStrings("closed", insert_source_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 16), insert_source_row.get("amount").?.integer);
+
     var delete_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -23747,6 +23894,23 @@ test "api http server executes SQL point writes through typed row batch ingress"
     var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
     defer parsed_query.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_query.value.object.get("result").?.object.get("total").?.integer);
+
+    var copied_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records WHERE id = 'u1-copy';\"}",
+    });
+    defer copied_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), copied_query_resp.status);
+    var parsed_copied_query = try std.json.parseFromSlice(std.json.Value, alloc, copied_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_copied_query.deinit();
+    const copied_result = parsed_copied_query.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), copied_result.get("total").?.integer);
+    const copied_row = copied_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1-copy", copied_row.get("id").?.string);
+    try std.testing.expectEqualStrings("closed", copied_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 16), copied_row.get("amount").?.integer);
 }
 
 test "api http server executes SQL notification channel plans through native runtime" {

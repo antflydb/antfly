@@ -148,9 +148,14 @@ Point write statements are also routed through that ingress when they lower to a
 single typed row-batch mutation: `INSERT ... VALUES`, primary-key `UPDATE`, and
 primary-key `DELETE` use the same row-batch validation, row-filter checks,
 transaction commit path, and `RETURNING` projection encoder as the public JSON
-rows APIs. Source, joined, recursive, merge, and truncate writes remain
-fail-closed until their SQL executor wiring can share the native row-claim,
-session staging, side-table read, mutation-source, trigger, and 2PC paths.
+rows APIs. Non-recursive `INSERT ... SELECT` executes through the typed
+insert-source path by reading the source side through the row-plan executor,
+building a typed row batch from insert assignments and conflict policy, applying
+target row filters, and returning the mutation-source `matched`/`staged` counts
+plus `RETURNING` rows. Claimed update/delete sources, joined sources, recursive
+write sources, merge, and truncate writes remain fail-closed until their SQL
+executor wiring can share the native row-claim, session staging, side-table
+read, mutation-source, trigger, and 2PC paths.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable

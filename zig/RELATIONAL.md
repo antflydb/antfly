@@ -5002,7 +5002,12 @@ response. Point `INSERT ... VALUES`, primary-key `UPDATE`, and primary-key
 `DELETE` now join that endpoint by lowering through the same DML adapter into
 typed row-batch mutations, applying row-filter checks, committing through the
 same row-batch transaction path, and returning the normal row-batch counts plus
-`RETURNING` rows under a SQL session response. Source, joined, recursive, merge,
+`RETURNING` rows under a SQL session response. Non-recursive
+`INSERT ... SELECT` joins the endpoint through the typed insert-source path: the
+source side executes as a typed row-read plan with CTE and row-filter handling,
+then the insert assignments, conflict policy, target row filters, transaction
+commit, and `RETURNING` projection use the same row-batch mutation machinery.
+Claimed update/delete sources, joined sources, recursive write sources, merge,
 and truncate writes should remain fail-closed until their SQL executor wiring
 can use the typed row-claim/session staging, side-table read, mutation-source,
 trigger, and 2PC paths already used by the public JSON endpoints. Prepared

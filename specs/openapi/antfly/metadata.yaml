@@ -1469,7 +1469,8 @@ components:
         statements route through the typed DDL/session execution path. Read
         statements lower through the same typed row-plan executor used by the
         JSON relational rows APIs. Point write statements lower through the
-        typed row-batch mutation path.
+        typed row-batch mutation path, and insert-from-source statements lower
+        through the typed row-read plus row-batch mutation path.
       properties:
         kind:
           type: string
@@ -1495,7 +1496,7 @@ components:
           type: object
           additionalProperties: true
           nullable: true
-          description: Typed relational row-plan or row-batch response for data statements.
+          description: Typed relational row-plan, row-batch, or mutation-source response for data statements.
       required:
         - kind
         - session_id
