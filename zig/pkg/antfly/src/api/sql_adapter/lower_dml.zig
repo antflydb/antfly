@@ -13748,7 +13748,7 @@ test "sql adapter lower dml lowers cross-column excluded conflict values" {
     ));
 }
 
-test "sql adapter lower dml lowers on conflict primary do nothing" {
+test "sql adapter lower dml lowers on conflict primary do nothing and update" {
     const alloc = std.testing.allocator;
     const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"usage_records_id_pk\",\"columns\":[\"id\"]}}";
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
@@ -13793,6 +13793,20 @@ test "sql adapter lower dml lowers on conflict primary do nothing" {
     try std.testing.expectEqual(@as(u32, 0), custom_named_primary.batch.inserted);
     try std.testing.expectEqual(@as(usize, 0), custom_named_primary.batch.writes.len);
     try std.testing.expectEqual(@as(usize, 0), custom_named_primary.batch.returning_rows.len);
+
+    var custom_named_primary_update = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT ON CONSTRAINT usage_records_id_pk DO UPDATE SET status = excluded.status RETURNING id, status",
+        schema,
+        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
+        resolver_ctx.resolver(),
+    );
+    defer custom_named_primary_update.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 0), custom_named_primary_update.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 0), custom_named_primary_update.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), custom_named_primary_update.batch.transforms.len);
+    try std.testing.expectEqual(@as(usize, 1), custom_named_primary_update.batch.returning_rows.len);
 
     try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertWithResolverForTestAlloc(
         alloc,

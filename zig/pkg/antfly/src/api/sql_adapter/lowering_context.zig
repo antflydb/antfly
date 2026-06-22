@@ -627,7 +627,13 @@ pub const RelationPopulationLoweringContext = struct {
     callbacks: RelationPopulationLoweringCallbacks,
 
     pub fn lower(self: *@This(), sql: []const u8) !plan.LoweredRelationPopulationPlan {
-        return try plan.lowerRelationPopulationPlanWithHooksAlloc(self.alloc, sql, self.hooks());
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        return try self.lowerParsed(&parsed_sql);
+    }
+
+    pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredRelationPopulationPlan {
+        return try plan.lowerRelationPopulationPlanWithParsedSqlAlloc(self.alloc, parsed_sql, self.hooks());
     }
 
     fn hooks(self: *@This()) plan.RelationPopulationLoweringHooks {

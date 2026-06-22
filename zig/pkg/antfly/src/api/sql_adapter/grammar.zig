@@ -7697,12 +7697,20 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
 pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
     var tokens = try lexer.tokenizeAlloc(alloc, sql);
     defer lexer.freeTokens(alloc, &tokens);
-    if (tokens.items.len == 0 or tokens.items[0].kind != .identifier) return error.UnsupportedSqlShape;
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "select")) {
-        return try parseSelectIntoPopulationSqlAlloc(alloc, sql, tokens.items);
+    return try parseRelationPopulationTokensAlloc(alloc, sql, tokens.items);
+}
+
+pub fn parseRelationPopulationTokensAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    tokens: []const Token,
+) !RelationPopulationSyntax {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(tokens[0].text, "select")) {
+        return try parseSelectIntoPopulationSqlAlloc(alloc, sql, tokens);
     }
-    if (std.ascii.eqlIgnoreCase(tokens.items[0].text, "create")) {
-        return try parseCreateTableAsPopulationSqlAlloc(alloc, sql, tokens.items);
+    if (std.ascii.eqlIgnoreCase(tokens[0].text, "create")) {
+        return try parseCreateTableAsPopulationSqlAlloc(alloc, sql, tokens);
     }
     return error.UnsupportedSqlShape;
 }
@@ -7836,12 +7844,12 @@ fn parseCreateTableAsPopulationSqlAlloc(
 }
 
 fn tokenStartOffset(sql: []const u8, token: Token) !usize {
-    if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
     const sql_start = @intFromPtr(sql.ptr);
     const sql_end = sql_start + sql.len;
     const token_start = @intFromPtr(token.text.ptr);
-    if (token_start < sql_start or token_start > sql_end) return error.UnsupportedSqlShape;
-    return token_start - sql_start;
+    if (token_start >= sql_start and token_start <= sql_end) return token_start - sql_start;
+    if (token.source_end > token.source_start and token.source_end <= sql.len) return token.source_start;
+    return error.UnsupportedSqlShape;
 }
 
 fn adapterNoopSetSessionSettingAllowed(setting: []const u8) bool {
@@ -11755,6 +11763,20 @@ test "sql adapter grammar parses relation population syntax" {
     try std.testing.expect(create_as.if_not_exists);
     try std.testing.expect(create_as.populate);
     try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", create_as.source_sql);
+
+    const padded_create_as_sql = "  CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;  ";
+    var padded_tokens = try lexer.tokenizeAlloc(alloc, padded_create_as_sql);
+    defer lexer.freeTokens(alloc, &padded_tokens);
+    var parsed_from_tokens = try parseRelationPopulationTokensAlloc(
+        alloc,
+        std.mem.trim(u8, padded_create_as_sql, " \t\r\n;"),
+        padded_tokens.items,
+    );
+    defer parsed_from_tokens.deinit(alloc);
+    try std.testing.expectEqual(RelationPopulationMode.create_table_as, parsed_from_tokens.mode);
+    try std.testing.expectEqualStrings("usage_archive", parsed_from_tokens.target_identifier);
+    try std.testing.expect(parsed_from_tokens.populate);
+    try std.testing.expectEqualStrings("SELECT account_id FROM usage_records", parsed_from_tokens.source_sql);
 
     var create_as_no_data = try parseRelationPopulationSqlAlloc(
         alloc,

@@ -2207,6 +2207,22 @@ pub fn lowerRelationPopulationPlanWithHooksAlloc(
     return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
 }
 
+pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    hooks: RelationPopulationLoweringHooks,
+) !LoweredRelationPopulationPlan {
+    var parsed = try grammar.parseRelationPopulationTokensAlloc(
+        alloc,
+        parsed_sql.statementSql(),
+        parsed_sql.items()[parsed_sql.raw_statement.token_start..parsed_sql.raw_statement.token_end],
+    );
+    defer parsed.deinit(alloc);
+    var source = try hooks.lower_read(hooks.ptr, parsed.source_sql);
+    errdefer source.deinit(alloc);
+    return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
+}
+
 pub const ExplainFormat = ast.SqlExplainFormat;
 
 pub const LoweredExplainPlan = struct {

@@ -15738,55 +15738,6 @@ test "postgres sql adapter insert source temporal unique conflict executes throu
     try std.testing.expectEqualStrings("{\"id\":\"existing\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":13}", rows.rows[0]);
 }
 
-test "postgres sql adapter write plan honors renamed primary conflict constraints" {
-    const alloc = std.testing.allocator;
-    const setup_schema_json = try schemaJsonFromSetupSqlAlloc(alloc, &.{
-        "CREATE TABLE usage_records (id uuid PRIMARY KEY, status text);",
-        "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_pkey TO usage_records_id_pk;",
-    });
-    defer alloc.free(setup_schema_json);
-    var parsed_setup = try schema_api.parseValidatedTableSchema(alloc, setup_schema_json);
-    defer parsed_setup.deinit(alloc);
-    const setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_setup);
-    defer runtime_schema.freeSchema(alloc, setup_schema);
-    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"existing\"}", .version = 12 };
-
-    var custom_named_write_plan = try lowerWritePlanAlloc(
-        alloc,
-        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT ON CONSTRAINT usage_records_id_pk DO NOTHING RETURNING *",
-        setup_schema,
-        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
-        .{ .unique_resolver = resolver_ctx.resolver() },
-    );
-    defer custom_named_write_plan.deinit(alloc);
-    switch (custom_named_write_plan) {
-        .insert => |insert| {
-            try std.testing.expectEqual(@as(u32, 0), insert.batch.inserted);
-            try std.testing.expectEqual(@as(usize, 0), insert.batch.writes.len);
-            try std.testing.expectEqual(@as(usize, 0), insert.batch.returning_rows.len);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-
-    var custom_named_update_plan = try lowerWritePlanAlloc(
-        alloc,
-        "INSERT INTO usage_records (id, status) VALUES ($1, $2) ON CONFLICT ON CONSTRAINT usage_records_id_pk DO UPDATE SET status = excluded.status RETURNING id, status",
-        setup_schema,
-        &.{ .{ .string = "u1" }, .{ .string = "pending" } },
-        .{ .unique_resolver = resolver_ctx.resolver() },
-    );
-    defer custom_named_update_plan.deinit(alloc);
-    switch (custom_named_update_plan) {
-        .insert => |insert| {
-            try std.testing.expectEqual(@as(u32, 0), insert.batch.inserted);
-            try std.testing.expectEqual(@as(usize, 0), insert.batch.writes.len);
-            try std.testing.expectEqual(@as(usize, 1), insert.batch.transforms.len);
-            try std.testing.expectEqual(@as(usize, 1), insert.batch.returning_rows.len);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
 test "postgres sql adapter lowers recursive cte stream contract" {
     const alloc = std.testing.allocator;
     const schema_json =
