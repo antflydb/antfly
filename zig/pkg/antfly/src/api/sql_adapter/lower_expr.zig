@@ -6549,7 +6549,7 @@ fn parenthesizedExpressionOrWhereCanStartAt(tokens: []const Token, pos: usize) b
                 depth -= 1;
                 if (depth == 0) return false;
             },
-            .identifier => if (depth == 1 and std.ascii.eqlIgnoreCase(token.text, "or")) return true,
+            .identifier => if (depth == 1 and token.matchesKeywordTag(.@"or")) return true,
             .semicolon => return false,
             else => {},
         }
@@ -9230,7 +9230,7 @@ pub fn aggregateJsonPathEqFilterCanStartAt(tokens: []const Token, pos: usize) bo
 }
 
 pub fn canParseAggregateFilterNot(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "not") and pos + 1 < tokens.len and tokens[pos + 1].kind == .lparen;
+    return parser.peekKeywordTag(tokens, pos, .not) and pos + 1 < tokens.len and tokens[pos + 1].kind == .lparen;
 }
 
 pub fn canParseBareBooleanAggregateHavingExpression(
@@ -10222,19 +10222,17 @@ pub fn aggregateHavingHasBooleanIsNot(tokens: []const Token, pos: usize) bool {
                 depth -= 1;
             },
             .identifier => {
-                if (depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "order") or
-                    std.ascii.eqlIgnoreCase(token.text, "limit") or
-                    std.ascii.eqlIgnoreCase(token.text, "offset") or
-                    std.ascii.eqlIgnoreCase(token.text, "fetch")))
+                if (depth == 0 and (token.matchesKeywordTag(.order) or
+                    token.matchesKeywordTag(.limit) or
+                    token.matchesKeywordTag(.offset) or
+                    token.matchesKeywordTag(.fetch)))
                 {
                     return false;
                 }
-                if (std.ascii.eqlIgnoreCase(token.text, "is") and
-                    tokens[i + 1].kind == .identifier and
-                    std.ascii.eqlIgnoreCase(tokens[i + 1].text, "not") and
-                    tokens[i + 2].kind == .identifier and
-                    (std.ascii.eqlIgnoreCase(tokens[i + 2].text, "true") or
-                        std.ascii.eqlIgnoreCase(tokens[i + 2].text, "false")))
+                if (token.matchesKeywordTag(.is) and
+                    tokens[i + 1].matchesKeywordTag(.not) and
+                    (tokens[i + 2].matchesKeywordTag(.true) or
+                        tokens[i + 2].matchesKeywordTag(.false)))
                 {
                     return true;
                 }
@@ -10246,7 +10244,7 @@ pub fn aggregateHavingHasBooleanIsNot(tokens: []const Token, pos: usize) bool {
 }
 
 pub fn canParseAggregateHavingNot(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "not") and pos + 1 < tokens.len and tokens[pos + 1].kind == .lparen;
+    return parser.peekKeywordTag(tokens, pos, .not) and pos + 1 < tokens.len and tokens[pos + 1].kind == .lparen;
 }
 
 pub fn matchBooleanGroupOpen(tokens: []const Token, pos: *usize) bool {

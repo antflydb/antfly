@@ -408,7 +408,8 @@ Current implementation status:
   JSON and expression null-safe distinct, null-test, membership, and expression
   negation helpers use keyword tags for SQL operator words. WHERE disjunction,
   access-predicate, text-pattern, and access-negation probes use token keyword
-  tags for `AND`/`OR`/`NOT`/`LIKE`/`ILIKE` and array markers.
+  tags for `AND`/`OR`/`NOT`/`LIKE`/`ILIKE` and array markers. Aggregate
+  boolean `IS NOT` and `NOT (...)` helper scans also use keyword tags.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
