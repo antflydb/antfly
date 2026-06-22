@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "edbe137528fe19626f3944aaf628560104195aa240f0dbb014327c5f9bdc2838",
+  "source_sha256": "3d298ab22e90275b34ac7fd6c0094fcb4cbee6cbd4e4c4117c6e2e62015df128",
   "source_entry_count": 1025,
   "entry_count": 1025,
   "skipped_entries": [
@@ -9517,7 +9517,7 @@
         "join_select": 2,
         "lateral_correlations": 1
       },
-      "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5:match_expr_or=2",
+      "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:right_order=1:right_order_expr=0:right_limit=1:corr=1:select=2:order=1:order_expr=0:limit=5:match_expr_or=2:match_expr_or_lower=1",
       "sql": "SELECT org.id AS organization_id, latest.amount AS latest_amount FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount, created_at FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' AND (bal.amount + org.amount > 10 OR lower(bal.kind) = lower(org.kind)) ORDER BY 2 DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY 1 ASC LIMIT 5"
     },
     {
@@ -9739,7 +9739,7 @@
         "offset": 6,
         "windows": 16
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=16:window_expr=9:window_default=1:window_frame_sig=4618562537789841559:select=2:order=2:limit=5:offset=6",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=16:window_expr=9:window_default=1:window_frame_sig=4618562537789841559:select=2:order=2:limit=5:window_scalar_minmax=2:offset=6",
       "sql": "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS row_num, rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS rank, dense_rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS dense_rank, percent_rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS percent_rank, cume_dist() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS cume_dist, ntile(4) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS amount_bucket, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS next_status, first_value(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS first_amount, last_value(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS last_amount, count(*) OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS partition_count, count(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC RANGE BETWEEN CURRENT ROW AND 25 FOLLOWING) AS range_amount_count, sum(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_sum, avg(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_avg, min(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_min, max(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_max FROM usage_records WHERE status = 'open' ORDER BY 3 ASC NULLS LAST LIMIT 5 OFFSET 6"
     },
     {
@@ -9871,7 +9871,7 @@
         "limit": 5,
         "windows": 2
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=1:limit=5",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=1:limit=5:window_expr_mod=2",
       "sql": "SELECT tenant_id, id, sum(amount % quantity) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_remainder, avg(MOD(amount + quantity, quantity)) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS average_shifted_remainder FROM usage_records WHERE status = 'open' ORDER BY running_remainder DESC LIMIT 5"
     },
     {
@@ -9883,7 +9883,7 @@
         "select": 2,
         "windows": 2
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=0:limit=-1",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=0:limit=-1:window_scalar_minmax=2",
       "sql": "SELECT tenant_id, id, min(status) OVER (PARTITION BY tenant_id) AS first_status, max(lower(status)) OVER (PARTITION BY tenant_id) AS last_status_key FROM usage_records"
     },
     {
@@ -9946,7 +9946,7 @@
         "limit": 5,
         "windows": 2
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=1:limit=5:window_filter=1:window_filter_expr=1",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=2:window_default=0:window_frame_sig=0:select=2:order=1:limit=5:window_filter=1:window_filter_expr=1:window_bool_agg=2",
       "sql": "SELECT tenant_id, id, bool_or(enabled) FILTER (WHERE status = 'open') OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS any_enabled, bool_and(starts_with(status, 'op')) FILTER (WHERE lower(status) LIKE 'op!_%' ESCAPE '!') OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS all_openish FROM usage_records WHERE status = 'open' ORDER BY any_enabled DESC LIMIT 5"
     },
     {

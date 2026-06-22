@@ -1072,6 +1072,28 @@ pub fn lowerExplainPlanWithOptionsCatalogAndFunctionBindingsAlloc(
     catalog: ?table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredExplainPlan {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        schema,
+        params,
+        options,
+        catalog,
+        function_bindings,
+    );
+}
+
+fn lowerExplainPlanWithOptionsCatalogAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    options: LowerWritePlanOptions,
+    catalog: ?table_catalog.CatalogSource,
+    function_bindings: SqlFunctionBindings,
+) !LoweredExplainPlan {
     var context = sql_adapter.ExplainPlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -1086,7 +1108,7 @@ pub fn lowerExplainPlanWithOptionsCatalogAndFunctionBindingsAlloc(
             .lower_write_without_catalog = lowerWritePlanParsedSqlAlloc,
         },
     };
-    return try context.lower(sql);
+    return try context.lowerParsed(parsed_sql);
 }
 
 pub fn lowerRelationPopulationPlanAlloc(
@@ -1116,6 +1138,26 @@ pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(
     catalog: ?table_catalog.CatalogSource,
     function_bindings: SqlFunctionBindings,
 ) !LoweredRelationPopulationPlan {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+        alloc,
+        &parsed_sql,
+        schema,
+        params,
+        catalog,
+        function_bindings,
+    );
+}
+
+fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
+    catalog: ?table_catalog.CatalogSource,
+    function_bindings: SqlFunctionBindings,
+) !LoweredRelationPopulationPlan {
     var context = sql_adapter.RelationPopulationLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -1127,7 +1169,7 @@ pub fn lowerRelationPopulationPlanWithCatalogAndFunctionBindingsAlloc(
             .lower_read_without_catalog = lowerReadPlanWithFunctionBindingsParsedSqlAlloc,
         },
     };
-    return try context.lower(sql);
+    return try context.lowerParsed(parsed_sql);
 }
 
 pub fn lowerWindowPlanAlloc(
@@ -2225,6 +2267,21 @@ pub fn lowerDdlPlanWithFunctionBindingsAlloc(
 ) !LoweredDdlPlan {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
+    return try lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, function_bindings);
+}
+
+fn lowerDdlPlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+) !LoweredDdlPlan {
+    return try lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, .{});
+}
+
+fn lowerDdlPlanWithFunctionBindingsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    function_bindings: SqlFunctionBindings,
+) !LoweredDdlPlan {
     const tokens = parsed_sql.items();
 
     var parser = Parser{
@@ -3873,21 +3930,6 @@ fn maybeCheckOrPromoteAppParityFixture(
     try sql_adapter.checkOrPromoteFixtureJson(alloc, mode, encoded);
 }
 
-fn appParityJsonTextIsObject(alloc: std.mem.Allocator, text: []const u8) !bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
-    defer parsed.deinit();
-    return parsed.value == .object;
-}
-
-fn appParitySourceSchemaJsonIsValid(alloc: std.mem.Allocator, text: []const u8) !bool {
-    var parsed = schema_api.parseValidatedTableSchema(alloc, text) catch return false;
-    defer parsed.deinit(alloc);
-    const schema = schema_api.deriveRuntimeTableSchema(alloc, parsed) catch return false;
-    defer runtime_schema.freeSchema(alloc, schema);
-    if (schema.storage_mode != .relational or schema.primary_key == null) return false;
-    return true;
-}
-
 fn appParitySetupSqlIsValid(alloc: std.mem.Allocator, setup_sql: []const []const u8) !bool {
     for (setup_sql) |sql| {
         if (sql.len == 0) return false;
@@ -3937,11 +3979,11 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
     if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql))) {
         return error.TestUnexpectedResult;
     }
-    if (entry.source_schema_json.len > 0 and !(try appParitySourceSchemaJsonIsValid(alloc, entry.source_schema_json))) {
+    if (entry.source_schema_json.len > 0 and !(try sql_adapter.fixtureSchemaJsonIsRelationalTableAlloc(alloc, entry.source_schema_json))) {
         return error.TestUnexpectedResult;
     }
     for (entry.catalog_tables) |catalog_table| {
-        if (!(try appParitySourceSchemaJsonIsValid(alloc, catalog_table.schema_json))) {
+        if (!(try sql_adapter.fixtureSchemaJsonIsRelationalTableAlloc(alloc, catalog_table.schema_json))) {
             return error.TestUnexpectedResult;
         }
         if (entry.summary.table_name) |target_table_name| {
@@ -3960,9 +4002,9 @@ fn validateAppParityFixtureMetadataWithBaseSchema(
         }
     }
     for (entry.returning_rows) |returning_row| {
-        if (!(try appParityJsonTextIsObject(alloc, returning_row))) return error.TestUnexpectedResult;
+        if (!(try sql_adapter.fixtureJsonTextIsObjectAlloc(alloc, returning_row))) return error.TestUnexpectedResult;
     }
-    if (entry.resolver_row_json.len > 0 and !(try appParityJsonTextIsObject(alloc, entry.resolver_row_json))) {
+    if (entry.resolver_row_json.len > 0 and !(try sql_adapter.fixtureJsonTextIsObjectAlloc(alloc, entry.resolver_row_json))) {
         return error.TestUnexpectedResult;
     }
     if (seen_names.contains(entry.name)) return error.TestUnexpectedResult;
@@ -8752,170 +8794,14 @@ test "postgres sql adapter catalog-backed read plans execute across source schem
     }
 }
 
-fn expectSqlAdapterEdgeCaseError(expected: []const u8, actual: anyerror) !void {
-    if (std.mem.eql(u8, expected, "unsupported_sql_shape")) {
-        return std.testing.expectEqual(error.UnsupportedSqlShape, actual);
-    }
-    if (std.mem.eql(u8, expected, "invalid_sql_catalog")) {
-        return std.testing.expectEqual(error.InvalidSqlCatalog, actual);
-    }
-    if (std.mem.eql(u8, expected, "unsupported_rows_selector")) {
-        return std.testing.expectEqual(error.UnsupportedRowsSelector, actual);
-    }
-    return error.TestUnexpectedResult;
-}
-
-fn expectSqlAdapterEdgeCaseNoErrorExpected(expected_error: []const u8) !void {
-    if (expected_error.len != 0) return error.TestUnexpectedResult;
-}
-
-fn expectSqlAdapterEdgeCaseSelect(
+fn lowerWritePlanForSqlAdapterEdgeCaseAlloc(
     alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
+    parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
-) !void {
-    var lowered = lowerSelectAlloc(alloc, edge_case.sql, schema, edge_case.params) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-    if (edge_case.expected_table) |table_name| {
-        try std.testing.expectEqualStrings(table_name, lowered.table_name);
-    }
-    if (edge_case.expected_predicates) |predicates| {
-        try std.testing.expectEqual(predicates, lowered.query.predicates.len);
-    }
-    if (edge_case.expected_first_predicate_field) |field| {
-        if (lowered.query.predicates.len == 0) return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(field, lowered.query.predicates[0].field);
-    }
-    if (edge_case.expected_first_predicate_value_json) |value_json| {
-        if (lowered.query.predicates.len == 0) return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(value_json, lowered.query.predicates[0].value_json orelse return error.TestUnexpectedResult);
-    }
-}
-
-fn expectSqlAdapterEdgeCaseUpdate(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-    schema: runtime_schema.TableSchema,
+    params: []const SqlValue,
     resolver: relational_rows.UniqueSelectorResolver,
-) !void {
-    var lowered = lowerUpdateAlloc(alloc, edge_case.sql, schema, edge_case.params, resolver) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-    if (edge_case.expected_table) |table_name| {
-        try std.testing.expectEqualStrings(table_name, lowered.table_name);
-    }
-    if (edge_case.expected_transformed) |transformed| {
-        try std.testing.expectEqual(transformed, lowered.batch.transformed);
-    }
-}
-
-fn expectSqlAdapterEdgeCaseDelete(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-    schema: runtime_schema.TableSchema,
-    resolver: relational_rows.UniqueSelectorResolver,
-) !void {
-    var lowered = lowerDeleteAlloc(alloc, edge_case.sql, schema, edge_case.params, resolver) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-}
-
-fn expectSqlAdapterEdgeCaseInsert(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-    schema: runtime_schema.TableSchema,
-    resolver: relational_rows.UniqueSelectorResolver,
-) !void {
-    var lowered = lowerInsertWithResolverAlloc(alloc, edge_case.sql, schema, edge_case.params, resolver) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-    if (edge_case.expected_table) |table_name| {
-        try std.testing.expectEqualStrings(table_name, lowered.table_name);
-    }
-    if (edge_case.expected_inserted) |inserted| {
-        try std.testing.expectEqual(inserted, lowered.batch.inserted);
-    }
-}
-
-fn expectSqlAdapterEdgeCaseDdl(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-) !void {
-    var lowered = lowerDdlPlanAlloc(alloc, edge_case.sql) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-    if (edge_case.expected_ddl_tag) |tag| switch (tag) {
-        .create_table => switch (lowered) {
-            .create_table => |plan| {
-                if (edge_case.expected_table) |table_name| try std.testing.expectEqualStrings(table_name, plan.table_name);
-                if (edge_case.expected_if_not_exists) |if_not_exists| try std.testing.expectEqual(if_not_exists, plan.if_not_exists);
-            },
-            else => return error.TestUnexpectedResult,
-        },
-    };
-}
-
-fn expectSqlAdapterEdgeCaseClassifyWrite(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-) !void {
-    var tokens = tokenizeAlloc(alloc, edge_case.sql) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer freeTokens(alloc, &tokens);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-    const expected_kind = edge_case.expected_write_kind orelse return error.TestUnexpectedResult;
-    const actual = sql_adapter.classifyWriteStatement(tokens.items) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(expected_kind, actual);
-}
-
-fn expectSqlAdapterEdgeCaseWritePlan(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-    schema: runtime_schema.TableSchema,
-    resolver: relational_rows.UniqueSelectorResolver,
-) !void {
-    var lowered = lowerWritePlanAlloc(alloc, edge_case.sql, schema, edge_case.params, .{ .unique_resolver = resolver }) catch |err| {
-        try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
-        return;
-    };
-    defer lowered.deinit(alloc);
-    try expectSqlAdapterEdgeCaseNoErrorExpected(edge_case.expected_error);
-}
-
-fn expectSqlAdapterEdgeCase(
-    alloc: std.mem.Allocator,
-    edge_case: sql_adapter.SqlAdapterEdgeCase,
-    schema: runtime_schema.TableSchema,
-    resolver: relational_rows.UniqueSelectorResolver,
-) !void {
-    errdefer std.debug.print("sql adapter edge case failed: {s}\n", .{edge_case.name});
-    switch (edge_case.action) {
-        .select => try expectSqlAdapterEdgeCaseSelect(alloc, edge_case, schema),
-        .update => try expectSqlAdapterEdgeCaseUpdate(alloc, edge_case, schema, resolver),
-        .delete => try expectSqlAdapterEdgeCaseDelete(alloc, edge_case, schema, resolver),
-        .insert => try expectSqlAdapterEdgeCaseInsert(alloc, edge_case, schema, resolver),
-        .ddl => try expectSqlAdapterEdgeCaseDdl(alloc, edge_case),
-        .classify_write => try expectSqlAdapterEdgeCaseClassifyWrite(alloc, edge_case),
-        .write_plan => try expectSqlAdapterEdgeCaseWritePlan(alloc, edge_case, schema, resolver),
-    }
+) !LoweredWritePlan {
+    return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{ .unique_resolver = resolver });
 }
 
 test "postgres sql adapter rejects data-driven application edge cases explicitly" {
@@ -8938,9 +8824,17 @@ test "postgres sql adapter rejects data-driven application edge cases explicitly
     defer required_coverage.deinit(alloc);
 
     var coverage = sql_adapter.SqlAdapterEdgeCaseCoverage{};
+    const callbacks = sql_adapter.SqlAdapterEdgeCaseLoweringCallbacks{
+        .lower_select = lowerSelectParsedSqlAlloc,
+        .lower_update = lowerUpdateParsedSqlAlloc,
+        .lower_delete = lowerDeleteParsedSqlAlloc,
+        .lower_insert = lowerInsertWithResolverParsedSqlAlloc,
+        .lower_ddl = lowerDdlPlanParsedSqlAlloc,
+        .lower_write_plan = lowerWritePlanForSqlAdapterEdgeCaseAlloc,
+    };
     for (root.cases) |edge_case| {
         try coverage.observe(edge_case);
-        try expectSqlAdapterEdgeCase(alloc, edge_case, schema, resolver_ctx.resolver());
+        try sql_adapter.expectSqlAdapterEdgeCase(alloc, edge_case, schema, resolver_ctx.resolver(), callbacks);
     }
     try sql_adapter.expectSqlAdapterEdgeCaseCoverageRequirements(coverage, required_coverage.root.required);
 }

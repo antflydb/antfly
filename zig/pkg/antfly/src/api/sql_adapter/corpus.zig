@@ -26,6 +26,8 @@ const metadata_transition_state = @import("../../metadata/transition_state.zig")
 const plan_mod = @import("plan.zig");
 const query_contract = @import("../query_contract.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
+const runtime_schema = @import("../../storage/schema.zig");
+const schema_api = @import("../../schema/mod.zig");
 const table_catalog = @import("../table_catalog.zig");
 const value_mod = @import("value.zig");
 
@@ -2914,6 +2916,14 @@ fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppPar
     }
 }
 
+pub fn fixtureSchemaJsonIsRelationalTableAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
+    var parsed = schema_api.parseValidatedTableSchema(alloc, text) catch return false;
+    defer parsed.deinit(alloc);
+    const schema = schema_api.deriveRuntimeTableSchema(alloc, parsed) catch return false;
+    defer runtime_schema.freeSchema(alloc, schema);
+    return schema.storage_mode == .relational and schema.primary_key != null;
+}
+
 fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
     if (entry.catalog_tables.len == 0) return true;
     for (entry.catalog_tables, 0..) |table, i| {
@@ -2927,7 +2937,7 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
     return true;
 }
 
-fn fixtureJsonTextIsObjectAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
+pub fn fixtureJsonTextIsObjectAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
     defer parsed.deinit();
     return parsed.value == .object;

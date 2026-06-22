@@ -300,6 +300,11 @@ Current implementation status:
   contiguous relation-population sources such as `CREATE TABLE AS`, and
   non-contiguous relation-population sources such as `SELECT INTO` now hand
   nested lowerers parsed child statements cloned from the parent token stream.
+  The public explain and relation-population facades now parse once at ingress
+  and route through parsed context entrypoints before dispatching to nested
+  read/write lowerers. The data-driven SQL edge-case harness also parses each
+  case once and passes `ParsedSql` through its lowering callbacks, including
+  write-family classification from parsed/tokenized metadata.
   Catalog-backed read/write prebinding now produces `BoundSqlStatement`, preserving the parsed statement variant while
   carrying owned session identity (`current_database` and `search_path`) plus
   resolved source schemas or write-plan catalog options before routing through

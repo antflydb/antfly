@@ -1124,7 +1124,11 @@ pub const ExplainPlanLoweringContext = struct {
     pub fn lower(self: *@This(), sql: []const u8) !plan.LoweredExplainPlan {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, sql);
         defer parsed_sql.deinit(self.alloc);
-        return try plan.lowerExplainPlanWithParsedSqlAlloc(self.alloc, &parsed_sql, self.hooks());
+        return try self.lowerParsed(&parsed_sql);
+    }
+
+    pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredExplainPlan {
+        return try plan.lowerExplainPlanWithParsedSqlAlloc(self.alloc, parsed_sql, self.hooks());
     }
 
     fn hooks(self: *@This()) plan.ExplainPlanLoweringHooks {
