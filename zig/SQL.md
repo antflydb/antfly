@@ -532,7 +532,7 @@ Prioritized improvements:
 
 Current implementation status:
 
-- `sql_adapter/tokenized.zig` owns reusable `TokenizedSql` state for a SQL input,
+- `src/sql/tokenized.zig` owns reusable `TokenizedSql` state for a SQL input,
   including the borrowed token stream, top-level statement family, read
   statement kind, and write statement kind.
 - `classifier.zig` classifies read families (`query`, `set_operation`,

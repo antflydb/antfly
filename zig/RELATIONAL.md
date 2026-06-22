@@ -4904,7 +4904,7 @@ no-ops: `PREPARE TRANSACTION`, `COMMIT PREPARED`, and `ROLLBACK PREPARED` lower
 to typed prepared-transaction DDL plans and a generated-corpus `execution_plan`
 fingerprint for the coordinator-owned recovery action
 (`register_prepared`, `resolve_commit`, or `resolve_rollback`).
-`relational_sql.executePreparedTransactionRecoveryPlan` is the explicit
+`sql.executePreparedTransactionRecoveryPlan` is the explicit
 execution boundary for those intents: it maps the SQL GID to a domain-separated
 deterministic Antfly transaction id, registers prepared transactions in the
 transaction coordinator store, resolves `COMMIT PREPARED` / `ROLLBACK PREPARED`
@@ -5437,7 +5437,7 @@ accepted, and default replacement is valid only for imports. Import-side
 `COPY FROM ... WHERE` admits a conservative scalar `field <op> literal`
 conjunction subset and stores it as shared `RelationalRowsExpressionCondition`
 metadata, so later row decoding can evaluate filters without carrying SQL text.
-`relational_sql.bulkSqlIoExecutionPlanFromDdlPlan` now maps supported stream,
+`sql.bulkSqlIoExecutionPlanFromDdlPlan` now maps supported stream,
 file, and program `COPY` plans into an explicit Antfly execution contract:
 `COPY FROM STDIN` requires a write permission on the table, audits as
 `copy_from`, and routes to the row-batch import surface; `COPY TO STDOUT`
