@@ -10886,7 +10886,6 @@ pub fn parseAggregateSelectListAlloc(
             );
             var parsed_spec_transferred = false;
             errdefer if (!parsed_spec_transferred) plan_mod.freeAggregateSpec(alloc, parsed_spec);
-            if (aggregateSpecNameCollidesWithGroupOutput(parsed_spec.name, group_fields.items, group_expressions.items)) return error.UnsupportedSqlShape;
             const maybe_spec_name = try allocateDisambiguatedAggregateSpecNameAlloc(
                 alloc,
                 parsed_spec.name,
@@ -20434,10 +20433,27 @@ pub fn parseWindowSelectListAlloc(
             );
             var parsed_spec_transferred = false;
             errdefer if (!parsed_spec_transferred) plan_mod.freeWindowSpec(alloc, parsed_spec);
-            if (windowSpecOutputCollision(parsed_spec.output, fields.items, windows.items)) return error.UnsupportedSqlShape;
-            try outputs.append(alloc, .{ .kind = .window, .index = windows.items.len });
-            try windows.append(alloc, parsed_spec);
+            const maybe_output = try allocateDisambiguatedWindowSpecOutputAlloc(
+                alloc,
+                parsed_spec.output,
+                fields.items,
+                windows.items,
+            );
+            var output_transferred = false;
+            errdefer if (!output_transferred) {
+                if (maybe_output) |output| alloc.free(output);
+            };
+            const spec = if (maybe_output) |output| windowSpecWithOutput(parsed_spec, output) else parsed_spec;
             parsed_spec_transferred = true;
+            if (maybe_output != null) {
+                alloc.free(parsed_spec.output);
+                output_transferred = true;
+            }
+            var spec_transferred = false;
+            errdefer if (!spec_transferred) plan_mod.freeWindowSpec(alloc, spec);
+            try outputs.append(alloc, .{ .kind = .window, .index = windows.items.len });
+            try windows.append(alloc, spec);
+            spec_transferred = true;
         } else {
             const parsed_field = try parseRowExpressionFieldOwnedAlloc(
                 alloc,
@@ -27050,18 +27066,34 @@ test "sql adapter lower expr lowers grouped aggregate queries" {
     try std.testing.expectEqualStrings("order_count", duplicate_direct_order.aggregate.order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, duplicate_direct_order.aggregate.order_by[0].direction);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+    var duplicate_group_aggregate_label = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer ORDER BY customer",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+    );
+    defer duplicate_group_aggregate_label.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_label.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", duplicate_group_aggregate_label.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_label.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("customer_2", duplicate_group_aggregate_label.aggregate.aggregations[0].name);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_label.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("customer", duplicate_group_aggregate_label.aggregate.order_by[0].field);
+
+    var duplicate_group_aggregate_ordinal_order = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer ORDER BY 2",
         schema,
         &.{},
-    ));
+    );
+    defer duplicate_group_aggregate_ordinal_order.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_ordinal_order.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", duplicate_group_aggregate_ordinal_order.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_ordinal_order.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("customer_2", duplicate_group_aggregate_ordinal_order.aggregate.aggregations[0].name);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_ordinal_order.aggregate.order_by.len);
+    try std.testing.expectEqualStrings("customer_2", duplicate_group_aggregate_ordinal_order.aggregate.order_by[0].field);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, customer, COUNT(*) AS order_count FROM usage_records GROUP BY customer",
@@ -27080,12 +27112,22 @@ test "sql adapter lower expr lowers grouped aggregate queries" {
         schema,
         &.{},
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
+    var duplicate_group_aggregate_having = try lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer HAVING customer > 0",
         schema,
         &.{},
-    ));
+    );
+    defer duplicate_group_aggregate_having.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_having.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", duplicate_group_aggregate_having.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_having.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("customer_2", duplicate_group_aggregate_having.aggregate.aggregations[0].name);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_group_aggregate_having.aggregate.having_predicates.len);
+    try std.testing.expectEqualStrings("customer", duplicate_group_aggregate_having.aggregate.having_predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, duplicate_group_aggregate_having.aggregate.having_predicates[0].op);
+    try std.testing.expectEqualStrings("0", duplicate_group_aggregate_having.aggregate.having_predicates[0].value_json.?);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
         alloc,
         "SELECT customer, COUNT(*) AS order_count FROM usage_records GROUP BY customer HAVING missing_alias > 0",
@@ -27191,6 +27233,18 @@ test "sql adapter lower expr lowers select distinct to group-only aggregate" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_alias_grouped.aggregate.group_expressions[0].expression.kind);
     try std.testing.expectEqual(@as(usize, 1), expression_alias_grouped.aggregate.aggregations.len);
     try std.testing.expectEqualStrings("row_count", expression_alias_grouped.aggregate.aggregations[0].name);
+
+    var duplicate_aggregate_label = try lowerAggregateForLowerExprTestAlloc(
+        alloc,
+        "SELECT customer, COUNT(*) AS customer FROM usage_records GROUP BY customer",
+        schema,
+        &.{},
+    );
+    defer duplicate_aggregate_label.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_aggregate_label.aggregate.group_by.len);
+    try std.testing.expectEqualStrings("customer", duplicate_aggregate_label.aggregate.group_by[0]);
+    try std.testing.expectEqual(@as(usize, 1), duplicate_aggregate_label.aggregate.aggregations.len);
+    try std.testing.expectEqualStrings("customer_2", duplicate_aggregate_label.aggregate.aggregations[0].name);
 
     var field_alias_grouped = try lowerAggregateForLowerExprTestAlloc(
         alloc,
@@ -34703,36 +34757,54 @@ test "sql adapter lower expr lowers row_number window query plans" {
         schema,
         &.{},
     ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+    var duplicate_window_field_label = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS id FROM usage_records",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+    );
+    defer duplicate_window_field_label.deinit(alloc);
+    try std.testing.expectEqualStrings("id_2", duplicate_window_field_label.plan.window.windows[0].output);
+
+    var duplicate_window_labels = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank, rank() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS usage_rank FROM usage_records",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+    );
+    defer duplicate_window_labels.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_rank", duplicate_window_labels.plan.window.windows[0].output);
+    try std.testing.expectEqualStrings("usage_rank_2", duplicate_window_labels.plan.window.windows[1].output);
+
+    var duplicate_default_window_labels = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC), row_number() OVER (PARTITION BY tenant ORDER BY id ASC) FROM usage_records",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+    );
+    defer duplicate_default_window_labels.deinit(alloc);
+    try std.testing.expectEqualStrings("row_number", duplicate_default_window_labels.plan.window.windows[0].output);
+    try std.testing.expectEqualStrings("row_number_2", duplicate_default_window_labels.plan.window.windows[1].output);
+
+    var duplicate_window_label_order_by_field = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS id FROM usage_records ORDER BY id",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerWindowPlanForLowerExprTestAlloc(
+    );
+    defer duplicate_window_label_order_by_field.deinit(alloc);
+    try std.testing.expectEqualStrings("id_2", duplicate_window_label_order_by_field.plan.window.windows[0].output);
+    try std.testing.expectEqualStrings("id", duplicate_window_label_order_by_field.plan.window.order_by[0].field);
+
+    var duplicate_window_label_order_by_ordinal = try lowerWindowPlanForLowerExprTestAlloc(
         alloc,
         "SELECT tenant, id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC, id ASC) AS id FROM usage_records ORDER BY 3",
         schema,
         &.{},
-    ));
+    );
+    defer duplicate_window_label_order_by_ordinal.deinit(alloc);
+    try std.testing.expectEqualStrings("id_2", duplicate_window_label_order_by_ordinal.plan.window.windows[0].output);
+    try std.testing.expectEqualStrings("id_2", duplicate_window_label_order_by_ordinal.plan.window.order_by[0].field);
 }
 
 test "sql adapter lower expr detects deterministic row expressions" {

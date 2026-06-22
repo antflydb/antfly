@@ -635,14 +635,14 @@ syntax such as `SET (status, amount) = ('active', amount + 1)`, including
 spelling, and `DEFAULT` items inside row-list assignments, is adapter sugar over
 the same ordered per-field typed assignments; it is rejected on duplicate
 targets and never creates tuple-valued storage operations. Row-query projection
-labels are a closed result-object
-contract: duplicate selected fields, compact projection
-outputs, and expression projection outputs fail request validation before
-execution, so storage and API-side preview execution never emit ambiguous JSON
-objects with repeated keys. The PostgreSQL adapter applies the same contract
-while lowering `SELECT`: repeated output labels, expression aliases that collide
-with selected fields, and `SELECT *` extras that collide with real row fields
-fail closed before a typed row-query plan is produced.
+labels are a closed result-object contract: native REST/SDK requests must
+provide unique selected fields, compact projection outputs, and expression
+projection outputs before execution, so storage and API-side preview execution
+never emit ambiguous JSON objects with repeated keys. The SQL adapter may accept
+repeated presentation labels by lowering the later computed output to a
+deterministic unique native key such as `id_2`; direct duplicate selected fields
+and `SELECT *` extras that collide with real row fields still fail closed until
+they can be represented without losing source identity.
 Parenthesized scalar order expressions are the same typed order keys as their
 unparenthesized forms: text-like, numeric, datetime, and boolean outputs are
 accepted directly. JSON, object, and array outputs are also typed order keys:
@@ -2364,8 +2364,8 @@ They can order by projected output names, ordinals, null-placement keys, or
 typed expressions over projected outputs such as
 `ORDER BY (right_metric - left_metric)`. Result rows keep unique JSON object
 keys, while `result_schema.display_name` can preserve a non-unique SQL label for
-presentation; adapter lowering still fails closed until it can prove a unique
-field key for references such as `ORDER BY name`. Native read join/lateral requests expose the same output-bound
+presentation; SQL lowering must either bind references to the generated unique
+native key or fail closed when a reference is genuinely ambiguous. Native read join/lateral requests expose the same output-bound
 `order_by` shape; joined mutation-source requests keep target-side row ordering
 for deterministic target claiming.
 Left joins preserve side-local `ON` predicates by lowering
@@ -4098,9 +4098,10 @@ lowered projection list before planning reaches storage; the stored plan carries
 the resulting field key or cloned typed expression key, not the ordinal. SQL
 output aliases such as `ORDER BY email_key` follow the same path: a unique
 projected alias resolves to the underlying field key or typed expression key,
-while duplicate output labels fail closed for references instead of guessing;
-row response metadata may carry those labels separately as
-`result_schema.display_name` while retaining unique `name` keys.
+and repeated presentation labels lower to generated native keys when the
+reference can be resolved deterministically. Row response metadata may carry
+those labels separately as `result_schema.display_name` while retaining unique
+`name` keys.
 Text-pattern predicates are native row-query predicates, not SQL strings. The
 REST/SDK shape is:
 
@@ -4700,8 +4701,9 @@ Current PR status:
   row-query output-order ordinal and alias normalization,
   join/lateral output-order ordinal normalization,
   window output-order ordinal normalization,
-  fail-closed duplicate output-name checks for row, aggregate, join, lateral,
-  and window order references,
+  generated-key duplicate output-label coverage for aggregate and window plans,
+  fail-closed duplicate direct-field checks and ambiguous output-reference
+  checks for row, aggregate, join, lateral, and window plans,
   group-only `SELECT DISTINCT` aggregate fingerprints, row-query
   `DISTINCT ON` fingerprints, offsets, row
   claims, adapter-only no-op classifications for session cleanup, plain
@@ -6154,9 +6156,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    aliases remain the public way to choose a stable application-facing
    result-object key. SQL adapters preserve presentation labels through
    `result_schema.display_name`; when a canonical or explicit label collides
-   with a selected column or another computed output, lowering must either pick
-   a unique durable `name` key and retain the repeated display label there, or
-   fail closed for ambiguous output references instead of guessing.
+   with a selected column or another computed output, lowering picks a unique
+   durable `name` key when the reference model remains deterministic, and fails
+   closed only for direct duplicate fields or genuinely ambiguous output
+   references.
 
 4. **Index and conflict-target completeness.**
    Keep ordinary, partial, and expression indexes as durable typed metadata.

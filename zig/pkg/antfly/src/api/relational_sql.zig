@@ -40,7 +40,6 @@ const aggregateOutputColumnExists = sql_adapter.aggregateOutputColumnExists;
 const aggregateDescendingPercentileCount = sql_adapter.aggregateDescendingPercentileCount;
 const aggregateFilterExpressionArrayCount = sql_adapter.aggregateFilterExpressionArrayCount;
 const aggregateFilterExpressionCount = sql_adapter.aggregateFilterExpressionCount;
-const aggregateFilterGroupCount = sql_adapter.aggregateFilterGroupCount;
 const aggregateFilterJsonAccessCount = sql_adapter.aggregateFilterJsonAccessCount;
 const aggregateFilterStructuredAccessCount = sql_adapter.aggregateFilterStructuredAccessCount;
 const aggregateInputExpressionCount = sql_adapter.aggregateInputExpressionCount;
@@ -293,7 +292,6 @@ const writeTextPatternPredicateAtomsJson = sql_adapter.writeTextPatternPredicate
 const ScalarOrCheckBranch = sql_adapter.ScalarOrCheckBranch;
 const conflictActionName = sql_adapter.conflictActionName;
 const expressionAssignmentComputedCount = sql_adapter.expressionAssignmentComputedCount;
-const transformOperationCount = sql_adapter.transformOperationCount;
 const rowExpressionBoundaryKeyword = sql_adapter.rowExpressionBoundaryKeyword;
 const sqlAssignmentTailKeyword = sql_adapter.sqlAssignmentTailKeyword;
 const sqlJoinedSourceAliasTerminator = sql_adapter.sqlJoinedSourceAliasTerminator;
@@ -351,21 +349,6 @@ pub const MergePredicateSide = sql_adapter.MergePredicateSide;
 pub const MergeArmPredicate = sql_adapter.MergeArmPredicate;
 pub const MergeMatchedArm = sql_adapter.MergeMatchedArm;
 pub const MergeNotMatchedArm = sql_adapter.MergeNotMatchedArm;
-const mergeMatchedPredicateCount = sql_adapter.mergeMatchedPredicateCount;
-const mergeMatchedUpdateCount = sql_adapter.mergeMatchedUpdateCount;
-const mergeMatchedUpdateExpressionCount = sql_adapter.mergeMatchedUpdateExpressionCount;
-const mergeMatchedExpressionPredicateCount = sql_adapter.mergeMatchedExpressionPredicateCount;
-const mergeMatchedExpressionOrPredicateCount = sql_adapter.mergeMatchedExpressionOrPredicateCount;
-const mergeMatchedExpressionNotPredicateCount = sql_adapter.mergeMatchedExpressionNotPredicateCount;
-const mergeMatchedHasDelete = sql_adapter.mergeMatchedHasDelete;
-const mergeMatchedHasDoNothing = sql_adapter.mergeMatchedHasDoNothing;
-const mergeNotMatchedPredicateCount = sql_adapter.mergeNotMatchedPredicateCount;
-const mergeNotMatchedInsertCount = sql_adapter.mergeNotMatchedInsertCount;
-const mergeNotMatchedInsertExpressionCount = sql_adapter.mergeNotMatchedInsertExpressionCount;
-const mergeNotMatchedExpressionPredicateCount = sql_adapter.mergeNotMatchedExpressionPredicateCount;
-const mergeNotMatchedExpressionOrPredicateCount = sql_adapter.mergeNotMatchedExpressionOrPredicateCount;
-const mergeNotMatchedExpressionNotPredicateCount = sql_adapter.mergeNotMatchedExpressionNotPredicateCount;
-const mergeNotMatchedHasDoNothing = sql_adapter.mergeNotMatchedHasDoNothing;
 pub const MergeExecutionTargetRow = sql_adapter.MergeExecutionTargetRow;
 pub const LoweredMergeMutationPlan = sql_adapter.LoweredMergeMutationPlan;
 pub const LoweredRecursiveMergeMutation = sql_adapter.LoweredRecursiveMergeMutation;
@@ -2424,8 +2407,6 @@ fn schemaJsonFromSetupSqlAlloc(
     return owned_current_schema_json orelse try alloc.dupe(u8, current_schema_json);
 }
 
-const expectQuerySummary = sql_adapter.expectQuerySummary;
-const expectQuerySourceSummary = sql_adapter.expectQuerySourceSummary;
 const expectCombinedQuerySourceSummary = sql_adapter.expectCombinedQuerySourceSummary;
 
 fn expectDdlSummary(summary: AppParityPlanSummary, lowered: LoweredDdlPlan) !void {
@@ -3076,242 +3057,9 @@ fn expectAppParityReadPlanEntry(
     }
 }
 
-fn expectAppParityReadSummary(summary: AppParityPlanSummary, lowered: LoweredReadPlan) !void {
-    switch (lowered) {
-        .query => |query| {
-            try expectOptionalTableName(summary.table_name, query.table_name);
-            try expectOptionalUsize(summary.ctes, query.plan.ctes.len);
-            try expectQuerySummary(summary, query.plan.query);
-        },
-        .set_operation => |set_operation| {
-            try expectOptionalTableName(summary.table_name, set_operation.left.table_name);
-            try expectOptionalUsize(summary.ctes, set_operation.left.plan.ctes.len + set_operation.right.plan.ctes.len);
-            try expectOptionalUsize(summary.select, set_operation.left.plan.query.select.len);
-            try expectOptionalUsize(summary.order_by, set_operation.left.plan.query.order_by.len + set_operation.right.plan.query.order_by.len + set_operation.order_by.len);
-            try expectOptionalU32(summary.limit, set_operation.limit orelse set_operation.left.plan.query.limit);
-            if (summary.offset) |expected| try std.testing.expectEqual(expected, if (set_operation.offset != 0) set_operation.offset else set_operation.left.plan.query.offset);
-            if (summary.right_offset) |expected| try std.testing.expectEqual(expected, set_operation.right.plan.query.offset);
-        },
-        .recursive_cte => |recursive_cte| {
-            try expectOptionalTableName(summary.table_name, recursive_cte.anchor.table_name);
-            try expectOptionalUsize(summary.ctes, 1);
-            try expectOptionalUsize(summary.select, recursive_cte.anchor.plan.query.select.len);
-            try expectOptionalUsize(summary.order_by, recursive_cte.anchor.plan.query.order_by.len);
-            try expectOptionalU32(summary.limit, recursive_cte.anchor.plan.query.limit);
-        },
-        .aggregate => |aggregate| {
-            try expectOptionalTableName(summary.table_name, aggregate.table_name);
-            try expectOptionalUsize(summary.ctes, aggregate.plan.ctes.len);
-            try expectQuerySourceSummary(summary, aggregate.plan.aggregate.source);
-            try expectOptionalUsize(summary.group_by, aggregate.plan.aggregate.group_by.len);
-            try expectOptionalUsize(summary.group_expressions, aggregate.plan.aggregate.group_expressions.len);
-            try expectOptionalUsize(summary.aggregations, aggregate.plan.aggregate.aggregations.len);
-            try expectOptionalUsize(summary.filter_groups, aggregateFilterGroupCount(aggregate.plan.aggregate.aggregations));
-            try expectOptionalUsize(summary.having, aggregate.plan.aggregate.having_predicates.len);
-            try expectOptionalUsize(summary.having_expressions, aggregate.plan.aggregate.having_expressions.len);
-            try expectOptionalUsize(summary.having_any, aggregate.plan.aggregate.having_any.len);
-            try expectOptionalUsize(summary.having_not, aggregate.plan.aggregate.having_not.len);
-            try expectOptionalUsize(summary.order_by, aggregate.plan.aggregate.order_by.len);
-            try expectOptionalU32(summary.limit, aggregate.plan.aggregate.limit);
-            if (summary.offset) |expected| try std.testing.expectEqual(expected, aggregate.plan.aggregate.offset);
-        },
-        .join => |join| {
-            try expectOptionalTableName(summary.table_name, join.left_table_name);
-            try expectCombinedQuerySourceSummary(summary, join.join.left, join.join.right);
-            try expectOptionalUsize(summary.join_on, join.join.on.len);
-            try expectOptionalUsize(summary.join_select, join.join.select.len);
-            try expectOptionalUsize(summary.order_by, join.join.order_by.len);
-            try expectOptionalU32(summary.limit, join.join.limit);
-            if (summary.offset) |expected| try std.testing.expectEqual(expected, join.join.offset);
-        },
-        .lateral => |lateral| {
-            try expectOptionalTableName(summary.table_name, lateral.left_table_name);
-            try expectCombinedQuerySourceSummary(summary, lateral.plan.lateral.left, lateral.plan.lateral.right);
-            try expectOptionalUsize(summary.lateral_correlations, lateral.plan.lateral.correlations.len);
-            try expectOptionalUsize(summary.join_select, lateral.plan.lateral.select.len);
-            try expectOptionalUsize(summary.order_by, lateral.plan.lateral.order_by.len);
-            try expectOptionalU32(summary.limit, lateral.plan.lateral.limit);
-            if (summary.offset) |expected| try std.testing.expectEqual(expected, lateral.plan.lateral.offset);
-            if (summary.right_offset) |expected| try std.testing.expectEqual(expected, lateral.plan.lateral.right.offset);
-        },
-        .window => |window| {
-            try expectOptionalTableName(summary.table_name, window.table_name);
-            try expectOptionalUsize(summary.ctes, window.plan.ctes.len);
-            try expectQuerySourceSummary(summary, window.plan.window.source);
-            try expectOptionalUsize(summary.windows, window.plan.window.windows.len);
-            try expectOptionalUsize(summary.select, window.plan.window.select.len);
-            try expectOptionalUsize(summary.order_by, window.plan.window.order_by.len);
-            try expectOptionalU32(summary.limit, window.plan.window.limit);
-            if (summary.offset) |expected| try std.testing.expectEqual(expected, window.plan.window.offset);
-        },
-    }
-}
-
-fn expectAppParityWriteSummary(summary: AppParityPlanSummary, lowered: LoweredWritePlan) !void {
-    switch (lowered) {
-        .insert => |insert| {
-            try expectOptionalTableName(summary.table_name, insert.table_name);
-            try expectOptionalUsize(summary.operations, transformOperationCount(insert.batch.transforms));
-            try expectOptionalUsize(summary.returning, insert.batch.returning_rows.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, insert.returning_all);
-            if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert.conflict_where);
-        },
-        .insert_source => |insert_source| {
-            try expectOptionalTableName(summary.table_name, insert_source.table_name);
-            try expectOptionalUsize(summary.ctes, insert_source.ctes.len);
-            try expectQuerySummary(summary, insert_source.insert_source.req.source);
-            try expectOptionalUsize(summary.operations, insert_source.insert_source.req.assignments.len);
-            const conflict_patch_expressions = if (insert_source.insert_source.req.on_conflict) |conflict| conflict.patch_expressions.len else 0;
-            const conflict_increment_expressions = if (insert_source.insert_source.req.on_conflict) |conflict| conflict.increment_expressions.len else 0;
-            const conflict_json_set_expressions = if (insert_source.insert_source.req.on_conflict) |conflict| conflict.json_set_expressions.len else 0;
-            try expectOptionalUsize(summary.patch_expressions, conflict_patch_expressions);
-            try expectOptionalUsize(summary.increment_expressions, conflict_increment_expressions);
-            try expectOptionalUsize(summary.json_set_expressions, conflict_json_set_expressions);
-            try expectOptionalUsize(summary.returning, insert_source.insert_source.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, insert_source.insert_source.req.returning_all);
-            if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert_source.conflict_where);
-        },
-        .recursive_insert_source => |recursive_insert_source| {
-            try expectOptionalTableName(summary.table_name, recursive_insert_source.insert_source.table_name);
-            try expectOptionalUsize(summary.ctes, 1);
-            try expectQuerySummary(summary, recursive_insert_source.insert_source.insert_source.req.source);
-            try expectOptionalUsize(summary.operations, recursive_insert_source.insert_source.insert_source.req.assignments.len);
-            const conflict_patch_expressions = if (recursive_insert_source.insert_source.insert_source.req.on_conflict) |conflict| conflict.patch_expressions.len else 0;
-            const conflict_increment_expressions = if (recursive_insert_source.insert_source.insert_source.req.on_conflict) |conflict| conflict.increment_expressions.len else 0;
-            const conflict_json_set_expressions = if (recursive_insert_source.insert_source.insert_source.req.on_conflict) |conflict| conflict.json_set_expressions.len else 0;
-            try expectOptionalUsize(summary.patch_expressions, conflict_patch_expressions);
-            try expectOptionalUsize(summary.increment_expressions, conflict_increment_expressions);
-            try expectOptionalUsize(summary.json_set_expressions, conflict_json_set_expressions);
-            try expectOptionalUsize(summary.returning, recursive_insert_source.insert_source.insert_source.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, recursive_insert_source.insert_source.insert_source.req.returning_all);
-            if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, recursive_insert_source.insert_source.conflict_where);
-        },
-        .update => |update| {
-            try expectOptionalTableName(summary.table_name, update.table_name);
-            try expectOptionalUsize(summary.operations, transformOperationCount(update.batch.transforms));
-            try expectOptionalUsize(summary.returning, update.batch.returning_rows.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, update.returning_all);
-        },
-        .delete => |delete| {
-            try expectOptionalTableName(summary.table_name, delete.table_name);
-            try expectOptionalUsize(summary.returning, delete.batch.returning_rows.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, delete.returning_all);
-        },
-        .update_source => |update_source| {
-            try expectOptionalTableName(summary.table_name, update_source.table_name);
-            try expectQuerySummary(summary, update_source.mutation.req.source);
-            try expectOptionalUsize(summary.operations, update_source.mutation.req.operations.len);
-            try expectOptionalUsize(summary.patch_expressions, update_source.mutation.req.patch_expressions.len);
-            try expectOptionalUsize(summary.increment_expressions, update_source.mutation.req.increment_expressions.len);
-            try expectOptionalUsize(summary.json_set_expressions, update_source.mutation.req.json_set_expressions.len);
-            try expectOptionalUsize(summary.returning, update_source.mutation.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, update_source.mutation.req.returning_all);
-        },
-        .delete_source => |delete_source| {
-            try expectOptionalTableName(summary.table_name, delete_source.table_name);
-            try expectQuerySummary(summary, delete_source.mutation.req.source);
-            try expectOptionalUsize(summary.returning, delete_source.mutation.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, delete_source.mutation.req.returning_all);
-        },
-        .truncate_source => |truncate_source| {
-            try expectOptionalTableName(summary.table_name, truncate_source.table_name);
-            try expectQuerySummary(summary, truncate_source.mutation.req.source);
-            try std.testing.expectEqual(db_mod.types.RelationalRowsMutationKind.delete, truncate_source.mutation.req.kind);
-            try std.testing.expectEqual(@as(usize, 0), truncate_source.mutation.req.returning.len);
-            try std.testing.expect(!truncate_source.mutation.req.returning_all);
-        },
-        .update_joined_source => |update_joined_source| {
-            try expectOptionalTableName(summary.table_name, update_joined_source.target_table_name);
-            try expectOptionalUsize(summary.ctes, update_joined_source.mutation.req.ctes.len);
-            try expectCombinedQuerySourceSummary(summary, update_joined_source.mutation.req.join.left, update_joined_source.mutation.req.join.right);
-            try expectOptionalUsize(summary.join_on, update_joined_source.mutation.req.join.on.len);
-            try expectOptionalUsize(summary.order_by, update_joined_source.mutation.req.join.order_by.len);
-            try expectOptionalU32(summary.limit, update_joined_source.mutation.req.join.limit);
-            try expectOptionalU32(summary.offset, update_joined_source.mutation.req.join.offset);
-            try expectOptionalUsize(summary.operations, update_joined_source.mutation.req.operations.len);
-            try expectOptionalUsize(summary.source_assignments, update_joined_source.mutation.req.source_assignments.len);
-            try expectOptionalUsize(summary.patch_expressions, update_joined_source.mutation.req.patch_expressions.len);
-            try expectOptionalUsize(summary.increment_expressions, update_joined_source.mutation.req.increment_expressions.len);
-            try expectOptionalUsize(summary.json_set_expressions, update_joined_source.mutation.req.json_set_expressions.len);
-            try expectOptionalUsize(summary.returning, update_joined_source.mutation.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, update_joined_source.mutation.req.returning_all);
-        },
-        .delete_joined_source => |delete_joined_source| {
-            try expectOptionalTableName(summary.table_name, delete_joined_source.target_table_name);
-            try expectOptionalUsize(summary.ctes, delete_joined_source.mutation.req.ctes.len);
-            try expectCombinedQuerySourceSummary(summary, delete_joined_source.mutation.req.join.left, delete_joined_source.mutation.req.join.right);
-            try expectOptionalUsize(summary.join_on, delete_joined_source.mutation.req.join.on.len);
-            try expectOptionalUsize(summary.order_by, delete_joined_source.mutation.req.join.order_by.len);
-            try expectOptionalU32(summary.limit, delete_joined_source.mutation.req.join.limit);
-            try expectOptionalU32(summary.offset, delete_joined_source.mutation.req.join.offset);
-            try expectOptionalUsize(summary.returning, delete_joined_source.mutation.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, delete_joined_source.mutation.req.returning_all);
-        },
-        .recursive_update_joined_source => |recursive_update_joined_source| {
-            try expectOptionalTableName(summary.table_name, recursive_update_joined_source.mutation.target_table_name);
-            try expectOptionalUsize(summary.ctes, 1);
-            try expectCombinedQuerySourceSummary(summary, recursive_update_joined_source.mutation.mutation.req.join.left, recursive_update_joined_source.mutation.mutation.req.join.right);
-            try expectOptionalUsize(summary.join_on, recursive_update_joined_source.mutation.mutation.req.join.on.len);
-            try expectOptionalUsize(summary.order_by, recursive_update_joined_source.mutation.mutation.req.join.order_by.len);
-            try expectOptionalU32(summary.limit, recursive_update_joined_source.mutation.mutation.req.join.limit);
-            try expectOptionalU32(summary.offset, recursive_update_joined_source.mutation.mutation.req.join.offset);
-            try expectOptionalUsize(summary.operations, recursive_update_joined_source.mutation.mutation.req.operations.len);
-            try expectOptionalUsize(summary.source_assignments, recursive_update_joined_source.mutation.mutation.req.source_assignments.len);
-            try expectOptionalUsize(summary.patch_expressions, recursive_update_joined_source.mutation.mutation.req.patch_expressions.len);
-            try expectOptionalUsize(summary.increment_expressions, recursive_update_joined_source.mutation.mutation.req.increment_expressions.len);
-            try expectOptionalUsize(summary.json_set_expressions, recursive_update_joined_source.mutation.mutation.req.json_set_expressions.len);
-            try expectOptionalUsize(summary.returning, recursive_update_joined_source.mutation.mutation.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, recursive_update_joined_source.mutation.mutation.req.returning_all);
-        },
-        .recursive_delete_joined_source => |recursive_delete_joined_source| {
-            try expectOptionalTableName(summary.table_name, recursive_delete_joined_source.mutation.target_table_name);
-            try expectOptionalUsize(summary.ctes, 1);
-            try expectCombinedQuerySourceSummary(summary, recursive_delete_joined_source.mutation.mutation.req.join.left, recursive_delete_joined_source.mutation.mutation.req.join.right);
-            try expectOptionalUsize(summary.join_on, recursive_delete_joined_source.mutation.mutation.req.join.on.len);
-            try expectOptionalUsize(summary.order_by, recursive_delete_joined_source.mutation.mutation.req.join.order_by.len);
-            try expectOptionalU32(summary.limit, recursive_delete_joined_source.mutation.mutation.req.join.limit);
-            try expectOptionalU32(summary.offset, recursive_delete_joined_source.mutation.mutation.req.join.offset);
-            try expectOptionalUsize(summary.returning, recursive_delete_joined_source.mutation.mutation.req.returning.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, recursive_delete_joined_source.mutation.mutation.req.returning_all);
-        },
-        .merge_mutation => |merge_mutation| {
-            try expectOptionalTableName(summary.table_name, merge_mutation.target_table_name);
-            try expectOptionalUsize(summary.ctes, merge_mutation.ctes.len);
-            try expectOptionalUsize(summary.join_on, merge_mutation.match_fields.len);
-            try expectOptionalUsize(summary.matched_predicates, mergeMatchedPredicateCount(merge_mutation.matched_arms));
-            try expectOptionalUsize(summary.operations, mergeMatchedUpdateCount(merge_mutation.matched_arms));
-            if (summary.matched_delete) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDelete(merge_mutation.matched_arms));
-            if (summary.matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDoNothing(merge_mutation.matched_arms));
-            try expectOptionalUsize(summary.not_matched_predicates, mergeNotMatchedPredicateCount(merge_mutation.not_matched_arms));
-            try expectOptionalUsize(summary.select, mergeNotMatchedInsertCount(merge_mutation.not_matched_arms));
-            if (summary.not_matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeNotMatchedHasDoNothing(merge_mutation.not_matched_arms));
-            try expectOptionalUsize(summary.returning, merge_mutation.returning.fields.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, merge_mutation.returning.returnsAll());
-        },
-        .recursive_merge_mutation => |recursive_merge_mutation| {
-            const merge_mutation = recursive_merge_mutation.merge;
-            try expectOptionalTableName(summary.table_name, merge_mutation.target_table_name);
-            try expectOptionalUsize(summary.ctes, 1);
-            try expectOptionalUsize(summary.join_on, merge_mutation.match_fields.len);
-            try expectOptionalUsize(summary.matched_predicates, mergeMatchedPredicateCount(merge_mutation.matched_arms));
-            try expectOptionalUsize(summary.operations, mergeMatchedUpdateCount(merge_mutation.matched_arms));
-            if (summary.matched_delete) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDelete(merge_mutation.matched_arms));
-            if (summary.matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeMatchedHasDoNothing(merge_mutation.matched_arms));
-            try expectOptionalUsize(summary.not_matched_predicates, mergeNotMatchedPredicateCount(merge_mutation.not_matched_arms));
-            try expectOptionalUsize(summary.select, mergeNotMatchedInsertCount(merge_mutation.not_matched_arms));
-            if (summary.not_matched_do_nothing) |expected| try std.testing.expectEqual(expected, mergeNotMatchedHasDoNothing(merge_mutation.not_matched_arms));
-            try expectOptionalUsize(summary.returning, merge_mutation.returning.fields.len);
-            if (summary.returning_all) |expected| try std.testing.expectEqual(expected, merge_mutation.returning.returnsAll());
-        },
-    }
-}
-
-fn expectAppParityExplainSummary(summary: AppParityPlanSummary, lowered: LoweredExplainPlan) !void {
-    switch (lowered.subject) {
-        .read => |read| try expectAppParityReadSummary(summary, read),
-        .write => |write| try expectAppParityWriteSummary(summary, write),
-    }
-}
+const expectAppParityReadSummary = sql_adapter.expectAppParityReadSummary;
+const expectAppParityWriteSummary = sql_adapter.expectAppParityWriteSummary;
+const expectAppParityExplainSummary = sql_adapter.expectAppParityExplainSummary;
 
 fn appParityPlanFamilyIsSupportedRead(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {

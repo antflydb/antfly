@@ -2,12 +2,6 @@
   "resolution_format": 1,
   "resolved": [
     {
-      "reason": "aggregate_duplicate_output_name",
-      "coverage": [
-        "unsupported_read_aggregate_duplicate_output_name"
-      ]
-    },
-    {
       "reason": "bulk_io_plan",
       "coverage": [
         "ddl_copy_binary_execution_contract",
@@ -32,12 +26,6 @@
       "reason": "duplicate_conflict_update_target",
       "coverage": [
         "invalid_duplicate_conflict_update_target"
-      ]
-    },
-    {
-      "reason": "duplicate_output_name",
-      "coverage": [
-        "unsupported_read_duplicate_output_name"
       ]
     },
     {

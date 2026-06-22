@@ -46,7 +46,9 @@ pub const SqlWriteStatementKind = enum {
     insert,
     insert_source,
     update,
+    update_joined_source,
     delete,
+    delete_joined_source,
     truncate,
     merge,
 };
@@ -87,14 +89,19 @@ pub fn classifyStatementFamily(tokens: []const Token) ?SqlStatementFamily {
 
 pub fn classifyWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
     return switch (classifyStatementFamily(tokens) orelse return null) {
-        .insert => .insert,
+        .insert => classifyInsertStatement(tokens, 0),
         .with => classifyWithWriteStatement(tokens),
-        .update => .update,
-        .delete => .delete,
+        .update => classifyUpdateStatement(tokens, 0),
+        .delete => classifyDeleteStatement(tokens, 0),
         .truncate => .truncate,
         .merge => .merge,
         .select, .ddl => null,
     };
+}
+
+pub fn classifyRecursiveWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
+    const index = withFinalStatementIndex(tokens, .{ .allow_recursive = true }) orelse return null;
+    return withFinalStatementWriteKind(tokens[index..]);
 }
 
 pub fn classifyReadStatement(tokens: []const Token) ?SqlReadStatementKind {
@@ -111,6 +118,7 @@ pub fn classifyReadStatement(tokens: []const Token) ?SqlReadStatementKind {
     if (readHasTopLevelSetOperation(statement)) return .set_operation;
     if (readHasTopLevelKeyword(statement, "lateral")) return .lateral;
     if (readHasTopLevelKeyword(statement, "over")) return .window;
+    if (readIsDistinctOnShape(statement)) return .query;
     if (readHasAggregateShape(statement)) return .aggregate;
     if (readHasTopLevelKeyword(statement, "join")) return .join;
     return .query;
@@ -126,12 +134,12 @@ pub fn classifyPreparedStatementStatementKind(tokens: []const Token, start: usiz
         const with_tokens = tokens[start..];
         const final_index = withFinalStatementIndex(with_tokens, .{ .allow_recursive = true }) orelse return null;
         if (with_tokens[final_index].isKeyword(.select)) return .read;
-        if (withFinalStatementWriteKind(with_tokens[final_index])) |kind| return preparedStatementKindFromWriteKind(kind);
+        if (withFinalStatementWriteKind(with_tokens[final_index..])) |kind| return preparedStatementKindFromWriteKind(kind);
         return null;
     }
-    if (statementStartsAt(tokens, start, "insert")) return .insert;
-    if (statementStartsAt(tokens, start, "update")) return .update;
-    if (statementStartsAt(tokens, start, "delete")) return .delete;
+    if (classifyInsertStatement(tokens, start)) |kind| return preparedStatementKindFromWriteKind(kind);
+    if (classifyUpdateStatement(tokens, start)) |kind| return preparedStatementKindFromWriteKind(kind);
+    if (classifyDeleteStatement(tokens, start)) |kind| return preparedStatementKindFromWriteKind(kind);
     if (statementStartsAt(tokens, start, "truncate")) return .truncate;
     if (statementStartsAt(tokens, start, "merge")) return .merge;
     if (statementStartsAt(tokens, start, "create") or
@@ -162,7 +170,9 @@ fn preparedStatementKindFromWriteKind(kind: SqlWriteStatementKind) SqlPreparedSt
         .insert => .insert,
         .insert_source => .insert_source,
         .update => .update,
+        .update_joined_source => .update,
         .delete => .delete,
+        .delete_joined_source => .delete,
         .truncate => .truncate,
         .merge => .merge,
     };
@@ -170,7 +180,7 @@ fn preparedStatementKindFromWriteKind(kind: SqlWriteStatementKind) SqlPreparedSt
 
 fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
     const index = withFinalStatementIndex(tokens, .{}) orelse return null;
-    return withFinalStatementWriteKind(tokens[index]);
+    return withFinalStatementWriteKind(tokens[index..]);
 }
 
 const WithFinalStatementOptions = struct {
@@ -202,16 +212,58 @@ fn withFinalStatementIndex(tokens: []const Token, options: WithFinalStatementOpt
     return index;
 }
 
-fn withFinalStatementWriteKind(token: Token) ?SqlWriteStatementKind {
-    if (token.kind != .identifier) return null;
-    return switch (token.keyword orelse return null) {
-        .insert => .insert_source,
-        .update => .update,
-        .delete => .delete,
+fn withFinalStatementWriteKind(tokens: []const Token) ?SqlWriteStatementKind {
+    if (tokens.len == 0 or tokens[0].kind != .identifier) return null;
+    return switch (tokens[0].keyword orelse return null) {
+        .insert => classifyInsertStatement(tokens, 0),
+        .update => classifyUpdateStatement(tokens, 0),
+        .delete => classifyDeleteStatement(tokens, 0),
         .merge => .merge,
         .truncate => .truncate,
         else => null,
     };
+}
+
+fn classifyInsertStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
+    if (!statementStartsAt(tokens, start, "insert")) return null;
+    const statement = tokens[start..];
+    const select_index = parser.findTopLevelKeyword(statement, "select");
+    const values_index = parser.findTopLevelKeyword(statement, "values");
+    const default_index = parser.findTopLevelKeyword(statement, "default");
+    if (select_index) |select_pos| {
+        if (values_index == null or select_pos < values_index.?) {
+            if (default_index == null or select_pos < default_index.?) return .insert_source;
+        }
+    }
+    return .insert;
+}
+
+fn classifyUpdateStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
+    if (!statementStartsAt(tokens, start, "update")) return null;
+    const statement = tokens[start..];
+    const set_index = parser.findTopLevelKeyword(statement, "set") orelse return .update;
+    const from_index = parser.findTopLevelKeywordFromIndex(statement, set_index + 1, "from") orelse return .update;
+    const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
+    return if (from_index < stop_index) .update_joined_source else .update;
+}
+
+fn classifyDeleteStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
+    if (!statementStartsAt(tokens, start, "delete")) return null;
+    const statement = tokens[start..];
+    const from_index = parser.findTopLevelKeyword(statement, "from") orelse return .delete;
+    const using_index = parser.findTopLevelKeywordFromIndex(statement, from_index + 1, "using") orelse return .delete;
+    const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
+    return if (using_index < stop_index) .delete_joined_source else .delete;
+}
+
+fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []const []const u8) ?usize {
+    var first: ?usize = null;
+    for (keywords) |keyword| {
+        if (parser.findTopLevelKeywordFromIndex(tokens, start, keyword)) |index| {
+            if (first == null or index < first.?) first = index;
+        }
+    }
+    return first;
 }
 
 fn keywordAt(tokens: []const Token, index: usize, keyword: []const u8) bool {
@@ -250,6 +302,10 @@ fn readHasTopLevelKeyword(tokens: []const Token, keyword: []const u8) bool {
 }
 
 fn readHasAggregateShape(tokens: []const Token) bool {
+    if (tokens.len > 1 and tokens[0].isKeyword(.select) and tokens[1].isKeyword(.distinct) and !readIsDistinctOnShape(tokens)) {
+        return true;
+    }
+
     var depth: usize = 0;
     for (tokens, 0..) |token, index| {
         switch (token.kind) {
@@ -273,6 +329,10 @@ fn readHasAggregateShape(tokens: []const Token) bool {
     return false;
 }
 
+fn readIsDistinctOnShape(tokens: []const Token) bool {
+    return tokens.len > 2 and tokens[0].isKeyword(.select) and tokens[1].isKeyword(.distinct) and tokens[2].isKeyword(.on);
+}
+
 fn sqlAggregateFunctionName(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "count") or
         std.ascii.eqlIgnoreCase(name, "sum") or
@@ -292,7 +352,9 @@ test "sql adapter classifier identifies write statement families" {
         expected: SqlWriteStatementKind,
     }{
         .{ .sql = "INSERT INTO usage_records(id) VALUES ('u1')", .expected = .insert },
+        .{ .sql = "INSERT INTO usage_records(id) SELECT id FROM archived_records", .expected = .insert_source },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows", .expected = .insert_source },
+        .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) VALUES ('u1')", .expected = .insert },
         .{ .sql = "WITH source_rows AS MATERIALIZED (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)", .expected = .update },
         .{ .sql = "WITH source_rows AS NOT MATERIALIZED (SELECT id FROM usage_records) DELETE FROM usage_records WHERE id IN (SELECT id FROM source_rows)", .expected = .delete },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = 'done'", .expected = .merge },
@@ -342,6 +404,8 @@ test "sql adapter classifier identifies read statement families" {
         .{ .sql = "SELECT org.id FROM usage_records AS org LEFT JOIN LATERAL (SELECT id FROM balance_records) AS bal ON true", .expected = .lateral },
         .{ .sql = "SELECT row_number() OVER (ORDER BY amount) FROM usage_records", .expected = .window },
         .{ .sql = "SELECT customer_id, count(*) FROM usage_records GROUP BY customer_id", .expected = .aggregate },
+        .{ .sql = "SELECT DISTINCT organization_id, status FROM usage_records ORDER BY organization_id", .expected = .aggregate },
+        .{ .sql = "SELECT DISTINCT ON (organization_id) organization_id, status FROM usage_records ORDER BY organization_id", .expected = .query },
         .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM archived_records", .expected = .set_operation },
         .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .expected = .query },
         .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .expected = .recursive_cte },

@@ -464,6 +464,66 @@ The end state should feel like this at API call sites:
 - executors and lifecycle services never need to know the request started as
   SQL.
 
+### Production Ownership Model
+
+The clean long-term shape is to treat SQL as a compiler frontend and Antfly
+services as the only owners of durable behavior. The SQL adapter should know
+PostgreSQL syntax, session rules, diagnostics, and how to lower syntax into
+Antfly-native intent. It should not own catalog mutations, role policy,
+extension state, index builds, storage placement, lake access, backup/restore
+semantics, or distributed job admission.
+
+That means each supported statement family should have one typed handoff:
+
+| SQL surface | Adapter output | Durable owner |
+| --- | --- | --- |
+| `SELECT`, joins, aggregates, windows, CTEs | Bound read plan | Row/query planner and storage read vtables |
+| `INSERT`, `UPDATE`, `DELETE`, `MERGE` | Bound write or mutation-source plan | Row write, claim, 2PC, and storage write vtables |
+| Table, database, namespace, tablespace DDL | Catalog lifecycle plan | Catalog service and metadata consensus path |
+| Index and derived-artifact DDL | Derived-index lifecycle plan | Index lifecycle, build, catch-up, and artifact jobs |
+| Role and grant SQL | Role lifecycle/authorization plan | Antfly user and role management service |
+| Extension SQL | Extension lifecycle plan | Extension package/install/update/drop service |
+| `ALTER ...` work that needs asynchronous validation | Typed lifecycle job request | Shared durable jobs service admitted through metadata ownership |
+| Lake, foreign-source, backup, restore SQL | Catalog-targeted storage/source plan | Lake, backup/restore, and storage services |
+| Session commands | Typed session mutation plan | SQL session state owner |
+
+The metadata leader or equivalent catalog owner should be the only component
+that commits catalog state transitions and lifecycle job records. SQL execution
+may prepare and validate a lifecycle plan, but it should not independently
+persist metadata, schedule background work, or mutate placement state outside
+the shared catalog/job service. This keeps REST, SQL, MCP, A2A, CLI, SDK, and
+internal automation on the same concurrency, authorization, audit, and retry
+model.
+
+Native APIs should not call back into SQL to get behavior. The dependency
+direction is one-way:
+
+```text
+SQL syntax -> parsed/bound SQL objects -> native Antfly plans -> shared services
+REST/SDK/MCP/A2A/CLI typed requests --------------------------^
+```
+
+If REST and SQL need the same operation, the shared service or plan builder is
+the reusable API. SQL-specific code may adapt syntax into that API, but the
+shared API must not accept SQL text as its semantic payload.
+
+For long-running `ALTER` and validation-heavy DDL, the production model should
+be:
+
+1. Parse SQL into a raw statement with spans.
+2. Bind catalog identity, session defaults, authorization, object versions, and
+   dependency facts.
+3. Build a typed lifecycle plan that describes the requested durable state.
+4. Submit that plan to the catalog/job owner, which records an idempotent job,
+   performs compare-and-swap catalog transitions, and owns retry/audit state.
+5. Expose status through the same job and lifecycle APIs used by non-SQL
+   callers.
+
+Fail-closed behavior belongs at the first phase with enough information to make
+the decision. Syntax gaps fail in parse/classify, missing catalog semantics fail
+in bind, unsupported native lifecycle semantics fail in plan, and runtime
+storage or placement failures fail in execution with typed diagnostics.
+
 ### Production Module Boundaries
 
 The long-term implementation should split SQL adapter ownership by phase:

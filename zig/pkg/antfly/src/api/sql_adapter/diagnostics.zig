@@ -84,7 +84,12 @@ pub fn classificationReasonIsAdapterNoop(reason: SqlAdapterClassificationReason)
 }
 
 pub fn classificationReasonIsUnsupportedRequirement(reason: SqlAdapterClassificationReason) bool {
-    return !classificationReasonIsAdapterNoop(reason);
+    return switch (reason) {
+        .aggregate_duplicate_output_name,
+        .duplicate_output_name,
+        => false,
+        else => !classificationReasonIsAdapterNoop(reason),
+    };
 }
 
 pub const NativeRequirementCategory = enum {
@@ -176,6 +181,8 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(!classificationReasonIsAdapterNoop(.set_operation_plan));
     try std.testing.expect(classificationReasonIsUnsupportedRequirement(.set_operation_plan));
     try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.session_setting));
+    try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.aggregate_duplicate_output_name));
+    try std.testing.expect(!classificationReasonIsUnsupportedRequirement(.duplicate_output_name));
     try std.testing.expect(!classificationReasonTokenIsKnown("set operation plan"));
     try std.testing.expect(!classificationReasonTokenIsKnown("future_reason"));
     try std.testing.expect(!classificationReasonTokenIsKnown(""));

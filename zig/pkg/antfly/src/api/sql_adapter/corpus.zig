@@ -6910,6 +6910,7 @@ pub const AppParityCorpusCoverage = struct {
     read_set_operation_cross_table_except_classifier: bool = false,
     read_set_operation_cross_table_intersect_classifier: bool = false,
     read_set_operation_cross_table_source_schema_classifier: bool = false,
+    read_window_duplicate_output_label: bool = false,
     query: bool = false,
     aggregate: bool = false,
     join: bool = false,
@@ -6953,8 +6954,6 @@ pub const AppParityCorpusCoverage = struct {
     delete_joined_source_cte_mutation: bool = false,
     adapter_noop_ddl: bool = false,
     unsupported_read: bool = false,
-    unsupported_read_aggregate_duplicate_output_name: bool = false,
-    unsupported_read_duplicate_output_name: bool = false,
     unsupported_ddl: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
@@ -7328,6 +7327,7 @@ pub const AppParityCorpusCoverage = struct {
     aggregate_percentile_nulls: bool = false,
     aggregate_percentile_array: bool = false,
     aggregate_mode: bool = false,
+    aggregate_duplicate_output_label: bool = false,
     aggregate_group_expression: bool = false,
     aggregate_group_expression_alias: bool = false,
     aggregate_having_expression: bool = false,
@@ -7946,6 +7946,10 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":percentile_array=");
                 self.aggregate_mode = self.aggregate_mode or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":mode=");
+                self.aggregate_duplicate_output_label = self.aggregate_duplicate_output_label or
+                    (std.mem.indexOf(u8, entry.sql, "COUNT(*) AS customer_id") != null and
+                        sql_adapter.planHasExactUsizeToken(entry.plan, ":group=", 1) and
+                        sql_adapter.planHasExactUsizeToken(entry.plan, ":aggs=", 1));
                 self.aggregate_group_expression = self.aggregate_group_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=") and
                     std.mem.indexOf(u8, entry.sql, "GROUP BY status_key") != null);
@@ -8200,6 +8204,10 @@ pub const AppParityCorpusCoverage = struct {
                 self.read_join = self.read_join or std.mem.startsWith(u8, entry.plan, "read:join:");
                 self.read_lateral = self.read_lateral or std.mem.startsWith(u8, entry.plan, "read:lateral:");
                 self.read_window = self.read_window or is_read_window;
+                self.read_window_duplicate_output_label = self.read_window_duplicate_output_label or
+                    (is_read_window and
+                        std.mem.indexOf(u8, entry.sql, "row_number() OVER") != null and
+                        std.mem.indexOf(u8, entry.sql, " AS id") != null);
                 self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
                         appParityEntryHasCatalogSchemas(entry) and
@@ -8242,10 +8250,6 @@ pub const AppParityCorpusCoverage = struct {
             },
         }
         if (entry.family == .unsupported_read) {
-            self.unsupported_read_aggregate_duplicate_output_name = self.unsupported_read_aggregate_duplicate_output_name or
-                std.mem.eql(u8, entry.classification_reason, "aggregate_duplicate_output_name");
-            self.unsupported_read_duplicate_output_name = self.unsupported_read_duplicate_output_name or
-                std.mem.eql(u8, entry.classification_reason, "duplicate_output_name");
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
                     std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null);

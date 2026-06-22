@@ -456,6 +456,10 @@ test "sql adapter tokenized sql classifies read and write statements once" {
     defer joined.deinit(alloc);
     try std.testing.expectEqual(classifier.SqlReadStatementKind.join, joined.read_statement_kind.?);
 
+    var distinct_on = try ParsedSql.initAlloc(alloc, "SELECT DISTINCT ON (organization_id) organization_id, id FROM usage_records ORDER BY organization_id ASC, created_at DESC");
+    defer distinct_on.deinit(alloc);
+    try std.testing.expectEqual(classifier.SqlReadStatementKind.query, distinct_on.readStatementKind().?);
+
     var write = try TokenizedSql.initAlloc(alloc, "WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
     defer write.deinit(alloc);
     try std.testing.expectEqual(classifier.SqlStatementFamily.with, write.statement_family.?);
