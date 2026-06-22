@@ -22,6 +22,8 @@ pub const TokenKind = token_mod.TokenKind;
 pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUnmanaged(Token) {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     errdefer freeTokens(alloc, &tokens);
+    const estimated_capacity = estimateTokenCapacity(sql);
+    if (estimated_capacity > 0) try tokens.ensureTotalCapacity(alloc, estimated_capacity);
 
     var i: usize = 0;
     while (i < sql.len) {
@@ -86,7 +88,7 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             if (sqlCastTypeAt(sql, i)) |cast_type| {
                 i = cast_type.end;
                 if (sqlCastTypeIsNumeric(cast_type.name)) {
-                    if (!sqlStringIsJsonNumber(alloc, owned)) return error.UnsupportedSqlShape;
+                    if (!sqlStringIsJsonNumber(owned)) return error.UnsupportedSqlShape;
                     try tokens.append(alloc, .{ .kind = .number, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
                 } else if (sqlCastTypeIsBoolean(cast_type.name)) {
                     if (!std.ascii.eqlIgnoreCase(owned, "true") and !std.ascii.eqlIgnoreCase(owned, "false")) return error.UnsupportedSqlShape;
@@ -281,6 +283,11 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
     return tokens;
 }
 
+fn estimateTokenCapacity(sql: []const u8) usize {
+    if (sql.len == 0) return 0;
+    return @min(sql.len, sql.len / 4 + 8);
+}
+
 pub fn freeTokens(alloc: std.mem.Allocator, tokens: *std.ArrayListUnmanaged(Token)) void {
     for (tokens.items) |token| {
         if (token.owned) alloc.free(token.text);
@@ -396,10 +403,40 @@ fn sqlCastTypeIsBoolean(type_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(type_name, "boolean");
 }
 
-fn sqlStringIsJsonNumber(alloc: std.mem.Allocator, text: []const u8) bool {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, text, .{}) catch return false;
-    defer parsed.deinit();
-    return parsed.value == .integer or parsed.value == .float;
+fn sqlStringIsJsonNumber(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var i: usize = 0;
+    if (text[i] == '-') {
+        i += 1;
+        if (i == text.len) return false;
+    }
+
+    if (text[i] == '0') {
+        i += 1;
+        if (i < text.len and std.ascii.isDigit(text[i])) return false;
+    } else if (text[i] >= '1' and text[i] <= '9') {
+        i += 1;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+    } else {
+        return false;
+    }
+
+    if (i < text.len and text[i] == '.') {
+        i += 1;
+        const fraction_start = i;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+        if (i == fraction_start) return false;
+    }
+
+    if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
+        i += 1;
+        if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+        const exponent_start = i;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+        if (i == exponent_start) return false;
+    }
+
+    return i == text.len;
 }
 
 test "sql adapter lexer records source spans and dollar quoted literals" {
@@ -432,4 +469,15 @@ test "sql adapter lexer records source spans and dollar quoted literals" {
 test "sql adapter lexer rejects unterminated dollar quoted literals" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT $tag$unterminated"));
+}
+
+test "sql adapter lexer validates numeric casts without JSON allocation" {
+    try std.testing.expect(sqlStringIsJsonNumber("42"));
+    try std.testing.expect(sqlStringIsJsonNumber("-42.5e+2"));
+    try std.testing.expect(sqlStringIsJsonNumber("0"));
+    try std.testing.expect(!sqlStringIsJsonNumber(""));
+    try std.testing.expect(!sqlStringIsJsonNumber("+1"));
+    try std.testing.expect(!sqlStringIsJsonNumber("01"));
+    try std.testing.expect(!sqlStringIsJsonNumber("1."));
+    try std.testing.expect(!sqlStringIsJsonNumber("1e"));
 }

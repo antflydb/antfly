@@ -10772,6 +10772,20 @@ fn aggregateSpecNameCollision(
     return false;
 }
 
+fn aggregateSpecNameCollidesWithGroupOutput(
+    name: []const u8,
+    group_fields: []const []const u8,
+    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
+) bool {
+    for (group_fields) |field| {
+        if (std.mem.eql(u8, field, name)) return true;
+    }
+    for (group_expressions) |projection| {
+        if (std.mem.eql(u8, projection.output, name)) return true;
+    }
+    return false;
+}
+
 fn allocateDisambiguatedAggregateSpecNameAlloc(
     alloc: std.mem.Allocator,
     name: []const u8,
@@ -10872,6 +10886,7 @@ pub fn parseAggregateSelectListAlloc(
             );
             var parsed_spec_transferred = false;
             errdefer if (!parsed_spec_transferred) plan_mod.freeAggregateSpec(alloc, parsed_spec);
+            if (aggregateSpecNameCollidesWithGroupOutput(parsed_spec.name, group_fields.items, group_expressions.items)) return error.UnsupportedSqlShape;
             const maybe_spec_name = try allocateDisambiguatedAggregateSpecNameAlloc(
                 alloc,
                 parsed_spec.name,
@@ -26362,7 +26377,7 @@ test "sql adapter lower expr lowers select distinct to group-only aggregate" {
         &.{},
     ));
 
-    var distinct_on = try lowerSelectAlloc(
+    var distinct_on = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT DISTINCT ON (customer) customer, id FROM usage_records WHERE status = 'open' ORDER BY customer ASC, created_at DESC LIMIT 3",
         schema,
@@ -26370,12 +26385,12 @@ test "sql adapter lower expr lowers select distinct to group-only aggregate" {
     );
     defer distinct_on.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", distinct_on.table_name);
-    try std.testing.expectEqual(@as(usize, 1), distinct_on.query.distinct_on_expressions.len);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, distinct_on.query.distinct_on_expressions[0].kind);
-    try std.testing.expectEqualStrings("customer", distinct_on.query.distinct_on_expressions[0].field);
-    try std.testing.expectEqual(@as(usize, 2), distinct_on.query.select.len);
-    try std.testing.expectEqual(@as(usize, 2), distinct_on.query.order_by.len);
-    try std.testing.expectEqual(@as(u32, 3), distinct_on.query.limit.?);
+    try std.testing.expectEqual(@as(usize, 1), distinct_on.plan.query.distinct_on_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, distinct_on.plan.query.distinct_on_expressions[0].kind);
+    try std.testing.expectEqualStrings("customer", distinct_on.plan.query.distinct_on_expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 2), distinct_on.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 2), distinct_on.plan.query.order_by.len);
+    try std.testing.expectEqual(@as(u32, 3), distinct_on.plan.query.limit.?);
 
     try std.testing.expectError(error.UnsupportedSqlShape, lowerAggregateForLowerExprTestAlloc(
         alloc,
@@ -26410,7 +26425,7 @@ test "sql adapter lower expr lowers select distinct to group-only aggregate" {
     try std.testing.expectEqual(@as(usize, 0), distinct_global_aggregate.aggregate.group_expressions.len);
     try std.testing.expectEqual(@as(usize, 1), distinct_global_aggregate.aggregate.aggregations.len);
     try std.testing.expectEqualStrings("row_count", distinct_global_aggregate.aggregate.aggregations[0].name);
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerSelectAlloc(
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT DISTINCT ON (customer) customer, id FROM usage_records ORDER BY created_at DESC",
         schema,
@@ -26762,7 +26777,7 @@ test "sql adapter lower expr lowers bounded array aggregate specs" {
     try std.testing.expect(lowered.aggregate.aggregations[0].distinct);
     try std.testing.expectEqual(db_mod.types.default_relational_rows_aggregate_distinct_max_items, lowered.aggregate.aggregations[0].distinct_max_items);
     try std.testing.expectEqualStrings("status", lowered.aggregate.aggregations[0].field.?);
-    try std.testing.expectEqual(default_array_agg_max_items, lowered.aggregate.aggregations[0].array_max_items);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_array_agg_max_items, lowered.aggregate.aggregations[0].array_max_items);
     try std.testing.expectEqual(@as(usize, 1), lowered.aggregate.aggregations[0].array_order_by.len);
     try std.testing.expectEqualStrings("amount", lowered.aggregate.aggregations[0].array_order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, lowered.aggregate.aggregations[0].array_order_by[0].direction);
@@ -26779,7 +26794,7 @@ test "sql adapter lower expr lowers bounded array aggregate specs" {
     try std.testing.expectEqual(@as(usize, 1), json_lowered.aggregate.aggregations.len);
     try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.array_agg, json_lowered.aggregate.aggregations[0].op);
     try std.testing.expectEqualStrings("metadata", json_lowered.aggregate.aggregations[0].field.?);
-    try std.testing.expectEqual(default_array_agg_max_items, json_lowered.aggregate.aggregations[0].array_max_items);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_array_agg_max_items, json_lowered.aggregate.aggregations[0].array_max_items);
 
     var string_lowered = try lowerAggregateForLowerExprTestAlloc(
         alloc,
@@ -26793,7 +26808,7 @@ test "sql adapter lower expr lowers bounded array aggregate specs" {
     try std.testing.expect(string_lowered.aggregate.aggregations[0].distinct);
     try std.testing.expectEqualStrings("status", string_lowered.aggregate.aggregations[0].field.?);
     try std.testing.expectEqualStrings("|", string_lowered.aggregate.aggregations[0].string_delimiter.?);
-    try std.testing.expectEqual(default_array_agg_max_items, string_lowered.aggregate.aggregations[0].array_max_items);
+    try std.testing.expectEqual(db_mod.types.default_relational_rows_array_agg_max_items, string_lowered.aggregate.aggregations[0].array_max_items);
     try std.testing.expectEqual(@as(usize, 1), string_lowered.aggregate.aggregations[0].array_order_by.len);
     try std.testing.expectEqualStrings("amount", string_lowered.aggregate.aggregations[0].array_order_by[0].field);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, string_lowered.aggregate.aggregations[0].array_order_by[0].direction);

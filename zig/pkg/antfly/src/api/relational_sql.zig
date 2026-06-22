@@ -15542,10 +15542,14 @@ test "postgres sql adapter classifies application parity corpus" {
     try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, external_source.source_sha256, corpus);
 
     var coverage = AppParityCorpusCoverage{};
+    var entry_arena = std.heap.ArenaAllocator.init(alloc);
+    defer entry_arena.deinit();
     for (corpus) |entry| {
+        _ = entry_arena.reset(.retain_capacity);
+        const entry_alloc = entry_arena.allocator();
         errdefer std.debug.print("application parity corpus entry failed: {s}\n", .{entry.name});
-        try coverage.observe(alloc, entry);
-        try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
+        try coverage.observe(entry_alloc, entry);
+        try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
     try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
 }
@@ -15592,15 +15596,18 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
         try seen_skipped_names.put(alloc, name, {});
     }
     var coverage = AppParityCorpusCoverage{};
+    var entry_arena = std.heap.ArenaAllocator.init(alloc);
+    defer entry_arena.deinit();
 
     for (fixture_root.entries) |entry_value| {
-        const entry = try sql_adapter.parseFixtureEntryAlloc(alloc, entry_value);
-        defer sql_adapter.freeFixtureEntry(alloc, entry);
+        _ = entry_arena.reset(.retain_capacity);
+        const entry_alloc = entry_arena.allocator();
+        const entry = try sql_adapter.parseFixtureEntryAlloc(entry_alloc, entry_value);
         errdefer std.debug.print("fixture parity corpus entry failed: {s}\n", .{entry.name});
         if (seen_skipped_names.contains(entry.name)) return error.TestUnexpectedResult;
         try validateAppParityFixtureMetadataWithBaseSchema(entry, schema_json, &seen_names, alloc);
-        try coverage.observe(alloc, entry);
-        try expectAppParityCorpusEntry(alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
+        try coverage.observe(entry_alloc, entry);
+        try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
     try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
 }

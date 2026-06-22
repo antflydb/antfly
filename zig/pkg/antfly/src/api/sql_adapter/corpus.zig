@@ -5884,6 +5884,7 @@ pub const AppParityCorpusCoverage = struct {
     read_cte_aggregate_expression: bool = false,
     read_cte_window_expression: bool = false,
     read_graph_table_function_cte_join: bool = false,
+    read_graph_table_function_inline_join: bool = false,
     read_join_cross_table_source_schema_classifier: bool = false,
     read_lateral_cross_table_source_schema_classifier: bool = false,
     read_set_operation_cross_table_except_classifier: bool = false,
@@ -7178,7 +7179,13 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "customer_records"));
                 self.read_graph_table_function_cte_join = self.read_graph_table_function_cte_join or
                     (std.mem.startsWith(u8, entry.plan, "read:join:") and
+                        std.mem.startsWith(u8, entry.sql, "WITH ") and
                         std.mem.indexOf(u8, entry.sql, "antfly.graph_match") != null and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
+                self.read_graph_table_function_inline_join = self.read_graph_table_function_inline_join or
+                    (std.mem.startsWith(u8, entry.plan, "read:join:") and
+                        std.mem.indexOf(u8, entry.sql, "JOIN antfly.graph_match") != null and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or

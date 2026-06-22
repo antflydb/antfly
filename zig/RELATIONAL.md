@@ -5,6 +5,11 @@ zstd-compressed JSON blob, and every index (`full_text`, `embeddings`,
 `graph`, `algebraic`) is *derived* from that blob. Schema is optional and
 soft.
 
+SQL-specific parser, lexer, session, PostgreSQL compatibility, lowering, and
+parity-test details are documented in [SQL.md](SQL.md). This document owns the
+native relational model that SQL, REST, SDK, MCP, A2A, CLI, and internal jobs
+target.
+
 **Relational mode** is a second table profile on the same engine. It keeps
 every piece of the existing machinery — shards, Raft, indexes, enrichers, the
 join planner, and the algebraic fold runtime — but changes two things:
@@ -1030,6 +1035,9 @@ is not itself a PostgreSQL wire server, SQL parser, migration runner, or PL/SQL
 runtime. PostgreSQL-specific surface work such as `pgx` protocol behavior,
 migration-file replay, extensions, triggers, PL/pgSQL functions, and exact
 PostgreSQL DDL syntax belongs in an adapter layer above the Antfly model.
+The canonical SQL adapter architecture, parser/lexer design, SQL session
+semantics, and parity strategy are now documented in [SQL.md](SQL.md); this
+section keeps only the relational/model boundary that SQL lowers into.
 
 The useful split is:
 
@@ -6072,10 +6080,10 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    `antfly.vector_search`, `antfly.graph_match`, `antfly.graph_metric`,
    `antfly.graph_metric_rerank`, and `antfly.hybrid_search` are also
    adapter-level syntax for native typed query requests. Graph table functions
-   can additionally project as CTE-backed row sources, so `antfly.graph_match`
-   can participate in ordinary SQL reads and joins while execution still routes
-   through the native graph query path. The parity corpus treats Antfly query
-   functions as a first-class
+   can additionally project as CTE-backed row sources or inline join row
+   sources, so `antfly.graph_match` can participate in ordinary SQL reads and
+   joins while execution still routes through the native graph query path. The
+   parity corpus treats Antfly query functions as a first-class
    `query_function` family and gates full-text, dense, graph-search,
    graph traversal/path, graph-metric, graph-rerank, simple hybrid, and
    structured hybrid source-list request production from data-driven fixture
@@ -7704,9 +7712,16 @@ Current implementation status:
 - Extraction-backed graph DDL stores the existing graph artifact-source manifest
   shape (`source.kind = artifact`, shorthand asset enrichment, node/edge
   templates) and validates the committed row source field before catalog write.
-- Remaining production work is to connect extraction materialization and managed
-  AKNN/graph builds all the way through durable job scheduling, readiness,
-  generation publish, and distributed recovery.
+- Extraction materialization is wired through enrichment artifact production,
+  graph edge artifact writes, graph artifact journal hints, and derived graph
+  replay, so graph index builds no longer depend on clients writing `_edges`
+  rows directly.
+- Managed AKNN lifecycle is wired through generated enrichment precompute,
+  `full_index`/`aknn` sync-level maintenance, published dense-index visibility,
+  and readiness/status encoding for replay completion.
+- Remaining long-term production work is distributed orchestration: remote
+  worker lease/retry accounting, cross-node recovery evidence, and operational
+  controls for large multi-index rebuilds.
 
 ### Query and movement invariants
 

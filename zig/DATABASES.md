@@ -80,6 +80,9 @@ CREATE DATABASE tenant_ops;
 PostgreSQL three-part object references should remain fail-closed until Antfly
 has explicit cross-database resolution and authorization semantics. Two-part
 references are namespace-qualified names inside the current database.
+The SQL adapter-specific parser, session, `search_path`, and lowering contract
+is documented in [SQL.md](SQL.md); this document owns the shared catalog
+identity model that SQL resolves into.
 
 ## Catalog Identity
 

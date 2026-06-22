@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "fa22d85c9ff05ec58be54ad3b8416018f957fc984112aafb8d8f497c451d5f30",
-  "source_entry_count": 1025,
-  "entry_count": 1025,
+  "source_sha256": "eaaafd1981c418f5bd84e0407b6071c0b1446a5651e1483be0c627ce33da82b1",
+  "source_entry_count": 1026,
+  "entry_count": 1026,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -8475,6 +8475,12 @@
       "family": "read",
       "plan": "read:join:join:type=inner:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:ctes=1:right_source_cte=1",
       "sql": "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5"
+    },
+    {
+      "name": "read classifier graph table function inline join",
+      "family": "read",
+      "plan": "read:join:join:type=inner:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:ctes=1:right_source_cte=1",
+      "sql": "SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5"
     },
     {
       "name": "read classifier catalog-backed equality join",
