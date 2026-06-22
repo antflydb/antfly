@@ -31865,7 +31865,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     var desc_order: db_mod.types.RelationalRowsQueryOrder = .{ .field = "status" };
     var desc_pos: usize = 0;
     const desc_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "desc", .source_start = 0, .source_end = 4 },
+        .{ .kind = .identifier, .text = "desc", .source_start = 0, .source_end = 4, .keyword = .desc },
         .{ .kind = .identifier, .text = "nulls", .source_start = 5, .source_end = 10 },
         .{ .kind = .identifier, .text = "last", .source_start = 11, .source_end = 15 },
     };
@@ -31876,7 +31876,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     var asc_order: db_mod.types.RelationalRowsQueryOrder = .{ .field = "status" };
     var asc_pos: usize = 0;
     const asc_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "asc", .source_start = 0, .source_end = 3 },
+        .{ .kind = .identifier, .text = "asc", .source_start = 0, .source_end = 3, .keyword = .asc },
         .{ .kind = .identifier, .text = "nulls", .source_start = 4, .source_end = 9 },
         .{ .kind = .identifier, .text = "first", .source_start = 10, .source_end = 15 },
     };
@@ -31887,7 +31887,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     var using_order: db_mod.types.RelationalRowsQueryOrder = .{ .field = "status" };
     var using_pos: usize = 0;
     const using_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "using", .source_start = 0, .source_end = 5 },
+        .{ .kind = .identifier, .text = "using", .source_start = 0, .source_end = 5, .keyword = .using },
         .{ .kind = .gte, .text = ">=", .source_start = 6, .source_end = 8 },
     };
     try std.testing.expect((try parseOrderModifiers(using_tokens[0..], &using_pos, &using_order)) == null);

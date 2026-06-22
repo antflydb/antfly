@@ -19,6 +19,7 @@ const parser = @import("parser.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+pub const TokenKeyword = token_mod.TokenKeyword;
 
 pub const SqlStatementFamily = enum {
     select,
@@ -29,6 +30,16 @@ pub const SqlStatementFamily = enum {
     merge,
     with,
     ddl,
+};
+
+pub const SqlReadStatementKind = enum {
+    query,
+    set_operation,
+    recursive_cte,
+    aggregate,
+    join,
+    lateral,
+    window,
 };
 
 pub const SqlWriteStatementKind = enum {
@@ -59,14 +70,19 @@ pub const SqlPreparedStatementStatementKind = enum {
 
 pub fn classifyStatementFamily(tokens: []const Token) ?SqlStatementFamily {
     const first = firstIdentifier(tokens) orelse return null;
-    if (std.ascii.eqlIgnoreCase(first, "select")) return .select;
-    if (std.ascii.eqlIgnoreCase(first, "insert")) return .insert;
-    if (std.ascii.eqlIgnoreCase(first, "update")) return .update;
-    if (std.ascii.eqlIgnoreCase(first, "delete")) return .delete;
-    if (std.ascii.eqlIgnoreCase(first, "truncate")) return .truncate;
-    if (std.ascii.eqlIgnoreCase(first, "merge")) return .merge;
-    if (std.ascii.eqlIgnoreCase(first, "with")) return .with;
-    return .ddl;
+    if (first.keyword) |keyword| {
+        return switch (keyword) {
+            .select => .select,
+            .insert => .insert,
+            .update => .update,
+            .delete => .delete,
+            .truncate => .truncate,
+            .merge => .merge,
+            .with => .with,
+            else => .ddl,
+        };
+    }
+    return if (first.kind == .identifier) .ddl else null;
 }
 
 pub fn classifyWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
@@ -81,6 +97,25 @@ pub fn classifyWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
     };
 }
 
+pub fn classifyReadStatement(tokens: []const Token) ?SqlReadStatementKind {
+    const family = classifyStatementFamily(tokens) orelse return null;
+    const statement_start = switch (family) {
+        .select => @as(usize, 0),
+        .with => withFinalStatementIndex(tokens, .{ .allow_recursive = true }) orelse return null,
+        .insert, .update, .delete, .truncate, .merge, .ddl => return null,
+    };
+    if (!statementStartsAt(tokens, statement_start, "select")) return null;
+    if (family == .with and tokens.len > 1 and keywordAt(tokens, 1, "recursive")) return .recursive_cte;
+
+    const statement = tokens[statement_start..];
+    if (readHasTopLevelSetOperation(statement)) return .set_operation;
+    if (readHasTopLevelKeyword(statement, "lateral")) return .lateral;
+    if (readHasTopLevelKeyword(statement, "over")) return .window;
+    if (readHasAggregateShape(statement)) return .aggregate;
+    if (readHasTopLevelKeyword(statement, "join")) return .join;
+    return .query;
+}
+
 pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize) ?SqlPreparedStatementSubjectKind {
     return preparedStatementSubjectKindFromStatementKind(classifyPreparedStatementStatementKind(tokens, start) orelse return null);
 }
@@ -90,8 +125,8 @@ pub fn classifyPreparedStatementStatementKind(tokens: []const Token, start: usiz
     if (statementStartsAt(tokens, start, "with")) {
         const with_tokens = tokens[start..];
         const final_index = withFinalStatementIndex(with_tokens, .{ .allow_recursive = true }) orelse return null;
-        if (std.ascii.eqlIgnoreCase(with_tokens[final_index].text, "select")) return .read;
-        if (withFinalStatementWriteKind(with_tokens[final_index].text)) |kind| return preparedStatementKindFromWriteKind(kind);
+        if (with_tokens[final_index].isKeyword(.select)) return .read;
+        if (withFinalStatementWriteKind(with_tokens[final_index])) |kind| return preparedStatementKindFromWriteKind(kind);
         return null;
     }
     if (statementStartsAt(tokens, start, "insert")) return .insert;
@@ -135,7 +170,7 @@ fn preparedStatementKindFromWriteKind(kind: SqlWriteStatementKind) SqlPreparedSt
 
 fn classifyWithWriteStatement(tokens: []const Token) ?SqlWriteStatementKind {
     const index = withFinalStatementIndex(tokens, .{}) orelse return null;
-    return withFinalStatementWriteKind(tokens[index].text);
+    return withFinalStatementWriteKind(tokens[index]);
 }
 
 const WithFinalStatementOptions = struct {
@@ -167,25 +202,87 @@ fn withFinalStatementIndex(tokens: []const Token, options: WithFinalStatementOpt
     return index;
 }
 
-fn withFinalStatementWriteKind(keyword: []const u8) ?SqlWriteStatementKind {
-    if (std.ascii.eqlIgnoreCase(keyword, "insert")) return .insert_source;
-    if (std.ascii.eqlIgnoreCase(keyword, "update")) return .update;
-    if (std.ascii.eqlIgnoreCase(keyword, "delete")) return .delete;
-    if (std.ascii.eqlIgnoreCase(keyword, "merge")) return .merge;
-    if (std.ascii.eqlIgnoreCase(keyword, "truncate")) return .truncate;
-    return null;
+fn withFinalStatementWriteKind(token: Token) ?SqlWriteStatementKind {
+    if (token.kind != .identifier) return null;
+    return switch (token.keyword orelse return null) {
+        .insert => .insert_source,
+        .update => .update,
+        .delete => .delete,
+        .merge => .merge,
+        .truncate => .truncate,
+        else => null,
+    };
 }
 
-fn firstIdentifier(tokens: []const Token) ?[]const u8 {
+fn keywordAt(tokens: []const Token, index: usize, keyword: []const u8) bool {
+    return index < tokens.len and tokens[index].matchesKeyword(keyword);
+}
+
+fn firstIdentifier(tokens: []const Token) ?Token {
     if (tokens.len == 0) return null;
     if (tokens[0].kind != .identifier) return null;
-    return tokens[0].text;
+    return tokens[0];
 }
 
 fn statementStartsAt(tokens: []const Token, start: usize, keyword: []const u8) bool {
-    if (start >= tokens.len) return false;
-    if (tokens[start].kind != .identifier) return false;
-    return std.ascii.eqlIgnoreCase(tokens[start].text, keyword);
+    return keywordAt(tokens, start, keyword);
+}
+
+fn readHasTopLevelSetOperation(tokens: []const Token) bool {
+    return readHasTopLevelKeyword(tokens, "union") or
+        readHasTopLevelKeyword(tokens, "intersect") or
+        readHasTopLevelKeyword(tokens, "except");
+}
+
+fn readHasTopLevelKeyword(tokens: []const Token, keyword: []const u8) bool {
+    var depth: usize = 0;
+    for (tokens) |token| {
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0 and token.matchesKeyword(keyword)) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn readHasAggregateShape(tokens: []const Token) bool {
+    var depth: usize = 0;
+    for (tokens, 0..) |token, index| {
+        switch (token.kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth > 0) depth -= 1;
+            },
+            .identifier => if (depth == 0) {
+                if (std.ascii.eqlIgnoreCase(token.text, "group") or
+                    std.ascii.eqlIgnoreCase(token.text, "having"))
+                {
+                    return true;
+                }
+                if (index + 1 < tokens.len and tokens[index + 1].kind == .lparen and sqlAggregateFunctionName(token.text)) {
+                    return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn sqlAggregateFunctionName(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "count") or
+        std.ascii.eqlIgnoreCase(name, "sum") or
+        std.ascii.eqlIgnoreCase(name, "avg") or
+        std.ascii.eqlIgnoreCase(name, "min") or
+        std.ascii.eqlIgnoreCase(name, "max") or
+        std.ascii.eqlIgnoreCase(name, "bool_or") or
+        std.ascii.eqlIgnoreCase(name, "bool_and") or
+        std.ascii.eqlIgnoreCase(name, "array_agg") or
+        std.ascii.eqlIgnoreCase(name, "string_agg");
 }
 
 test "sql adapter classifier identifies write statement families" {
@@ -232,6 +329,32 @@ test "sql adapter classifier rejects non-write and non-token statements" {
     try std.testing.expect(classifyWriteStatement(recursive_tokens.items) == null);
 
     try std.testing.expect(classifyStatementFamily(&.{}) == null);
+}
+
+test "sql adapter classifier identifies read statement families" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        expected: SqlReadStatementKind,
+    }{
+        .{ .sql = "SELECT id FROM usage_records", .expected = .query },
+        .{ .sql = "SELECT id FROM usage_records JOIN customers ON usage_records.customer_id = customers.id", .expected = .join },
+        .{ .sql = "SELECT org.id FROM usage_records AS org LEFT JOIN LATERAL (SELECT id FROM balance_records) AS bal ON true", .expected = .lateral },
+        .{ .sql = "SELECT row_number() OVER (ORDER BY amount) FROM usage_records", .expected = .window },
+        .{ .sql = "SELECT customer_id, count(*) FROM usage_records GROUP BY customer_id", .expected = .aggregate },
+        .{ .sql = "SELECT id FROM usage_records UNION SELECT id FROM archived_records", .expected = .set_operation },
+        .{ .sql = "WITH source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .expected = .query },
+        .{ .sql = "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows", .expected = .recursive_cte },
+    };
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(alloc, case.sql);
+        defer lexer.freeTokens(alloc, &tokens);
+        try std.testing.expectEqual(case.expected, classifyReadStatement(tokens.items).?);
+    }
+
+    var update_tokens = try lexer.tokenizeAlloc(alloc, "UPDATE usage_records SET status = 'done'");
+    defer lexer.freeTokens(alloc, &update_tokens);
+    try std.testing.expect(classifyReadStatement(update_tokens.items) == null);
 }
 
 test "sql adapter classifier identifies prepared statement subject families" {

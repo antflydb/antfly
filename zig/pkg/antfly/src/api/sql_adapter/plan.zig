@@ -19,12 +19,12 @@ const classifier = @import("classifier.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const grammar = @import("grammar.zig");
-const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const query_function = @import("query_function.zig");
 const relational_rows = @import("../relational_rows.zig");
 const runtime_schema = @import("../../storage/schema.zig");
 const strings = @import("strings.zig");
+const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
@@ -740,15 +740,16 @@ pub fn lowerWritePlanWithHooksAlloc(
     hooks: WritePlanLoweringHooks,
 ) !LoweredWritePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    const tokens = parsed_sql.items();
 
-    if (tokens.items.len >= 2 and std.ascii.eqlIgnoreCase(tokens.items[0].text, "with") and std.ascii.eqlIgnoreCase(tokens.items[1].text, "recursive")) {
-        return try lowerRecursiveWritePlanWithHooksAlloc(tokens.items, schema, options, hooks);
+    if (tokens.len >= 2 and std.ascii.eqlIgnoreCase(tokens[0].text, "with") and std.ascii.eqlIgnoreCase(tokens[1].text, "recursive")) {
+        return try lowerRecursiveWritePlanWithHooksAlloc(tokens, schema, options, hooks);
     }
 
-    const write_kind = classifier.classifyWriteStatement(tokens.items) orelse
-        return try lowerRecursiveWritePlanWithHooksAlloc(tokens.items, schema, options, hooks);
+    const write_kind = parsed_sql.tokenized_sql.write_statement_kind orelse
+        return try lowerRecursiveWritePlanWithHooksAlloc(tokens, schema, options, hooks);
 
     if (write_kind == .insert) {
         const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
@@ -2067,6 +2068,7 @@ pub const LoweredReadPlan = union(enum) {
 
 pub const ReadPlanLoweringHooks = struct {
     ptr: *anyopaque,
+    statement_kind: ?classifier.SqlReadStatementKind = null,
     lower_lateral: *const fn (*anyopaque) anyerror!LoweredLateralPlan,
     lower_window: *const fn (*anyopaque) anyerror!LoweredWindowPlan,
     lower_aggregate: *const fn (*anyopaque) anyerror!LoweredAggregatePlan,
@@ -2076,63 +2078,70 @@ pub const ReadPlanLoweringHooks = struct {
     lower_set_operation: *const fn (*anyopaque) anyerror!LoweredSetOperationPlan,
 };
 
+const ReadPlanDispatchState = struct {
+    saw_invalid_catalog: bool = false,
+};
+
+fn lowerReadPlanKindWithHooks(hooks: ReadPlanLoweringHooks, kind: classifier.SqlReadStatementKind) !LoweredReadPlan {
+    return switch (kind) {
+        .lateral => .{ .lateral = try hooks.lower_lateral(hooks.ptr) },
+        .window => .{ .window = try hooks.lower_window(hooks.ptr) },
+        .aggregate => .{ .aggregate = try hooks.lower_aggregate(hooks.ptr) },
+        .recursive_cte => .{ .recursive_cte = try hooks.lower_recursive_cte(hooks.ptr) },
+        .join => .{ .join = try hooks.lower_join(hooks.ptr) },
+        .query => .{ .query = try hooks.lower_query(hooks.ptr) },
+        .set_operation => blk: {
+            if (hooks.lower_query(hooks.ptr)) |lowered| {
+                break :blk .{ .query = lowered };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            }
+            break :blk .{ .set_operation = try hooks.lower_set_operation(hooks.ptr) };
+        },
+    };
+}
+
+fn tryLowerReadPlanKindWithHooks(
+    hooks: ReadPlanLoweringHooks,
+    kind: classifier.SqlReadStatementKind,
+    state: *ReadPlanDispatchState,
+) !?LoweredReadPlan {
+    if (lowerReadPlanKindWithHooks(hooks, kind)) |lowered| {
+        return lowered;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => return null,
+        error.InvalidSqlCatalog => {
+            state.saw_invalid_catalog = true;
+            return null;
+        },
+        else => return err,
+    }
+}
+
 pub fn lowerReadPlanWithHooks(hooks: ReadPlanLoweringHooks) !LoweredReadPlan {
-    var saw_invalid_catalog = false;
+    var state = ReadPlanDispatchState{};
 
-    if (hooks.lower_lateral(hooks.ptr)) |lowered| {
-        return .{ .lateral = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-        error.InvalidSqlCatalog => saw_invalid_catalog = true,
-        else => return err,
+    if (hooks.statement_kind) |kind| {
+        if (try tryLowerReadPlanKindWithHooks(hooks, kind, &state)) |lowered| return lowered;
     }
 
-    if (hooks.lower_window(hooks.ptr)) |lowered| {
-        return .{ .window = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-        error.InvalidSqlCatalog => saw_invalid_catalog = true,
-        else => return err,
+    const fallback_order = [_]classifier.SqlReadStatementKind{
+        .lateral,
+        .window,
+        .aggregate,
+        .recursive_cte,
+        .join,
+        .query,
+        .set_operation,
+    };
+    for (fallback_order) |kind| {
+        if (hooks.statement_kind != null and hooks.statement_kind.? == kind) continue;
+        if (try tryLowerReadPlanKindWithHooks(hooks, kind, &state)) |lowered| return lowered;
     }
 
-    if (hooks.lower_aggregate(hooks.ptr)) |lowered| {
-        return .{ .aggregate = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-        error.InvalidSqlCatalog => saw_invalid_catalog = true,
-        else => return err,
-    }
-
-    if (hooks.lower_recursive_cte(hooks.ptr)) |lowered| {
-        return .{ .recursive_cte = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-        error.InvalidSqlCatalog => saw_invalid_catalog = true,
-        else => return err,
-    }
-
-    if (hooks.lower_join(hooks.ptr)) |lowered| {
-        return .{ .join = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-        error.InvalidSqlCatalog => saw_invalid_catalog = true,
-        else => return err,
-    }
-
-    if (hooks.lower_query(hooks.ptr)) |lowered| {
-        return .{ .query = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => {},
-        else => return err,
-    }
-
-    if (hooks.lower_set_operation(hooks.ptr)) |lowered| {
-        return .{ .set_operation = lowered };
-    } else |err| switch (err) {
-        error.UnsupportedSqlShape => if (saw_invalid_catalog) return error.InvalidSqlCatalog else return error.UnsupportedSqlShape,
-        error.InvalidSqlCatalog => return error.InvalidSqlCatalog,
-        else => return err,
-    }
+    if (state.saw_invalid_catalog) return error.InvalidSqlCatalog;
+    return error.UnsupportedSqlShape;
 }
 
 pub const LoweredRelationPopulationPlan = struct {
@@ -2230,6 +2239,15 @@ pub const ExplainPlanLoweringHooks = struct {
 
 pub fn lowerExplainPlanWithHooksAlloc(sql: []const u8, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
     const parsed = try grammar.parseExplainPrefix(sql);
+    return try lowerExplainPlanWithParsedPrefixAlloc(parsed, hooks);
+}
+
+pub fn lowerExplainPlanWithParsedSqlAlloc(parsed_sql: *const tokenized.ParsedSql, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
+    const parsed = try grammar.parseExplainPrefix(parsed_sql.statementSql());
+    return try lowerExplainPlanWithParsedPrefixAlloc(parsed, hooks);
+}
+
+fn lowerExplainPlanWithParsedPrefixAlloc(parsed: ast.SqlExplainPrefix, hooks: ExplainPlanLoweringHooks) !LoweredExplainPlan {
     var read_err: ?anyerror = null;
     if (hooks.lower_read(hooks.ptr, parsed.inner_sql)) |read| {
         return .{

@@ -3263,10 +3263,10 @@ fn appendRoutineCastArgumentTokensAlloc(
     const start_len = normalized.items.len;
     errdefer freeRoutineTokensAfter(alloc, normalized, start_len);
 
-    try normalized.append(alloc, borrowedRoutineToken(.identifier, "cast", token));
+    try normalized.append(alloc, borrowedRoutineKeywordToken(.identifier, "cast", token, .cast));
     try normalized.append(alloc, borrowedRoutineToken(.lparen, "(", token));
     try appendRoutineArgumentTokenAlloc(alloc, normalized, token, argument_index);
-    try normalized.append(alloc, borrowedRoutineTrailingToken(.identifier, "as", token));
+    try normalized.append(alloc, borrowedRoutineTrailingKeywordToken(.identifier, "as", token, .as));
     try normalized.append(alloc, borrowedRoutineTrailingToken(.identifier, cast_type, token));
     try normalized.append(alloc, borrowedRoutineTrailingToken(.rparen, ")", token));
 }
@@ -3298,6 +3298,12 @@ fn borrowedRoutineToken(kind: TokenKind, text: []const u8, source: Token) Token 
     };
 }
 
+fn borrowedRoutineKeywordToken(kind: TokenKind, text: []const u8, source: Token, keyword: token_mod.TokenKeyword) Token {
+    var token = borrowedRoutineToken(kind, text, source);
+    token.keyword = keyword;
+    return token;
+}
+
 fn borrowedRoutineTrailingToken(kind: TokenKind, text: []const u8, source: Token) Token {
     return .{
         .kind = kind,
@@ -3306,6 +3312,12 @@ fn borrowedRoutineTrailingToken(kind: TokenKind, text: []const u8, source: Token
         .source_start = source.source_end,
         .source_end = source.source_end,
     };
+}
+
+fn borrowedRoutineTrailingKeywordToken(kind: TokenKind, text: []const u8, source: Token, keyword: token_mod.TokenKeyword) Token {
+    var token = borrowedRoutineTrailingToken(kind, text, source);
+    token.keyword = keyword;
+    return token;
 }
 
 fn freeRoutineTokensAfter(alloc: std.mem.Allocator, tokens: *std.ArrayListUnmanaged(Token), start_len: usize) void {

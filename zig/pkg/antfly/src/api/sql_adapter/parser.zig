@@ -18,6 +18,7 @@ const ast = @import("ast.zig");
 const token_mod = @import("token.zig");
 
 pub const Token = token_mod.Token;
+pub const TokenKeyword = token_mod.TokenKeyword;
 pub const TokenKind = token_mod.TokenKind;
 
 pub const Cursor = struct {
@@ -52,8 +53,14 @@ pub const Cursor = struct {
     pub fn matchKeyword(self: Cursor, keyword: []const u8) bool {
         if (self.pos.* >= self.tokens.len) return false;
         const token = self.tokens[self.pos.*];
-        if (token.kind != .identifier) return false;
-        if (!std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
+        if (!token.matchesKeyword(keyword)) return false;
+        self.pos.* += 1;
+        return true;
+    }
+
+    pub fn matchKeywordTag(self: Cursor, keyword: TokenKeyword) bool {
+        if (self.pos.* >= self.tokens.len) return false;
+        if (!self.tokens[self.pos.*].isKeyword(keyword)) return false;
         self.pos.* += 1;
         return true;
     }
@@ -76,8 +83,11 @@ pub const Cursor = struct {
 
     pub fn peekKeyword(self: Cursor, keyword: []const u8) bool {
         if (self.pos.* >= self.tokens.len) return false;
-        const token = self.tokens[self.pos.*];
-        return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, keyword);
+        return self.tokens[self.pos.*].matchesKeyword(keyword);
+    }
+
+    pub fn peekKeywordTag(self: Cursor, keyword: TokenKeyword) bool {
+        return self.pos.* < self.tokens.len and self.tokens[self.pos.*].isKeyword(keyword);
     }
 
     pub fn peekIdentifierIf(self: Cursor, comptime predicate: fn ([]const u8) bool) bool {
@@ -96,9 +106,7 @@ pub const Cursor = struct {
 
     pub fn functionCallStartsAt(self: Cursor, index: usize, keyword: []const u8) bool {
         if (index + 1 >= self.tokens.len) return false;
-        const token = self.tokens[index];
-        return token.kind == .identifier and
-            std.ascii.eqlIgnoreCase(token.text, keyword) and
+        return self.tokens[index].matchesKeyword(keyword) and
             self.tokens[index + 1].kind == .lparen;
     }
 
@@ -133,9 +141,14 @@ pub fn expectToken(tokens: []const Token, pos: *usize, kind: TokenKind) !void {
 
 pub fn matchKeyword(tokens: []const Token, pos: *usize, keyword: []const u8) bool {
     if (pos.* >= tokens.len) return false;
-    const token = tokens[pos.*];
-    if (token.kind != .identifier) return false;
-    if (!std.ascii.eqlIgnoreCase(token.text, keyword)) return false;
+    if (!tokens[pos.*].matchesKeyword(keyword)) return false;
+    pos.* += 1;
+    return true;
+}
+
+pub fn matchKeywordTag(tokens: []const Token, pos: *usize, keyword: TokenKeyword) bool {
+    if (pos.* >= tokens.len) return false;
+    if (!tokens[pos.*].isKeyword(keyword)) return false;
     pos.* += 1;
     return true;
 }
@@ -150,8 +163,11 @@ pub fn matchToken(tokens: []const Token, pos: *usize, kind: TokenKind) ?Token {
 
 pub fn peekKeyword(tokens: []const Token, pos: usize, keyword: []const u8) bool {
     if (pos >= tokens.len) return false;
-    const token = tokens[pos];
-    return token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, keyword);
+    return tokens[pos].matchesKeyword(keyword);
+}
+
+pub fn peekKeywordTag(tokens: []const Token, pos: usize, keyword: TokenKeyword) bool {
+    return pos < tokens.len and tokens[pos].isKeyword(keyword);
 }
 
 pub fn peekKind(tokens: []const Token, pos: usize, kind: TokenKind) bool {
@@ -163,7 +179,7 @@ pub fn atEnd(tokens: []const Token, pos: usize) bool {
 }
 
 pub fn tokensStartWithKeyword(tokens: []const Token, keyword: []const u8) bool {
-    return tokens.len > 0 and tokens[0].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[0].text, keyword);
+    return tokens.len > 0 and tokens[0].matchesKeyword(keyword);
 }
 
 pub fn consumeCteMaterializationHint(tokens: []const Token, pos: *usize) !void {
@@ -189,7 +205,7 @@ pub fn findTopLevelKeywordFromIndex(tokens: []const Token, start: usize, keyword
                 depth -= 1;
             },
             .semicolon => if (depth == 0) return null,
-            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, keyword)) return i,
+            .identifier => if (depth == 0 and token.matchesKeyword(keyword)) return i,
             else => {},
         }
     }

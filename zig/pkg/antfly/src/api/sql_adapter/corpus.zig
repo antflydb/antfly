@@ -3815,19 +3815,72 @@ pub const PlanStringTokenScan = union(enum) {
     invalid,
 };
 
-pub fn scanStringToken(plan: []const u8, token: []const u8) PlanStringTokenScan {
-    var start: usize = 0;
-    var found: ?[]const u8 = null;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const value_start = index + token.len;
-        var value_end = value_start;
-        while (value_end < plan.len and plan[value_end] != ':') : (value_end += 1) {}
-        if (found != null) return .invalid;
-        found = plan[value_start..value_end];
-        start = index + token.len;
+pub const PlanFingerprintView = struct {
+    plan: []const u8,
+
+    pub fn init(plan: []const u8) PlanFingerprintView {
+        return .{ .plan = plan };
     }
-    if (found) |value| return .{ .value = value };
-    return .absent;
+
+    pub fn scanStringToken(self: PlanFingerprintView, token: []const u8) PlanStringTokenScan {
+        var start: usize = 0;
+        var found: ?[]const u8 = null;
+        while (std.mem.indexOfPos(u8, self.plan, start, token)) |index| {
+            if (!self.tokenStartsAtBoundary(index, token)) {
+                start = index + 1;
+                continue;
+            }
+            const value_start = index + token.len;
+            var value_end = value_start;
+            while (value_end < self.plan.len and self.plan[value_end] != ':') : (value_end += 1) {}
+            if (found != null) return .invalid;
+            found = self.plan[value_start..value_end];
+            start = value_end + 1;
+        }
+        if (found) |value| return .{ .value = value };
+        return .absent;
+    }
+
+    pub fn scanUsizeToken(self: PlanFingerprintView, token: []const u8) PlanUsizeTokenScan {
+        return switch (self.scanStringToken(token)) {
+            .absent => .absent,
+            .invalid => .invalid,
+            .value => |value| .{ .value = parseWholeUsizeTokenValue(value) orelse return .invalid },
+        };
+    }
+
+    pub fn hasNonZeroUsizeTokenNamePrefix(self: PlanFingerprintView, name_prefix: []const u8) bool {
+        var segment_start: usize = 0;
+        var found_non_zero = false;
+        while (segment_start < self.plan.len) {
+            const segment_end = std.mem.indexOfScalarPos(u8, self.plan, segment_start, ':') orelse self.plan.len;
+            const segment = self.plan[segment_start..segment_end];
+            if (std.mem.indexOfScalar(u8, segment, '=')) |equals_index| {
+                if (std.mem.startsWith(u8, segment[0..equals_index], name_prefix)) {
+                    const value = parseWholeUsizeTokenValue(segment[equals_index + 1 ..]) orelse return false;
+                    found_non_zero = found_non_zero or value > 0;
+                }
+            }
+            segment_start = segment_end + 1;
+        }
+        return found_non_zero;
+    }
+
+    fn tokenStartsAtBoundary(self: PlanFingerprintView, index: usize, token: []const u8) bool {
+        if (token.len > 0 and token[0] == ':') return index < self.plan.len and self.plan[index] == ':';
+        if (token.len > 0 and token[0] == '_') return index > 0 and self.segmentStartBefore(index) < index;
+        return index == 0 or self.plan[index - 1] == ':';
+    }
+
+    fn segmentStartBefore(self: PlanFingerprintView, index: usize) usize {
+        var start = index;
+        while (start > 0 and self.plan[start - 1] != ':') start -= 1;
+        return start;
+    }
+};
+
+pub fn scanStringToken(plan: []const u8, token: []const u8) PlanStringTokenScan {
+    return PlanFingerprintView.init(plan).scanStringToken(token);
 }
 
 pub fn planHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
@@ -3859,13 +3912,18 @@ pub fn planHasAnyExactStringToken(plan: []const u8, token: []const u8, expected_
 }
 
 pub fn parseDelimitedUsizeToken(plan: []const u8, value_start: usize) ?usize {
-    var pos = value_start;
-    if (pos >= plan.len or plan[pos] < '0' or plan[pos] > '9') return null;
+    const value_end = std.mem.indexOfScalarPos(u8, plan, value_start, ':') orelse plan.len;
+    return parseWholeUsizeTokenValue(plan[value_start..value_end]);
+}
+
+fn parseWholeUsizeTokenValue(value_text: []const u8) ?usize {
+    var pos: usize = 0;
+    if (value_text.len == 0 or value_text[0] < '0' or value_text[0] > '9') return null;
     var value: usize = 0;
-    while (pos < plan.len and plan[pos] >= '0' and plan[pos] <= '9') : (pos += 1) {
-        value = value * 10 + @as(usize, plan[pos] - '0');
+    while (pos < value_text.len and value_text[pos] >= '0' and value_text[pos] <= '9') : (pos += 1) {
+        value = value * 10 + @as(usize, value_text[pos] - '0');
     }
-    if (pos != plan.len and plan[pos] != ':') return null;
+    if (pos != value_text.len) return null;
     return value;
 }
 
@@ -3876,16 +3934,7 @@ pub const PlanUsizeTokenScan = union(enum) {
 };
 
 pub fn scanUsizeToken(plan: []const u8, token: []const u8) PlanUsizeTokenScan {
-    var start: usize = 0;
-    var found: ?usize = null;
-    while (std.mem.indexOfPos(u8, plan, start, token)) |index| {
-        const parsed = parseDelimitedUsizeToken(plan, index + token.len) orelse return .invalid;
-        if (found != null) return .invalid;
-        found = parsed;
-        start = index + token.len;
-    }
-    if (found) |value| return .{ .value = value };
-    return .absent;
+    return PlanFingerprintView.init(plan).scanUsizeToken(token);
 }
 
 pub fn planUsizeTokenValue(plan: []const u8, token: []const u8) ?usize {
@@ -3903,21 +3952,7 @@ pub fn planHasNonZeroToken(plan: []const u8, token: []const u8) bool {
 }
 
 pub fn planHasNonZeroUsizeTokenNamePrefix(plan: []const u8, name_prefix: []const u8) bool {
-    var segment_start: usize = 0;
-    var found_non_zero = false;
-    while (segment_start < plan.len) {
-        var segment_end = segment_start;
-        while (segment_end < plan.len and plan[segment_end] != ':') : (segment_end += 1) {}
-        const segment = plan[segment_start..segment_end];
-        if (std.mem.indexOfScalar(u8, segment, '=')) |equals_index| {
-            if (std.mem.startsWith(u8, segment[0..equals_index], name_prefix)) {
-                const value = parseDelimitedUsizeToken(segment, equals_index + 1) orelse return false;
-                found_non_zero = found_non_zero or value > 0;
-            }
-        }
-        segment_start = segment_end + 1;
-    }
-    return found_non_zero;
+    return PlanFingerprintView.init(plan).hasNonZeroUsizeTokenNamePrefix(name_prefix);
 }
 
 pub fn planHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {

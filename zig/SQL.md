@@ -274,6 +274,38 @@ Prioritized improvements:
    actually needs typed JSON.
 9. Keep unsupported classifications cheap and allocation-light.
 
+Current implementation status:
+
+- `sql_adapter/tokenized.zig` owns reusable `TokenizedSql` state for a SQL input,
+  including the borrowed token stream, top-level statement family, read
+  statement kind, and write statement kind.
+- `classifier.zig` classifies read families (`query`, `set_operation`,
+  `recursive_cte`, `aggregate`, `join`, `lateral`, and `window`) and write
+  families from the shared token stream.
+- Read lowering dispatches through the classified statement family before
+  falling back to the legacy probe order for unclassified or future shapes. Set
+  operation-shaped SQL still tries the query optimizer first so existing
+  predicate-rewrite plans remain available before the native set-operation plan.
+- Write lowering consumes `TokenizedSql` for write-family selection instead of
+  tokenizing separately from classification.
+- `ParsedSql` wraps `TokenizedSql` with a raw statement view and byte-source
+  span. DDL lowering, catalog-apply test lowering, read statement dispatch, and
+  write statement dispatch now use that shared wrapper as the top-level SQL
+  object. Existing lowerer callbacks still accept SQL text for compatibility;
+  migrating those callbacks to borrowed `ParsedSql`/token slices is the next
+  mechanical step toward zero selected-lowerer re-tokenization.
+- Identifier tokens carry optional compact keyword metadata, and the shared
+  parser/classifier helpers use it before falling back to text comparison.
+- Tokens expose stable source spans, quoted identifiers keep quoted-source
+  spans without being marked as keywords, and diagnostics have a span-bearing
+  `SqlDiagnostic` shape for unsupported classifications.
+- Fixture fingerprint checks use a structured `PlanFingerprintView` scanner with
+  explicit exact-token and suffix-token modes instead of open-coded substring
+  searches.
+- Numeric string-cast validation stays allocation-free and does not parse JSON
+  during lexing; broader JSON literal parsing remains deferred to semantic
+  lowerers that actually need typed JSON.
+
 The target shape is:
 
 ```text

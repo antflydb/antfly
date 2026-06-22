@@ -11522,6 +11522,90 @@ fn lowerDeleteMutationSourceForTestAlloc(
     };
 }
 
+fn lowerUpdateJoinedMutationSourceForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredJoinedMutationSource {
+    return try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(alloc, sql, schema, schema, params, row_claim);
+}
+
+fn lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredJoinedMutationSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parseJoinedMutationSourceAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.updateJoinedMutationSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
+}
+
+fn lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    row_claim: db_mod.types.RowClaimRequest,
+) !plan_mod.LoweredJoinedMutationSource {
+    const lexer = @import("lexer.zig");
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (row_claim.txn_id == null) return error.UnsupportedRowsQuery;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .params = params,
+        .mutation_claim = row_claim,
+    };
+    return parseJoinedMutationSourceAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.joinCteSelectParserHooks(&parser_state),
+        parser_context.ParserState.ContextAccessors.deleteJoinedMutationSourceParserHooks(&parser_state),
+    ) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedRowsQuery,
+        else => return err,
+    };
+}
+
 fn lowerTruncateMutationSourceForTestAlloc(
     alloc: std.mem.Allocator,
     sql: []const u8,
@@ -11669,10 +11753,10 @@ fn lowerWritePlanForDmlTestAlloc(
             .lower_insert_with_resolver = lowerInsertWithResolverForTestAlloc,
             .lower_insert_source_with_resolver = lowerInsertSourceWithResolverForDmlTestAlloc,
             .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasForDmlTestAlloc,
-            .lower_update_joined_source_with_schemas = unsupportedJoinedMutationSourceForDmlTestAlloc,
+            .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc,
             .lower_update_with_resolver = lowerUpdateForTestAlloc,
             .lower_update_source = lowerUpdateMutationSourceForTestAlloc,
-            .lower_delete_joined_source_with_schemas = unsupportedJoinedMutationSourceForDmlTestAlloc,
+            .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc,
             .lower_delete_with_resolver = lowerDeleteForTestAlloc,
             .lower_delete_source = lowerDeleteMutationSourceForTestAlloc,
             .lower_truncate_source = lowerTruncateMutationSourceForTestAlloc,
@@ -11731,17 +11815,6 @@ fn unsupportedRecursiveMergeMutationForDmlTestAlloc(
     _: runtime_schema.TableSchema,
     _: []const sql_value.SqlValue,
 ) anyerror!plan_mod.LoweredRecursiveMergeMutation {
-    return error.UnsupportedSqlShape;
-}
-
-fn unsupportedJoinedMutationSourceForDmlTestAlloc(
-    _: std.mem.Allocator,
-    _: []const u8,
-    _: runtime_schema.TableSchema,
-    _: runtime_schema.TableSchema,
-    _: []const sql_value.SqlValue,
-    _: db_mod.types.RowClaimRequest,
-) anyerror!plan_mod.LoweredJoinedMutationSource {
     return error.UnsupportedSqlShape;
 }
 
@@ -13725,6 +13798,24 @@ test "sql adapter lower dml lowers conflict update explicit default values" {
         schema,
         &.{},
         resolver_ctx.resolver(),
+    ));
+}
+
+test "sql adapter lower dml rejects insert without primary key" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","id"],"additionalProperties":false}}}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, schema.storage_mode);
+    try std.testing.expect(schema.primary_key == null);
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_stage (tenant_id, id, status) VALUES ('t1', 'u1', 'open')",
+        schema,
+        &.{},
     ));
 }
 
@@ -16684,6 +16775,650 @@ test "sql adapter lower dml lowers claimed delete mutation source" {
         &.{},
         .{ .mode = .for_update, .owner_id = "cleanup", .lease_ms = 0, .txn_id = txn_id },
     ));
+}
+
+test "sql adapter lower dml lowers joined mutation source with separate target and source schemas" {
+    const alloc = std.testing.allocator;
+    const target_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"source_id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"quantity":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const source_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"source_pk":{"type":"keyword"},"id":{"type":"keyword"},"source_status":{"type":"keyword"},"source_quantity":{"type":"numeric"},"source_enabled":{"type":"boolean"}},"required":["source_pk"],"additionalProperties":false}}},"primary_key":{"columns":["source_pk"]}}
+    ;
+    const target_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, target_schema_json);
+    defer runtime_schema.freeSchema(alloc, target_schema);
+    const source_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, source_schema_json);
+    defer runtime_schema.freeSchema(alloc, source_schema);
+
+    const txn_id = [_]u8{ 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f };
+    const row_claim: db_mod.types.RowClaimRequest = .{
+        .mode = .for_update,
+        .owner_id = "joined-worker",
+        .txn_id = txn_id,
+    };
+    const sql = "UPDATE usage_records SET quantity = source.source_quantity, status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND source.source_status = 'ready' FOR UPDATE SKIP LOCKED RETURNING id, quantity";
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerUpdateJoinedMutationSourceForDmlTestAlloc(
+        alloc,
+        sql,
+        target_schema,
+        &.{},
+        row_claim,
+    ));
+
+    var lowered = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        sql,
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.target_table_name);
+    try std.testing.expectEqualStrings("source_records", lowered.source_table_name);
+    try std.testing.expectEqualStrings("source_records", lowered.mutation.req.source_table);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_id", lowered.mutation.req.join.on[0].left_field);
+    try std.testing.expectEqualStrings("source_pk", lowered.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.join.right.predicates.len);
+    try std.testing.expectEqualStrings("source_status", lowered.mutation.req.join.right.predicates[0].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.source_assignments.len);
+    try std.testing.expectEqualStrings("source_quantity", lowered.mutation.req.source_assignments[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.mutation.req.operations.len);
+    try std.testing.expectEqual(@as(usize, 2), lowered.mutation.req.returning.len);
+
+    var cte_update = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "WITH ready_sources AS (SELECT source_pk, source_status FROM source_records WHERE source_status = 'ready') UPDATE usage_records SET status = source.source_status FROM ready_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer cte_update.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cte_update.target_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_update.source_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_update.mutation.req.source_table);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.ctes.len);
+    try std.testing.expectEqualStrings("ready_sources", cte_update.mutation.req.ctes[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.ctes[0].query.predicates.len);
+    try std.testing.expectEqualStrings("source_status", cte_update.mutation.req.ctes[0].query.predicates[0].field);
+    try std.testing.expectEqualStrings("ready_sources", cte_update.mutation.req.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_pk", cte_update.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.source_assignments.len);
+    try std.testing.expectEqualStrings("source_status", cte_update.mutation.req.source_assignments[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), cte_update.mutation.req.returning.len);
+
+    var cte_delete = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "WITH stale_sources AS (SELECT source_pk FROM source_records WHERE source_status = 'stale') DELETE FROM usage_records USING stale_sources AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer cte_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cte_delete.target_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_delete.source_table_name);
+    try std.testing.expectEqualStrings("source_records", cte_delete.mutation.req.source_table);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.ctes.len);
+    try std.testing.expectEqualStrings("stale_sources", cte_delete.mutation.req.ctes[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.ctes[0].query.predicates.len);
+    try std.testing.expectEqualStrings("source_status", cte_delete.mutation.req.ctes[0].query.predicates[0].field);
+    try std.testing.expectEqualStrings("stale_sources", cte_delete.mutation.req.join.right.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.join.on.len);
+    try std.testing.expectEqualStrings("source_pk", cte_delete.mutation.req.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), cte_delete.mutation.req.returning.len);
+
+    var primary_key_rewrite = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET id = source.id FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer primary_key_rewrite.deinit(alloc);
+    try std.testing.expect(primary_key_rewrite.mutation.req.rewrite_identity);
+    try std.testing.expectEqual(@as(usize, 1), primary_key_rewrite.mutation.req.source_assignments.len);
+    try std.testing.expectEqualStrings("id", primary_key_rewrite.mutation.req.source_assignments[0].field);
+    try std.testing.expectEqualStrings("id", primary_key_rewrite.mutation.req.source_assignments[0].source_field);
+
+    var row_assignment = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET (quantity, status) = ROW(source.source_quantity, DEFAULT) FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity, status",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer row_assignment.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), row_assignment.mutation.req.source_assignments.len);
+    try std.testing.expectEqualStrings("quantity", row_assignment.mutation.req.source_assignments[0].field);
+    try std.testing.expectEqualStrings("source_quantity", row_assignment.mutation.req.source_assignments[0].source_field);
+    try std.testing.expectEqual(@as(usize, 1), row_assignment.mutation.req.operations.len);
+    try std.testing.expectEqualStrings("status", row_assignment.mutation.req.operations[0].path);
+    try std.testing.expectEqualStrings("\"active\"", row_assignment.mutation.req.operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 3), row_assignment.mutation.req.returning.len);
+
+    var expression_assignment = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = lower(source.source_status) FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer expression_assignment.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), expression_assignment.mutation.req.source_assignments.len);
+    try std.testing.expectEqual(@as(usize, 0), expression_assignment.mutation.req.operations.len);
+    try std.testing.expectEqual(@as(usize, 1), expression_assignment.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("status", expression_assignment.mutation.req.patch_expressions[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, expression_assignment.mutation.req.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), expression_assignment.mutation.req.patch_expressions[0].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, expression_assignment.mutation.req.patch_expressions[0].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_status", expression_assignment.mutation.req.patch_expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(@as(usize, 1), expression_assignment.mutation.req.returning.len);
+
+    var numeric_expression_assignment = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity + 1 FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer numeric_expression_assignment.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), numeric_expression_assignment.mutation.req.source_assignments.len);
+    try std.testing.expectEqual(@as(usize, 1), numeric_expression_assignment.mutation.req.patch_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, numeric_expression_assignment.mutation.req.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, numeric_expression_assignment.mutation.req.patch_expressions[0].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_quantity", numeric_expression_assignment.mutation.req.patch_expressions[0].expression.operands[0].field);
+
+    var boolean_expression_assignment = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET enabled = usage_records.enabled OR source.source_enabled FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer boolean_expression_assignment.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), boolean_expression_assignment.mutation.req.source_assignments.len);
+    try std.testing.expectEqual(@as(usize, 1), boolean_expression_assignment.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("enabled", boolean_expression_assignment.mutation.req.patch_expressions[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, boolean_expression_assignment.mutation.req.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, boolean_expression_assignment.mutation.req.patch_expressions[0].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("enabled", boolean_expression_assignment.mutation.req.patch_expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, boolean_expression_assignment.mutation.req.patch_expressions[0].expression.operands[1].field_source);
+    try std.testing.expectEqualStrings("source_enabled", boolean_expression_assignment.mutation.req.patch_expressions[0].expression.operands[1].field);
+
+    var modulo_expression_assignment = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = MOD(source.source_quantity + usage_records.quantity, 7) FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING quantity, quantity % 2 AS quantity_remainder",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer modulo_expression_assignment.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), modulo_expression_assignment.mutation.req.source_assignments.len);
+    try std.testing.expectEqual(@as(usize, 1), modulo_expression_assignment.mutation.req.patch_expressions.len);
+    try std.testing.expectEqualStrings("quantity", modulo_expression_assignment.mutation.req.patch_expressions[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_expression_assignment.mutation.req.patch_expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 2), modulo_expression_assignment.mutation.req.patch_expressions[0].expression.operands.len);
+    const modulo_add = modulo_expression_assignment.mutation.req.patch_expressions[0].expression.operands[0];
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, modulo_add.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, modulo_add.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_quantity", modulo_add.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, modulo_add.operands[1].field_source);
+    try std.testing.expectEqualStrings("quantity", modulo_add.operands[1].field);
+    try std.testing.expectEqual(@as(usize, 1), modulo_expression_assignment.mutation.req.returning.len);
+    try std.testing.expectEqual(@as(usize, 1), modulo_expression_assignment.mutation.req.returning_expressions.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mod, modulo_expression_assignment.mutation.req.returning_expressions[0].expression.kind);
+
+    var jsonb_concat = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET metadata = metadata || '{\"joined\":true}'::jsonb FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer jsonb_concat.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), jsonb_concat.mutation.req.operations.len);
+    try std.testing.expectEqual(db_mod.types.TransformOpType.set, jsonb_concat.mutation.req.operations[0].op);
+    try std.testing.expectEqualStrings("metadata.joined", jsonb_concat.mutation.req.operations[0].path);
+    try std.testing.expectEqualStrings("true", jsonb_concat.mutation.req.operations[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 0), jsonb_concat.mutation.req.json_set_expressions.len);
+    try std.testing.expectEqual(@as(usize, 1), jsonb_concat.mutation.req.returning.len);
+
+    var boolean_side_filters = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND usage_records.enabled IS TRUE AND source.source_enabled IS UNKNOWN FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer boolean_side_filters.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), boolean_side_filters.mutation.req.join.left.predicates.len);
+    try std.testing.expectEqualStrings("enabled", boolean_side_filters.mutation.req.join.left.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, boolean_side_filters.mutation.req.join.left.predicates[0].op);
+    try std.testing.expectEqualStrings("true", boolean_side_filters.mutation.req.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), boolean_side_filters.mutation.req.join.right.predicates.len);
+    try std.testing.expectEqualStrings("source_enabled", boolean_side_filters.mutation.req.join.right.predicates[0].field);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_side_filters.mutation.req.join.right.predicates[0].op);
+    try std.testing.expect(boolean_side_filters.mutation.req.join.right.predicates[0].value_json == null);
+
+    var null_inclusive_boolean_side_filters = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND source.source_enabled IS NOT TRUE FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer null_inclusive_boolean_side_filters.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), null_inclusive_boolean_side_filters.mutation.req.join.right.predicates.len);
+    try std.testing.expectEqual(@as(usize, 2), null_inclusive_boolean_side_filters.mutation.req.join.right.expression_or_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, null_inclusive_boolean_side_filters.mutation.req.join.right.expression_or_predicates[0].conditions[0].op);
+    try std.testing.expectEqualStrings("source_enabled", null_inclusive_boolean_side_filters.mutation.req.join.right.expression_or_predicates[0].conditions[0].lhs.field);
+    try std.testing.expectEqualStrings("true", null_inclusive_boolean_side_filters.mutation.req.join.right.expression_or_predicates[0].conditions[0].rhs[0].value_json);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, null_inclusive_boolean_side_filters.mutation.req.join.right.expression_or_predicates[1].conditions[0].op);
+    try std.testing.expectEqualStrings("source_enabled", null_inclusive_boolean_side_filters.mutation.req.join.right.expression_or_predicates[1].conditions[0].lhs.field);
+
+    var escaped_source_text_filter = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND source.source_status NOT ILIKE $1 ESCAPE $2 FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{ .{ .string = "skip!_%" }, .{ .string = "!" } },
+        row_claim,
+    );
+    defer escaped_source_text_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), escaped_source_text_filter.mutation.req.join.right.text_patterns.len);
+    try std.testing.expectEqualStrings("source_status", escaped_source_text_filter.mutation.req.join.right.text_patterns[0].field);
+    try std.testing.expectEqualStrings("skip\\_%", escaped_source_text_filter.mutation.req.join.right.text_patterns[0].pattern);
+    try std.testing.expect(escaped_source_text_filter.mutation.req.join.right.text_patterns[0].case_insensitive);
+    try std.testing.expect(escaped_source_text_filter.mutation.req.join.right.text_patterns[0].negated);
+
+    var computed_source_pattern_filter = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND lower(source.source_status) LIKE 'ready!_%' ESCAPE '!' FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer computed_source_pattern_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_source_pattern_filter.mutation.req.join.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_source_pattern_filter.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqualStrings("source_status", computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"ready\\\\_%\"", computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_source_pattern_filter.mutation.req.join.right.expression_predicates[0].rhs[0].value_json);
+
+    var computed_source_pattern_some_filter = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'synced' FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND lower(source.source_status) LIKE SOME(ARRAY['ready%', 'queued%']) FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer computed_source_pattern_some_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), computed_source_pattern_some_filter.mutation.req.join.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("source_status", computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"ready%\"", computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", computed_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].rhs[0].value_json);
+
+    const public_sql = "UPDATE public.usage_records SET quantity = source.source_quantity, status = 'synced' FROM public.source_records AS source WHERE usage_records.source_id = source.source_pk AND source.source_status = 'ready' FOR UPDATE SKIP LOCKED RETURNING id, quantity";
+    var public_lowered = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        public_sql,
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer public_lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", public_lowered.target_table_name);
+    try std.testing.expectEqualStrings("source_records", public_lowered.source_table_name);
+    try std.testing.expectEqualStrings("source_records", public_lowered.mutation.req.source_table);
+
+    var joined_catalog = try corpus.AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, &.{
+        .{ .name = "usage_records", .schema_json = target_schema_json },
+        .{ .name = "source_records", .schema_json = source_schema_json },
+    });
+    defer joined_catalog.deinit(alloc);
+
+    var resolved_catalog_update_options = try binder.resolveWritePlanCatalogOptionsAlloc(
+        alloc,
+        public_sql,
+        .{ .row_claim = row_claim },
+        joined_catalog.iface(),
+    );
+    defer resolved_catalog_update_options.deinit(alloc);
+    try std.testing.expect(resolved_catalog_update_options.options.joined_source_schema != null);
+
+    var catalog_update_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        public_sql,
+        target_schema,
+        &.{},
+        .{ .row_claim = row_claim },
+        joined_catalog.iface(),
+    );
+    defer catalog_update_plan.deinit(alloc);
+    switch (catalog_update_plan) {
+        .update_joined_source => |catalog_update| {
+            try std.testing.expectEqualStrings("usage_records", catalog_update.target_table_name);
+            try std.testing.expectEqualStrings("source_records", catalog_update.source_table_name);
+            try std.testing.expectEqual(@as(usize, 1), catalog_update.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("source_status", catalog_update.mutation.req.join.right.predicates[0].field);
+            try std.testing.expectEqual(@as(usize, 1), catalog_update.mutation.req.source_assignments.len);
+            try std.testing.expectEqualStrings("source_quantity", catalog_update.mutation.req.source_assignments[0].source_field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var catalog_delete_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM public.usage_records USING public.source_records AS source WHERE usage_records.source_id = source.source_pk AND source.source_status = 'stale' FOR UPDATE RETURNING id, lower(source.source_status) AS deleted_source_status_key",
+        target_schema,
+        &.{},
+        .{ .row_claim = row_claim },
+        joined_catalog.iface(),
+    );
+    defer catalog_delete_plan.deinit(alloc);
+    switch (catalog_delete_plan) {
+        .delete_joined_source => |catalog_delete| {
+            try std.testing.expectEqualStrings("usage_records", catalog_delete.target_table_name);
+            try std.testing.expectEqualStrings("source_records", catalog_delete.source_table_name);
+            try std.testing.expectEqual(@as(usize, 1), catalog_delete.mutation.req.join.right.predicates.len);
+            try std.testing.expectEqualStrings("source_status", catalog_delete.mutation.req.join.right.predicates[0].field);
+            try std.testing.expectEqual(@as(usize, 1), catalog_delete.mutation.req.returning_expressions.len);
+            try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, catalog_delete.mutation.req.returning_expressions[0].expression.operands[0].field_source);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var target_returning_expression = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity + 1 AS next_quantity",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer target_returning_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), target_returning_expression.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", target_returning_expression.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), target_returning_expression.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("next_quantity", target_returning_expression.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, target_returning_expression.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("quantity", target_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field);
+
+    var source_returning_expression = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, lower(source.source_status) AS source_status_key",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer source_returning_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), source_returning_expression.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", source_returning_expression.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), source_returning_expression.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("source_status_key", source_returning_expression.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, source_returning_expression.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, source_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_status", source_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field);
+
+    var mixed_returning_expression = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, concat(status, ':', source.source_status) AS target_source_status",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer mixed_returning_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_returning_expression.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", mixed_returning_expression.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), mixed_returning_expression.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("target_source_status", mixed_returning_expression.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, mixed_returning_expression.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("status", mixed_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, mixed_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_status", mixed_returning_expression.mutation.req.returning_expressions[0].expression.operands[2].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, mixed_returning_expression.mutation.req.returning_expressions[0].expression.operands[2].field_source);
+
+    var delete_target_returning_expression = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity + 1 AS deleted_quantity",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer delete_target_returning_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), delete_target_returning_expression.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", delete_target_returning_expression.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), delete_target_returning_expression.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("deleted_quantity", delete_target_returning_expression.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, delete_target_returning_expression.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqualStrings("quantity", delete_target_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field);
+
+    var delete_source_returning_expression = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, lower(source.source_status) AS deleted_source_status_key",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer delete_source_returning_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_returning_expression.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", delete_source_returning_expression.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_returning_expression.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("deleted_source_status_key", delete_source_returning_expression.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, delete_source_returning_expression.mutation.req.returning_expressions[0].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, delete_source_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_status", delete_source_returning_expression.mutation.req.returning_expressions[0].expression.operands[0].field);
+
+    var delete_source_pattern_some_filter = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk AND lower(source.source_status) LIKE SOME(ARRAY['stale%', 'expired%']) FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer delete_source_pattern_some_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), delete_source_pattern_some_filter.mutation.req.join.right.text_patterns.len);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.bool_or, delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.kind);
+    try std.testing.expectEqual(@as(usize, 2), delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.like, delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].kind);
+    try std.testing.expectEqualStrings("source_status", delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[0].operands[0].field);
+    try std.testing.expectEqualStrings("\"stale%\"", delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].lhs.operands[0].operands[1].value_json);
+    try std.testing.expectEqualStrings("true", delete_source_pattern_some_filter.mutation.req.join.right.expression_predicates[0].rhs[0].value_json);
+
+    var implicit_claim = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.source_status FROM source_records AS source WHERE usage_records.source_id = source.source_pk",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer implicit_claim.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", implicit_claim.target_table_name);
+    try std.testing.expectEqualStrings("source_records", implicit_claim.source_table_name);
+    try std.testing.expectEqual(@as(usize, 1), implicit_claim.mutation.req.join.on.len);
+    try std.testing.expectEqual(@as(usize, 1), implicit_claim.mutation.req.source_assignments.len);
+    try std.testing.expect(implicit_claim.mutation.req.join.left.row_claim != null);
+    try std.testing.expect(!implicit_claim.mutation.req.join.left.row_claim.?.skip_locked);
+
+    var implicit_delete = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer implicit_delete.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", implicit_delete.target_table_name);
+    try std.testing.expectEqualStrings("source_records", implicit_delete.source_table_name);
+    try std.testing.expectEqual(@as(usize, 1), implicit_delete.mutation.req.join.on.len);
+    try std.testing.expect(implicit_delete.mutation.req.join.left.row_claim != null);
+    try std.testing.expect(!implicit_delete.mutation.req.join.left.row_claim.?.skip_locked);
+
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.source_status FROM source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET status = source.source_status FROM source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .owner_id = "joined-worker", .lease_ms = 0, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .txn_id = txn_id },
+    ));
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        .{ .mode = .for_update, .owner_id = "joined-worker", .lease_ms = 0, .txn_id = txn_id },
+    ));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE archive.usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, quantity + 1 AS id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    ));
+    var update_source_returning = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, source.source_quantity AS copied_quantity",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer update_source_returning.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), update_source_returning.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", update_source_returning.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), update_source_returning.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("copied_quantity", update_source_returning.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, update_source_returning.mutation.req.returning_expressions[0].expression.field_source);
+    try std.testing.expectEqualStrings("source_quantity", update_source_returning.mutation.req.returning_expressions[0].expression.field);
+
+    var delete_source_returning = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id, source.source_quantity AS copied_quantity",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer delete_source_returning.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_returning.mutation.req.returning.len);
+    try std.testing.expectEqualStrings("id", delete_source_returning.mutation.req.returning[0]);
+    try std.testing.expectEqual(@as(usize, 1), delete_source_returning.mutation.req.returning_expressions.len);
+    try std.testing.expectEqualStrings("copied_quantity", delete_source_returning.mutation.req.returning_expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, delete_source_returning.mutation.req.returning_expressions[0].expression.field_source);
+    try std.testing.expectEqualStrings("source_quantity", delete_source_returning.mutation.req.returning_expressions[0].expression.field);
+    try std.testing.expectError(error.UnsupportedRowsQuery, lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity, quantity = 7 FROM source_records AS source WHERE usage_records.source_id = source.source_pk FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    ));
+    var mixed_update_filter = try lowerUpdateJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "UPDATE usage_records SET quantity = source.source_quantity FROM source_records AS source WHERE usage_records.source_id = source.source_pk AND lower(usage_records.status) = lower(source.source_status) FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer mixed_update_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_update_filter.mutation.req.match_expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, mixed_update_filter.mutation.req.match_expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_update_filter.mutation.req.match_expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("status", mixed_update_filter.mutation.req.match_expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, mixed_update_filter.mutation.req.match_expression_predicates[0].lhs.operands[0].field_source);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, mixed_update_filter.mutation.req.match_expression_predicates[0].rhs[0].kind);
+    try std.testing.expectEqualStrings("source_status", mixed_update_filter.mutation.req.match_expression_predicates[0].rhs[0].operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, mixed_update_filter.mutation.req.match_expression_predicates[0].rhs[0].operands[0].field_source);
+
+    var mixed_delete_filter = try lowerDeleteJoinedMutationSourceWithSchemasForDmlTestAlloc(
+        alloc,
+        "DELETE FROM usage_records USING source_records AS source WHERE usage_records.source_id = source.source_pk AND usage_records.quantity + source.source_quantity > 10 FOR UPDATE RETURNING id",
+        target_schema,
+        source_schema,
+        &.{},
+        row_claim,
+    );
+    defer mixed_delete_filter.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), mixed_delete_filter.mutation.req.match_expression_predicates.len);
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gt, mixed_delete_filter.mutation.req.match_expression_predicates[0].op);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.kind);
+    try std.testing.expectEqualStrings("quantity", mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.operands[0].field_source);
+    try std.testing.expectEqualStrings("source_quantity", mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.operands[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, mixed_delete_filter.mutation.req.match_expression_predicates[0].lhs.operands[1].field_source);
+    try std.testing.expectEqualStrings("10", mixed_delete_filter.mutation.req.match_expression_predicates[0].rhs[0].value_json);
 }
 
 test "sql adapter lower dml detects merge target row usage" {

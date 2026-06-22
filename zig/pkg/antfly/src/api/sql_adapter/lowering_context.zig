@@ -15,12 +15,14 @@
 const std = @import("std");
 
 const binder = @import("binder.zig");
+const classifier = @import("classifier.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan = @import("plan.zig");
 const relational_rows = @import("../relational_rows.zig");
 const table_catalog = @import("../table_catalog.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
 pub const ReadPlanLoweringCallbacks = struct {
@@ -82,14 +84,21 @@ pub const ReadPlanLoweringContext = struct {
     params: []const value_mod.SqlValue,
     function_bindings: lower_expr.SqlFunctionBindings,
     callbacks: ReadPlanLoweringCallbacks,
+    statement_kind: ?classifier.SqlReadStatementKind = null,
 
     pub fn lower(self: *@This()) !plan.LoweredReadPlan {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, self.sql);
+        defer parsed_sql.deinit(self.alloc);
+        const old_statement_kind = self.statement_kind;
+        self.statement_kind = parsed_sql.tokenized_sql.read_statement_kind;
+        defer self.statement_kind = old_statement_kind;
         return try plan.lowerReadPlanWithHooks(self.hooks());
     }
 
     fn hooks(self: *@This()) plan.ReadPlanLoweringHooks {
         return .{
             .ptr = self,
+            .statement_kind = self.statement_kind,
             .lower_lateral = lowerLateralHook,
             .lower_window = lowerWindowHook,
             .lower_aggregate = lowerAggregateHook,
@@ -510,7 +519,9 @@ pub const ExplainPlanLoweringContext = struct {
     callbacks: ExplainPlanLoweringCallbacks,
 
     pub fn lower(self: *@This(), sql: []const u8) !plan.LoweredExplainPlan {
-        return try plan.lowerExplainPlanWithHooksAlloc(sql, self.hooks());
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(self.alloc, sql);
+        defer parsed_sql.deinit(self.alloc);
+        return try plan.lowerExplainPlanWithParsedSqlAlloc(&parsed_sql, self.hooks());
     }
 
     fn hooks(self: *@This()) plan.ExplainPlanLoweringHooks {

@@ -7787,6 +7787,347 @@ fn lowerDdlPlanWithFunctionBindingsForTestAlloc(
     });
 }
 
+test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
+    const alloc = std.testing.allocator;
+    var lowered = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE IF NOT EXISTS usage_records (
+        \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  amount numeric(18, 2) DEFAULT 0 CHECK (amount >= 0),
+        \\  metadata jsonb,
+        \\  tags text[],
+        \\  created_at timestamptz DEFAULT now(),
+        \\  email_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,
+        \\  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),
+        \\  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE
+        \\);
+        ,
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expect(plan.if_not_exists);
+            try std.testing.expectEqual(@as(usize, 7), plan.columns.len);
+            try std.testing.expectEqualStrings("id", plan.columns[0].name);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, plan.columns[0].field_type);
+            try std.testing.expect(!plan.columns[0].nullable);
+            try std.testing.expect(plan.columns[0].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.uuid_v4, plan.columns[0].default_value.?.kind);
+            try std.testing.expectEqualStrings("amount", plan.columns[2].name);
+            try std.testing.expectEqual(runtime_schema.AntflyType.numeric, plan.columns[2].field_type);
+            try std.testing.expect(plan.columns[2].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, plan.columns[2].default_value.?.kind);
+            try std.testing.expectEqualStrings("0", plan.columns[2].default_value.?.value_json);
+            try std.testing.expectEqual(runtime_schema.AntflyType.json, plan.columns[3].field_type);
+            try std.testing.expectEqual(runtime_schema.AntflyType.array, plan.columns[4].field_type);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, plan.columns[4].array_item_type.?);
+            try std.testing.expectEqual(runtime_schema.AntflyType.datetime, plan.columns[5].field_type);
+            try std.testing.expect(plan.columns[5].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.now_ns, plan.columns[5].default_value.?.kind);
+            try std.testing.expectEqualStrings("email_key", plan.columns[6].name);
+            try std.testing.expect(plan.columns[6].generated != null);
+            try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, plan.columns[6].generated.?.op);
+            try std.testing.expectEqualStrings("tenant_id", plan.columns[6].generated.?.field.?);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.columns.len);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("usage_records_tenant_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.foreign_keys.len);
+            try std.testing.expectEqualStrings("usage_records_tenant_fkey", plan.foreign_keys[0].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.foreign_keys[0].child_columns[0]);
+            try std.testing.expectEqualStrings("tenants", plan.foreign_keys[0].parent_table);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyAction.cascade, plan.foreign_keys[0].on_delete);
+            try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
+            try std.testing.expectEqualStrings("amount", plan.checks[0].field);
+            try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, plan.checks[0].op);
+            try std.testing.expectEqualStrings("0", plan.checks[0].value_json.?);
+        },
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var casted_defaults = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE casted_defaults (
+        \\  id uuid PRIMARY KEY,
+        \\  amount numeric DEFAULT '0'::numeric,
+        \\  enabled boolean DEFAULT 'true'::boolean
+        \\);
+        ,
+    );
+    defer casted_defaults.deinit(alloc);
+    switch (casted_defaults) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("casted_defaults", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 3), plan.columns.len);
+            try std.testing.expectEqual(runtime_schema.AntflyType.numeric, plan.columns[1].field_type);
+            try std.testing.expect(plan.columns[1].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, plan.columns[1].default_value.?.kind);
+            try std.testing.expectEqualStrings("0", plan.columns[1].default_value.?.value_json);
+            try std.testing.expectEqual(runtime_schema.AntflyType.boolean, plan.columns[2].field_type);
+            try std.testing.expect(plan.columns[2].default_value != null);
+            try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.literal, plan.columns[2].default_value.?.kind);
+            try std.testing.expectEqualStrings("true", plan.columns[2].default_value.?.value_json);
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+            try std.testing.expectEqual(@as(usize, 3), applied.relational_columns.len);
+        },
+        .create_index => return error.TestUnexpectedResult,
+        .drop_index => return error.TestUnexpectedResult,
+        .drop_table => return error.TestUnexpectedResult,
+        .alter_table => return error.TestUnexpectedResult,
+        .create_update_policy => return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    }
+
+    var no_primary_key = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE usage_stage (tenant_id text NOT NULL, id uuid NOT NULL, status text);",
+    );
+    defer no_primary_key.deinit(alloc);
+    switch (no_primary_key) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("usage_stage", plan.table_name);
+            try std.testing.expect(plan.primary_key == null);
+            try std.testing.expectEqual(@as(usize, 3), plan.columns.len);
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+            try std.testing.expectEqual(runtime_schema.StorageMode.relational, applied.storage_mode);
+            try std.testing.expect(applied.primary_key == null);
+            try std.testing.expectEqual(@as(usize, 3), applied.relational_columns.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var primary_key_timing = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE primary_key_timing (
+        \\  id uuid CONSTRAINT primary_key_timing_id_pk PRIMARY KEY NOT DEFERRABLE INITIALLY IMMEDIATE,
+        \\  tenant_id text NOT NULL
+        \\);
+        ,
+    );
+    defer primary_key_timing.deinit(alloc);
+    switch (primary_key_timing) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("primary_key_timing", plan.table_name);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("primary_key_timing_id_pk", plan.primary_key.?.name.?);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.columns.len);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var table_primary_key_timing = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE table_primary_key_timing (
+        \\  tenant_id text NOT NULL,
+        \\  id uuid NOT NULL,
+        \\  status text,
+        \\  CONSTRAINT table_primary_key_timing_pk PRIMARY KEY (tenant_id, id) INCLUDE (status) NOT DEFERRABLE INITIALLY IMMEDIATE
+        \\);
+        ,
+    );
+    defer table_primary_key_timing.deinit(alloc);
+    switch (table_primary_key_timing) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("table_primary_key_timing", plan.table_name);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("table_primary_key_timing_pk", plan.primary_key.?.name.?);
+            try std.testing.expectEqual(@as(usize, 2), plan.primary_key.?.columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[1]);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.include_columns.len);
+            try std.testing.expectEqualStrings("status", plan.primary_key.?.include_columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var primary_key_not_null = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE primary_key_not_null (id uuid PRIMARY KEY NOT NULL);",
+    );
+    defer primary_key_not_null.deinit(alloc);
+    switch (primary_key_not_null) {
+        .create_table => |plan| {
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expect(!plan.columns[0].nullable);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var unique_nulls_distinct = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE unique_nulls_distinct (
+        \\  id uuid PRIMARY KEY,
+        \\  email text UNIQUE NULLS DISTINCT NOT DEFERRABLE INITIALLY IMMEDIATE,
+        \\  tenant_id text CONSTRAINT unique_nulls_distinct_tenant_key UNIQUE NULLS DISTINCT NOT DEFERRABLE,
+        \\  CONSTRAINT unique_nulls_distinct_tenant_email_key UNIQUE NULLS DISTINCT (tenant_id, email) NOT DEFERRABLE INITIALLY IMMEDIATE
+        \\);
+        ,
+    );
+    defer unique_nulls_distinct.deinit(alloc);
+    switch (unique_nulls_distinct) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("unique_nulls_distinct", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 3), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqualStrings("unique_nulls_distinct_tenant_key", plan.unique_constraints[1].name);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[1].columns[0]);
+            try std.testing.expectEqualStrings("unique_nulls_distinct_tenant_email_key", plan.unique_constraints[2].name);
+            try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints[2].columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[2].columns[0]);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[2].columns[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var covering_unique_constraints = try lowerDdlPlanForTestAlloc(
+        alloc,
+        \\CREATE TABLE covering_unique_constraints (
+        \\  id uuid PRIMARY KEY INCLUDE (tenant_id),
+        \\  tenant_id text,
+        \\  status text,
+        \\  email text UNIQUE INCLUDE (tenant_id),
+        \\  CONSTRAINT covering_unique_constraints_status_key UNIQUE (status) INCLUDE (tenant_id, email) NOT DEFERRABLE INITIALLY IMMEDIATE
+        \\);
+        ,
+    );
+    defer covering_unique_constraints.deinit(alloc);
+    switch (covering_unique_constraints) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("covering_unique_constraints", plan.table_name);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expectEqualStrings("id", plan.primary_key.?.columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.primary_key.?.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.primary_key.?.include_columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints.len);
+            try std.testing.expectEqualStrings("email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints[0].include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[0].include_columns[0]);
+            try std.testing.expectEqualStrings("covering_unique_constraints_status_key", plan.unique_constraints[1].name);
+            try std.testing.expectEqualStrings("status", plan.unique_constraints[1].columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), plan.unique_constraints[1].include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", plan.unique_constraints[1].include_columns[0]);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[1].include_columns[1]);
+
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+            try std.testing.expect(applied.primary_key != null);
+            try std.testing.expectEqual(@as(usize, 1), applied.primary_key.?.include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", applied.primary_key.?.include_columns[0]);
+            try std.testing.expectEqual(@as(usize, 2), applied.unique_constraints.len);
+            try std.testing.expectEqual(@as(usize, 2), applied.unique_constraints[1].include_columns.len);
+            try std.testing.expectEqualStrings("tenant_id", applied.unique_constraints[1].include_columns[0]);
+            try std.testing.expectEqualStrings("email", applied.unique_constraints[1].include_columns[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE ONLY usage_records (id uuid PRIMARY KEY);",
+    ));
+    var inline_nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_unique_nulls (id uuid PRIMARY KEY, email text UNIQUE NULLS NOT DISTINCT);",
+    );
+    defer inline_nulls_not_distinct_unique.deinit(alloc);
+    switch (inline_nulls_not_distinct_unique) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_unique_nulls", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expect(plan.unique_constraints[0].nulls_not_distinct);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var table_nulls_not_distinct_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_table_unique_nulls (id uuid PRIMARY KEY, email text, CONSTRAINT bad_table_unique_nulls_email_key UNIQUE NULLS NOT DISTINCT (email));",
+    );
+    defer table_nulls_not_distinct_unique.deinit(alloc);
+    switch (table_nulls_not_distinct_unique) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_table_unique_nulls", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expect(plan.unique_constraints[0].nulls_not_distinct);
+            try std.testing.expectEqualStrings("bad_table_unique_nulls_email_key", plan.unique_constraints[0].name);
+            try std.testing.expectEqualStrings("email", plan.unique_constraints[0].columns[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var deferrable_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_deferred_unique (id uuid PRIMARY KEY, email text UNIQUE DEFERRABLE);",
+    );
+    defer deferrable_unique.deinit(alloc);
+    switch (deferrable_unique) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_deferred_unique", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.unique_constraints.len);
+            try std.testing.expect(plan.unique_constraints[0].deferrable);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.immediate, plan.unique_constraints[0].timing);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_deferred_table_unique (id uuid PRIMARY KEY, email text, CONSTRAINT bad_deferred_table_unique_email_key UNIQUE (email) NOT DEFERRABLE INITIALLY DEFERRED);",
+    ));
+    var deferrable_primary = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_deferred_primary (id uuid PRIMARY KEY DEFERRABLE);",
+    );
+    defer deferrable_primary.deinit(alloc);
+    switch (deferrable_primary) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("bad_deferred_primary", plan.table_name);
+            try std.testing.expect(plan.primary_key != null);
+            try std.testing.expect(plan.primary_key.?.deferrable);
+            try std.testing.expectEqual(runtime_schema.ForeignKeyTiming.immediate, plan.primary_key.?.timing);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_deferred_table_primary (tenant_id text NOT NULL, id uuid NOT NULL, CONSTRAINT bad_deferred_table_primary_pk PRIMARY KEY (tenant_id, id) NOT DEFERRABLE INITIALLY DEFERRED);",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_primary_include_overlap (id uuid PRIMARY KEY INCLUDE (id));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE bad_unique_include_overlap (id uuid PRIMARY KEY, email text UNIQUE INCLUDE (email));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE duplicate_pk (tenant_id text, id text, PRIMARY KEY (tenant_id, tenant_id));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE duplicate_unique (id text PRIMARY KEY, tenant_id text, CONSTRAINT duplicate_unique_tenant_key UNIQUE (tenant_id, tenant_id));",
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE TABLE duplicate_fk (id text PRIMARY KEY, tenant_id text, FOREIGN KEY (tenant_id, tenant_id) REFERENCES tenants (id, id));",
+    ));
+}
+
 test "sql adapter ddl plan lowers create index ddl" {
     const alloc = std.testing.allocator;
 

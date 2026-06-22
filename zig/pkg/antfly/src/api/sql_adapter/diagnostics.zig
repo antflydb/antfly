@@ -14,6 +14,20 @@
 
 const std = @import("std");
 
+const token_mod = @import("token.zig");
+
+pub const SourceSpan = token_mod.SourceSpan;
+pub const Token = token_mod.Token;
+
+pub const SqlDiagnostic = struct {
+    reason: SqlAdapterClassificationReason,
+    span: SourceSpan = .{},
+
+    pub fn fromToken(reason: SqlAdapterClassificationReason, token: Token) SqlDiagnostic {
+        return .{ .reason = reason, .span = token.sourceSpan() };
+    }
+};
+
 pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
     bulk_io_plan,

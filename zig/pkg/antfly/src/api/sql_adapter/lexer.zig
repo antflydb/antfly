@@ -50,17 +50,30 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '.')) i += 1;
             const end = i;
             i = skipSqlCast(sql, i);
-            try tokens.append(alloc, .{ .kind = .identifier, .text = sql[start..end] });
+            try tokens.append(alloc, .{
+                .kind = .identifier,
+                .text = sql[start..end],
+                .source_start = start,
+                .source_end = end,
+                .keyword = token_mod.keywordFromIdentifier(sql[start..end]),
+            });
             continue;
         }
         if (ch == '"') {
+            const source_start = i;
             const start = i + 1;
             i += 1;
             while (i < sql.len and sql[i] != '"') i += 1;
             if (i >= sql.len) return error.UnsupportedSqlShape;
-            try tokens.append(alloc, .{ .kind = .identifier, .text = sql[start..i] });
             i += 1;
+            const source_end = i;
             i = skipSqlCast(sql, i);
+            try tokens.append(alloc, .{
+                .kind = .identifier,
+                .text = sql[start .. source_end - 1],
+                .source_start = source_start,
+                .source_end = source_end,
+            });
             continue;
         }
         if (ch == '\'') {
@@ -92,7 +105,7 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
                     try tokens.append(alloc, .{ .kind = .number, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
                 } else if (sqlCastTypeIsBoolean(cast_type.name)) {
                     if (!std.ascii.eqlIgnoreCase(owned, "true") and !std.ascii.eqlIgnoreCase(owned, "false")) return error.UnsupportedSqlShape;
-                    try tokens.append(alloc, .{ .kind = .identifier, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
+                    try tokens.append(alloc, .{ .kind = .identifier, .text = owned, .owned = true, .source_start = source_start, .source_end = i, .keyword = token_mod.keywordFromIdentifier(owned) });
                 } else {
                     try tokens.append(alloc, .{ .kind = .string, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
                 }
