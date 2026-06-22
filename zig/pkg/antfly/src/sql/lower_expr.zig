@@ -2377,7 +2377,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-        const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+        const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
             try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
@@ -2390,7 +2390,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
 
     if (parser.matchKeyword(tokens, pos, "not")) {
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-            const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+            const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
                 try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
@@ -2645,7 +2645,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-        const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+        const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
             try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
@@ -2668,7 +2668,7 @@ pub fn parseExpressionWhereConditionsAlloc(
 
     if (parser.matchKeyword(tokens, pos, "not")) {
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-            const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+            const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const condition = if (tokenAtIsAnySomeOrAll(tokens, pos.*))
                 try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
@@ -22286,7 +22286,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-        const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+        const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, negated, realtime_ns);
         return;
     }
@@ -22312,7 +22312,7 @@ pub fn parseWhereAtomAlloc(
             return;
         }
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-            const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+            const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, true, realtime_ns);
             return;
         }
@@ -22511,14 +22511,14 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-            const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+            const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "not")) {
             if (parser.matchKeyword(tokens, pos, "like") or parser.matchKeyword(tokens, pos, "ilike")) {
-                const case_insensitive = std.ascii.eqlIgnoreCase(tokens[pos.* - 1].text, "ilike");
+                const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;

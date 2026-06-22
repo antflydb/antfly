@@ -741,6 +741,11 @@ Current implementation status:
 - Common expression-start function names now carry compact token keyword
   metadata, and expression classifier probes consume those tags instead of
   repeating local case-insensitive string checks.
+- Write, explain, and relation-population hook lowerers use parsed entrypoints
+  only; the raw SQL wrappers were removed so callers construct `ParsedSql` once
+  at ingress and pass it through. Relation-population parser tests exercise
+  `ParsedSql` directly, and text-pattern predicate lowering uses keyword tags
+  for `ILIKE` detection instead of re-reading token text.
 - HTTP relational SQL DDL execution, source-backed DDL application, bulk SQL,
   and auth-catalog DDL helpers construct `ParsedSql` once at ingress before
   lowering DDL/session control plans, and transaction-boundary session cleanup

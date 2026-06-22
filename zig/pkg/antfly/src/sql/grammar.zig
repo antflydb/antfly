@@ -7649,12 +7649,6 @@ fn freeDdlGeneratedValue(alloc: std.mem.Allocator, generated: runtime_schema.Rel
     if (generated.expression) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
 }
 
-pub fn parseRelationPopulationSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !RelationPopulationSyntax {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try parseRelationPopulationParsedSqlAlloc(alloc, &parsed_sql);
-}
-
 pub fn parseRelationPopulationParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -11656,7 +11650,7 @@ test "sql adapter grammar parses relation population syntax" {
     const alloc = std.testing.allocator;
 
     const select_into_sql = "SELECT account_id, total INTO public.usage_archive FROM usage_records WHERE total > 10";
-    var select_into = try parseRelationPopulationSqlAlloc(
+    var select_into = try parseRelationPopulationParsedForTestAlloc(
         alloc,
         select_into_sql,
     );
@@ -11673,7 +11667,7 @@ test "sql adapter grammar parses relation population syntax" {
     );
 
     const select_into_temp_sql = "SELECT account_id, total INTO TEMP TABLE usage_session_archive FROM usage_records WHERE total > 10";
-    var select_into_temp = try parseRelationPopulationSqlAlloc(
+    var select_into_temp = try parseRelationPopulationParsedForTestAlloc(
         alloc,
         select_into_temp_sql,
     );
@@ -11690,7 +11684,7 @@ test "sql adapter grammar parses relation population syntax" {
     );
 
     const select_into_unlogged_sql = "SELECT account_id INTO UNLOGGED usage_ingest_archive FROM usage_records WHERE total > 10";
-    var select_into_unlogged = try parseRelationPopulationSqlAlloc(
+    var select_into_unlogged = try parseRelationPopulationParsedForTestAlloc(
         alloc,
         select_into_unlogged_sql,
     );
@@ -11707,7 +11701,7 @@ test "sql adapter grammar parses relation population syntax" {
     );
 
     const create_as_sql = "CREATE TEMP TABLE IF NOT EXISTS usage_session_archive AS SELECT account_id FROM usage_records";
-    var create_as = try parseRelationPopulationSqlAlloc(
+    var create_as = try parseRelationPopulationParsedForTestAlloc(
         alloc,
         create_as_sql,
     );
@@ -11750,7 +11744,7 @@ test "sql adapter grammar parses relation population syntax" {
     );
 
     const create_as_no_data_sql = "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH NO DATA;";
-    var create_as_no_data = try parseRelationPopulationSqlAlloc(
+    var create_as_no_data = try parseRelationPopulationParsedForTestAlloc(
         alloc,
         create_as_no_data_sql,
     );
@@ -11769,7 +11763,7 @@ test "sql adapter grammar parses relation population syntax" {
     );
 
     const create_as_with_data_sql = "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH DATA;";
-    var create_as_with_data = try parseRelationPopulationSqlAlloc(
+    var create_as_with_data = try parseRelationPopulationParsedForTestAlloc(
         alloc,
         create_as_with_data_sql,
     );
@@ -11786,8 +11780,17 @@ test "sql adapter grammar parses relation population syntax" {
 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        parseRelationPopulationSqlAlloc(alloc, "CREATE TABLE usage_archive SELECT account_id FROM usage_records"),
+        parseRelationPopulationParsedForTestAlloc(alloc, "CREATE TABLE usage_archive SELECT account_id FROM usage_records"),
     );
+}
+
+fn parseRelationPopulationParsedForTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+) !RelationPopulationSyntax {
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try parseRelationPopulationParsedSqlAlloc(alloc, &parsed_sql);
 }
 
 fn expectRelationPopulationSourceRanges(
@@ -11796,21 +11799,22 @@ fn expectRelationPopulationSourceRanges(
     expected_prefix: []const u8,
     expected_suffix: ?[]const u8,
 ) !void {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    var parsed = try parseRelationPopulationTokensAlloc(alloc, sql, tokens.items);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    var parsed = try parseRelationPopulationParsedSqlAlloc(alloc, &parsed_sql);
     defer parsed.deinit(alloc);
+    const tokens = parsed_sql.items();
 
     const start = parsed.source_token_start orelse return error.TestUnexpectedResult;
     const end = parsed.source_token_end orelse return error.TestUnexpectedResult;
-    if (end <= start or end > tokens.items.len) return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings(expected_prefix, sql[tokens.items[start].source_start..tokens.items[end - 1].source_end]);
+    if (end <= start or end > tokens.len) return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(expected_prefix, sql[tokens[start].source_start..tokens[end - 1].source_end]);
 
     if (expected_suffix) |suffix| {
         const suffix_start = parsed.source_suffix_token_start orelse return error.TestUnexpectedResult;
         const suffix_end = parsed.source_suffix_token_end orelse return error.TestUnexpectedResult;
-        if (suffix_end <= suffix_start or suffix_end > tokens.items.len) return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings(suffix, sql[tokens.items[suffix_start].source_start..tokens.items[suffix_end - 1].source_end]);
+        if (suffix_end <= suffix_start or suffix_end > tokens.len) return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(suffix, sql[tokens[suffix_start].source_start..tokens[suffix_end - 1].source_end]);
     } else {
         try std.testing.expect(parsed.source_suffix_token_start == null);
         try std.testing.expect(parsed.source_suffix_token_end == null);

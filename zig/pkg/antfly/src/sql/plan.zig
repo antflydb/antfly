@@ -746,18 +746,6 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
     }
 }
 
-pub fn lowerWritePlanWithHooksAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    schema: runtime_schema.TableSchema,
-    options: LowerWritePlanOptions,
-    hooks: WritePlanLoweringHooks,
-) !LoweredWritePlan {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerWritePlanWithParsedSqlAlloc(&parsed_sql, schema, options, hooks);
-}
-
 pub fn lowerWritePlanWithParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
@@ -2166,16 +2154,6 @@ pub const RelationPopulationLoweringHooks = struct {
     lower_read: *const fn (*anyopaque, *const tokenized.ParsedSql) anyerror!LoweredReadPlan,
 };
 
-pub fn lowerRelationPopulationPlanWithHooksAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    hooks: RelationPopulationLoweringHooks,
-) !LoweredRelationPopulationPlan {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &parsed_sql, hooks);
-}
-
 pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -2248,16 +2226,6 @@ pub const ExplainPlanLoweringHooks = struct {
     lower_read: *const fn (*anyopaque, *const tokenized.ParsedSql) anyerror!LoweredReadPlan,
     lower_write: *const fn (*anyopaque, *const tokenized.ParsedSql) anyerror!LoweredWritePlan,
 };
-
-pub fn lowerExplainPlanWithHooksAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    hooks: ExplainPlanLoweringHooks,
-) !LoweredExplainPlan {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerExplainPlanWithParsedSqlAlloc(alloc, &parsed_sql, hooks);
-}
 
 pub fn lowerExplainPlanWithParsedSqlAlloc(
     alloc: std.mem.Allocator,
