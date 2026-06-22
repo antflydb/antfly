@@ -3254,18 +3254,21 @@ fn expectAppParityUnsupportedPlanEntry(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+
     switch (entry.family) {
-        .unsupported => try expectFailClosedUnsupported(lowerQueryPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
-        .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
-        .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanAlloc(alloc, entry.sql)),
+        .unsupported => try expectFailClosedUnsupported(lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{})),
+        .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{})),
+        .unsupported_ddl => try expectFailClosedUnsupported(lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql)),
         .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanAlloc(alloc, effective_schema, entry, unique_resolver, row_claim)),
-        .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
-        .unsupported_update => try expectFailClosedUnsupported(lowerUpdateAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
-        .unsupported_update_source => try expectFailClosedUnsupported(lowerUpdateMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
-        .unsupported_delete => try expectFailClosedUnsupported(lowerDeleteAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
-        .unsupported_update_joined_source => try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
-        .unsupported_delete_joined_source => try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
-        .unsupported_merge_mutation => try expectFailClosedUnsupported(lowerMergeMutationPlanAlloc(alloc, entry.sql, effective_schema, effective_schema, entry.params)),
+        .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update => try expectFailClosedUnsupported(lowerUpdateParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update_source => try expectFailClosedUnsupported(lowerUpdateMutationSourceParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, row_claim)),
+        .unsupported_delete => try expectFailClosedUnsupported(lowerDeleteParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .unsupported_update_joined_source => try expectFailClosedUnsupported(lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
+        .unsupported_delete_joined_source => try expectFailClosedUnsupported(lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
+        .unsupported_merge_mutation => try expectFailClosedUnsupported(lowerMergeMutationPlanParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params)),
         else => return error.TestUnexpectedResult,
     }
 
@@ -3286,13 +3289,16 @@ fn expectAppParityInvalidPlanEntry(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    defer parsed_sql.deinit(alloc);
+
     switch (entry.family) {
-        .invalid_read => try expectTypedInvalid(lowerReadPlanAlloc(alloc, entry.sql, effective_schema, entry.params)),
-        .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
-        .invalid_update => try expectTypedInvalid(lowerUpdateStrictAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
-        .invalid_delete => try expectTypedInvalid(lowerDeleteAlloc(alloc, entry.sql, effective_schema, entry.params, unique_resolver)),
-        .invalid_update_source => try expectTypedInvalid(lowerUpdateMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
-        .invalid_update_joined_source => try expectTypedInvalid(lowerUpdateJoinedMutationSourceAlloc(alloc, entry.sql, effective_schema, entry.params, row_claim)),
+        .invalid_read => try expectTypedInvalid(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, .{})),
+        .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_update => try expectTypedInvalid(lowerUpdateStrictParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_delete => try expectTypedInvalid(lowerDeleteParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, unique_resolver)),
+        .invalid_update_source => try expectTypedInvalid(lowerUpdateMutationSourceParsedSqlAlloc(alloc, &parsed_sql, effective_schema, entry.params, row_claim)),
+        .invalid_update_joined_source => try expectTypedInvalid(lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc(alloc, &parsed_sql, effective_schema, effective_schema, entry.params, row_claim)),
         else => return error.TestUnexpectedResult,
     }
 

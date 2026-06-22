@@ -838,6 +838,20 @@ pub const BoundSqlStatement = struct {
     }
 };
 
+fn requireParsedCatalogReadStatement(statement: tokenized.ParsedStatement) !void {
+    switch (statement) {
+        .read => {},
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
+fn requireParsedCatalogWriteStatement(statement: tokenized.ParsedStatement) !void {
+    switch (statement) {
+        .write => {},
+        else => return error.UnsupportedSqlShape,
+    }
+}
+
 pub const CatalogLogicalReadPlan = struct {
     statement: tokenized.ParsedStatement,
     session: BoundSqlSession,
@@ -1180,6 +1194,7 @@ pub fn bindWritePlanCatalogStatementWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
+    try requireParsedCatalogWriteStatement(parsed_sql.statement);
     return try bindWritePlanCatalogStatementFromTokensWithStatementAlloc(
         alloc,
         parsed_sql.statement,
@@ -1265,6 +1280,7 @@ pub fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundWritePlanOptions {
+    try requireParsedCatalogWriteStatement(parsed_sql.statement);
     return try resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(alloc, parsed_sql.items(), options, catalog, session);
 }
 
@@ -1352,6 +1368,7 @@ pub fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !CatalogBoundReadPlanSourceSchema {
+    try requireParsedCatalogReadStatement(parsed_sql.statement);
     return try resolveReadPlanCatalogSourceSchemaFromTokensWithSessionAlloc(alloc, parsed_sql.items(), catalog, session);
 }
 
@@ -1369,6 +1386,7 @@ pub fn bindReadPlanCatalogStatementWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !BoundSqlStatement {
+    try requireParsedCatalogReadStatement(parsed_sql.statement);
     return try bindReadPlanCatalogStatementFromTokensWithStatementAlloc(
         alloc,
         parsed_sql.statement,
@@ -2196,6 +2214,11 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect((try bound_write.writeCatalog()).owned_insert_source_schema == null);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, bindReadPlanCatalogStatementAlloc(alloc, &parsed_write, catalog.iface()));
+    try std.testing.expectError(error.UnsupportedSqlShape, resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(alloc, &parsed_write, catalog.iface()));
+    try std.testing.expectError(error.UnsupportedSqlShape, bindWritePlanCatalogStatementAlloc(alloc, &parsed_read, .{}, catalog.iface()));
+    try std.testing.expectError(error.UnsupportedSqlShape, resolveWritePlanCatalogOptionsParsedSqlAlloc(alloc, &parsed_read, .{}, catalog.iface()));
 
     const tenant_path = [_][]const u8{"analytics"};
     const tenant_session: catalog_resources.SqlCatalogSession = .{

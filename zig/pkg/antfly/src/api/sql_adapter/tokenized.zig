@@ -255,6 +255,9 @@ fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const Tokenize
     if (tokenized_sql.write_statement_kind) |kind| {
         return .{ .write = .{ .kind = kind, .raw = raw_statement } };
     }
+    if (classifier.classifyRecursiveWriteStatement(tokenized_sql.items())) |kind| {
+        return .{ .write = .{ .kind = kind, .raw = raw_statement } };
+    }
     return switch (tokenized_sql.statement_family orelse return .{ .unknown = raw_statement }) {
         .ddl => classifyDdlLikeStatement(raw_statement, tokenized_sql.items()),
         else => .{ .unknown = raw_statement },
@@ -534,6 +537,13 @@ test "sql adapter parsed sql owns typed statement variants" {
     defer write.deinit(alloc);
     switch (write.statement) {
         .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.update, statement.kind),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var recursive_write = try ParsedSql.initAlloc(alloc, "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) INSERT INTO archive(id) SELECT id FROM source_rows");
+    defer recursive_write.deinit(alloc);
+    switch (recursive_write.statement) {
+        .write => |statement| try std.testing.expectEqual(classifier.SqlWriteStatementKind.insert_source, statement.kind),
         else => return error.TestUnexpectedResult,
     }
 
