@@ -6071,8 +6071,11 @@ The remaining PostgreSQL/API work should land in these model-level slices:
    such as `antfly.full_text_search`, `antfly.semantic_search`,
    `antfly.vector_search`, `antfly.graph_match`, `antfly.graph_metric`,
    `antfly.graph_metric_rerank`, and `antfly.hybrid_search` are also
-   adapter-level syntax for native typed query requests rather than relational
-   row-plan fragments. The parity corpus treats them as a first-class
+   adapter-level syntax for native typed query requests. Graph table functions
+   can additionally project as CTE-backed row sources, so `antfly.graph_match`
+   can participate in ordinary SQL reads and joins while execution still routes
+   through the native graph query path. The parity corpus treats Antfly query
+   functions as a first-class
    `query_function` family and gates full-text, dense, graph-search,
    graph traversal/path, graph-metric, graph-rerank, simple hybrid, and
    structured hybrid source-list request production from data-driven fixture
