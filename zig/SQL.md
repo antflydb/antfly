@@ -330,6 +330,9 @@ Current implementation status:
   through `ParsedSql` before computing structured fingerprints. Antfly query
   function lowering has parsed entrypoints, and app-parity query-function
   checks reuse `ParsedSql` instead of tokenizing fixture SQL directly.
+  Corpus fixture parameter coverage parses fixture SQL once and validates
+  placeholders from parsed token spans instead of using a separate raw string
+  scanner.
   Parsed-only lowering context construction does not require a raw SQL field.
   Recursive data-modifying CTEs carry a parsed recursive-write flag, so generic
   write planning no longer reclassifies recursive write kind from the token
@@ -349,7 +352,8 @@ Current implementation status:
 - Fixture fingerprint checks use a structured `PlanFingerprintView` scanner with
   explicit exact-token and suffix-token modes instead of open-coded substring
   searches. Lateral and window expression coverage checks now use emitted plan
-  tokens rather than matching SQL spelling.
+  tokens rather than matching SQL spelling. Fixture parameter coverage now uses
+  `ParsedSql` placeholder tokens instead of a separate raw SQL byte scanner.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

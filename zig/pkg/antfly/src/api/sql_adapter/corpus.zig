@@ -2617,13 +2617,20 @@ fn setOperationPlanHasRightTable(plan: []const u8, source_table_name: []const u8
     return std.mem.eql(u8, plan[value_start..value_end], source_table_name);
 }
 
-pub fn corpusFixtureSqlParameterCoverageMatches(entry: AppParityCorpusEntry) bool {
+pub fn corpusFixtureSqlParameterCoverageMatchesAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !bool {
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return false;
+    defer parsed_sql.deinit(alloc);
+
     if (entry.family == .ddl and entry.summary.ddl_tag == .prepare_statement) {
         if (entry.params.len != 0) return false;
         const prepared_params = planUsizeTokenValue(entry.plan, ":params=") orelse return false;
-        return sqlParameterCoverageMatches(entry.sql, prepared_params);
+        return sqlParameterCoverageMatchesParsedSql(&parsed_sql, prepared_params);
     }
-    return sqlParameterCoverageMatches(entry.sql, entry.params.len);
+    return sqlParameterCoverageMatchesParsedSql(&parsed_sql, entry.params.len);
+}
+
+pub fn sqlParameterCoverageMatchesParsedSql(parsed_sql: *const tokenized.ParsedSql, param_count: usize) bool {
+    return sqlParameterCoverageMatchesTokens(parsed_sql.items(), param_count);
 }
 
 pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
@@ -2907,7 +2914,6 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
             return error.TestUnexpectedResult;
         }
     }
-    if (!corpusFixtureSqlParameterCoverageMatches(entry)) return error.TestUnexpectedResult;
     const has_resolver_hint = entry.resolver_row_json.len > 0 or
         entry.resolver_version != 0 or
         entry.resolver_exists != null;
@@ -2943,6 +2949,7 @@ pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
 }
 
 fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
+    if (!(try corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, entry))) return error.TestUnexpectedResult;
     for (entry.returning_rows) |row_json| {
         if (!(try fixtureJsonTextIsObjectAlloc(alloc, row_json))) return error.TestUnexpectedResult;
     }
@@ -5190,177 +5197,43 @@ fn consumeRowRewriteExpressionFingerprint(text: []const u8, index: *usize) bool 
     return index.* > start and depth == 0;
 }
 
-pub const SqlParameterScan = union(enum) {
-    absent,
-    value: usize,
-    invalid,
-};
-
-pub fn sqlHasParameterIndex(sql: []const u8, expected: usize) bool {
-    var index: usize = 0;
-    while (sqlNextParameter(sql, &index)) |scan| {
-        switch (scan) {
-            .value => |param_index| if (param_index == expected) return true,
-            .absent, .invalid => {},
-        }
+pub fn sqlTokensHaveParameterIndex(tokens: []const tokenized.Token, expected: usize) bool {
+    for (tokens) |token| {
+        const param_index = sqlParameterIndexFromToken(token) orelse continue;
+        if (param_index == expected) return true;
     }
     return false;
 }
 
-pub fn sqlParameterCoverageMatches(sql: []const u8, param_count: usize) bool {
-    var index: usize = 0;
+pub fn sqlParameterCoverageMatchesTokens(tokens: []const tokenized.Token, param_count: usize) bool {
     var saw_parameter = false;
     var max_index: usize = 0;
-    while (sqlNextParameter(sql, &index)) |scan| {
-        switch (scan) {
-            .value => |param_index| {
-                if (param_index == 0 or param_index > param_count) return false;
-                saw_parameter = true;
-                max_index = @max(max_index, param_index);
-            },
-            .invalid => return false,
-            .absent => {},
-        }
+    for (tokens) |token| {
+        const param_index = sqlParameterIndexFromToken(token) orelse continue;
+        if (param_index == 0 or param_index > param_count) return false;
+        saw_parameter = true;
+        max_index = @max(max_index, param_index);
     }
     if (param_count == 0) return !saw_parameter;
     if (!saw_parameter or max_index != param_count) return false;
 
     for (1..param_count + 1) |param_index| {
-        if (!sqlHasParameterIndex(sql, param_index)) return false;
+        if (!sqlTokensHaveParameterIndex(tokens, param_index)) return false;
     }
     return true;
 }
 
-pub fn sqlNextParameter(sql: []const u8, index: *usize) ?SqlParameterScan {
-    while (index.* < sql.len) {
-        switch (sql[index.*]) {
-            '\'' => {
-                index.* = sqlSingleQuotedEnd(sql, index.*);
-                continue;
-            },
-            '"' => {
-                index.* = sqlDoubleQuotedEnd(sql, index.*);
-                continue;
-            },
-            '-' => {
-                if (index.* + 1 < sql.len and sql[index.* + 1] == '-') {
-                    index.* = sqlLineCommentEnd(sql, index.*);
-                    continue;
-                }
-            },
-            '/' => {
-                if (index.* + 1 < sql.len and sql[index.* + 1] == '*') {
-                    index.* = sqlBlockCommentEnd(sql, index.*);
-                    continue;
-                }
-            },
-            '$' => {
-                const dollar = index.*;
-                if (sqlParameterIndexAt(sql, dollar)) |scan| {
-                    index.* = sqlParameterTokenEnd(sql, dollar);
-                    return scan;
-                }
-                if (sqlDollarQuotedEnd(sql, dollar)) |end| {
-                    index.* = end;
-                    continue;
-                }
-            },
-            else => {},
-        }
-        index.* += 1;
-    }
-    return null;
-}
+fn sqlParameterIndexFromToken(token: tokenized.Token) ?usize {
+    if (token.kind != .placeholder) return null;
+    const text = token.text;
+    if (text.len < 2 or text[0] != '$' or !std.ascii.isDigit(text[1])) return null;
 
-fn sqlParameterIndexAt(sql: []const u8, dollar: usize) ?SqlParameterScan {
-    if (dollar + 1 >= sql.len) return null;
-    if (sql[dollar] != '$') return null;
-    if (sql[dollar + 1] < '0' or sql[dollar + 1] > '9') return null;
-
-    var index = dollar + 1;
+    var index: usize = 1;
     var value: usize = 0;
-    while (index < sql.len and sql[index] >= '0' and sql[index] <= '9') : (index += 1) {
-        value = value * 10 + (sql[index] - '0');
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {
+        value = value * 10 + (text[index] - '0');
     }
-    if (index < sql.len and (std.ascii.isAlphanumeric(sql[index]) or sql[index] == '_')) return .invalid;
-    return .{ .value = value };
-}
-
-fn sqlParameterTokenEnd(sql: []const u8, dollar: usize) usize {
-    var index = dollar + 1;
-    while (index < sql.len and sql[index] >= '0' and sql[index] <= '9') : (index += 1) {}
-    return index;
-}
-
-fn sqlSingleQuotedEnd(sql: []const u8, quote: usize) usize {
-    var index = quote + 1;
-    while (index < sql.len) : (index += 1) {
-        if (sql[index] != '\'') continue;
-        if (index + 1 < sql.len and sql[index + 1] == '\'') {
-            index += 1;
-            continue;
-        }
-        return index + 1;
-    }
-    return sql.len;
-}
-
-fn sqlDoubleQuotedEnd(sql: []const u8, quote: usize) usize {
-    var index = quote + 1;
-    while (index < sql.len) : (index += 1) {
-        if (sql[index] != '"') continue;
-        if (index + 1 < sql.len and sql[index + 1] == '"') {
-            index += 1;
-            continue;
-        }
-        return index + 1;
-    }
-    return sql.len;
-}
-
-fn sqlLineCommentEnd(sql: []const u8, dash: usize) usize {
-    var index = dash + 2;
-    while (index < sql.len and sql[index] != '\n' and sql[index] != '\r') : (index += 1) {}
-    return index;
-}
-
-fn sqlBlockCommentEnd(sql: []const u8, slash: usize) usize {
-    var index = slash + 2;
-    while (index + 1 < sql.len) : (index += 1) {
-        if (sql[index] == '*' and sql[index + 1] == '/') return index + 2;
-    }
-    return sql.len;
-}
-
-fn sqlDollarQuotedEnd(sql: []const u8, dollar: usize) ?usize {
-    if (dollar + 1 >= sql.len) return null;
-    if (sql[dollar + 1] >= '0' and sql[dollar + 1] <= '9') return null;
-
-    var delimiter_end = dollar + 1;
-    if (sql[delimiter_end] == '$') {
-        delimiter_end += 1;
-    } else {
-        if (!sqlDollarQuoteTagStart(sql[delimiter_end])) return null;
-        delimiter_end += 1;
-        while (delimiter_end < sql.len and sqlDollarQuoteTagContinue(sql[delimiter_end])) : (delimiter_end += 1) {}
-        if (delimiter_end >= sql.len or sql[delimiter_end] != '$') return null;
-        delimiter_end += 1;
-    }
-
-    const delimiter = sql[dollar..delimiter_end];
-    const body_start = delimiter_end;
-    if (std.mem.indexOfPos(u8, sql, body_start, delimiter)) |close| {
-        return close + delimiter.len;
-    }
-    return sql.len;
-}
-
-fn sqlDollarQuoteTagStart(ch: u8) bool {
-    return std.ascii.isAlphabetic(ch) or ch == '_';
-}
-
-fn sqlDollarQuoteTagContinue(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or ch == '_';
+    return value;
 }
 
 test "sql adapter corpus parses fixture entries and owns allocated slices" {
@@ -6098,27 +5971,29 @@ test "sql adapter corpus owns fixture family policies" {
         .{ .name = "set operation", .family = .read, .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records", .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records" },
         "archived_records",
     ));
-    try std.testing.expect(corpusFixtureSqlParameterCoverageMatches(.{
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect(try corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, .{
         .name = "query params",
         .family = .query,
         .plan = "query:table=usage_records",
         .sql = "SELECT id FROM usage_records WHERE tenant_id = $1",
         .params = &.{.{ .string = "tenant-a" }},
     }));
-    try std.testing.expect(corpusFixtureSqlParameterCoverageMatches(.{
+    try std.testing.expect(try corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, .{
         .name = "prepare params",
         .family = .ddl,
         .summary = .{ .ddl_tag = .prepare_statement },
         .plan = "ddl:prepare:params=2",
         .sql = "PREPARE lookup AS SELECT id FROM usage_records WHERE tenant_id = $1 AND user_id = $2",
     }));
-    try std.testing.expect(!corpusFixtureSqlParameterCoverageMatches(.{
+    try std.testing.expect(!(try corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, .{
         .name = "prepare missing param",
         .family = .ddl,
         .summary = .{ .ddl_tag = .prepare_statement },
         .plan = "ddl:prepare:params=2",
         .sql = "PREPARE lookup AS SELECT id FROM usage_records WHERE tenant_id = $1",
-    }));
+    })));
 }
 
 test "sql adapter corpus rejects malformed fixture root metadata" {
@@ -9514,20 +9389,19 @@ test "sql adapter corpus owns ddl applied-plan fixture policy" {
 }
 
 test "sql adapter corpus placeholder coverage ignores literals and comments" {
-    try std.testing.expect(sqlParameterCoverageMatches(
-        "SELECT id FROM usage_records WHERE tenant_id = $1 AND user_id = $2",
-        2,
-    ));
-    try std.testing.expect(!sqlParameterCoverageMatches(
-        "SELECT id FROM usage_records WHERE tenant_id = $1 AND user_id = $3",
-        3,
-    ));
-    try std.testing.expect(!sqlParameterCoverageMatches(
-        "SELECT id FROM usage_records WHERE tenant_id = $1abc",
-        1,
-    ));
-    try std.testing.expect(sqlParameterCoverageMatches(
-        "SELECT '$1', $$ $2 $$, id FROM usage_records -- $3abc\nWHERE tenant_id = $1",
-        1,
-    ));
+    const alloc = std.testing.allocator;
+
+    var contiguous = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tenant_id = $1 AND user_id = $2");
+    defer contiguous.deinit(alloc);
+    try std.testing.expect(sqlParameterCoverageMatchesParsedSql(&contiguous, 2));
+
+    var gap = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tenant_id = $1 AND user_id = $3");
+    defer gap.deinit(alloc);
+    try std.testing.expect(!sqlParameterCoverageMatchesParsedSql(&gap, 3));
+
+    try std.testing.expectError(error.UnsupportedSqlShape, tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tenant_id = $1abc"));
+
+    var ignored = try tokenized.ParsedSql.initAlloc(alloc, "SELECT '$1', $$ $2 $$, id FROM usage_records -- $3abc\nWHERE tenant_id = $1");
+    defer ignored.deinit(alloc);
+    try std.testing.expect(sqlParameterCoverageMatchesParsedSql(&ignored, 1));
 }
