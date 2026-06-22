@@ -112,11 +112,49 @@ pub fn bindingForRuntimeSchema(target: CatalogTableRef, schema: runtime_schema.T
         .document => .{ .document = .{
             .target = target,
             .schema = schema,
+            .capabilities = documentCapabilitiesForRuntimeSchema(schema),
         } },
         .lake => .{ .lake = .{
             .target = target,
             .schema = schema,
         } },
+    };
+}
+
+pub fn documentCapabilitiesForRuntimeSchema(schema: runtime_schema.TableSchema) DocumentSqlCapabilities {
+    var capabilities = DocumentSqlCapabilities{};
+    for (schema.relational_columns) |column| {
+        if (!column.indexed or column.index_lifecycle != .ready) continue;
+        switch (column.field_type) {
+            .text, .html, .search_as_you_type => {
+                capabilities.full_text_filters = true;
+                capabilities.indexed_scalar_filters = true;
+            },
+            .embedding => capabilities.vector_filters = true,
+            .blob => {},
+            .keyword,
+            .numeric,
+            .link,
+            .boolean,
+            .datetime,
+            .geopoint,
+            .geoshape,
+            .json,
+            .array,
+            => capabilities.indexed_scalar_filters = true,
+        }
+        if (documentColumnSupportsAlgebraicAggregate(column)) {
+            capabilities.algebraic_aggregates = true;
+        }
+    }
+    return capabilities;
+}
+
+fn documentColumnSupportsAlgebraicAggregate(column: runtime_schema.RelationalColumn) bool {
+    if (!column.indexed or column.index_lifecycle != .ready) return false;
+    return switch (column.field_type) {
+        .keyword, .numeric, .boolean, .datetime, .geopoint, .geoshape => true,
+        else => false,
     };
 }
 
@@ -149,6 +187,47 @@ test "source binding classifies relational document and lake schemas" {
         .document => |binding| {
             try std.testing.expect(binding.capabilities.doc_id_lookup);
             try std.testing.expect(binding.virtual_schema.exposes_doc);
+            try std.testing.expect(binding.capabilities.full_text_filters);
+            try std.testing.expect(binding.capabilities.indexed_scalar_filters);
+            try std.testing.expect(!binding.capabilities.vector_filters);
+            try std.testing.expect(!binding.capabilities.algebraic_aggregates);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    const capable_schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text },
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+            .{ .name = "embedding", .path = "embedding", .field_type = .embedding },
+        },
+    };
+    const capable = bindingForRuntimeSchema(target, capable_schema);
+    switch (capable) {
+        .document => |binding| {
+            try std.testing.expect(binding.capabilities.full_text_filters);
+            try std.testing.expect(binding.capabilities.indexed_scalar_filters);
+            try std.testing.expect(binding.capabilities.vector_filters);
+            try std.testing.expect(binding.capabilities.algebraic_aggregates);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    const unavailable_schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword, .index_lifecycle = .building },
+            .{ .name = "body", .path = "body", .field_type = .text, .indexed = false },
+        },
+    };
+    const unavailable = bindingForRuntimeSchema(target, unavailable_schema);
+    switch (unavailable) {
+        .document => |binding| {
+            try std.testing.expect(!binding.capabilities.full_text_filters);
+            try std.testing.expect(!binding.capabilities.indexed_scalar_filters);
+            try std.testing.expect(!binding.capabilities.vector_filters);
+            try std.testing.expect(!binding.capabilities.algebraic_aggregates);
         },
         else => return error.TestExpectedEqual,
     }
