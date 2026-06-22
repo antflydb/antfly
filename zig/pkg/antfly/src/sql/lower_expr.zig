@@ -7394,7 +7394,7 @@ pub fn parseGeneratedFieldExpressionOwnedAlloc(
 ) !?[]const u8 {
     if (pos.* + 1 >= tokens.len or tokens[pos.*].kind != .identifier or tokens[pos.* + 1].kind != .lparen) return null;
 
-    if (generatedUnaryOpKeyword(tokens[pos.*].text)) |op| {
+    if (generatedUnaryOpToken(tokens[pos.*])) |op| {
         pos.* += 2;
         const parsed_source = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
         defer alloc.free(parsed_source);
@@ -7413,8 +7413,8 @@ pub fn parseGeneratedFieldExpressionOwnedAlloc(
         return try alloc.dupe(u8, generated.name);
     }
 
-    const is_concat = std.ascii.eqlIgnoreCase(tokens[pos.*].text, "concat");
-    const is_concat_ws = std.ascii.eqlIgnoreCase(tokens[pos.*].text, "concat_ws");
+    const is_concat = tokens[pos.*].matchesKeywordTag(.concat);
+    const is_concat_ws = tokens[pos.*].matchesKeywordTag(.concat_ws);
     if (!is_concat and !is_concat_ws) return null;
 
     const generated = (try generatedConcatColumnAt(
@@ -7515,10 +7515,10 @@ pub fn parseRowExpressionFieldOwnedAlloc(
     return try parseIdentifierOwnedAlloc(alloc, tokens, pos);
 }
 
-fn generatedUnaryOpKeyword(keyword: []const u8) ?runtime_schema.RelationalGeneratedOp {
-    if (std.ascii.eqlIgnoreCase(keyword, "lower")) return .lower;
-    if (std.ascii.eqlIgnoreCase(keyword, "upper")) return .upper;
-    if (std.ascii.eqlIgnoreCase(keyword, "md5")) return .md5;
+fn generatedUnaryOpToken(token: Token) ?runtime_schema.RelationalGeneratedOp {
+    if (token.matchesKeywordTag(.lower)) return .lower;
+    if (token.matchesKeywordTag(.upper)) return .upper;
+    if (token.matchesKeywordTag(.md5)) return .md5;
     return null;
 }
 
@@ -7544,8 +7544,8 @@ fn concatCallMatchesGeneratedAt(
     if (generated.fields.len == 0) return false;
     if (pos + 2 >= tokens.len) return false;
     if (tokens[pos].kind != .identifier) return false;
-    if (generated.op == .concat and !std.ascii.eqlIgnoreCase(tokens[pos].text, "concat")) return false;
-    if (generated.op == .concat_ws and !std.ascii.eqlIgnoreCase(tokens[pos].text, "concat_ws")) return false;
+    if (generated.op == .concat and !tokens[pos].matchesKeywordTag(.concat)) return false;
+    if (generated.op == .concat_ws and !tokens[pos].matchesKeywordTag(.concat_ws)) return false;
     if (tokens[pos + 1].kind != .lparen) return false;
     var i: usize = pos + 2;
     if (generated.op == .concat_ws) {
@@ -24108,6 +24108,7 @@ test "sql adapter expression keyword predicates classify function and tail token
 
     const tagged_expression_starts = [_]Token{
         .{ .kind = .identifier, .text = "CONCAT_WS", .keyword = .concat_ws },
+        .{ .kind = .identifier, .text = "MD5", .keyword = .md5 },
         .{ .kind = .identifier, .text = "STRING_TO_ARRAY", .keyword = .string_to_array },
         .{ .kind = .identifier, .text = "CURRENT_TIMESTAMP", .keyword = .current_timestamp },
         .{ .kind = .identifier, .text = "REPLACE", .keyword = .replace },
@@ -24118,6 +24119,8 @@ test "sql adapter expression keyword predicates classify function and tail token
     }
     const quoted_expression_name = Token{ .kind = .identifier, .text = "concat_ws", .source_start = 0, .source_end = 11 };
     try std.testing.expect(!expressionStartKeywordToken(quoted_expression_name));
+    const quoted_generated_name = Token{ .kind = .identifier, .text = "md5", .source_start = 0, .source_end = 5 };
+    try std.testing.expect(generatedUnaryOpToken(quoted_generated_name) == null);
 
     const unsupported_tail_tokens = [_]Token{.{ .kind = .identifier, .text = "LATERAL", .keyword = .lateral }};
     try std.testing.expect(nextIsUnsupportedQueryKeyword(unsupported_tail_tokens[0..], 0));

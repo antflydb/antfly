@@ -746,6 +746,9 @@ Current implementation status:
   at ingress and pass it through. Relation-population parser tests exercise
   `ParsedSql` directly, and text-pattern predicate lowering uses keyword tags
   for `ILIKE` detection instead of re-reading token text.
+- Generated-column expression matching also uses token keyword metadata for
+  `lower`, `upper`, `md5`, `concat`, and `concat_ws` instead of local
+  case-insensitive token-text checks.
 - HTTP relational SQL DDL execution, source-backed DDL application, bulk SQL,
   and auth-catalog DDL helpers construct `ParsedSql` once at ingress before
   lowering DDL/session control plans, and transaction-boundary session cleanup

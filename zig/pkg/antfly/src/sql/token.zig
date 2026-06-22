@@ -149,6 +149,7 @@ pub const TokenKeyword = enum {
     limit,
     lower,
     materialized,
+    md5,
     merge,
     metric,
     metric_freshness,
@@ -315,6 +316,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.current_timestamp, keywordFromIdentifier("CURRENT_TIMESTAMP").?);
     try std.testing.expectEqual(TokenKeyword.concat_ws, keywordFromIdentifier("CONCAT_WS").?);
     try std.testing.expectEqual(TokenKeyword.length, keywordFromIdentifier("LENGTH").?);
+    try std.testing.expectEqual(TokenKeyword.md5, keywordFromIdentifier("MD5").?);
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.string_to_array, keywordFromIdentifier("STRING_TO_ARRAY").?);
     try std.testing.expectEqual(TokenKeyword.to_jsonb, keywordFromIdentifier("TO_JSONB").?);
