@@ -177,9 +177,14 @@ pub fn lowerAntflyQueryFunctionSqlAlloc(
 
     const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
         antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    const structured_primary_text_index_name = if (function == .hybrid_search)
+        try hybridSourcesPrimaryTextIndexAlloc(alloc, args.items)
+    else
+        null;
+    defer if (structured_primary_text_index_name) |index_name| alloc.free(index_name);
     const primary_text_index_name = antflyQueryFunctionStringArg(args.items, "full_text_index") orelse
         antflyQueryFunctionStringArg(args.items, "text_index") orelse
-        if (function == .full_text_search) antflyQueryFunctionStringArg(args.items, "index") else null;
+        if (function == .full_text_search) antflyQueryFunctionStringArg(args.items, "index") else structured_primary_text_index_name;
 
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(alloc);
@@ -759,6 +764,10 @@ fn appendHybridFunctionBody(
     first: *bool,
     args: []const SqlQueryFunctionArg,
 ) !void {
+    if (antflyQueryFunctionStringArg(args, "sources_json")) |sources_json| {
+        return try appendStructuredHybridFunctionBody(alloc, out, first, args, sources_json);
+    }
+
     const query = requireAntflyQueryFunctionStringArg(args, "query") catch try requireAntflyQueryFunctionStringArg(args, "text");
     var semantic_indexes = std.ArrayListUnmanaged([]const u8).empty;
     defer semantic_indexes.deinit(alloc);
@@ -793,6 +802,170 @@ fn appendHybridFunctionBody(
     try appendAntflySqlJsonStringField(alloc, out, &merge_first, "strategy", antflyQueryFunctionStringArg(args, "fusion") orelse "rrf");
     if (antflyQueryFunctionNumberArg(args, "window_size")) |window_size| try appendAntflySqlJsonNumberField(alloc, out, &merge_first, "window_size", window_size);
     try out.append(alloc, '}');
+}
+
+fn appendStructuredHybridFunctionBody(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    args: []const SqlQueryFunctionArg,
+    sources_json: []const u8,
+) !void {
+    const query = requireAntflyQueryFunctionStringArg(args, "query") catch try requireAntflyQueryFunctionStringArg(args, "text");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sources_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array or parsed.value.array.items.len == 0) return error.UnsupportedSqlShape;
+
+    var semantic_indexes = std.ArrayListUnmanaged([]const u8).empty;
+    defer semantic_indexes.deinit(alloc);
+    var weights = std.ArrayListUnmanaged(HybridSourceWeight).empty;
+    defer weights.deinit(alloc);
+    var saw_full_text = false;
+    var saw_graph_metric = false;
+
+    for (parsed.value.array.items) |source_value| {
+        if (source_value != .object) return error.UnsupportedSqlShape;
+        const source = source_value.object;
+        const kind = jsonObjectString(source, "kind") orelse jsonObjectString(source, "type") orelse return error.UnsupportedSqlShape;
+        const index_name = jsonObjectString(source, "index") orelse jsonObjectString(source, "index_name") orelse return error.UnsupportedSqlShape;
+        const source_name = jsonObjectString(source, "name") orelse hybridSourceDefaultName(kind, index_name);
+        if (source_name.len == 0) return error.UnsupportedSqlShape;
+        if (jsonObjectNumber(source, "weight")) |weight| try weights.append(alloc, .{ .name = source_name, .weight = weight });
+
+        if (std.ascii.eqlIgnoreCase(kind, "full_text") or std.ascii.eqlIgnoreCase(kind, "text")) {
+            if (saw_full_text) return error.UnsupportedSqlShape;
+            saw_full_text = true;
+            try appendAntflySqlJsonFieldName(alloc, out, first, "full_text_search");
+            try out.append(alloc, '{');
+            var text_first = true;
+            const field = jsonObjectString(source, "field") orelse antflyQueryFunctionStringArg(args, "field");
+            if (field) |field_name| {
+                try appendAntflySqlJsonStringField(alloc, out, &text_first, "match", query);
+                try appendAntflySqlJsonStringField(alloc, out, &text_first, "field", field_name);
+            } else {
+                try appendAntflySqlJsonStringField(alloc, out, &text_first, "query", query);
+            }
+            try out.append(alloc, '}');
+        } else if (std.ascii.eqlIgnoreCase(kind, "semantic") or std.ascii.eqlIgnoreCase(kind, "vector")) {
+            try semantic_indexes.append(alloc, index_name);
+        } else if (std.ascii.eqlIgnoreCase(kind, "graph_metric") or std.ascii.eqlIgnoreCase(kind, "graph")) {
+            if (saw_graph_metric) return error.UnsupportedSqlShape;
+            saw_graph_metric = true;
+            const metric = jsonObjectString(source, "metric") orelse jsonObjectString(source, "graph_metric") orelse return error.UnsupportedSqlShape;
+            try appendAntflySqlJsonFieldName(alloc, out, first, "graph_metric_rerank");
+            try out.append(alloc, '{');
+            var graph_first = true;
+            try appendAntflySqlJsonStringField(alloc, out, &graph_first, "index", index_name);
+            try appendAntflySqlJsonStringField(alloc, out, &graph_first, "metric", metric);
+            if (jsonObjectNumber(source, "weight")) |weight| try appendAntflySqlJsonNumberValueField(alloc, out, &graph_first, "weight", weight);
+            if (jsonObjectNumber(source, "base_weight")) |base_weight| try appendAntflySqlJsonNumberValueField(alloc, out, &graph_first, "base_weight", base_weight);
+            if (jsonObjectNumber(source, "missing_score")) |missing_score| try appendAntflySqlJsonNumberValueField(alloc, out, &graph_first, "missing_score", missing_score);
+            if (jsonObjectString(source, "freshness")) |freshness| try appendAntflySqlJsonStringField(alloc, out, &graph_first, "metric_freshness", freshness);
+            if (jsonObjectString(source, "metric_freshness")) |freshness| {
+                if (jsonObjectString(source, "freshness") != null) return error.UnsupportedSqlShape;
+                try appendAntflySqlJsonStringField(alloc, out, &graph_first, "metric_freshness", freshness);
+            }
+            try out.append(alloc, '}');
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+
+    if (semantic_indexes.items.len > 0) {
+        try appendAntflySqlJsonStringField(alloc, out, first, "semantic_search", query);
+        try appendAntflySqlJsonStringArrayField(alloc, out, first, "indexes", semantic_indexes.items);
+    }
+
+    try appendAntflySqlJsonFieldName(alloc, out, first, "merge_config");
+    try out.append(alloc, '{');
+    var merge_first = true;
+    try appendAntflySqlJsonStringField(alloc, out, &merge_first, "strategy", antflyQueryFunctionStringArg(args, "fusion") orelse "rrf");
+    if (antflyQueryFunctionNumberArg(args, "window_size")) |window_size| try appendAntflySqlJsonNumberField(alloc, out, &merge_first, "window_size", window_size);
+    if (weights.items.len > 0) {
+        try appendAntflySqlJsonFieldName(alloc, out, &merge_first, "weights");
+        try out.append(alloc, '{');
+        var weights_first = true;
+        for (weights.items) |weight| {
+            try appendAntflySqlJsonNumberValueField(alloc, out, &weights_first, weight.name, weight.weight);
+        }
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, '}');
+}
+
+const HybridSourceWeight = struct {
+    name: []const u8,
+    weight: std.json.Value,
+};
+
+fn hybridSourcesPrimaryTextIndexAlloc(
+    alloc: std.mem.Allocator,
+    args: []const SqlQueryFunctionArg,
+) !?[]const u8 {
+    const sources_json = antflyQueryFunctionStringArg(args, "sources_json") orelse return null;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sources_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.UnsupportedSqlShape;
+    var primary: ?[]const u8 = null;
+    for (parsed.value.array.items) |source_value| {
+        if (source_value != .object) return error.UnsupportedSqlShape;
+        const source = source_value.object;
+        const kind = jsonObjectString(source, "kind") orelse jsonObjectString(source, "type") orelse return error.UnsupportedSqlShape;
+        if (!std.ascii.eqlIgnoreCase(kind, "full_text") and !std.ascii.eqlIgnoreCase(kind, "text")) continue;
+        if (primary != null) return error.UnsupportedSqlShape;
+        primary = jsonObjectString(source, "index") orelse jsonObjectString(source, "index_name") orelse return error.UnsupportedSqlShape;
+    }
+    return if (primary) |index_name| try alloc.dupe(u8, index_name) else null;
+}
+
+fn hybridSourceDefaultName(kind: []const u8, index_name: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(kind, "full_text") or std.ascii.eqlIgnoreCase(kind, "text")) return "full_text_search";
+    if (std.ascii.eqlIgnoreCase(kind, "graph_metric") or std.ascii.eqlIgnoreCase(kind, "graph")) return "graph_metric_rerank";
+    return index_name;
+}
+
+fn jsonObjectString(object: std.json.ObjectMap, field_name: []const u8) ?[]const u8 {
+    const value = object.get(field_name) orelse return null;
+    return switch (value) {
+        .string => |text| if (text.len > 0) text else null,
+        else => null,
+    };
+}
+
+fn jsonObjectNumber(object: std.json.ObjectMap, field_name: []const u8) ?std.json.Value {
+    const value = object.get(field_name) orelse return null;
+    return switch (value) {
+        .integer, .float, .number_string => value,
+        else => null,
+    };
+}
+
+fn appendAntflySqlJsonNumberValueField(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    name: []const u8,
+    value: std.json.Value,
+) !void {
+    try appendAntflySqlJsonFieldName(alloc, out, first, name);
+    switch (value) {
+        .integer => |integer| {
+            const rendered = try std.fmt.allocPrint(alloc, "{}", .{integer});
+            defer alloc.free(rendered);
+            try out.appendSlice(alloc, rendered);
+        },
+        .float => |float| {
+            if (!std.math.isFinite(float)) return error.UnsupportedSqlShape;
+            const rendered = try std.fmt.allocPrint(alloc, "{d}", .{float});
+            defer alloc.free(rendered);
+            try out.appendSlice(alloc, rendered);
+        },
+        .number_string => |text| {
+            if (text.len == 0) return error.UnsupportedSqlShape;
+            try out.appendSlice(alloc, text);
+        },
+        else => return error.UnsupportedSqlShape,
+    }
 }
 
 fn appendGraphMetricObjectFields(
@@ -1130,4 +1303,39 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expect(hybrid.req.graph_metric_rerank != null);
     try std.testing.expect(hybrid.req.merge_config != null);
     try std.testing.expectEqual(@as(u32, 9), hybrid.req.limit);
+
+    var structured_hybrid = try lowerAntflyQueryFunctionSqlAlloc(alloc, resolver,
+        \\SELECT * FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources_json => '[{"kind":"full_text","index":"docs_body_fts","field":"body","weight":0.25},{"kind":"semantic","index":"docs_body_semantic","weight":0.6},{"kind":"graph_metric","index":"docs_edge_graph","metric":"pagerank","weight":0.15,"base_weight":0.5,"missing_score":0.1,"freshness":"fresh"}]', limit => 9);
+    );
+    defer structured_hybrid.deinit(alloc);
+    try std.testing.expectEqualStrings("docs_body_fts", structured_hybrid.req.primary_text_index_name.?);
+    try std.testing.expect(structured_hybrid.req.full_text != null);
+    try std.testing.expect(structured_hybrid.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", structured_hybrid.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("hybrid refund", structured_hybrid.req.full_text.?.match.text);
+    try std.testing.expectEqual(@as(usize, 1), structured_hybrid.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_body_semantic", structured_hybrid.req.dense_queries[0].index_name);
+    try std.testing.expect(structured_hybrid.req.graph_metric_rerank != null);
+    try std.testing.expectEqualStrings("docs_edge_graph", structured_hybrid.req.graph_metric_rerank.?.index_name);
+    try std.testing.expectEqualStrings("pagerank", structured_hybrid.req.graph_metric_rerank.?.metric_name);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, structured_hybrid.req.graph_metric_rerank.?.freshness);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.15), structured_hybrid.req.graph_metric_rerank.?.weight, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), structured_hybrid.req.graph_metric_rerank.?.base_weight, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), structured_hybrid.req.graph_metric_rerank.?.missing_score, 0.0001);
+    const structured_merge = structured_hybrid.req.merge_config orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 25), structured_merge.window_size);
+    try std.testing.expectEqual(@as(usize, 3), structured_merge.weights.len);
+    try expectMergeWeight(structured_merge.weights, "full_text_search", 0.25);
+    try expectMergeWeight(structured_merge.weights, "docs_body_semantic", 0.6);
+    try expectMergeWeight(structured_merge.weights, "graph_metric_rerank", 0.15);
+}
+
+fn expectMergeWeight(weights: []const @import("../../search/fusion.zig").NamedWeight, name: []const u8, expected: f64) !void {
+    for (weights) |weight| {
+        if (std.mem.eql(u8, weight.name, name)) {
+            try std.testing.expectApproxEqAbs(expected, weight.weight, 0.0001);
+            return;
+        }
+    }
+    return error.TestUnexpectedResult;
 }
