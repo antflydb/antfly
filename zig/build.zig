@@ -4017,7 +4017,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter plan resolves CTE and base table sources",
             "sql adapter plan resolves join CTE sides to physical base table",
             "sql adapter plan clones query check without catalog name",
-            "postgres sql adapter lowers recursive cte stream contract",
+            "sql adapter lower expr lowers recursive cte stream contract",
             "sql adapter ddl plan lowers create index ddl",
             "sql adapter query function lowers antfly query functions into native search requests",
             "sql adapter ddl plan lowers alter table ddl",

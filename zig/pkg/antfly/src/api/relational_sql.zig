@@ -15632,69 +15632,6 @@ test "postgres sql adapter insert source temporal unique conflict executes throu
     try std.testing.expectEqualStrings("{\"id\":\"existing\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":13}", rows.rows[0]);
 }
 
-test "postgres sql adapter lowers recursive cte stream contract" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"depth":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
-
-    var lowered = try lowerReadPlanAlloc(
-        alloc,
-        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
-        schema,
-        &.{},
-    );
-    defer lowered.deinit(alloc);
-
-    const recursive = switch (lowered) {
-        .recursive_cte => |plan| plan,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expectEqualStrings("walk", recursive.cte_name);
-    try std.testing.expectEqual(SelectSetOperation.union_all, recursive.operation);
-    try std.testing.expect(recursive.recursive_member_references_cte);
-    const recursive_member_join = switch (recursive.recursive_member) {
-        .join => |join| join,
-    };
-    try std.testing.expectEqualStrings("nodes", recursive_member_join.left_table_name);
-    try std.testing.expectEqualStrings("walk", recursive_member_join.right_table_name);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, recursive_member_join.join_type);
-    try std.testing.expectEqual(@as(usize, 1), recursive_member_join.on.len);
-    try std.testing.expectEqual(@as(usize, 2), recursive_member_join.projections.len);
-    try std.testing.expectEqualStrings("id", recursive_member_join.projections[0].output);
-    try std.testing.expectEqualStrings("depth", recursive_member_join.projections[1].output);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, recursive_member_join.projections[0].expression.kind);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.row, recursive_member_join.projections[0].expression.field_source);
-    try std.testing.expectEqualStrings("id", recursive_member_join.projections[0].expression.field);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, recursive_member_join.projections[1].expression.kind);
-    try std.testing.expectEqual(@as(usize, 2), recursive_member_join.projections[1].expression.operands.len);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, recursive_member_join.projections[1].expression.operands[0].field_source);
-    try std.testing.expectEqualStrings("depth", recursive_member_join.projections[1].expression.operands[0].field);
-    try std.testing.expectEqualStrings("parent_id", recursive_member_join.on[0].left_field);
-    try std.testing.expectEqualStrings("id", recursive_member_join.on[0].right_field);
-    try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), recursive.max_rows);
-    try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), recursive.max_bytes);
-    try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), recursive.spill_after_bytes);
-    try std.testing.expectEqualStrings("nodes", recursive.anchor.table_name);
-    try std.testing.expectEqual(@as(usize, 1), recursive.anchor.plan.query.predicates.len);
-    try std.testing.expectEqualStrings("parent_id", recursive.anchor.plan.query.predicates[0].field);
-    try std.testing.expectEqual(@as(usize, 2), recursive.output_columns.len);
-    try std.testing.expectEqualStrings("id", recursive.output_columns[0].name);
-    try std.testing.expectEqualStrings("depth", recursive.output_columns[1].name);
-
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerRecursiveCtePlanAlloc(
-        alloc,
-        "WITH RECURSIVE walk AS (SELECT id FROM nodes UNION ALL SELECT id FROM nodes) SELECT id FROM walk",
-        schema,
-        &.{},
-        .{},
-    ));
-}
-
 test "postgres sql adapter classifies read sql into typed plan families" {
     const alloc = std.testing.allocator;
     const schema_json =

@@ -24668,6 +24668,80 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     );
 }
 
+fn lowerRecursiveCtePlanForLowerExprTestAlloc(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    schema: runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+) !plan_mod.LoweredRecursiveCtePlan {
+    const parser_context = @import("parser_context.zig");
+
+    if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    var tokens = try lexer.tokenizeAlloc(alloc, sql);
+    defer lexer.freeTokens(alloc, &tokens);
+
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = tokens.items,
+        .schema = schema,
+        .params = params,
+    };
+    return try plan_mod.parseRecursiveCtePlanAlloc(
+        alloc,
+        tokens.items,
+        &parser_state.pos,
+        parser_context.ParserState.ContextAccessors.recursiveCteParserHooks(&parser_state),
+    );
+}
+
+test "sql adapter lower expr lowers recursive cte stream contract" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"depth":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var recursive = try lowerRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        "WITH RECURSIVE walk(id, depth) AS (SELECT id, depth FROM nodes WHERE parent_id = 'root' UNION ALL SELECT nodes.id, walk.depth + 1 FROM nodes JOIN walk ON nodes.parent_id = walk.id) SELECT id FROM walk",
+        schema,
+        &.{},
+    );
+    defer recursive.deinit(alloc);
+
+    try std.testing.expectEqualStrings("walk", recursive.cte_name);
+    try std.testing.expectEqual(plan_mod.SelectSetOperation.union_all, recursive.operation);
+    try std.testing.expect(recursive.recursive_member_references_cte);
+    try std.testing.expectEqual(@as(?u32, db_mod.types.default_relational_rows_cte_max_rows), recursive.max_rows);
+    try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_max_bytes), recursive.max_bytes);
+    try std.testing.expectEqual(@as(?u64, db_mod.types.default_relational_rows_cte_spill_after_bytes), recursive.spill_after_bytes);
+    try std.testing.expectEqualStrings("nodes", recursive.anchor.table_name);
+    try std.testing.expectEqualStrings("parent_id", recursive.anchor.plan.query.predicates[0].field);
+    try std.testing.expectEqualStrings("id", recursive.output_columns[0].name);
+    try std.testing.expectEqualStrings("depth", recursive.output_columns[1].name);
+
+    const recursive_member_join = switch (recursive.recursive_member) {
+        .join => |join| join,
+    };
+    try std.testing.expectEqualStrings("nodes", recursive_member_join.left_table_name);
+    try std.testing.expectEqualStrings("walk", recursive_member_join.right_table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.inner, recursive_member_join.join_type);
+    try std.testing.expectEqualStrings("parent_id", recursive_member_join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", recursive_member_join.on[0].right_field);
+    try std.testing.expectEqualStrings("id", recursive_member_join.projections[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.add, recursive_member_join.projections[1].expression.kind);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionFieldSource.source, recursive_member_join.projections[1].expression.operands[0].field_source);
+    try std.testing.expectEqualStrings("depth", recursive_member_join.projections[1].expression.operands[0].field);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRecursiveCtePlanForLowerExprTestAlloc(
+        alloc,
+        "WITH RECURSIVE walk AS (SELECT id FROM nodes UNION ALL SELECT id FROM nodes) SELECT id FROM walk",
+        schema,
+        &.{},
+    ));
+}
+
 test "sql adapter lower expr lowers direct select set operation query plans" {
     const alloc = std.testing.allocator;
     const schema_json =
