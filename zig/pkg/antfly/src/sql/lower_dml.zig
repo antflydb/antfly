@@ -10880,7 +10880,7 @@ fn booleanKeywordCanStart(token: Token) bool {
         token.matchesKeywordTag(.cast) or
         token.matchesKeywordTag(.coalesce) or
         token.matchesKeywordTag(.nullif) or
-        lower_expr.sqlKeywordIsStartsWithFunction(token.text);
+        lower_expr.sqlTokenIsStartsWithFunction(token);
 }
 
 fn keywordTagAt(tokens: []const Token, pos: usize, keyword: parser.TokenKeyword) bool {

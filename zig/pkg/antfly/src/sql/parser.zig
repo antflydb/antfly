@@ -73,6 +73,14 @@ pub const Cursor = struct {
         return token;
     }
 
+    pub fn matchIdentifierTokenIf(self: Cursor, comptime predicate: fn (Token) bool) ?Token {
+        if (self.pos.* >= self.tokens.len) return null;
+        const token = self.tokens[self.pos.*];
+        if (token.kind != .identifier or !predicate(token)) return null;
+        self.pos.* += 1;
+        return token;
+    }
+
     pub fn matchToken(self: Cursor, kind: TokenKind) ?Token {
         if (self.pos.* >= self.tokens.len) return null;
         const token = self.tokens[self.pos.*];
@@ -118,12 +126,24 @@ pub const Cursor = struct {
             self.tokens[index + 1].kind == .lparen;
     }
 
+    pub fn functionCallStartsAtTokenIf(self: Cursor, index: usize, comptime predicate: fn (Token) bool) bool {
+        if (index + 1 >= self.tokens.len) return false;
+        const token = self.tokens[index];
+        return token.kind == .identifier and
+            predicate(token) and
+            self.tokens[index + 1].kind == .lparen;
+    }
+
     pub fn peekFunctionCall(self: Cursor, keyword: []const u8) bool {
         return self.functionCallStartsAt(self.pos.*, keyword);
     }
 
     pub fn peekFunctionCallIf(self: Cursor, comptime predicate: fn ([]const u8) bool) bool {
         return self.functionCallStartsAtIf(self.pos.*, predicate);
+    }
+
+    pub fn peekFunctionCallTokenIf(self: Cursor, comptime predicate: fn (Token) bool) bool {
+        return self.functionCallStartsAtTokenIf(self.pos.*, predicate);
     }
 
     pub fn atEnd(self: Cursor) bool {

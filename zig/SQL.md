@@ -122,6 +122,21 @@ Execution consumes typed plans only:
 | `CREATE/ALTER/DROP ROLE`, `GRANT`, `REVOKE` | Antfly user/role management service |
 | `SET`, `RESET`, `SHOW`, `DISCARD ALL` | SQL session plan application |
 
+The first public HTTP SQL ingress should be `POST /db/v1/sql`. It belongs
+under the database API version because SQL is a database control and data
+surface, not a separate product namespace. The endpoint is intentionally
+psql-shaped: each request carries one SQL statement plus an optional logical
+`session_id`, and each response returns the session id that should be reused by
+clients that need prepared statements, LISTEN/NOTIFY state, search-path
+defaults, or later portal state. Prepared statements and cursors are SQL
+session state, not durable REST resources, so the initial API should not expose
+`/statements`, `/prepared-statements`, or `/cursors` resources. Cursor-backed
+fetches and asynchronous statement jobs can be layered on later when Antfly has
+native portal lifetime, result paging, cancellation, and job-status contracts.
+Until shared read/write execution derives table-level permissions from lowered
+typed plans, the endpoint requires database-admin permission on the default
+database when authentication is enabled.
+
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
 expression behavior, lower it to the shared row-expression AST first.
@@ -766,6 +781,9 @@ Current implementation status:
   expression operands, generated-column predicates, and general expression
   starts use the same token metadata for JSON, array, regex, text, datetime,
   generated/hash, and UUID function families.
+- Parser cursors expose token-predicate identifier/function-call helpers, and
+  DDL generated-expression plus DML boolean-start probes use them for
+  generated/hash and text-pattern functions instead of local string callbacks.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

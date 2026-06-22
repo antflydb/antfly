@@ -2998,6 +2998,49 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/sql:
+    post:
+      summary: Execute SQL text in a logical SQL session
+      tags:
+        - data_operations
+      description: >
+        Executes SQL through Antfly's psql-style HTTP ingress. The request is a
+
+        single synchronous statement and the response returns the logical
+
+        `session_id` that should be supplied on later requests when session
+
+        state such as prepared statements, LISTEN/NOTIFY subscriptions, or SQL
+
+        catalog defaults must be reused. Prepared statements and cursors are
+
+        SQL session state, not durable REST resources. Cursor-backed fetches and
+
+        asynchronous statement jobs are reserved for later extensions.
+      operationId: executeSql
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SqlStatementRequest'
+      responses:
+        '200':
+          description: SQL statement result metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SqlStatementResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '408':
+          description: SQL statement timeout
+        '501':
+          description: SQL statement shape is not supported by the HTTP SQL ingress yet
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/query:
     post:
       summary: Perform a global query
@@ -8078,6 +8121,65 @@ components:
           example: An error message
       required:
         - error
+    SqlStatementRequest:
+      type: object
+      additionalProperties: false
+      description: >
+        Synchronous SQL statement request. `session_id` is optional on the first
+
+        request and should be reused from prior responses when SQL session state
+
+        must persist across requests.
+      properties:
+        sql:
+          type: string
+          minLength: 1
+          description: SQL statement text to execute.
+        session_id:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 1
+          description: Logical SQL session id returned by an earlier SQL response.
+        database:
+          type: string
+          nullable: true
+          description: Optional current database override for this request.
+        namespace:
+          type: string
+          nullable: true
+          description: Optional single search-path namespace override for this request.
+      required:
+        - sql
+    SqlStatementResponse:
+      type: object
+      additionalProperties: false
+      description: >
+        Synchronous SQL statement result metadata. Initial support is for
+
+        catalog/session/control statements routed through the typed DDL/session
+
+        execution path.
+      properties:
+        kind:
+          type: string
+          enum:
+            - ddl
+        session_id:
+          type: integer
+          format: int64
+          minimum: 1
+        noop:
+          type: boolean
+        applied:
+          type: object
+          additionalProperties: true
+          description: Applied DDL/session result record.
+      required:
+        - kind
+        - session_id
+        - noop
+        - applied
     SortDirection:
       type: boolean
       description: Sort direction for a single field. true = descending, false = ascending.

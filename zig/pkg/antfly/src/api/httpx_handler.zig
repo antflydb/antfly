@@ -302,7 +302,9 @@ pub const AntflyApiHandler = struct {
         }
         const method = requestMethod(ctx) orelse return null;
         if (http_server_mod.requiredPermissionForRequest(method, path)) |required| {
-            if (!http_server_mod.permissionsAllow(authenticated.permissions, required.resource_type, required.resource, required.permission_type)) {
+            const resource = try required.resourceNameAlloc(ctx.allocator);
+            defer ctx.allocator.free(resource);
+            if (!http_server_mod.permissionsAllow(authenticated.permissions, required.resource_type, resource, required.permission_type)) {
                 return try textResponse(ctx, 403, "forbidden");
             }
         }
@@ -1170,6 +1172,18 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
         var resp = try cluster_api_http.handleClusterBackupList(ctx.allocator, params.location, self.api_server.clusterApi());
         return respondOwnedApiResponse(ctx, &resp);
+    }
+
+    pub fn executeSql(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var authenticated_identity: ?AuthenticatedIdentity = null;
+        defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &authenticated_identity)) |resp| return resp;
+        const body_data = (try ctx.body()) orelse {
+            _ = ctx.status(400);
+            return ctx.text("missing body");
+        };
+        var resp = try self.api_server.handlePublicSql(body_data, authenticated_identity);
+        return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
     pub fn globalQuery(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

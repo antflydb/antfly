@@ -4468,10 +4468,10 @@ pub fn peekDdlIndexElementExpression(
     while (scan < tokens.len and tokens[scan].kind == .lparen) : (scan += 1) {}
     if (scan >= tokens.len or tokens[scan].kind != .identifier) return false;
     if (scan + 1 >= tokens.len or tokens[scan + 1].kind != .lparen) return false;
-    const text = tokens[scan].text;
-    if (std.ascii.eqlIgnoreCase(text, "lower") or
-        std.ascii.eqlIgnoreCase(text, "upper") or
-        sqlKeywordIsMd5Function(text))
+    const token = tokens[scan];
+    if (token.matchesKeywordTag(.lower) or
+        token.matchesKeywordTag(.upper) or
+        lower_expr.sqlTokenIsMd5Function(token))
     {
         return true;
     }
@@ -4507,7 +4507,7 @@ pub fn parseDdlUniqueExpressionAlloc(
     else if (cursor.matchKeyword("upper"))
         .upper
     else blk: {
-        if (cursor.matchIdentifierIf(sqlKeywordIsMd5Function) == null) break :blk null;
+        if (cursor.matchIdentifierTokenIf(lower_expr.sqlTokenIsMd5Function) == null) break :blk null;
         break :blk .md5;
     };
     if (op) |simple_op| {
@@ -4543,13 +4543,13 @@ pub fn parseDdlGeneratedExpressionAlloc(
 ) !runtime_schema.RelationalGeneratedValue {
     const cursor = parser.Cursor.init(tokens, pos);
     const start = cursor.checkpoint();
-    if (cursor.peekKeyword("lower") or cursor.peekKeyword("upper") or cursor.peekFunctionCallIf(sqlKeywordIsMd5Function)) {
-        const op: runtime_schema.RelationalGeneratedOp = if (cursor.matchKeyword("lower"))
+    if (cursor.peekKeywordTag(.lower) or cursor.peekKeywordTag(.upper) or cursor.peekFunctionCallTokenIf(lower_expr.sqlTokenIsMd5Function)) {
+        const op: runtime_schema.RelationalGeneratedOp = if (cursor.matchKeywordTag(.lower))
             .lower
-        else if (cursor.matchKeyword("upper"))
+        else if (cursor.matchKeywordTag(.upper))
             .upper
         else blk: {
-            if (cursor.matchIdentifierIf(sqlKeywordIsMd5Function) == null) return error.UnsupportedSqlShape;
+            if (cursor.matchIdentifierTokenIf(lower_expr.sqlTokenIsMd5Function) == null) return error.UnsupportedSqlShape;
             break :blk .md5;
         };
         try cursor.expectToken(.lparen);

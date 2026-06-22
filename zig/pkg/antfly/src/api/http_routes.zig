@@ -29,6 +29,7 @@ pub const Routes = struct {
     pub const auth_subjects = "/auth/v1/subjects";
     pub const auth_subjects_prefix = "/auth/v1/subjects/";
     pub const eval = "/eval";
+    pub const sql = "/sql";
     pub const agents_query_builder = "/agents/query-builder";
     pub const agents_retrieval = "/agents/retrieval";
     pub const mcp_v1 = "/mcp/v1";
@@ -93,6 +94,7 @@ pub const Routes = struct {
     pub const batch_suffix = "/batch";
     pub const rows_batch_suffix = "/rows/batch";
     pub const rows_get_suffix = "/rows/get";
+    pub const rows_plan_suffix = "/rows/plan";
     pub const rows_query_suffix = "/rows/query";
     pub const rows_aggregate_suffix = "/rows/aggregate";
     pub const rows_window_suffix = "/rows/window";
@@ -603,6 +605,10 @@ pub const Routes = struct {
 
     pub fn matchTableRowsQuery(path: []const u8) ?TableRows {
         return matchTableRowsAction(path, rows_query_suffix);
+    }
+
+    pub fn matchTableRowsPlan(path: []const u8) ?TableRows {
+        return matchTableRowsAction(path, rows_plan_suffix);
     }
 
     pub fn matchTableRowsAggregate(path: []const u8) ?TableRows {
@@ -1706,6 +1712,9 @@ test "public api routes compile" {
     try std.testing.expectEqualStrings("docs", query.table_name);
     const batch = Routes.matchTableBatch("/tables/docs/batch").?;
     try std.testing.expectEqualStrings("docs", batch.table_name);
+    const rows_plan = Routes.matchTableRowsPlan("/tables/docs/rows/plan").?;
+    try std.testing.expectEqualStrings("docs", rows_plan.table_name);
+    try std.testing.expect(Routes.matchTablePath("/tables/docs/rows/plan") == null);
     const schema = Routes.matchTableSchema("/tables/docs/schema").?;
     try std.testing.expectEqualStrings("docs", schema.table_name);
     const backup = Routes.matchTableBackup("/tables/docs/backup").?;

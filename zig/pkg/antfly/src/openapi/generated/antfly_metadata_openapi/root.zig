@@ -6,6 +6,8 @@ pub const server = @import("server.zig");
 pub const ServerRouter = server.ServerRouter;
 
 pub const Error = types.Error;
+pub const SqlStatementRequest = types.SqlStatementRequest;
+pub const SqlStatementResponse = types.SqlStatementResponse;
 pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const ClusterHealth = types.ClusterHealth;

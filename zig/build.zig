@@ -4527,6 +4527,7 @@ pub fn build(b: *std.Build) void {
             "postgres sql adapter",
             "api http server resolves relational rows by unique selector",
             "api http server executes public relational row plan endpoints",
+            "api http server exposes psql-style SQL session endpoint",
             "api http server applies SQL routine catalog plans through native runtime",
             "api http server exposes SQL routine bindings to catalog read planning",
             "api http server passes SQL routine bindings to source-backed schema DDL",

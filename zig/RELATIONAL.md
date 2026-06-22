@@ -4985,6 +4985,27 @@ catalog-session defaults. The runtime intentionally stores typed metadata, not
 raw SQL text. Executing cached statement bodies still fails closed until Antfly
 has a native prepared-plan cache keyed by typed plan fingerprints, parameter
 schemas, catalog epochs, authorization context, and invalidation rules.
+
+The HTTP SQL ingress for that protocol state should be `POST /db/v1/sql`, not
+`/sql/v1` or `/db/v1/sql/statements`. SQL is one database-facing API surface and
+should version with the rest of `/db/v1`. The endpoint is synchronous and
+session-shaped: clients submit one SQL statement plus an optional logical
+`session_id`, and the server returns the session id to reuse for later
+psql-style requests. The first implementation should route catalog, session,
+prepared-statement, notification, routine, and extension DDL/control statements
+through the existing typed SQL execution path. SQL reads and writes should join
+that endpoint only after there is a shared statement executor that lowers them
+to the same typed row APIs used by the public JSON endpoints. Prepared
+statements and cursors remain session state rather than REST resources;
+cursor-backed fetches and asynchronous `202` statement jobs are later protocol
+extensions once portal lifetime, page tokens, cancellation, result retention,
+and cleanup semantics are native.
+While the endpoint only supports the typed catalog/session/control path, it
+should require database-admin permission on the default database when
+authentication is enabled. SQL reads and writes should relax to statement-level
+table permissions only after the shared executor derives required permissions
+from the lowered typed plan before execution.
+
 `DECLARE ... [BINARY]
 [NO] SCROLL CURSOR [WITH|WITHOUT HOLD]`, `FETCH [direction] [FROM|IN]
 cursor`, shorthand `FETCH cursor`, bare-count `FETCH n cursor`, and `CLOSE

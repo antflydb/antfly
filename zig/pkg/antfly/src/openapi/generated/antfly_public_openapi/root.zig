@@ -5,6 +5,8 @@ pub const types = @import("types.zig");
 pub const server = @import("server.zig");
 
 pub const Error = types.Error;
+pub const SqlStatementRequest = types.SqlStatementRequest;
+pub const SqlStatementResponse = types.SqlStatementResponse;
 pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const ClusterHealth = types.ClusterHealth;

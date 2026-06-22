@@ -12,6 +12,27 @@ const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 
 pub const Error = antfly_usermgr_openapi.Error;
 
+/// Synchronous SQL statement request. `session_id` is optional on the first request and should be reused from prior responses when SQL session state must persist across requests.
+pub const SqlStatementRequest = struct {
+    /// SQL statement text to execute.
+    sql: []const u8,
+    /// Logical SQL session id returned by an earlier SQL response.
+    session_id: ?i64 = null,
+    /// Optional current database override for this request.
+    database: ?[]const u8 = null,
+    /// Optional single search-path namespace override for this request.
+    namespace: ?[]const u8 = null,
+};
+
+/// Synchronous SQL statement result metadata. Initial support is for catalog/session/control statements routed through the typed DDL/session execution path.
+pub const SqlStatementResponse = struct {
+    kind: []const u8,
+    session_id: i64,
+    noop: bool,
+    /// Applied DDL/session result record.
+    applied: std.json.Value,
+};
+
 pub const SortDirection = antfly_indexes_openapi.SortDirection;
 
 pub const SortField = antfly_indexes_openapi.SortField;

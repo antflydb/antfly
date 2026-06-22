@@ -4383,6 +4383,78 @@ pub const ApiHttpServer = struct {
         return applied;
     }
 
+    const PublicSqlRequest = struct {
+        sql: []const u8,
+        session_id: ?u64 = null,
+        database: ?[]const u8 = null,
+        namespace: ?[]const u8 = null,
+    };
+
+    const PublicSqlResponse = struct {
+        kind: []const u8,
+        session_id: u64,
+        noop: bool,
+        applied: tables_api.AppliedRelationalSqlDdlRecord,
+    };
+
+    fn ownedSqlCatalogSessionForPublicRequestAlloc(self: *ApiHttpServer, request: PublicSqlRequest) !sql_adapter.OwnedSqlCatalogSession {
+        var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(self.alloc, catalog_resources.SqlCatalogSession.default());
+        errdefer session.deinit(self.alloc);
+        if (request.session_id) |session_id| session.notification_session_id = session_id;
+        if (request.database) |database| {
+            if (!catalogApiIdentifierValid(database)) return error.InvalidSqlRequest;
+            self.alloc.free(session.current_database_name);
+            session.current_database_name = try self.alloc.dupe(u8, database);
+        }
+        if (request.namespace) |namespace| {
+            if (!catalogApiIdentifierValid(namespace)) return error.InvalidSqlRequest;
+            for (session.search_path) |name| self.alloc.free(@constCast(name));
+            if (session.search_path.len > 0) self.alloc.free(session.search_path);
+            const search_path = try self.alloc.alloc([]const u8, 1);
+            errdefer self.alloc.free(search_path);
+            search_path[0] = try self.alloc.dupe(u8, namespace);
+            session.search_path = search_path;
+        }
+        return session;
+    }
+
+    pub fn handlePublicSql(self: *ApiHttpServer, body: []const u8, _: ?AuthenticatedIdentity) !http_common.HttpResponse {
+        var parsed = std.json.parseFromSlice(PublicSqlRequest, self.alloc, body, .{
+            .ignore_unknown_fields = true,
+            .allocate = .alloc_always,
+        }) catch return try textResponse(self.alloc, 400, "invalid sql request");
+        defer parsed.deinit();
+        if (std.mem.trim(u8, parsed.value.sql, " \t\r\n").len == 0) return try textResponse(self.alloc, 400, "invalid sql request");
+
+        var session = self.ownedSqlCatalogSessionForPublicRequestAlloc(parsed.value) catch |err| switch (err) {
+            error.InvalidSqlRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+            else => return err,
+        };
+        defer session.deinit(self.alloc);
+
+        var applied = self.applyRelationalSqlDdlWithSession(parsed.value.sql, &session) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            error.StatementTimeout => return try textResponse(self.alloc, 408, "sql statement timeout"),
+            error.InvalidSqlSession,
+            error.PreparedStatementAlreadyExists,
+            error.PreparedStatementNotFound,
+            error.PreparedStatementArgumentMismatch,
+            error.InvalidSqlCatalog,
+            error.InvalidRoleSetting,
+            error.RoleSettingNotFound,
+            => return try textResponse(self.alloc, 400, "invalid sql request"),
+            else => return err,
+        };
+        defer applied.deinit(self.alloc);
+
+        return try jsonResponse(self.alloc, PublicSqlResponse{
+            .kind = "ddl",
+            .session_id = self.ensureSqlProtocolSessionId(&session),
+            .noop = applied.noop,
+            .applied = applied,
+        });
+    }
+
     fn applyPreparedTransactionPlan(
         self: *ApiHttpServer,
         plan: sql_adapter.PreparedTransactionPlan,
@@ -5440,6 +5512,9 @@ pub const ApiHttpServer = struct {
                 cluster.applySecretStoreHealth(&public_status, secret_store.healthSnapshot());
             }
             return try jsonResponse(self.alloc, public_status);
+        }
+        if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.sql)) {
+            return try self.handlePublicSql(req.body, authenticated_identity);
         }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.cluster)) {
             const metadata_status = try self.source.status();
@@ -8613,6 +8688,11 @@ pub const ApiHttpServer = struct {
         if (req.method == .POST) {
             if (routes.Routes.matchTableRowsGet(uri_parts.path)) |rows_route| {
                 return try self.handlePublicTableRowsGet(rows_route.table_name, req.body, authenticated_identity);
+            }
+        }
+        if (req.method == .POST) {
+            if (routes.Routes.matchTableRowsPlan(uri_parts.path)) |rows_route| {
+                return try self.handlePublicTableRowsPlan(rows_route.table_name, req.body, authenticated_identity);
             }
         }
         if (req.method == .POST) {
@@ -16801,6 +16881,11 @@ pub const RequiredPermission = struct {
 };
 
 pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8) ?RequiredPermission {
+    if (method == .POST and std.mem.eql(u8, path, routes.Routes.sql)) return .{
+        .resource_type = .database,
+        .resource = catalog_resources.default_database_name,
+        .permission_type = .admin,
+    };
     if (std.mem.eql(u8, path, routes.Routes.tablespaces)) return switch (method) {
         .GET => .{
             .resource_type = .tablespace,
@@ -16909,6 +16994,11 @@ pub fn requiredPermissionForRequest(method: http_common.Method, path: []const u8
         .permission_type = .read,
     };
     if (routes.Routes.matchTableRowsGet(path)) |rows| return .{
+        .resource_type = .table,
+        .resource = rows.table_name,
+        .permission_type = .read,
+    };
+    if (routes.Routes.matchTableRowsPlan(path)) |rows| return .{
         .resource_type = .table,
         .resource = rows.table_name,
         .permission_type = .read,
@@ -17111,6 +17201,14 @@ test "table permissions allow default public qualified resources during migratio
 test "explicit catalog routes declare qualified namespace and table permissions" {
     const alloc = std.testing.allocator;
 
+    {
+        const required = requiredPermissionForRequest(.POST, "/sql").?;
+        try std.testing.expectEqual(usermgr.ResourceType.database, required.resource_type);
+        try std.testing.expectEqual(usermgr.PermissionType.admin, required.permission_type);
+        const resource = try required.resourceNameAlloc(alloc);
+        defer alloc.free(resource);
+        try std.testing.expectEqualStrings(catalog_resources.default_database_name, resource);
+    }
     {
         const required = requiredPermissionForRequest(.GET, "/databases/tenant_ops/namespaces/analytics/tables").?;
         try std.testing.expectEqual(usermgr.ResourceType.namespace, required.resource_type);
@@ -23027,6 +23125,85 @@ test "api http server applies prepared statement SQL plans to session runtime" {
     );
 }
 
+test "api http server exposes psql-style SQL session endpoint" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var prepare_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;\"}",
+    });
+    defer prepare_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), prepare_resp.status);
+    var parsed_prepare = try std.json.parseFromSlice(std.json.Value, alloc, prepare_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_prepare.deinit();
+    const session_id = @as(u64, @intCast(parsed_prepare.value.object.get("session_id").?.integer));
+    try std.testing.expect(session_id != 0);
+    try std.testing.expectEqualStrings("ddl", parsed_prepare.value.object.get("kind").?.string);
+    try std.testing.expect(parsed_prepare.value.object.get("noop").?.bool);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        server.sql_prepared_statement_runtime.statementCountForTest(session_id),
+    );
+
+    const execute_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"session_id\":{d},\"sql\":\"EXECUTE usage_plan('open');\"}}",
+        .{session_id},
+    );
+    defer alloc.free(execute_body);
+    var execute_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = execute_body,
+    });
+    defer execute_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), execute_resp.status);
+    var parsed_execute = try std.json.parseFromSlice(std.json.Value, alloc, execute_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_execute.deinit();
+    try std.testing.expectEqual(@as(i64, @intCast(session_id)), parsed_execute.value.object.get("session_id").?.integer);
+
+    var missing_session_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"EXECUTE usage_plan('open');\"}",
+    });
+    defer missing_session_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), missing_session_resp.status);
+
+    var unsupported_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records;\"}",
+    });
+    defer unsupported_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), unsupported_resp.status);
+}
+
 test "api http server executes SQL notification channel plans through native runtime" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -28197,6 +28374,19 @@ test "api http server executes public relational row plan endpoints" {
     try expectRowsResultSchemaColumnCollation(parsed_query.value, "id", "C");
     try expectRowsResultSchemaColumn(parsed_query.value, "amount", "numeric", true, null);
     try expectRowsResultSchemaColumnCollation(parsed_query.value, "amount", null);
+
+    var plan_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/records/rows/plan",
+        .content_type = "application/json",
+        .body = "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"order\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"open\"}]},\"select\":[\"id\",\"amount\"],\"order_by\":[{\"field\":\"amount\",\"direction\":\"desc\"}]}}",
+    });
+    defer plan_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), plan_resp.status);
+    var parsed_plan = try std.json.parseFromSlice(std.json.Value, alloc, plan_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_plan.deinit();
+    try std.testing.expectEqual(@as(i64, 2), parsed_plan.value.object.get("total").?.integer);
+    try std.testing.expectEqualStrings("o2", parsed_plan.value.object.get("rows").?.array.items[0].object.get("id").?.string);
 
     var public_claim_query_resp = try server.handle(.{
         .method = .POST,

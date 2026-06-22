@@ -414,6 +414,17 @@ pub const Client = struct {
         return ApiResponse(types.BackupListResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Execute SQL text in a logical SQL session
+    /// POST /db/v1/sql
+    pub fn executeSql(self: *@This(), body: types.SqlStatementRequest) !ApiResponse(types.SqlStatementResponse) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sql", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringify(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.SqlStatementResponse).fromResponse(self.allocator, &resp);
+    }
+
     /// Perform a global query
     /// POST /db/v1/query
     pub fn globalQuery(self: *@This(), body: types.QueryRequest) !ApiResponse(types.QueryResponses) {

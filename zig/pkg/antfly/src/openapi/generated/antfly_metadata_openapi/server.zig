@@ -152,6 +152,11 @@ pub const ListBackupsParams = struct {
     location: []const u8,
 };
 
+/// Parse the JSON request body for executeSql.
+pub fn parseExecuteSqlBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlStatementRequest) {
+    return std.json.parseFromSlice(types.SqlStatementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for globalQuery.
 pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
     return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -865,6 +870,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
     .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
+    .{ .method = "POST", .path = "/sql", .operation_id = "executeSql" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
@@ -970,6 +976,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "backup")) @compileError("ServerRouter: Impl missing required method 'backup'");
         if (!@hasDecl(Impl, "restore")) @compileError("ServerRouter: Impl missing required method 'restore'");
         if (!@hasDecl(Impl, "listBackups")) @compileError("ServerRouter: Impl missing required method 'listBackups'");
+        if (!@hasDecl(Impl, "executeSql")) @compileError("ServerRouter: Impl missing required method 'executeSql'");
         if (!@hasDecl(Impl, "globalQuery")) @compileError("ServerRouter: Impl missing required method 'globalQuery'");
         if (!@hasDecl(Impl, "evaluate")) @compileError("ServerRouter: Impl missing required method 'evaluate'");
         if (!@hasDecl(Impl, "queryBuilderAgent")) @compileError("ServerRouter: Impl missing required method 'queryBuilderAgent'");
@@ -1076,6 +1083,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/backup", backup);
             try server.post("/restore", restore);
             try server.get("/backups", listBackups);
+            try server.post("/sql", executeSql);
             try server.post("/query", globalQuery);
             try server.post("/eval", evaluate);
             try server.post("/agents/query-builder", queryBuilderAgent);
@@ -1339,6 +1347,13 @@ pub fn ServerRouter(comptime Impl: type) type {
                 .location = ctx.query("location") orelse return ctx.status(400).json(.{ .@"error" = "missing_query_param", .message = "Missing required query parameter: location" }),
             };
             return impl.listBackups(ctx, query_params);
+        }
+
+        /// Execute SQL text in a logical SQL session
+        /// POST /sql
+        fn executeSql(ctx: *httpx.Context) anyerror!httpx.Response {
+            const impl = active_impl orelse return ctx.status(503).json(.{ .@"error" = "not_initialized", .message = "server not initialized" });
+            return impl.executeSql(ctx);
         }
 
         /// Perform a global query
@@ -1979,6 +1994,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
+//   fn executeSql(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response

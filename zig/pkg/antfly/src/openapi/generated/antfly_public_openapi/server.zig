@@ -151,6 +151,11 @@ pub const ListBackupsParams = struct {
     location: []const u8,
 };
 
+/// Parse the JSON request body for executeSql.
+pub fn parseExecuteSqlBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SqlStatementRequest) {
+    return std.json.parseFromSlice(types.SqlStatementRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Parse the JSON request body for globalQuery.
 pub fn parseGlobalQueryBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.QueryRequest) {
     return std.json.parseFromSlice(types.QueryRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1051,6 +1056,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/backup", .operation_id = "backup" },
     .{ .method = "POST", .path = "/restore", .operation_id = "restore" },
     .{ .method = "GET", .path = "/backups", .operation_id = "listBackups" },
+    .{ .method = "POST", .path = "/sql", .operation_id = "executeSql" },
     .{ .method = "POST", .path = "/query", .operation_id = "globalQuery" },
     .{ .method = "POST", .path = "/eval", .operation_id = "evaluate" },
     .{ .method = "POST", .path = "/agents/query-builder", .operation_id = "queryBuilderAgent" },
@@ -1171,6 +1177,7 @@ pub const routes = [_]Route{
 //   fn backup(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn restore(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn listBackups(self: *Impl, ctx: *httpx.Context, params: ListBackupsParams) !httpx.Response
+//   fn executeSql(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn globalQuery(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn evaluate(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn queryBuilderAgent(self: *Impl, ctx: *httpx.Context) !httpx.Response
