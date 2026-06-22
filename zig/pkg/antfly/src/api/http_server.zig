@@ -5119,6 +5119,142 @@ pub const ApiHttpServer = struct {
         return .{ .result = result };
     }
 
+    fn applyLoweredPublicSqlMergeMutation(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: *sql_adapter.LoweredMergeMutationPlan,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        batch: relational_rows_api.OwnedRowsBatchRequest,
+    } {
+        const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        if (lowered.ctes.len != 0 or lowered.data_modifying_ctes.len != 0 or lowered.source.source_cte.len != 0) {
+            return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") };
+        }
+
+        const source_table_name = rowsPlanEffectiveSideTable(target_table_name, lowered.source_table_name);
+        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+            error.PermissionDenied => return .{ .failure = try textResponse(self.alloc, 403, "forbidden") },
+        };
+
+        const source_schema = if (std.mem.eql(u8, source_table_name, target_table_name))
+            target_schema
+        else
+            sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
+                self.alloc,
+                self.catalogSource(),
+                source_table_name,
+                session,
+            ) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                else => return err,
+            };
+        defer if (!std.mem.eql(u8, source_table_name, target_table_name)) runtime_schema_mod.freeSchema(self.alloc, source_schema);
+
+        var target_query: relational_rows_api.OwnedRowsQueryRequest = .{ .select_all = true };
+        defer self.deinitRowsAuthFilterQueryAdditions(&target_query);
+        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (target_filter) |*value| value.deinit(self.alloc);
+        if (target_filter) |active| {
+            try self.applyRowsAuthFilterToQuery(target_schema, active, &target_query);
+        }
+
+        var source_filter = self.rowsAuthFilterPlanForIdentity(source_table_name, authenticated_identity, source_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (source_filter) |*value| value.deinit(self.alloc);
+        if (source_filter) |active| {
+            try self.applyRowsAuthFilterToQuery(source_schema, active, &lowered.source);
+        }
+
+        var batch = (table_reads.rowsMergeMutationBatchFromRoutedScansWithSchemasAlloc(
+            self.alloc,
+            read_source,
+            target_table_name,
+            source_table_name,
+            target_schema,
+            source_schema,
+            lowered.*,
+            target_query,
+            &.{},
+            lowered.source,
+            &.{},
+            .read_index,
+        ) catch |err| switch (err) {
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+            error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            else => {
+                std.log.err("public sql merge plan failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        errdefer batch.deinit(self.alloc);
+
+        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        return .{ .batch = batch };
+    }
+
+    fn applyLoweredPublicSqlRecursiveMergeMutation(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: sql_adapter.LoweredRecursiveMergeMutation,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        batch: relational_rows_api.OwnedRowsBatchRequest,
+    } {
+        const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+
+        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (target_filter) |*value| value.deinit(self.alloc);
+        if (target_filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
+
+        var batch = (table_reads.rowsRecursiveMergeMutationBatchFromRoutedScansWithSchemasAndSessionAlloc(
+            self.alloc,
+            read_source,
+            self.catalogSource(),
+            session,
+            target_table_name,
+            target_table_name,
+            target_schema,
+            target_schema,
+            lowered,
+            .{ .select_all = true },
+            &.{},
+            .read_index,
+        ) catch |err| switch (err) {
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.InvalidBatchRequest, error.ForeignKeyViolation, error.UniqueConstraintViolation, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+            error.UnsupportedOperation, error.UnsupportedRowsQuery, error.UnsupportedSqlShape => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            else => {
+                std.log.err("public sql recursive merge plan failed table={s} cte={s} err={}", .{ target_table_name, lowered.recursive.cte_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        errdefer batch.deinit(self.alloc);
+
+        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        return .{ .batch = batch };
+    }
+
     fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -5131,8 +5267,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
         switch (statement_kind) {
-            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => {},
-            else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate, .merge => {},
         }
 
         const target_table = self.publicSqlWriteTargetTableNameAlloc(&parsed_sql) catch |err| switch (err) {
@@ -5279,6 +5414,40 @@ pub const ApiHttpServer = struct {
                 self.ensureSqlProtocolSessionId(session),
                 @tagName(statement_kind),
                 recursive_joined_mutation_result,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
+
+        if (lowered == .merge_mutation) {
+            var merge_batch = switch (try self.applyLoweredPublicSqlMergeMutation(target_table, schema, &lowered.merge_mutation, session.session(), authenticated_identity)) {
+                .failure => |failure| return failure,
+                .batch => |batch| batch,
+            };
+            defer merge_batch.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsBatchResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                merge_batch,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
+
+        if (lowered == .recursive_merge_mutation) {
+            var merge_batch = switch (try self.applyLoweredPublicSqlRecursiveMergeMutation(target_table, schema, lowered.recursive_merge_mutation, session.session(), authenticated_identity)) {
+                .failure => |failure| return failure,
+                .batch => |batch| batch,
+            };
+            defer merge_batch.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsBatchResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                merge_batch,
             );
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
@@ -24591,6 +24760,95 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("recursive-c", recursive_rows[2].object.get("id").?.string);
     try std.testing.expectEqualStrings("other", recursive_rows[2].object.get("status").?.string);
 
+    var merge_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('merge-target', 'old', 1), ('merge-source-update', 'merge-target', 44), ('merge-source-insert', 'merge-inserted', 55);\"}",
+    });
+    defer merge_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), merge_seed_resp.status);
+
+    var merge_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"MERGE INTO usage_records AS target USING usage_records AS source ON target.id = source.status WHEN MATCHED AND source.id = 'merge-source-update' THEN UPDATE SET status = 'merged', amount = source.amount WHEN NOT MATCHED AND source.id = 'merge-source-insert' THEN INSERT (id, status, amount) VALUES (source.status, 'inserted', source.amount) RETURNING target.id, target.status, target.amount;\"}",
+    });
+    defer merge_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), merge_resp.status);
+    var parsed_merge = try std.json.parseFromSlice(std.json.Value, alloc, merge_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_merge.deinit();
+    try std.testing.expectEqualStrings("write", parsed_merge.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("merge", parsed_merge.value.object.get("statement_kind").?.string);
+    const merge_result = parsed_merge.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), merge_result.get("inserted").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), merge_result.get("transformed").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), merge_result.get("returning").?.array.items.len);
+
+    var merge_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records WHERE id IN ('merge-inserted', 'merge-target') ORDER BY id ASC;\"}",
+    });
+    defer merge_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), merge_query_resp.status);
+    var parsed_merge_query = try std.json.parseFromSlice(std.json.Value, alloc, merge_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_merge_query.deinit();
+    const merge_rows = parsed_merge_query.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), merge_rows.len);
+    try std.testing.expectEqualStrings("merge-inserted", merge_rows[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("inserted", merge_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 55), merge_rows[0].object.get("amount").?.integer);
+    try std.testing.expectEqualStrings("merge-target", merge_rows[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("merged", merge_rows[1].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 44), merge_rows[1].object.get("amount").?.integer);
+
+    var recursive_merge_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('recursive-merge-a', 'merge-root', 7), ('recursive-merge-b', 'recursive-merge-a', 8), ('recursive-merge-c', 'merge-other', 9);\"}",
+    });
+    defer recursive_merge_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recursive_merge_seed_resp.status);
+
+    var recursive_merge_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records WHERE status = 'merge-root' UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.status = parent.id) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) RETURNING target.id, target.status;\"}",
+    });
+    defer recursive_merge_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recursive_merge_resp.status);
+    var parsed_recursive_merge = try std.json.parseFromSlice(std.json.Value, alloc, recursive_merge_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_recursive_merge.deinit();
+    try std.testing.expectEqualStrings("write", parsed_recursive_merge.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("merge", parsed_recursive_merge.value.object.get("statement_kind").?.string);
+    const recursive_merge_result = parsed_recursive_merge.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), recursive_merge_result.get("transformed").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), recursive_merge_result.get("returning").?.array.items.len);
+
+    var recursive_merge_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status FROM usage_records WHERE id IN ('recursive-merge-a', 'recursive-merge-b', 'recursive-merge-c') ORDER BY id ASC;\"}",
+    });
+    defer recursive_merge_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recursive_merge_query_resp.status);
+    var parsed_recursive_merge_query = try std.json.parseFromSlice(std.json.Value, alloc, recursive_merge_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_recursive_merge_query.deinit();
+    const recursive_merge_rows = parsed_recursive_merge_query.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), recursive_merge_rows.len);
+    try std.testing.expectEqualStrings("recursive-merge-a", recursive_merge_rows[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("merge-root", recursive_merge_rows[0].object.get("status").?.string);
+    try std.testing.expectEqualStrings("recursive-merge-b", recursive_merge_rows[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("recursive-merge-a", recursive_merge_rows[1].object.get("status").?.string);
+    try std.testing.expectEqualStrings("recursive-merge-c", recursive_merge_rows[2].object.get("id").?.string);
+    try std.testing.expectEqualStrings("merge-other", recursive_merge_rows[2].object.get("status").?.string);
+
     var truncate_seed_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -24613,8 +24871,8 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("write", parsed_truncate.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate.value.object.get("statement_kind").?.string);
     const truncate_result = parsed_truncate.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 6), truncate_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 6), truncate_result.get("staged").?.integer);
+    try std.testing.expectEqual(@as(i64, 13), truncate_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 13), truncate_result.get("staged").?.integer);
 
     var truncated_query_resp = try server.handle(.{
         .method = .POST,

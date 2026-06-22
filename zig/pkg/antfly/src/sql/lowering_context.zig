@@ -327,7 +327,7 @@ fn lowerQueryParsedSqlForLoweringContextTestAlloc(
 ) !plan.LoweredQueryPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser_mod.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -366,7 +366,7 @@ fn lowerWindowParsedSqlForLoweringContextTestAlloc(
 ) !plan.LoweredWindowPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser_mod.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -402,7 +402,7 @@ fn lowerAggregateParsedSqlForLoweringContextTestAlloc(
 ) !plan.LoweredAggregatePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser_mod.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -440,7 +440,7 @@ fn lowerJoinWithSchemasParsedSqlForLoweringContextTestAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser_mod.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -479,7 +479,7 @@ fn lowerLateralWithSchemasParsedSqlForLoweringContextTestAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser_mod.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser_mod.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,

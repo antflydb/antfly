@@ -23,6 +23,7 @@ pub const namespace_cmd = @import("namespace.zig");
 pub const tablespace = @import("tablespace.zig");
 pub const index = @import("index.zig");
 pub const query = @import("query.zig");
+pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
@@ -137,6 +138,7 @@ test "cli mod compiles" {
     _ = tablespace;
     _ = index;
     _ = query;
+    _ = sql;
     _ = data;
     _ = backup;
     _ = agents;

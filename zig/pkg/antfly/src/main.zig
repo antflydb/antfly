@@ -63,10 +63,10 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table",   "database", "namespace", "tablespace",
-        "index",   "query",    "lookup",    "load",
-        "insert",  "delete",   "agents",    "backup",
-        "restore", "auth",     "internal",
+        "table",  "database", "namespace", "tablespace",
+        "index",  "query",    "lookup",    "load",
+        "sql",    "insert",   "delete",    "agents",
+        "backup", "restore",  "auth",      "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
@@ -153,6 +153,7 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "sql")) return cmd.cli.sql.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "load")) return cmd.cli.data.load(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "insert")) return cmd.cli.data.insert(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "delete")) return cmd.cli.data.delete(allocator, io, &client, args);
@@ -183,6 +184,7 @@ fn printUsage(argv0: []const u8) void {
         \\  index          Manage indexes (create, drop, list, get)
         \\  query          Query data from a table
         \\  lookup         Look up a document by key
+        \\  sql            Execute SQL or start a psql-style SQL REPL
         \\  load           Bulk load data from NDJSON file
         \\  insert         Insert a single document
         \\  delete         Delete a single document

@@ -210,6 +210,10 @@ pub fn tokensStartWithKeyword(tokens: []const Token, keyword: []const u8) bool {
     return tokens.len > 0 and tokens[0].matchesKeyword(keyword);
 }
 
+pub fn tokensStartWithKeywordTag(tokens: []const Token, keyword: TokenKeyword) bool {
+    return tokens.len > 0 and tokens[0].matchesKeywordTag(keyword);
+}
+
 pub fn consumeCteMaterializationHint(tokens: []const Token, pos: *usize) !void {
     if (matchKeywordTag(tokens, pos, .materialized)) return;
     if (matchKeywordTag(tokens, pos, .not) and !matchKeywordTag(tokens, pos, .materialized)) {
@@ -481,6 +485,7 @@ test "sql adapter parser consumes shared keyword helpers" {
         .{ .kind = .lparen, .text = "(" },
     };
     try std.testing.expect(tokensStartWithKeyword(materialized_tokens[0..], "materialized"));
+    try std.testing.expect(tokensStartWithKeywordTag(materialized_tokens[0..], .materialized));
     var materialized_pos: usize = 0;
     try consumeCteMaterializationHint(materialized_tokens[0..], &materialized_pos);
     try std.testing.expectEqual(@as(usize, 1), materialized_pos);

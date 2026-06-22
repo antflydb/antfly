@@ -616,7 +616,7 @@ pub fn lowerSelectParsedSqlAlloc(
 ) !LoweredSelect {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,
@@ -697,7 +697,7 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
 ) !LoweredQueryPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,
@@ -1179,7 +1179,7 @@ fn lowerWindowPlanParsedSqlAlloc(
 ) !LoweredWindowPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,
@@ -2093,7 +2093,7 @@ fn lowerAggregatePlanParsedSqlAlloc(
 ) !LoweredAggregatePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,
@@ -2152,7 +2152,7 @@ fn lowerJoinWithSchemasParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,
@@ -2212,7 +2212,7 @@ fn lowerLateralPlanWithSchemasParsedSqlAlloc(
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = sql_adapter.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
 
     var parser = Parser{
         .alloc = alloc,

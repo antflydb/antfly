@@ -1731,9 +1731,10 @@ bounded recursive producer, the inner mutation consumes the materialized CTE by
 typed `source_cte`, and execution feeds the deterministic target-row claim/OCC
 or MERGE batch builders without passing SQL text through storage.
 The public SQL execution path applies that shape to recursive claimed
-update/delete today by materializing the recursive producer under the read-plan
-caps, filtering the CTE rows through the typed row-query evaluator, and passing
-the resulting source rows to the joined mutation-source autocommit path.
+update/delete and recursive MERGE by materializing the recursive producer under
+the read-plan caps, filtering the CTE rows through the typed row-query
+evaluator, and passing the resulting source rows to the joined
+mutation-source autocommit path or deterministic MERGE row-batch builder.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.
@@ -1883,11 +1884,17 @@ path as ordinary row APIs, so matched updates/deletes resolve the exact
 scalar key into one target. Catalog-backed MERGE lowering resolves a
 cross-table source schema from the table catalog before validating source-field
 assignments, so SQL text cannot smuggle source columns past the typed
-source/target schema boundary. Remaining production MERGE work is owner-group
-staging and topology behavior: provisioned/hosted write execution still needs to
-stage matched target intents in their owner groups while unmatched rows stage
-ordinary inserts through the target row-batch path, validate topology epochs
-across collection and staging, and retry or fail closed around range movement. MERGE
+source/target schema boundary. Public `/db/v1/sql` execution now uses this shape
+for direct table-source MERGE and recursive CTE-backed MERGE: it collects typed
+preimages through public read sources, builds an owned row-batch mutation, and
+applies that batch through the ordinary public row-batch authorization, trigger,
+transaction, and commit path. Non-recursive source-CTE MERGE and
+data-modifying-CTE MERGE producers remain fail-closed until their materialized
+source rows can enter the same preimage-to-row-batch boundary. Remaining
+production MERGE work is owner-group topology hardening: provisioned/hosted
+write execution needs broader chaos coverage around matched target intents and
+unmatched target inserts while range movement races collection, staging,
+topology epoch validation, and retry/fail-closed behavior. MERGE
 arms are modeled as ordered typed arrays: the parser preserves every
 `WHEN MATCHED` and `WHEN NOT MATCHED` arm in input order, and the batch builder
 evaluates the first matching arm for each source row. Arms can independently

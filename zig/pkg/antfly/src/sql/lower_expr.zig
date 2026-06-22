@@ -24912,7 +24912,7 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -24955,7 +24955,7 @@ fn lowerJoinForLowerExprTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -24996,7 +24996,7 @@ fn lowerLateralForLowerExprTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -25037,7 +25037,7 @@ fn lowerWindowPlanForLowerExprTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,
@@ -25077,7 +25077,7 @@ fn lowerAggregatePlanForLowerExprTestAlloc(
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
     const tokens = parsed_sql.items();
-    const cte_adapter_shape = parser.tokensStartWithKeyword(tokens, "with");
+    const cte_adapter_shape = parser.tokensStartWithKeywordTag(tokens, .with);
 
     var parser_state = parser_context.ParserState{
         .alloc = alloc,

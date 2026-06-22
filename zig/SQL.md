@@ -171,9 +171,13 @@ executor wiring can share the native cross-table catalog barrier, identity
 allocator, and 2PC paths. Recursive CTE-backed claimed update/delete statements
 execute by materializing the bounded recursive producer through the typed read
 planner, filtering the referenced CTE output, and feeding those rows into the
-same joined mutation-source autocommit path. Recursive MERGE writes remain
-fail-closed until their SQL executor wiring can share the native recursive
-materialization, trigger, catalog barrier, and 2PC paths.
+same joined mutation-source autocommit path. Direct table-source MERGE and
+recursive CTE-backed MERGE execute by collecting typed target/source preimages,
+building the deterministic row-batch mutation, and applying that batch through
+the ordinary public row-batch authorization, trigger, transaction, and commit
+path. Non-recursive source-CTE and data-modifying-CTE MERGE producers remain
+fail-closed until their materialized source rows can be fed through the same
+batch boundary without adding a SQL-text execution path.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
@@ -845,6 +849,9 @@ Current implementation status:
   tags for statement heads, query-tail clauses, recursive write guards, row
   claim clauses, and returning clauses; selectors and assignments remain typed
   binder/expression/value work.
+- Read, join, lateral, window, aggregate, and lowerer test adapters classify
+  CTE-shaped parsed statements from token keyword metadata instead of the
+  compatibility string helper.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

@@ -2630,6 +2630,7 @@ pub const tableSchemaCatalogExists = binder.tableSchemaCatalogExists;
 pub const tableSchemaJson = binder.tableSchemaJson;
 pub const tableLockModeFromSyntax = ddl_plan.tableLockModeFromSyntax;
 pub const tokensStartWithKeyword = parser.tokensStartWithKeyword;
+pub const tokensStartWithKeywordTag = parser.tokensStartWithKeywordTag;
 pub const transactionAccessModeFromSyntax = ddl_plan.transactionAccessModeFromSyntax;
 pub const transactionIsolationLevelFromSyntax = ddl_plan.transactionIsolationLevelFromSyntax;
 pub const transactionModeStarterFromSyntax = ddl_plan.transactionModeStarterFromSyntax;
