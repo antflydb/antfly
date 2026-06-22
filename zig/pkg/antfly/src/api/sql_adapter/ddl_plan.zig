@@ -4620,6 +4620,9 @@ pub fn parseCreateGraphIndexPlanAlloc(
     const table_name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
+    if (cursor.peekKeyword("source")) {
+        return try parseCreateGraphExtractionIndexPlanTailAlloc(alloc, tokens, pos, index_name, &index_transferred, table_name, &table_transferred, if_not_exists);
+    }
     try cursor.expectKeyword("edge");
     try cursor.expectToken(.lparen);
     const source_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
@@ -4666,6 +4669,85 @@ pub fn parseCreateGraphIndexPlanAlloc(
     table_transferred = true;
     source_transferred = true;
     target_transferred = true;
+    config_transferred = true;
+    columns_transferred = true;
+    return .{
+        .index_name = index_name,
+        .table_name = table_name,
+        .if_not_exists = if_not_exists,
+        .unique = false,
+        .method = .antfly_graph,
+        .columns = columns,
+        .derived_index_config_json = config_json,
+    };
+}
+
+fn parseCreateGraphExtractionIndexPlanTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    index_name: []const u8,
+    index_transferred: *bool,
+    table_name: []const u8,
+    table_transferred: *bool,
+    if_not_exists: bool,
+) !CreateIndexPlan {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("source");
+    try cursor.expectKeyword("enrichment");
+    const enrichment_name = try grammar.parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(enrichment_name);
+    try cursor.expectKeyword("from");
+    const input_field = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+    var input_transferred = false;
+    errdefer if (!input_transferred) alloc.free(input_field);
+    try cursor.expectKeyword("using");
+    const extractor_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(extractor_token.text, "extractor")) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("model");
+    const model_token = cursor.matchToken(.string) orelse cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("edges");
+    try cursor.expectKeyword("json_path");
+    const path_token = cursor.matchToken(.string) orelse return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("source");
+    const source_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+    defer alloc.free(source_path);
+    if (!std.mem.eql(u8, source_path, "_id")) return error.UnsupportedSqlShape;
+    try cursor.expectKeyword("target");
+    const target_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+    defer alloc.free(target_path);
+
+    var type_path: ?[]const u8 = null;
+    defer if (type_path) |path| alloc.free(path);
+    var weight_path: ?[]const u8 = null;
+    defer if (weight_path) |path| alloc.free(path);
+    while (true) {
+        if (cursor.matchKeyword("type")) {
+            if (type_path != null) return error.UnsupportedSqlShape;
+            type_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+            continue;
+        }
+        if (cursor.matchKeyword("weight")) {
+            if (weight_path != null) return error.UnsupportedSqlShape;
+            weight_path = try parseDerivedIndexFieldPathAlloc(alloc, tokens, pos);
+            continue;
+        }
+        break;
+    }
+
+    const config_json = try graphExtractionIndexConfigJsonAlloc(alloc, tokens, pos, enrichment_name, input_field, model_token.text, path_token.text, target_path, type_path, weight_path);
+    var config_transferred = false;
+    errdefer if (!config_transferred) alloc.free(config_json);
+    try grammar.parseAdapterNoopStatementEnd(tokens, pos);
+
+    const columns = try alloc.alloc([]const u8, 1);
+    var columns_transferred = false;
+    errdefer if (!columns_transferred) alloc.free(columns);
+    columns[0] = input_field;
+
+    index_transferred.* = true;
+    table_transferred.* = true;
+    input_transferred = true;
     config_transferred = true;
     columns_transferred = true;
     return .{
@@ -5215,6 +5297,93 @@ fn graphIndexConfigJsonAlloc(
     if (type_field) |field| try appendJsonStringField(alloc, &out, &edge_first, "type_field", field);
     if (weight_field) |field| try appendJsonStringField(alloc, &out, &edge_first, "weight_field", field);
     try out.append(alloc, '}');
+    try appendJsonStringField(alloc, &out, &first, "edge_policy", derivedIndexOptionString(options, "edge_policy") orelse "all");
+
+    for (options) |option| {
+        if (std.ascii.eqlIgnoreCase(option.name, "edge_policy")) continue;
+        try appendJsonOptionField(alloc, &out, &first, option);
+    }
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
+}
+
+fn graphExtractionIndexConfigJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    pos: *usize,
+    enrichment_name: []const u8,
+    input_field: []const u8,
+    model: []const u8,
+    edges_json_path: []const u8,
+    target_path: []const u8,
+    type_path: ?[]const u8,
+    weight_path: ?[]const u8,
+) ![]u8 {
+    const options = try parseDerivedIndexOptionsAlloc(alloc, tokens, pos);
+    defer freeDerivedIndexOptions(alloc, options);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    try appendJsonStringField(alloc, &out, &first, "type", "graph");
+
+    try out.append(alloc, ',');
+    try appendJsonStringLiteral(alloc, &out, "source");
+    try out.appendSlice(alloc, ":{");
+    var source_first = true;
+    try appendJsonStringField(alloc, &out, &source_first, "kind", "artifact");
+    try appendJsonStringField(alloc, &out, &source_first, "artifact", enrichment_name);
+    try appendJsonStringField(alloc, &out, &source_first, "path", edges_json_path);
+    try appendJsonStringField(alloc, &out, &source_first, "format", "extraction_relation");
+    try out.append(alloc, '}');
+
+    try out.append(alloc, ',');
+    try appendJsonStringLiteral(alloc, &out, "artifact");
+    try out.appendSlice(alloc, ":{");
+    var artifact_first = true;
+    try appendJsonStringField(alloc, &out, &artifact_first, "name", enrichment_name);
+    try appendJsonStringField(alloc, &out, &artifact_first, "kind", "asset");
+    try appendJsonStringField(alloc, &out, &artifact_first, "field", input_field);
+    try appendJsonStringField(alloc, &out, &artifact_first, "content_type", "application/json");
+    try out.append(alloc, ',');
+    try appendJsonStringLiteral(alloc, &out, "producer_json");
+    try out.appendSlice(alloc, ":{");
+    var producer_first = true;
+    try appendJsonStringField(alloc, &out, &producer_first, "type", "extractor");
+    try appendJsonStringField(alloc, &out, &producer_first, "model", model);
+    try out.append(alloc, '}');
+    try out.append(alloc, '}');
+
+    try out.append(alloc, ',');
+    try appendJsonStringLiteral(alloc, &out, "nodes");
+    try out.appendSlice(alloc, ":{");
+    var nodes_first = true;
+    try appendJsonStringField(alloc, &out, &nodes_first, "model", "document");
+    try appendJsonStringField(alloc, &out, &nodes_first, "source", "{{ _doc.key }}");
+    const target_template = try std.fmt.allocPrint(alloc, "{{{{ _item.{s} }}}}", .{target_path});
+    defer alloc.free(target_template);
+    try appendJsonStringField(alloc, &out, &nodes_first, "target", target_template);
+    try out.append(alloc, '}');
+
+    if (type_path != null or weight_path != null) {
+        try out.append(alloc, ',');
+        try appendJsonStringLiteral(alloc, &out, "edge");
+        try out.appendSlice(alloc, ":{");
+        var edge_first = true;
+        if (type_path) |path| {
+            const type_template = try std.fmt.allocPrint(alloc, "{{{{ _item.{s} }}}}", .{path});
+            defer alloc.free(type_template);
+            try appendJsonStringField(alloc, &out, &edge_first, "type", type_template);
+        }
+        if (weight_path) |path| {
+            const weight_template = try std.fmt.allocPrint(alloc, "{{{{ _item.{s} }}}}", .{path});
+            defer alloc.free(weight_template);
+            try appendJsonStringField(alloc, &out, &edge_first, "weight", weight_template);
+        }
+        try out.append(alloc, '}');
+    }
+
     try appendJsonStringField(alloc, &out, &first, "edge_policy", derivedIndexOptionString(options, "edge_policy") orelse "all");
 
     for (options) |option| {
@@ -7917,6 +8086,39 @@ test "sql adapter ddl plan lowers create index ddl" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var graph_extraction_syntax = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all');",
+    );
+    defer graph_extraction_syntax.deinit(alloc);
+    switch (graph_extraction_syntax) {
+        .create_index => |plan| {
+            try std.testing.expectEqual(DdlIndexMethod.antfly_graph, plan.method);
+            try std.testing.expectEqualStrings("docs_rel_graph", plan.index_name);
+            try std.testing.expectEqualStrings("docs", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.columns.len);
+            try std.testing.expectEqualStrings("body", plan.columns[0]);
+            const config = plan.derived_index_config_json orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"graph\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"kind\":\"artifact\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"artifact\":\"relations_v1\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"path\":\"$.relations[*]\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"field\":\"body\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"producer_json\":{\"type\":\"extractor\",\"model\":\"relations\"}") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"source\":\"{{ _doc.key }}\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"target\":\"{{ _item.target.document_id }}\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"type\":\"{{ _item.type }}\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"weight\":\"{{ _item.confidence }}\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, config, "\"edge_policy\":\"all\"") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(
+        alloc,
+        "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE source.document_id TARGET target.document_id;",
+    ));
 
     var graph_metric = try lowerDdlPlanForTestAlloc(
         alloc,

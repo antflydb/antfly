@@ -13589,6 +13589,226 @@ test "sql adapter lower dml lowers insert default values into defaulted row batc
     try std.testing.expectEqualStrings("{\"id\":\"u_default\",\"status\":\"active\"}", omitted_default_conflict_update.batch.returning_rows[0]);
 }
 
+test "sql adapter lower dml lowers uuid generation insert values" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"request_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var inserted = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, request_id) VALUES ('u1', gen_random_uuid()) RETURNING request_id",
+        schema,
+        &.{},
+    );
+    defer inserted.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), inserted.batch.inserted);
+    var returned = try std.json.parseFromSlice(std.json.Value, alloc, inserted.batch.returning_rows[0], .{});
+    defer returned.deinit();
+    const request_id = returned.value.object.get("request_id") orelse return error.TestUnexpectedResult;
+    try expectSqlUuidV4StringForDmlTest(request_id);
+}
+
+test "sql adapter lower dml lowers insert values returning into row batch" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"amount":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id","status"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, metadata) VALUES ($1, $2, $3::jsonb) RETURNING id, status, metadata",
+        schema,
+        &.{
+            .{ .string = "u1" },
+            .{ .string = "pending" },
+            .{ .json = "{\"source\":\"autoscale_delta\"}" },
+        },
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings("usage_records", lowered.table_name);
+    try std.testing.expectEqual(@as(u32, 1), lowered.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.batch.returning_rows.len);
+
+    var returned = try std.json.parseFromSlice(std.json.Value, alloc, lowered.batch.returning_rows[0], .{});
+    defer returned.deinit();
+    try std.testing.expectEqualStrings("u1", returned.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("pending", returned.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("autoscale_delta", returned.value.object.get("metadata").?.object.get("source").?.string);
+
+    var multi_row = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) VALUES ('u_multi_1', 'open', 1), ('u_multi_2', 'closed', 2) RETURNING id, status",
+        schema,
+        &.{},
+    );
+    defer multi_row.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), multi_row.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 2), multi_row.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 2), multi_row.batch.returning_rows.len);
+    var multi_first = try std.json.parseFromSlice(std.json.Value, alloc, multi_row.batch.returning_rows[0], .{});
+    defer multi_first.deinit();
+    var multi_second = try std.json.parseFromSlice(std.json.Value, alloc, multi_row.batch.returning_rows[1], .{});
+    defer multi_second.deinit();
+    try std.testing.expectEqualStrings("u_multi_1", multi_first.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("open", multi_first.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("u_multi_2", multi_second.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("closed", multi_second.value.object.get("status").?.string);
+
+    var multi_conflict_resolver = TestPrimaryResolver{ .row_json = "{\"id\":\"u_multi_1\",\"status\":\"open\"}", .version = 1 };
+    var multi_conflict = try lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u_multi_1', 'open'), ('u_multi_2', 'closed') ON CONFLICT (id) DO NOTHING RETURNING id",
+        schema,
+        &.{},
+        multi_conflict_resolver.resolver(),
+    );
+    defer multi_conflict.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), multi_conflict.batch.inserted);
+    try std.testing.expectEqual(@as(usize, 0), multi_conflict.batch.writes.len);
+    try std.testing.expectEqual(@as(usize, 0), multi_conflict.batch.returning_rows.len);
+
+    var all_returning = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, metadata) VALUES ('u2', 'ready', jsonb_build_object('source', 'seed')) RETURNING *, lower(status) AS status_key, metadata->>'source' AS source",
+        schema,
+        &.{},
+    );
+    defer all_returning.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), all_returning.batch.returning_rows.len);
+    var all_returned = try std.json.parseFromSlice(std.json.Value, alloc, all_returning.batch.returning_rows[0], .{});
+    defer all_returned.deinit();
+    try std.testing.expectEqualStrings("u2", all_returned.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("ready", all_returned.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("seed", all_returned.value.object.get("metadata").?.object.get("source").?.string);
+    try std.testing.expectEqualStrings("ready", all_returned.value.object.get("status_key").?.string);
+    try std.testing.expectEqualStrings("seed", all_returned.value.object.get("source").?.string);
+
+    var signed_numeric = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, amount) VALUES ('u3', 'debit', -12.5) RETURNING id, amount",
+        schema,
+        &.{},
+    );
+    defer signed_numeric.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), signed_numeric.batch.returning_rows.len);
+    var signed_returned = try std.json.parseFromSlice(std.json.Value, alloc, signed_numeric.batch.returning_rows[0], .{});
+    defer signed_returned.deinit();
+    try std.testing.expectEqualStrings("u3", signed_returned.value.object.get("id").?.string);
+    switch (signed_returned.value.object.get("amount").?) {
+        .float => |value| try std.testing.expectEqual(@as(f64, -12.5), value),
+        .number_string => |value| try std.testing.expectEqualStrings("-12.5", value),
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready') RETURNING *, id",
+        schema,
+        &.{},
+    ));
+    var qualified_all_returning = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, metadata) VALUES ('u5', 'ready', jsonb_build_object('source', 'qualified')) RETURNING usage_records.*",
+        schema,
+        &.{},
+    );
+    defer qualified_all_returning.deinit(alloc);
+    try std.testing.expect(qualified_all_returning.returning_all);
+    try std.testing.expectEqual(@as(usize, 1), qualified_all_returning.batch.returning_rows.len);
+    var qualified_all_row = try std.json.parseFromSlice(std.json.Value, alloc, qualified_all_returning.batch.returning_rows[0], .{});
+    defer qualified_all_row.deinit();
+    try std.testing.expectEqualStrings("u5", qualified_all_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("ready", qualified_all_row.value.object.get("status").?.string);
+
+    var public_qualified_all_returning = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO public.usage_records (id, status) VALUES ('u6', 'ready') RETURNING public.usage_records.*",
+        schema,
+        &.{},
+    );
+    defer public_qualified_all_returning.deinit(alloc);
+    try std.testing.expect(public_qualified_all_returning.returning_all);
+    try std.testing.expectEqual(@as(usize, 1), public_qualified_all_returning.batch.returning_rows.len);
+    var public_qualified_all_row = try std.json.parseFromSlice(std.json.Value, alloc, public_qualified_all_returning.batch.returning_rows[0], .{});
+    defer public_qualified_all_row.deinit();
+    try std.testing.expectEqualStrings("u6", public_qualified_all_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("ready", public_qualified_all_row.value.object.get("status").?.string);
+
+    var alias_qualified_fields = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records AS u (id, status) VALUES ('u8', 'ready') RETURNING u.id, u.status AS returned_status",
+        schema,
+        &.{},
+    );
+    defer alias_qualified_fields.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", alias_qualified_fields.table_name);
+    try std.testing.expectEqual(@as(usize, 1), alias_qualified_fields.batch.returning_rows.len);
+    var alias_qualified_row = try std.json.parseFromSlice(std.json.Value, alloc, alias_qualified_fields.batch.returning_rows[0], .{});
+    defer alias_qualified_row.deinit();
+    try std.testing.expectEqualStrings("u8", alias_qualified_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("ready", alias_qualified_row.value.object.get("returned_status").?.string);
+
+    var public_qualified_fields = try lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO public.usage_records (id, status) VALUES ('u9', 'ready') RETURNING public.usage_records.id, public.usage_records.status AS returned_status",
+        schema,
+        &.{},
+    );
+    defer public_qualified_fields.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", public_qualified_fields.table_name);
+    try std.testing.expectEqual(@as(usize, 1), public_qualified_fields.batch.returning_rows.len);
+    var public_qualified_row = try std.json.parseFromSlice(std.json.Value, alloc, public_qualified_fields.batch.returning_rows[0], .{});
+    defer public_qualified_row.deinit();
+    try std.testing.expectEqualStrings("u9", public_qualified_row.value.object.get("id").?.string);
+    try std.testing.expectEqualStrings("ready", public_qualified_row.value.object.get("returned_status").?.string);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u7', 'ready') RETURNING other_table.*",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, status) VALUES ('u4', 'ready', 'duplicate')",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready'), ('u4', 'duplicate')",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertWithResolverForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, status) VALUES ('u4', 'ready', 'duplicate') ON CONFLICT (id) DO NOTHING",
+        schema,
+        &.{},
+        multi_conflict_resolver.resolver(),
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready') RETURNING id, id",
+        schema,
+        &.{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerInsertForTestAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u4', 'ready') RETURNING id, lower(status) AS id",
+        schema,
+        &.{},
+    ));
+}
+
 test "sql adapter lower dml lowers insert jsonb literal" {
     const alloc = std.testing.allocator;
     const schema_json =

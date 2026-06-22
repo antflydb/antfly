@@ -821,6 +821,17 @@ fn validateDerivedIndexFieldRefsValue(schema: runtime_schema_mod.TableSchema, va
             if (edge_table.object.get("type_field")) |type_field| try validateOptionalDerivedIndexFieldRefJson(schema, type_field);
             if (edge_table.object.get("weight_field")) |weight_field| try validateOptionalDerivedIndexFieldRefJson(schema, weight_field);
         }
+        if (value.object.get("artifact")) |artifact| {
+            if (artifact != .object) return error.InvalidTableIndexMetadata;
+            if (artifact.object.get("field")) |field| try validateDerivedIndexFieldRefJson(schema, field);
+        }
+        if (value.object.get("context")) |context| {
+            if (context != .object) return error.InvalidTableIndexMetadata;
+            if (context.object.get("doc_fields")) |doc_fields| {
+                if (doc_fields != .array) return error.InvalidTableIndexMetadata;
+                for (doc_fields.array.items) |field| try validateDerivedIndexFieldRefJson(schema, field);
+            }
+        }
     }
 
     if (value.object.get("enrichments")) |enrichments| {
@@ -4645,6 +4656,11 @@ test "derived index field refs validate against relational and embedded json sch
         "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"attrs.source\",\"target_field\":\"attrs.target\",\"type_field\":\"attrs.edge_type\",\"weight_field\":\"attrs.confidence\"}}",
         schema_json,
     );
+    try validateDerivedIndexFieldRefsForSchemaAlloc(
+        alloc,
+        "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\",\"format\":\"extraction_relation\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"body\",\"content_type\":\"application/json\",\"producer_json\":{\"type\":\"extractor\",\"model\":\"relations\"}},\"nodes\":{\"model\":\"document\",\"source\":\"{{ _doc.key }}\",\"target\":\"{{ _item.target.document_id }}\"},\"edge\":{\"type\":\"{{ _item.type }}\",\"weight\":\"{{ _item.confidence }}\"},\"context\":{\"doc_fields\":[\"id\"]}}",
+        schema_json,
+    );
 
     try std.testing.expectError(
         error.InvalidTableIndexMetadata,
@@ -4675,6 +4691,14 @@ test "derived index field refs validate against relational and embedded json sch
         validateDerivedIndexFieldRefsForSchemaAlloc(
             alloc,
             "{\"type\":\"graph\",\"edge_table\":{\"source_field\":\"source_doc\",\"target_field\":\"target_doc\",\"type_field\":\"missing_kind\"}}",
+            schema_json,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        validateDerivedIndexFieldRefsForSchemaAlloc(
+            alloc,
+            "{\"type\":\"graph\",\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"field\":\"missing_body\"}}",
             schema_json,
         ),
     );
@@ -5341,9 +5365,30 @@ test "metadata.schema update sql ddl applies Antfly derived indexes to table met
     try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"type\":\"graph\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"edge_policy\":\"all\"") != null);
 
-    var graph_metric = try applyRelationalSqlDdlToTableRecordAlloc(
+    var extraction_graph = try applyRelationalSqlDdlToTableRecordAlloc(
         std.testing.allocator,
         &graph.table,
+        "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all');",
+    );
+    defer extraction_graph.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, extraction_graph.table.indexes_json, "\"docs_rel_graph\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extraction_graph.table.indexes_json, "\"kind\":\"artifact\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extraction_graph.table.indexes_json, "\"artifact\":\"relations_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extraction_graph.table.indexes_json, "\"field\":\"body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, extraction_graph.table.indexes_json, "\"target\":\"{{ _item.target.document_id }}\"") != null);
+
+    try std.testing.expectError(
+        error.InvalidTableIndexMetadata,
+        applyRelationalSqlDdlToTableRecordAlloc(
+            std.testing.allocator,
+            &extraction_graph.table,
+            "CREATE GRAPH INDEX docs_bad_rel_graph ON docs SOURCE ENRICHMENT bad_relations FROM missing_body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id;",
+        ),
+    );
+
+    var graph_metric = try applyRelationalSqlDdlToTableRecordAlloc(
+        std.testing.allocator,
+        &extraction_graph.table,
         "CREATE INDEX docs_graph_pagerank ON docs USING antfly_graph_metric () WITH (graph_index = 'docs_graph', metric = 'pagerank');",
     );
     defer graph_metric.deinit(std.testing.allocator);

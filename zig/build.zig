@@ -3889,6 +3889,8 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml lowers excluded explicit default values",
             "sql adapter lower dml lowers conflict update explicit default values",
             "sql adapter lower dml lowers cross-column excluded conflict values",
+            "sql adapter lower dml lowers uuid generation insert values",
+            "sql adapter lower dml lowers insert values returning into row batch",
             "sql adapter lower dml lowers insert jsonb literal",
             "sql adapter lower dml lowers jsonb_build_object insert values",
             "sql adapter lower dml lowers convert_from jsonb insert values",

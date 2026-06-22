@@ -7667,7 +7667,9 @@ Current implementation status:
 
 - SQL DDL parsing covers `antfly_full_text`, external `hnsw`, managed
   `antfly_aknn`, `antfly_algebraic`, explicit edge-table `antfly_graph`, the
-  first-class `CREATE GRAPH INDEX ... EDGE (...)` form, first-class
+  first-class `CREATE GRAPH INDEX ... EDGE (...)` form,
+  extraction-backed `CREATE GRAPH INDEX ... SOURCE ENRICHMENT ... EDGES ...`
+  graph manifests, first-class
   `ALTER GRAPH INDEX ... ADD METRIC ... USING ...` graph metric attachment, the
   lower-level compatibility `antfly_graph_metric` form, and `antfly_hybrid`
   configs.
@@ -7683,10 +7685,12 @@ Current implementation status:
   configs must reference existing index configs, and drops are rejected when
   another derived index would be left with a dangling `graph_index` or
   `sources` reference.
-- Remaining production work is to add extraction-based graph indexes from
-  enrichment output and connect managed AKNN/graph builds all the way through
-  durable job scheduling, readiness, generation publish, and distributed
-  recovery.
+- Extraction-backed graph DDL stores the existing graph artifact-source manifest
+  shape (`source.kind = artifact`, shorthand asset enrichment, node/edge
+  templates) and validates the committed row source field before catalog write.
+- Remaining production work is to connect extraction materialization and managed
+  AKNN/graph builds all the way through durable job scheduling, readiness,
+  generation publish, and distributed recovery.
 
 ### Query and movement invariants
 
