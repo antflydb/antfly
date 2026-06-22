@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "c6dced88268827c3d12a5b7c07417f819f0c058b27561efc8b3d55ed130f2dd8",
-  "source_entry_count": 1026,
-  "entry_count": 1026,
+  "source_sha256": "edbe137528fe19626f3944aaf628560104195aa240f0dbb014327c5f9bdc2838",
+  "source_entry_count": 1025,
+  "entry_count": 1025,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -4439,13 +4439,6 @@
       },
       "plan": "ddl:create_function:name=audit_perform_arg_body:args=0:replace=false:returns=trigger:language=plpgsql:body=plpgsql_trigger:hook=trigger_return_new:perform=1:perform=audit_log:perform_args=1:arg=1",
       "sql": "CREATE FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(1); RETURN NEW; END$$"
-    },
-    {
-      "name": "unsupported create function routine option",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=routine_option_plan",
-      "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support"
     },
     {
       "name": "drop function catalog ddl",

@@ -682,7 +682,6 @@
     "unsupported_ddl",
     "unsupported_ddl_copy_unsupported_options",
     "unsupported_ddl_copy_wrong_stream_endpoint",
-    "unsupported_ddl_routine_option",
     "unsupported_insert",
     "unsupported_read",
     "unsupported_read_aggregate_duplicate_output_name",

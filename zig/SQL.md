@@ -292,7 +292,8 @@ Current implementation status:
   span. DDL lowering, catalog-apply test lowering, read statement dispatch, and
   write statement dispatch now use that shared wrapper as the top-level SQL
   object. `ParsedSql` owns a typed `ParsedStatement` union with read, write,
-  DDL, EXPLAIN, transaction, and session variants, and read/write lowerer
+  DDL, EXPLAIN, transaction, and session variants. `ParsedExplainStatement`
+  owns EXPLAIN options plus the nested subject token range, and read/write lowerer
   dispatch now routes from that parsed statement view instead of reaching back
   into tokenization metadata. Read, write, catalog-backed read/write, EXPLAIN,
   and relation population lowering callbacks consume borrowed `ParsedSql`. `EXPLAIN`,

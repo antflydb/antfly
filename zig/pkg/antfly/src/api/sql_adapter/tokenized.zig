@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const ast = @import("ast.zig");
 const classifier = @import("classifier.zig");
 const lexer = @import("lexer.zig");
 const token_mod = @import("token.zig");
@@ -54,6 +55,17 @@ pub const ParsedDdlStatement = struct {
 
 pub const ParsedExplainStatement = struct {
     raw: RawSqlStatement,
+    analyze: bool = false,
+    format: ast.SqlExplainFormat = .text,
+    verbose: bool = false,
+    costs: bool = true,
+    buffers: bool = false,
+    timing: bool = true,
+    summary: bool = true,
+    settings: bool = false,
+    wal: bool = false,
+    inner_token_start: ?usize = null,
+    inner_token_end: ?usize = null,
 };
 
 pub const ParsedTransactionStatement = struct {
@@ -251,10 +263,105 @@ fn parseStatement(raw_statement: RawSqlStatement, tokenized_sql: *const Tokenize
 
 fn classifyDdlLikeStatement(raw_statement: RawSqlStatement, tokens: []const Token) ParsedStatement {
     if (tokens.len == 0 or tokens[0].kind != .identifier) return .{ .unknown = raw_statement };
-    if (tokens[0].isKeyword(.explain)) return .{ .explain = .{ .raw = raw_statement } };
+    if (tokens[0].isKeyword(.explain)) return .{ .explain = parseExplainStatement(raw_statement, tokens) catch .{ .raw = raw_statement } };
     if (tokens[0].isKeyword(.begin)) return .{ .transaction = .{ .raw = raw_statement } };
     if (tokens[0].isKeyword(.set)) return .{ .session = .{ .raw = raw_statement } };
     return .{ .ddl = .{ .raw = raw_statement } };
+}
+
+fn parseExplainStatement(raw_statement: RawSqlStatement, tokens: []const Token) !ParsedExplainStatement {
+    var index = raw_statement.token_start;
+    if (!matchKeyword(tokens, &index, raw_statement.token_end, "explain")) return error.UnsupportedSqlShape;
+    if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
+
+    var statement = ParsedExplainStatement{ .raw = raw_statement };
+    if (matchToken(tokens, &index, raw_statement.token_end, .lparen)) {
+        try parseExplainOptions(tokens, &index, raw_statement.token_end, &statement);
+        if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
+    }
+
+    if (matchKeyword(tokens, &index, raw_statement.token_end, "analyze")) {
+        statement.analyze = true;
+        if (index >= raw_statement.token_end) return error.UnsupportedSqlShape;
+    }
+
+    statement.inner_token_start = index;
+    statement.inner_token_end = raw_statement.token_end;
+    return statement;
+}
+
+fn parseExplainOptions(
+    tokens: []const Token,
+    index: *usize,
+    end: usize,
+    statement: *ParsedExplainStatement,
+) !void {
+    while (true) {
+        if (index.* >= end) return error.UnsupportedSqlShape;
+        if (matchKeyword(tokens, index, end, "format")) {
+            if (matchKeyword(tokens, index, end, "json")) {
+                statement.format = .json;
+            } else if (matchKeyword(tokens, index, end, "text")) {
+                statement.format = .text;
+            } else {
+                return error.UnsupportedSqlShape;
+            }
+        } else if (matchKeyword(tokens, index, end, "verbose")) {
+            statement.verbose = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "costs")) {
+            statement.costs = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "analyze")) {
+            statement.analyze = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "buffers")) {
+            statement.buffers = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "timing")) {
+            statement.timing = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "summary")) {
+            statement.summary = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "settings")) {
+            statement.settings = parseOptionalExplainBool(tokens, index, end, true);
+        } else if (matchKeyword(tokens, index, end, "wal")) {
+            statement.wal = parseOptionalExplainBool(tokens, index, end, true);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+
+        if (matchToken(tokens, index, end, .comma)) continue;
+        if (matchToken(tokens, index, end, .rparen)) return;
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn parseOptionalExplainBool(tokens: []const Token, index: *usize, end: usize, default_value: bool) bool {
+    const before = index.*;
+    if (matchKeyword(tokens, index, end, "true") or
+        matchKeyword(tokens, index, end, "on") or
+        matchKeyword(tokens, index, end, "yes"))
+    {
+        return true;
+    }
+    index.* = before;
+    if (matchKeyword(tokens, index, end, "false") or
+        matchKeyword(tokens, index, end, "off") or
+        matchKeyword(tokens, index, end, "no"))
+    {
+        return false;
+    }
+    index.* = before;
+    return default_value;
+}
+
+fn matchKeyword(tokens: []const Token, index: *usize, end: usize, keyword: []const u8) bool {
+    if (index.* >= end or index.* >= tokens.len) return false;
+    if (!tokens[index.*].matchesKeyword(keyword)) return false;
+    index.* += 1;
+    return true;
+}
+
+fn matchToken(tokens: []const Token, index: *usize, end: usize, kind: token_mod.TokenKind) bool {
+    if (index.* >= end or index.* >= tokens.len or tokens[index.*].kind != kind) return false;
+    index.* += 1;
+    return true;
 }
 
 fn cloneTokensAlloc(alloc: std.mem.Allocator, source_tokens: []const Token) !std.ArrayListUnmanaged(Token) {
@@ -429,7 +536,32 @@ test "sql adapter parsed sql owns typed statement variants" {
     var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN SELECT id FROM usage_records");
     defer explain.deinit(alloc);
     switch (explain.statement) {
-        .explain => |statement| try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records", statement.raw.sql(explain.sql())),
+        .explain => |statement| {
+            try std.testing.expectEqualStrings("EXPLAIN SELECT id FROM usage_records", statement.raw.sql(explain.sql()));
+            try std.testing.expect(!statement.analyze);
+            try std.testing.expectEqual(ast.SqlExplainFormat.text, statement.format);
+            try std.testing.expectEqual(@as(?usize, 1), statement.inner_token_start);
+            try std.testing.expectEqual(@as(?usize, 5), statement.inner_token_end);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var explain_options = try ParsedSql.initAlloc(alloc, "EXPLAIN (FORMAT JSON, VERBOSE, COSTS OFF, ANALYZE ON, BUFFERS, TIMING OFF, SUMMARY OFF, SETTINGS ON, WAL) SELECT id FROM usage_records");
+    defer explain_options.deinit(alloc);
+    switch (explain_options.statement) {
+        .explain => |statement| {
+            try std.testing.expect(statement.analyze);
+            try std.testing.expectEqual(ast.SqlExplainFormat.json, statement.format);
+            try std.testing.expect(statement.verbose);
+            try std.testing.expect(!statement.costs);
+            try std.testing.expect(statement.buffers);
+            try std.testing.expect(!statement.timing);
+            try std.testing.expect(!statement.summary);
+            try std.testing.expect(statement.settings);
+            try std.testing.expect(statement.wal);
+            try std.testing.expect(statement.inner_token_start != null);
+            try std.testing.expect(statement.inner_token_end != null);
+        },
         else => return error.TestUnexpectedResult,
     }
 

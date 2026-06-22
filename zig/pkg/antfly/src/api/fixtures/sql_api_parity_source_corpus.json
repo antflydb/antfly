@@ -4853,13 +4853,6 @@
       "sql": "CREATE FUNCTION audit_perform_arg_body() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN PERFORM audit_log(1); RETURN NEW; END$$"
     },
     {
-      "name": "unsupported create function routine option",
-      "family": "unsupported_ddl",
-      "plan": "unsupported:ddl:requires=routine_option_plan",
-      "classification_reason": "routine_option_plan",
-      "sql": "CREATE FUNCTION stable_audit() RETURNS trigger LANGUAGE plpgsql SUPPORT audit_support SUPPORT audit_support"
-    },
-    {
       "name": "drop function catalog ddl",
       "family": "ddl",
       "summary": {

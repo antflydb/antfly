@@ -5554,22 +5554,29 @@ import cannot bypass supported before-insert hooks. The model also admits the
 side-effect-free PL/pgSQL procedure body `BEGIN NULL; END` as a
 `plpgsql_procedure` / `procedure_noop` hook, plus the same benign `RAISE NOTICE
 'literal';` and safe zero-argument `PERFORM function_name();` prefix statements
-allowed for trigger bodies. `CALL procedure_name()` executes that hook through
-the routine runtime after catalog recovery; the hook is still intentionally not
-executable through the expression-function path. Other PL/pgSQL bodies,
-including argument-bearing `PERFORM`, dynamic SQL, procedural branches, loops,
-table writes, or external side effects, fail closed under `routine_body_plan`
-unless their row inputs, side effects, dependency tracking, replay behavior,
-and repair semantics have native contracts.
+allowed for trigger bodies. `PERFORM` calls may also carry scalar JSON
+arguments; the routine runtime validates and executes them against the exact
+function arity, preserves the argument JSON in catalog metadata, and rejects
+drops of referenced overloads. `CALL procedure_name()` executes that hook
+through the routine runtime after catalog recovery; the hook is still
+intentionally not executable through the expression-function path. Other
+PL/pgSQL bodies, including dynamic SQL, procedural branches, loops, table
+writes, or external side effects, fail closed under `routine_body_plan` unless
+their row inputs, side effects, dependency tracking, replay behavior, and repair
+semantics have native contracts.
 Table-schema and table-storage application still reject routine-catalog plans
 because routines are catalog/runtime objects, not schema JSON mutations.
 Routine bodies and routine options are resolved only when they lower to typed
-metadata over this safe catalog/runtime subset. Bodies or options outside that
-subset are pinned in the source parity corpus under `routine_body_plan` and
-`routine_option_plan` as deliberate fail-closed classifications, preserving the
-native mutation-hook/catalog contract: deterministic hook identity, declared row
-inputs and outputs, allowed side effects, dependency tracking, schema
-promotion, authorization hooks, replay behavior, and repair/rebuild semantics.
+metadata over this safe catalog/runtime subset. Supported options such as
+volatility, security, null-input behavior, parallel safety, support function,
+transforms, cost, rows, and settings are stored as structured routine metadata;
+duplicate or malformed options fail during parsing rather than becoming opaque
+catalog text. Bodies outside the safe subset remain pinned in the source parity
+corpus under `routine_body_plan` as deliberate fail-closed classifications,
+preserving the native mutation-hook/catalog contract: deterministic hook
+identity, declared row inputs and outputs, allowed side effects, dependency
+tracking, schema promotion, authorization hooks, replay behavior, and
+repair/rebuild semantics.
 Storage should never execute or persist opaque PL/pgSQL bodies as part of the
 relational model.
 

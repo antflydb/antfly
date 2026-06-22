@@ -126,7 +126,9 @@
     {
       "reason": "routine_option_plan",
       "coverage": [
-        "unsupported_ddl_routine_option"
+        "ddl_function_setting",
+        "ddl_function_support",
+        "ddl_function_transform"
       ]
     },
     {

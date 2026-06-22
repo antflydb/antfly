@@ -2235,7 +2235,7 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
 ) !LoweredRelationPopulationPlan {
     var parsed = try grammar.parseRelationPopulationTokensAlloc(
         alloc,
-        parsed_sql.statementSql(),
+        parsed_sql.sql(),
         parsed_sql.items()[parsed_sql.raw_statement.token_start..parsed_sql.raw_statement.token_end],
     );
     defer parsed.deinit(alloc);
@@ -2320,22 +2320,26 @@ pub fn lowerExplainPlanWithParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     hooks: ExplainPlanLoweringHooks,
 ) !LoweredExplainPlan {
-    const statement_tokens = parsed_sql.items()[parsed_sql.raw_statement.token_start..parsed_sql.raw_statement.token_end];
-    const parsed = try grammar.parseExplainPrefixTokens(parsed_sql.sql(), statement_tokens);
+    const parsed = switch (parsed_sql.statement) {
+        .explain => |statement| statement,
+        else => return error.UnsupportedSqlShape,
+    };
     return try lowerExplainPlanWithParsedPrefixAlloc(alloc, parsed_sql, parsed, hooks);
 }
 
 fn lowerExplainPlanWithParsedPrefixAlloc(
     alloc: std.mem.Allocator,
     parent_sql: *const tokenized.ParsedSql,
-    parsed: ast.SqlExplainPrefix,
+    parsed: tokenized.ParsedExplainStatement,
     hooks: ExplainPlanLoweringHooks,
 ) !LoweredExplainPlan {
+    const inner_start = parsed.inner_token_start orelse return error.UnsupportedSqlShape;
+    const inner_end = parsed.inner_token_end orelse return error.UnsupportedSqlShape;
     var inner_sql = try tokenized.ParsedSql.initChildStatementAlloc(
         alloc,
         parent_sql,
-        parsed.inner_token_start,
-        parsed.inner_token_end,
+        inner_start,
+        inner_end,
     );
     defer inner_sql.deinit(alloc);
 
