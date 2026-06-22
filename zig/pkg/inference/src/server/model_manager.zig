@@ -1139,9 +1139,23 @@ fn effectiveLoadBackends(
 
     var idx: usize = 0;
     for (preferred_backends) |backend| {
+        if (backend == .native) {
+            scratch[idx] = backend;
+            idx += 1;
+        }
+    }
+    for (preferred_backends) |backend| {
+        if (backend == .native) continue;
+        if (backend.usesGpuHostedSession()) continue;
         if (backend == .onnx) continue;
         scratch[idx] = backend;
         idx += 1;
+    }
+    for (preferred_backends) |backend| {
+        if (backend.usesGpuHostedSession()) {
+            scratch[idx] = backend;
+            idx += 1;
+        }
     }
     for (preferred_backends) |backend| {
         if (backend == .onnx) {
@@ -1218,6 +1232,20 @@ test "model manager backend clones preserve explicit graph runtime" {
     const cloned = sessionManagerForPreferredBackends(std.testing.allocator, preferred[0..], &source);
     try std.testing.expectEqual(source.graph_runtime_strategy, cloned.graph_runtime_strategy);
     try std.testing.expectEqualSlices(backends.BackendType, preferred[0..], cloned.preferred_backends);
+}
+
+test "effectiveLoadBackends puts native before gpu for native-preferred manifests" {
+    const allocator = std.testing.allocator;
+    var man = manifest_mod.ModelManifest{ .allocator = allocator, .native_arch_hint = .florence };
+    defer man.deinit();
+    man.gguf_path = try allocator.dupe(u8, "model.gguf");
+
+    const preferred = [_]backends.BackendType{ .metal, .native, .onnx };
+    var scratch: [7]backends.BackendType = undefined;
+    const effective = effectiveLoadBackends(&scratch, preferred[0..], man);
+
+    const expected = [_]backends.BackendType{ .native, .metal, .onnx };
+    try std.testing.expectEqualSlices(backends.BackendType, expected[0..], effective);
 }
 
 test "preferredModelPathForBackend keeps metal/native on model directory when native assets exist" {
