@@ -69,8 +69,24 @@ typedef struct antfly_buffer {
 #define ANTFLY_LITE_OPEN_MODE_READONLY 1u
 #define ANTFLY_LITE_OPEN_MODE_STATUS_ONLY 2u
 
+#define ANTFLY_OPEN_MODE_WRITER 0u
+#define ANTFLY_OPEN_MODE_READONLY 1u
+#define ANTFLY_OPEN_MODE_STATUS_ONLY 2u
+
+#define ANTFLY_STORAGE_KIND_DIRECTORY 0u
+#define ANTFLY_STORAGE_KIND_LITE 1u
+
+#define ANTFLY_PROFILE_NATIVE 0u
+#define ANTFLY_PROFILE_HOSTED 1u
+
 #define ANTFLY_LITE_PROFILE_NATIVE 0u
 #define ANTFLY_LITE_PROFILE_HOSTED 1u
+
+#define ANTFLY_OPEN_FLAG_NO_SYNC (1u << 0)
+#define ANTFLY_OPEN_FLAG_TTL_CLEANUP (1u << 1)
+#define ANTFLY_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED (1u << 2)
+#define ANTFLY_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED (1u << 3)
+#define ANTFLY_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY (1u << 4)
 
 #define ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_OR_DISABLED "caller_supplied_or_disabled"
 #define ANTFLY_LITE_INFERENCE_MODE_CALLER_SUPPLIED_ARTIFACTS "caller_supplied_artifacts"
@@ -84,6 +100,24 @@ typedef struct antfly_buffer {
 #define ANTFLY_LITE_OPEN_FLAG_REMOTE_PROVIDER_CONFIGURED (1u << 2)
 #define ANTFLY_LITE_OPEN_FLAG_LOCAL_RUNTIME_CONFIGURED (1u << 3)
 #define ANTFLY_LITE_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY (1u << 4)
+
+typedef struct antfly_open_options {
+    uint32_t abi_size;
+    uint32_t storage_kind;
+    uint32_t open_mode;
+    uint32_t profile;
+    uint32_t flags;
+    uint32_t reserved0;
+    uint64_t map_size;
+    bool ttl_cleanup_enabled;
+    bool ttl_cleanup_lease_owned;
+    uint32_t ttl_cleanup_batch_size;
+    antfly_slice ttl_cleanup_owner_id;
+    uint64_t ttl_cleanup_lease_ttl_ms;
+    uint64_t ttl_cleanup_interval_ms;
+    uint64_t ttl_cleanup_grace_period_ns;
+    uint64_t reserved[8];
+} antfly_open_options;
 
 typedef struct antfly_lite_open_options {
     uint32_t abi_size;
@@ -213,10 +247,30 @@ typedef struct antfly_scan_hash_result {
 
 uint32_t antfly_abi_version(void);
 uint32_t antfly_lite_abi_version(void);
+uint32_t antfly_open_options_size(void);
 uint32_t antfly_lite_open_options_size(void);
 const char *antfly_error_code_name(antfly_error_code code);
 const char *antfly_error_code_description(antfly_error_code code);
+antfly_error_code antfly_open_options_init(antfly_open_options *options);
 antfly_error_code antfly_lite_open_options_init(antfly_lite_open_options *options);
+
+/*
+ * Storage-neutral embedded opens. ANTFLY_STORAGE_KIND_DIRECTORY opens a normal
+ * single-node Antfly directory. ANTFLY_STORAGE_KIND_LITE opens a v1 .aflite
+ * single-file database. The antfly_lite_* helpers below are convenience
+ * wrappers over ANTFLY_STORAGE_KIND_LITE.
+ */
+antfly_error_code antfly_db_open(const char *path, void **out_handle);
+antfly_error_code antfly_db_open_with_options(
+    const char *path,
+    const antfly_open_options *options,
+    void **out_handle
+);
+antfly_error_code antfly_db_create_with_options(
+    const char *path,
+    const antfly_open_options *options,
+    void **out_handle
+);
 
 /*
  * antfly_lite_create* creates a new v1 .aflite database. antfly_lite_open*

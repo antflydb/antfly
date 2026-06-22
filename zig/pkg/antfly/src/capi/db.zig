@@ -1591,15 +1591,18 @@ const JsonGraphNode = struct {
     }
 };
 
-pub export fn antfly_db_open(path: [*:0]const u8, out_handle: *?*anyopaque) capi.ErrorCode {
+pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
     const alloc = std.heap.c_allocator;
     const handle = alloc.create(Handle) catch return .internal;
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, std.mem.span(path), .{}) catch |err| return capi.mapError(err),
+        .db = db_mod.DB.open(alloc, path_slice, .{}) catch |err| return capi.mapError(err),
     };
-    out_handle.* = handle;
+    out.* = handle;
     return .ok;
 }
 
@@ -1620,6 +1623,10 @@ pub export fn antfly_lite_open_options_size() u32 {
     return @intCast(@sizeOf(capi.LiteOpenOptions));
 }
 
+pub export fn antfly_open_options_size() u32 {
+    return @intCast(@sizeOf(capi.OpenOptions));
+}
+
 pub export fn antfly_error_code_name(code: c_int) [*:0]const u8 {
     return capi.errorCodeName(code);
 }
@@ -1634,13 +1641,31 @@ pub export fn antfly_lite_open_options_init(options: ?*capi.LiteOpenOptions) cap
     return .ok;
 }
 
+pub export fn antfly_open_options_init(options: ?*capi.OpenOptions) capi.ErrorCode {
+    const opts = options orelse return .invalid_argument;
+    opts.* = .{};
+    return .ok;
+}
+
 const lite_open_known_flags = capi.lite_open_flag_no_sync |
     capi.lite_open_flag_ttl_cleanup |
     capi.lite_open_flag_remote_provider_configured |
     capi.lite_open_flag_local_runtime_configured |
     capi.lite_open_flag_generated_enrichment_replay;
 
+const open_known_flags = capi.open_flag_no_sync |
+    capi.open_flag_ttl_cleanup |
+    capi.open_flag_remote_provider_configured |
+    capi.open_flag_local_runtime_configured |
+    capi.open_flag_generated_enrichment_replay;
+
+const StorageKind = enum {
+    directory,
+    lite,
+};
+
 const LiteResolvedOpenOptions = struct {
+    storage_kind: StorageKind = .lite,
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     profile: lite_backend.Profile = .native,
     map_size: ?usize = null,
@@ -1650,65 +1675,190 @@ const LiteResolvedOpenOptions = struct {
     generated_enrichment_replay: bool = false,
 };
 
-fn validateLiteOpenOptionsReserved(options: *const capi.LiteOpenOptions) !void {
-    for (options.reserved) |word| {
+fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
+    return @TypeOf(@field(@as(Options, .{}), field_name));
+}
+
+fn optionHasField(comptime Options: type, comptime field_name: []const u8) bool {
+    inline for (std.meta.fields(Options)) |field| {
+        if (std.mem.eql(u8, field.name, field_name)) return true;
+    }
+    return false;
+}
+
+fn optionFieldPresent(comptime Options: type, abi_size: u32, comptime field_name: []const u8) bool {
+    const Field = optionFieldType(Options, field_name);
+    const offset = @offsetOf(Options, field_name);
+    return abi_size >= offset + @sizeOf(Field);
+}
+
+fn readOptionField(
+    comptime Options: type,
+    options: *const Options,
+    abi_size: u32,
+    comptime field_name: []const u8,
+) ?optionFieldType(Options, field_name) {
+    const Field = optionFieldType(Options, field_name);
+    const offset = @offsetOf(Options, field_name);
+    if (abi_size < offset + @sizeOf(Field)) return null;
+    const raw: [*]const u8 = @ptrCast(options);
+    return std.mem.bytesAsValue(Field, raw[offset..][0..@sizeOf(Field)]).*;
+}
+
+fn validateOpenOptionsReserved(comptime Options: type, options: *const Options, abi_size: u32) !void {
+    if (comptime optionHasField(Options, "reserved0")) {
+        if (optionFieldPresent(Options, abi_size, "reserved0")) {
+            if (readOptionField(Options, options, abi_size, "reserved0").? != 0) return error.InvalidArgument;
+        }
+    }
+    if (comptime !optionHasField(Options, "reserved")) {
+        return;
+    }
+    const reserved_offset = @offsetOf(Options, "reserved");
+    if (abi_size <= reserved_offset) return;
+    const available = @min(@as(usize, abi_size) - reserved_offset, @sizeOf(optionFieldType(Options, "reserved")));
+    if (available % @sizeOf(u64) != 0) return error.InvalidArgument;
+    const raw: [*]const u8 = @ptrCast(options);
+    var offset: usize = reserved_offset;
+    var remaining = available;
+    while (remaining >= @sizeOf(u64)) : ({
+        offset += @sizeOf(u64);
+        remaining -= @sizeOf(u64);
+    }) {
+        const word = std.mem.bytesAsValue(u64, raw[offset..][0..@sizeOf(u64)]).*;
         if (word != 0) return error.InvalidArgument;
+    }
+}
+
+fn openModeFromU32(value: u32) !db_mod.OpenOptions.OpenMode {
+    return switch (value) {
+        0 => .writer,
+        1 => .query_readonly,
+        2 => .status_only,
+        else => return error.InvalidArgument,
+    };
+}
+
+fn profileFromU32(value: u32) !lite_backend.Profile {
+    return switch (value) {
+        0 => .native,
+        1 => .hosted,
+        else => return error.InvalidArgument,
+    };
+}
+
+fn validateResolvedOpenOptions(resolved: LiteResolvedOpenOptions) !void {
+    if (resolved.profile == .hosted and resolved.ttl_cleanup != null) {
+        return error.InvalidArgument;
+    }
+    if (resolved.profile == .hosted and resolved.generated_enrichment_replay) {
+        return error.InvalidArgument;
     }
 }
 
 fn resolveLiteOpenOptions(options_ptr: ?*const capi.LiteOpenOptions) !LiteResolvedOpenOptions {
     const options = options_ptr orelse return .{};
-    if (options.abi_size < @sizeOf(capi.LiteOpenOptions)) return error.InvalidArgument;
-    if ((options.flags & ~lite_open_known_flags) != 0) return error.InvalidArgument;
-    try validateLiteOpenOptionsReserved(options);
+    const abi_size = options.abi_size;
+    if (abi_size < @offsetOf(capi.LiteOpenOptions, "open_mode")) return error.InvalidArgument;
+    const flags = readOptionField(capi.LiteOpenOptions, options, abi_size, "flags") orelse 0;
+    if ((flags & ~lite_open_known_flags) != 0) return error.InvalidArgument;
+    try validateOpenOptionsReserved(capi.LiteOpenOptions, options, abi_size);
 
-    const open_mode: db_mod.OpenOptions.OpenMode = switch (options.open_mode) {
-        capi.lite_open_mode_writer => .writer,
-        capi.lite_open_mode_readonly => .query_readonly,
-        capi.lite_open_mode_status_only => .status_only,
-        else => return error.InvalidArgument,
-    };
-    const profile: lite_backend.Profile = switch (options.profile) {
-        capi.lite_profile_native => .native,
-        capi.lite_profile_hosted => .hosted,
-        else => return error.InvalidArgument,
-    };
-    if (profile == .hosted and (options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
-        return error.InvalidArgument;
-    }
-    if (profile == .hosted and (options.flags & capi.lite_open_flag_generated_enrichment_replay) != 0) {
-        return error.InvalidArgument;
-    }
-    if (options.map_size > std.math.maxInt(usize)) return error.InvalidArgument;
+    const open_mode = try openModeFromU32(readOptionField(capi.LiteOpenOptions, options, abi_size, "open_mode") orelse capi.lite_open_mode_writer);
+    const profile = try profileFromU32(readOptionField(capi.LiteOpenOptions, options, abi_size, "profile") orelse capi.lite_profile_native);
+    const map_size = readOptionField(capi.LiteOpenOptions, options, abi_size, "map_size") orelse 0;
+    if (map_size > std.math.maxInt(usize)) return error.InvalidArgument;
 
     var resolved = LiteResolvedOpenOptions{
         .open_mode = open_mode,
         .profile = profile,
-        .map_size = if (options.map_size == 0) null else @as(usize, @intCast(options.map_size)),
-        .no_sync = (options.flags & capi.lite_open_flag_no_sync) != 0,
+        .map_size = if (map_size == 0) null else @as(usize, @intCast(map_size)),
+        .no_sync = (flags & capi.lite_open_flag_no_sync) != 0,
         .inference = .{
-            .remote_provider_configured = (options.flags & capi.lite_open_flag_remote_provider_configured) != 0,
-            .local_runtime_configured = (options.flags & capi.lite_open_flag_local_runtime_configured) != 0,
+            .remote_provider_configured = (flags & capi.lite_open_flag_remote_provider_configured) != 0,
+            .local_runtime_configured = (flags & capi.lite_open_flag_local_runtime_configured) != 0,
         },
-        .generated_enrichment_replay = (options.flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
+        .generated_enrichment_replay = (flags & capi.lite_open_flag_generated_enrichment_replay) != 0,
     };
-    if ((options.flags & capi.lite_open_flag_ttl_cleanup) != 0) {
-        if (options.ttl_cleanup_owner_id.ptr == null and options.ttl_cleanup_owner_id.len != 0) {
+    if ((flags & capi.lite_open_flag_ttl_cleanup) != 0) {
+        const owner_id = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
+        if (owner_id.ptr == null and owner_id.len != 0) {
             return error.InvalidArgument;
         }
         var ttl_cfg = db_mod.ttl_runtime.Config{
-            .enabled = options.ttl_cleanup_enabled,
-            .lease_owned = options.ttl_cleanup_lease_owned,
+            .enabled = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_enabled") orelse false,
+            .lease_owned = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_lease_owned") orelse false,
         };
-        if (options.ttl_cleanup_owner_id.len != 0) {
-            ttl_cfg.owner_id = options.ttl_cleanup_owner_id.ptr.?[0..options.ttl_cleanup_owner_id.len];
+        if (owner_id.len != 0) {
+            ttl_cfg.owner_id = owner_id.ptr.?[0..owner_id.len];
         }
-        if (options.ttl_cleanup_lease_ttl_ms != 0) ttl_cfg.lease_ttl_ms = options.ttl_cleanup_lease_ttl_ms;
-        if (options.ttl_cleanup_interval_ms != 0) ttl_cfg.interval_ms = options.ttl_cleanup_interval_ms;
-        if (options.ttl_cleanup_batch_size != 0) ttl_cfg.batch_size = options.ttl_cleanup_batch_size;
-        if (options.ttl_cleanup_grace_period_ns != 0) ttl_cfg.grace_period_ns = options.ttl_cleanup_grace_period_ns;
+        const lease_ttl_ms = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_lease_ttl_ms") orelse 0;
+        const interval_ms = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_interval_ms") orelse 0;
+        const batch_size = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_batch_size") orelse 0;
+        const grace_period_ns = readOptionField(capi.LiteOpenOptions, options, abi_size, "ttl_cleanup_grace_period_ns") orelse 0;
+        if (lease_ttl_ms != 0) ttl_cfg.lease_ttl_ms = lease_ttl_ms;
+        if (interval_ms != 0) ttl_cfg.interval_ms = interval_ms;
+        if (batch_size != 0) ttl_cfg.batch_size = batch_size;
+        if (grace_period_ns != 0) ttl_cfg.grace_period_ns = grace_period_ns;
         resolved.ttl_cleanup = ttl_cfg;
     }
+    try validateResolvedOpenOptions(resolved);
+    return resolved;
+}
+
+fn resolveOpenOptions(options_ptr: ?*const capi.OpenOptions) !LiteResolvedOpenOptions {
+    const options = options_ptr orelse return .{ .storage_kind = .directory };
+    const abi_size = options.abi_size;
+    if (abi_size < @offsetOf(capi.OpenOptions, "storage_kind")) return error.InvalidArgument;
+    const flags = readOptionField(capi.OpenOptions, options, abi_size, "flags") orelse 0;
+    if ((flags & ~open_known_flags) != 0) return error.InvalidArgument;
+    try validateOpenOptionsReserved(capi.OpenOptions, options, abi_size);
+
+    const storage_kind: StorageKind = switch (readOptionField(capi.OpenOptions, options, abi_size, "storage_kind") orelse capi.storage_kind_directory) {
+        capi.storage_kind_directory => .directory,
+        capi.storage_kind_lite => .lite,
+        else => return error.InvalidArgument,
+    };
+    const open_mode = try openModeFromU32(readOptionField(capi.OpenOptions, options, abi_size, "open_mode") orelse capi.open_mode_writer);
+    const profile = try profileFromU32(readOptionField(capi.OpenOptions, options, abi_size, "profile") orelse capi.profile_native);
+    const map_size = readOptionField(capi.OpenOptions, options, abi_size, "map_size") orelse 0;
+    if (map_size > std.math.maxInt(usize)) return error.InvalidArgument;
+
+    var resolved = LiteResolvedOpenOptions{
+        .storage_kind = storage_kind,
+        .open_mode = open_mode,
+        .profile = profile,
+        .map_size = if (map_size == 0) null else @as(usize, @intCast(map_size)),
+        .no_sync = (flags & capi.open_flag_no_sync) != 0,
+        .inference = .{
+            .remote_provider_configured = (flags & capi.open_flag_remote_provider_configured) != 0,
+            .local_runtime_configured = (flags & capi.open_flag_local_runtime_configured) != 0,
+        },
+        .generated_enrichment_replay = (flags & capi.open_flag_generated_enrichment_replay) != 0,
+    };
+    if ((flags & capi.open_flag_ttl_cleanup) != 0) {
+        const owner_id = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_owner_id") orelse capi.Slice{};
+        if (owner_id.ptr == null and owner_id.len != 0) {
+            return error.InvalidArgument;
+        }
+        var ttl_cfg = db_mod.ttl_runtime.Config{
+            .enabled = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_enabled") orelse false,
+            .lease_owned = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_lease_owned") orelse false,
+        };
+        if (owner_id.len != 0) {
+            ttl_cfg.owner_id = owner_id.ptr.?[0..owner_id.len];
+        }
+        const lease_ttl_ms = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_lease_ttl_ms") orelse 0;
+        const interval_ms = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_interval_ms") orelse 0;
+        const batch_size = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_batch_size") orelse 0;
+        const grace_period_ns = readOptionField(capi.OpenOptions, options, abi_size, "ttl_cleanup_grace_period_ns") orelse 0;
+        if (lease_ttl_ms != 0) ttl_cfg.lease_ttl_ms = lease_ttl_ms;
+        if (interval_ms != 0) ttl_cfg.interval_ms = interval_ms;
+        if (batch_size != 0) ttl_cfg.batch_size = batch_size;
+        if (grace_period_ns != 0) ttl_cfg.grace_period_ns = grace_period_ns;
+        resolved.ttl_cleanup = ttl_cfg;
+    }
+    try validateResolvedOpenOptions(resolved);
     return resolved;
 }
 
@@ -1769,9 +1919,81 @@ fn openLiteHandle(
     return .ok;
 }
 
+fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) db_mod.OpenOptions {
+    var opts = db_mod.OpenOptions{
+        .open_mode = resolved.open_mode,
+        .external_derived_checkpoints = !lite,
+    };
+    if (resolved.map_size) |map_size| opts.map_size = map_size;
+    opts.no_sync = resolved.no_sync;
+    if (resolved.ttl_cleanup) |ttl_cleanup| opts.ttl_cleanup = ttl_cleanup;
+    if (resolved.generated_enrichment_replay) {
+        opts.enrichment = .{ .enable_without_producers = true };
+    }
+    if (resolved.profile == .hosted) {
+        opts.executor = .{ .backend = .manual };
+        opts.ttl_cleanup = .{ .enabled = false };
+        opts.transaction_recovery = .{ .enabled = false };
+        opts.text_merge = .{ .enabled = false };
+        opts.sparse_compaction = .{ .enabled = false };
+    }
+    return opts;
+}
+
+fn openDirectoryHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    if (create and !liteOpenModeCanWrite(resolved.open_mode)) return .invalid_argument;
+    const alloc = std.heap.c_allocator;
+    const handle = alloc.create(Handle) catch return .internal;
+    errdefer alloc.destroy(handle);
+
+    const db = db_mod.DB.open(alloc, path, dbOpenOptionsFromResolved(resolved, false)) catch |err| return capi.mapError(err);
+    handle.* = .{
+        .alloc = alloc,
+        .db = db,
+        .open_mode = resolved.open_mode,
+    };
+    out.* = handle;
+    return .ok;
+}
+
+fn openGenericHandle(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+    out_handle: ?*?*anyopaque,
+) capi.ErrorCode {
+    return switch (resolved.storage_kind) {
+        .directory => openDirectoryHandle(path, resolved, create, out_handle),
+        .lite => openLiteHandle(path, resolved, create, out_handle),
+    };
+}
+
 fn cStringSpan(path: ?[*:0]const u8) ?[]const u8 {
     const ptr = path orelse return null;
     return std.mem.span(ptr);
+}
+
+pub export fn antfly_db_open_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
+    return openGenericHandle(path_slice, resolved, false, out);
+}
+
+pub export fn antfly_db_create_with_options(path: ?[*:0]const u8, options: ?*const capi.OpenOptions, out_handle: ?*?*anyopaque) capi.ErrorCode {
+    const out = out_handle orelse return .invalid_argument;
+    out.* = null;
+    const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const resolved = resolveOpenOptions(options) catch |err| return capi.mapError(err);
+    return openGenericHandle(path_slice, resolved, true, out);
 }
 
 pub export fn antfly_lite_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) capi.ErrorCode {
@@ -7316,6 +7538,26 @@ test "capi lite open options validate and configure ttl cleanup" {
 
     try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(capi.LiteOpenOptions))), antfly_lite_open_options_size());
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_lite_open_options_init(null));
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(capi.OpenOptions))), antfly_open_options_size());
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_open_options_init(null));
+
+    var generic_defaults = capi.OpenOptions{
+        .abi_size = 0,
+        .storage_kind = 99,
+        .open_mode = 99,
+        .profile = 99,
+        .flags = std.math.maxInt(u32),
+        .reserved0 = 1,
+        .reserved = .{1} ** 8,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
+    try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
+    try std.testing.expectEqual(capi.storage_kind_directory, generic_defaults.storage_kind);
+    try std.testing.expectEqual(capi.open_mode_writer, generic_defaults.open_mode);
+    try std.testing.expectEqual(capi.profile_native, generic_defaults.profile);
+    try std.testing.expectEqual(@as(u32, 0), generic_defaults.flags);
+    try std.testing.expectEqual(@as(u32, 0), generic_defaults.reserved0);
+    for (generic_defaults.reserved) |word| try std.testing.expectEqual(@as(u64, 0), word);
 
     var defaults = capi.LiteOpenOptions{
         .abi_size = 0,
@@ -7344,6 +7586,56 @@ test "capi lite open options validate and configure ttl cleanup" {
     antfly_db_close(default_handle);
     default_handle = null;
     cleanupTestFile(path);
+
+    var prefix_lite_options = capi.LiteOpenOptions{
+        .abi_size = @offsetOf(capi.LiteOpenOptions, "flags"),
+        .open_mode = capi.lite_open_mode_readonly,
+        .profile = capi.lite_profile_native,
+        .flags = std.math.maxInt(u32),
+        .reserved = .{1} ** 8,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create_with_options(path, &defaults, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open_with_options(path, &prefix_lite_options, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    cleanupTestFile(path);
+
+    var generic_lite_options = capi.OpenOptions{
+        .storage_kind = capi.storage_kind_lite,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &generic_lite_options, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    generic_lite_options.open_mode = capi.open_mode_readonly;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &generic_lite_options, &default_handle));
+    antfly_db_close(default_handle);
+    default_handle = null;
+    cleanupTestFile(path);
+
+    const dir_path = try tempTestPath(alloc, "capi-generic-directory-open");
+    defer alloc.free(dir_path);
+    cleanupTestDir(dir_path);
+    defer cleanupTestDir(dir_path);
+    var directory_handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dir_path, &generic_defaults, &directory_handle));
+    const generic_writes = [_]capi.WriteIntent{.{
+        .key = .{ .ptr = "doc:generic", .len = "doc:generic".len },
+        .value = .{ .ptr = "{\"title\":\"generic\"}", .len = "{\"title\":\"generic\"}".len },
+        .is_delete = false,
+    }};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(directory_handle, &generic_writes, generic_writes.len, null, 0, 1_000, 0));
+    antfly_db_close(directory_handle);
+    directory_handle = null;
+    var generic_readonly = capi.OpenOptions{
+        .storage_kind = capi.storage_kind_directory,
+        .open_mode = capi.open_mode_readonly,
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(dir_path, &generic_readonly, &directory_handle));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_batch(directory_handle, &generic_writes, generic_writes.len, null, 0, 2_000, 0));
+    antfly_db_close(directory_handle);
+    directory_handle = null;
 
     var sentinel: u8 = 0;
     var invalid_handle: ?*anyopaque = &sentinel;

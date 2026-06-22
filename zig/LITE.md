@@ -141,11 +141,11 @@ The library API should be small and boring:
 - restore/import
 - integrity check
 
-`libantfly` should be the long-term stable C ABI boundary. Antfly Lite should
-not have a separate independently-versioned ABI; `.aflite` is a storage/open
-mode and Lite-specific status, backup, restore, check, and maintenance helpers
-are convenience entrypoints in the same `libantfly` ABI. Native Zig, Go, Rust,
-Python, Node, and Java bindings can layer on top of that common boundary.
+`libantfly` should be the long-term stable C ABI boundary. The storage-neutral
+open surface, ABI evolution rules, and read-only backend contract live in
+[`CAPI.md`](CAPI.md). Antfly Lite should not have a separate
+independently-versioned ABI; `.aflite` is a storage/open mode and the
+`antfly_lite_*` names are convenience entrypoints in the same `libantfly` ABI.
 
 The C ABI should expose a single Lite status JSON call that mirrors
 `antfly lite status`: storage identity, DB stats, pending work, and capability

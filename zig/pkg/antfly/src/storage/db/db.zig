@@ -2517,6 +2517,7 @@ const PrimaryStoreOpenPlan = union(enum) {
     lmdb: struct {
         map_size: usize,
         no_sync: bool,
+        read_only: bool,
     },
     mem: mem_backend_mod.Options,
     lsm_memory: lsm_backend_mod.Options,
@@ -2535,6 +2536,7 @@ fn primaryStoreOpenPlan(opts: db_config.CoreOpenOptions) PrimaryStoreOpenPlan {
             .lmdb = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
+                .read_only = opts.read_only,
             },
         },
         .mem => |mem_opts| .{ .mem = mem_opts },
@@ -2609,6 +2611,7 @@ fn openPrimaryStore(alloc: Allocator, path: []const u8, opts: db_config.CoreOpen
             .store = try docstore_mod.DocStore.open(alloc, zpath, .{
                 .map_size = lmdb_opts.map_size,
                 .no_sync = lmdb_opts.no_sync,
+                .read_only = lmdb_opts.read_only,
             }),
         },
         .mem => |mem_opts| mem_blk: {
@@ -2877,6 +2880,7 @@ pub const DB = struct {
             const core_opts: db_config.CoreOpenOptions = .{
                 .map_size = opts.map_size,
                 .no_sync = opts.no_sync,
+                .read_only = openModeRequiresReadOnlyBackends(opts.open_mode),
                 .primary_backend = effective_primary_backend,
                 .primary_runtime_store = opts.primary_runtime_store,
                 .storage = opts.storage,
@@ -39339,6 +39343,66 @@ test "db query_readonly lsm primary opens physical backend read-only" {
         },
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expectError(error.ReadOnly, readonly.batch(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .write,
+    }));
+}
+
+test "db query_readonly lmdb primary does not create missing database" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var readonly = DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .lmdb,
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    }) catch |err| switch (err) {
+        error.UnsupportedPlatform => return,
+        error.FileNotFound, error.NotFound, error.LmdbUnexpected => return,
+        else => return err,
+    };
+    readonly.close();
+    return error.ExpectedReadonlyLmdbMissingOpenFailure;
+}
+
+test "db query_readonly lmdb primary rejects writes after readonly open" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = DB.open(alloc, std.mem.span(path), .{
+            .primary_backend = .lmdb,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        }) catch |err| switch (err) {
+            error.UnsupportedPlatform => return,
+            else => return err,
+        };
+        defer db.close();
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .write,
+        });
+    }
+
+    var readonly = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .lmdb,
+        .open_mode = .query_readonly,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer readonly.close();
+
+    var result = (try readonly.lookup(alloc, "doc:a", .{})) orelse return error.MissingReadonlyLmdbDocument;
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
     try std.testing.expectError(error.ReadOnly, readonly.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
         .sync_level = .write,

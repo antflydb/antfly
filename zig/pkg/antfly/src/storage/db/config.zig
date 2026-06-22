@@ -180,6 +180,7 @@ pub const IndexBackendOptions = struct {
 pub const CoreOpenOptions = struct {
     map_size: usize = 256 * 1024 * 1024,
     no_sync: bool = false,
+    read_only: bool = false,
     primary_backend: PrimaryBackend = .{ .lsm = primary_lsm_options_default },
     primary_runtime_store: ?*backend_erased_mod.Store = null,
     storage: ?lsm_backend_mod.Storage = null,

@@ -44,14 +44,48 @@ pub const lite_open_mode_writer: u32 = 0;
 pub const lite_open_mode_readonly: u32 = 1;
 pub const lite_open_mode_status_only: u32 = 2;
 
+pub const open_mode_writer: u32 = 0;
+pub const open_mode_readonly: u32 = 1;
+pub const open_mode_status_only: u32 = 2;
+
+pub const storage_kind_directory: u32 = 0;
+pub const storage_kind_lite: u32 = 1;
+
+pub const profile_native: u32 = 0;
+pub const profile_hosted: u32 = 1;
+
 pub const lite_profile_native: u32 = 0;
 pub const lite_profile_hosted: u32 = 1;
+
+pub const open_flag_no_sync: u32 = 1 << 0;
+pub const open_flag_ttl_cleanup: u32 = 1 << 1;
+pub const open_flag_remote_provider_configured: u32 = 1 << 2;
+pub const open_flag_local_runtime_configured: u32 = 1 << 3;
+pub const open_flag_generated_enrichment_replay: u32 = 1 << 4;
 
 pub const lite_open_flag_no_sync: u32 = 1 << 0;
 pub const lite_open_flag_ttl_cleanup: u32 = 1 << 1;
 pub const lite_open_flag_remote_provider_configured: u32 = 1 << 2;
 pub const lite_open_flag_local_runtime_configured: u32 = 1 << 3;
 pub const lite_open_flag_generated_enrichment_replay: u32 = 1 << 4;
+
+pub const OpenOptions = extern struct {
+    abi_size: u32 = @sizeOf(OpenOptions),
+    storage_kind: u32 = storage_kind_directory,
+    open_mode: u32 = open_mode_writer,
+    profile: u32 = profile_native,
+    flags: u32 = 0,
+    reserved0: u32 = 0,
+    map_size: u64 = 0,
+    ttl_cleanup_enabled: bool = false,
+    ttl_cleanup_lease_owned: bool = false,
+    ttl_cleanup_batch_size: u32 = 0,
+    ttl_cleanup_owner_id: Slice = .{},
+    ttl_cleanup_lease_ttl_ms: u64 = 0,
+    ttl_cleanup_interval_ms: u64 = 0,
+    ttl_cleanup_grace_period_ns: u64 = 0,
+    reserved: [8]u64 = .{0} ** 8,
+};
 
 pub const LiteOpenOptions = extern struct {
     abi_size: u32 = @sizeOf(LiteOpenOptions),
