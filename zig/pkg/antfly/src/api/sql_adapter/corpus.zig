@@ -8410,26 +8410,26 @@ pub const AppParityCorpusCoverage = struct {
                     appParityTokensHaveKeywordSequence(sql_tokens, &.{ .insert, .into }));
         } else if (entry.family == .truncate_source) {
             self.truncate_continue_identity = self.truncate_continue_identity or
-                (std.mem.indexOf(u8, entry.sql, "CONTINUE IDENTITY") != null and
+                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"continue", .identity }) and
                     sql_adapter.planHasExactStringToken(entry.plan, "truncate_source:table=", "usage_records"));
             self.truncate_restart_identity = self.truncate_restart_identity or
-                (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
+                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .restart, .identity }) and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
             self.truncate_multi_table_generation_barrier = self.truncate_multi_table_generation_barrier or
-                (std.mem.indexOf(u8, entry.sql, ", archived_records") != null and
+                (appParityTokensHaveIdentifier(sql_tokens, "archived_records") and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":additional_tables=", 1));
             self.truncate_cascade_generation_barrier = self.truncate_cascade_generation_barrier or
-                (std.mem.indexOf(u8, entry.sql, " CASCADE") != null and
+                (appParityTokensHaveKeyword(sql_tokens, .cascade) and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":cascade=", 1));
         } else if (entry.family == .unsupported_ddl) {
             self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
-                    std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, " TO STDIN") != null);
+                    appParityTokensStartWithKeyword(sql_tokens, .copy) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .to, .stdin }));
             self.unsupported_ddl_copy_unsupported_options = self.unsupported_ddl_copy_unsupported_options or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
-                    std.mem.startsWith(u8, entry.sql, "COPY ") and
-                    std.mem.indexOf(u8, entry.sql, "OIDS") != null);
+                    appParityTokensStartWithKeyword(sql_tokens, .copy) and
+                    appParityTokensHaveKeyword(sql_tokens, .oids));
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -8673,11 +8673,11 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_log_verbosity = self.ddl_copy_log_verbosity or sql_adapter.planHasExactStringToken(entry.plan, ":log_verbosity=", "verbose");
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
                     self.ddl_copy_oids_false_noop = self.ddl_copy_oids_false_noop or
-                        std.mem.indexOf(u8, entry.sql, "OIDS false") != null and
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .oids, .false }) and
                             std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:");
                     self.ddl_copy_on_error_ignore = self.ddl_copy_on_error_ignore or sql_adapter.planHasExactStringToken(entry.plan, ":on_error=", "ignore");
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
-                        std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null and
+                        appParityTokensHaveKeyword(sql_tokens, .program) and
                             std.mem.indexOf(u8, entry.execution_plan, ":stream=program:") != null and
                             std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=program:") != null;
                     self.ddl_copy_reject_limit = self.ddl_copy_reject_limit or sql_adapter.planHasExactUsizeToken(entry.plan, ":reject_limit=", 10);
@@ -8695,7 +8695,7 @@ pub const AppParityCorpusCoverage = struct {
                         (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
                             std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
-                        std.mem.indexOf(u8, entry.sql, " PROGRAM ") != null and
+                        appParityTokensHaveKeyword(sql_tokens, .program) and
                             std.mem.indexOf(u8, entry.execution_plan, ":stream=program:") != null and
                             std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=program:") != null;
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");

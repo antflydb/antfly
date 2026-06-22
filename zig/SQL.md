@@ -538,6 +538,10 @@ Current implementation status:
 - Adapter no-op transaction/session coverage now uses parsed statement-start
   keyword tags for `COMMIT`, `ROLLBACK`, `RESET`, `SHOW`, and `DISCARD`
   instead of case-insensitive raw SQL prefix probes.
+- TRUNCATE and COPY corpus coverage now uses parsed keyword/identifier tokens
+  for identity handling, cascades, multi-table detection, `COPY ... TO STDIN`,
+  `OIDS`, and `PROGRAM` endpoint probes while retaining native plan and
+  execution-plan evidence.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
