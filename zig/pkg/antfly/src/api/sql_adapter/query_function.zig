@@ -709,7 +709,9 @@ fn appendGraphPatternEdgeSpec(
 ) !void {
     const trimmed = std.mem.trim(u8, spec, " \t\r\n");
     const star_index = std.mem.indexOfScalar(u8, trimmed, '*');
-    const raw_types = if (star_index) |index| trimmed[0..index] else trimmed;
+    const raw_types_and_constraints = if (star_index) |index| trimmed[0..index] else trimmed;
+    const edge_head = try parseGraphPatternEdgeHead(raw_types_and_constraints);
+    const raw_types = edge_head.types;
     const types_text = std.mem.trim(u8, if (std.mem.startsWith(u8, raw_types, ":")) raw_types[1..] else raw_types, " \t\r\n");
 
     if (types_text.len > 0) {
@@ -728,6 +730,8 @@ fn appendGraphPatternEdgeSpec(
         try out.append(alloc, ']');
     }
 
+    if (edge_head.constraints) |constraints| try appendGraphPatternEdgeConstraints(alloc, out, first, constraints);
+
     if (star_index) |index| {
         const quantifier = std.mem.trim(u8, trimmed[index + 1 ..], " \t\r\n");
         if (quantifier.len == 0) return error.UnsupportedSqlShape;
@@ -745,6 +749,120 @@ fn appendGraphPatternEdgeSpec(
             try appendAntflySqlJsonNumberField(alloc, out, first, "max_hops", quantifier);
         }
     }
+}
+
+const GraphPatternEdgeHead = struct {
+    types: []const u8,
+    constraints: ?[]const u8 = null,
+};
+
+fn parseGraphPatternEdgeHead(raw: []const u8) !GraphPatternEdgeHead {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    const open = std.mem.indexOfScalar(u8, trimmed, '{') orelse return .{ .types = trimmed };
+    const close = std.mem.lastIndexOfScalar(u8, trimmed, '}') orelse return error.UnsupportedSqlShape;
+    if (close <= open) return error.UnsupportedSqlShape;
+    const tail = std.mem.trim(u8, trimmed[close + 1 ..], " \t\r\n");
+    if (tail.len != 0) return error.UnsupportedSqlShape;
+    return .{
+        .types = std.mem.trim(u8, trimmed[0..open], " \t\r\n"),
+        .constraints = std.mem.trim(u8, trimmed[open + 1 .. close], " \t\r\n"),
+    };
+}
+
+const GraphPatternEdgeWeightConstraints = struct {
+    min_weight: ?[]const u8 = null,
+    max_weight: ?[]const u8 = null,
+    min_value: ?f64 = null,
+    max_value: ?f64 = null,
+};
+
+fn appendGraphPatternEdgeConstraints(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    first: *bool,
+    constraints: []const u8,
+) !void {
+    const parsed = try parseGraphPatternEdgeWeightConstraints(constraints);
+    if (parsed.min_value != null and parsed.max_value != null and parsed.max_value.? < parsed.min_value.?) return error.UnsupportedSqlShape;
+    if (parsed.min_weight) |value| try appendAntflySqlJsonNumberField(alloc, out, first, "min_weight", value);
+    if (parsed.max_weight) |value| try appendAntflySqlJsonNumberField(alloc, out, first, "max_weight", value);
+}
+
+fn parseGraphPatternEdgeWeightConstraints(constraints: []const u8) !GraphPatternEdgeWeightConstraints {
+    if (constraints.len == 0) return error.UnsupportedSqlShape;
+    var parsed = GraphPatternEdgeWeightConstraints{};
+    var split = std.mem.splitScalar(u8, constraints, ',');
+    while (split.next()) |raw_part| {
+        const part = std.mem.trim(u8, raw_part, " \t\r\n");
+        if (part.len == 0) return error.UnsupportedSqlShape;
+        const item = try parseGraphPatternEdgeWeightConstraint(part);
+        if (std.ascii.eqlIgnoreCase(item.name, "min_weight") or
+            std.ascii.eqlIgnoreCase(item.name, "weight_min") or
+            (std.ascii.eqlIgnoreCase(item.name, "weight") and item.kind == .min))
+        {
+            if (parsed.min_weight != null) return error.UnsupportedSqlShape;
+            parsed.min_weight = item.value;
+            parsed.min_value = item.numeric;
+        } else if (std.ascii.eqlIgnoreCase(item.name, "max_weight") or
+            std.ascii.eqlIgnoreCase(item.name, "weight_max") or
+            (std.ascii.eqlIgnoreCase(item.name, "weight") and item.kind == .max))
+        {
+            if (parsed.max_weight != null) return error.UnsupportedSqlShape;
+            parsed.max_weight = item.value;
+            parsed.max_value = item.numeric;
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    if (parsed.min_weight == null and parsed.max_weight == null) return error.UnsupportedSqlShape;
+    return parsed;
+}
+
+const GraphPatternEdgeWeightConstraintKind = enum {
+    exact,
+    min,
+    max,
+};
+
+const GraphPatternEdgeWeightConstraint = struct {
+    name: []const u8,
+    value: []const u8,
+    numeric: f64,
+    kind: GraphPatternEdgeWeightConstraintKind,
+};
+
+fn parseGraphPatternEdgeWeightConstraint(part: []const u8) !GraphPatternEdgeWeightConstraint {
+    if (std.mem.indexOf(u8, part, ">=")) |index| {
+        return try graphPatternEdgeWeightConstraint(part[0..index], part[index + 2 ..], .min);
+    }
+    if (std.mem.indexOf(u8, part, "<=")) |index| {
+        return try graphPatternEdgeWeightConstraint(part[0..index], part[index + 2 ..], .max);
+    }
+    if (std.mem.indexOfScalar(u8, part, ':')) |index| {
+        return try graphPatternEdgeWeightConstraint(part[0..index], part[index + 1 ..], .exact);
+    }
+    if (std.mem.indexOfScalar(u8, part, '=')) |index| {
+        return try graphPatternEdgeWeightConstraint(part[0..index], part[index + 1 ..], .exact);
+    }
+    return error.UnsupportedSqlShape;
+}
+
+fn graphPatternEdgeWeightConstraint(
+    raw_name: []const u8,
+    raw_value: []const u8,
+    kind: GraphPatternEdgeWeightConstraintKind,
+) !GraphPatternEdgeWeightConstraint {
+    const name = std.mem.trim(u8, raw_name, " \t\r\n");
+    const value = std.mem.trim(u8, raw_value, " \t\r\n");
+    if (name.len == 0 or value.len == 0) return error.UnsupportedSqlShape;
+    const numeric = std.fmt.parseFloat(f64, value) catch return error.UnsupportedSqlShape;
+    if (!std.math.isFinite(numeric) or numeric < 0) return error.UnsupportedSqlShape;
+    return .{
+        .name = name,
+        .value = value,
+        .numeric = numeric,
+        .kind = kind,
+    };
 }
 
 fn appendGraphPatternStep(
@@ -1336,7 +1454,7 @@ test "sql adapter query function lowers antfly query functions into native searc
     var graph_match = try lowerAntflyQueryFunctionSqlAlloc(
         alloc,
         null,
-        "SELECT * FROM antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites|references*1..3]->(b)<-[:mentions]-(c)', return => 'b,c', metrics => 'pagerank', order_metric => 'pagerank', order_direction => 'desc', order_nulls => 'last', where_metric => 'pagerank', where_op => '>=', where_value => 0.25, freshness => 'published', include_metric_status => true, fields => 'title,url', max_results => 17);",
+        "SELECT * FROM antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites|references {min_weight:0.25,max_weight:2.5}*1..3]->(b)<-[:mentions {weight >= 0.1, weight <= 1.0}]-(c)', return => 'b,c', metrics => 'pagerank', order_metric => 'pagerank', order_direction => 'desc', order_nulls => 'last', where_metric => 'pagerank', where_op => '>=', where_value => 0.25, freshness => 'published', include_metric_status => true, fields => 'title,url', max_results => 17);",
     );
     defer graph_match.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), graph_match.req.graph_queries.len);
@@ -1353,10 +1471,14 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqual(@as(usize, 2), graph_match_query.pattern[1].edge.types.len);
     try std.testing.expectEqualStrings("cites", graph_match_query.pattern[1].edge.types[0]);
     try std.testing.expectEqualStrings("references", graph_match_query.pattern[1].edge.types[1]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), graph_match_query.pattern[1].edge.min_weight, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), graph_match_query.pattern[1].edge.max_weight, 0.0001);
     try std.testing.expectEqualStrings("c", graph_match_query.pattern[2].alias);
     try std.testing.expectEqual(@as(@TypeOf(graph_match_query.pattern[2].edge.direction), .in), graph_match_query.pattern[2].edge.direction);
     try std.testing.expectEqual(@as(usize, 1), graph_match_query.pattern[2].edge.types.len);
     try std.testing.expectEqualStrings("mentions", graph_match_query.pattern[2].edge.types[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), graph_match_query.pattern[2].edge.min_weight, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), graph_match_query.pattern[2].edge.max_weight, 0.0001);
     try std.testing.expectEqual(@as(usize, 2), graph_match_query.return_aliases.len);
     try std.testing.expectEqualStrings("b", graph_match_query.return_aliases[0]);
     try std.testing.expectEqualStrings("c", graph_match_query.return_aliases[1]);
@@ -1433,6 +1555,30 @@ test "sql adapter query function lowers antfly query functions into native searc
             alloc,
             null,
             "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites*3..1]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites {min_weight:3,max_weight:1}]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites {confidence:0.7}]->(b)');",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyQueryFunctionSqlAlloc(
+            alloc,
+            null,
+            "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites {min_weight:bad}]->(b)');",
         ),
     );
     try std.testing.expectError(
