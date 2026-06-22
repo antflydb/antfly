@@ -18442,14 +18442,21 @@ test "sql adapter lower dml lowers joined mutation source with separate target a
     });
     defer joined_catalog.deinit(alloc);
 
-    var resolved_catalog_update_options = try binder.resolveWritePlanCatalogOptionsAlloc(
+    var parsed_catalog_update = try tokenized.ParsedSql.initAlloc(alloc, public_sql);
+    defer parsed_catalog_update.deinit(alloc);
+    var bound_catalog_update = try binder.bindWritePlanCatalogStatementAlloc(
         alloc,
-        public_sql,
+        &parsed_catalog_update,
         .{ .row_claim = row_claim },
         joined_catalog.iface(),
     );
-    defer resolved_catalog_update_options.deinit(alloc);
-    try std.testing.expect(resolved_catalog_update_options.options.joined_source_schema != null);
+    defer bound_catalog_update.deinit(alloc);
+    var logical_catalog_update = try binder.logicalWritePlanFromBoundStatement(&bound_catalog_update);
+    defer logical_catalog_update.deinit(alloc);
+    switch (logical_catalog_update) {
+        .catalog_write => |catalog_write| try std.testing.expect(catalog_write.options.joined_source_schema != null),
+        else => return error.TestUnexpectedResult,
+    }
 
     var catalog_update_plan = try lowerWritePlanWithCatalogForDmlTestAlloc(
         alloc,

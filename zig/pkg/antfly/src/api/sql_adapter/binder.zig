@@ -934,17 +934,6 @@ pub const WritePlanCatalogLoweringHooks = struct {
     lower_with_options: *const fn (*anyopaque, plan_mod.LowerWritePlanOptions) anyerror!plan_mod.LoweredWritePlan,
 };
 
-pub fn lowerReadPlanWithCatalogSourceSchemaAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    catalog: table_catalog.CatalogSource,
-    hooks: ReadPlanCatalogLoweringHooks,
-) !plan_mod.LoweredReadPlan {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerReadPlanWithCatalogSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, catalog, hooks);
-}
-
 pub fn lowerReadPlanWithCatalogSourceSchemaParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -975,18 +964,6 @@ pub fn lowerReadPlanWithCatalogBoundStatementWithSessionAlloc(
     var logical = try logicalReadPlanFromBoundStatement(&resolved);
     defer logical.deinit(alloc);
     return try lowerReadCatalogLogicalPlan(&logical, hooks);
-}
-
-pub fn lowerWritePlanWithCatalogOptionsAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
-    hooks: WritePlanCatalogLoweringHooks,
-) !plan_mod.LoweredWritePlan {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try lowerWritePlanWithCatalogOptionsParsedSqlAlloc(alloc, &parsed_sql, options, catalog, hooks);
 }
 
 pub fn lowerWritePlanWithCatalogOptionsParsedSqlAlloc(
@@ -1209,17 +1186,6 @@ pub fn bindWritePlanCatalogStatementWithSessionAlloc(
     };
 }
 
-pub fn resolveWritePlanCatalogOptionsAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    options: plan_mod.LowerWritePlanOptions,
-    catalog: table_catalog.CatalogSource,
-) !CatalogBoundWritePlanOptions {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try resolveWritePlanCatalogOptionsParsedSqlAlloc(alloc, &parsed_sql, options, catalog);
-}
-
 pub fn resolveWritePlanCatalogOptionsParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -1289,16 +1255,6 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAlloc(
     }
 
     return out;
-}
-
-pub fn resolveReadPlanCatalogSourceSchemaAlloc(
-    alloc: std.mem.Allocator,
-    sql: []const u8,
-    catalog: table_catalog.CatalogSource,
-) !CatalogBoundReadPlanSourceSchema {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, catalog);
 }
 
 pub fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(

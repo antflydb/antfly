@@ -626,6 +626,10 @@ Current implementation status:
 - Relation-population syntax parsing has a `ParsedSql` entrypoint; the raw SQL
   parser is now a leaf wrapper that parses once before delegating, and planning
   consumes and exports the parsed entrypoint directly.
+- Catalog read/write resolver and lowerer APIs no longer keep raw SQL wrapper
+  paths in the binder or expose them from the adapter facade. The route is
+  parsed, bound, or logical-plan based, and joined DML catalog coverage now
+  validates `ParsedSql -> BoundSqlStatement -> LogicalSqlPlan` directly.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
