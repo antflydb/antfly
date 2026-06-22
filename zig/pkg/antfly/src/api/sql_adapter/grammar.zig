@@ -1104,10 +1104,13 @@ pub const UnlistenNotificationSyntax = struct {
 
 pub const TruncateMutationSourceSyntax = struct {
     table_name: []const u8,
+    additional_table_names: []const []const u8 = &.{},
     restart_identity: bool = false,
+    cascade: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.table_name));
+        freeStringSlice(alloc, self.additional_table_names);
         self.* = undefined;
     }
 };
@@ -6331,7 +6334,14 @@ pub fn parseTruncateMutationSourceSqlAlloc(
     const table_name = try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
-    if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
+    var additional_table_names = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (additional_table_names.items) |name| alloc.free(name);
+        additional_table_names.deinit(alloc);
+    }
+    while (cursor.matchToken(.comma) != null) {
+        try additional_table_names.append(alloc, try parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos));
+    }
 
     var restart_identity = false;
     if (cursor.matchKeyword("restart")) {
@@ -6342,12 +6352,22 @@ pub fn parseTruncateMutationSourceSqlAlloc(
     } else if (cursor.matchKeyword("identity")) {
         return error.UnsupportedSqlShape;
     }
-    if (cursor.matchKeyword("cascade")) return error.UnsupportedSqlShape;
-    _ = cursor.matchKeyword("restrict");
+    const cascade = cursor.matchKeyword("cascade");
+    if (cascade) {
+        if (cursor.matchKeyword("restrict")) return error.UnsupportedSqlShape;
+    } else {
+        _ = cursor.matchKeyword("restrict");
+    }
     try adapterNoopStatementEnd(cursor);
 
+    const owned_additional_table_names = try additional_table_names.toOwnedSlice(alloc);
     table_transferred = true;
-    return .{ .table_name = table_name, .restart_identity = restart_identity };
+    return .{
+        .table_name = table_name,
+        .additional_table_names = owned_additional_table_names,
+        .restart_identity = restart_identity,
+        .cascade = cascade,
+    };
 }
 
 pub fn parseCreatePublicationCatalogTailAlloc(
@@ -11339,7 +11359,9 @@ test "sql adapter grammar parses truncate mutation-source syntax" {
     defer truncate.deinit(alloc);
     try std.testing.expectEqual(truncate_tokens.items.len, truncate_pos);
     try std.testing.expectEqualStrings("usage_records", truncate.table_name);
+    try std.testing.expectEqual(@as(usize, 0), truncate.additional_table_names.len);
     try std.testing.expect(!truncate.restart_identity);
+    try std.testing.expect(!truncate.cascade);
 
     var restart_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records RESTART IDENTITY;");
     defer lexer.freeTokens(alloc, &restart_tokens);
@@ -11349,16 +11371,26 @@ test "sql adapter grammar parses truncate mutation-source syntax" {
     try std.testing.expectEqual(restart_tokens.items.len, restart_pos);
     try std.testing.expectEqualStrings("usage_records", restart.table_name);
     try std.testing.expect(restart.restart_identity);
+    try std.testing.expect(!restart.cascade);
 
     var multi_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records, audit_records;");
     defer lexer.freeTokens(alloc, &multi_tokens);
     var multi_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseTruncateMutationSourceSqlAlloc(alloc, multi_tokens.items, &multi_pos));
+    var multi = try parseTruncateMutationSourceSqlAlloc(alloc, multi_tokens.items, &multi_pos);
+    defer multi.deinit(alloc);
+    try std.testing.expectEqual(multi_tokens.items.len, multi_pos);
+    try std.testing.expectEqualStrings("usage_records", multi.table_name);
+    try std.testing.expectEqual(@as(usize, 1), multi.additional_table_names.len);
+    try std.testing.expectEqualStrings("audit_records", multi.additional_table_names[0]);
 
     var cascade_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records CASCADE;");
     defer lexer.freeTokens(alloc, &cascade_tokens);
     var cascade_pos: usize = 0;
-    try std.testing.expectError(error.UnsupportedSqlShape, parseTruncateMutationSourceSqlAlloc(alloc, cascade_tokens.items, &cascade_pos));
+    var cascade = try parseTruncateMutationSourceSqlAlloc(alloc, cascade_tokens.items, &cascade_pos);
+    defer cascade.deinit(alloc);
+    try std.testing.expectEqual(cascade_tokens.items.len, cascade_pos);
+    try std.testing.expectEqualStrings("usage_records", cascade.table_name);
+    try std.testing.expect(cascade.cascade);
 
     var identity_tokens = try lexer.tokenizeAlloc(alloc, "TRUNCATE usage_records IDENTITY;");
     defer lexer.freeTokens(alloc, &identity_tokens);

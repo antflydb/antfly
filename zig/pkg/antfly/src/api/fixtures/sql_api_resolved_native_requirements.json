@@ -81,6 +81,13 @@
       ]
     },
     {
+      "reason": "multi_table_generation_barrier",
+      "coverage": [
+        "truncate_cascade_generation_barrier",
+        "truncate_multi_table_generation_barrier"
+      ]
+    },
+    {
       "reason": "prepared_transaction_plan",
       "coverage": [
         "ddl_prepared_transaction_commit",

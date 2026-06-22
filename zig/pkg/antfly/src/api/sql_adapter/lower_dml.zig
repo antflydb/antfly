@@ -9459,10 +9459,14 @@ pub fn parseTruncateMutationSourceAlloc(
 
     const table_name = syntax.table_name;
     syntax.table_name = "";
+    const additional_table_names = syntax.additional_table_names;
+    syntax.additional_table_names = &.{};
     return .{
         .table_name = table_name,
+        .additional_table_names = additional_table_names,
         .mutation = mutation,
         .restart_identity = syntax.restart_identity,
+        .truncate_cascade = syntax.cascade,
     };
 }
 
@@ -17288,18 +17292,27 @@ test "sql adapter lower dml lowers truncate into claimed table-emptying mutation
     try std.testing.expect(restart_identity.restart_identity);
     try std.testing.expect(restart_identity.mutation.req.restart_identity);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceForTestAlloc(
+    var multi_table = try lowerTruncateMutationSourceForTestAlloc(
         alloc,
         "TRUNCATE usage_records, other_records",
         schema,
         claim,
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerTruncateMutationSourceForTestAlloc(
+    );
+    defer multi_table.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", multi_table.table_name);
+    try std.testing.expectEqual(@as(usize, 1), multi_table.additional_table_names.len);
+    try std.testing.expectEqualStrings("other_records", multi_table.additional_table_names[0]);
+    try std.testing.expect(!multi_table.truncate_cascade);
+
+    var cascade = try lowerTruncateMutationSourceForTestAlloc(
         alloc,
         "TRUNCATE usage_records CASCADE",
         schema,
         claim,
-    ));
+    );
+    defer cascade.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", cascade.table_name);
+    try std.testing.expect(cascade.truncate_cascade);
 }
 
 test "sql adapter lower dml lowers mutation source pagination fetch forms" {

@@ -1,6 +1,6 @@
 {
   "fixture_format": 1,
-  "source_sha256": "370f8be41734392234317d47fb9a7f2c3f26af7f34095255810bdda16e800f74",
+  "source_sha256": "31548c83f0dbee218ca67049bd231e17e339503f51701b541ff4da5c2f2c0dae",
   "source_entry_count": 1026,
   "entry_count": 1026,
   "skipped_entries": [
@@ -1476,17 +1476,23 @@
       "sql": "TRUNCATE TABLE usage_records RESTART IDENTITY;"
     },
     {
-      "name": "unsupported truncate multi-table generation barrier",
-      "family": "unsupported_write",
-      "plan": "unsupported:write:requires=multi_table_generation_barrier",
-      "classification_reason": "multi_table_generation_barrier",
+      "name": "truncate multi-table generation barrier plan",
+      "family": "truncate_source",
+      "summary": {
+        "table_name": "usage_records",
+        "row_claim_skip_locked": false
+      },
+      "plan": "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0:additional_tables=1",
       "sql": "TRUNCATE TABLE usage_records, archived_records;"
     },
     {
-      "name": "unsupported truncate cascade generation barrier",
-      "family": "unsupported_write",
-      "plan": "unsupported:write:requires=multi_table_generation_barrier",
-      "classification_reason": "multi_table_generation_barrier",
+      "name": "truncate cascade generation barrier plan",
+      "family": "truncate_source",
+      "summary": {
+        "table_name": "usage_records",
+        "row_claim_skip_locked": false
+      },
+      "plan": "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0:cascade=1",
       "sql": "TRUNCATE TABLE usage_records CASCADE;"
     },
     {

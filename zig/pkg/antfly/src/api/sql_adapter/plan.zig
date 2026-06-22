@@ -448,12 +448,15 @@ pub const LoweredMutation = struct {
 
 pub const LoweredMutationSource = struct {
     table_name: []const u8,
+    additional_table_names: []const []const u8 = &.{},
     mutation: relational_rows.OwnedRowsMutationSourceRequest,
     sync_level: db_mod.types.SyncLevel = .write,
     restart_identity: bool = false,
+    truncate_cascade: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
+        freeStringSlice(alloc, self.additional_table_names);
         self.mutation.deinit(alloc);
         self.* = undefined;
     }

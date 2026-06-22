@@ -2378,3 +2378,304 @@ test "sql adapter ddl fingerprint owns notification and logical replication ddl 
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
 }
+
+test "sql adapter ddl fingerprint owns type system ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');",
+            .fingerprint = "ddl:create_collation:collation=case_insensitive:options=2",
+        },
+        .{
+            .sql = "ALTER COLLATION case_insensitive RENAME TO ci_text;",
+            .fingerprint = "ddl:rename_collation:collation=case_insensitive:new=ci_text",
+        },
+        .{
+            .sql = "DROP COLLATION IF EXISTS ci_text;",
+            .fingerprint = "ddl:drop_collation:collation=ci_text:if_exists=true",
+        },
+        .{
+            .sql = "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);",
+            .fingerprint = "ddl:create_operator:operator====:options=3",
+        },
+        .{
+            .sql = "DROP OPERATOR === (text, text);",
+            .fingerprint = "ddl:drop_operator:operator====:args=2",
+        },
+        .{
+            .sql = "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);",
+            .fingerprint = "ddl:create_aggregate:aggregate=first_value_text:args=1:options=2",
+        },
+        .{
+            .sql = "DROP AGGREGATE first_value_text(text);",
+            .fingerprint = "ddl:drop_aggregate:aggregate=first_value_text:args=1",
+        },
+        .{
+            .sql = "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;",
+            .fingerprint = "ddl:create_cast:source=jsonb:target=text:function=jsonb_to_text:assignment=true",
+        },
+        .{
+            .sql = "DROP CAST (jsonb AS text);",
+            .fingerprint = "ddl:drop_cast:source=jsonb:target=text",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
+test "sql adapter ddl fingerprint owns maintenance job ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "VACUUM usage_records;",
+            .fingerprint = "ddl:maintenance:kind=vacuum:table=usage_records:full=false:freeze=false:verbose=false:analyze=false",
+        },
+        .{
+            .sql = "ANALYZE usage_records;",
+            .fingerprint = "ddl:maintenance:kind=analyze:table=usage_records:verbose=false:columns=0",
+        },
+        .{
+            .sql = "REINDEX TABLE usage_records;",
+            .fingerprint = "ddl:maintenance:kind=reindex:target=table:name=usage_records:concurrently=false",
+        },
+        .{
+            .sql = "CLUSTER usage_records USING usage_records_status_idx;",
+            .fingerprint = "ddl:maintenance:kind=cluster:table=usage_records:index=usage_records_status_idx:verbose=false",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
+test "sql adapter ddl fingerprint owns transaction protocol ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE;",
+            .fingerprint = "ddl:transaction_control:kind=table_lock:tables=1:mode=access_exclusive",
+        },
+        .{
+            .sql = "SET CONSTRAINTS ALL DEFERRED;",
+            .fingerprint = "ddl:transaction_control:kind=constraint_mode:all=true:constraints=0:mode=deferred",
+        },
+        .{
+            .sql = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;",
+            .fingerprint = "ddl:transaction_control:kind=transaction_mode:starter=set_transaction:isolation=serializable:access=read_only:deferrable=none",
+        },
+        .{
+            .sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+            .fingerprint = "ddl:transaction_control:kind=transaction_mode:starter=start_transaction:isolation=repeatable_read:access=none:deferrable=none",
+        },
+        .{
+            .sql = "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;",
+            .fingerprint = "ddl:transaction_control:kind=transaction_mode:starter=begin:isolation=serializable:access=read_write:deferrable=none",
+        },
+        .{
+            .sql = "BEGIN;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "BEGIN WORK;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "START TRANSACTION;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "COMMIT;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "COMMIT TRANSACTION;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "ROLLBACK;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "ROLLBACK WORK;",
+            .fingerprint = "adapter_noop:ddl:reason=transaction_control",
+        },
+        .{
+            .sql = "SELECT pg_advisory_lock(42);",
+            .fingerprint = "ddl:transaction_control:kind=advisory_lock:action=lock:keys=1",
+        },
+        .{
+            .sql = "SELECT pg_advisory_unlock(42);",
+            .fingerprint = "ddl:transaction_control:kind=advisory_lock:action=unlock:keys=1",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
+test "sql adapter ddl fingerprint owns prepared transaction ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "PREPARE TRANSACTION 'usage_batch';",
+            .fingerprint = "ddl:prepared_transaction:action=prepare:gid=usage_batch",
+        },
+        .{
+            .sql = "COMMIT PREPARED 'usage_batch';",
+            .fingerprint = "ddl:prepared_transaction:action=commit:gid=usage_batch",
+        },
+        .{
+            .sql = "ROLLBACK PREPARED 'usage_batch';",
+            .fingerprint = "ddl:prepared_transaction:action=rollback:gid=usage_batch",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}
+
+test "sql adapter ddl fingerprint owns prepared statement cursor and savepoint ddl surfaces" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        sql: []const u8,
+        fingerprint: []const u8,
+    }{
+        .{
+            .sql = "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;",
+            .fingerprint = "ddl:prepare_statement:name=usage_plan:params=1:subject=read:statement=read",
+        },
+        .{
+            .sql = "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) SELECT id FROM source_rows;",
+            .fingerprint = "ddl:prepare_statement:name=recursive_usage_read_plan:params=0:subject=read:statement=read",
+        },
+        .{
+            .sql = "PREPARE merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;",
+            .fingerprint = "ddl:prepare_statement:name=merge_plan:params=0:subject=write:statement=merge",
+        },
+        .{
+            .sql = "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);",
+            .fingerprint = "ddl:prepare_statement:name=cte_write_plan:params=0:subject=write:statement=update",
+        },
+        .{
+            .sql = "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);",
+            .fingerprint = "ddl:prepare_statement:name=recursive_usage_plan:params=0:subject=write:statement=update",
+        },
+        .{
+            .sql = "EXECUTE usage_plan('open');",
+            .fingerprint = "ddl:execute_statement:name=usage_plan:args=1",
+        },
+        .{
+            .sql = "DEALLOCATE usage_plan;",
+            .fingerprint = "ddl:deallocate_statement:name=usage_plan",
+        },
+        .{
+            .sql = "DEALLOCATE PREPARE usage_plan;",
+            .fingerprint = "ddl:deallocate_statement:name=usage_plan",
+        },
+        .{
+            .sql = "DEALLOCATE ALL;",
+            .fingerprint = "ddl:deallocate_statement:all=true",
+        },
+        .{
+            .sql = "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;",
+            .fingerprint = "ddl:declare_cursor:portal=usage_cursor:scroll=default:binary=false:hold=false:subject=read",
+        },
+        .{
+            .sql = "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id;",
+            .fingerprint = "ddl:declare_cursor:portal=usage_scroll_cursor:scroll=scroll:binary=true:hold=true:subject=read",
+        },
+        .{
+            .sql = "DECLARE merge_cursor CURSOR FOR MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;",
+            .fingerprint = "ddl:declare_cursor:portal=merge_cursor:scroll=default:binary=false:hold=false:subject=write",
+        },
+        .{
+            .sql = "FETCH NEXT FROM usage_cursor;",
+            .fingerprint = "ddl:fetch_cursor:portal=usage_cursor:direction=next",
+        },
+        .{
+            .sql = "FETCH FORWARD 10 IN usage_cursor;",
+            .fingerprint = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
+        },
+        .{
+            .sql = "FETCH usage_cursor;",
+            .fingerprint = "ddl:fetch_cursor:portal=usage_cursor:direction=next",
+        },
+        .{
+            .sql = "FETCH 10 usage_cursor;",
+            .fingerprint = "ddl:fetch_cursor:portal=usage_cursor:direction=forward:count=10",
+        },
+        .{
+            .sql = "FETCH FORWARD usage_cursor;",
+            .fingerprint = "ddl:fetch_cursor:portal=usage_cursor:direction=forward",
+        },
+        .{
+            .sql = "CLOSE usage_cursor;",
+            .fingerprint = "ddl:close_cursor:portal=usage_cursor",
+        },
+        .{
+            .sql = "CLOSE ALL;",
+            .fingerprint = "ddl:close_cursor:all=true",
+        },
+        .{
+            .sql = "SAVEPOINT before_retry;",
+            .fingerprint = "ddl:savepoint:name=before_retry",
+        },
+        .{
+            .sql = "RELEASE SAVEPOINT before_retry;",
+            .fingerprint = "ddl:release_savepoint:name=before_retry",
+        },
+        .{
+            .sql = "RELEASE before_retry;",
+            .fingerprint = "ddl:release_savepoint:name=before_retry",
+        },
+        .{
+            .sql = "ROLLBACK TO SAVEPOINT before_retry;",
+            .fingerprint = "ddl:rollback_to_savepoint:name=before_retry",
+        },
+        .{
+            .sql = "ROLLBACK TO before_retry;",
+            .fingerprint = "ddl:rollback_to_savepoint:name=before_retry",
+        },
+    };
+
+    for (cases) |case| {
+        var lowered = try lowerDdlPlanForFingerprintTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        const fingerprint = try ddlFingerprintAlloc(alloc, lowered);
+        defer alloc.free(fingerprint);
+        try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
+    }
+}

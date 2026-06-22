@@ -1,7 +1,6 @@
 {
   "requirement_format": 1,
   "required": [
-    "cte_mutation_source_plan",
-    "multi_table_generation_barrier"
+    "cte_mutation_source_plan"
   ]
 }

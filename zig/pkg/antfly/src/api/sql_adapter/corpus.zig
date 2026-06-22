@@ -6068,7 +6068,6 @@ pub const AppParityCorpusCoverage = struct {
     query_function_hybrid: bool = false,
     query_function_hybrid_sources_json: bool = false,
     query_function_hybrid_source_helpers: bool = false,
-    unsupported_write: bool = false,
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
     invalid_duplicate_conflict_update_target: bool = false,
@@ -6094,8 +6093,8 @@ pub const AppParityCorpusCoverage = struct {
     merge_mutation_cte: bool = false,
     merge_mutation_typed_plan: bool = false,
     merge_mutation_default_expressions: bool = false,
-    unsupported_write_truncate_multi_table: bool = false,
-    unsupported_write_truncate_cascade: bool = false,
+    truncate_multi_table_generation_barrier: bool = false,
+    truncate_cascade_generation_barrier: bool = false,
     truncate_continue_identity: bool = false,
     truncate_restart_identity: bool = false,
     update_source_claim_nowait: bool = false,
@@ -7268,7 +7267,7 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported => {},
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
-            .unsupported_write => self.unsupported_write = true,
+            .unsupported_write => {},
             .unsupported_insert => self.unsupported_insert = true,
             .unsupported_update => {},
             .unsupported_update_source => {},
@@ -7361,13 +7360,6 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.startsWith(u8, entry.plan, "recursive_insert_source:") and
                     std.mem.startsWith(u8, entry.sql, "WITH RECURSIVE ") and
                     std.mem.indexOf(u8, entry.sql, " INSERT INTO ") != null);
-        } else if (entry.family == .unsupported_write) {
-            self.unsupported_write_truncate_multi_table = self.unsupported_write_truncate_multi_table or
-                (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
-                    std.mem.indexOf(u8, entry.sql, ", archived_records") != null);
-            self.unsupported_write_truncate_cascade = self.unsupported_write_truncate_cascade or
-                (std.mem.eql(u8, entry.classification_reason, "multi_table_generation_barrier") and
-                    std.mem.indexOf(u8, entry.sql, " CASCADE") != null);
         } else if (entry.family == .truncate_source) {
             self.truncate_continue_identity = self.truncate_continue_identity or
                 (std.mem.indexOf(u8, entry.sql, "CONTINUE IDENTITY") != null and
@@ -7375,6 +7367,12 @@ pub const AppParityCorpusCoverage = struct {
             self.truncate_restart_identity = self.truncate_restart_identity or
                 (std.mem.indexOf(u8, entry.sql, "RESTART IDENTITY") != null and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
+            self.truncate_multi_table_generation_barrier = self.truncate_multi_table_generation_barrier or
+                (std.mem.indexOf(u8, entry.sql, ", archived_records") != null and
+                    sql_adapter.planHasExactUsizeToken(entry.plan, ":additional_tables=", 1));
+            self.truncate_cascade_generation_barrier = self.truncate_cascade_generation_barrier or
+                (std.mem.indexOf(u8, entry.sql, " CASCADE") != null and
+                    sql_adapter.planHasExactUsizeToken(entry.plan, ":cascade=", 1));
         } else if (entry.family == .unsupported_ddl) {
             self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and

@@ -10862,6 +10862,567 @@ test "sql adapter ddl plan lowers notification and logical replication catalog d
     }
 }
 
+test "sql adapter ddl plan lowers type system catalog ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var create_collation = try lowerDdlPlanForTestAlloc(alloc, "CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2');");
+    defer create_collation.deinit(alloc);
+    switch (create_collation) {
+        .type_system_catalog => |plan| switch (plan) {
+            .collation => |collation| switch (collation) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("case_insensitive", create.collation_name);
+                    try std.testing.expectEqual(@as(usize, 2), create.option_count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rename_collation = try lowerDdlPlanForTestAlloc(alloc, "ALTER COLLATION case_insensitive RENAME TO ci_text;");
+    defer rename_collation.deinit(alloc);
+    switch (rename_collation) {
+        .type_system_catalog => |plan| switch (plan) {
+            .collation => |collation| switch (collation) {
+                .rename => |rename| {
+                    try std.testing.expectEqualStrings("case_insensitive", rename.collation_name);
+                    try std.testing.expectEqualStrings("ci_text", rename.new_collation_name);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_collation = try lowerDdlPlanForTestAlloc(alloc, "DROP COLLATION IF EXISTS ci_text;");
+    defer drop_collation.deinit(alloc);
+    switch (drop_collation) {
+        .type_system_catalog => |plan| switch (plan) {
+            .collation => |collation| switch (collation) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("ci_text", drop.collation_name);
+                    try std.testing.expect(drop.if_exists);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_operator = try lowerDdlPlanForTestAlloc(alloc, "CREATE OPERATOR === (FUNCTION = text_eq, LEFTARG = text, RIGHTARG = text);");
+    defer create_operator.deinit(alloc);
+    switch (create_operator) {
+        .type_system_catalog => |plan| switch (plan) {
+            .operator => |operator| switch (operator) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("===", create.operator_name);
+                    try std.testing.expectEqual(@as(usize, 3), create.option_count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_operator = try lowerDdlPlanForTestAlloc(alloc, "DROP OPERATOR === (text, text);");
+    defer drop_operator.deinit(alloc);
+    switch (drop_operator) {
+        .type_system_catalog => |plan| switch (plan) {
+            .operator => |operator| switch (operator) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("===", drop.operator_name);
+                    try std.testing.expectEqual(@as(usize, 2), drop.argument_count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_aggregate = try lowerDdlPlanForTestAlloc(alloc, "CREATE AGGREGATE first_value_text(text) (SFUNC = first_sfunc, STYPE = text);");
+    defer create_aggregate.deinit(alloc);
+    switch (create_aggregate) {
+        .type_system_catalog => |plan| switch (plan) {
+            .aggregate => |aggregate| switch (aggregate) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("first_value_text", create.aggregate_name);
+                    try std.testing.expectEqual(@as(usize, 1), create.argument_count);
+                    try std.testing.expectEqual(@as(usize, 2), create.option_count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_aggregate = try lowerDdlPlanForTestAlloc(alloc, "DROP AGGREGATE first_value_text(text);");
+    defer drop_aggregate.deinit(alloc);
+    switch (drop_aggregate) {
+        .type_system_catalog => |plan| switch (plan) {
+            .aggregate => |aggregate| switch (aggregate) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("first_value_text", drop.aggregate_name);
+                    try std.testing.expectEqual(@as(usize, 1), drop.argument_count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var create_cast = try lowerDdlPlanForTestAlloc(alloc, "CREATE CAST (jsonb AS text) WITH FUNCTION jsonb_to_text(jsonb) AS ASSIGNMENT;");
+    defer create_cast.deinit(alloc);
+    switch (create_cast) {
+        .type_system_catalog => |plan| switch (plan) {
+            .cast => |cast| switch (cast) {
+                .create => |create| {
+                    try std.testing.expectEqualStrings("jsonb", create.source_type);
+                    try std.testing.expectEqualStrings("text", create.target_type);
+                    try std.testing.expectEqualStrings("jsonb_to_text", create.function_name);
+                    try std.testing.expect(create.assignment);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_cast = try lowerDdlPlanForTestAlloc(alloc, "DROP CAST (jsonb AS text);");
+    defer drop_cast.deinit(alloc);
+    switch (drop_cast) {
+        .type_system_catalog => |plan| switch (plan) {
+            .cast => |cast| switch (cast) {
+                .drop => |drop| {
+                    try std.testing.expectEqualStrings("jsonb", drop.source_type);
+                    try std.testing.expectEqualStrings("text", drop.target_type);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers maintenance job ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var vacuum = try lowerDdlPlanForTestAlloc(alloc, "VACUUM usage_records;");
+    defer vacuum.deinit(alloc);
+    switch (vacuum) {
+        .maintenance_job => |plan| switch (plan) {
+            .vacuum => |vacuum_plan| {
+                try std.testing.expectEqualStrings("usage_records", vacuum_plan.table_name);
+                try std.testing.expect(!vacuum_plan.full);
+                try std.testing.expect(!vacuum_plan.freeze);
+                try std.testing.expect(!vacuum_plan.verbose);
+                try std.testing.expect(!vacuum_plan.analyze);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var analyze = try lowerDdlPlanForTestAlloc(alloc, "ANALYZE usage_records;");
+    defer analyze.deinit(alloc);
+    switch (analyze) {
+        .maintenance_job => |plan| switch (plan) {
+            .analyze => |analyze_plan| {
+                try std.testing.expectEqualStrings("usage_records", analyze_plan.table_name);
+                try std.testing.expect(!analyze_plan.verbose);
+                try std.testing.expectEqual(@as(usize, 0), analyze_plan.column_count);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var reindex = try lowerDdlPlanForTestAlloc(alloc, "REINDEX TABLE usage_records;");
+    defer reindex.deinit(alloc);
+    switch (reindex) {
+        .maintenance_job => |plan| switch (plan) {
+            .reindex => |reindex_plan| {
+                try std.testing.expectEqual(ReindexMaintenanceTarget.table, reindex_plan.target);
+                try std.testing.expectEqualStrings("usage_records", reindex_plan.name);
+                try std.testing.expect(!reindex_plan.concurrently);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var cluster = try lowerDdlPlanForTestAlloc(alloc, "CLUSTER usage_records USING usage_records_status_idx;");
+    defer cluster.deinit(alloc);
+    switch (cluster) {
+        .maintenance_job => |plan| switch (plan) {
+            .cluster => |cluster_plan| {
+                try std.testing.expectEqualStrings("usage_records", cluster_plan.table_name);
+                try std.testing.expectEqualStrings("usage_records_status_idx", cluster_plan.index_name orelse return error.TestUnexpectedResult);
+                try std.testing.expect(!cluster_plan.verbose);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers transaction control and protocol ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var table_lock = try lowerDdlPlanForTestAlloc(alloc, "LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE;");
+    defer table_lock.deinit(alloc);
+    switch (table_lock) {
+        .transaction_control => |plan| switch (plan) {
+            .table_lock => |lock| {
+                try std.testing.expectEqual(@as(usize, 1), lock.table_names.len);
+                try std.testing.expectEqualStrings("usage_records", lock.table_names[0]);
+                try std.testing.expectEqual(TableLockMode.access_exclusive, lock.mode);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var constraint_mode = try lowerDdlPlanForTestAlloc(alloc, "SET CONSTRAINTS ALL DEFERRED;");
+    defer constraint_mode.deinit(alloc);
+    switch (constraint_mode) {
+        .transaction_control => |plan| switch (plan) {
+            .constraint_mode => |constraints| {
+                try std.testing.expect(constraints.all);
+                try std.testing.expectEqual(@as(usize, 0), constraints.constraint_names.len);
+                try std.testing.expectEqual(ConstraintCheckMode.deferred, constraints.mode);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var set_transaction = try lowerDdlPlanForTestAlloc(alloc, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY;");
+    defer set_transaction.deinit(alloc);
+    switch (set_transaction) {
+        .transaction_control => |plan| switch (plan) {
+            .transaction_mode => |transaction| {
+                try std.testing.expectEqual(TransactionModeStarter.set_transaction, transaction.starter);
+                try std.testing.expectEqual(TransactionIsolationLevel.serializable, transaction.isolation_level.?);
+                try std.testing.expectEqual(TransactionAccessMode.read_only, transaction.access_mode.?);
+                try std.testing.expect(transaction.deferrable == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var start_transaction = try lowerDdlPlanForTestAlloc(alloc, "START TRANSACTION ISOLATION LEVEL REPEATABLE READ;");
+    defer start_transaction.deinit(alloc);
+    switch (start_transaction) {
+        .transaction_control => |plan| switch (plan) {
+            .transaction_mode => |transaction| {
+                try std.testing.expectEqual(TransactionModeStarter.start_transaction, transaction.starter);
+                try std.testing.expectEqual(TransactionIsolationLevel.repeatable_read, transaction.isolation_level.?);
+                try std.testing.expect(transaction.access_mode == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var begin_transaction = try lowerDdlPlanForTestAlloc(alloc, "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;");
+    defer begin_transaction.deinit(alloc);
+    switch (begin_transaction) {
+        .transaction_control => |plan| switch (plan) {
+            .transaction_mode => |transaction| {
+                try std.testing.expectEqual(TransactionModeStarter.begin, transaction.starter);
+                try std.testing.expectEqual(TransactionIsolationLevel.serializable, transaction.isolation_level.?);
+                try std.testing.expectEqual(TransactionAccessMode.read_write, transaction.access_mode.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const noops = [_][]const u8{
+        "BEGIN;",
+        "BEGIN WORK;",
+        "START TRANSACTION;",
+        "COMMIT;",
+        "COMMIT TRANSACTION;",
+        "ROLLBACK;",
+        "ROLLBACK WORK;",
+    };
+    for (noops) |sql| {
+        var noop = try lowerDdlPlanForTestAlloc(alloc, sql);
+        defer noop.deinit(alloc);
+        switch (noop) {
+            .adapter_noop => |plan| try std.testing.expectEqual(AdapterNoopDdlReason.transaction_control, plan.reason),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var advisory_lock = try lowerDdlPlanForTestAlloc(alloc, "SELECT pg_advisory_lock(42);");
+    defer advisory_lock.deinit(alloc);
+    switch (advisory_lock) {
+        .transaction_control => |plan| switch (plan) {
+            .advisory_lock => |lock| {
+                try std.testing.expectEqual(AdvisoryLockAction.lock, lock.action);
+                try std.testing.expectEqual(@as(i64, 42), lock.key1);
+                try std.testing.expect(lock.key2 == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var advisory_unlock = try lowerDdlPlanForTestAlloc(alloc, "SELECT pg_advisory_unlock(42);");
+    defer advisory_unlock.deinit(alloc);
+    switch (advisory_unlock) {
+        .transaction_control => |plan| switch (plan) {
+            .advisory_lock => |lock| {
+                try std.testing.expectEqual(AdvisoryLockAction.unlock, lock.action);
+                try std.testing.expectEqual(@as(i64, 42), lock.key1);
+                try std.testing.expect(lock.key2 == null);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers prepared transaction ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var prepare = try lowerDdlPlanForTestAlloc(alloc, "PREPARE TRANSACTION 'usage_batch';");
+    defer prepare.deinit(alloc);
+    switch (prepare) {
+        .prepared_transaction => |plan| {
+            try std.testing.expectEqual(PreparedTransactionAction.prepare, plan.action);
+            try std.testing.expectEqualStrings("usage_batch", plan.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var commit = try lowerDdlPlanForTestAlloc(alloc, "COMMIT PREPARED 'usage_batch';");
+    defer commit.deinit(alloc);
+    switch (commit) {
+        .prepared_transaction => |plan| {
+            try std.testing.expectEqual(PreparedTransactionAction.commit, plan.action);
+            try std.testing.expectEqualStrings("usage_batch", plan.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var rollback = try lowerDdlPlanForTestAlloc(alloc, "ROLLBACK PREPARED 'usage_batch';");
+    defer rollback.deinit(alloc);
+    switch (rollback) {
+        .prepared_transaction => |plan| {
+            try std.testing.expectEqual(PreparedTransactionAction.rollback, plan.action);
+            try std.testing.expectEqualStrings("usage_batch", plan.gid);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter ddl plan lowers prepared statement cursor and savepoint ddl plans" {
+    const alloc = std.testing.allocator;
+
+    var prepare_statement = try lowerDdlPlanForTestAlloc(alloc, "PREPARE usage_plan(text) AS SELECT id FROM usage_records WHERE status = $1;");
+    defer prepare_statement.deinit(alloc);
+    switch (prepare_statement) {
+        .prepared_statement => |plan| switch (plan) {
+            .prepare => |prepare| {
+                try std.testing.expectEqualStrings("usage_plan", prepare.statement_name);
+                try std.testing.expectEqual(@as(usize, 1), prepare.parameter_count);
+                try std.testing.expectEqual(PreparedStatementSubjectKind.read, prepare.statement_kind);
+                try std.testing.expectEqual(PreparedStatementStatementKind.read, prepare.statement_family);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const prepared_cases = [_]struct {
+        sql: []const u8,
+        family: PreparedStatementStatementKind,
+    }{
+        .{ .sql = "PREPARE merge_plan AS MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;", .family = .merge },
+        .{ .sql = "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);", .family = .update },
+        .{ .sql = "PREPARE recursive_usage_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows);", .family = .update },
+    };
+    for (prepared_cases) |case| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .prepared_statement => |plan| switch (plan) {
+                .prepare => |prepare| {
+                    try std.testing.expectEqual(PreparedStatementSubjectKind.write, prepare.statement_kind);
+                    try std.testing.expectEqual(case.family, prepare.statement_family);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var execute_statement = try lowerDdlPlanForTestAlloc(alloc, "EXECUTE usage_plan('open');");
+    defer execute_statement.deinit(alloc);
+    switch (execute_statement) {
+        .prepared_statement => |plan| switch (plan) {
+            .execute => |execute| {
+                try std.testing.expectEqualStrings("usage_plan", execute.statement_name);
+                try std.testing.expectEqual(@as(usize, 1), execute.argument_count);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var deallocate_statement = try lowerDdlPlanForTestAlloc(alloc, "DEALLOCATE usage_plan;");
+    defer deallocate_statement.deinit(alloc);
+    switch (deallocate_statement) {
+        .prepared_statement => |plan| switch (plan) {
+            .deallocate => |deallocate| try std.testing.expectEqualStrings("usage_plan", deallocate.statement_name orelse return error.TestUnexpectedResult),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var deallocate_all = try lowerDdlPlanForTestAlloc(alloc, "DEALLOCATE ALL;");
+    defer deallocate_all.deinit(alloc);
+    switch (deallocate_all) {
+        .prepared_statement => |plan| switch (plan) {
+            .deallocate => |deallocate| try std.testing.expect(deallocate.all),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var declare_cursor = try lowerDdlPlanForTestAlloc(alloc, "DECLARE usage_cursor CURSOR FOR SELECT id FROM usage_records ORDER BY id;");
+    defer declare_cursor.deinit(alloc);
+    switch (declare_cursor) {
+        .cursor_portal => |plan| switch (plan) {
+            .declare => |declare| {
+                try std.testing.expectEqualStrings("usage_cursor", declare.portal_name);
+                try std.testing.expectEqual(CursorScrollMode.default, declare.scroll);
+                try std.testing.expect(!declare.binary);
+                try std.testing.expect(!declare.hold);
+                try std.testing.expectEqual(PreparedStatementSubjectKind.read, declare.statement_kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var declare_scroll_hold = try lowerDdlPlanForTestAlloc(alloc, "DECLARE usage_scroll_cursor BINARY SCROLL CURSOR WITH HOLD FOR SELECT id FROM usage_records ORDER BY id;");
+    defer declare_scroll_hold.deinit(alloc);
+    switch (declare_scroll_hold) {
+        .cursor_portal => |plan| switch (plan) {
+            .declare => |declare| {
+                try std.testing.expectEqualStrings("usage_scroll_cursor", declare.portal_name);
+                try std.testing.expectEqual(CursorScrollMode.scroll, declare.scroll);
+                try std.testing.expect(declare.binary);
+                try std.testing.expect(declare.hold);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var declare_merge = try lowerDdlPlanForTestAlloc(alloc, "DECLARE merge_cursor CURSOR FOR MERGE INTO usage_records USING source_records ON usage_records.id = source_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status;");
+    defer declare_merge.deinit(alloc);
+    switch (declare_merge) {
+        .cursor_portal => |plan| switch (plan) {
+            .declare => |declare| {
+                try std.testing.expectEqualStrings("merge_cursor", declare.portal_name);
+                try std.testing.expectEqual(PreparedStatementSubjectKind.write, declare.statement_kind);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const fetch_cases = [_]struct {
+        sql: []const u8,
+        direction: CursorFetchDirection,
+        count: ?i64 = null,
+    }{
+        .{ .sql = "FETCH NEXT FROM usage_cursor;", .direction = .next },
+        .{ .sql = "FETCH FORWARD 10 IN usage_cursor;", .direction = .forward, .count = 10 },
+        .{ .sql = "FETCH usage_cursor;", .direction = .next },
+        .{ .sql = "FETCH 10 usage_cursor;", .direction = .forward, .count = 10 },
+        .{ .sql = "FETCH FORWARD usage_cursor;", .direction = .forward },
+    };
+    for (fetch_cases) |case| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .cursor_portal => |plan| switch (plan) {
+                .fetch => |fetch| {
+                    try std.testing.expectEqualStrings("usage_cursor", fetch.portal_name);
+                    try std.testing.expectEqual(case.direction, fetch.direction);
+                    try std.testing.expectEqual(case.count, fetch.count);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var close_cursor = try lowerDdlPlanForTestAlloc(alloc, "CLOSE usage_cursor;");
+    defer close_cursor.deinit(alloc);
+    switch (close_cursor) {
+        .cursor_portal => |plan| switch (plan) {
+            .close => |close| try std.testing.expectEqualStrings("usage_cursor", close.portal_name orelse return error.TestUnexpectedResult),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var close_all = try lowerDdlPlanForTestAlloc(alloc, "CLOSE ALL;");
+    defer close_all.deinit(alloc);
+    switch (close_all) {
+        .cursor_portal => |plan| switch (plan) {
+            .close => |close| try std.testing.expect(close.all),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const savepoint_cases = [_]struct {
+        sql: []const u8,
+        tag: std.meta.Tag(SavepointTransactionPlan),
+    }{
+        .{ .sql = "SAVEPOINT before_retry;", .tag = .savepoint },
+        .{ .sql = "RELEASE SAVEPOINT before_retry;", .tag = .release },
+        .{ .sql = "RELEASE before_retry;", .tag = .release },
+        .{ .sql = "ROLLBACK TO SAVEPOINT before_retry;", .tag = .rollback_to },
+        .{ .sql = "ROLLBACK TO before_retry;", .tag = .rollback_to },
+    };
+    for (savepoint_cases) |case| {
+        var lowered = try lowerDdlPlanForTestAlloc(alloc, case.sql);
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .savepoint_transaction => |plan| {
+                try std.testing.expectEqual(case.tag, std.meta.activeTag(plan));
+                const name = switch (plan) {
+                    .savepoint => |savepoint| savepoint.savepoint_name,
+                    .release => |release| release.savepoint_name,
+                    .rollback_to => |rollback| rollback.savepoint_name,
+                };
+                try std.testing.expectEqualStrings("before_retry", name);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "sql adapter ddl plan lowers routine expression bindings into ddl plans" {
     const alloc = std.testing.allocator;
 

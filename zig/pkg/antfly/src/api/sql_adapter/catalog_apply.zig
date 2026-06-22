@@ -1660,6 +1660,18 @@ test "catalog apply creates clones and replaces public schema json" {
     try std.testing.expectEqualStrings("users_tenant_email_key", applied_runtime.unique_constraints[0].name);
     try std.testing.expectEqual(@as(usize, 1), applied_runtime.checks.len);
 
+    var begin_protocol = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "BEGIN;");
+    defer begin_protocol.deinit(alloc);
+    var begin_protocol_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, begin_protocol);
+    defer begin_protocol_applied.deinit(alloc);
+    try std.testing.expectEqualStrings(applied.schema_json, begin_protocol_applied.schema_json);
+
+    var set_search_path = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "SET search_path TO public;");
+    defer set_search_path.deinit(alloc);
+    var set_search_path_applied = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, set_search_path);
+    defer set_search_path_applied.deinit(alloc);
+    try std.testing.expectEqualStrings(applied.schema_json, set_search_path_applied.schema_json);
+
     var duplicate_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users (id uuid PRIMARY KEY);");
     defer duplicate_create.deinit(alloc);
     try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create));
@@ -2555,6 +2567,9 @@ test "catalog apply executes prepared transaction recovery intents" {
     try std.testing.expectEqualSlices(u8, &expected_txn_id, &prepared.txn_id);
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, prepared.status);
     try std.testing.expect(prepared.coordinator_recovery_log);
+    const prepared_fingerprint = try preparedTransactionRecoveryFingerprintAlloc(alloc, preparedTransactionRecoveryIntentFromPlan(prepare_plan));
+    defer alloc.free(prepared_fingerprint);
+    try std.testing.expectEqualStrings("prepared_txn_recovery:op=register_prepared:gid=usage_batch:audit=prepare:requires_coordinator=true", prepared_fingerprint);
 
     var manager = try transactions_mod.TxnManager.init(alloc, &runtime_store);
     defer manager.deinit();
@@ -2570,6 +2585,9 @@ test "catalog apply executes prepared transaction recovery intents" {
     const committed = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, commit_plan, 2_000);
     try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, committed.operation);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, committed.status);
+    const committed_fingerprint = try preparedTransactionRecoveryFingerprintAlloc(alloc, preparedTransactionRecoveryIntentFromPlan(commit_plan));
+    defer alloc.free(committed_fingerprint);
+    try std.testing.expectEqualStrings("prepared_txn_recovery:op=resolve_commit:gid=usage_batch:audit=commit:requires_coordinator=true", committed_fingerprint);
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try manager.getTransactionStatus(expected_txn_id));
     const committed_retry = try executePreparedTransactionRecoveryPlan(alloc, &runtime_store, commit_plan, 2_500);
     try std.testing.expectEqual(PreparedTransactionRecoveryOperation.resolve_commit, committed_retry.operation);
