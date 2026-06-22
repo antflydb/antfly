@@ -1210,6 +1210,7 @@ fn appParityAppliedDdlPlanAlloc(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
     entry: AppParityCorpusEntry,
+    parsed_sql: *const sql_adapter.ParsedSql,
 ) ![]u8 {
     var current_schema_json: []const u8 = if (try sql_adapter.corpusDdlFixtureAppliesFromEmptyCatalog(entry)) "" else base_schema_json;
     var owned_current_schema_json: ?[]u8 = null;
@@ -1229,9 +1230,7 @@ fn appParityAppliedDdlPlanAlloc(
         current_schema_json = next_schema_json;
     }
 
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
-    defer parsed_sql.deinit(alloc);
-    var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, &parsed_sql);
+    var lowered = try lowerDdlPlanParsedSqlAlloc(alloc, parsed_sql);
     defer lowered.deinit(alloc);
     var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, lowered);
     defer applied.deinit(alloc);
