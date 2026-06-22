@@ -59,7 +59,7 @@ pub const SqlAdapterEdgeCaseLoweringCallbacks = struct {
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        relational_rows.UniqueSelectorResolver,
+        ?relational_rows.UniqueSelectorResolver,
     ) anyerror!plan.LoweredWritePlan,
 };
 
@@ -213,7 +213,8 @@ fn expectSqlAdapterEdgeCaseWritePlan(
     resolver: relational_rows.UniqueSelectorResolver,
     callbacks: SqlAdapterEdgeCaseLoweringCallbacks,
 ) !void {
-    var lowered = callbacks.lower_write_plan(alloc, parsed_sql, schema, edge_case.params, resolver) catch |err| {
+    const effective_resolver: ?relational_rows.UniqueSelectorResolver = if (edge_case.omit_resolver) null else resolver;
+    var lowered = callbacks.lower_write_plan(alloc, parsed_sql, schema, edge_case.params, effective_resolver) catch |err| {
         try expectSqlAdapterEdgeCaseError(edge_case.expected_error, err);
         return;
     };

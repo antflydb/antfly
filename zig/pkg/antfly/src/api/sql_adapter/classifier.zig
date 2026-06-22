@@ -46,8 +46,10 @@ pub const SqlWriteStatementKind = enum {
     insert,
     insert_source,
     update,
+    update_source,
     update_joined_source,
     delete,
+    delete_source,
     delete_joined_source,
     truncate,
     merge,
@@ -170,8 +172,10 @@ fn preparedStatementKindFromWriteKind(kind: SqlWriteStatementKind) SqlPreparedSt
         .insert => .insert,
         .insert_source => .insert_source,
         .update => .update,
+        .update_source => .update,
         .update_joined_source => .update,
         .delete => .delete,
+        .delete_source => .delete,
         .delete_joined_source => .delete,
         .truncate => .truncate,
         .merge => .merge,
@@ -241,23 +245,58 @@ fn classifyInsertStatement(tokens: []const Token, start: usize) ?SqlWriteStateme
 fn classifyUpdateStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
     if (!statementStartsAt(tokens, start, "update")) return null;
     const statement = tokens[start..];
+    if (statementHasForPortionBeforeKeyword(statement, 1, "set")) return .update_source;
     const set_index = parser.findTopLevelKeyword(statement, "set") orelse return .update;
     if (parser.findTopLevelKeywordFromIndex(statement, set_index + 1, "from")) |from_index| {
         const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
         if (from_index < stop_index) return .update_joined_source;
     }
-    return if (statementHasWhereSemijoinSubquery(statement, set_index + 1)) .update_joined_source else .update;
+    if (statementHasWhereSemijoinSubquery(statement, set_index + 1)) return .update_joined_source;
+    if (statementHasMutationSourceTail(statement, set_index + 1)) return .update_source;
+    return .update;
 }
 
 fn classifyDeleteStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
     if (!statementStartsAt(tokens, start, "delete")) return null;
     const statement = tokens[start..];
     const from_index = parser.findTopLevelKeyword(statement, "from") orelse return .delete;
+    if (statementHasForPortionBeforeKeyword(statement, from_index + 1, "where") or
+        statementHasForPortionBeforeKeyword(statement, from_index + 1, "returning"))
+    {
+        return .delete_source;
+    }
     if (parser.findTopLevelKeywordFromIndex(statement, from_index + 1, "using")) |using_index| {
         const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
         if (using_index < stop_index) return .delete_joined_source;
     }
-    return if (statementHasWhereSemijoinSubquery(statement, from_index + 1)) .delete_joined_source else .delete;
+    if (statementHasWhereSemijoinSubquery(statement, from_index + 1)) return .delete_joined_source;
+    if (statementHasMutationSourceTail(statement, from_index + 1)) return .delete_source;
+    return .delete;
+}
+
+fn statementHasForPortionBeforeKeyword(tokens: []const Token, start: usize, keyword: []const u8) bool {
+    const stop_index = parser.findTopLevelKeywordFromIndex(tokens, start, keyword) orelse tokens.len;
+    var index = start;
+    while (index + 1 < stop_index) : (index += 1) {
+        if (tokens[index].matchesKeyword("for") and tokens[index + 1].matchesKeyword("portion")) return true;
+    }
+    return false;
+}
+
+fn statementHasMutationSourceTail(tokens: []const Token, start: usize) bool {
+    if (firstTopLevelKeywordIndex(tokens, start, &.{ "order", "limit", "offset", "fetch" }) != null) return true;
+    var index = start;
+    while (index + 1 < tokens.len) : (index += 1) {
+        if (!tokens[index].matchesKeyword("for")) continue;
+        if (tokens[index + 1].matchesKeyword("update") or
+            tokens[index + 1].matchesKeyword("no") or
+            tokens[index + 1].matchesKeyword("share") or
+            tokens[index + 1].matchesKeyword("key"))
+        {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []const []const u8) ?usize {
@@ -399,12 +438,14 @@ test "sql adapter classifier identifies write statement families" {
         .{ .sql = "UPDATE usage_records SET status = source_records.status FROM source_records WHERE usage_records.id = source_records.id", .expected = .update_joined_source },
         .{ .sql = "UPDATE usage_records SET status = 'archived' WHERE id IN (SELECT id FROM archived_records) RETURNING id", .expected = .update_joined_source },
         .{ .sql = "UPDATE usage_records SET status = 'archived' WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.id = usage_records.id)", .expected = .update_joined_source },
-        .{ .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a'", .expected = .update },
+        .{ .sql = "UPDATE usage_records SET status = 'done' WHERE status = 'open' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED", .expected = .update_source },
+        .{ .sql = "UPDATE prices FOR PORTION OF valid_time FROM 3 TO 7 SET price = 99 WHERE sku = 'sku:a'", .expected = .update_source },
         .{ .sql = "DELETE FROM usage_records", .expected = .delete },
         .{ .sql = "DELETE FROM usage_records USING source_records WHERE usage_records.id = source_records.id", .expected = .delete_joined_source },
         .{ .sql = "DELETE FROM usage_records WHERE id IN (SELECT id FROM archived_records)", .expected = .delete_joined_source },
         .{ .sql = "DELETE FROM usage_records WHERE EXISTS (SELECT 1 FROM archived_records WHERE archived_records.id = usage_records.id)", .expected = .delete_joined_source },
-        .{ .sql = "DELETE FROM usage_records WHERE status = 'expired' ORDER BY expires_at USING < LIMIT 10 RETURNING id", .expected = .delete },
+        .{ .sql = "DELETE FROM usage_records WHERE status = 'expired' ORDER BY expires_at USING < LIMIT 10 RETURNING id", .expected = .delete_source },
+        .{ .sql = "DELETE FROM prices FOR PORTION OF valid_time FROM 2 TO 8 WHERE sku = 'sku:b'", .expected = .delete_source },
         .{ .sql = "TRUNCATE usage_records", .expected = .truncate },
         .{ .sql = "MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = source_rows.status", .expected = .merge },
     };

@@ -930,6 +930,7 @@ pub const SqlAdapterEdgeCase = struct {
     expected_inserted: ?u32 = null,
     expected_ddl_tag: ?SqlAdapterEdgeCaseDdlTag = null,
     expected_if_not_exists: ?bool = null,
+    omit_resolver: bool = false,
     params: []const SqlValue = &.{},
 };
 
@@ -971,6 +972,7 @@ pub const SqlAdapterEdgeCaseCoverage = struct {
     expression_conflict_target_rejection: bool = false,
     fail_closed_unterminated_comment: bool = false,
     malformed_placeholder_suffix: bool = false,
+    mutation_source_boundary: bool = false,
     point_lowerer_boundary: bool = false,
     preserved_comments_success: bool = false,
     typed_create_table_ddl: bool = false,
@@ -978,8 +980,10 @@ pub const SqlAdapterEdgeCaseCoverage = struct {
     typed_select_predicate: bool = false,
     typed_update_mutation: bool = false,
     write_kind_delete: bool = false,
+    write_kind_delete_source: bool = false,
     write_kind_delete_joined_source: bool = false,
     write_kind_update: bool = false,
+    write_kind_update_source: bool = false,
     write_kind_update_joined_source: bool = false,
 
     pub fn observe(self: *@This(), edge_case: SqlAdapterEdgeCase) !void {
@@ -1656,8 +1660,10 @@ fn sqlAdapterEdgeCaseExpectedErrorCoverageName(expected_error: []const u8) !?[]c
 fn sqlAdapterEdgeCaseWriteKindCoverageName(kind: classifier.SqlWriteStatementKind) []const u8 {
     return switch (kind) {
         .delete => "write_kind_delete",
+        .delete_source => "write_kind_delete_source",
         .delete_joined_source => "write_kind_delete_joined_source",
         .update => "write_kind_update",
+        .update_source => "write_kind_update_source",
         .update_joined_source => "write_kind_update_joined_source",
         else => "",
     };
@@ -1790,6 +1796,7 @@ fn parseSqlAdapterEdgeCaseAlloc(
         "expected_inserted",
         "expected_ddl_tag",
         "expected_if_not_exists",
+        "omit_resolver",
         "params",
         "sql",
     });
@@ -1820,6 +1827,7 @@ fn parseSqlAdapterEdgeCaseAlloc(
         else
             null,
         .expected_if_not_exists = try fixtureJsonOptionalBool(object, "expected_if_not_exists"),
+        .omit_resolver = (try fixtureJsonOptionalBool(object, "omit_resolver")) orelse false,
         .params = params,
     };
 }

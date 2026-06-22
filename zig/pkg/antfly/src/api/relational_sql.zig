@@ -1990,9 +1990,11 @@ fn lowerWritePlanParsedSqlAlloc(
             .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlAlloc,
             .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlAlloc,
             .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlAlloc,
+            .classify_update_selector = sql_adapter.classifyUpdateSelectorParsedSqlAlloc,
             .lower_update_with_resolver = lowerUpdateParsedSqlAlloc,
             .lower_update_source = lowerUpdateMutationSourceParsedSqlAlloc,
             .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlAlloc,
+            .classify_delete_selector = sql_adapter.classifyDeleteSelectorParsedSqlAlloc,
             .lower_delete_with_resolver = lowerDeleteParsedSqlAlloc,
             .lower_delete_source = lowerDeleteMutationSourceParsedSqlAlloc,
             .lower_truncate_source = lowerTruncateMutationSourceParsedSqlAlloc,
@@ -8319,7 +8321,7 @@ fn lowerWritePlanForSqlAdapterEdgeCaseAlloc(
     parsed_sql: *const sql_adapter.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const SqlValue,
-    resolver: relational_rows.UniqueSelectorResolver,
+    resolver: ?relational_rows.UniqueSelectorResolver,
 ) !LoweredWritePlan {
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{ .unique_resolver = resolver });
 }

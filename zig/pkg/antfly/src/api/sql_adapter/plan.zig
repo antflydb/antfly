@@ -693,6 +693,11 @@ pub fn writePlanFallbackError(primary_err: ?anyerror, fallback_err: anyerror) an
     return fallback_err;
 }
 
+pub const MutationSelectorKind = enum {
+    point,
+    source,
+};
+
 pub const WritePlanLoweringHooks = struct {
     ptr: *anyopaque,
     lower_recursive_insert_source: *const fn (*anyopaque, runtime_schema.TableSchema, relational_rows.UniqueSelectorResolver) anyerror!LoweredRecursiveInsertSource,
@@ -703,9 +708,11 @@ pub const WritePlanLoweringHooks = struct {
     lower_insert_source: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredInsertSource,
     lower_insert_source_with_schema: *const fn (*anyopaque, runtime_schema.TableSchema, relational_rows.UniqueSelectorResolver) anyerror!LoweredInsertSource,
     lower_update_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredJoinedMutationSource,
+    classify_update_selector: *const fn (*anyopaque, ?relational_rows.UniqueSelectorResolver) anyerror!MutationSelectorKind,
     lower_update: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredMutation,
     lower_update_source: *const fn (*anyopaque, db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource,
     lower_delete_joined_source: *const fn (*anyopaque, runtime_schema.TableSchema, db_mod.types.RowClaimRequest) anyerror!LoweredJoinedMutationSource,
+    classify_delete_selector: *const fn (*anyopaque, ?relational_rows.UniqueSelectorResolver) anyerror!MutationSelectorKind,
     lower_delete: *const fn (*anyopaque, relational_rows.UniqueSelectorResolver) anyerror!LoweredMutation,
     lower_delete_source: *const fn (*anyopaque, db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource,
     lower_truncate_source: *const fn (*anyopaque, db_mod.types.RowClaimRequest) anyerror!LoweredMutationSource,
@@ -727,6 +734,7 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
             return loweredWritePlanWithSyncLevel(.{ .recursive_insert_source = try hooks.lower_recursive_insert_source(hooks.ptr, source_schema, resolver) }, options.sync_level);
         },
         .update,
+        .update_source,
         .update_joined_source,
         => {
             const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
@@ -735,6 +743,7 @@ fn lowerRecursiveWritePlanWithHooksAlloc(
             return loweredWritePlanWithSyncLevel(.{ .recursive_update_joined_source = lowered }, options.sync_level);
         },
         .delete,
+        .delete_source,
         .delete_joined_source,
         => {
             const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
@@ -795,15 +804,21 @@ pub fn lowerWritePlanWithParsedSqlAlloc(
     }
 
     if (write_kind == .update) {
-        if (options.unique_resolver) |resolver| {
-            if (hooks.lower_update(hooks.ptr, resolver)) |lowered| {
-                return loweredWritePlanWithSyncLevel(.{ .update = lowered }, options.sync_level);
-            } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
+        switch (try hooks.classify_update_selector(hooks.ptr, options.unique_resolver)) {
+            .point => {
+                const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+                return loweredWritePlanWithSyncLevel(.{ .update = try hooks.lower_update(hooks.ptr, resolver) }, options.sync_level);
+            },
+            .source => {
+                const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+                return loweredWritePlanWithSyncLevel(.{ .update_source = try hooks.lower_update_source(hooks.ptr, row_claim) }, options.sync_level);
+            },
         }
-        if (options.row_claim) |row_claim| {
-            return loweredWritePlanWithSyncLevel(.{ .update_source = try hooks.lower_update_source(hooks.ptr, row_claim) }, options.sync_level);
-        }
-        return error.UnsupportedRowsSelector;
+    }
+
+    if (write_kind == .update_source) {
+        const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+        return loweredWritePlanWithSyncLevel(.{ .update_source = try hooks.lower_update_source(hooks.ptr, row_claim) }, options.sync_level);
     }
 
     if (write_kind == .update_joined_source) {
@@ -813,15 +828,21 @@ pub fn lowerWritePlanWithParsedSqlAlloc(
     }
 
     if (write_kind == .delete) {
-        if (options.unique_resolver) |resolver| {
-            if (hooks.lower_delete(hooks.ptr, resolver)) |lowered| {
-                return loweredWritePlanWithSyncLevel(.{ .delete = lowered }, options.sync_level);
-            } else |err| if (!sqlWritePlanFallbackAllowed(err)) return err;
+        switch (try hooks.classify_delete_selector(hooks.ptr, options.unique_resolver)) {
+            .point => {
+                const resolver = options.unique_resolver orelse return error.UnsupportedRowsSelector;
+                return loweredWritePlanWithSyncLevel(.{ .delete = try hooks.lower_delete(hooks.ptr, resolver) }, options.sync_level);
+            },
+            .source => {
+                const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+                return loweredWritePlanWithSyncLevel(.{ .delete_source = try hooks.lower_delete_source(hooks.ptr, row_claim) }, options.sync_level);
+            },
         }
-        if (options.row_claim) |row_claim| {
-            return loweredWritePlanWithSyncLevel(.{ .delete_source = try hooks.lower_delete_source(hooks.ptr, row_claim) }, options.sync_level);
-        }
-        return error.UnsupportedRowsSelector;
+    }
+
+    if (write_kind == .delete_source) {
+        const row_claim = options.row_claim orelse return error.UnsupportedRowsQuery;
+        return loweredWritePlanWithSyncLevel(.{ .delete_source = try hooks.lower_delete_source(hooks.ptr, row_claim) }, options.sync_level);
     }
 
     if (write_kind == .delete_joined_source) {
@@ -2098,7 +2119,19 @@ fn lowerReadPlanKindWithHooks(hooks: ReadPlanLoweringHooks, kind: classifier.Sql
         .recursive_cte => .{ .recursive_cte = try hooks.lower_recursive_cte(hooks.ptr) },
         .join => .{ .join = try hooks.lower_join(hooks.ptr) },
         .query => .{ .query = try hooks.lower_query(hooks.ptr) },
-        .set_operation => .{ .set_operation = try hooks.lower_set_operation(hooks.ptr) },
+        .set_operation => blk: {
+            // Some set-operation syntax has a proven equivalent row-query plan
+            // (for example disjoint UNION ALL predicates). Keep that optimizer
+            // scoped to the parsed set-operation variant; unproved shapes use
+            // the native set-operation plan below.
+            if (hooks.lower_query(hooks.ptr)) |lowered| {
+                break :blk .{ .query = lowered };
+            } else |err| switch (err) {
+                error.UnsupportedSqlShape => {},
+                else => return err,
+            }
+            break :blk .{ .set_operation = try hooks.lower_set_operation(hooks.ptr) };
+        },
     };
 }
 

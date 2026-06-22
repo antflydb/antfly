@@ -284,10 +284,16 @@ Current implementation status:
   families from the shared token stream.
 - Parsed read lowering dispatches strictly through the parsed statement
   variant. The lower-level hook API fails closed when a caller does not supply
-  a statement kind. Set-operation-shaped SQL routes through its native
-  set-operation variant rather than a query-first probe.
+  a statement kind. Set-operation-shaped SQL routes through the parsed
+  set-operation variant; that variant may emit a native row-query plan when the
+  set algebra has a proven equivalent query rewrite, otherwise it emits the
+  native set-operation plan.
 - Write lowering consumes `TokenizedSql` for write-family selection instead of
-  tokenizing separately from classification.
+  tokenizing separately from classification. Syntactic mutation-source forms
+  such as row-claimed, ordered/paginated, and temporal `FOR PORTION` `UPDATE`
+  and `DELETE` statements classify directly as `update_source` / `delete_source`
+  variants; ambiguous non-unique selectors still need binder-owned selector
+  proof before the point-write fallback can be removed completely.
 - `ParsedSql` wraps `TokenizedSql` with a raw statement view and byte-source
   span. DDL lowering, catalog-apply test lowering, read statement dispatch, and
   write statement dispatch now use that shared wrapper as the top-level SQL
@@ -632,6 +638,42 @@ acceptance bar is that every supported SQL statement has the same durable effect
 as the equivalent Antfly-native API call, every unsupported statement names the
 missing native model, and no internal subsystem needs to recover semantics from
 SQL strings after binding.
+
+### Production Acceptance Checklist
+
+The production cutoff should be based on removing adapter-local behavior, not
+on adding more PostgreSQL syntax. A SQL statement family is production-shaped
+only when all of these are true:
+
+- External entrypoints parse once into `ParsedSql`; nested statements reuse
+  parsed children or source token ranges, never reconstructed SQL strings.
+- Catalog-aware statements bind once into `BoundSqlStatement`, carrying the
+  SQL session, resolved catalog targets, object versions, source schemas,
+  authorization results, and dependency facts needed by planning.
+- Dispatch is variant-based. Read, write, DDL, session, explain, and
+  transaction planning route from typed statement variants and explicit
+  statement kinds instead of "try lowerer A, then lowerer B" probing.
+- Durable behavior is native. Catalog, table, namespace, database, tablespace,
+  index, extension, role, lake, backup/restore, and job effects are expressed
+  as shared Antfly lifecycle or execution plans.
+- The metadata/catalog owner admits and records lifecycle jobs for asynchronous
+  work. SQL can prepare and validate the request, but it does not separately
+  commit catalog transitions or schedule durable background work.
+- Backend storage/read/write vtables receive typed catalog targets and typed
+  plans. Compatibility storage keys and foreign-source query-string bridges are
+  treated as migration debt.
+- Diagnostics carry phase and span. Unsupported SQL has a stable parse, bind,
+  plan, or execute error that names the missing native model and points at the
+  relevant source range.
+- Fixture and parity checks consume structured summaries or coverage bits from
+  parser, binder, planner, and lowerer phases, not substring scans over SQL or
+  fingerprints.
+
+Compatibility wrappers are acceptable only at ingress boundaries and tests.
+Their job is to build or receive `ParsedSql`, invoke the shared binder/planner,
+and disappear once the caller can use the typed API directly. New features
+should be rejected in review if they add another durable SQL-string bridge, an
+adapter-owned metadata path, or a second parser hidden inside fixture checking.
 
 ## Parity and Test Strategy
 

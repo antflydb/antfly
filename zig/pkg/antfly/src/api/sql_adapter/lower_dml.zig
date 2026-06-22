@@ -2286,6 +2286,81 @@ pub fn parsePointWhereJsonAlloc(
     return try out.toOwnedSlice();
 }
 
+fn pointSelectorTailComplete(tokens: []const Token, pos: usize) bool {
+    if (pos >= tokens.len) return true;
+    if (tokens[pos].kind == .semicolon) return pos + 1 == tokens.len;
+    return tokens[pos].matchesKeyword("returning");
+}
+
+fn classifyParsedPointWhereAlloc(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    where_json: []const u8,
+    schema: runtime_schema.TableSchema,
+    resolver: ?relational_rows.UniqueSelectorResolver,
+) !plan_mod.MutationSelectorKind {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, where_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    const key = relational_rows.physicalPrimaryKeyFromWhereAlloc(alloc, table_name, schema, parsed.value, resolver, true) catch |err| switch (err) {
+        error.UnsupportedRowsSelector => return .point,
+        error.InvalidRowsRequest => return .source,
+        else => return err,
+    };
+    if (key) |owned_key| alloc.free(owned_key);
+    return .point;
+}
+
+pub fn classifyUpdateSelectorParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    resolver: ?relational_rows.UniqueSelectorResolver,
+) !plan_mod.MutationSelectorKind {
+    const tokens = parsed_sql.items();
+    var pos: usize = 0;
+    try parser.expectKeyword(tokens, &pos, "update");
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    defer plan_mod.freeTableAlias(alloc, target_table);
+
+    const where_index = parser.findTopLevelKeywordFromIndex(tokens, pos, "where") orelse return .source;
+    pos = where_index + 1;
+    const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+    const where_json = parsePointWhereJsonAlloc(alloc, tokens, &pos, params, schema, &selector_qualifiers, 0) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return .source,
+        else => return err,
+    };
+    defer alloc.free(where_json);
+    if (!pointSelectorTailComplete(tokens, pos)) return .source;
+    return try classifyParsedPointWhereAlloc(alloc, target_table.name, where_json, schema, resolver);
+}
+
+pub fn classifyDeleteSelectorParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    resolver: ?relational_rows.UniqueSelectorResolver,
+) !plan_mod.MutationSelectorKind {
+    const tokens = parsed_sql.items();
+    var pos: usize = 0;
+    try parser.expectKeyword(tokens, &pos, "delete");
+    try parser.expectKeyword(tokens, &pos, "from");
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    defer plan_mod.freeTableAlias(alloc, target_table);
+
+    const where_index = parser.findTopLevelKeywordFromIndex(tokens, pos, "where") orelse return .source;
+    pos = where_index + 1;
+    const selector_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+    const where_json = parsePointWhereJsonAlloc(alloc, tokens, &pos, params, schema, &selector_qualifiers, 0) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return .source,
+        else => return err,
+    };
+    defer alloc.free(where_json);
+    if (!pointSelectorTailComplete(tokens, pos)) return .source;
+    return try classifyParsedPointWhereAlloc(alloc, target_table.name, where_json, schema, resolver);
+}
+
 pub fn parseConflictUpdateSetAssignmentAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -12228,9 +12303,11 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
             .lower_insert_source_with_resolver = lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc,
             .lower_insert_source_with_schemas = lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
             .lower_update_joined_source_with_schemas = lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .classify_update_selector = classifyUpdateSelectorParsedSqlAlloc,
             .lower_update_with_resolver = lowerUpdateParsedSqlForDmlTestAlloc,
             .lower_update_source = lowerUpdateMutationSourceParsedSqlForDmlTestAlloc,
             .lower_delete_joined_source_with_schemas = lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
+            .classify_delete_selector = classifyDeleteSelectorParsedSqlAlloc,
             .lower_delete_with_resolver = lowerDeleteParsedSqlForDmlTestAlloc,
             .lower_delete_source = lowerDeleteMutationSourceParsedSqlForDmlTestAlloc,
             .lower_truncate_source = lowerTruncateMutationSourceParsedSqlForDmlTestAlloc,

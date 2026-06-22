@@ -18,6 +18,7 @@
     "expression_conflict_target_rejection",
     "fail_closed_unterminated_comment",
     "malformed_placeholder_suffix",
+    "mutation_source_boundary",
     "point_lowerer_boundary",
     "preserved_comments_success",
     "typed_create_table_ddl",
@@ -26,7 +27,9 @@
     "typed_update_mutation",
     "write_kind_delete",
     "write_kind_delete_joined_source",
+    "write_kind_delete_source",
     "write_kind_update",
-    "write_kind_update_joined_source"
+    "write_kind_update_joined_source",
+    "write_kind_update_source"
   ]
 }

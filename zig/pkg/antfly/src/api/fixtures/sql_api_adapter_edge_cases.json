@@ -91,7 +91,18 @@
       "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
     },
     {
-      "name": "non-unique update write plan requires row selector",
+      "name": "non-unique update write plan requires row claim",
+      "action": "write_plan",
+      "coverage": [
+        "action_write_plan",
+        "expected_error_unsupported_rows_query",
+        "mutation_source_boundary"
+      ],
+      "expected_error": "unsupported_rows_query",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
+    },
+    {
+      "name": "point update write plan requires resolver",
       "action": "write_plan",
       "coverage": [
         "action_write_plan",
@@ -99,7 +110,8 @@
         "point_lowerer_boundary"
       ],
       "expected_error": "unsupported_rows_selector",
-      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
+      "omit_resolver": true,
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE id = 'u1'"
     },
     {
       "name": "malformed update placeholder suffix",
@@ -143,6 +155,16 @@
       ],
       "expected_write_kind": "update",
       "sql": "UPDATE users SET organization_id = 'o2' WHERE id = 'u1'"
+    },
+    {
+      "name": "claimed ordered update classifies as update source",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_update_source"
+      ],
+      "expected_write_kind": "update_source",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED"
     },
     {
       "name": "cte semijoin update classifies as joined source update",
@@ -197,6 +219,16 @@
       ],
       "expected_write_kind": "delete",
       "sql": "DELETE FROM users WHERE id = 'u1'"
+    },
+    {
+      "name": "claimed ordered delete classifies as delete source",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_delete_source"
+      ],
+      "expected_write_kind": "delete_source",
+      "sql": "DELETE FROM users WHERE organization_id = 'o1' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED"
     },
     {
       "name": "cte semijoin delete classifies as joined source delete",
