@@ -219,6 +219,7 @@ pub const TokenKeyword = enum {
     percentile_disc,
     period,
     portion,
+    position,
     power,
     prepare,
     prepared,

@@ -855,6 +855,9 @@ Current implementation status:
 - Expression helper function-call probes use token keyword metadata for common
   scalar, array, text, UUID, datetime, and math function families instead of
   rechecking function-name text.
+- `POSITION(...)` is tokenized as a first-class function keyword, keeping
+  expression-start and function-call probes on the same token-tag path as
+  `ARRAY_POSITION`, `STRPOS`, and the other text/array helpers.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.
@@ -1398,6 +1401,8 @@ The parity suite should assert:
   catalog behavior;
 - session state affects name resolution only through the typed SQL session;
 - fixtures validate structural plan summaries, not arbitrary non-empty strings;
+- EXPLAIN fixtures validate the structured inner plan family, including MERGE,
+  instead of accepting a generic write plan wrapper;
 - bind parameters, aliases, CTE output schemas, result schemas, and catalog
   targets are checked structurally.
 

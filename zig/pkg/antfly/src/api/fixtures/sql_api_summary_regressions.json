@@ -156,6 +156,30 @@
       ]
     },
     {
+      "name": "explain merge write plans expose structured inner merge",
+      "entry": {
+        "name": "explain merge",
+        "sql": "EXPLAIN MERGE INTO usage_records USING staged_records ON usage_records.id = staged_records.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN DO NOTHING",
+        "family": "explain",
+        "summary": {
+          "matched_predicates": 1,
+          "matched_delete": true,
+          "not_matched_predicates": 0,
+          "not_matched_do_nothing": true
+        },
+        "plan": "explain:kind=write:analyze=false:inner=merge_mutation:target=usage_records:source=staged_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0"
+      },
+      "expect_true": [
+        "allows_merge_arm",
+        "explain_plan_has_write_kind",
+        "explain_write_inner_merge",
+        "merge_arm_matches_plan"
+      ],
+      "expect_false": [
+        "explain_write_inner_insert"
+      ]
+    },
+    {
       "name": "aggregate summaries match structured plans",
       "entry": {
         "name": "aggregate",

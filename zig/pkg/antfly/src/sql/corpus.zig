@@ -821,6 +821,7 @@ const app_parity_summary_regression_assertions = [_][]const u8{
     "explain_plan_has_read_kind",
     "explain_plan_has_write_kind",
     "explain_write_inner_insert",
+    "explain_write_inner_merge",
     "full_query_output_matches",
     "join_on_matches_1",
     "join_select_matches_1",
@@ -1956,6 +1957,7 @@ fn appParitySummaryRegressionAssertion(entry: AppParityCorpusEntry, name: []cons
     if (std.mem.eql(u8, name, "explain_plan_has_write_kind")) return explainPlanHasKind(entry.plan, "write");
     if (std.mem.eql(u8, name, "explain_plan_has_read_kind")) return explainPlanHasKind(entry.plan, "read");
     if (std.mem.eql(u8, name, "explain_write_inner_insert")) return corpusExplainWriteInnerHasPrefix(entry, ":inner=insert:");
+    if (std.mem.eql(u8, name, "explain_write_inner_merge")) return corpusExplainWriteInnerHasPrefix(entry, ":inner=merge_mutation:");
     if (std.mem.eql(u8, name, "read_plan_has_query_prefix")) return corpusReadPlanHasPrefix(entry, "read:query:");
     if (std.mem.eql(u8, name, "plan_analyze_true_token")) return planHasExactBoolToken(entry.plan, ":analyze=", true);
     if (std.mem.eql(u8, name, "plan_format_present")) return planHasStringToken(entry.plan, ":format=");

@@ -24,6 +24,7 @@
     "explain_plan_has_read_kind",
     "explain_plan_has_write_kind",
     "explain_write_inner_insert",
+    "explain_write_inner_merge",
     "full_query_output_matches",
     "join_on_matches_1",
     "join_select_matches_1",
