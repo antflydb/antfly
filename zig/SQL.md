@@ -1006,6 +1006,9 @@ Current implementation status:
 - SQL routine trigger DDL runtime helpers accept `ParsedSql` directly, and the
   HTTP DDL fallback path reuses the parsed statement when installing or
   dropping trigger metadata instead of spinning up a private tokenizer.
+- User-manager role and row-security DDL execution can consume parsed or
+  already-lowered DDL plans directly, and HTTP SQL DDL reuses its existing
+  lowered plan for auth catalog lookup and user-manager execution.
 - DDL plan lowering now lives behind `sql_adapter` exports; auth role/row
   security execution, catalog jobs, notifications, and extension lifecycle use
   adapter-native plan types instead of importing the broader relational SQL

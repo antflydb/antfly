@@ -74,6 +74,18 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
     return try executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, alloc, plan, catalog);
 }
 
+pub fn executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindings(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    catalog: SqlAuthCatalog,
+    function_bindings: sql_adapter.SqlFunctionBindings,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
+    var plan = try sql_adapter.lowerDdlPlanParsedSqlWithFunctionBindingsAlloc(alloc, parsed_sql, function_bindings);
+    defer plan.deinit(alloc);
+    return try executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, alloc, plan, catalog);
+}
+
 pub fn executeRelationalSqlDdlPlanOnUserManagerWithCatalog(
     manager: *usermgr.UserManager,
     alloc: std.mem.Allocator,
@@ -794,7 +806,9 @@ test "sql auth adapter creates roles and applies table grants through user manag
 
     try std.testing.expectError(error.RoleNotFound, executeRelationalSqlDdlOnUserManager(&manager, alloc, "GRANT SELECT ON TABLE usage_records TO app_writer;"));
 
-    var created = (try executeRelationalSqlDdlOnUserManager(&manager, alloc, "CREATE ROLE app_writer;")).?;
+    var create_role_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "CREATE ROLE app_writer;");
+    defer create_role_sql.deinit(alloc);
+    var created = (try executeRelationalSqlDdlParsedSqlOnUserManagerWithCatalogAndFunctionBindings(&manager, alloc, &create_role_sql, .{}, .{})).?;
     defer created.deinit(alloc);
 
     const subjects_after_create = try manager.listAuthSubjects();

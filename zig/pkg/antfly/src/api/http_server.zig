@@ -4368,9 +4368,9 @@ pub const ApiHttpServer = struct {
         }
 
         if (self.cfg.user_manager) |manager| {
-            var catalog = try self.sqlAuthCatalogForDdlWithSession(sql, session.session());
+            var catalog = try self.sqlAuthCatalogForDdlPlanWithSession(plan, session.session());
             defer catalog.deinit(self.alloc);
-            if (try auth_sql_adapter.executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(manager, self.alloc, sql, catalog.value, function_bindings)) |applied_value| {
+            if (try auth_sql_adapter.executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, self.alloc, plan, catalog.value)) |applied_value| {
                 var applied = applied_value;
                 errdefer applied.deinit(self.alloc);
                 try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -6355,6 +6355,10 @@ pub const ApiHttpServer = struct {
             else => return err,
         };
         defer plan.deinit(self.alloc);
+        return try self.sqlAuthCatalogForDdlPlanWithSession(plan, session);
+    }
+
+    fn sqlAuthCatalogForDdlPlanWithSession(self: *ApiHttpServer, plan: sql_adapter.LoweredDdlPlan, session: catalog_resources.SqlCatalogSession) !OwnedSqlAuthCatalog {
         const needs_table_catalog = switch (plan) {
             .authorization_catalog => |authorization_plan| switch (authorization_plan) {
                 .grant_privilege => |grant| std.ascii.eqlIgnoreCase(grant.object_kind, "table") or std.ascii.eqlIgnoreCase(grant.object_kind, "all_tables_in_schema"),
