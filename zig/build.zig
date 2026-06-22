@@ -4031,6 +4031,8 @@ pub fn build(b: *std.Build) void {
             "sql adapter plan resolves join CTE sides to physical base table",
             "sql adapter plan clones query check without catalog name",
             "sql adapter lower expr lowers recursive cte stream contract",
+            "document SQL lowers algebraic grouped count over indexed facts",
+            "document SQL rejects algebraic group by without indexed facts",
             "sql adapter ddl plan lowers create index ddl",
             "sql adapter query function dispatch uses token keyword metadata",
             "sql adapter query function lowers antfly query functions into native search requests",

@@ -64,6 +64,48 @@ pub const DocumentIndexQuery = struct {
     }
 };
 
+pub const DocumentAggregateOp = enum {
+    count,
+};
+
+pub const DocumentAggregateGroupBy = struct {
+    field: []const u8,
+    field_type: runtime_schema.AntflyType,
+    output: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.field.len > 0) alloc.free(@constCast(self.field));
+        if (self.output.len > 0) alloc.free(@constCast(self.output));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentAggregateSpec = struct {
+    op: DocumentAggregateOp,
+    output: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.output.len > 0) alloc.free(@constCast(self.output));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentAlgebraicAggregatePlan = struct {
+    table_name: []const u8,
+    filter_query_json: ?[]const u8 = null,
+    group_by: ?DocumentAggregateGroupBy = null,
+    aggregate: DocumentAggregateSpec,
+    limit: ?u32 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        if (self.filter_query_json) |filter| alloc.free(@constCast(filter));
+        if (self.group_by) |*group_by| group_by.deinit(alloc);
+        self.aggregate.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const DocumentOrderDirection = enum {
     asc,
     desc,
@@ -177,6 +219,66 @@ pub fn lowerDocumentReadPlanParsedSqlAlloc(
         .projection = projection,
         .producer = producer,
         .order_by = order_by,
+        .limit = limit,
+    };
+}
+
+pub fn lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+) !DocumentAlgebraicAggregatePlan {
+    if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    if (parsed_sql.statement.readKind() != .aggregate) return error.UnsupportedSqlShape;
+
+    const tokens = parsed_sql.items();
+    if (tokens.len == 0 or !tokens[0].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
+
+    const from_index = findTopLevelKeyword(tokens, .from) orelse return error.UnsupportedSqlShape;
+    const where_index = findTopLevelKeyword(tokens, .where);
+    const group_index = findTopLevelKeyword(tokens, .group);
+    const having_index = findTopLevelKeyword(tokens, .having);
+    const order_index = findTopLevelKeyword(tokens, .order);
+    const limit_index = findTopLevelKeyword(tokens, .limit);
+    if (having_index != null or order_index != null or
+        findTopLevelKeyword(tokens, .join) != null or
+        findTopLevelKeyword(tokens, .window) != null)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (from_index + 1 >= tokens.len or tokens[from_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
+    const table_name = try alloc.dupe(u8, tokens[from_index + 1].text);
+    errdefer alloc.free(table_name);
+
+    const tail_start = minOptionalIndex(where_index, group_index, limit_index) orelse tokens.len;
+    try validateFromTail(tokens[from_index + 2 .. tail_start]);
+
+    var aggregate = try parseDocumentAggregateSpecAlloc(alloc, tokens[1..from_index]);
+    errdefer aggregate.deinit(alloc);
+
+    const limit = if (limit_index) |idx| try parseLimit(tokens, idx) else null;
+    var group_by = if (group_index) |idx|
+        try parseDocumentAggregateGroupByAlloc(alloc, tokens, idx, limit_index orelse tokens.len, schema)
+    else
+        null;
+    errdefer if (group_by) |*group| group.deinit(alloc);
+
+    const filter_query_json: ?[]const u8 = if (where_index) |idx| blk: {
+        var producer = try parseWhereProducerAlloc(alloc, tokens, idx, group_index orelse limit_index orelse tokens.len, schema);
+        defer producer.deinit(alloc);
+        break :blk switch (producer) {
+            .indexed_query => |query| try documentAggregateFilterFromIndexQueryAlloc(alloc, query),
+            else => return error.UnsupportedSqlShape,
+        };
+    } else null;
+    errdefer if (filter_query_json) |filter| alloc.free(@constCast(filter));
+
+    return .{
+        .table_name = table_name,
+        .filter_query_json = filter_query_json,
+        .group_by = group_by,
+        .aggregate = aggregate,
         .limit = limit,
     };
 }
@@ -462,6 +564,62 @@ fn parseOrderByAlloc(
     };
 }
 
+fn parseDocumentAggregateSpecAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !DocumentAggregateSpec {
+    const aliased = try splitProjectionAlias(tokens);
+    const expression = aliased.expression;
+    if (expression.len != 4 or
+        !expression[0].matchesKeywordTag(.count) or
+        expression[1].kind != .lparen or
+        expression[2].kind != .star or
+        expression[3].kind != .rparen)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    return .{
+        .op = .count,
+        .output = try alloc.dupe(u8, aliased.output orelse "count"),
+    };
+}
+
+fn parseDocumentAggregateGroupByAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    group_index: usize,
+    end_index: usize,
+    schema: runtime_schema.TableSchema,
+) !DocumentAggregateGroupBy {
+    if (group_index + 2 >= end_index) return error.UnsupportedSqlShape;
+    if (!tokens[group_index + 1].matchesKeywordTag(.by)) return error.UnsupportedSqlShape;
+    const group_tokens = tokens[group_index + 2 .. end_index];
+    if (group_tokens.len == 0) return error.UnsupportedSqlShape;
+    if (findComma(group_tokens, 0) != null) return error.UnsupportedSqlShape;
+
+    var field = (try documentAggregateFieldForExpressionAlloc(alloc, group_tokens, schema)) orelse return error.UnsupportedSqlShape;
+    errdefer field.deinit(alloc);
+    const output = try alloc.dupe(u8, documentAggregateOutputName(group_tokens));
+    errdefer alloc.free(output);
+    return .{
+        .field = field.takePath(),
+        .field_type = field.field_type,
+        .output = output,
+    };
+}
+
+fn documentAggregateOutputName(tokens: []const Token) []const u8 {
+    if (tokens.len == 1 and tokens[0].kind == .identifier) return tokens[0].text;
+    if (tokens.len > 0 and tokens[tokens.len - 1].kind == .string) return tokens[tokens.len - 1].text;
+    return "group";
+}
+
+fn documentAggregateFilterFromIndexQueryAlloc(alloc: std.mem.Allocator, query: DocumentIndexQuery) !?[]const u8 {
+    if (query.full_text_query != null) return error.UnsupportedSqlShape;
+    if (query.filter_query_json) |filter| return try alloc.dupe(u8, filter);
+    return null;
+}
+
 fn parseWhereClauseIntoAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -694,6 +852,19 @@ fn documentOrderFieldForExpressionAlloc(
     return .{
         .path = try alloc.dupe(u8, expression.path),
         .field_type = exact_column.field_type,
+    };
+}
+
+fn documentAggregateFieldForExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+) !?DocumentFilterField {
+    var field = (try documentFilterFieldForExpressionAlloc(alloc, tokens, schema)) orelse return null;
+    errdefer field.deinit(alloc);
+    return switch (field.field_type) {
+        .keyword, .numeric, .boolean, .datetime, .geopoint, .geoshape => field,
+        else => error.UnsupportedSqlShape,
     };
 }
 
@@ -994,6 +1165,42 @@ test "document SQL rejects order by over indexed query until native ordering exi
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, status FROM docs WHERE status = 'active' ORDER BY status ASC LIMIT 10");
     defer parsed.deinit(alloc);
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDocumentReadPlanParsedSqlAlloc(alloc, &parsed, schema));
+}
+
+test "document SQL lowers algebraic grouped count over indexed facts" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+            .{ .name = "plan", .path = "metadata/plan", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE status = 'active' GROUP BY plan LIMIT 5");
+    defer parsed.deinit(alloc);
+    var lowered = try lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &parsed, schema);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", lowered.table_name);
+    try std.testing.expectEqual(DocumentAggregateOp.count, lowered.aggregate.op);
+    try std.testing.expectEqualStrings("row_count", lowered.aggregate.output);
+    try std.testing.expectEqualStrings("/metadata/plan", lowered.group_by.?.field);
+    try std.testing.expectEqualStrings("plan", lowered.group_by.?.output);
+    try std.testing.expect(lowered.filter_query_json != null);
+    try std.testing.expectEqual(@as(?u32, 5), lowered.limit);
+}
+
+test "document SQL rejects algebraic group by without indexed facts" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = true, .index_lifecycle = .ready },
+            .{ .name = "plan", .path = "metadata/plan", .field_type = .keyword, .indexed = false },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE status = 'active' GROUP BY plan");
+    defer parsed.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, &parsed, schema));
 }
 
 test "document SQL lowers json path projection" {

@@ -283,7 +283,12 @@ fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
 ) !plan.LoweredReadPlan {
     _ = params;
     _ = function_bindings;
-    return .{ .document_query = try @import("document_plan.zig").lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) };
+    const document_plan = @import("document_plan.zig");
+    return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
+        .aggregate => .{ .document_aggregate = try document_plan.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
+        .query => .{ .document_query = try document_plan.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 fn lowerReadPlanWithSourceSchemaParsedSqlForLoweringContextTestAlloc(

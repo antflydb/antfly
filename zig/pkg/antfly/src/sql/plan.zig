@@ -2049,6 +2049,7 @@ pub const LateralSubquery = struct {
 pub const LoweredReadPlan = union(enum) {
     query: LoweredQueryPlan,
     document_query: document_plan.DocumentReadPlan,
+    document_aggregate: document_plan.DocumentAlgebraicAggregatePlan,
     set_operation: LoweredSetOperationPlan,
     recursive_cte: LoweredRecursiveCtePlan,
     aggregate: LoweredAggregatePlan,
@@ -2060,6 +2061,7 @@ pub const LoweredReadPlan = union(enum) {
         switch (self.*) {
             .query => |*query| query.deinit(alloc),
             .document_query => |*document_query| document_query.deinit(alloc),
+            .document_aggregate => |*document_aggregate| document_aggregate.deinit(alloc),
             .set_operation => |*set_operation| set_operation.deinit(alloc),
             .recursive_cte => |*recursive_cte| recursive_cte.deinit(alloc),
             .aggregate => |*aggregate| aggregate.deinit(alloc),

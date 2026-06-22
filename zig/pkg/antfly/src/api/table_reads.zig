@@ -4851,6 +4851,19 @@ pub fn executeLoweredSqlReadPlanWithSessionAlloc(
             errdefer result.deinit(alloc);
             break :blk .{ .document_query = result };
         },
+        .document_aggregate => |lowered| blk: {
+            var result = (try executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
+                alloc,
+                source,
+                catalog,
+                session,
+                default_table_name,
+                lowered,
+                consistency,
+            )) orelse break :blk null;
+            errdefer result.deinit(alloc);
+            break :blk .{ .aggregate = result };
+        },
         .set_operation => |lowered| blk: {
             var result = (try executeLoweredSqlSetOperationPlanAlloc(
                 alloc,
@@ -4990,7 +5003,7 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
             }
         },
         .indexed_query => |query| {
-            var query_req = try documentSqlIndexQueryRequestAlloc(alloc, native_table_name, query, lowered.limit);
+            var query_req = try documentSqlIndexQueryRequestAlloc(alloc, native_table_name, query, lowered.limit, false);
             defer query_req.deinit(alloc);
             var query_response = (try source.query(alloc, native_table_name, query_req.req, consistency)) orelse return null;
             defer query_response.deinit(alloc);
@@ -5026,6 +5039,25 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
         .rows = try rows.toOwnedSlice(alloc),
         .total = total,
     };
+}
+
+fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    lowered: sql_adapter_runtime.DocumentAlgebraicAggregatePlan,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsAggregateResult {
+    _ = alloc;
+    _ = source;
+    _ = catalog;
+    _ = session;
+    _ = default_table_name;
+    _ = lowered;
+    _ = consistency;
+    return error.UnsupportedSqlShape;
 }
 
 const DocumentSqlSortKey = union(enum) {
@@ -5241,6 +5273,7 @@ fn documentSqlIndexQueryRequestAlloc(
     table_name: []const u8,
     query: sql_adapter_runtime.DocumentIndexQuery,
     limit: ?u32,
+    include_documents: bool,
 ) !query_api.OwnedQueryRequest {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
@@ -5257,6 +5290,9 @@ fn documentSqlIndexQueryRequestAlloc(
     }
     if (limit) |value| {
         try appendJsonFieldU32(alloc, &out, &first, "limit", value);
+    }
+    if (include_documents) {
+        try appendJsonFieldBool(alloc, &out, &first, "include_documents", true);
     }
     try out.append(alloc, '}');
     const body = try out.toOwnedSlice(alloc);
@@ -5302,6 +5338,59 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
         var lookup = (try source.lookup(alloc, table_name, id_value.string, .{}, consistency)) orelse continue;
         defer lookup.deinit(alloc);
         try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, id_value.string, lookup.json, projection));
+    }
+}
+
+fn appendDocumentSqlFullRowsFromQueryResponseAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    table_name: []const u8,
+    response_json: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    rows: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const responses_value = parsed.value.object.get("responses") orelse return error.InvalidRowsRequest;
+    if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidRowsRequest;
+    const first_response = responses_value.array.items[0];
+    if (first_response != .object) return error.InvalidRowsRequest;
+    const hits_value = first_response.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hits_value != .object) return error.InvalidRowsRequest;
+    const hit_items = hits_value.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hit_items != .array) return error.InvalidRowsRequest;
+
+    for (hit_items.array.items) |hit_value| {
+        if (hit_value != .object) return error.InvalidRowsRequest;
+        const id_value = hit_value.object.get("_id") orelse return error.InvalidRowsRequest;
+        if (id_value != .string) return error.InvalidRowsRequest;
+        if (hit_value.object.get("_source")) |source_value| {
+            if (source_value == .object) {
+                try rows.append(alloc, try std.json.Stringify.valueAlloc(alloc, source_value, .{}));
+                continue;
+            }
+            if (source_value != .null) return error.InvalidRowsRequest;
+        }
+
+        var lookup = (try source.lookup(alloc, table_name, id_value.string, .{}, consistency)) orelse continue;
+        defer lookup.deinit(alloc);
+        try rows.append(alloc, try alloc.dupe(u8, lookup.json));
+    }
+}
+
+fn appendDocumentSqlFullRowsFromScanAlloc(
+    alloc: std.mem.Allocator,
+    ndjson: []const u8,
+    rows: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var lines = std.mem.splitScalar(u8, ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRowsRequest;
+        try rows.append(alloc, try std.json.Stringify.valueAlloc(alloc, parsed.value, .{}));
     }
 }
 
@@ -5896,6 +5985,20 @@ fn catalogRuntimeSchemaUnlessDefaultAlloc(
     const runtime_schema = schema_api.deriveRuntimeTableSchema(alloc, parsed_schema) catch return error.InvalidRowsRequest;
     errdefer storage_schema.freeSchema(alloc, runtime_schema);
     if (runtime_schema.storage_mode != .relational or runtime_schema.primary_key == null) return error.InvalidRowsRequest;
+    return runtime_schema;
+}
+
+fn catalogRuntimeSchemaForTableAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+) !storage_schema.TableSchema {
+    const schema_json = (try table_catalog.tableSchemaJsonAlloc(alloc, catalog, table_name)) orelse return error.TableNotFound;
+    defer alloc.free(schema_json);
+    var parsed_schema = schema_api.parseValidatedTableSchema(alloc, schema_json) catch return error.InvalidRowsRequest;
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = schema_api.deriveRuntimeTableSchema(alloc, parsed_schema) catch return error.InvalidRowsRequest;
+    errdefer storage_schema.freeSchema(alloc, runtime_schema);
     return runtime_schema;
 }
 

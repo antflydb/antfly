@@ -31,6 +31,7 @@ const usermgr = @import("../usermgr/mod.zig");
 // storage-backed execution helpers keep their current owning modules.
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
+pub const DocumentAlgebraicAggregatePlan = sql_adapter.DocumentAlgebraicAggregatePlan;
 pub const DocumentIndexQuery = sql_adapter.DocumentIndexQuery;
 pub const DocumentOrderBy = sql_adapter.DocumentOrderBy;
 pub const DocumentOrderDirection = sql_adapter.DocumentOrderDirection;
@@ -838,7 +839,11 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
 ) !LoweredReadPlan {
     if (schema.storage_mode == .document) {
         if (source_schema != null) return error.UnsupportedSqlShape;
-        return .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) };
+        return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
+            .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, schema) },
+            .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) },
+            else => error.UnsupportedSqlShape,
+        };
     }
     var context = sql_adapter.ReadPlanLoweringContext{
         .alloc = alloc,
@@ -1041,7 +1046,11 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
 ) !LoweredReadPlan {
     _ = params;
     _ = function_bindings;
-    return .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) };
+    return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
+        .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
+        .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, document.schema) },
+        else => error.UnsupportedSqlShape,
+    };
 }
 
 pub fn lowerExplainPlanAlloc(
