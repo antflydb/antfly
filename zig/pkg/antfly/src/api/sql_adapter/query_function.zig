@@ -373,16 +373,23 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
         return error.UnsupportedSqlShape;
     }
 
+    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
+        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
     var lowered = try lowerParsedAntflyQueryFunctionAlloc(alloc, null, function, args.items);
     defer lowered.deinit(alloc);
     if (lowered.req.graph_queries.len != 1) return error.UnsupportedSqlShape;
     if (lowered.req.full_text != null or lowered.req.dense != null or lowered.req.sparse != null) return error.UnsupportedSqlShape;
 
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
     const graph_queries = lowered.req.graph_queries;
     const graph_query = graph_queries[0];
     lowered.req.graph_queries = &.{};
     if (graph_queries.len > 0) alloc.free(@constCast(graph_queries));
-    return .{ .graph_query = graph_query };
+    return .{ .graph_query = .{
+        .table_name = owned_table_name,
+        .query = graph_query,
+    } };
 }
 
 fn lowerParsedAntflyQueryFunctionAlloc(

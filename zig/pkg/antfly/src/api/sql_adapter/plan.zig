@@ -1134,6 +1134,7 @@ pub fn parseCtesForPlanAlloc(
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
         if (lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
             pos.* = close_index + 1;
+            try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
             try ctes.append(alloc, .{
                 .name = cte_name,
                 .table_function = table_function,
@@ -1170,6 +1171,21 @@ fn lowerAntflyGraphTableFunctionCteAlloc(
     tokens: []const Token,
 ) !db_mod.types.RelationalRowsTableFunction {
     return try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, tokens);
+}
+
+fn resolveTableFunctionBaseSourceTableAlloc(
+    alloc: std.mem.Allocator,
+    table_function: db_mod.types.RelationalRowsTableFunction,
+    base_table_name: *?[]const u8,
+) !void {
+    const table_name = switch (table_function) {
+        .graph_query => |graph_query| graph_query.table_name,
+    };
+    if (base_table_name.*) |base| {
+        if (!std.mem.eql(u8, base, table_name)) return error.UnsupportedSqlShape;
+        return;
+    }
+    base_table_name.* = try alloc.dupe(u8, table_name);
 }
 
 pub fn freePlanCtes(alloc: std.mem.Allocator, ctes: []const db_mod.types.RelationalRowsCte) void {

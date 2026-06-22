@@ -19539,8 +19539,9 @@ pub const DB = struct {
     fn materializeGraphQueryTableFunctionRowsAlloc(
         self: *DB,
         alloc: Allocator,
-        graph_query: types.NamedGraphQuery,
+        graph_table_function: types.RelationalRowsGraphTableFunction,
     ) ![]const []const u8 {
+        const graph_query = graph_table_function.query;
         var search_result = try self.search(alloc, .{
             .graph_queries = &.{graph_query},
             .include_stored = true,

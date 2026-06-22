@@ -12104,6 +12104,29 @@ test "postgres sql adapter lowers equality join queries" {
     try std.testing.expectEqual(@as(usize, 1), graph_cte_join.join.order_by.len);
     try std.testing.expectEqualStrings("graph_score", graph_cte_join.join.order_by[0].field);
 
+    var graph_cte_read = try lowerQueryPlanAlloc(
+        alloc,
+        "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT id, score FROM gm WHERE graph_name = 'graph_match' ORDER BY score DESC LIMIT 5",
+        schema,
+        &.{},
+    );
+    defer graph_cte_read.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", graph_cte_read.table_name);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_read.ctes.len);
+    try std.testing.expectEqualStrings("gm", graph_cte_read.ctes[0].name);
+    try std.testing.expect(graph_cte_read.ctes[0].table_function != null);
+    const graph_table_function = graph_cte_read.ctes[0].table_function.?.graph_query;
+    try std.testing.expectEqualStrings("usage_records", graph_table_function.table_name);
+    try std.testing.expectEqualStrings("gm", graph_cte_read.query.source_cte);
+    try std.testing.expectEqual(@as(usize, 2), graph_cte_read.query.select.len);
+    try std.testing.expectEqualStrings("id", graph_cte_read.query.select[0]);
+    try std.testing.expectEqualStrings("score", graph_cte_read.query.select[1]);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_read.query.predicates.len);
+    try std.testing.expectEqualStrings("graph_name", graph_cte_read.query.predicates[0].field);
+    try std.testing.expectEqualStrings("\"graph_match\"", graph_cte_read.query.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), graph_cte_read.query.order_by.len);
+    try std.testing.expectEqualStrings("score", graph_cte_read.query.order_by[0].field);
+
     var inner_lowered = try lowerJoinAlloc(
         alloc,
         "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant = c.tenant AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5",

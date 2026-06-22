@@ -1444,12 +1444,23 @@ pub const RelationalRowsTableFunctionKind = enum {
 };
 
 pub const RelationalRowsTableFunction = union(RelationalRowsTableFunctionKind) {
-    graph_query: NamedGraphQuery,
+    graph_query: RelationalRowsGraphTableFunction,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         switch (self.*) {
-            .graph_query => |*query| freeNamedGraphQuery(alloc, query),
+            .graph_query => |*query| query.deinit(alloc),
         }
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphTableFunction = struct {
+    table_name: []const u8,
+    query: NamedGraphQuery,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        freeNamedGraphQuery(alloc, &self.query);
         self.* = undefined;
     }
 };
