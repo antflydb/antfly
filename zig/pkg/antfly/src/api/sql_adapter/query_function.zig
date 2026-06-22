@@ -78,6 +78,18 @@ pub fn parseAntflyQueryFunctionCall(
     try expectSqlKeyword(tokens, pos, "select");
     _ = try expectSqlToken(tokens, pos, .star);
     try expectSqlKeyword(tokens, pos, "from");
+    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, tokens, pos, args);
+    _ = matchSqlToken(tokens, pos, .semicolon);
+    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
+    return function;
+}
+
+pub fn parseAntflyQueryFunctionExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    args: *std.ArrayListUnmanaged(SqlQueryFunctionArg),
+) !AntflyQueryFunction {
     const function_token = try expectSqlToken(tokens, pos, .identifier);
     const function = antflyQueryFunctionFromSqlName(function_token.text) orelse return error.UnsupportedSqlShape;
     _ = try expectSqlToken(tokens, pos, .lparen);
@@ -93,8 +105,6 @@ pub fn parseAntflyQueryFunctionCall(
         }
         _ = try expectSqlToken(tokens, pos, .rparen);
     }
-    _ = matchSqlToken(tokens, pos, .semicolon);
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     return function;
 }
 
@@ -319,32 +329,62 @@ pub fn lowerAntflyQueryFunctionSqlAlloc(
     var pos: usize = 0;
     const function = try parseAntflyQueryFunctionCall(alloc, tokens.items, &pos, &args);
 
-    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
-        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
+}
+
+pub fn lowerAntflyQueryFunctionExpressionSqlAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    sql: []const u8,
+) !query_contract.OwnedQueryRequest {
+    var tokens = try lexer_mod.tokenizeAlloc(alloc, sql);
+    defer lexer_mod.freeTokens(alloc, &tokens);
+
+    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
+    var pos: usize = 0;
+    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, tokens.items, &pos, &args);
+    _ = matchSqlToken(tokens.items, &pos, .semicolon);
+    if (pos != tokens.items.len) return error.UnsupportedSqlShape;
+
+    return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
+}
+
+fn lowerParsedAntflyQueryFunctionAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    function: AntflyQueryFunction,
+    args: []const SqlQueryFunctionArg,
+) !query_contract.OwnedQueryRequest {
+    const table_name = antflyQueryFunctionStringArg(args, "table_name") orelse
+        antflyQueryFunctionStringArg(args, "table") orelse return error.UnsupportedSqlShape;
     const structured_primary_text_index_name = if (function == .hybrid_search)
-        try hybridSourcesPrimaryTextIndexAlloc(alloc, args.items)
+        try hybridSourcesPrimaryTextIndexAlloc(alloc, args)
     else
         null;
     defer if (structured_primary_text_index_name) |index_name| alloc.free(index_name);
-    const primary_text_index_name = antflyQueryFunctionStringArg(args.items, "full_text_index") orelse
-        antflyQueryFunctionStringArg(args.items, "text_index") orelse
-        if (function == .full_text_search) antflyQueryFunctionStringArg(args.items, "index") else structured_primary_text_index_name;
+    const primary_text_index_name = antflyQueryFunctionStringArg(args, "full_text_index") orelse
+        antflyQueryFunctionStringArg(args, "text_index") orelse
+        if (function == .full_text_search) antflyQueryFunctionStringArg(args, "index") else structured_primary_text_index_name;
 
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(alloc);
     try body.append(alloc, '{');
     var first = true;
     switch (function) {
-        .full_text_search => try appendFullTextFunctionBody(alloc, &body, &first, args.items),
-        .semantic_search => try appendSemanticFunctionBody(alloc, &body, &first, args.items),
-        .vector_search => try appendVectorFunctionBody(alloc, &body, &first, args.items),
-        .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths => try appendGraphSearchFunctionBody(alloc, &body, &first, function, args.items),
-        .graph_match => try appendGraphMatchFunctionBody(alloc, &body, &first, args.items),
-        .graph_metric => try appendGraphMetricFunctionBody(alloc, &body, &first, args.items),
-        .graph_metric_rerank => try appendGraphMetricRerankFunctionBody(alloc, &body, &first, args.items),
-        .hybrid_search => try appendHybridFunctionBody(alloc, &body, &first, args.items),
+        .full_text_search => try appendFullTextFunctionBody(alloc, &body, &first, args),
+        .semantic_search => try appendSemanticFunctionBody(alloc, &body, &first, args),
+        .vector_search => try appendVectorFunctionBody(alloc, &body, &first, args),
+        .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths => try appendGraphSearchFunctionBody(alloc, &body, &first, function, args),
+        .graph_match => try appendGraphMatchFunctionBody(alloc, &body, &first, args),
+        .graph_metric => try appendGraphMetricFunctionBody(alloc, &body, &first, args),
+        .graph_metric_rerank => try appendGraphMetricRerankFunctionBody(alloc, &body, &first, args),
+        .hybrid_search => try appendHybridFunctionBody(alloc, &body, &first, args),
     }
-    try appendCommonAntflyQueryFunctionOptions(alloc, &body, &first, args.items);
+    try appendCommonAntflyQueryFunctionOptions(alloc, &body, &first, args);
     try body.append(alloc, '}');
 
     var lowered = try query_contract.parseQueryRequest(alloc, semantic_resolver, table_name, body.items);
@@ -1352,6 +1392,18 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqualStrings("body", full_text.req.full_text.?.match.field);
     try std.testing.expectEqualStrings("refund policy", full_text.req.full_text.?.match.text);
 
+    var full_text_expression = try lowerAntflyQueryFunctionExpressionSqlAlloc(
+        alloc,
+        null,
+        "antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'body', query => 'refund policy', limit => 5)",
+    );
+    defer full_text_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 5), full_text_expression.req.limit);
+    try std.testing.expectEqualStrings("docs_body_fts", full_text_expression.req.primary_text_index_name.?);
+    try std.testing.expect(full_text_expression.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", full_text_expression.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("refund policy", full_text_expression.req.full_text.?.match.text);
+
     var semantic = try lowerAntflyQueryFunctionSqlAlloc(
         alloc,
         resolver,
@@ -1497,6 +1549,30 @@ test "sql adapter query function lowers antfly query functions into native searc
     try std.testing.expectEqualStrings("title", graph_match_query.fields[0]);
     try std.testing.expectEqualStrings("url", graph_match_query.fields[1]);
     try std.testing.expect(graph_match_query.include_metric_status);
+
+    var graph_match_expression = try lowerAntflyQueryFunctionExpressionSqlAlloc(
+        alloc,
+        null,
+        "antfly.graph_match(table_name => 'docs', name => 'citation_pattern', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b', max_results => 5)",
+    );
+    defer graph_match_expression.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), graph_match_expression.req.graph_queries.len);
+    try std.testing.expectEqualStrings("citation_pattern", graph_match_expression.req.graph_queries[0].name);
+    try std.testing.expectEqual(@as(@TypeOf(graph_match_expression.req.graph_queries[0].query.query_type), .pattern), graph_match_expression.req.graph_queries[0].query.query_type);
+    try std.testing.expectEqual(@as(u32, 5), graph_match_expression.req.graph_queries[0].query.params.max_results);
+
+    var expression_tokens = try lexer_mod.tokenizeAlloc(alloc, "antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)') AS gm");
+    defer lexer_mod.freeTokens(alloc, &expression_tokens);
+    var expression_args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, expression_args.items);
+        expression_args.deinit(alloc);
+    }
+    var expression_pos: usize = 0;
+    const embedded_function = try parseAntflyQueryFunctionExpressionAlloc(alloc, expression_tokens.items, &expression_pos, &expression_args);
+    try std.testing.expectEqual(AntflyQueryFunction.graph_match, embedded_function);
+    try std.testing.expect(expression_pos < expression_tokens.items.len);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(expression_tokens.items[expression_pos].text, "as"));
 
     var graph_match_ref = try lowerAntflyQueryFunctionSqlAlloc(
         alloc,
