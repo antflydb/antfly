@@ -399,7 +399,10 @@ Current implementation status:
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
   aggregate recognition, and prepared-statement subject classification before
-  falling back to text comparison for non-keyword identifiers.
+  falling back to text comparison for non-keyword identifiers. Antfly
+  query-function parsing also consumes parsed tokens with keyword-tagged
+  function, boolean, array, and structured-source fields instead of local
+  keyword scanners.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source
   spans without being marked as keywords, and diagnostics have a span-bearing
   `SqlDiagnostic` shape for unsupported classifications.
@@ -410,7 +413,11 @@ Current implementation status:
   `ParsedSql` placeholder tokens instead of a separate raw SQL byte scanner.
   Corpus feature coverage parses entries once and uses SQL tokens for query
   function, conflict, multi-row insert, computed-pattern, JSONB, array, and UUID
-  coverage checks instead of raw substring probes.
+  coverage checks instead of raw substring probes. More corpus coverage buckets,
+  including pagination tails, temporal range constructors/operators, set
+  operation tails, joined-source returning expressions, CTE mutation markers,
+  and row-lock invalid cases, now use parsed token predicates instead of raw
+  SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

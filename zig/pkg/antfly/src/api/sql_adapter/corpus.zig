@@ -6524,21 +6524,46 @@ fn appParityTokensHaveIdentifierPrefix(tokens: []const tokenized.Token, prefix: 
     return false;
 }
 
-fn appParityTokensHaveKeyword(tokens: []const tokenized.Token, keyword: []const u8) bool {
+fn appParityTokensHaveKeyword(tokens: []const tokenized.Token, keyword: token_mod.TokenKeyword) bool {
     for (tokens) |token| {
-        if (token.matchesKeyword(keyword)) return true;
+        if (token.matchesKeywordTag(keyword)) return true;
     }
     return false;
 }
 
-fn appParityTokensHaveKeywordSequence(tokens: []const tokenized.Token, keywords: []const []const u8) bool {
+fn appParityTokensHaveKeywordSequence(tokens: []const tokenized.Token, keywords: []const token_mod.TokenKeyword) bool {
     if (keywords.len == 0) return true;
     if (tokens.len < keywords.len) return false;
     var start: usize = 0;
     while (start + keywords.len <= tokens.len) : (start += 1) {
         var offset: usize = 0;
-        while (offset < keywords.len and tokens[start + offset].matchesKeyword(keywords[offset])) : (offset += 1) {}
+        while (offset < keywords.len and tokens[start + offset].matchesKeywordTag(keywords[offset])) : (offset += 1) {}
         if (offset == keywords.len) return true;
+    }
+    return false;
+}
+
+fn appParityTokensStartWithKeyword(tokens: []const tokenized.Token, keyword: token_mod.TokenKeyword) bool {
+    return tokens.len > 0 and tokens[0].matchesKeywordTag(keyword);
+}
+
+fn appParityTokensHaveFunctionCall(tokens: []const tokenized.Token, name: []const u8) bool {
+    if (tokens.len < 2) return false;
+    var index: usize = 0;
+    while (index + 1 < tokens.len) : (index += 1) {
+        if (tokens[index + 1].kind == .lparen and
+            tokens[index].kind == .identifier and
+            std.ascii.eqlIgnoreCase(tokens[index].text, name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn appParityTokensHaveKind(tokens: []const tokenized.Token, kind: token_mod.TokenKind) bool {
+    for (tokens) |token| {
+        if (token.kind == kind) return true;
     }
     return false;
 }
@@ -6558,7 +6583,7 @@ fn appParityTokensHaveKindSequence(tokens: []const tokenized.Token, kinds: []con
 fn appParityParsedSqlHasComputedPattern(parsed_sql: *const tokenized.ParsedSql) bool {
     const tokens = parsed_sql.items();
     return appParityTokensHaveIdentifier(tokens, "lower") and
-        (appParityTokensHaveKeyword(tokens, "like") or appParityTokensHaveKeyword(tokens, "ilike"));
+        (appParityTokensHaveKeyword(tokens, .like) or appParityTokensHaveKeyword(tokens, .ilike));
 }
 
 fn appParityAnyStringContains(values: []const []const u8, needle: []const u8) bool {
@@ -7353,7 +7378,7 @@ pub const AppParityCorpusCoverage = struct {
         const uses_cte_stream = sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") or sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
         const uses_returning_all = sql_adapter.planHasNonZeroToken(entry.plan, ":returning_all=");
         const uses_conflict_where = sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_where=");
-        const uses_insert_conflict = entry.family == .insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ "on", "conflict" });
+        const uses_insert_conflict = entry.family == .insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .conflict });
         const uses_multi_row_insert = entry.family == .insert and appParityTokensHaveKindSequence(sql_tokens, &.{ .rparen, .comma, .lparen });
         const uses_computed_pattern = appParityParsedSqlHasComputedPattern(&parsed_sql);
         const is_update_joined_source = entry.family == .update_joined_source;
@@ -7446,8 +7471,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
         self.update_source_pagination = self.update_source_pagination or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":source_offset="));
         self.update_source_nullable_pagination = self.update_source_nullable_pagination or (entry.family == .update_source and
-            std.mem.indexOf(u8, entry.sql, "LIMIT NULL") != null and
-            std.mem.indexOf(u8, entry.sql, "OFFSET NULL") != null and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
             sql_adapter.planHasExactStringToken(entry.plan, ":source_limit=", "-1") and
             sql_adapter.planTokenAbsent(entry.plan, ":source_offset="));
         self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
@@ -7471,15 +7495,15 @@ pub const AppParityCorpusCoverage = struct {
             std.mem.indexOf(u8, entry.sql, "'(,") != null and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_numrange_constructor_insert = self.schema_temporal_numrange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "numrange(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "numrange") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_daterange_constructor_insert = self.schema_temporal_daterange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_constructor_insert = self.schema_temporal_inclusive_daterange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
             std.mem.indexOf(u8, entry.sql, "'[]'") != null and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
@@ -7489,7 +7513,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_constructor_insert = self.schema_temporal_lower_exclusive_daterange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
             std.mem.indexOf(u8, entry.sql, "'(]'") != null and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
@@ -7503,7 +7527,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_constructor_insert = self.schema_temporal_tsrange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "tsrange(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "tsrange") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_insert = self.schema_temporal_tstzrange_insert or (entry.family == .insert and
@@ -7511,26 +7535,26 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_constructor_insert = self.schema_temporal_tstzrange_constructor_insert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "tstzrange(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "tstzrange") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_bound_query = self.schema_temporal_range_bound_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, "lower(") != null and
-            std.mem.indexOf(u8, entry.sql, "upper(") != null and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveFunctionCall(sql_tokens, "upper") and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.schema_temporal_range_contains_query = self.schema_temporal_range_contains_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " @> ") != null and
+            appParityTokensHaveKind(sql_tokens, .at_contains) and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_range_overlap_query = self.schema_temporal_range_overlap_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " && ") != null and
+            appParityTokensHaveKind(sql_tokens, .range_overlap) and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_inclusive_daterange_overlap_query = self.schema_temporal_inclusive_daterange_overlap_query or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " && ") != null and
-            std.mem.indexOf(u8, entry.sql, "daterange(") != null and
+            appParityTokensHaveKind(sql_tokens, .range_overlap) and
+            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
             std.mem.indexOf(u8, entry.sql, "'[]'") != null and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
@@ -7541,28 +7565,28 @@ pub const AppParityCorpusCoverage = struct {
             entry.apply_setup_sql.len > 0 and
             entry.resolver_row_json.len > 0);
         self.query_set_operation_order_limit = self.query_set_operation_order_limit or (entry.family == .query and
-            std.mem.indexOf(u8, entry.sql, " UNION ") != null and
-            std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
+            appParityTokensHaveKeyword(sql_tokens, .@"union") and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
             sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "5"));
         self.read_set_operation_order_limit = self.read_set_operation_order_limit or (entry.family == .read and
-            (std.mem.indexOf(u8, entry.sql, " INTERSECT ") != null or
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null) and
-            std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
+            (appParityTokensHaveKeyword(sql_tokens, .intersect) or
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all })) and
+            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
             (sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") or std.mem.startsWith(u8, entry.plan, "read:set_operation:")) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":result_order=") and
             sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "5"));
         self.set_operation_fetch_tail = self.set_operation_fetch_tail or
             ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                std.mem.indexOf(u8, entry.sql, " FETCH FIRST ROW ONLY") != null and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .fetch, .first }) and
                 (sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "1") or
                     sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "1")));
         self.set_operation_null_pagination_tail = self.set_operation_null_pagination_tail or
             ((entry.family == .query or entry.family == .read) and
-                std.mem.indexOf(u8, entry.sql, " UNION ALL ") != null and
-                std.mem.indexOf(u8, entry.sql, " LIMIT NULL OFFSET NULL") != null and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
                 sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "none") and
                 sql_adapter.planTokenAbsent(entry.plan, ":offset="));
         self.cte_set_operation_tail = self.cte_set_operation_tail or
@@ -7668,20 +7692,23 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.joined_source_returning_source_field = self.joined_source_returning_source_field or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "source.") != null);
+            appParityTokensHaveKeyword(sql_tokens, .returning) and
+            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
         self.joined_source_returning_source_expression = self.joined_source_returning_source_expression or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
+            appParityTokensHaveKeyword(sql_tokens, .returning) and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
         self.update_joined_source_returning_source_expression = self.update_joined_source_returning_source_expression or (entry.family == .update_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
+            appParityTokensHaveKeyword(sql_tokens, .returning) and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
         self.delete_joined_source_returning_source_expression = self.delete_joined_source_returning_source_expression or (entry.family == .delete_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            std.mem.indexOf(u8, entry.sql, "RETURNING") != null and
-            std.mem.indexOf(u8, entry.sql, "lower(source.") != null);
+            appParityTokensHaveKeyword(sql_tokens, .returning) and
+            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
         self.update_joined_source_non_primary_semijoin = self.update_joined_source_non_primary_semijoin or (is_update_joined_source and
             std.mem.indexOf(u8, entry.sql, "IN (SELECT organization_id FROM archived_records)") != null and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 1));
@@ -8048,13 +8075,13 @@ pub const AppParityCorpusCoverage = struct {
             .update_joined_source => {
                 self.update_joined_source = true;
                 self.update_joined_source_cte_mutation = self.update_joined_source_cte_mutation or
-                    (std.mem.startsWith(u8, entry.sql, "WITH ") and
+                    (appParityTokensStartWithKeyword(sql_tokens, .with) and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
             .delete_joined_source => {
                 self.delete_joined_source = true;
                 self.delete_joined_source_cte_mutation = self.delete_joined_source_cte_mutation or
-                    (std.mem.startsWith(u8, entry.sql, "WITH ") and
+                    (appParityTokensStartWithKeyword(sql_tokens, .with) and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
             .merge_mutation => {
@@ -8075,7 +8102,8 @@ pub const AppParityCorpusCoverage = struct {
             .invalid_read => {
                 self.invalid_read_row_lock_target = self.invalid_read_row_lock_target or
                     (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
+                        appParityTokensHaveIdentifier(sql_tokens, "archived_records"));
             },
             .invalid_insert => {
                 self.invalid_insert = true;
@@ -8096,15 +8124,17 @@ pub const AppParityCorpusCoverage = struct {
             .invalid_update_source => {
                 self.invalid_update_source_row_lock_mode = self.invalid_update_source_row_lock_mode or
                     (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        std.mem.indexOf(u8, entry.sql, "FOR SHARE") != null);
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .share }));
                 self.invalid_update_source_row_lock_target = self.invalid_update_source_row_lock_target or
                     (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF archived_records") != null);
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
+                        appParityTokensHaveIdentifier(sql_tokens, "archived_records"));
             },
             .invalid_update_joined_source => {
                 self.invalid_update_joined_source_row_lock_target = self.invalid_update_joined_source_row_lock_target or
                     (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        std.mem.indexOf(u8, entry.sql, "FOR UPDATE OF source") != null);
+                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
+                        appParityTokensHaveIdentifier(sql_tokens, "source"));
             },
             .unsupported => {},
             .unsupported_read => self.unsupported_read = true,

@@ -15325,7 +15325,7 @@ fn parseGraphTableFunctionSourceAtAlloc(
 ) !?DirectGraphTableFunctionSource {
     if (function_start + 1 >= tokens.len) return null;
     if (tokens[function_start].kind != .identifier or tokens[function_start + 1].kind != .lparen) return null;
-    const function = query_function.antflyQueryFunctionFromSqlName(tokens[function_start].text) orelse return null;
+    const function = query_function.antflyQueryFunctionFromSqlToken(tokens[function_start]) orelse return null;
     switch (function) {
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {},
         else => return null,
@@ -32151,7 +32151,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     const asc_tokens = [_]Token{
         .{ .kind = .identifier, .text = "asc", .source_start = 0, .source_end = 3, .keyword = .asc },
         .{ .kind = .identifier, .text = "nulls", .source_start = 4, .source_end = 9 },
-        .{ .kind = .identifier, .text = "first", .source_start = 10, .source_end = 15 },
+        .{ .kind = .identifier, .text = "first", .source_start = 10, .source_end = 15, .keyword = .first },
     };
     try std.testing.expectEqual(true, (try parseOrderModifiers(asc_tokens[0..], &asc_pos, &asc_order)).?);
     try std.testing.expectEqual(@as(usize, 3), asc_pos);
