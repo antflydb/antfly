@@ -18,6 +18,7 @@
 //! layout plus the first native page stores used by the Lite backend.
 
 const std = @import("std");
+const fs_paths = @import("../../common/fs_paths.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -1134,7 +1135,9 @@ pub const NativeFile = struct {
     }
 
     pub fn copyStableSnapshotToPath(self: *NativeFile, dest_path: []const u8, replace: bool) !StableSnapshotReport {
-        if (std.mem.eql(u8, self.path, dest_path)) return error.InvalidNativeSnapshotPath;
+        if (std.mem.eql(u8, self.path, dest_path) or try pathsReferToSameExistingFile(self.allocator, self.io_impl.io(), self.path, dest_path)) {
+            return error.InvalidNativeSnapshotPath;
+        }
         const dest_exists = pathExists(self.io_impl.io(), dest_path);
         if (!replace and dest_exists) return error.PathAlreadyExists;
 
@@ -1988,6 +1991,22 @@ fn writerLockPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![]u8
     const canonical_missing_path = try std.fs.path.join(allocator, &.{ canonical_parent, basename });
     defer allocator.free(canonical_missing_path);
     return appendLockSuffix(allocator, canonical_missing_path);
+}
+
+fn pathsReferToSameExistingFile(allocator: Allocator, io: std.Io, a: []const u8, b: []const u8) !bool {
+    const a_real = realPathAlloc(allocator, io, a) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(a_real);
+
+    const b_real = realPathAlloc(allocator, io, b) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    defer allocator.free(b_real);
+
+    return std.mem.eql(u8, a_real, b_real);
 }
 
 fn realPathAlloc(allocator: Allocator, io: std.Io, path: []const u8) ![:0]u8 {
@@ -3723,6 +3742,38 @@ test "lite native stable snapshot copies committed prefix without tail bytes" {
     const doc = (try reopened.getDocumentAlloc(allocator, "doc:1")).?;
     defer allocator.free(doc);
     try std.testing.expectEqualStrings("{\"title\":\"one\"}", doc);
+}
+
+test "lite native stable snapshot rejects same target by canonical path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const path = try testPath(allocator, tmp, "native-snapshot-self.aflite");
+    defer allocator.free(path);
+    const nested_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested", .{tmp.sub_path});
+    defer allocator.free(nested_dir);
+    const alias_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/nested/../native-snapshot-self.aflite", .{tmp.sub_path});
+    defer allocator.free(alias_path);
+
+    try fs_paths.createDirPathPortable(io, nested_dir);
+    {
+        var writer = try NativeFile.create(allocator, path);
+        defer writer.close();
+        try writer.putDocument("doc:self", "{\"title\":\"same target\"}");
+    }
+
+    var reader = try NativeFile.open(allocator, path, true);
+    defer reader.close();
+    try std.testing.expectError(error.InvalidNativeSnapshotPath, reader.copyStableSnapshotToPath(alias_path, true));
+
+    const report = try checkFile(allocator, path);
+    try std.testing.expect(report.valid);
 }
 
 test "lite native stable snapshot holds output writer lock before staging" {

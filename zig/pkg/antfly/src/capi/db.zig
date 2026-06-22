@@ -1595,15 +1595,22 @@ pub export fn antfly_db_open(path: ?[*:0]const u8, out_handle: ?*?*anyopaque) ca
     const out = out_handle orelse return .invalid_argument;
     out.* = null;
     const path_slice = cStringSpan(path) orelse return .invalid_argument;
+    const handle = openDefaultDirectoryHandle(path_slice) catch |err| return capi.mapError(err);
+    out.* = handle;
+    return .ok;
+}
+
+fn openDefaultDirectoryHandle(path: []const u8) !*Handle {
     const alloc = std.heap.c_allocator;
-    const handle = alloc.create(Handle) catch return .internal;
+    var db = try db_mod.DB.open(alloc, path, .{});
+    errdefer db.close();
+    const handle = alloc.create(Handle) catch return error.OutOfMemory;
     errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
-        .db = db_mod.DB.open(alloc, path_slice, .{}) catch |err| return capi.mapError(err),
+        .db = db,
     };
-    out.* = handle;
-    return .ok;
+    return handle;
 }
 
 pub export fn antfly_db_close(handle_ptr: ?*anyopaque) void {
@@ -1870,21 +1877,29 @@ fn openLiteHandle(
 ) capi.ErrorCode {
     const out = out_handle orelse return .invalid_argument;
     out.* = null;
-    const alloc = std.heap.c_allocator;
-    const handle = alloc.create(Handle) catch return .internal;
-    errdefer alloc.destroy(handle);
+    const handle = openLiteHandleAlloc(path, resolved, create) catch |err| return capi.mapError(err);
+    out.* = handle;
+    return .ok;
+}
 
-    if (create and !liteOpenModeCanWrite(resolved.open_mode)) return .invalid_argument;
+fn openLiteHandleAlloc(
+    path: []const u8,
+    resolved: LiteResolvedOpenOptions,
+    create: bool,
+) !*Handle {
+    const alloc = std.heap.c_allocator;
+
+    if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
     var backend = if (create)
-        lite_backend.Handle.createWithOptions(alloc, path, .{
+        try lite_backend.Handle.createWithOptions(alloc, path, .{
             .exclusive = true,
             .no_sync = resolved.no_sync,
-        }) catch |err| return capi.mapError(err)
+        })
     else
-        lite_backend.Handle.open(alloc, path, .{
+        try lite_backend.Handle.open(alloc, path, .{
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
-        }) catch |err| return capi.mapError(err);
+        });
     errdefer backend.deinit();
 
     var opts = db_mod.OpenOptions{
@@ -1904,9 +1919,13 @@ fn openLiteHandle(
         opts.text_merge = .{ .enabled = false };
         opts.sparse_compaction = .{ .enabled = false };
     }
-    backend.configureDbOpenOptions(&opts) catch |err| return capi.mapError(err);
+    try backend.configureDbOpenOptions(&opts);
 
-    const db = db_mod.DB.open(alloc, path, opts) catch |err| return capi.mapError(err);
+    var db = try db_mod.DB.open(alloc, path, opts);
+    errdefer db.close();
+
+    const handle = alloc.create(Handle) catch return error.OutOfMemory;
+    errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .db = db,
@@ -1915,8 +1934,7 @@ fn openLiteHandle(
         .lite_profile = resolved.profile,
         .lite_inference_status = lite_backend.inferenceStatusForProfileWithOptions(resolved.profile, resolved.inference),
     };
-    out.* = handle;
-    return .ok;
+    return handle;
 }
 
 fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) db_mod.OpenOptions {
@@ -1949,18 +1967,23 @@ fn openDirectoryHandle(
     const out = out_handle orelse return .invalid_argument;
     out.* = null;
     if (create) return .invalid_argument;
-    const alloc = std.heap.c_allocator;
-    const handle = alloc.create(Handle) catch return .internal;
-    errdefer alloc.destroy(handle);
+    const handle = openDirectoryHandleAlloc(path, resolved) catch |err| return capi.mapError(err);
+    out.* = handle;
+    return .ok;
+}
 
-    const db = db_mod.DB.open(alloc, path, dbOpenOptionsFromResolved(resolved, false)) catch |err| return capi.mapError(err);
+fn openDirectoryHandleAlloc(path: []const u8, resolved: LiteResolvedOpenOptions) !*Handle {
+    const alloc = std.heap.c_allocator;
+    var db = try db_mod.DB.open(alloc, path, dbOpenOptionsFromResolved(resolved, false));
+    errdefer db.close();
+    const handle = alloc.create(Handle) catch return error.OutOfMemory;
+    errdefer alloc.destroy(handle);
     handle.* = .{
         .alloc = alloc,
         .db = db,
         .open_mode = resolved.open_mode,
     };
-    out.* = handle;
-    return .ok;
+    return handle;
 }
 
 fn openGenericHandle(
@@ -2108,10 +2131,11 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
     if (handle.owned_lite_backend == null) return .invalid_argument;
 
     var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(handle.alloc);
+    defer out.deinit(handle.alloc);
     portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
     portable_backup.validatePortable(handle.alloc, out.items) catch |err| return capi.mapError(err);
     const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
+    out = .empty;
     out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
     return .ok;
 }
