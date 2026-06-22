@@ -211,8 +211,8 @@ pub fn tokensStartWithKeyword(tokens: []const Token, keyword: []const u8) bool {
 }
 
 pub fn consumeCteMaterializationHint(tokens: []const Token, pos: *usize) !void {
-    if (matchKeyword(tokens, pos, "materialized")) return;
-    if (matchKeyword(tokens, pos, "not") and !matchKeyword(tokens, pos, "materialized")) {
+    if (matchKeywordTag(tokens, pos, .materialized)) return;
+    if (matchKeywordTag(tokens, pos, .not) and !matchKeywordTag(tokens, pos, .materialized)) {
         return error.UnsupportedSqlShape;
     }
 }
