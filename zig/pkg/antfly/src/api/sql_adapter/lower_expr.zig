@@ -18591,7 +18591,7 @@ pub fn sqlKeywordIsRegexpInstrFunction(text: []const u8) bool {
 pub fn matchAnyOrSomeKeyword(tokens: []const Token, pos: *usize) bool {
     if (pos.* >= tokens.len) return false;
     const token = tokens[pos.*];
-    if (token.kind != .identifier or !sqlKeywordIsAnyOrSome(token.text)) return false;
+    if (!token.matchesKeywordTag(.any) and !token.matchesKeywordTag(.some)) return false;
     pos.* += 1;
     return true;
 }
@@ -18599,19 +18599,19 @@ pub fn matchAnyOrSomeKeyword(tokens: []const Token, pos: *usize) bool {
 pub fn tokenAtIsAnySomeOrAll(tokens: []const Token, index: usize) bool {
     if (index >= tokens.len) return false;
     const token = tokens[index];
-    return token.kind == .identifier and
-        (sqlKeywordIsAnyOrSome(token.text) or std.ascii.eqlIgnoreCase(token.text, "all"));
+    return token.matchesKeywordTag(.any) or
+        token.matchesKeywordTag(.some) or
+        token.matchesKeywordTag(.all);
 }
 
 pub fn matchAnySomeOrAllKeyword(tokens: []const Token, pos: *usize) ?ast.SqlPatternQuantifier {
     if (pos.* >= tokens.len) return null;
     const token = tokens[pos.*];
-    if (token.kind != .identifier) return null;
-    if (sqlKeywordIsAnyOrSome(token.text)) {
+    if (token.matchesKeywordTag(.any) or token.matchesKeywordTag(.some)) {
         pos.* += 1;
         return .any;
     }
-    if (std.ascii.eqlIgnoreCase(token.text, "all")) {
+    if (token.matchesKeywordTag(.all)) {
         pos.* += 1;
         return .all;
     }
@@ -18964,7 +18964,7 @@ pub fn peekCastExpressionSyntax(tokens: []const Token, pos: usize) bool {
 }
 
 pub fn peekBooleanNotExpressionSyntax(tokens: []const Token, pos: usize) bool {
-    return parser.peekKeyword(tokens, pos, "not");
+    return parser.peekKeywordTag(tokens, pos, .not);
 }
 
 pub fn peekUnaryNegativeExpressionSyntax(tokens: []const Token, pos: usize) bool {
@@ -23248,10 +23248,10 @@ pub fn parseScalarWherePredicateAlloc(
         };
     }
 
-    if (parser.peekKeyword(tokens, pos.*, "in") or parser.peekKeyword(tokens, pos.*, "not")) return error.UnsupportedSqlShape;
-    if (parser.peekKeyword(tokens, pos.*, "between")) return error.UnsupportedSqlShape;
+    if (parser.peekKeywordTag(tokens, pos.*, .in) or parser.peekKeywordTag(tokens, pos.*, .not)) return error.UnsupportedSqlShape;
+    if (parser.peekKeywordTag(tokens, pos.*, .between)) return error.UnsupportedSqlShape;
     const op = try parseComparisonOp(tokens, pos);
-    if (parser.peekKind(tokens, pos.*, .identifier) and sqlKeywordIsAnyOrSome(tokens[pos.*].text)) return error.UnsupportedSqlShape;
+    if (parser.peekKeywordTag(tokens, pos.*, .any) or parser.peekKeywordTag(tokens, pos.*, .some)) return error.UnsupportedSqlShape;
     const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
     var value_transferred = false;
     errdefer if (!value_transferred) alloc.free(value_json);
@@ -23273,9 +23273,9 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
     if (token.kind != .identifier) return false;
     if (functionCallStartsAtIf(tokens, index, sqlKeywordIsArrayLengthFunction) or
         functionCallStartsAtIf(tokens, index, sqlKeywordIsArrayPositionFunction) or
-        std.ascii.eqlIgnoreCase(token.text, "case") or
-        std.ascii.eqlIgnoreCase(token.text, "cast") or
-        std.ascii.eqlIgnoreCase(token.text, "coalesce") or
+        token.matchesKeywordTag(.case) or
+        token.matchesKeywordTag(.cast) or
+        token.matchesKeywordTag(.coalesce) or
         std.ascii.eqlIgnoreCase(token.text, "concat") or
         std.ascii.eqlIgnoreCase(token.text, "concat_ws") or
         std.ascii.eqlIgnoreCase(token.text, "convert_from") or
@@ -23283,7 +23283,7 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
         std.ascii.eqlIgnoreCase(token.text, "current_timestamp") or
         functionCallStartsAt(tokens, index, "gen_random_uuid") or
         functionCallStartsAt(tokens, index, "uuid_generate_v4") or
-        std.ascii.eqlIgnoreCase(token.text, "false") or
+        token.matchesKeywordTag(.false) or
         std.ascii.eqlIgnoreCase(token.text, "abs") or
         std.ascii.eqlIgnoreCase(token.text, "ascii") or
         functionCallStartsAt(tokens, index, "floor") or
@@ -23297,8 +23297,8 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
         std.ascii.eqlIgnoreCase(token.text, "bit_length") or
         std.ascii.eqlIgnoreCase(token.text, "lower") or
         std.ascii.eqlIgnoreCase(token.text, "now") or
-        std.ascii.eqlIgnoreCase(token.text, "null") or
-        std.ascii.eqlIgnoreCase(token.text, "nullif") or
+        token.matchesKeywordTag(.null) or
+        token.matchesKeywordTag(.nullif) or
         std.ascii.eqlIgnoreCase(token.text, "octet_length") or
         sqlKeywordIsOverlayFunction(token.text) or
         std.ascii.eqlIgnoreCase(token.text, "round") or
@@ -23333,7 +23333,7 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
         sqlKeywordIsRegexpInstrFunction(token.text) or
         std.ascii.eqlIgnoreCase(token.text, "replace") or
         sqlKeywordIsTranslateFunction(token.text) or
-        std.ascii.eqlIgnoreCase(token.text, "true") or
+        token.matchesKeywordTag(.true) or
         std.ascii.eqlIgnoreCase(token.text, "upper"))
     {
         return true;
