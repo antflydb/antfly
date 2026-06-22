@@ -194,6 +194,68 @@ SDK, MCP, A2A, CLI, internal job, or automation path reach the same native
 service contract with the same authorization, idempotency, audit, retry, and
 failure semantics.
 
+### Recommended Production Shape
+
+The best long-term design is to make SQL a thin, typed frontend over Antfly's
+native services. The adapter should be responsible for syntax, spans,
+PostgreSQL-compatible session interpretation, and conversion into native
+intent. It should not become an alternate owner for catalog metadata, storage
+routing, index lifecycle, role state, extension installs, backup state, lake
+sources, or durable jobs.
+
+The recommended architecture has four internal contracts:
+
+1. `ParsedSql` is the only parse product. It owns the token stream, keyword
+   metadata, raw AST, nested statement references, source byte spans, and
+   parse diagnostics for one input.
+2. `BoundSqlStatement` is the only catalog-aware SQL object. It combines the
+   parsed statement with explicit SQL session state, resolved catalog targets,
+   object versions, schemas, dependency facts, placement facts, and role
+   authorization results.
+3. `LogicalSqlPlan` is the only planner output. It expresses read, write, DDL,
+   session, role, extension, index, job, lake, backup/restore, and storage
+   intent as Antfly-native structs.
+4. Shared Antfly services are the only durable owners. The catalog or metadata
+   owner commits lifecycle transitions and admits durable jobs; row/storage
+   services execute typed read/write plans; role, extension, index, lake, and
+   backup services own their respective effects.
+
+This keeps the dependency direction one-way:
+
+```text
+SQL text
+  -> ParsedSql
+  -> BoundSqlStatement
+  -> LogicalSqlPlan
+  -> shared Antfly service request
+
+REST / SDK / MCP / A2A / CLI typed requests
+  ----------------------------------------^
+```
+
+Feature work should be organized around statement-family cutovers rather than
+one large parser rewrite. For each family, first add raw AST coverage, then
+binding, then native planning, then service-owned execution, then structured
+diagnostics and parity evidence. Compatibility wrappers may stay at ingress
+while a family migrates, but they should be leaf adapters that immediately
+construct or receive `ParsedSql`.
+
+Review should reject new SQL support when it:
+
+- stores SQL text as durable semantics;
+- dispatches by substring scans, fingerprints, or lowerer probe order after a
+  typed statement variant exists;
+- bypasses `BoundSqlStatement` for catalog-aware behavior;
+- schedules lifecycle work outside the metadata owner;
+- adds fixture validation that reconstructs parser behavior from SQL strings;
+- implements SQL-only behavior that the equivalent native API cannot reach.
+
+The practical production bar is not broad PostgreSQL syntax acceptance. It is
+that every supported statement reaches the same native Antfly service contract
+as the corresponding REST, SDK, MCP, A2A, CLI, job, or internal automation
+path, with the same authorization, idempotency, audit, retry, diagnostic, and
+failure semantics.
+
 ## Catalog and Session Semantics
 
 SQL object names resolve through the same `database / namespace / table` model
