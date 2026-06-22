@@ -1730,6 +1730,10 @@ recursive-source envelopes over those native primitives: the wrapper owns the
 bounded recursive producer, the inner mutation consumes the materialized CTE by
 typed `source_cte`, and execution feeds the deterministic target-row claim/OCC
 or MERGE batch builders without passing SQL text through storage.
+The public SQL execution path applies that shape to recursive claimed
+update/delete today by materializing the recursive producer under the read-plan
+caps, filtering the CTE rows through the typed row-query evaluator, and passing
+the resulting source rows to the joined mutation-source autocommit path.
 The catalog-backed write-plan entrypoint also resolves direct joined
 `UPDATE ... FROM` and `DELETE ... USING` source schemas from table metadata
 before lowering into the same claimed joined mutation-source typed requests.

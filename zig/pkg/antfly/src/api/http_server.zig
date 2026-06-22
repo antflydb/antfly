@@ -4499,12 +4499,60 @@ pub const ApiHttpServer = struct {
         return try alloc.dupe(u8, identifier);
     }
 
+    fn publicSqlWithFinalStatementIndex(tokens: []const sql_adapter.Token, start: usize, end: usize) ?usize {
+        if (start >= end or start >= tokens.len) return null;
+        if (!tokens[start].matchesKeywordTag(.with)) return start;
+
+        var index = start + 1;
+        if (index < end and tokens[index].matchesKeywordTag(.recursive)) index += 1;
+        while (true) {
+            if (index >= end or tokens[index].kind != .identifier) return null;
+            index += 1;
+            if (index < end and tokens[index].kind == .lparen) {
+                index = (publicSqlFindMatchingRParenIndex(tokens, index, end) orelse return null) + 1;
+            }
+            if (index >= end or !tokens[index].matchesKeywordTag(.as)) return null;
+            index += 1;
+            if (index < end and tokens[index].matchesKeywordTag(.not)) {
+                if (index + 1 < end and tokens[index + 1].matchesKeywordTag(.materialized)) index += 2;
+            } else if (index < end and tokens[index].matchesKeywordTag(.materialized)) {
+                index += 1;
+            }
+            if (index >= end or tokens[index].kind != .lparen) return null;
+            index = (publicSqlFindMatchingRParenIndex(tokens, index, end) orelse return null) + 1;
+            if (index < end and tokens[index].kind == .comma) {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        if (index >= end or tokens[index].kind != .identifier) return null;
+        return index;
+    }
+
+    fn publicSqlFindMatchingRParenIndex(tokens: []const sql_adapter.Token, lparen_index: usize, end: usize) ?usize {
+        if (lparen_index >= end or tokens[lparen_index].kind != .lparen) return null;
+        var depth: usize = 1;
+        var index = lparen_index + 1;
+        while (index < end) : (index += 1) {
+            switch (tokens[index].kind) {
+                .lparen => depth += 1,
+                .rparen => {
+                    depth -= 1;
+                    if (depth == 0) return index;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn publicSqlWriteTargetTableNameAlloc(self: *ApiHttpServer, parsed_sql: *const sql_adapter.ParsedSql) ![]const u8 {
         const statement_kind = parsed_sql.writeStatementKind() orelse return error.UnsupportedSqlShape;
         const tokens = parsed_sql.items();
         const raw = parsed_sql.statement.raw();
         if (raw.token_start >= raw.token_end or raw.token_start >= tokens.len) return error.UnsupportedSqlShape;
-        var pos = raw.token_start;
+        var pos = publicSqlWithFinalStatementIndex(tokens, raw.token_start, raw.token_end) orelse return error.UnsupportedSqlShape;
         switch (statement_kind) {
             .insert, .insert_source => {
                 if (!tokens[pos].matchesKeywordTag(.insert)) return error.UnsupportedSqlShape;
@@ -5017,6 +5065,60 @@ pub const ApiHttpServer = struct {
         return .{ .result = result };
     }
 
+    fn applyLoweredPublicSqlRecursiveJoinedMutationSource(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
+    } {
+        const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        const write_source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.mutation.req.kind) catch |err| switch (err) {
+            error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return err,
+        };
+
+        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (target_filter) |*value| value.deinit(self.alloc);
+        if (target_filter != null) return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") };
+
+        const result = (table_writes.mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
+            self.alloc,
+            read_source,
+            write_source,
+            self.catalogSource(),
+            session,
+            target_table_name,
+            target_schema,
+            target_schema,
+            lowered,
+            .read_index,
+        ) catch |err| switch (err) {
+            error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+            error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
+            error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
+            else => {
+                std.log.err("public sql recursive joined mutation source failed table={s} cte={s} err={}", .{ target_table_name, lowered.recursive.cte_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        return .{ .result = result };
+    }
+
     fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -5155,6 +5257,28 @@ pub const ApiHttpServer = struct {
                 self.ensureSqlProtocolSessionId(session),
                 @tagName(statement_kind),
                 joined_mutation_result,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
+
+        if (lowered == .recursive_update_joined_source or lowered == .recursive_delete_joined_source) {
+            const recursive_joined_mutation_source = switch (lowered) {
+                .recursive_update_joined_source => |recursive_update_joined_source| recursive_update_joined_source,
+                .recursive_delete_joined_source => |recursive_delete_joined_source| recursive_delete_joined_source,
+                else => unreachable,
+            };
+            var recursive_joined_mutation_result = switch (try self.applyLoweredPublicSqlRecursiveJoinedMutationSource(target_table, schema, recursive_joined_mutation_source, session.session(), authenticated_identity)) {
+                .failure => |failure| return failure,
+                .result => |result| result,
+            };
+            defer recursive_joined_mutation_result.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsMutationSourceResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                recursive_joined_mutation_result,
             );
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
@@ -24421,6 +24545,52 @@ test "api http server executes SQL point writes through typed row batch ingress"
     defer parsed_deleted_joined_source_query.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_deleted_joined_source_query.value.object.get("result").?.object.get("total").?.integer);
 
+    var recursive_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('recursive-a', 'root', 1), ('recursive-b', 'recursive-a', 2), ('recursive-c', 'other', 3);\"}",
+    });
+    defer recursive_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recursive_seed_resp.status);
+
+    var recursive_update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'root' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.status = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows) RETURNING id, status;\"}",
+    });
+    defer recursive_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recursive_update_resp.status);
+    var parsed_recursive_update = try std.json.parseFromSlice(std.json.Value, alloc, recursive_update_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_recursive_update.deinit();
+    try std.testing.expectEqualStrings("write", parsed_recursive_update.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("update_joined_source", parsed_recursive_update.value.object.get("statement_kind").?.string);
+    const recursive_update_result = parsed_recursive_update.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), recursive_update_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), recursive_update_result.get("staged").?.integer);
+    const recursive_returning = recursive_update_result.get("returning").?.array;
+    try std.testing.expectEqual(@as(usize, 2), recursive_returning.items.len);
+
+    var recursive_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status FROM usage_records WHERE id IN ('recursive-a', 'recursive-b', 'recursive-c') ORDER BY id ASC;\"}",
+    });
+    defer recursive_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), recursive_query_resp.status);
+    var parsed_recursive_query = try std.json.parseFromSlice(std.json.Value, alloc, recursive_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_recursive_query.deinit();
+    const recursive_rows = parsed_recursive_query.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), recursive_rows.len);
+    try std.testing.expectEqualStrings("recursive-a", recursive_rows[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("done", recursive_rows[0].object.get("status").?.string);
+    try std.testing.expectEqualStrings("recursive-b", recursive_rows[1].object.get("id").?.string);
+    try std.testing.expectEqualStrings("done", recursive_rows[1].object.get("status").?.string);
+    try std.testing.expectEqualStrings("recursive-c", recursive_rows[2].object.get("id").?.string);
+    try std.testing.expectEqualStrings("other", recursive_rows[2].object.get("status").?.string);
+
     var truncate_seed_resp = try server.handle(.{
         .method = .POST,
         .uri = "/db/v1/sql",
@@ -24443,8 +24613,8 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("write", parsed_truncate.value.object.get("kind").?.string);
     try std.testing.expectEqualStrings("truncate", parsed_truncate.value.object.get("statement_kind").?.string);
     const truncate_result = parsed_truncate.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 3), truncate_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 3), truncate_result.get("staged").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), truncate_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), truncate_result.get("staged").?.integer);
 
     var truncated_query_resp = try server.handle(.{
         .method = .POST,

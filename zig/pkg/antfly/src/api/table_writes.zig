@@ -4503,6 +4503,82 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
     );
 }
 
+pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitAlloc(
+    alloc: std.mem.Allocator,
+    read_source: table_reads.TableReadSource,
+    write_source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    recursive_source_schema: storage_schema.TableSchema,
+    target_schema: storage_schema.TableSchema,
+    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsMutationSourceResult {
+    return try mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
+        alloc,
+        read_source,
+        write_source,
+        catalog,
+        catalog_resources.SqlCatalogSession.default(),
+        default_table_name,
+        recursive_source_schema,
+        target_schema,
+        lowered,
+        consistency,
+    );
+}
+
+pub fn mutateRowsJoinedFromRecursiveCtePlanAutocommitWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    read_source: table_reads.TableReadSource,
+    write_source: TableWriteSource,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+    default_table_name: []const u8,
+    recursive_source_schema: storage_schema.TableSchema,
+    target_schema: storage_schema.TableSchema,
+    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsMutationSourceResult {
+    const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
+    if (!std.mem.eql(u8, source_query.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
+
+    var materialized = (try table_reads.materializeLoweredSqlRecursiveCteRowsWithSessionAlloc(
+        alloc,
+        read_source,
+        catalog,
+        session,
+        default_table_name,
+        recursive_source_schema,
+        lowered.recursive,
+        consistency,
+    )) orelse return null;
+    defer materialized.deinit(alloc);
+
+    var cte_schema = recursive_source_schema;
+    cte_schema.relational_columns = lowered.recursive.output_columns;
+    const synthetic_primary_key_columns = [_][]const u8{lowered.recursive.output_columns[0].name};
+    cte_schema.primary_key = .{ .columns = synthetic_primary_key_columns[0..] };
+
+    var filtered_source_query = source_query;
+    filtered_source_query.source_cte = "";
+    filtered_source_query.select = &.{};
+    filtered_source_query.select_all = true;
+    filtered_source_query.row_claim = null;
+    var source_rows = try relational_rows_api.executeRowsQueryOnJsonRowsAlloc(alloc, cte_schema, filtered_source_query, materialized.rows);
+    defer source_rows.deinit(alloc);
+
+    return try write_source.mutateRowsJoinedFromSourceRowsAutocommit(
+        alloc,
+        lowered.mutation.target_table_name,
+        target_schema,
+        recursive_source_schema,
+        lowered.mutation.mutation.req,
+        source_rows.rows,
+        lowered.mutation.sync_level,
+    );
+}
+
 pub fn mergeRowsFromRecursiveCtePlanAlloc(
     alloc: std.mem.Allocator,
     read_source: table_reads.TableReadSource,

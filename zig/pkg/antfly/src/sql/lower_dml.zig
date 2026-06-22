@@ -762,7 +762,7 @@ pub fn parseInsertSourceAlloc(
     cte_hooks: plan_mod.CteSelectParserHooks,
     hooks: InsertSourceParserHooks,
 ) !plan_mod.LoweredInsertSource {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseInsertSourceWithCtesAlloc(alloc, tokens, pos, hooks, .{
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) return try parseInsertSourceWithCtesAlloc(alloc, tokens, pos, hooks, .{
         .ctes = &.{},
         .base_table_name = null,
     });
@@ -789,8 +789,8 @@ pub fn parseInsertSourceWithCtesAlloc(
     hooks: InsertSourceParserHooks,
     options: InsertSourceParserOptions,
 ) !plan_mod.LoweredInsertSource {
-    try parser.expectKeyword(tokens, pos, "insert");
-    try parser.expectKeyword(tokens, pos, "into");
+    try parser.expectKeywordTag(tokens, pos, .insert);
+    try parser.expectKeywordTag(tokens, pos, .into);
 
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, pos);
     errdefer plan_mod.freeTableAlias(alloc, target_table);
@@ -813,7 +813,7 @@ pub fn parseInsertSourceWithCtesAlloc(
     }
     try parser.expectToken(tokens, pos, .rparen);
     try validateSqlInsertColumnsUnique(hooks.schema, columns.items);
-    if (!parser.peekKeyword(tokens, pos.*, "select")) return error.UnsupportedSqlShape;
+    if (!parser.peekKeywordTag(tokens, pos.*, .select)) return error.UnsupportedSqlShape;
 
     const base_source_schema = hooks.joined_source_schema orelse hooks.schema;
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
@@ -850,7 +850,7 @@ pub fn parseInsertSourceWithCtesAlloc(
     var conflict: ?db_mod.types.RelationalRowsOnConflict = null;
     errdefer if (conflict) |value| freeRowsOnConflictValue(alloc, value);
     var conflict_where = false;
-    if (parser.matchKeyword(tokens, pos, "on")) {
+    if (parser.matchKeywordTag(tokens, pos, .on)) {
         const conflict_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         const parsed_conflict = try parseConflictClauseWithContextAlloc(alloc, tokens, pos, .{
             .params = hooks.params,
@@ -874,7 +874,7 @@ pub fn parseInsertSourceWithCtesAlloc(
 
     var returning: ReturningProjection = .{};
     errdefer returning.deinit(alloc);
-    if (parser.matchKeyword(tokens, pos, "returning")) {
+    if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, hooks.schema, &returning_qualifiers, hooks.returning_hooks);
     }
@@ -2401,20 +2401,20 @@ pub fn parseConflictClauseAlloc(
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
 ) !ConflictClause {
-    try parser.expectKeyword(tokens, pos, "conflict");
+    try parser.expectKeywordTag(tokens, pos, .conflict);
     const target = try parseConflictTargetAlloc(alloc, tokens, pos, schema, table_name, target_options);
     errdefer freeConflictTarget(alloc, target);
-    try parser.expectKeyword(tokens, pos, "do");
+    try parser.expectKeywordTag(tokens, pos, .do);
 
-    if (parser.matchKeyword(tokens, pos, "nothing")) {
+    if (parser.matchKeywordTag(tokens, pos, .nothing)) {
         return .{
             .target = target,
             .action = .nothing,
         };
     }
 
-    try parser.expectKeyword(tokens, pos, "update");
-    try parser.expectKeyword(tokens, pos, "set");
+    try parser.expectKeywordTag(tokens, pos, .update);
+    try parser.expectKeywordTag(tokens, pos, .set);
     var patch = std.ArrayListUnmanaged(FieldJsonValue).empty;
     errdefer {
         freeFieldJsonValues(alloc, patch.items);
@@ -2484,7 +2484,7 @@ pub fn parseConflictClauseAlloc(
     }
     if (patch.items.len == 0 and patch_expr.items.len == 0 and increment.items.len == 0 and increment_expr.items.len == 0 and json_set.items.len == 0 and array_update.items.len == 0) return error.UnsupportedSqlShape;
     try validateSqlUpdateTargetPaths(schema, patch.items, patch_expr.items, increment.items, increment_expr.items, json_set.items, array_update.items);
-    if (parser.matchKeyword(tokens, pos, "where")) {
+    if (parser.matchKeywordTag(tokens, pos, .where)) {
         try parseConflictActionWhereClause(
             alloc,
             tokens,
@@ -9350,8 +9350,8 @@ pub fn parseInsertAlloc(
     pos: *usize,
     options: InsertParserOptions,
 ) !plan_mod.LoweredInsert {
-    try parser.expectKeyword(tokens, pos, "insert");
-    try parser.expectKeyword(tokens, pos, "into");
+    try parser.expectKeywordTag(tokens, pos, .insert);
+    try parser.expectKeywordTag(tokens, pos, .into);
 
     const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, pos);
     errdefer plan_mod.freeTableAlias(alloc, target_table);
@@ -9368,8 +9368,8 @@ pub fn parseInsertAlloc(
         freeInsertValueRows(alloc, row_values_rows.items);
         row_values_rows.deinit(alloc);
     }
-    if (parser.matchKeyword(tokens, pos, "default")) {
-        try parser.expectKeyword(tokens, pos, "values");
+    if (parser.matchKeywordTag(tokens, pos, .default)) {
+        try parser.expectKeywordTag(tokens, pos, .values);
         const row_values_owned = try alloc.alloc([]const u8, 0);
         var row_values_transferred = false;
         errdefer if (!row_values_transferred) alloc.free(row_values_owned);
@@ -9411,7 +9411,7 @@ pub fn parseInsertAlloc(
         try parser.expectToken(tokens, pos, .rparen);
         try validateSqlInsertColumnsUnique(options.schema, columns.items);
 
-        try parser.expectKeyword(tokens, pos, "values");
+        try parser.expectKeywordTag(tokens, pos, .values);
         while (true) {
             try parser.expectToken(tokens, pos, .lparen);
             var row_values = std.ArrayListUnmanaged([]const u8).empty;
@@ -9474,7 +9474,7 @@ pub fn parseInsertAlloc(
         freeConflictClauses(alloc, conflicts.items);
         conflicts.deinit(alloc);
     }
-    if (parser.matchKeyword(tokens, pos, "on")) {
+    if (parser.matchKeywordTag(tokens, pos, .on)) {
         const conflict_pos = pos.*;
         var after_conflict_pos: ?usize = null;
         const conflict_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
@@ -9497,7 +9497,7 @@ pub fn parseInsertAlloc(
 
     var returning: ReturningProjection = .{};
     errdefer returning.deinit(alloc);
-    if (parser.matchKeyword(tokens, pos, "returning")) {
+    if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
         returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
     }

@@ -168,7 +168,10 @@ counts and `RETURNING` rows. Plain single-table `TRUNCATE` uses the typed
 table-emptying mutation-source path with the SQL-owned row claim; multi-table
 truncate, `CASCADE`, and `RESTART IDENTITY` remain fail-closed until their
 executor wiring can share the native cross-table catalog barrier, identity
-allocator, and 2PC paths. Recursive write sources and merge writes remain
+allocator, and 2PC paths. Recursive CTE-backed claimed update/delete statements
+execute by materializing the bounded recursive producer through the typed read
+planner, filtering the referenced CTE output, and feeding those rows into the
+same joined mutation-source autocommit path. Recursive MERGE writes remain
 fail-closed until their SQL executor wiring can share the native recursive
 materialization, trigger, catalog barrier, and 2PC paths.
 
@@ -830,6 +833,10 @@ Current implementation status:
 - SQL plan parsing uses token keyword tags for CTE heads, set/read result-tail
   clauses, recursive CTE member joins, and final recursive SELECT detection;
   semantic output and source-name comparisons remain ordinary name matching.
+- SQL insert-family parsing uses token keyword tags for `INSERT`, `VALUES`,
+  `INSERT ... SELECT`, `ON CONFLICT`, `DO UPDATE`, `WHERE`, and `RETURNING`
+  structural clauses; semantic column, table, and value comparisons remain
+  ordinary binder/value work.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.
