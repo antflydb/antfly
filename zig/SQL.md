@@ -761,6 +761,11 @@ Current implementation status:
   for scalar, text, regex, JSON, array, datetime, and generated/hash function
   families, so write lowering no longer reinterprets those identifiers from raw
   token text before selecting an assignment-expression parser.
+- Read-side expression classifiers for simple returning fields, aggregate
+  inputs, aggregate filters, aggregate order keys, select projections, row
+  expression operands, generated-column predicates, and general expression
+  starts use the same token metadata for JSON, array, regex, text, datetime,
+  generated/hash, and UUID function families.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

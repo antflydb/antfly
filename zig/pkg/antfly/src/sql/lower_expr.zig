@@ -19494,37 +19494,37 @@ pub fn peekSimpleReturningField(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len or tokens[pos].kind != .identifier) return false;
     if (parser.peekKeyword(tokens, pos, "lower") or
         parser.peekKeyword(tokens, pos, "upper") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsInitcapFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsInitcapFunction) or
         parser.peekKeyword(tokens, pos, "trim") or
         parser.peekKeyword(tokens, pos, "replace") or
         parser.peekKeyword(tokens, pos, "regexp_replace") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction) or
         parser.peekKeyword(tokens, pos, "concat") or
         parser.peekKeyword(tokens, pos, "concat_ws") or
         parser.peekKeyword(tokens, pos, "coalesce") or
         parser.peekKeyword(tokens, pos, "nullif") or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction) or
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
@@ -19626,13 +19626,13 @@ pub fn peekAggregateExpressionInput(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len) return false;
     if (tokens[pos].kind == .lparen or tokens[pos].kind == .minus) return true;
     if (jsonExtractExpressionCanStartAt(tokens, pos)) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction) or
         value_mod.peekConvertFromFunctionCall(tokens, pos) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction) or
         parser.peekKeyword(tokens, pos, "case") or
         parser.peekKeyword(tokens, pos, "cast") or
         peekCoalesceFunctionCall(tokens, pos) or
@@ -19643,28 +19643,28 @@ pub fn peekAggregateExpressionInput(tokens: []const Token, pos: usize) bool {
         peekConcatFunctionCall(tokens, pos) or
         peekReplaceFunctionCall(tokens, pos) or
         peekRegexpReplaceFunctionCall(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction) or
         peekNullifFunctionCall(tokens, pos) or
         peekTextLengthFunctionKeyword(tokens, pos) or
         peekFixedUnaryFunctionCall(tokens, pos, .ascii) or
         peekFixedUnaryFunctionCall(tokens, pos, .chr) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
         parser.peekKeyword(tokens, pos, "position") or
         peekFixedUnaryFunctionCall(tokens, pos, .abs) or
         peekFixedUnaryFunctionCall(tokens, pos, .round) or
@@ -19698,34 +19698,34 @@ pub fn peekAggregateExpressionFilter(tokens: []const Token, pos: usize) bool {
     if (parser.peekKeyword(tokens, pos, "lower") or
         parser.peekKeyword(tokens, pos, "upper") or
         parser.peekKeyword(tokens, pos, "trim") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction) or
         parser.peekKeyword(tokens, pos, "replace") or
         parser.peekKeyword(tokens, pos, "regexp_replace") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction) or
         parser.peekKeyword(tokens, pos, "case") or
         parser.peekKeyword(tokens, pos, "cast") or
         parser.peekKeyword(tokens, pos, "coalesce") or
         parser.peekKeyword(tokens, pos, "nullif") or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
@@ -19738,12 +19738,12 @@ pub fn peekAggregateExpressionFilter(tokens: []const Token, pos: usize) bool {
         peekFunctionCall(tokens, pos, "power") or
         parser.peekKeyword(tokens, pos, "greatest") or
         parser.peekKeyword(tokens, pos, "least") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction) or
         parser.peekKeyword(tokens, pos, "now") or
         parser.peekKeyword(tokens, pos, "current_timestamp") or
         parser.peekKeyword(tokens, pos, "current_date"))
@@ -19766,22 +19766,22 @@ pub fn peekAggregateOutputOrderExpression(tokens: []const Token, pos: usize) boo
     if (parser.peekKeyword(tokens, pos, "lower") or
         parser.peekKeyword(tokens, pos, "upper") or
         parser.peekKeyword(tokens, pos, "trim") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction) or
         parser.peekKeyword(tokens, pos, "replace") or
         parser.peekKeyword(tokens, pos, "regexp_replace") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction) or
         parser.peekKeyword(tokens, pos, "concat") or
         parser.peekKeyword(tokens, pos, "concat_ws") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction) or
         parser.peekKeyword(tokens, pos, "array_append") or
         parser.peekKeyword(tokens, pos, "array_prepend") or
         parser.peekKeyword(tokens, pos, "array_cat") or
@@ -19794,22 +19794,22 @@ pub fn peekAggregateOutputOrderExpression(tokens: []const Token, pos: usize) boo
         parser.peekKeyword(tokens, pos, "coalesce") or
         parser.peekKeyword(tokens, pos, "nullif") or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
@@ -19835,13 +19835,13 @@ pub fn peekAggregateOutputOrderExpression(tokens: []const Token, pos: usize) boo
 }
 
 pub fn peekGeneralOrderRowExpression(tokens: []const Token, pos: usize) bool {
-    return peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
+    return peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction) or
         value_mod.peekToJsonbFunctionCall(tokens, pos) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction) or
         peekArrayElementTransformFunctionCall(tokens, pos) or
         peekArrayToStringFunctionCall(tokens, pos) or
         peekCaseExpressionSyntax(tokens, pos) or
@@ -19849,29 +19849,29 @@ pub fn peekGeneralOrderRowExpression(tokens: []const Token, pos: usize) bool {
         peekCoalesceFunctionCall(tokens, pos) or
         peekRegexpReplaceFunctionCall(tokens, pos) or
         peekReplaceFunctionCall(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction) or
         peekNullifFunctionCall(tokens, pos) or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
         peekPositionFunctionSyntax(tokens, pos) or
         peekFixedUnaryFunctionCall(tokens, pos, .abs) or
         peekFixedUnaryFunctionCall(tokens, pos, .round) or
@@ -19904,7 +19904,7 @@ pub fn orderExpressionStartAt(tokens: []const Token, pos: usize) OrderExpression
     if (rowExpressionHasTopLevelPipeConcat(tokens, pos)) return .pipe_concat;
     if (pos < tokens.len and tokens[pos].kind == .identifier and pos + 1 < tokens.len and tokenKindIsJsonExtractOperator(tokens[pos + 1].kind)) return .json_extract_field;
     if (peekCaseFoldFunctionCall(tokens, pos)) return .generated_or_case_fold;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) return .generated_or_md5;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function)) return .generated_or_md5;
     if (peekConcatFunctionCall(tokens, pos)) return .generated_or_concat;
     if (peekGeneralOrderRowExpression(tokens, pos)) return .general;
     if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
@@ -20344,18 +20344,18 @@ pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     if (rowExpressionHasTopLevelPipeConcat(tokens, pos)) return .pipe_concat;
     if (peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
     if (peekBooleanNotExpressionSyntax(tokens, pos)) return .boolean_not;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsUuidV4Function)) return .uuid_v4;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsUuidV4Function)) return .uuid_v4;
     if (peekSqlNowExpressionSyntax(tokens, pos)) return .now;
     if (peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
     if (peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction)) return .json_extract_path;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction)) return .json_typeof;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction)) return .json_array_length;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction)) return .json_build_object;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction)) return .json_extract_path;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction)) return .json_typeof;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction)) return .json_array_length;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction)) return .json_build_object;
     if (value_mod.peekConvertFromFunctionCall(tokens, pos)) return .convert_from;
     if (value_mod.peekToJsonbFunctionCall(tokens, pos)) return .to_jsonb;
-    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction)) return .array_length;
-    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction)) return .array_position;
+    if (functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction)) return .array_length;
+    if (functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction)) return .array_position;
     if (peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
     if (peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
     if (peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
@@ -20363,30 +20363,30 @@ pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     if (peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
     if (peekReplaceFunctionCall(tokens, pos)) return .replace;
     if (peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction)) return .regexp_substr;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction)) return .regexp_match;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction)) return .regexp_count;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction)) return .regexp_instr;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction)) return .translate;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction)) return .regexp_substr;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction)) return .regexp_match;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction)) return .regexp_count;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction)) return .regexp_instr;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction)) return .translate;
     if (peekConcatFunctionCall(tokens, pos)) return .concat;
     if (peekNullifFunctionCall(tokens, pos)) return .nullif;
     if (peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction)) return .ascii;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction)) return .chr;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction)) return .ascii;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction)) return .chr;
     if (peekSubstringFunctionKeyword(tokens, pos)) return .substring;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction)) return .overlay;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction)) return .overlay;
     if (peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
     if (peekStrposFunctionKeyword(tokens, pos) or peekPositionFunctionSyntax(tokens, pos)) return .strpos;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction)) return .left_right;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction)) return .pad;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction)) return .repeat;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction)) return .reverse;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) return .md5;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction)) return .starts_with;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction)) return .ends_with;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction)) return .date_trunc;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction)) return .date_bin;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction)) return .date_part;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction)) return .left_right;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction)) return .pad;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction)) return .repeat;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction)) return .reverse;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function)) return .md5;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction)) return .starts_with;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction)) return .ends_with;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction)) return .date_trunc;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction)) return .date_bin;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction)) return .date_part;
     if (peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
     if (peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
     if (peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
@@ -21157,36 +21157,36 @@ pub fn rowExpressionOperandStartAt(tokens: []const Token, pos: usize) ?RowExpres
     if (peekSqlNowExpressionSyntax(tokens, pos)) return .now;
     if (peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
     if (peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsUuidV4Function)) return .uuid_v4;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsUuidV4Function)) return .uuid_v4;
     if (peekSqlIntervalExpressionSyntax(tokens, pos)) return .interval;
     if (peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
     if (peekReplaceFunctionCall(tokens, pos)) return .replace;
     if (peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction)) return .regexp_substr;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction)) return .regexp_match;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction)) return .regexp_count;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction)) return .regexp_instr;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction)) return .translate;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction)) return .regexp_substr;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction)) return .regexp_match;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction)) return .regexp_count;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction)) return .regexp_instr;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction)) return .translate;
     if (peekConcatFunctionCall(tokens, pos)) return .concat;
     if (peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
     if (peekNullifFunctionCall(tokens, pos)) return .nullif;
     if (peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction)) return .ascii;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction)) return .chr;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction)) return .ascii;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction)) return .chr;
     if (peekSubstringFunctionKeyword(tokens, pos)) return .substring;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction)) return .overlay;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction)) return .overlay;
     if (peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
     if (peekStrposFunctionKeyword(tokens, pos) or peekPositionFunctionSyntax(tokens, pos)) return .strpos;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction)) return .left_right;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction)) return .pad;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction)) return .repeat;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction)) return .reverse;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) return .md5;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction)) return .starts_with;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction)) return .ends_with;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction)) return .date_trunc;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction)) return .date_bin;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction)) return .date_part;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction)) return .left_right;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction)) return .pad;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction)) return .repeat;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction)) return .reverse;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function)) return .md5;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction)) return .starts_with;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction)) return .ends_with;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction)) return .date_trunc;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction)) return .date_bin;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction)) return .date_part;
     if (peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
     if (peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
     if (peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
@@ -21197,14 +21197,14 @@ pub fn rowExpressionOperandStartAt(tokens: []const Token, pos: usize) ?RowExpres
     if (peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
     if (peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
     if (peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction)) return .json_extract_path;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction)) return .json_typeof;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction)) return .json_array_length;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction)) return .json_build_object;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction)) return .json_extract_path;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction)) return .json_typeof;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction)) return .json_array_length;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction)) return .json_build_object;
     if (value_mod.peekToJsonbFunctionCall(tokens, pos)) return .to_jsonb;
     if (value_mod.peekConvertFromFunctionCall(tokens, pos)) return .convert_from;
-    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction)) return .array_length;
-    if (functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction)) return .array_position;
+    if (functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction)) return .array_length;
+    if (functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction)) return .array_position;
     if (peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
     if (peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
     if (peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
@@ -21479,35 +21479,35 @@ pub fn peekAggregateHavingExpression(tokens: []const Token, pos: usize) bool {
         parser.peekKeyword(tokens, pos, "lower") or
         parser.peekKeyword(tokens, pos, "upper") or
         parser.peekKeyword(tokens, pos, "trim") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction) or
         parser.peekKeyword(tokens, pos, "replace") or
         parser.peekKeyword(tokens, pos, "regexp_replace") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction) or
         parser.peekKeyword(tokens, pos, "case") or
         parser.peekKeyword(tokens, pos, "cast") or
         parser.peekKeyword(tokens, pos, "coalesce") or
         parser.peekKeyword(tokens, pos, "nullif") or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
@@ -23660,8 +23660,8 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
     if (token.kind == .minus) return true;
     if (token.kind == .number or token.kind == .string or token.kind == .placeholder) return true;
     if (token.kind != .identifier) return false;
-    if (functionCallStartsAtIf(tokens, index, sqlKeywordIsArrayLengthFunction) or
-        functionCallStartsAtIf(tokens, index, sqlKeywordIsArrayPositionFunction) or
+    if (functionCallStartsAtTokenIf(tokens, index, sqlTokenIsArrayLengthFunction) or
+        functionCallStartsAtTokenIf(tokens, index, sqlTokenIsArrayPositionFunction) or
         expressionStartKeywordToken(token) or
         functionCallStartsAt(tokens, index, "gen_random_uuid") or
         functionCallStartsAt(tokens, index, "uuid_generate_v4") or
@@ -23671,29 +23671,29 @@ pub fn expressionCanStartAt(tokens: []const Token, index: usize) bool {
         functionCallStartsAt(tokens, index, "sign") or
         functionCallStartsAt(tokens, index, "mod") or
         functionCallStartsAt(tokens, index, "power") or
-        sqlKeywordIsOverlayFunction(token.text) or
+        sqlTokenIsOverlayFunction(token) or
         functionCallStartsAt(tokens, index, "trunc") or
-        sqlKeywordIsTrimVariantFunction(token.text) or
-        sqlKeywordIsPadFunction(token.text) or
-        sqlKeywordIsRepeatFunction(token.text) or
-        sqlKeywordIsReverseFunction(token.text) or
-        sqlKeywordIsInitcapFunction(token.text) or
-        sqlKeywordIsMd5Function(token.text) or
-        sqlKeywordIsStartsWithFunction(token.text) or
-        sqlKeywordIsEndsWithFunction(token.text) or
-        sqlKeywordIsDateTruncFunction(token.text) or
-        sqlKeywordIsDateBinFunction(token.text) or
-        sqlKeywordIsDatePartFunction(token.text) or
-        (sqlKeywordIsJsonExtractPathFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
-        (sqlKeywordIsJsonTypeofFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
-        (sqlKeywordIsJsonArrayLengthFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
-        (sqlKeywordIsJsonBuildObjectFunction(token.text) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
+        sqlTokenIsTrimVariantFunction(token) or
+        sqlTokenIsPadFunction(token) or
+        sqlTokenIsRepeatFunction(token) or
+        sqlTokenIsReverseFunction(token) or
+        sqlTokenIsInitcapFunction(token) or
+        sqlTokenIsMd5Function(token) or
+        sqlTokenIsStartsWithFunction(token) or
+        sqlTokenIsEndsWithFunction(token) or
+        sqlTokenIsDateTruncFunction(token) or
+        sqlTokenIsDateBinFunction(token) or
+        sqlTokenIsDatePartFunction(token) or
+        (sqlTokenIsJsonExtractPathFunction(token) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
+        (sqlTokenIsJsonTypeofFunction(token) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
+        (sqlTokenIsJsonArrayLengthFunction(token) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
+        (sqlTokenIsJsonBuildObjectFunction(token) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
         (token.matchesKeywordTag(.to_jsonb) and index + 1 < tokens.len and tokens[index + 1].kind == .lparen) or
-        sqlKeywordIsRegexpMatchFunction(token.text) or
-        sqlKeywordIsRegexpCountFunction(token.text) or
-        sqlKeywordIsRegexpSubstrFunction(token.text) or
-        sqlKeywordIsRegexpInstrFunction(token.text) or
-        sqlKeywordIsTranslateFunction(token.text))
+        sqlTokenIsRegexpMatchFunction(token) or
+        sqlTokenIsRegexpCountFunction(token) or
+        sqlTokenIsRegexpSubstrFunction(token) or
+        sqlTokenIsRegexpInstrFunction(token) or
+        sqlTokenIsTranslateFunction(token))
     {
         return true;
     }
@@ -23806,8 +23806,8 @@ fn singleBooleanExpressionCanStartAt(tokens: []const Token, index: usize, schema
         token.matchesKeywordTag(.cast) or
         token.matchesKeywordTag(.coalesce) or
         token.matchesKeywordTag(.nullif) or
-        sqlKeywordIsRegexpMatchFunction(token.text) or
-        sqlKeywordIsStartsWithFunction(token.text) or
+        sqlTokenIsRegexpMatchFunction(token) or
+        sqlTokenIsStartsWithFunction(token) or
         binder.relationalColumnForField(schema, token.text, null) != null;
 }
 
@@ -23958,8 +23958,8 @@ pub fn canParseExpressionWhereCondition(
             defer_row_expression_field_validation,
         ));
     }
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsInitcapFunction)) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function)) {
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsInitcapFunction)) return true;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function)) {
         return !(try generatedExpressionCallHasGeneratedColumn(
             alloc,
             tokens,
@@ -23981,12 +23981,12 @@ pub fn canParseExpressionWhereCondition(
             defer_row_expression_field_validation,
         ));
     }
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonExtractPathFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonTypeofFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonArrayLengthFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsJsonBuildObjectFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayLengthFunction) or
-        functionCallStartsAtIf(tokens, pos, sqlKeywordIsArrayPositionFunction) or
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonExtractPathFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonTypeofFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonArrayLengthFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsJsonBuildObjectFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayLengthFunction) or
+        functionCallStartsAtTokenIf(tokens, pos, sqlTokenIsArrayPositionFunction) or
         parser.peekKeyword(tokens, pos, "array_append") or
         parser.peekKeyword(tokens, pos, "array_prepend") or
         parser.peekKeyword(tokens, pos, "array_cat") or
@@ -23996,27 +23996,27 @@ pub fn canParseExpressionWhereCondition(
         parser.peekKeyword(tokens, pos, "case") or
         parser.peekKeyword(tokens, pos, "cast") or
         parser.peekKeyword(tokens, pos, "coalesce") or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpSubstrFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpSubstrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction) or
         parser.peekKeyword(tokens, pos, "nullif") or
         peekTextLengthFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsAsciiFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsChrFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsAsciiFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsChrFunction) or
         peekSubstringFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsOverlayFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsOverlayFunction) or
         peekSplitPartFunctionKeyword(tokens, pos) or
         peekStrposFunctionKeyword(tokens, pos) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsLeftRightFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsPadFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsRepeatFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsReverseFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsStartsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsEndsWithFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateTruncFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDateBinFunction) or
-        peekFunctionCallIf(tokens, pos, sqlKeywordIsDatePartFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsLeftRightFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsPadFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRepeatFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsReverseFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsStartsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsEndsWithFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateTruncFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDateBinFunction) or
+        peekFunctionCallTokenIf(tokens, pos, sqlTokenIsDatePartFunction) or
         parser.peekKeyword(tokens, pos, "position") or
         parser.peekKeyword(tokens, pos, "abs") or
         parser.peekKeyword(tokens, pos, "round") or
@@ -24032,13 +24032,13 @@ pub fn canParseExpressionWhereCondition(
     if (expressionNullSafeDistinctPredicateCanStartAt(tokens, pos)) return true;
     if (textPatternSetPredicateCanStartAt(tokens, pos)) return true;
     if (parser.peekKeyword(tokens, pos, "trim")) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsTrimVariantFunction)) return true;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTrimVariantFunction)) return true;
     if (parser.peekKeyword(tokens, pos, "replace")) return true;
     if (parser.peekKeyword(tokens, pos, "regexp_replace")) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpMatchFunction)) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpCountFunction)) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsRegexpInstrFunction)) return true;
-    if (peekFunctionCallIf(tokens, pos, sqlKeywordIsTranslateFunction)) return true;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpMatchFunction)) return true;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpCountFunction)) return true;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsRegexpInstrFunction)) return true;
+    if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsTranslateFunction)) return true;
     if (parser.peekKeyword(tokens, pos, "concat_ws")) return true;
     if (jsonExtractNullTestPredicateCanStartAt(tokens, pos)) return true;
     if (jsonExtractNullSafeDistinctPredicateCanStartAt(tokens, pos)) return true;
@@ -24083,7 +24083,7 @@ fn generatedExpressionCallHasGeneratedColumn(
         .lower
     else if (parser.peekKeyword(tokens, pos, "upper"))
         .upper
-    else if (peekFunctionCallIf(tokens, pos, sqlKeywordIsMd5Function))
+    else if (peekFunctionCallTokenIf(tokens, pos, sqlTokenIsMd5Function))
         .md5
     else
         return false;
