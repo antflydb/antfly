@@ -358,6 +358,9 @@ fn writePlannedExport(
     if (isColqwenBundleExportManifest(manifest)) {
         try exportColqwenBundleSidecars(allocator, model_dir, output_path, manifest);
     }
+    if (isFlorence2ExportManifest(manifest)) {
+        try exportFlorence2BundleSidecars(allocator, model_dir, output_path);
+    }
 }
 
 fn writeSinglePlanExport(
@@ -393,6 +396,11 @@ fn isColqwenBundleExportManifest(manifest: manifest_mod.ModelManifest) bool {
 fn isClipclapExportManifest(manifest: manifest_mod.ModelManifest) bool {
     return std.mem.eql(u8, manifest.config_model_arch, "clipclap") or
         std.mem.eql(u8, manifest.inference_bundle_family, "clipclap_gguf_bundle/v1");
+}
+
+fn isFlorence2ExportManifest(manifest: manifest_mod.ModelManifest) bool {
+    return florence_mod.isFlorenceModel(manifest.config_model_arch) or
+        std.mem.eql(u8, manifest.inference_bundle_family, "florence2_gguf_bundle/v1");
 }
 
 const colqwen_required_sidecars = [_][]const u8{
@@ -561,6 +569,91 @@ fn synthesizeColqwenModelManifestJson(
         .capabilities = caps.items,
         .inputs = &[_][]const u8{ "text", "image" },
     }, .{});
+}
+
+const florence2_required_sidecars = [_][]const u8{
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "preprocessor_config.json",
+};
+
+const florence2_optional_sidecars = [_][]const u8{
+    "processor_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+    "generation_config.json",
+    "chat_template.jinja",
+};
+
+fn exportFlorence2BundleSidecars(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    output_path: []const u8,
+) !void {
+    const io = io_compat();
+    const out_dir = std.fs.path.dirname(output_path) orelse ".";
+    if (out_dir.len > 0) try compat.cwd().createDirPath(io, out_dir);
+
+    for (florence2_required_sidecars) |file_name| {
+        try copyRequiredFlorence2Sidecar(allocator, model_dir, out_dir, file_name);
+    }
+    for (florence2_optional_sidecars) |file_name| {
+        try copySidecarIfExists(allocator, model_dir, out_dir, file_name);
+    }
+
+    const model_manifest_out = try std.fs.path.join(allocator, &.{ out_dir, "model_manifest.json" });
+    defer allocator.free(model_manifest_out);
+    const manifest_json = try synthesizeFlorence2ModelManifestJson(allocator);
+    defer allocator.free(manifest_json);
+    try compat.cwd().writeFile(io, .{ .sub_path = model_manifest_out, .data = manifest_json });
+
+    try writeFlorence2BundleMarker(allocator, out_dir, output_path);
+    try variants_manifest.writeFlorence2VariantsManifestForModel(allocator, io, out_dir, std.fs.path.basename(output_path));
+}
+
+fn copyRequiredFlorence2Sidecar(
+    allocator: std.mem.Allocator,
+    source_dir: []const u8,
+    out_dir: []const u8,
+    file_name: []const u8,
+) !void {
+    if (!c_file.fileExistsInDir(allocator, source_dir, file_name)) return error.MissingRequiredFlorence2Sidecar;
+    try copySidecarIfExists(allocator, source_dir, out_dir, file_name);
+}
+
+fn synthesizeFlorence2ModelManifestJson(allocator: std.mem.Allocator) ![]u8 {
+    return std.json.Stringify.valueAlloc(allocator, .{
+        .type = "reader",
+        .tasks = &[_][]const u8{"read"},
+        .capabilities = &[_][]const u8{ "extraction", "ocr", "captioning" },
+        .inputs = &[_][]const u8{ "text", "image" },
+    }, .{});
+}
+
+fn writeFlorence2BundleMarker(
+    allocator: std.mem.Allocator,
+    out_dir: []const u8,
+    output_path: []const u8,
+) !void {
+    const marker_path = try std.fs.path.join(allocator, &.{ out_dir, "antfly_inference_bundle.json" });
+    defer allocator.free(marker_path);
+    const marker_bytes = try std.json.Stringify.valueAlloc(allocator, .{
+        .family = "florence2_gguf_bundle/v1",
+        .model = std.fs.path.basename(output_path),
+        .required_sidecars = &florence2_required_sidecars,
+        .optional_sidecars = &florence2_optional_sidecars,
+        .tasks = &[_][]const u8{"read"},
+        .capabilities = &[_][]const u8{ "extraction", "ocr", "captioning" },
+        .inputs = &[_][]const u8{ "text", "image" },
+    }, .{});
+    defer allocator.free(marker_bytes);
+    try compat.cwd().writeFile(io_compat(), .{
+        .sub_path = marker_path,
+        .data = marker_bytes,
+    });
 }
 
 const clipclap_required_sidecars = [_][]const u8{
@@ -6407,6 +6500,15 @@ test "dense florence export writes florence metadata and tensors" {
         \\{"model_type":"florence2","text_config":{"d_model":8,"encoder_layers":1,"decoder_layers":1,"encoder_attention_heads":2,"decoder_attention_heads":2,"encoder_ffn_dim":16,"decoder_ffn_dim":16,"vocab_size":32,"max_position_embeddings":16},"vision_config":{"image_size":32,"hidden_size":8,"patch_size":[7,3,3,3],"patch_stride":[4,2,2,2],"patch_padding":[3,1,1,1],"patch_prenorm":[false,true,true,true],"dim_embed":[8,16,24,32],"num_heads":[1,2,3,4],"num_groups":[1,2,3,4],"depths":[1,1,2,1],"window_size":12,"image_pos_embed":{"max_pos_embeddings":50},"visual_temporal_embedding":{"max_temporal_embeddings":100},"image_feature_source":["spatial_avg_pool","last_frame"]},"projection_dim":8,"image_token_id":31,"bos_token_id":2,"eos_token_id":3,"pad_token_id":1,"decoder_start_token_id":2}
         ,
     });
+    try writeTestFileInDir(allocator, dir_path, "tokenizer.json",
+        \\{"version":"1.0","model":{"type":"BPE","vocab":{"<s>":2,"</s>":3,"<OCR>":4},"merges":[]}}
+    );
+    try writeTestFileInDir(allocator, dir_path, "tokenizer_config.json", "{}");
+    try writeTestFileInDir(allocator, dir_path, "preprocessor_config.json",
+        \\{"size":{"height":32,"width":32},"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]}
+    );
+    try writeTestFileInDir(allocator, dir_path, "vocab.json", "{}");
+    try writeTestFileInDir(allocator, dir_path, "merges.txt", "");
 
     const st_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(st_path);
@@ -6424,7 +6526,7 @@ test "dense florence export writes florence metadata and tensors" {
         .{ .name = "lm_head.weight", .shape = &.{ 32, 8 }, .data = &([_]f32{0.0} ** 256) },
     });
 
-    const out_path = try std.fs.path.join(allocator, &.{ dir_path, "florence.gguf" });
+    const out_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.gguf" });
     defer allocator.free(out_path);
     try exportModelDirToGguf(allocator, dir_path, out_path, .none);
 
@@ -6449,6 +6551,30 @@ test "dense florence export writes florence metadata and tensors" {
     try std.testing.expect(catalog.find("language_model.model.decoder.layers.0.self_attn.k_proj.weight") != null);
     try std.testing.expect(catalog.find("language_model.final_logits_bias") != null);
     try std.testing.expect(catalog.find("lm_head.weight") != null);
+
+    const bundle_marker_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_bundle.json" });
+    defer allocator.free(bundle_marker_path);
+    const bundle_marker = try c_file.readFile(allocator, bundle_marker_path);
+    defer allocator.free(bundle_marker);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_marker, "\"family\":\"florence2_gguf_bundle/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bundle_marker, "\"model\":\"florence-2-base.gguf\"") != null);
+
+    const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
+    defer allocator.free(variants_path);
+    const variants = try c_file.readFile(allocator, variants_path);
+    defer allocator.free(variants);
+    try std.testing.expect(std.mem.indexOf(u8, variants, "\"family\": \"florence2_variants/v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, variants, "\"model\": \"florence-2-base.gguf\"") != null);
+
+    var exported_manifest = try manifest_mod.loadFromDir(allocator, dir_path);
+    defer exported_manifest.deinit();
+    try std.testing.expect(exported_manifest.isFlorence2GgufBundle());
+    try std.testing.expect(!exported_manifest.hasIncompleteFlorence2GgufBundle());
+    try std.testing.expectEqual(manifest_mod.ModelType.reader, exported_manifest.model_type);
+    try std.testing.expect(exported_manifest.hasTask("read"));
+    try std.testing.expect(exported_manifest.hasCapability("extraction"));
+    try std.testing.expect(exported_manifest.hasInput("text"));
+    try std.testing.expect(exported_manifest.hasInput("image"));
 }
 
 test "gliner2 export writes split encoder gguf bundle" {
@@ -8012,6 +8138,12 @@ fn writeWideQuantFixture(allocator: std.mem.Allocator, dir_path: []const u8) !vo
         .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
         .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 256, 256 }, .data = wide },
     });
+}
+
+fn writeTestFileInDir(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8, data: []const u8) !void {
+    const path = try std.fs.path.join(allocator, &.{ dir_path, name });
+    defer allocator.free(path);
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = data });
 }
 
 fn writeMinimalQuantizedGgufFixture(allocator: std.mem.Allocator, path: []const u8) !void {
