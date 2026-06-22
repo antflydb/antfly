@@ -1412,8 +1412,10 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         const entry = try parseFixtureEntryAlloc(alloc, entry_value);
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
-        try validateSourceCorpusEntryMetadata(alloc, entry);
-        try validateSourceCorpusEntryJsonPayloads(alloc, entry);
+        var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+        defer parsed_sql.deinit(alloc);
+        try validateSourceCorpusEntryMetadataParsedSql(entry, &parsed_sql);
+        try validateSourceCorpusEntryJsonPayloadsParsedSql(alloc, entry, &parsed_sql);
         try seen_names.put(alloc, entry.name, {});
         try entries.append(alloc, entry);
     }
@@ -2640,13 +2642,16 @@ fn setOperationPlanHasRightTable(plan: []const u8, source_table_name: []const u8
 pub fn corpusFixtureSqlParameterCoverageMatchesAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !bool {
     var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return false;
     defer parsed_sql.deinit(alloc);
+    return corpusFixtureSqlParameterCoverageMatchesParsedSql(entry, &parsed_sql);
+}
 
+pub fn corpusFixtureSqlParameterCoverageMatchesParsedSql(entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) bool {
     if (entry.family == .ddl and entry.summary.ddl_tag == .prepare_statement) {
         if (entry.params.len != 0) return false;
         const prepared_params = planUsizeTokenValue(entry.plan, ":params=") orelse return false;
-        return sqlParameterCoverageMatchesParsedSql(&parsed_sql, prepared_params);
+        return sqlParameterCoverageMatchesParsedSql(parsed_sql, prepared_params);
     }
-    return sqlParameterCoverageMatchesParsedSql(&parsed_sql, entry.params.len);
+    return sqlParameterCoverageMatchesParsedSql(parsed_sql, entry.params.len);
 }
 
 pub fn sqlParameterCoverageMatchesParsedSql(parsed_sql: *const tokenized.ParsedSql, param_count: usize) bool {
@@ -2736,7 +2741,11 @@ const AppParityCorpusMetadataMode = enum {
     generated_fixture,
 };
 
-fn validateCorpusMetadataCore(alloc: std.mem.Allocator, entry: AppParityCorpusEntry, mode: AppParityCorpusMetadataMode) !void {
+fn validateCorpusMetadataCoreParsedSql(
+    entry: AppParityCorpusEntry,
+    mode: AppParityCorpusMetadataMode,
+    parsed_sql: *const tokenized.ParsedSql,
+) !void {
     if (entry.name.len == 0 or entry.sql.len == 0 or entry.plan.len == 0) return error.TestUnexpectedResult;
     if (!corpusPlanMatchesFamily(entry.family, entry.plan)) return error.TestUnexpectedResult;
     if (corpusFixtureFamilyNeedsReason(entry.family) and entry.classification_reason.len == 0) {
@@ -2940,7 +2949,7 @@ fn validateCorpusMetadataCore(alloc: std.mem.Allocator, entry: AppParityCorpusEn
     if (has_resolver_hint and !corpusFixtureFamilyAllowsResolverHint(entry.family)) return error.TestUnexpectedResult;
     if (has_resolver_hint and
         (entry.family == .insert or entry.family == .invalid_insert or entry.family == .unsupported_insert) and
-        !try corpusSqlHasOnConflictParsedSqlAlloc(alloc, entry.sql))
+        !corpusParsedSqlHasOnConflictTokens(parsed_sql))
     {
         return error.TestUnexpectedResult;
     }
@@ -2961,17 +2970,23 @@ fn validateCorpusMetadataCore(alloc: std.mem.Allocator, entry: AppParityCorpusEn
 }
 
 pub fn validateSourceCorpusEntryMetadata(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
-    return validateCorpusMetadataCore(alloc, entry, .source);
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+    defer parsed_sql.deinit(alloc);
+    return validateSourceCorpusEntryMetadataParsedSql(entry, &parsed_sql);
+}
+
+pub fn validateSourceCorpusEntryMetadataParsedSql(entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) !void {
+    return validateCorpusMetadataCoreParsedSql(entry, .source, parsed_sql);
 }
 
 pub fn validateFixtureMetadataCore(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
-    return validateCorpusMetadataCore(alloc, entry, .generated_fixture);
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+    defer parsed_sql.deinit(alloc);
+    return validateFixtureMetadataCoreParsedSql(entry, &parsed_sql);
 }
 
-fn corpusSqlHasOnConflictParsedSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !bool {
-    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, sql) catch return false;
-    defer parsed_sql.deinit(alloc);
-    return corpusParsedSqlHasOnConflictTokens(&parsed_sql);
+pub fn validateFixtureMetadataCoreParsedSql(entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) !void {
+    return validateCorpusMetadataCoreParsedSql(entry, .generated_fixture, parsed_sql);
 }
 
 fn corpusParsedSqlHasOnConflictTokens(parsed_sql: *const tokenized.ParsedSql) bool {
@@ -2980,6 +2995,15 @@ fn corpusParsedSqlHasOnConflictTokens(parsed_sql: *const tokenized.ParsedSql) bo
 
 fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
     if (!(try corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, entry))) return error.TestUnexpectedResult;
+    try validateSourceCorpusEntryJsonPayloadsOnlyAlloc(alloc, entry);
+}
+
+fn validateSourceCorpusEntryJsonPayloadsParsedSql(alloc: std.mem.Allocator, entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) !void {
+    if (!corpusFixtureSqlParameterCoverageMatchesParsedSql(entry, parsed_sql)) return error.TestUnexpectedResult;
+    try validateSourceCorpusEntryJsonPayloadsOnlyAlloc(alloc, entry);
+}
+
+fn validateSourceCorpusEntryJsonPayloadsOnlyAlloc(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
     for (entry.returning_rows) |row_json| {
         if (!(try fixtureJsonTextIsObjectAlloc(alloc, row_json))) return error.TestUnexpectedResult;
     }

@@ -130,8 +130,10 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     seen_names: *std.StringHashMapUnmanaged(void),
     callbacks: AppParityFixtureMetadataCallbacks,
 ) !void {
-    try corpus.validateFixtureMetadataCore(alloc, entry);
-    if (!(try corpus.corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, entry))) return error.TestUnexpectedResult;
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+    defer parsed_sql.deinit(alloc);
+    try corpus.validateFixtureMetadataCoreParsedSql(entry, &parsed_sql);
+    if (!corpus.corpusFixtureSqlParameterCoverageMatchesParsedSql(entry, &parsed_sql)) return error.TestUnexpectedResult;
     var owned_applied_base_schema_json: ?[]u8 = null;
     defer if (owned_applied_base_schema_json) |schema_json| alloc.free(schema_json);
     const applied_base_schema_json = if (base_schema_json.len > 0)
@@ -160,8 +162,6 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
         }
     }
     if (entry.source_schema_json.len > 0) {
-        var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
-        defer parsed_sql.deinit(alloc);
         const source_table_name = (corpus.appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
         defer alloc.free(@constCast(source_table_name));
         if (source_table_name.len == 0) return error.TestUnexpectedResult;

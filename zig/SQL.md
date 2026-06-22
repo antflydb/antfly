@@ -640,6 +640,9 @@ Current implementation status:
   `ParsedSql` placeholder tokens instead of a separate raw SQL byte scanner,
   and resolver-hint metadata validates `ON CONFLICT` from parsed statement
   tokens instead of spinning up a hidden tokenizer from fixture SQL.
+  Source-corpus loading and generated-fixture metadata validation now parse
+  each fixture entry once and share that `ParsedSql` through metadata,
+  parameter, resolver-hint, and source-table checks.
   Corpus feature coverage parses entries once and uses SQL tokens for query
   function, conflict, multi-row insert, computed-pattern, JSONB, array, and UUID
   coverage checks instead of raw substring probes. More corpus coverage buckets,
@@ -664,6 +667,9 @@ Current implementation status:
 - DML conflict, assignment, and merge expression-start helpers share the same
   keyword metadata for boolean atoms, `DEFAULT`, `NOT`, `OR`, and
   parenthesized conjunction/disjunction probes.
+- Row-expression boundary detection and unsupported read-tail detection use
+  keyword metadata, including CASE branch delimiters, so expression scanners
+  stop on parsed token facts instead of reinterpreting identifier text.
 - Conflict-update and insert-source conflict coverage checks now use parsed SQL
   tokens for function calls, keyword sequences, JSONB concatenation, row
   assignment, boolean update, and regex expression buckets instead of raw SQL

@@ -19368,7 +19368,7 @@ pub fn rowExpressionHasTopLevelPipeConcat(tokens: []const Token, pos: usize) boo
             },
             .pipe_concat => if (depth == 0) return true,
             .comma, .semicolon, .eq, .neq, .lt, .lte, .gt, .gte, .at_contains, .range_overlap, .question, .arrow_json, .arrow_text, .path_arrow_json, .path_arrow_text, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => if (depth == 0) return false,
-            .identifier => if (depth == 0 and rowExpressionBoundaryKeyword(token.text)) return false,
+            .identifier => if (depth == 0 and rowExpressionBoundaryKeywordToken(token)) return false,
             else => {},
         }
     }
@@ -23625,7 +23625,7 @@ pub fn textPatternSetPredicateCanStartAt(tokens: []const Token, index: usize) bo
                 {
                     return tokenAtIsAnySomeOrAll(tokens, i + 2);
                 }
-                if (rowExpressionBoundaryKeyword(token.text)) return false;
+                if (rowExpressionBoundaryKeywordToken(token)) return false;
             },
             else => {},
         }
@@ -23653,7 +23653,7 @@ pub fn expressionNullSafeDistinctPredicateCanStartAt(tokens: []const Token, inde
                 return distinct_index + 1 < tokens.len and
                     tokens[distinct_index].matchesKeywordTag(.distinct) and
                     tokens[distinct_index + 1].matchesKeywordTag(.from);
-            } else if (depth == 0 and rowExpressionBoundaryKeyword(token.text)) {
+            } else if (depth == 0 and rowExpressionBoundaryKeywordToken(token)) {
                 return false;
             },
             .semicolon, .comma => if (depth == 0) return false,
@@ -23945,14 +23945,14 @@ pub fn expressionPredicateCanStartAt(tokens: []const Token, index: usize) bool {
 
 pub fn nextIsUnsupportedQueryKeyword(tokens: []const Token, pos: usize) bool {
     if (pos >= tokens.len or tokens[pos].kind != .identifier) return false;
-    const token = tokens[pos].text;
-    return std.ascii.eqlIgnoreCase(token, "join") or
-        std.ascii.eqlIgnoreCase(token, "left") or
-        std.ascii.eqlIgnoreCase(token, "inner") or
-        std.ascii.eqlIgnoreCase(token, "group") or
-        std.ascii.eqlIgnoreCase(token, "with") or
-        std.ascii.eqlIgnoreCase(token, "over") or
-        std.ascii.eqlIgnoreCase(token, "lateral");
+    const token = tokens[pos];
+    return token.matchesKeywordTag(.join) or
+        token.matchesKeywordTag(.left) or
+        token.matchesKeywordTag(.inner) or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.with) or
+        token.matchesKeywordTag(.over) or
+        token.matchesKeywordTag(.lateral);
 }
 
 pub fn rowExpressionBoundaryKeyword(text: []const u8) bool {
@@ -23977,6 +23977,30 @@ pub fn rowExpressionBoundaryKeyword(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(text, "when") or
         std.ascii.eqlIgnoreCase(text, "filter") or
         std.ascii.eqlIgnoreCase(text, "over");
+}
+
+pub fn rowExpressionBoundaryKeywordToken(token: Token) bool {
+    return token.matchesKeywordTag(.as) or
+        token.matchesKeywordTag(.from) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.@"and") or
+        token.matchesKeywordTag(.@"or") or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.having) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.asc) or
+        token.matchesKeywordTag(.desc) or
+        token.matchesKeywordTag(.nulls) or
+        token.matchesKeywordTag(.then) or
+        token.matchesKeywordTag(.@"else") or
+        token.matchesKeywordTag(.end) or
+        token.matchesKeywordTag(.when) or
+        token.matchesKeywordTag(.filter) or
+        token.matchesKeywordTag(.over);
 }
 
 pub fn sqlWhereTailClauseKeyword(text: []const u8) bool {
@@ -24074,6 +24098,12 @@ test "sql adapter expression keyword predicates classify function and tail token
     try std.testing.expect(rowExpressionBoundaryKeyword("returning") == false);
     try std.testing.expect(sqlWhereTailClauseKeyword("returning"));
     try std.testing.expect(sqlWindowTailClauseKeyword("fetch"));
+    try std.testing.expect(rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "THEN", .keyword = .then }));
+    try std.testing.expect(rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "ELSE", .keyword = .@"else" }));
+    try std.testing.expect(rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "END", .keyword = .end }));
+
+    const unsupported_tail_tokens = [_]Token{.{ .kind = .identifier, .text = "LATERAL", .keyword = .lateral }};
+    try std.testing.expect(nextIsUnsupportedQueryKeyword(unsupported_tail_tokens[0..], 0));
 
     const length_tokens = [_]Token{
         .{ .kind = .identifier, .text = "char_length" },

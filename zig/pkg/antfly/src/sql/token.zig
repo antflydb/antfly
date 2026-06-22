@@ -90,6 +90,8 @@ pub const TokenKeyword = enum {
     do,
     discard,
     drop,
+    @"else",
+    end,
     except,
     exists,
     explain,
@@ -179,6 +181,7 @@ pub const TokenKeyword = enum {
     sum,
     system,
     table,
+    then,
     to,
     true,
     trigger,
@@ -280,4 +283,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
         .keyword = keywordFromIdentifier("array_agg"),
     };
     try std.testing.expect(aggregate_function.matchesKeywordTag(.array_agg));
+    try std.testing.expectEqual(TokenKeyword.then, keywordFromIdentifier("THEN").?);
+    try std.testing.expectEqual(TokenKeyword.@"else", keywordFromIdentifier("ELSE").?);
+    try std.testing.expectEqual(TokenKeyword.end, keywordFromIdentifier("END").?);
 }
