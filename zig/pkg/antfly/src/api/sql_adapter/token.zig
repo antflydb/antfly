@@ -153,6 +153,7 @@ pub const TokenKeyword = enum {
     percentile_cont,
     percentile_disc,
     portion,
+    prepare,
     program,
     recursive,
     rename,

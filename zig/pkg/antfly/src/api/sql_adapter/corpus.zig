@@ -8837,17 +8837,17 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_prepare_statement_delete_family = self.ddl_prepare_statement_delete_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "delete");
                     self.ddl_prepare_statement_merge_family = self.ddl_prepare_statement_merge_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "merge");
                     self.ddl_prepare_cte_write_statement = self.ddl_prepare_cte_write_statement or
-                        std.mem.startsWith(u8, entry.sql, "PREPARE ") and
-                            std.mem.indexOf(u8, entry.sql, " AS WITH ") != null and
+                        appParityTokensStartWithKeyword(sql_tokens, .prepare) and
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with }) and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                     self.ddl_prepare_recursive_cte_read_statement = self.ddl_prepare_recursive_cte_read_statement or
-                        std.mem.startsWith(u8, entry.sql, "PREPARE ") and
-                            std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null and
+                        appParityTokensStartWithKeyword(sql_tokens, .prepare) and
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with, .recursive }) and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "read");
                     self.ddl_prepare_recursive_cte_write_statement = self.ddl_prepare_recursive_cte_write_statement or
-                        std.mem.startsWith(u8, entry.sql, "PREPARE ") and
-                            std.mem.indexOf(u8, entry.sql, " AS WITH RECURSIVE ") != null and
+                        appParityTokensStartWithKeyword(sql_tokens, .prepare) and
+                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with, .recursive }) and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                 },
                 .prepare_transaction => {

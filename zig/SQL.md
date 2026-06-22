@@ -542,6 +542,9 @@ Current implementation status:
   for identity handling, cascades, multi-table detection, `COPY ... TO STDIN`,
   `OIDS`, and `PROGRAM` endpoint probes while retaining native plan and
   execution-plan evidence.
+- Prepared-statement CTE coverage now uses parsed `PREPARE ... AS WITH`
+  keyword sequences plus plan subject/family tokens instead of raw SQL prefix
+  and substring checks.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
