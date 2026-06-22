@@ -461,7 +461,8 @@ Current implementation status:
   substring checks.
 - Insert conflict-target coverage now extracts `ON CONFLICT` target ranges from
   parsed tokens for named constraints, column targets, partial targets, and
-  expression targets instead of scanning SQL text.
+  expression targets, including temporal named-constraint upserts, instead of
+  scanning SQL text.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.

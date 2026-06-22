@@ -7682,7 +7682,7 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_unique_conflict_upsert = self.schema_temporal_unique_conflict_upsert or (entry.family == .insert and
-            std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT prices_sku_time_key") != null and
+            appParityTokensHaveConflictConstraint(sql_tokens, "prices_sku_time_key") and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "prices") and
             sql_adapter.planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
             entry.apply_setup_sql.len > 0 and
