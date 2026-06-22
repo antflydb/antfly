@@ -113,16 +113,16 @@ pub fn classifyReadStatement(tokens: []const Token) ?SqlReadStatementKind {
         .with => withFinalStatementIndex(tokens, .{ .allow_recursive = true }) orelse return null,
         .insert, .update, .delete, .truncate, .merge, .ddl => return null,
     };
-    if (!statementStartsAt(tokens, statement_start, "select")) return null;
-    if (family == .with and tokens.len > 1 and keywordAt(tokens, 1, "recursive")) return .recursive_cte;
+    if (!statementStartsAt(tokens, statement_start, .select)) return null;
+    if (family == .with and keywordAt(tokens, 1, .recursive)) return .recursive_cte;
 
     const statement = tokens[statement_start..];
     if (readHasTopLevelSetOperation(statement)) return .set_operation;
-    if (readHasTopLevelKeyword(statement, "lateral")) return .lateral;
-    if (readHasTopLevelKeyword(statement, "over")) return .window;
+    if (readHasTopLevelKeyword(statement, .lateral)) return .lateral;
+    if (readHasTopLevelKeyword(statement, .over)) return .window;
     if (readIsDistinctOnShape(statement)) return .query;
     if (readHasAggregateShape(statement)) return .aggregate;
-    if (readHasTopLevelKeyword(statement, "join")) return .join;
+    if (readHasTopLevelKeyword(statement, .join)) return .join;
     return .query;
 }
 
@@ -131,22 +131,22 @@ pub fn classifyPreparedStatementSubjectKind(tokens: []const Token, start: usize)
 }
 
 pub fn classifyPreparedStatementStatementKind(tokens: []const Token, start: usize) ?SqlPreparedStatementStatementKind {
-    if (statementStartsAt(tokens, start, "select")) return .read;
-    if (statementStartsAt(tokens, start, "with")) {
+    if (statementStartsAt(tokens, start, .select)) return .read;
+    if (statementStartsAt(tokens, start, .with)) {
         const with_tokens = tokens[start..];
         const final_index = withFinalStatementIndex(with_tokens, .{ .allow_recursive = true }) orelse return null;
-        if (with_tokens[final_index].isKeyword(.select)) return .read;
+        if (with_tokens[final_index].matchesKeywordTag(.select)) return .read;
         if (withFinalStatementWriteKind(with_tokens[final_index..])) |kind| return preparedStatementKindFromWriteKind(kind);
         return null;
     }
     if (classifyInsertStatement(tokens, start)) |kind| return preparedStatementKindFromWriteKind(kind);
     if (classifyUpdateStatement(tokens, start)) |kind| return preparedStatementKindFromWriteKind(kind);
     if (classifyDeleteStatement(tokens, start)) |kind| return preparedStatementKindFromWriteKind(kind);
-    if (statementStartsAt(tokens, start, "truncate")) return .truncate;
-    if (statementStartsAt(tokens, start, "merge")) return .merge;
-    if (statementStartsAt(tokens, start, "create") or
-        statementStartsAt(tokens, start, "alter") or
-        statementStartsAt(tokens, start, "drop"))
+    if (statementStartsAt(tokens, start, .truncate)) return .truncate;
+    if (statementStartsAt(tokens, start, .merge)) return .merge;
+    if (statementStartsAt(tokens, start, .create) or
+        statementStartsAt(tokens, start, .alter) or
+        statementStartsAt(tokens, start, .drop))
     {
         return .ddl;
     }
@@ -193,7 +193,7 @@ const WithFinalStatementOptions = struct {
 
 fn withFinalStatementIndex(tokens: []const Token, options: WithFinalStatementOptions) ?usize {
     var index: usize = 1;
-    if (parser.matchKeyword(tokens, &index, "recursive") and !options.allow_recursive) return null;
+    if (parser.matchKeywordTag(tokens, &index, .recursive) and !options.allow_recursive) return null;
 
     while (true) {
         if (index >= tokens.len or tokens[index].kind != .identifier) return null;
@@ -201,7 +201,7 @@ fn withFinalStatementIndex(tokens: []const Token, options: WithFinalStatementOpt
         if (index < tokens.len and tokens[index].kind == .lparen) {
             index = (parser.findMatchingRParenIndex(tokens, index) orelse return null) + 1;
         }
-        if (!parser.matchKeyword(tokens, &index, "as")) return null;
+        if (!parser.matchKeywordTag(tokens, &index, .as)) return null;
         parser.consumeCteMaterializationHint(tokens, &index) catch return null;
         if (index >= tokens.len or tokens[index].kind != .lparen) return null;
         index = (parser.findMatchingRParenIndex(tokens, index) orelse return null) + 1;
@@ -229,11 +229,11 @@ fn withFinalStatementWriteKind(tokens: []const Token) ?SqlWriteStatementKind {
 }
 
 fn classifyInsertStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
-    if (!statementStartsAt(tokens, start, "insert")) return null;
+    if (!statementStartsAt(tokens, start, .insert)) return null;
     const statement = tokens[start..];
-    const select_index = parser.findTopLevelKeyword(statement, "select");
-    const values_index = parser.findTopLevelKeyword(statement, "values");
-    const default_index = parser.findTopLevelKeyword(statement, "default");
+    const select_index = parser.findTopLevelKeywordTag(statement, .select);
+    const values_index = parser.findTopLevelKeywordTag(statement, .values);
+    const default_index = parser.findTopLevelKeywordTag(statement, .default);
     if (select_index) |select_pos| {
         if (values_index == null or select_pos < values_index.?) {
             if (default_index == null or select_pos < default_index.?) return .insert_source;
@@ -243,12 +243,12 @@ fn classifyInsertStatement(tokens: []const Token, start: usize) ?SqlWriteStateme
 }
 
 fn classifyUpdateStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
-    if (!statementStartsAt(tokens, start, "update")) return null;
+    if (!statementStartsAt(tokens, start, .update)) return null;
     const statement = tokens[start..];
-    if (statementHasForPortionBeforeKeyword(statement, 1, "set")) return .update_source;
-    const set_index = parser.findTopLevelKeyword(statement, "set") orelse return .update;
-    if (parser.findTopLevelKeywordFromIndex(statement, set_index + 1, "from")) |from_index| {
-        const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
+    if (statementHasForPortionBeforeKeyword(statement, 1, .set)) return .update_source;
+    const set_index = parser.findTopLevelKeywordTag(statement, .set) orelse return .update;
+    if (parser.findTopLevelKeywordTagFromIndex(statement, set_index + 1, .from)) |from_index| {
+        const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ .where, .order, .limit, .offset, .fetch, .@"for", .returning }) orelse statement.len;
         if (from_index < stop_index) return .update_joined_source;
     }
     if (statementHasWhereSemijoinSubquery(statement, set_index + 1)) return .update_joined_source;
@@ -257,16 +257,16 @@ fn classifyUpdateStatement(tokens: []const Token, start: usize) ?SqlWriteStateme
 }
 
 fn classifyDeleteStatement(tokens: []const Token, start: usize) ?SqlWriteStatementKind {
-    if (!statementStartsAt(tokens, start, "delete")) return null;
+    if (!statementStartsAt(tokens, start, .delete)) return null;
     const statement = tokens[start..];
-    const from_index = parser.findTopLevelKeyword(statement, "from") orelse return .delete;
-    if (statementHasForPortionBeforeKeyword(statement, from_index + 1, "where") or
-        statementHasForPortionBeforeKeyword(statement, from_index + 1, "returning"))
+    const from_index = parser.findTopLevelKeywordTag(statement, .from) orelse return .delete;
+    if (statementHasForPortionBeforeKeyword(statement, from_index + 1, .where) or
+        statementHasForPortionBeforeKeyword(statement, from_index + 1, .returning))
     {
         return .delete_source;
     }
-    if (parser.findTopLevelKeywordFromIndex(statement, from_index + 1, "using")) |using_index| {
-        const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ "where", "order", "limit", "offset", "fetch", "for", "returning" }) orelse statement.len;
+    if (parser.findTopLevelKeywordTagFromIndex(statement, from_index + 1, .using)) |using_index| {
+        const stop_index = firstTopLevelKeywordIndex(statement, from_index + 1, &.{ .where, .order, .limit, .offset, .fetch, .@"for", .returning }) orelse statement.len;
         if (using_index < stop_index) return .delete_joined_source;
     }
     if (statementHasWhereSemijoinSubquery(statement, from_index + 1)) return .delete_joined_source;
@@ -274,24 +274,24 @@ fn classifyDeleteStatement(tokens: []const Token, start: usize) ?SqlWriteStateme
     return .delete;
 }
 
-fn statementHasForPortionBeforeKeyword(tokens: []const Token, start: usize, keyword: []const u8) bool {
-    const stop_index = parser.findTopLevelKeywordFromIndex(tokens, start, keyword) orelse tokens.len;
+fn statementHasForPortionBeforeKeyword(tokens: []const Token, start: usize, keyword: TokenKeyword) bool {
+    const stop_index = parser.findTopLevelKeywordTagFromIndex(tokens, start, keyword) orelse tokens.len;
     var index = start;
     while (index + 1 < stop_index) : (index += 1) {
-        if (tokens[index].matchesKeyword("for") and tokens[index + 1].matchesKeyword("portion")) return true;
+        if (tokens[index].matchesKeywordTag(.@"for") and tokens[index + 1].matchesKeywordTag(.portion)) return true;
     }
     return false;
 }
 
 fn statementHasMutationSourceTail(tokens: []const Token, start: usize) bool {
-    if (firstTopLevelKeywordIndex(tokens, start, &.{ "order", "limit", "offset", "fetch" }) != null) return true;
+    if (firstTopLevelKeywordIndex(tokens, start, &.{ .order, .limit, .offset, .fetch }) != null) return true;
     var index = start;
     while (index + 1 < tokens.len) : (index += 1) {
-        if (!tokens[index].matchesKeyword("for")) continue;
-        if (tokens[index + 1].matchesKeyword("update") or
-            tokens[index + 1].matchesKeyword("no") or
-            tokens[index + 1].matchesKeyword("share") or
-            tokens[index + 1].matchesKeyword("key"))
+        if (!tokens[index].matchesKeywordTag(.@"for")) continue;
+        if (tokens[index + 1].matchesKeywordTag(.update) or
+            tokens[index + 1].matchesKeywordTag(.no) or
+            tokens[index + 1].matchesKeywordTag(.share) or
+            tokens[index + 1].matchesKeywordTag(.key))
         {
             return true;
         }
@@ -299,10 +299,10 @@ fn statementHasMutationSourceTail(tokens: []const Token, start: usize) bool {
     return false;
 }
 
-fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []const []const u8) ?usize {
+fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []const TokenKeyword) ?usize {
     var first: ?usize = null;
     for (keywords) |keyword| {
-        if (parser.findTopLevelKeywordFromIndex(tokens, start, keyword)) |index| {
+        if (parser.findTopLevelKeywordTagFromIndex(tokens, start, keyword)) |index| {
             if (first == null or index < first.?) first = index;
         }
     }
@@ -310,8 +310,8 @@ fn firstTopLevelKeywordIndex(tokens: []const Token, start: usize, keywords: []co
 }
 
 fn statementHasWhereSemijoinSubquery(tokens: []const Token, start: usize) bool {
-    const where_index = parser.findTopLevelKeywordFromIndex(tokens, start, "where") orelse return false;
-    const stop_index = firstTopLevelKeywordIndex(tokens, where_index + 1, &.{ "order", "limit", "offset", "fetch", "for", "returning" }) orelse tokens.len;
+    const where_index = parser.findTopLevelKeywordTagFromIndex(tokens, start, .where) orelse return false;
+    const stop_index = firstTopLevelKeywordIndex(tokens, where_index + 1, &.{ .order, .limit, .offset, .fetch, .@"for", .returning }) orelse tokens.len;
     return tokenRangeHasTopLevelSemijoinSubquery(tokens[where_index + 1 .. stop_index]);
 }
 
@@ -324,7 +324,7 @@ fn tokenRangeHasTopLevelSemijoinSubquery(tokens: []const Token) bool {
                 if (depth > 0) depth -= 1;
             },
             .identifier => if (depth == 0) {
-                if ((token.matchesKeyword("in") or token.matchesKeyword("exists")) and nextParenContainsSelect(tokens, index + 1)) return true;
+                if ((token.matchesKeywordTag(.in) or token.matchesKeywordTag(.exists)) and nextParenContainsSelect(tokens, index + 1)) return true;
             },
             else => {},
         }
@@ -336,12 +336,12 @@ fn nextParenContainsSelect(tokens: []const Token, start: usize) bool {
     var index = start;
     while (index < tokens.len and tokens[index].kind == .comma) : (index += 1) {}
     if (index >= tokens.len or tokens[index].kind != .lparen) return false;
-    if (index + 1 >= tokens.len or !tokens[index + 1].matchesKeyword("select")) return false;
+    if (index + 1 >= tokens.len or !tokens[index + 1].matchesKeywordTag(.select)) return false;
     return parser.findMatchingRParenIndex(tokens, index) != null;
 }
 
-fn keywordAt(tokens: []const Token, index: usize, keyword: []const u8) bool {
-    return index < tokens.len and tokens[index].matchesKeyword(keyword);
+fn keywordAt(tokens: []const Token, index: usize, keyword: TokenKeyword) bool {
+    return index < tokens.len and tokens[index].matchesKeywordTag(keyword);
 }
 
 fn firstIdentifier(tokens: []const Token) ?Token {
@@ -350,17 +350,17 @@ fn firstIdentifier(tokens: []const Token) ?Token {
     return tokens[0];
 }
 
-fn statementStartsAt(tokens: []const Token, start: usize, keyword: []const u8) bool {
+fn statementStartsAt(tokens: []const Token, start: usize, keyword: TokenKeyword) bool {
     return keywordAt(tokens, start, keyword);
 }
 
 fn readHasTopLevelSetOperation(tokens: []const Token) bool {
-    return readHasTopLevelKeyword(tokens, "union") or
-        readHasTopLevelKeyword(tokens, "intersect") or
-        readHasTopLevelKeyword(tokens, "except");
+    return readHasTopLevelKeyword(tokens, .@"union") or
+        readHasTopLevelKeyword(tokens, .intersect) or
+        readHasTopLevelKeyword(tokens, .except);
 }
 
-fn readHasTopLevelKeyword(tokens: []const Token, keyword: []const u8) bool {
+fn readHasTopLevelKeyword(tokens: []const Token, keyword: TokenKeyword) bool {
     var depth: usize = 0;
     for (tokens) |token| {
         switch (token.kind) {
@@ -368,7 +368,7 @@ fn readHasTopLevelKeyword(tokens: []const Token, keyword: []const u8) bool {
             .rparen, .rbracket => {
                 if (depth > 0) depth -= 1;
             },
-            .identifier => if (depth == 0 and token.matchesKeyword(keyword)) return true,
+            .identifier => if (depth == 0 and token.matchesKeywordTag(keyword)) return true,
             else => {},
         }
     }
@@ -376,7 +376,7 @@ fn readHasTopLevelKeyword(tokens: []const Token, keyword: []const u8) bool {
 }
 
 fn readHasAggregateShape(tokens: []const Token) bool {
-    if (tokens.len > 1 and tokens[0].isKeyword(.select) and tokens[1].isKeyword(.distinct) and !readIsDistinctOnShape(tokens)) {
+    if (tokens.len > 1 and tokens[0].matchesKeywordTag(.select) and tokens[1].matchesKeywordTag(.distinct) and !readIsDistinctOnShape(tokens)) {
         return true;
     }
 
@@ -388,12 +388,12 @@ fn readHasAggregateShape(tokens: []const Token) bool {
                 if (depth > 0) depth -= 1;
             },
             .identifier => if (depth == 0) {
-                if (std.ascii.eqlIgnoreCase(token.text, "group") or
-                    std.ascii.eqlIgnoreCase(token.text, "having"))
+                if (token.matchesKeywordTag(.group) or
+                    token.matchesKeywordTag(.having))
                 {
                     return true;
                 }
-                if (index + 1 < tokens.len and tokens[index + 1].kind == .lparen and sqlAggregateFunctionName(token.text)) {
+                if (index + 1 < tokens.len and tokens[index + 1].kind == .lparen and sqlAggregateFunctionName(token)) {
                     return true;
                 }
             },
@@ -404,19 +404,19 @@ fn readHasAggregateShape(tokens: []const Token) bool {
 }
 
 fn readIsDistinctOnShape(tokens: []const Token) bool {
-    return tokens.len > 2 and tokens[0].isKeyword(.select) and tokens[1].isKeyword(.distinct) and tokens[2].isKeyword(.on);
+    return tokens.len > 2 and tokens[0].matchesKeywordTag(.select) and tokens[1].matchesKeywordTag(.distinct) and tokens[2].matchesKeywordTag(.on);
 }
 
-fn sqlAggregateFunctionName(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "count") or
-        std.ascii.eqlIgnoreCase(name, "sum") or
-        std.ascii.eqlIgnoreCase(name, "avg") or
-        std.ascii.eqlIgnoreCase(name, "min") or
-        std.ascii.eqlIgnoreCase(name, "max") or
-        std.ascii.eqlIgnoreCase(name, "bool_or") or
-        std.ascii.eqlIgnoreCase(name, "bool_and") or
-        std.ascii.eqlIgnoreCase(name, "array_agg") or
-        std.ascii.eqlIgnoreCase(name, "string_agg");
+fn sqlAggregateFunctionName(token: Token) bool {
+    return token.matchesKeywordTag(.count) or
+        token.matchesKeywordTag(.sum) or
+        token.matchesKeywordTag(.avg) or
+        token.matchesKeywordTag(.min) or
+        token.matchesKeywordTag(.max) or
+        token.matchesKeywordTag(.bool_or) or
+        token.matchesKeywordTag(.bool_and) or
+        token.matchesKeywordTag(.array_agg) or
+        token.matchesKeywordTag(.string_agg);
 }
 
 test "sql adapter classifier identifies write statement families" {

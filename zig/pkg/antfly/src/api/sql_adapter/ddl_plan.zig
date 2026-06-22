@@ -17,12 +17,12 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("../catalog_resources.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const grammar = @import("grammar.zig");
-const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
 const parser_context = @import("parser_context.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 
 pub const AdapterNoopDdlReason = enum {
@@ -7792,15 +7792,24 @@ fn lowerDdlPlanWithFunctionBindingsForTestAlloc(
     sql: []const u8,
     function_bindings: lower_expr.SqlFunctionBindings,
 ) !LoweredDdlPlan {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
 
+    return try lowerDdlPlanParsedSqlWithFunctionBindingsForTestAlloc(alloc, &parsed_sql, function_bindings);
+}
+
+fn lowerDdlPlanParsedSqlWithFunctionBindingsForTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    function_bindings: lower_expr.SqlFunctionBindings,
+) !LoweredDdlPlan {
+    const tokens = parsed_sql.items();
     var state = parser_context.ParserState{
         .alloc = alloc,
-        .tokens = tokens.items,
+        .tokens = tokens,
         .function_bindings = function_bindings,
     };
-    return try parseDdlPlanAlloc(alloc, tokens.items, &state.pos, .{
+    return try parseDdlPlanAlloc(alloc, tokens, &state.pos, .{
         .schema = state.schema,
         .field_expression_qualifiers = state.field_expression_qualifiers,
         .returning_expression_qualifiers = state.returning_expression_qualifiers,

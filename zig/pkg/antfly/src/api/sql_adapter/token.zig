@@ -58,9 +58,13 @@ pub const TokenKeyword = enum {
     alter,
     analyze,
     @"and",
+    array_agg,
     as,
     asc,
+    avg,
     begin,
+    bool_and,
+    bool_or,
     by,
     cascade,
     case,
@@ -68,7 +72,9 @@ pub const TokenKeyword = enum {
     coalesce,
     conflict,
     constraint,
+    count,
     create,
+    default,
     delete,
     desc,
     distinct,
@@ -90,11 +96,15 @@ pub const TokenKeyword = enum {
     intersect,
     into,
     join,
+    key,
     lateral,
     like,
     limit,
     materialized,
     merge,
+    max,
+    min,
+    no,
     not,
     null,
     offset,
@@ -103,10 +113,14 @@ pub const TokenKeyword = enum {
     @"or",
     order,
     over,
+    portion,
     recursive,
     returning,
     select,
     set,
+    share,
+    string_agg,
+    sum,
     table,
     to,
     true,
@@ -132,14 +146,19 @@ pub const Token = struct {
         return self.kind == .identifier and self.keyword == keyword;
     }
 
+    pub fn matchesKeywordTag(self: Token, keyword: TokenKeyword) bool {
+        if (self.kind != .identifier) return false;
+        if (self.keyword) |token_keyword| return token_keyword == keyword;
+        if (self.source_start == 0 and self.source_end == 0) {
+            return std.ascii.eqlIgnoreCase(self.text, @tagName(keyword));
+        }
+        return false;
+    }
+
     pub fn matchesKeyword(self: Token, keyword_text: []const u8) bool {
         if (self.kind != .identifier) return false;
         if (keywordFromIdentifier(keyword_text)) |keyword| {
-            if (self.keyword == keyword) return true;
-            if (self.keyword == null and self.source_start == 0 and self.source_end == 0) {
-                return std.ascii.eqlIgnoreCase(self.text, keyword_text);
-            }
-            return false;
+            return self.matchesKeywordTag(keyword);
         }
         return std.ascii.eqlIgnoreCase(self.text, keyword_text);
     }
@@ -162,4 +181,37 @@ pub fn keywordFromIdentifier(identifier: []const u8) ?TokenKeyword {
         lower[i] = std.ascii.toLower(ch);
     }
     return std.meta.stringToEnum(TokenKeyword, lower[0..identifier.len]);
+}
+
+test "sql adapter tokens match keyword tags without treating quoted identifiers as keywords" {
+    const source_keyword = Token{
+        .kind = .identifier,
+        .text = "SELECT",
+        .source_start = 0,
+        .source_end = 6,
+        .keyword = keywordFromIdentifier("SELECT"),
+    };
+    try std.testing.expect(source_keyword.matchesKeywordTag(.select));
+    try std.testing.expect(source_keyword.matchesKeyword("select"));
+
+    const synthetic_keyword = Token{ .kind = .identifier, .text = "select" };
+    try std.testing.expect(synthetic_keyword.matchesKeywordTag(.select));
+
+    const quoted_identifier = Token{
+        .kind = .identifier,
+        .text = "select",
+        .source_start = 0,
+        .source_end = 8,
+    };
+    try std.testing.expect(!quoted_identifier.matchesKeywordTag(.select));
+    try std.testing.expect(!quoted_identifier.matchesKeyword("select"));
+
+    const aggregate_function = Token{
+        .kind = .identifier,
+        .text = "array_agg",
+        .source_start = 0,
+        .source_end = 9,
+        .keyword = keywordFromIdentifier("array_agg"),
+    };
+    try std.testing.expect(aggregate_function.matchesKeywordTag(.array_agg));
 }

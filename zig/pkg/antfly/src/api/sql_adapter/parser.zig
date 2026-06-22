@@ -60,7 +60,7 @@ pub const Cursor = struct {
 
     pub fn matchKeywordTag(self: Cursor, keyword: TokenKeyword) bool {
         if (self.pos.* >= self.tokens.len) return false;
-        if (!self.tokens[self.pos.*].isKeyword(keyword)) return false;
+        if (!self.tokens[self.pos.*].matchesKeywordTag(keyword)) return false;
         self.pos.* += 1;
         return true;
     }
@@ -87,7 +87,7 @@ pub const Cursor = struct {
     }
 
     pub fn peekKeywordTag(self: Cursor, keyword: TokenKeyword) bool {
-        return self.pos.* < self.tokens.len and self.tokens[self.pos.*].isKeyword(keyword);
+        return self.pos.* < self.tokens.len and self.tokens[self.pos.*].matchesKeywordTag(keyword);
     }
 
     pub fn peekIdentifierIf(self: Cursor, comptime predicate: fn ([]const u8) bool) bool {
@@ -148,7 +148,7 @@ pub fn matchKeyword(tokens: []const Token, pos: *usize, keyword: []const u8) boo
 
 pub fn matchKeywordTag(tokens: []const Token, pos: *usize, keyword: TokenKeyword) bool {
     if (pos.* >= tokens.len) return false;
-    if (!tokens[pos.*].isKeyword(keyword)) return false;
+    if (!tokens[pos.*].matchesKeywordTag(keyword)) return false;
     pos.* += 1;
     return true;
 }
@@ -167,7 +167,7 @@ pub fn peekKeyword(tokens: []const Token, pos: usize, keyword: []const u8) bool 
 }
 
 pub fn peekKeywordTag(tokens: []const Token, pos: usize, keyword: TokenKeyword) bool {
-    return pos < tokens.len and tokens[pos].isKeyword(keyword);
+    return pos < tokens.len and tokens[pos].matchesKeywordTag(keyword);
 }
 
 pub fn peekKind(tokens: []const Token, pos: usize, kind: TokenKind) bool {
@@ -194,6 +194,9 @@ pub fn findTopLevelKeyword(tokens: []const Token, keyword: []const u8) ?usize {
 }
 
 pub fn findTopLevelKeywordFromIndex(tokens: []const Token, start: usize, keyword: []const u8) ?usize {
+    if (token_mod.keywordFromIdentifier(keyword)) |keyword_tag| {
+        return findTopLevelKeywordTagFromIndex(tokens, start, keyword_tag);
+    }
     var depth: usize = 0;
     var i = start;
     while (i < tokens.len) : (i += 1) {
@@ -206,6 +209,29 @@ pub fn findTopLevelKeywordFromIndex(tokens: []const Token, start: usize, keyword
             },
             .semicolon => if (depth == 0) return null,
             .identifier => if (depth == 0 and token.matchesKeyword(keyword)) return i,
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn findTopLevelKeywordTag(tokens: []const Token, keyword: TokenKeyword) ?usize {
+    return findTopLevelKeywordTagFromIndex(tokens, 0, keyword);
+}
+
+pub fn findTopLevelKeywordTagFromIndex(tokens: []const Token, start: usize, keyword: TokenKeyword) ?usize {
+    var depth: usize = 0;
+    var i = start;
+    while (i < tokens.len) : (i += 1) {
+        const token = tokens[i];
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) return null,
+            .identifier => if (depth == 0 and token.matchesKeywordTag(keyword)) return i,
             else => {},
         }
     }
@@ -292,7 +318,7 @@ pub fn hasTopLevelOrBeforeTail(
             },
             .semicolon => if (depth == 0) return false,
             .identifier => if (depth == 0) {
-                if (std.ascii.eqlIgnoreCase(token.text, "or")) return true;
+                if (token.matchesKeywordTag(.@"or")) return true;
                 if (tail_clause_keyword(token.text)) return false;
             },
             else => {},
@@ -312,7 +338,7 @@ pub fn hasTopLevelOrBeforeCloseParen(tokens: []const Token, start: usize) bool {
                 if (depth == 0) return false;
                 depth -= 1;
             },
-            .identifier => if (depth == 0 and std.ascii.eqlIgnoreCase(token.text, "or")) return true,
+            .identifier => if (depth == 0 and token.matchesKeywordTag(.@"or")) return true,
             else => {},
         }
     }

@@ -371,11 +371,14 @@ Current implementation status:
   separate tokenization paths. DML adapter write-plan regression callbacks,
   direct DML test facades, and lower-expression query/join/lateral/window/
   aggregate/set-operation/recursive-CTE test facades consume borrowed parsed
-  tokens instead of round-tripping through SQL text. DDL fingerprint regression
-  helpers parse once through `ParsedSql` before computing structured
-  fingerprints. Antfly query function lowering has parsed entrypoints, and
-  app-parity query-function checks reuse `ParsedSql` instead of tokenizing
-  fixture SQL directly.
+  tokens instead of round-tripping through SQL text. DDL plan and DDL
+  fingerprint regression helpers parse once through `ParsedSql` before
+  computing typed plans or structured fingerprints. PostgreSQL compatibility
+  no-ops that are represented as control statements, including
+  `SELECT pg_advisory_*`, still enter through `ParsedSql` and then lower inside
+  the adapter-owned DDL/control plan parser. Antfly query function lowering has
+  parsed entrypoints, and app-parity query-function checks reuse `ParsedSql`
+  instead of tokenizing fixture SQL directly.
   Corpus fixture parameter coverage parses fixture SQL once and validates
   placeholders from parsed token spans instead of using a separate raw string
   scanner. Corpus coverage observation now parses each entry once and uses
@@ -392,8 +395,11 @@ Current implementation status:
   fixtures also enters through parsed source-table helpers instead of public
   token-slice adapters, and those helpers now validate the parsed statement
   family/kind before scanning source-table tokens.
-- Identifier tokens carry optional compact keyword metadata, and the shared
-  parser/classifier helpers use it before falling back to text comparison.
+- Identifier tokens carry optional compact keyword metadata. The shared
+  parser/classifier helpers use enum-backed keyword searches for statement
+  family dispatch, top-level clause discovery, mutation-source detection,
+  aggregate recognition, and prepared-statement subject classification before
+  falling back to text comparison for non-keyword identifiers.
 - Tokens expose stable source spans, quoted identifiers keep quoted-source
   spans without being marked as keywords, and diagnostics have a span-bearing
   `SqlDiagnostic` shape for unsupported classifications.
