@@ -2247,19 +2247,6 @@ pub const lowerAntflyQueryFunctionSqlAlloc = sql_adapter.lowerAntflyQueryFunctio
 const AppParitySourceSchemaCatalog = sql_adapter.AppParitySourceSchemaCatalog;
 const appParitySourceTableNameAlloc = sql_adapter.appParitySourceTableNameAlloc;
 
-fn expectAppliedDdlWorkActions(applied: AppliedDdlSchemaJson, expected: []const AppliedDdlWorkAction) !void {
-    try std.testing.expectEqual(expected.len, applied.work_items.len);
-    for (expected, 0..) |action, i| {
-        try std.testing.expectEqual(action, applied.work_items[i].action);
-        try std.testing.expectEqual(AppliedDdlWorkSubject.table, applied.work_items[i].subject);
-        switch (action) {
-            .rebuild => try std.testing.expectEqual(AppliedDdlWorkReason.derived_artifacts, applied.work_items[i].reason),
-            .validate => try std.testing.expectEqual(AppliedDdlWorkReason.constraints, applied.work_items[i].reason),
-            .rewrite => try std.testing.expectEqual(AppliedDdlWorkReason.row_images, applied.work_items[i].reason),
-        }
-    }
-}
-
 fn expectAlterRoleLiteralSettingValue(expected: []const u8, value: ?AlterRolePlan.SettingValue) !void {
     const actual = value orelse return error.TestUnexpectedResult;
     switch (actual) {
@@ -2291,27 +2278,6 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
 
     var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create);
     defer applied.deinit(alloc);
-    try std.testing.expect(!applied.requires_rebuild);
-    try std.testing.expect(!applied.validation_required);
-    try std.testing.expect(!applied.rewrite_required);
-    var applied_parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
-    defer applied_parsed.deinit(alloc);
-    const applied_runtime = try schema_api.deriveRuntimeTableSchema(alloc, applied_parsed);
-    defer runtime_schema.freeSchema(alloc, applied_runtime);
-    const applied_email = relationalColumnForField(applied_runtime, "email", null) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("C", applied_email.collation.?);
-
-    var duplicate_create = try lowerDdlPlanAlloc(alloc, "CREATE TABLE users (id uuid PRIMARY KEY);");
-    defer duplicate_create.deinit(alloc);
-    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create));
-
-    var duplicate_create_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY);");
-    defer duplicate_create_if_not_exists.deinit(alloc);
-    var unchanged = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create_if_not_exists);
-    defer unchanged.deinit(alloc);
-    try std.testing.expect(!unchanged.requires_rebuild);
-    try std.testing.expect(!unchanged.validation_required);
-    try std.testing.expect(!unchanged.rewrite_required);
 
     var table_clone = try lowerDdlPlanAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
     defer table_clone.deinit(alloc);
@@ -2336,29 +2302,6 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
         "ddl:table_clone:table=users_copy:source=users:if_not_exists=true:columns=true:defaults=true:generated=true:checks=true:constraints=true:indexes=true:periods=true:update_policies=true",
         clone_fingerprint,
     );
-    var cloned = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_clone);
-    defer cloned.deinit(alloc);
-    try std.testing.expect(cloned.requires_rebuild);
-    try std.testing.expect(cloned.validation_required);
-    try std.testing.expect(!cloned.rewrite_required);
-    var cloned_parsed = try schema_api.parseValidatedTableSchema(alloc, cloned.schema_json);
-    defer cloned_parsed.deinit(alloc);
-    const cloned_runtime = try schema_api.deriveRuntimeTableSchema(alloc, cloned_parsed);
-    defer runtime_schema.freeSchema(alloc, cloned_runtime);
-    try std.testing.expectEqual(runtime_schema.StorageMode.relational, cloned_runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 7), cloned_runtime.relational_columns.len);
-    try std.testing.expect(cloned_runtime.primary_key != null);
-    try std.testing.expectEqualStrings("id", cloned_runtime.primary_key.?.columns[0]);
-    try std.testing.expectEqual(@as(usize, 1), cloned_runtime.unique_constraints.len);
-    try std.testing.expectEqual(@as(usize, 1), cloned_runtime.checks.len);
-    const cloned_email = relationalColumnForField(cloned_runtime, "email", null) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("C", cloned_email.collation.?);
-    const cloned_current_day = relationalColumnForField(cloned_runtime, "current_day_ns", null) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(cloned_current_day.default_value != null);
-
-    var table_clone_without_constraints = try lowerDdlPlanAlloc(alloc, "CREATE TABLE users_copy (LIKE users);");
-    defer table_clone_without_constraints.deinit(alloc);
-    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_clone_without_constraints));
 
     var create_view = try lowerDdlPlanAlloc(alloc, "CREATE VIEW users_v AS SELECT id, email FROM users;");
     defer create_view.deinit(alloc);
@@ -5530,69 +5473,6 @@ test "postgres sql adapter compiles create table ddl plan to public schema json"
     const rollback_to_savepoint_shorthand_fingerprint = try ddlFingerprintAlloc(alloc, rollback_to_savepoint_shorthand);
     defer alloc.free(rollback_to_savepoint_shorthand_fingerprint);
     try std.testing.expectEqualStrings("ddl:rollback_to_savepoint:name=before_retry", rollback_to_savepoint_shorthand_fingerprint);
-
-    var replace = try lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE TABLE users (id uuid PRIMARY KEY);");
-    defer replace.deinit(alloc);
-    const replace_plan = switch (replace) {
-        .create_table => |create_table| create_table,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(replace_plan.replace_existing);
-    try std.testing.expect(!replace_plan.if_not_exists);
-
-    var replaced = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace);
-    defer replaced.deinit(alloc);
-    try std.testing.expect(replaced.requires_rebuild);
-    try std.testing.expect(replaced.validation_required);
-    try std.testing.expect(replaced.rewrite_required);
-    try expectAppliedDdlWorkActions(replaced, &.{ .rebuild, .validate, .rewrite });
-
-    var replaced_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced.schema_json);
-    defer replaced_parsed.deinit(alloc);
-    const replaced_runtime = try schema_api.deriveRuntimeTableSchema(alloc, replaced_parsed);
-    defer runtime_schema.freeSchema(alloc, replaced_runtime);
-    try std.testing.expectEqual(runtime_schema.StorageMode.relational, replaced_runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 1), replaced_runtime.relational_columns.len);
-    try std.testing.expect(replaced_runtime.primary_key != null);
-    try std.testing.expectEqualStrings("id", replaced_runtime.primary_key.?.columns[0]);
-
-    var replace_if_not_exists = try lowerDdlPlanAlloc(alloc, "CREATE OR REPLACE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, status text);");
-    defer replace_if_not_exists.deinit(alloc);
-    const replace_if_not_exists_plan = switch (replace_if_not_exists) {
-        .create_table => |create_table| create_table,
-        else => return error.TestUnexpectedResult,
-    };
-    try std.testing.expect(replace_if_not_exists_plan.replace_existing);
-    try std.testing.expect(replace_if_not_exists_plan.if_not_exists);
-    var replaced_if_not_exists = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_if_not_exists);
-    defer replaced_if_not_exists.deinit(alloc);
-    try std.testing.expect(replaced_if_not_exists.requires_rebuild);
-    try std.testing.expect(replaced_if_not_exists.validation_required);
-    try std.testing.expect(replaced_if_not_exists.rewrite_required);
-    try expectAppliedDdlWorkActions(replaced_if_not_exists, &.{ .rebuild, .validate, .rewrite });
-    var replaced_if_not_exists_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced_if_not_exists.schema_json);
-    defer replaced_if_not_exists_parsed.deinit(alloc);
-    const replaced_if_not_exists_runtime = try schema_api.deriveRuntimeTableSchema(alloc, replaced_if_not_exists_parsed);
-    defer runtime_schema.freeSchema(alloc, replaced_if_not_exists_runtime);
-    try std.testing.expectEqual(@as(usize, 2), replaced_if_not_exists_runtime.relational_columns.len);
-    try std.testing.expect(relationalColumnForField(replaced_if_not_exists_runtime, "status", null) != null);
-
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
-    defer parsed.deinit(alloc);
-    const runtime = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, runtime);
-    try std.testing.expectEqual(runtime_schema.StorageMode.relational, runtime.storage_mode);
-    try std.testing.expectEqual(@as(usize, 7), runtime.relational_columns.len);
-    try std.testing.expect(runtime.primary_key != null);
-    try std.testing.expectEqualStrings("id", runtime.primary_key.?.columns[0]);
-    const current_day = relationalColumnForField(runtime, "current_day_ns", null) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, current_day.field_type);
-    try std.testing.expect(current_day.default_value != null);
-    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.current_date_ns, current_day.default_value.?.kind);
-    try std.testing.expect(std.mem.indexOf(u8, applied.schema_json, "\"current_day_ns\":{\"type\":\"datetime\",\"x-antfly-default\":{\"op\":\"current_date_ns\"}}") != null);
-    try std.testing.expectEqual(@as(usize, 1), runtime.unique_constraints.len);
-    try std.testing.expectEqualStrings("users_tenant_email_key", runtime.unique_constraints[0].name);
-    try std.testing.expectEqual(@as(usize, 1), runtime.checks.len);
 }
 
 const TestPrimaryResolver = struct {
@@ -11790,12 +11670,13 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
 }
 
 const AppParityCorpusCoverage = sql_adapter.AppParityCorpusCoverage;
+const app_parity_default_schema_json =
+    \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"cloud_instance_id":{"type":"keyword"},"user_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"metric_type":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"rating_status":{"type":"keyword"},"product_family":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"rated_quantity":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"recorded_at":{"type":"numeric"},"expires_at":{"type":"numeric"},"billing_cycle_start":{"type":"numeric"},"bucket_start":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+;
 
 test "postgres sql adapter classifies application parity corpus" {
     const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_id":{"type":"keyword"},"organization_id":{"type":"keyword"},"cloud_instance_id":{"type":"keyword"},"user_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"kind":{"type":"keyword"},"status":{"type":"keyword","default":"active"},"metric_type":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"},"rating_status":{"type":"keyword"},"product_family":{"type":"keyword"},"enabled":{"type":"boolean"},"amount":{"type":"numeric"},"quantity":{"type":"numeric"},"rated_quantity":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"updated_at_ns":{"type":"numeric"},"recorded_at":{"type":"numeric"},"expires_at":{"type":"numeric"},"billing_cycle_start":{"type":"numeric"},"bucket_start":{"type":"numeric"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
+    const schema_json = app_parity_default_schema_json;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
@@ -11818,8 +11699,6 @@ test "postgres sql adapter classifies application parity corpus" {
     var required_coverage = try sql_adapter.parseAppParityCoverageRequirementsAlloc(alloc);
     defer required_coverage.deinit(alloc);
 
-    try maybeCheckOrPromoteAppParityFixture(alloc, schema_json, external_source.source_sha256, corpus);
-
     var coverage = AppParityCorpusCoverage{};
     var entry_arena = std.heap.ArenaAllocator.init(alloc);
     defer entry_arena.deinit();
@@ -11831,6 +11710,18 @@ test "postgres sql adapter classifies application parity corpus" {
         try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
     try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
+}
+
+test "postgres sql adapter checks application parity fixture freshness" {
+    const alloc = std.testing.allocator;
+    var external_source = try sql_adapter.parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer external_source.deinit(alloc);
+    try maybeCheckOrPromoteAppParityFixture(
+        alloc,
+        app_parity_default_schema_json,
+        external_source.source_sha256,
+        external_source.root.entries,
+    );
 }
 
 test "postgres sql adapter classifies fixture-backed application parity corpus" {

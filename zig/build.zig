@@ -3874,6 +3874,7 @@ pub fn build(b: *std.Build) void {
             "postgres sql adapter validates app parity fixture metadata with applied schema context",
             "sql adapter ddl plan lowers create table ddl into typed schema plan",
             "sql adapter ddl plan lowers application-time temporal table constraints",
+            "catalog apply creates clones and replaces public schema json",
             "catalog apply applies create table ddl plan to owned runtime schema",
             "catalog apply applies additive alter table ddl plan to runtime schema",
             "catalog apply applies create index ddl plan to runtime schema",
@@ -4545,7 +4546,7 @@ pub fn build(b: *std.Build) void {
     const sql_api_parity_fixture_promote_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
         .filters = &.{
-            "postgres sql adapter classifies application parity corpus",
+            "postgres sql adapter checks application parity fixture freshness",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -4555,7 +4556,7 @@ pub fn build(b: *std.Build) void {
     const sql_api_parity_fixture_check_tests = b.addTest(.{
         .root_module = api_rows_test_mod,
         .filters = &.{
-            "postgres sql adapter classifies application parity corpus",
+            "postgres sql adapter checks application parity fixture freshness",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

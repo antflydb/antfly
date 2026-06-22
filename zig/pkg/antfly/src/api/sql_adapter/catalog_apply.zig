@@ -1617,6 +1617,119 @@ fn expectAppliedDdlWorkActions(applied: ddl_plan.AppliedDdlSchemaJson, expected:
     }
 }
 
+test "catalog apply creates clones and replaces public schema json" {
+    const alloc = std.testing.allocator;
+    var create = try lowerDdlPlanForCatalogApplyTestAlloc(
+        alloc,
+        \\CREATE TABLE users (
+        \\  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+        \\  tenant_id text NOT NULL,
+        \\  email text COLLATE "C",
+        \\  attrs jsonb,
+        \\  tags text[],
+        \\  updated_at_ns bigint DEFAULT 0,
+        \\  current_day_ns date DEFAULT CURRENT_DATE,
+        \\  CONSTRAINT users_tenant_email_key UNIQUE (tenant_id, email),
+        \\  CONSTRAINT users_updated_check CHECK (updated_at_ns >= 0)
+        \\);
+        ,
+    );
+    defer create.deinit(alloc);
+
+    var applied = try applyDdlPlanToSchemaJsonAlloc(alloc, "", create);
+    defer applied.deinit(alloc);
+    try std.testing.expect(!applied.requires_rebuild);
+    try std.testing.expect(!applied.validation_required);
+    try std.testing.expect(!applied.rewrite_required);
+    var applied_parsed = try schema_api.parseValidatedTableSchema(alloc, applied.schema_json);
+    defer applied_parsed.deinit(alloc);
+    const applied_runtime = try schema_api.deriveRuntimeTableSchema(alloc, applied_parsed);
+    defer runtime_schema.freeSchema(alloc, applied_runtime);
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, applied_runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 7), applied_runtime.relational_columns.len);
+    try std.testing.expect(applied_runtime.primary_key != null);
+    try std.testing.expectEqualStrings("id", applied_runtime.primary_key.?.columns[0]);
+    const applied_email = binder.relationalColumnForField(applied_runtime, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("C", applied_email.collation.?);
+    const current_day = binder.relationalColumnForField(applied_runtime, "current_day_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, current_day.field_type);
+    try std.testing.expect(current_day.default_value != null);
+    try std.testing.expectEqual(runtime_schema.RelationalDefaultKind.current_date_ns, current_day.default_value.?.kind);
+    try std.testing.expect(std.mem.indexOf(u8, applied.schema_json, "\"current_day_ns\":{\"type\":\"datetime\",\"x-antfly-default\":{\"op\":\"current_date_ns\"}}") != null);
+    try std.testing.expectEqual(@as(usize, 1), applied_runtime.unique_constraints.len);
+    try std.testing.expectEqualStrings("users_tenant_email_key", applied_runtime.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 1), applied_runtime.checks.len);
+
+    var duplicate_create = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users (id uuid PRIMARY KEY);");
+    defer duplicate_create.deinit(alloc);
+    try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create));
+
+    var duplicate_create_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY);");
+    defer duplicate_create_if_not_exists.deinit(alloc);
+    var unchanged = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, duplicate_create_if_not_exists);
+    defer unchanged.deinit(alloc);
+    try std.testing.expectEqualStrings(applied.schema_json, unchanged.schema_json);
+    try std.testing.expect(!unchanged.requires_rebuild);
+    try std.testing.expect(!unchanged.validation_required);
+    try std.testing.expect(!unchanged.rewrite_required);
+
+    var table_clone = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE IF NOT EXISTS users_copy (LIKE users INCLUDING ALL EXCLUDING COMMENTS);");
+    defer table_clone.deinit(alloc);
+    var cloned = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_clone);
+    defer cloned.deinit(alloc);
+    try std.testing.expect(cloned.requires_rebuild);
+    try std.testing.expect(cloned.validation_required);
+    try std.testing.expect(!cloned.rewrite_required);
+    var cloned_parsed = try schema_api.parseValidatedTableSchema(alloc, cloned.schema_json);
+    defer cloned_parsed.deinit(alloc);
+    const cloned_runtime = try schema_api.deriveRuntimeTableSchema(alloc, cloned_parsed);
+    defer runtime_schema.freeSchema(alloc, cloned_runtime);
+    try std.testing.expectEqual(runtime_schema.StorageMode.relational, cloned_runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 7), cloned_runtime.relational_columns.len);
+    try std.testing.expect(cloned_runtime.primary_key != null);
+    try std.testing.expectEqualStrings("id", cloned_runtime.primary_key.?.columns[0]);
+    try std.testing.expectEqual(@as(usize, 1), cloned_runtime.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 1), cloned_runtime.checks.len);
+    const cloned_email = binder.relationalColumnForField(cloned_runtime, "email", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("C", cloned_email.collation.?);
+    const cloned_current_day = binder.relationalColumnForField(cloned_runtime, "current_day_ns", null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(cloned_current_day.default_value != null);
+
+    var table_clone_without_constraints = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE TABLE users_copy (LIKE users);");
+    defer table_clone_without_constraints.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedSqlShape, applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, table_clone_without_constraints));
+
+    var replace = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE OR REPLACE TABLE users (id uuid PRIMARY KEY);");
+    defer replace.deinit(alloc);
+    var replaced = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace);
+    defer replaced.deinit(alloc);
+    try std.testing.expect(replaced.requires_rebuild);
+    try std.testing.expect(replaced.validation_required);
+    try std.testing.expect(replaced.rewrite_required);
+    try expectAppliedDdlWorkActions(replaced, &.{ .rebuild, .validate, .rewrite });
+    var replaced_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced.schema_json);
+    defer replaced_parsed.deinit(alloc);
+    const replaced_runtime = try schema_api.deriveRuntimeTableSchema(alloc, replaced_parsed);
+    defer runtime_schema.freeSchema(alloc, replaced_runtime);
+    try std.testing.expectEqual(@as(usize, 1), replaced_runtime.relational_columns.len);
+    try std.testing.expectEqualStrings("id", replaced_runtime.primary_key.?.columns[0]);
+
+    var replace_if_not_exists = try lowerDdlPlanForCatalogApplyTestAlloc(alloc, "CREATE OR REPLACE TABLE IF NOT EXISTS users (id uuid PRIMARY KEY, status text);");
+    defer replace_if_not_exists.deinit(alloc);
+    var replaced_if_not_exists = try applyDdlPlanToSchemaJsonAlloc(alloc, applied.schema_json, replace_if_not_exists);
+    defer replaced_if_not_exists.deinit(alloc);
+    try std.testing.expect(replaced_if_not_exists.requires_rebuild);
+    try std.testing.expect(replaced_if_not_exists.validation_required);
+    try std.testing.expect(replaced_if_not_exists.rewrite_required);
+    try expectAppliedDdlWorkActions(replaced_if_not_exists, &.{ .rebuild, .validate, .rewrite });
+    var replaced_if_not_exists_parsed = try schema_api.parseValidatedTableSchema(alloc, replaced_if_not_exists.schema_json);
+    defer replaced_if_not_exists_parsed.deinit(alloc);
+    const replaced_if_not_exists_runtime = try schema_api.deriveRuntimeTableSchema(alloc, replaced_if_not_exists_parsed);
+    defer runtime_schema.freeSchema(alloc, replaced_if_not_exists_runtime);
+    try std.testing.expectEqual(@as(usize, 2), replaced_if_not_exists_runtime.relational_columns.len);
+    try std.testing.expect(binder.relationalColumnForField(replaced_if_not_exists_runtime, "status", null) != null);
+}
+
 test "catalog apply applies incremental ddl plans to public schema json" {
     const alloc = std.testing.allocator;
     var create = try lowerDdlPlanForCatalogApplyTestAlloc(
