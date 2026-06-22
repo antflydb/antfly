@@ -15334,7 +15334,7 @@ fn parseGraphTableFunctionSourceAtAlloc(
     const function_end = close_index + 1;
 
     var alias_pos = function_end;
-    const explicit_alias = parser.matchKeyword(tokens, &alias_pos, "as");
+    const explicit_alias = parser.matchKeywordTag(tokens, &alias_pos, .as);
     const alias_source = if (explicit_alias) blk: {
         if (alias_pos >= tokens.len or tokens[alias_pos].kind != .identifier) return error.UnsupportedSqlShape;
         const alias = tokens[alias_pos].text;
@@ -15342,7 +15342,7 @@ fn parseGraphTableFunctionSourceAtAlloc(
         break :blk alias;
     } else if (alias_pos < tokens.len and
         tokens[alias_pos].kind == .identifier and
-        !plan_mod.selectSourceAliasTailKeyword(tokens[alias_pos].text))
+        !plan_mod.selectSourceAliasTailKeyword(tokens[alias_pos]))
     blk: {
         const alias = tokens[alias_pos].text;
         alias_pos += 1;

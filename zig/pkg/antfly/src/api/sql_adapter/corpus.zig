@@ -23,6 +23,7 @@ const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const metadata_transition_state = @import("../../metadata/transition_state.zig");
+const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
 const query_contract = @import("../query_contract.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
@@ -6543,6 +6544,18 @@ fn appParityTokensHaveKeywordSequence(tokens: []const tokenized.Token, keywords:
     return false;
 }
 
+fn appParityTokensHaveKeywordsInOrder(tokens: []const tokenized.Token, keywords: []const token_mod.TokenKeyword) bool {
+    if (keywords.len == 0) return true;
+    var next: usize = 0;
+    for (tokens) |token| {
+        if (token.matchesKeywordTag(keywords[next])) {
+            next += 1;
+            if (next == keywords.len) return true;
+        }
+    }
+    return false;
+}
+
 fn appParityTokensHaveKeywordThenKind(tokens: []const tokenized.Token, keyword: token_mod.TokenKeyword, kind: token_mod.TokenKind) bool {
     if (tokens.len < 2) return false;
     var index: usize = 0;
@@ -6565,6 +6578,24 @@ fn appParityTokensHaveFunctionCall(tokens: []const tokenized.Token, name: []cons
             std.ascii.eqlIgnoreCase(tokens[index].text, name))
         {
             return true;
+        }
+    }
+    return false;
+}
+
+fn appParityTokensHaveFunctionCallWithKeyword(tokens: []const tokenized.Token, name: []const u8, keyword: token_mod.TokenKeyword) bool {
+    if (tokens.len < 4) return false;
+    var index: usize = 0;
+    while (index + 1 < tokens.len) : (index += 1) {
+        if (tokens[index + 1].kind != .lparen or
+            tokens[index].kind != .identifier or
+            !std.ascii.eqlIgnoreCase(tokens[index].text, name))
+        {
+            continue;
+        }
+        const close_index = parser.findMatchingRParenIndex(tokens, index + 1) orelse return false;
+        for (tokens[index + 2 .. close_index]) |token| {
+            if (token.matchesKeywordTag(keyword)) return true;
         }
     }
     return false;
@@ -7893,31 +7924,34 @@ pub const AppParityCorpusCoverage = struct {
                 self.cte_aggregate = self.cte_aggregate or uses_cte_stream;
                 self.aggregate_offset = self.aggregate_offset or sql_adapter.planHasNonZeroToken(entry.plan, ":offset=");
                 self.aggregate_input_expression = self.aggregate_input_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr=");
-                self.aggregate_modulo_expression = self.aggregate_modulo_expression or (std.mem.indexOf(u8, entry.sql, "SUM(quantity % 7)") != null and
-                    std.mem.indexOf(u8, entry.sql, "SUM(MOD(amount + quantity") != null and
+                self.aggregate_modulo_expression = self.aggregate_modulo_expression or (appParityTokensHaveFunctionCall(sql_tokens, "sum") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "mod") and
+                    appParityTokensHaveKind(sql_tokens, .percent) and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(octet_length(status))") != null and
+                self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (appParityTokensHaveFunctionCall(sql_tokens, "octet_length") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (std.mem.indexOf(u8, entry.sql, "SUM(bit_length(status))") != null and
+                self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (appParityTokensHaveFunctionCall(sql_tokens, "bit_length") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_scalar_minmax = self.aggregate_scalar_minmax or (std.mem.indexOf(u8, entry.sql, "MIN(status)") != null and
-                    std.mem.indexOf(u8, entry.sql, "MAX(lower(status))") != null and
+                self.aggregate_scalar_minmax = self.aggregate_scalar_minmax or (appParityTokensHaveFunctionCall(sql_tokens, "min") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "max") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "lower") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_regexp_numeric_expression = self.aggregate_regexp_numeric_expression or (std.mem.indexOf(u8, entry.sql, "SUM(regexp_count(status,") != null and
-                    std.mem.indexOf(u8, entry.sql, "SUM(regexp_instr(status,") != null and
+                self.aggregate_regexp_numeric_expression = self.aggregate_regexp_numeric_expression or (appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_regexp_text_expression = self.aggregate_regexp_text_expression or (std.mem.indexOf(u8, entry.sql, "COUNT(DISTINCT regexp_substr(status,") != null and
+                self.aggregate_regexp_text_expression = self.aggregate_regexp_text_expression or (appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "count", .distinct) and
+                    appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
                 self.aggregate_percentile_cont = self.aggregate_percentile_cont or
-                    std.mem.indexOf(u8, entry.sql, "percentile_cont") != null;
+                    appParityTokensHaveFunctionCall(sql_tokens, "percentile_cont");
                 self.aggregate_percentile_disc = self.aggregate_percentile_disc or
-                    std.mem.indexOf(u8, entry.sql, "percentile_disc") != null;
+                    appParityTokensHaveFunctionCall(sql_tokens, "percentile_disc");
                 self.aggregate_percentile_desc = self.aggregate_percentile_desc or
-                    (std.mem.indexOf(u8, entry.sql, "WITHIN GROUP") != null and
-                        std.mem.indexOf(u8, entry.sql, " DESC") != null);
+                    (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .within, .group }) and
+                        appParityTokensHaveKeyword(sql_tokens, .desc));
                 self.aggregate_percentile_nulls = self.aggregate_percentile_nulls or
-                    (std.mem.indexOf(u8, entry.sql, "WITHIN GROUP") != null and
-                        std.mem.indexOf(u8, entry.sql, " NULLS ") != null);
+                    (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .within, .group }) and
+                        appParityTokensHaveIdentifier(sql_tokens, "nulls"));
                 self.aggregate_percentile_array = self.aggregate_percentile_array or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":percentile_array=");
                 self.aggregate_mode = self.aggregate_mode or
@@ -7933,28 +7967,29 @@ pub const AppParityCorpusCoverage = struct {
                 self.aggregate_having_any = self.aggregate_having_any or sql_adapter.planHasNonZeroToken(entry.plan, ":having_any=");
                 self.aggregate_boolean_having_predicate = self.aggregate_boolean_having_predicate or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":having=") and
-                        (std.mem.indexOf(u8, entry.sql, "HAVING enabled IS TRUE") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS FALSE") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS UNKNOWN") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS NOT UNKNOWN") != null);
+                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .true }) or
+                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .false }) or
+                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .unknown }) or
+                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .unknown }));
                 self.aggregate_boolean_is_not_having = self.aggregate_boolean_is_not_having or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":having_any=") and
-                        (std.mem.indexOf(u8, entry.sql, "HAVING enabled IS NOT TRUE") != null or
-                            std.mem.indexOf(u8, entry.sql, "HAVING enabled IS NOT FALSE") != null);
+                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .true }) or
+                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .false }));
                 self.aggregate_filter_expression = self.aggregate_filter_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=");
                 self.aggregate_computed_pattern_filter = self.aggregate_computed_pattern_filter or
                     uses_computed_pattern and sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=");
                 self.aggregate_filter_groups = self.aggregate_filter_groups or sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=");
                 self.aggregate_boolean_is_not_filter = self.aggregate_boolean_is_not_filter or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=") and
-                        (std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS NOT TRUE") != null or
-                            std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS NOT FALSE") != null);
+                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .true }) or
+                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .false }));
                 self.aggregate_boolean_unknown_filter = self.aggregate_boolean_unknown_filter or
                     (sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=") or sql_adapter.planHasNonZeroToken(entry.plan, ":aggs=")) and
-                        (std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS UNKNOWN") != null or
-                            std.mem.indexOf(u8, entry.sql, "FILTER (WHERE enabled IS NOT UNKNOWN") != null);
+                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .unknown }) or
+                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .unknown }));
                 self.aggregate_distinct_json_array_expression = self.aggregate_distinct_json_array_expression or
-                    std.mem.indexOf(u8, entry.sql, "array_agg(DISTINCT metadata->'flags')") != null and
+                    appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "array_agg", .distinct) and
+                        appParityTokensHaveKind(sql_tokens, .arrow_json) and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr=");
                 self.aggregate_distinct_group_projection = self.aggregate_distinct_group_projection or
                     (sql_adapter.planHasNonZeroToken(entry.plan, ":group=") and

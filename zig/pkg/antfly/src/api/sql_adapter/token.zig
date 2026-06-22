@@ -88,6 +88,7 @@ pub const TokenKeyword = enum {
     false,
     fetch,
     field,
+    filter,
     first,
     @"for",
     freshness,
@@ -106,6 +107,7 @@ pub const TokenKeyword = enum {
     @"if",
     ilike,
     in,
+    inner,
     insert,
     intersect,
     into,
@@ -114,6 +116,7 @@ pub const TokenKeyword = enum {
     key,
     kind,
     lateral,
+    left,
     like,
     limit,
     materialized,
@@ -133,7 +136,10 @@ pub const TokenKeyword = enum {
     only,
     @"or",
     order,
+    outer,
     over,
+    percentile_cont,
+    percentile_disc,
     portion,
     recursive,
     returning,
@@ -160,6 +166,7 @@ pub const TokenKeyword = enum {
     when,
     where,
     with,
+    within,
 };
 
 pub const Token = struct {

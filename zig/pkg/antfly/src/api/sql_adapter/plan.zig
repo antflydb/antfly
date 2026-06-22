@@ -1928,7 +1928,7 @@ fn tokensContainTopLevelSourceName(tokens: []const Token, name: []const u8) bool
             },
             .identifier => {
                 if (depth == 0 and previous_source_keyword and std.ascii.eqlIgnoreCase(token.text, name)) return true;
-                previous_source_keyword = depth == 0 and (std.ascii.eqlIgnoreCase(token.text, "from") or std.ascii.eqlIgnoreCase(token.text, "join"));
+                previous_source_keyword = depth == 0 and (token.matchesKeywordTag(.from) or token.matchesKeywordTag(.join));
             },
             else => previous_source_keyword = false,
         }
@@ -3181,7 +3181,7 @@ pub fn parseTableAliasAlloc(
     const name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);
-    const alias = if (parser.matchKeyword(tokens, pos, "as"))
+    const alias = if (parser.matchKeywordTag(tokens, pos, .as))
         try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
     else if (parser.peekKind(tokens, pos.*, .identifier) and !nextIsJoinClauseKeyword(tokens, pos.*))
         try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
@@ -3210,7 +3210,7 @@ pub fn inferSelectSourceAliasAlloc(
                 depth -= 1;
             },
             .identifier => {
-                if (depth != 0 or !std.ascii.eqlIgnoreCase(token.text, "from")) continue;
+                if (depth != 0 or !token.matchesKeywordTag(.from)) continue;
                 return try inferSelectSourceAliasAtAlloc(alloc, tokens, i + 1);
             },
             else => {},
@@ -3226,7 +3226,7 @@ pub fn inferSelectSourceAliasAtAlloc(
 ) !?TableAlias {
     var name_index = from_index;
     if (name_index >= tokens.len) return null;
-    if (tokens[name_index].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[name_index].text, "only")) {
+    if (tokens[name_index].matchesKeywordTag(.only)) {
         name_index += 1;
     }
     if (name_index >= tokens.len or tokens[name_index].kind != .identifier) return null;
@@ -3236,12 +3236,12 @@ pub fn inferSelectSourceAliasAtAlloc(
 
     var alias_index = name_index + 1;
     const alias = alias: {
-        if (alias_index < tokens.len and tokens[alias_index].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[alias_index].text, "as")) {
+        if (alias_index < tokens.len and tokens[alias_index].matchesKeywordTag(.as)) {
             alias_index += 1;
             if (alias_index >= tokens.len or tokens[alias_index].kind != .identifier) return error.UnsupportedSqlShape;
             break :alias try alloc.dupe(u8, tokens[alias_index].text);
         }
-        if (alias_index < tokens.len and tokens[alias_index].kind == .identifier and !selectSourceAliasTailKeyword(tokens[alias_index].text)) {
+        if (alias_index < tokens.len and tokens[alias_index].kind == .identifier and !selectSourceAliasTailKeyword(tokens[alias_index])) {
             break :alias try alloc.dupe(u8, tokens[alias_index].text);
         }
         break :alias try alloc.dupe(u8, name);
@@ -3254,26 +3254,26 @@ pub fn inferSelectSourceAliasAtAlloc(
     return .{ .name = name, .alias = alias };
 }
 
-pub fn selectSourceAliasTailKeyword(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "where") or
-        std.ascii.eqlIgnoreCase(text, "group") or
-        std.ascii.eqlIgnoreCase(text, "having") or
-        std.ascii.eqlIgnoreCase(text, "order") or
-        std.ascii.eqlIgnoreCase(text, "limit") or
-        std.ascii.eqlIgnoreCase(text, "offset") or
-        std.ascii.eqlIgnoreCase(text, "fetch") or
-        std.ascii.eqlIgnoreCase(text, "for") or
-        std.ascii.eqlIgnoreCase(text, "left") or
-        std.ascii.eqlIgnoreCase(text, "outer") or
-        std.ascii.eqlIgnoreCase(text, "inner") or
-        std.ascii.eqlIgnoreCase(text, "join") or
-        std.ascii.eqlIgnoreCase(text, "on") or
-        std.ascii.eqlIgnoreCase(text, "using") or
-        std.ascii.eqlIgnoreCase(text, "returning") or
-        std.ascii.eqlIgnoreCase(text, "set") or
-        std.ascii.eqlIgnoreCase(text, "union") or
-        std.ascii.eqlIgnoreCase(text, "intersect") or
-        std.ascii.eqlIgnoreCase(text, "except");
+pub fn selectSourceAliasTailKeyword(token: Token) bool {
+    return token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.having) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.left) or
+        token.matchesKeywordTag(.outer) or
+        token.matchesKeywordTag(.inner) or
+        token.matchesKeywordTag(.join) or
+        token.matchesKeywordTag(.on) or
+        token.matchesKeywordTag(.using) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.set) or
+        token.matchesKeywordTag(.@"union") or
+        token.matchesKeywordTag(.intersect) or
+        token.matchesKeywordTag(.except);
 }
 
 pub fn parseDmlTargetAliasAlloc(
@@ -3284,7 +3284,7 @@ pub fn parseDmlTargetAliasAlloc(
     const name = try grammar.parseSqlTableReferenceIdentifierOwnedAlloc(alloc, tokens, pos);
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);
-    const alias = if (parser.matchKeyword(tokens, pos, "as"))
+    const alias = if (parser.matchKeywordTag(tokens, pos, .as))
         try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
     else if (parser.peekKind(tokens, pos.*, .identifier) and !nextIsDmlTargetTailKeyword(tokens, pos.*))
         try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
@@ -3299,42 +3299,42 @@ pub fn parseDmlTargetAliasAlloc(
 
 pub fn nextIsDmlTargetTailKeyword(tokens: []const Token, pos: usize) bool {
     if (nextIsJoinClauseKeyword(tokens, pos)) return true;
-    if (pos >= tokens.len or tokens[pos].kind != .identifier) return false;
-    const token = tokens[pos].text;
-    return std.ascii.eqlIgnoreCase(token, "default") or
-        std.ascii.eqlIgnoreCase(token, "values") or
-        std.ascii.eqlIgnoreCase(token, "conflict") or
-        std.ascii.eqlIgnoreCase(token, "set") or
-        std.ascii.eqlIgnoreCase(token, "where") or
-        std.ascii.eqlIgnoreCase(token, "order") or
-        std.ascii.eqlIgnoreCase(token, "limit") or
-        std.ascii.eqlIgnoreCase(token, "offset") or
-        std.ascii.eqlIgnoreCase(token, "fetch") or
-        std.ascii.eqlIgnoreCase(token, "for") or
-        std.ascii.eqlIgnoreCase(token, "returning");
+    if (pos >= tokens.len) return false;
+    const token = tokens[pos];
+    return token.matchesKeywordTag(.default) or
+        token.matchesKeywordTag(.values) or
+        token.matchesKeywordTag(.conflict) or
+        token.matchesKeywordTag(.set) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.fetch) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.returning);
 }
 
 pub fn nextIsJoinClauseKeyword(tokens: []const Token, pos: usize) bool {
-    if (pos >= tokens.len or tokens[pos].kind != .identifier) return false;
-    const token = tokens[pos].text;
-    return std.ascii.eqlIgnoreCase(token, "left") or
-        std.ascii.eqlIgnoreCase(token, "outer") or
-        std.ascii.eqlIgnoreCase(token, "inner") or
-        std.ascii.eqlIgnoreCase(token, "join") or
-        std.ascii.eqlIgnoreCase(token, "on") or
-        std.ascii.eqlIgnoreCase(token, "where") or
-        std.ascii.eqlIgnoreCase(token, "set") or
-        std.ascii.eqlIgnoreCase(token, "from") or
-        std.ascii.eqlIgnoreCase(token, "using") or
-        std.ascii.eqlIgnoreCase(token, "order") or
-        std.ascii.eqlIgnoreCase(token, "limit") or
-        std.ascii.eqlIgnoreCase(token, "offset") or
-        std.ascii.eqlIgnoreCase(token, "returning") or
-        std.ascii.eqlIgnoreCase(token, "for") or
-        std.ascii.eqlIgnoreCase(token, "group") or
-        std.ascii.eqlIgnoreCase(token, "union") or
-        std.ascii.eqlIgnoreCase(token, "intersect") or
-        std.ascii.eqlIgnoreCase(token, "except");
+    if (pos >= tokens.len) return false;
+    const token = tokens[pos];
+    return token.matchesKeywordTag(.left) or
+        token.matchesKeywordTag(.outer) or
+        token.matchesKeywordTag(.inner) or
+        token.matchesKeywordTag(.join) or
+        token.matchesKeywordTag(.on) or
+        token.matchesKeywordTag(.where) or
+        token.matchesKeywordTag(.set) or
+        token.matchesKeywordTag(.from) or
+        token.matchesKeywordTag(.using) or
+        token.matchesKeywordTag(.order) or
+        token.matchesKeywordTag(.limit) or
+        token.matchesKeywordTag(.offset) or
+        token.matchesKeywordTag(.returning) or
+        token.matchesKeywordTag(.@"for") or
+        token.matchesKeywordTag(.group) or
+        token.matchesKeywordTag(.@"union") or
+        token.matchesKeywordTag(.intersect) or
+        token.matchesKeywordTag(.except);
 }
 
 pub fn parseQualifiedFieldAlloc(
@@ -3375,7 +3375,7 @@ pub fn parseJoinProjectionListAlloc(
         const source = try parseQualifiedFieldAlloc(alloc, tokens, pos);
         var source_transferred = false;
         errdefer if (!source_transferred) freeQualifiedField(alloc, source);
-        const output = if (parser.matchKeyword(tokens, pos, "as"))
+        const output = if (parser.matchKeywordTag(tokens, pos, .as))
             try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos)
         else
             try alloc.dupe(u8, source.field);

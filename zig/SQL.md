@@ -397,7 +397,9 @@ Current implementation status:
   family/kind before scanning source-table tokens. Catalog prebinding
   source-table scanners now use token keyword metadata for statement heads,
   top-level clauses, set-operation tails, and optional `ONLY`/`AS`/`LATERAL`
-  modifiers instead of local string-keyword checks.
+  modifiers instead of local string-keyword checks. Relation/source alias
+  inference and DML target alias tail detection also use token keyword metadata
+  for clause boundaries and join/source modifiers.
 - Identifier tokens carry optional compact keyword metadata. The shared
   parser/classifier helpers use enum-backed keyword searches for statement
   family dispatch, top-level clause discovery, mutation-source detection,
@@ -420,8 +422,9 @@ Current implementation status:
   including pagination tails, temporal range constructors/operators, set
   operation tails, joined-source returning expressions, CTE mutation markers,
   mutation-source row assignments, temporal `FOR PORTION` clauses, boolean
-  `IS [NOT]` predicates, and row-lock invalid cases, now use parsed token
-  predicates instead of raw SQL substring probes.
+  `IS [NOT]` predicates, aggregate expression functions, percentile ordering,
+  aggregate boolean `HAVING`/`FILTER` clauses, and row-lock invalid cases, now
+  use parsed token predicates instead of raw SQL substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
