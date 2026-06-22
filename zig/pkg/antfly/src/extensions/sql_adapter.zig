@@ -26,7 +26,14 @@ pub fn executeRelationalSqlDdlOnService(
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     var plan = try sql_adapter.lowerDdlPlanAlloc(alloc, sql);
     defer plan.deinit(alloc);
+    return try executeRelationalSqlDdlPlanOnService(service, alloc, plan);
+}
 
+pub fn executeRelationalSqlDdlPlanOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.LoweredDdlPlan,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
     switch (plan) {
         .adapter_noop => |noop| {
             if (noop.reason != .extension) return null;

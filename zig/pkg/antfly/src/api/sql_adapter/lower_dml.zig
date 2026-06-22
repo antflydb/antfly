@@ -11884,6 +11884,33 @@ fn lowerRecursiveMergeMutationWithSchemasForDmlTestAlloc(
     return try lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(alloc, &parsed_sql, target_schema, source_schema, params);
 }
 
+fn lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    target_schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    unique_resolver: relational_rows.UniqueSelectorResolver,
+) !plan_mod.LoweredRecursiveInsertSource {
+    const parser_context = @import("parser_context.zig");
+
+    if (target_schema.storage_mode != .relational or target_schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema.storage_mode != .relational or source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    var parser_state = parser_context.ParserState{
+        .alloc = alloc,
+        .tokens = parsed_sql.items(),
+        .schema = target_schema,
+        .joined_source_schema = source_schema,
+        .insert_source_allows_different_table = true,
+        .params = params,
+        .unique_resolver = unique_resolver,
+    };
+    return parser_context.ParserState.ContextAccessors.parseRecursiveInsertSource(&parser_state) catch |err| switch (err) {
+        error.InvalidRowsRequest => return error.UnsupportedSqlShape,
+        else => return err,
+    };
+}
+
 fn lowerInsertWithResolverParsedSqlForDmlTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -12299,7 +12326,7 @@ fn lowerWritePlanParsedSqlForDmlTestAlloc(
         .schema = schema,
         .params = params,
         .callbacks = .{
-            .lower_recursive_insert_source_with_schemas = unsupportedRecursiveInsertSourceForDmlTestAlloc,
+            .lower_recursive_insert_source_with_schemas = lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc,
             .lower_recursive_update_joined_source_with_schemas = lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
             .lower_recursive_delete_joined_source_with_schemas = lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc,
             .lower_recursive_merge_mutation_with_schemas = lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc,
@@ -12341,6 +12368,10 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
     };
     return try context.lowerParsed(&parsed_sql, options, catalog);
 }
+
+pub const lowerWritePlanAlloc = lowerWritePlanForDmlTestAlloc;
+pub const lowerWritePlanParsedSqlAlloc = lowerWritePlanParsedSqlForDmlTestAlloc;
+pub const lowerWritePlanWithCatalogAlloc = lowerWritePlanWithCatalogForDmlTestAlloc;
 
 fn unsupportedRecursiveInsertSourceForDmlTestAlloc(
     _: std.mem.Allocator,

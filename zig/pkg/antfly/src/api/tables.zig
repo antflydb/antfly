@@ -1482,15 +1482,23 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
 ) !AppliedRelationalSqlDdlRecord {
     var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
+    return try applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, &plan, session);
+}
 
-    if (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) |table_ref_value| {
+pub fn applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    table: *const metadata_table_manager.TableRecord,
+    plan: *sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !AppliedRelationalSqlDdlRecord {
+    if (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan.*, session)) |table_ref_value| {
         var table_ref = table_ref_value;
         defer table_ref.deinit(alloc);
         if (!tableCatalogIdentityMatches(table.*, table_ref.database_name, table_ref.namespace_name, table_ref.table_name)) return error.InvalidSchemaUpdateRequest;
-        try retargetRelationalSqlDdlPlanTableNameAlloc(alloc, &plan, table.name);
+        try retargetRelationalSqlDdlPlanTableNameAlloc(alloc, plan, table.name);
     }
 
-    switch (plan) {
+    switch (plan.*) {
         .create_index => |create_index| {
             if (create_index.derived_index_config_json) |index_json| {
                 return try applyRelationalDerivedIndexCreateToTableRecordAlloc(alloc, table, create_index, index_json);
@@ -1504,7 +1512,7 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
         else => {},
     }
 
-    const current_schema_json: []const u8 = switch (plan) {
+    const current_schema_json: []const u8 = switch (plan.*) {
         .create_table => blk: {
             if (table.schema_json.len != 0) return error.InvalidSchemaUpdateRequest;
             break :blk "";
@@ -1513,7 +1521,7 @@ pub fn applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
         .create_index, .drop_index, .alter_table, .create_update_policy => table.schema_json,
         else => return error.UnsupportedSqlShape,
     };
-    var applied = try sql_adapter.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan);
+    var applied = try sql_adapter.applyDdlPlanToSchemaJsonAlloc(alloc, current_schema_json, plan.*);
     defer applied.deinit(alloc);
 
     const updated = try applyRelationalDdlSchemaRecordAlloc(alloc, table, applied.schema_json);
@@ -1752,7 +1760,14 @@ pub fn relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
 ) !RelationalSqlDdlTarget {
     var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
+    return try relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan, session);
+}
 
+pub fn relationalSqlDdlTargetForPlanWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !RelationalSqlDdlTarget {
     var table_ref = (try relationalSqlDdlPlanTableRefWithSessionAlloc(alloc, plan, session)) orelse return error.UnsupportedSqlShape;
     errdefer table_ref.deinit(alloc);
     return .{
@@ -3792,6 +3807,30 @@ pub fn applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(
 
     var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
+    return try applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, snapshot, plan, session);
+}
+
+pub fn applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    svc: anytype,
+    snapshot: *const metadata_api.AdminSnapshot,
+    plan: sql_adapter.LoweredDdlPlan,
+    session: catalog_resources.SqlCatalogSession,
+) !?AppliedRelationalSqlDdlRecord {
+    const ServiceType = @TypeOf(svc);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (comptime !(@hasDecl(ServiceDeclType, "upsertDatabase") and
+        @hasDecl(ServiceDeclType, "removeDatabase") and
+        @hasDecl(ServiceDeclType, "upsertNamespace") and
+        @hasDecl(ServiceDeclType, "removeNamespace") and
+        @hasDecl(ServiceDeclType, "upsertTablespace") and
+        @hasDecl(ServiceDeclType, "removeTablespace")))
+    {
+        return null;
+    }
 
     switch (plan) {
         .database_catalog => |database_plan| return try applyDatabaseCatalogPlanOnServiceAlloc(alloc, svc, snapshot, database_plan),

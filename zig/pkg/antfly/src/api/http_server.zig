@@ -1329,7 +1329,10 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     session: catalog_resources.SqlCatalogSession,
     function_bindings: relational_sql.SqlFunctionBindings,
 ) !tables_api.AppliedRelationalSqlDdlRecord {
-    if (try extension_domain.sql_adapter.executeRelationalSqlDdlOnService(svc, alloc, sql)) |applied| {
+    var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
+    defer plan.deinit(alloc);
+
+    if (try extension_domain.sql_adapter.executeRelationalSqlDdlPlanOnService(svc, alloc, plan)) |applied| {
         try svc.runRound();
         return applied;
     }
@@ -1337,18 +1340,18 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     var snapshot = try svc.adminSnapshot();
     defer svc.freeAdminSnapshot(&snapshot);
 
-    if (try tables_api.applyRelationalCatalogDdlOnServiceWithSessionAndFunctionBindingsAlloc(alloc, svc, &snapshot, sql, session, function_bindings)) |applied| {
+    if (try tables_api.applyRelationalCatalogDdlPlanOnServiceWithSessionAlloc(alloc, svc, &snapshot, plan, session)) |applied| {
         try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
         try svc.runRound();
         return applied;
     }
 
-    if (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(alloc, svc, &snapshot, sql, session, function_bindings)) |applied| {
+    if (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(alloc, svc, &snapshot, &plan, session)) |applied| {
         try svc.runRound();
         return applied;
     }
 
-    var target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(alloc, sql, session, function_bindings);
+    var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(alloc, plan, session);
     defer target.deinit(alloc);
 
     if (target.createsTable()) {
@@ -1361,7 +1364,7 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
             policy_table = try tables_api.applyTablespacePlacementPolicyAlloc(alloc, base_table, tablespace);
             break :blk policy_table.?;
         } else base_table;
-        var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, &resolved_table, sql, session, function_bindings);
+        var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, &resolved_table, &plan, session);
         errdefer applied.deinit(alloc);
         applied.created_table = true;
 
@@ -1398,11 +1401,11 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
         try svc.runRound();
         return dropped;
     }
-    if (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(alloc, svc, table, target, sql, function_bindings)) |derived_applied| {
+    if (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(alloc, svc, table, target, plan)) |derived_applied| {
         try svc.runRound();
         return derived_applied;
     }
-    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(alloc, table, sql, session, function_bindings);
+    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(alloc, table, &plan, session);
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
     try catalog_jobs.scheduleSchemaRewriteJobsForAppliedDdlOnService(svc, alloc, applied);
@@ -1410,17 +1413,14 @@ fn applyRelationalSqlDdlOnServiceWithSessionAndFunctionBindings(
     return applied;
 }
 
-fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     snapshot: *const metadata_api.AdminSnapshot,
-    sql: []const u8,
+    plan: *sql_adapter.LoweredDdlPlan,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: relational_sql.SqlFunctionBindings,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
-    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
-    defer plan.deinit(alloc);
-    const create_index = switch (plan) {
+    const create_index = switch (plan.*) {
         .create_index => |value| value,
         else => return null,
     };
@@ -1430,12 +1430,11 @@ fn applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindin
     defer alloc.free(graph_index_name);
     const table = (try findTableContainingIndexConfigAlloc(alloc, snapshot, graph_index_name)) orelse return error.TableNotFound;
 
-    var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
+    var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
         alloc,
         table,
-        sql,
+        plan,
         session,
-        function_bindings,
     );
     errdefer applied.deinit(alloc);
     try svc.upsertTable(applied.table);
@@ -1471,17 +1470,14 @@ fn findTableContainingIndexConfigAlloc(
     return match;
 }
 
-fn applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+fn applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
     alloc: std.mem.Allocator,
     svc: anytype,
     table: *const metadata_table_manager.TableRecord,
     target: tables_api.RelationalSqlDdlTarget,
-    sql: []const u8,
-    function_bindings: relational_sql.SqlFunctionBindings,
+    plan: sql_adapter.LoweredDdlPlan,
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     _ = target;
-    var plan = try relational_sql.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
-    defer plan.deinit(alloc);
     const create_index = switch (plan) {
         .create_index => |value| value,
         else => return null,
@@ -1831,20 +1827,20 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     defer service.deinit(alloc);
 
     const full_text_sql = "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH (analyzer = 'standard');";
-    var full_text_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var full_text_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, full_text_sql, .{});
+    defer full_text_plan.deinit(alloc);
+    var full_text_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        full_text_sql,
+        full_text_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer full_text_target.deinit(alloc);
-    var full_text = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var full_text = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         full_text_target,
-        full_text_sql,
-        .{},
+        full_text_plan,
     )).?;
     defer full_text.deinit(alloc);
     try std.testing.expect(full_text.requires_rebuild);
@@ -1853,20 +1849,20 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, service.table.indexes_json, "\"field\":\"body\"") != null);
 
     const vector_sql = "CREATE INDEX docs_embedding_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 3);";
-    var vector_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var vector_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, vector_sql, .{});
+    defer vector_plan.deinit(alloc);
+    var vector_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        vector_sql,
+        vector_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer vector_target.deinit(alloc);
-    var vector = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var vector = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         vector_target,
-        vector_sql,
-        .{},
+        vector_plan,
     )).?;
     defer vector.deinit(alloc);
     try std.testing.expect(vector.requires_rebuild);
@@ -1876,20 +1872,20 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, vector.table.indexes_json, "\"metric\":\"l2_squared\"") != null);
 
     const aknn_sql = "CREATE INDEX docs_body_semantic ON docs USING antfly_aknn (body) WITH (embedding_name = 'body_embedding_v1', model = 'local-model', dimension = 384);";
-    var aknn_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var aknn_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, aknn_sql, .{});
+    defer aknn_plan.deinit(alloc);
+    var aknn_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        aknn_sql,
+        aknn_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer aknn_target.deinit(alloc);
-    var aknn = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var aknn = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         aknn_target,
-        aknn_sql,
-        .{},
+        aknn_plan,
     )).?;
     defer aknn.deinit(alloc);
     try std.testing.expect(aknn.requires_rebuild);
@@ -1901,40 +1897,40 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, aknn.table.indexes_json, "\"expected_dims\":384") != null);
 
     const noop_sql = "CREATE INDEX IF NOT EXISTS docs_embedding_hnsw ON docs USING hnsw (embedding vector_l2_ops) WITH (dimension = 3);";
-    var noop_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var noop_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, noop_sql, .{});
+    defer noop_plan.deinit(alloc);
+    var noop_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        noop_sql,
+        noop_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer noop_target.deinit(alloc);
-    var noop = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var noop = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         noop_target,
-        noop_sql,
-        .{},
+        noop_plan,
     )).?;
     defer noop.deinit(alloc);
     try std.testing.expect(noop.noop);
     try std.testing.expectEqual(@as(usize, 3), service.upsert_count);
 
     const graph_sql = "CREATE INDEX docs_edge_graph ON docs USING antfly_graph (id, body) WITH (type_field = 'edge_type', edge_policy = 'all');";
-    var graph_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var graph_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, graph_sql, .{});
+    defer graph_plan.deinit(alloc);
+    var graph_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        graph_sql,
+        graph_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer graph_target.deinit(alloc);
-    var graph = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var graph = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         graph_target,
-        graph_sql,
-        .{},
+        graph_plan,
     )).?;
     defer graph.deinit(alloc);
     try std.testing.expect(graph.requires_rebuild);
@@ -1944,20 +1940,20 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, graph.table.indexes_json, "\"target_field\":\"body\"") != null);
 
     const graph_syntax_sql = "CREATE GRAPH INDEX docs_edge_graph_syntax ON docs EDGE (id -> body) TYPE edge_type WITH (edge_policy = 'all');";
-    var graph_syntax_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var graph_syntax_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, graph_syntax_sql, .{});
+    defer graph_syntax_plan.deinit(alloc);
+    var graph_syntax_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        graph_syntax_sql,
+        graph_syntax_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer graph_syntax_target.deinit(alloc);
-    var graph_syntax = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var graph_syntax = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         graph_syntax_target,
-        graph_syntax_sql,
-        .{},
+        graph_syntax_plan,
     )).?;
     defer graph_syntax.deinit(alloc);
     try std.testing.expect(graph_syntax.requires_rebuild);
@@ -1966,15 +1962,16 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, graph_syntax.table.indexes_json, "\"target_field\":\"body\"") != null);
 
     const graph_metric_sql = "ALTER GRAPH INDEX docs_edge_graph ADD METRIC docs_pagerank USING pagerank WITH (max_iterations = 40);";
+    var graph_metric_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, graph_metric_sql, .{});
+    defer graph_metric_plan.deinit(alloc);
     var graph_metric_snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&graph_metric_snapshot);
-    var graph_metric = (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var graph_metric = (try applyUntargetedRelationalDerivedIndexDdlOnServiceWithSessionAlloc(
         alloc,
         &service,
         &graph_metric_snapshot,
-        graph_metric_sql,
+        &graph_metric_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     )).?;
     defer graph_metric.deinit(alloc);
     try std.testing.expect(graph_metric.requires_rebuild);
@@ -1984,20 +1981,20 @@ test "api http server applies SQL derived index DDL to catalog index metadata" {
     try std.testing.expect(std.mem.indexOf(u8, graph_metric.table.indexes_json, "\"algorithm\":\"pagerank\"") != null);
 
     const hybrid_sql = "CREATE INDEX docs_hybrid ON docs USING antfly_hybrid () WITH (sources = 'docs_body_fts,docs_embedding_hnsw,docs_pagerank', fusion = 'rrf');";
-    var hybrid_target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(
+    var hybrid_plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, hybrid_sql, .{});
+    defer hybrid_plan.deinit(alloc);
+    var hybrid_target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(
         alloc,
-        hybrid_sql,
+        hybrid_plan,
         catalog_resources.SqlCatalogSession.default(),
-        .{},
     );
     defer hybrid_target.deinit(alloc);
-    var hybrid = (try applyRelationalDerivedIndexDdlOnServiceWithSessionAndFunctionBindings(
+    var hybrid = (try applyRelationalDerivedIndexDdlOnServiceWithPlanAlloc(
         alloc,
         &service,
         &service.table,
         hybrid_target,
-        hybrid_sql,
-        .{},
+        hybrid_plan,
     )).?;
     defer hybrid.deinit(alloc);
     try std.testing.expect(hybrid.requires_rebuild);
@@ -23752,17 +23749,19 @@ test "api http server passes SQL routine bindings to source-backed schema DDL" {
             self.binding_aware_calls += 1;
             try std.testing.expectEqual(@as(usize, 1), function_bindings.routine_expressions.len);
 
-            var target = try tables_api.relationalSqlDdlTargetWithSessionAndFunctionBindingsAlloc(allocator, sql, session, function_bindings);
+            var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(allocator, sql, function_bindings);
+            defer plan.deinit(allocator);
+
+            var target = try tables_api.relationalSqlDdlTargetForPlanWithSessionAlloc(allocator, plan, session);
             defer target.deinit(allocator);
 
             var base_table = tables_api.deriveRelationalSqlDdlTargetTableRecord(target);
             const source_table = if (self.table) |*record| record else &base_table;
-            var applied = try tables_api.applyRelationalSqlDdlToTableRecordWithSessionAndFunctionBindingsAlloc(
+            var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
                 allocator,
                 source_table,
-                sql,
+                &plan,
                 session,
-                function_bindings,
             );
             errdefer applied.deinit(allocator);
 

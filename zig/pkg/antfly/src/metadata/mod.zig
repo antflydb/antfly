@@ -76,6 +76,7 @@ pub const SecondaryIndexRebuildRangeSelector = table_manager.SecondaryIndexRebui
 pub const SecondaryIndexRebuildRangeBeginRequest = table_manager.SecondaryIndexRebuildRangeBeginRequest;
 pub const SecondaryIndexRebuildRangeFinishRequest = table_manager.SecondaryIndexRebuildRangeFinishRequest;
 pub const SecondaryIndexRebuildRangeInvalidateRequest = table_manager.SecondaryIndexRebuildRangeInvalidateRequest;
+pub const SchemaRewriteRename = table_manager.SchemaRewriteRename;
 pub const SchemaRewriteJobRecord = table_manager.SchemaRewriteJobRecord;
 pub const SchemaRewriteJobBeginRequest = table_manager.SchemaRewriteJobBeginRequest;
 pub const SchemaRewriteJobFinishRequest = table_manager.SchemaRewriteJobFinishRequest;

@@ -1901,7 +1901,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        var resp = try self.api_server.handlePublicCatalogTableRowsBatch(catalogTableTarget(database_name, namespace_name, table_name), body_data);
+        var resp = try self.api_server.handlePublicCatalogTableRowsBatch(catalogTableTarget(database_name, namespace_name, table_name), body_data, authenticated_identity);
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 
@@ -2017,7 +2017,7 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("missing body");
         };
-        var resp = try self.api_server.handlePublicTableRowsBatch(table_name, body_data);
+        var resp = try self.api_server.handlePublicTableRowsBatch(table_name, body_data, authenticated_identity);
         return respondWithAllocator(ctx, &resp, self.api_server.alloc);
     }
 

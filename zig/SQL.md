@@ -256,6 +256,88 @@ as the corresponding REST, SDK, MCP, A2A, CLI, job, or internal automation
 path, with the same authorization, idempotency, audit, retry, diagnostic, and
 failure semantics.
 
+### Production Adapter Design
+
+The SQL adapter should be organized as a compiler frontend plus a service
+handoff layer. Each statement family should move through the same typed
+pipeline, and every phase boundary should make ownership explicit:
+
+```text
+external SQL request
+  -> parseSql(sql) : ParsedSql
+  -> bindSql(parsed, session, catalog, principal) : BoundSqlStatement
+  -> planSql(bound) : LogicalSqlPlan
+  -> executeSqlPlan(plan, services) : row result, metadata transition, or job
+```
+
+`parseSql` is the only place that accepts raw SQL text. It owns tokenization,
+keyword metadata, source spans, raw AST nodes, nested statement structure, and
+parse diagnostics. Parser output is intentionally catalog-free and must not
+infer permissions, storage placement, JSON values, or durable catalog names.
+
+`bindSql` is the first semantic boundary. It receives an explicit SQL session,
+catalog snapshot, and principal, then resolves current database, search path,
+catalog targets, object versions, source schemas, role grants, dependency
+facts, extension identity, tablespace policy inputs, lake or foreign-source
+identity, and backup/restore scope. Any statement that can touch catalog,
+storage, role, extension, tablespace, lake, or backup state must pass through
+binding before planning.
+
+`planSql` converts bound statements into Antfly-native intent. Plans should be
+closed unions by family: read, write, table/catalog DDL, derived index,
+extension, role, session, transaction, job, lake/source, backup/restore, and
+storage. A plan may reference source spans for diagnostics and provenance, but
+it must not use SQL text as the durable semantic payload.
+
+`executeSqlPlan` is a thin bridge into shared services. It should not contain
+parser probes, catalog guessing, or SQL-specific metadata persistence. Durable
+effects are owned by the same service that owns the equivalent non-SQL API:
+row/storage vtables for reads and writes, the catalog or metadata leader for
+database/namespace/table/tablespace lifecycle, derived-index services for index
+builds, role management for grants and role settings, extension lifecycle for
+package operations, lake/source services for external data, backup/restore
+services for backup scopes, and the shared durable jobs system for asynchronous
+validation or rewrite work.
+
+This design gives every statement family a clear maturity ladder:
+
+1. **Recognized**: statement family and unsupported shape are classified with a
+   stable diagnostic.
+2. **Parsed**: the family has raw AST coverage, source spans, nested statement
+   nodes or token ranges, and no substring rediscovery in normal lowering.
+3. **Bound**: catalog-aware forms require `BoundSqlStatement` with session,
+   resolved identity, object versions, schemas, role checks, dependencies, and
+   placement facts.
+4. **Planned**: supported forms lower to typed Antfly-native logical plans; gaps
+   fail closed with the missing native model named.
+5. **Executed**: plans hand off to shared Antfly services, with metadata changes
+   and durable jobs admitted only by the service that owns the state.
+6. **Proven**: SQL and native REST/SDK/MCP/A2A/CLI paths share parity coverage
+   through structured summaries or coverage bits, not SQL-string scans.
+
+Statement-family migrations should follow this order:
+
+1. Normalize ingress so HTTP SQL, SQL wire protocol, CLI, MCP, A2A, fixtures,
+   tests, and internal helpers construct `ParsedSql` once.
+2. Promote compatibility token scans into raw AST nodes for reads, writes, DDL,
+   session commands, transactions, `EXPLAIN`, CTEs, relation population,
+   `INSERT ... SELECT`, `UPDATE ... FROM`, `DELETE ... USING`, and `MERGE`.
+3. Move catalog-sensitive resolution behind binder APIs that require explicit
+   session, catalog snapshot, and principal inputs.
+4. Replace lowerer probe order with `switch` dispatch over parsed statement
+   variants and compact statement-kind enums.
+5. Replace durable SQL fragments in metadata, job payloads, index definitions,
+   role settings, extension state, backup scopes, and storage dispatch with
+   typed plan fields.
+6. Delete compatibility wrappers after the typed path has parity coverage for
+   the same native service contract.
+
+The review rule is simple: a new SQL feature is not production-shaped if it
+adds another raw-string semantic bridge, bypasses `BoundSqlStatement` for a
+catalog-aware operation, stores SQL as durable behavior, schedules lifecycle
+work outside the metadata owner, or validates fixtures by reconstructing parser
+behavior from strings.
+
 ## Catalog and Session Semantics
 
 SQL object names resolve through the same `database / namespace / table` model

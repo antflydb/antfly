@@ -71,7 +71,15 @@ pub fn executeRelationalSqlDdlOnUserManagerWithCatalogAndFunctionBindings(
 ) !?tables_api.AppliedRelationalSqlDdlRecord {
     var plan = try sql_adapter.lowerDdlPlanWithFunctionBindingsAlloc(alloc, sql, function_bindings);
     defer plan.deinit(alloc);
+    return try executeRelationalSqlDdlPlanOnUserManagerWithCatalog(manager, alloc, plan, catalog);
+}
 
+pub fn executeRelationalSqlDdlPlanOnUserManagerWithCatalog(
+    manager: *usermgr.UserManager,
+    alloc: std.mem.Allocator,
+    plan: sql_adapter.LoweredDdlPlan,
+    catalog: SqlAuthCatalog,
+) !?tables_api.AppliedRelationalSqlDdlRecord {
     switch (plan) {
         .authorization_catalog => |authorization_plan| switch (authorization_plan) {
             .create_role => |create| return try executeCreateRole(manager, alloc, create),
