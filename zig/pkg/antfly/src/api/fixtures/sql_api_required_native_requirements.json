@@ -6,7 +6,6 @@
     "enforced_unique_conflict_target",
     "multi_table_generation_barrier",
     "routine_body_plan",
-    "routine_option_plan",
-    "set_operation_output_shape"
+    "routine_option_plan"
   ]
 }

@@ -10068,6 +10068,50 @@ test "sql adapter ddl plan lowers catalog-only ddl plans" {
     }
     try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE TABLE usage_records (id bigint GENERATED ALWAYS AS IDENTITY (NO MINVALUE MINVALUE 1) PRIMARY KEY, status text);"));
 
+    var create_extension = try lowerDdlPlanForTestAlloc(alloc, "CREATE EXTENSION postgis VERSION '3.4.0';");
+    defer create_extension.deinit(alloc);
+    switch (create_extension) {
+        .extension_catalog => |plan| switch (plan) {
+            .create => |create| {
+                try std.testing.expectEqualStrings("postgis", create.extension_name);
+                try std.testing.expectEqualStrings("3.4.0", create.version.?);
+                try std.testing.expect(!create.if_not_exists);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var update_extension = try lowerDdlPlanForTestAlloc(alloc, "ALTER EXTENSION postgis UPDATE TO '3.5.0';");
+    defer update_extension.deinit(alloc);
+    switch (update_extension) {
+        .extension_catalog => |plan| switch (plan) {
+            .update => |update| {
+                try std.testing.expectEqualStrings("postgis", update.extension_name);
+                try std.testing.expectEqualStrings("3.5.0", update.target_version.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var drop_extension = try lowerDdlPlanForTestAlloc(alloc, "DROP EXTENSION IF EXISTS postgis CASCADE;");
+    defer drop_extension.deinit(alloc);
+    switch (drop_extension) {
+        .extension_catalog => |plan| switch (plan) {
+            .drop => |drop| {
+                try std.testing.expectEqualStrings("postgis", drop.extension_name);
+                try std.testing.expect(drop.if_exists);
+                try std.testing.expect(drop.cascade);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE EXTENSION pgcrypto WITH SCHEMA public;"));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerDdlPlanForTestAlloc(alloc, "CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA private;"));
+
     var create_domain = try lowerDdlPlanForTestAlloc(alloc, "CREATE DOMAIN positive_amount AS numeric CHECK (VALUE > 0);");
     defer create_domain.deinit(alloc);
     switch (create_domain) {

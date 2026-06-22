@@ -1882,6 +1882,30 @@ test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
             .fingerprint = "ddl:identity_allocator:table=usage_records:column=id:kind=generated_always:primary=true:columns=1:options=6",
         },
         .{
+            .sql = "CREATE EXTENSION postgis;",
+            .fingerprint = "ddl:create_extension:extension=postgis:if_not_exists=false",
+        },
+        .{
+            .sql = "CREATE EXTENSION postgis VERSION '3.4.0';",
+            .fingerprint = "ddl:create_extension:extension=postgis:if_not_exists=false:version=3.4.0",
+        },
+        .{
+            .sql = "CREATE EXTENSION IF NOT EXISTS postgis VERSION '3.4.0';",
+            .fingerprint = "ddl:create_extension:extension=postgis:if_not_exists=true:version=3.4.0",
+        },
+        .{
+            .sql = "ALTER EXTENSION postgis UPDATE TO '3.5.0';",
+            .fingerprint = "ddl:alter_extension_update:extension=postgis:version=3.5.0",
+        },
+        .{
+            .sql = "ALTER EXTENSION postgis UPDATE;",
+            .fingerprint = "ddl:alter_extension_update:extension=postgis:version=latest",
+        },
+        .{
+            .sql = "DROP EXTENSION IF EXISTS postgis CASCADE;",
+            .fingerprint = "ddl:drop_extension:extension=postgis:if_exists=true:cascade=true",
+        },
+        .{
             .sql = "CREATE TYPE usage_status AS ENUM ('queued', 'processing', 'done');",
             .fingerprint = "ddl:create_enum_type:type=usage_status:values=3",
         },

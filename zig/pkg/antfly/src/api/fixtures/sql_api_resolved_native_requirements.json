@@ -76,6 +76,14 @@
       ]
     },
     {
+      "reason": "set_operation_output_shape",
+      "coverage": [
+        "read_set_operation_cross_table_source_schema_classifier",
+        "read_set_operation_order_limit",
+        "unsupported_read_set_operation_output_shape"
+      ]
+    },
+    {
       "reason": "set_operation_plan",
       "coverage": [
         "read_set_operation_cross_table_source_schema_classifier",
