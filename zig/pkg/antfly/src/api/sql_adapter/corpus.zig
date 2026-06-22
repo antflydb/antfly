@@ -7166,6 +7166,7 @@ pub const AppParityCorpusCoverage = struct {
     update_source_row_assignment: bool = false,
     update_source_row_assignment_default: bool = false,
     update_source_row_assignment_constructor: bool = false,
+    schema_additive_unique_conflict_target: bool = false,
     schema_default_primary_named_conflict_target: bool = false,
     schema_custom_primary_named_conflict_target: bool = false,
     schema_unique_conflict_target: bool = false,
@@ -7206,7 +7207,6 @@ pub const AppParityCorpusCoverage = struct {
     migration_equivalent_schema_rebuild: bool = false,
     migration_equivalent_schema_rewrite: bool = false,
     migration_equivalent_schema_validation: bool = false,
-    unsupported_unvalidated_unique_conflict_target: bool = false,
     to_jsonb_value_wrapper: bool = false,
     to_jsonb_dynamic_expression: bool = false,
     update_source_json_set_expression: bool = false,
@@ -9330,6 +9330,8 @@ pub const AppParityCorpusCoverage = struct {
                     std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT usage_records_id_pk") != null);
             self.schema_unique_conflict_target = self.schema_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "email text UNIQUE") and
                 std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email)") != null);
+            self.schema_additive_unique_conflict_target = self.schema_additive_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "ADD CONSTRAINT usage_records_email_key UNIQUE") and
+                std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email)") != null);
             self.schema_partial_unique_conflict_target = self.schema_partial_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
                 appParityAnyStringContains(entry.apply_setup_sql, " WHERE ") and
                 std.mem.indexOf(u8, entry.sql, "ON CONFLICT (email) WHERE") != null);
@@ -9339,8 +9341,6 @@ pub const AppParityCorpusCoverage = struct {
             self.schema_mixed_expression_unique_conflict_target = self.schema_mixed_expression_unique_conflict_target or (appParityAnyStringContains(entry.apply_setup_sql, "CREATE UNIQUE INDEX") and
                 appParityAnyStringContains(entry.apply_setup_sql, "tenant_id, lower(") and
                 std.mem.indexOf(u8, entry.sql, "ON CONFLICT (tenant_id, lower(") != null);
-        } else if (entry.family == .unsupported_insert) {
-            self.unsupported_unvalidated_unique_conflict_target = self.unsupported_unvalidated_unique_conflict_target or std.mem.eql(u8, entry.classification_reason, "enforced_unique_conflict_target");
         }
         if (entry.family == .insert and !uses_insert_conflict) {
             self.multi_row_insert = self.multi_row_insert or uses_multi_row_insert;

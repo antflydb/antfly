@@ -4390,7 +4390,7 @@ pub fn parseAlterTableAddColumnOperationAlloc(
             var constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, &.{column.name}, include_columns, null, nulls_not_distinct, timing);
             var constraint_transferred = false;
             errdefer if (!constraint_transferred) freeDdlUniqueConstraint(alloc, constraint);
-            constraint.validation_state = .unvalidated;
+            constraint.validation_state = alterTableAddedUniqueValidationState(tokens, pos, timing);
             try unique_constraints.append(alloc, constraint);
             constraint_transferred = true;
         } else if (constraint_prefix.kind == .check and cursor.matchKeyword("check")) {
@@ -4485,7 +4485,7 @@ pub fn parseAlterTableOperationAlloc(
         defer freeStringSlice(alloc, include_columns);
         const timing = try grammar.parseOptionalDdlConstraintTiming(tokens, pos);
         var constraint = try makeDdlUniqueConstraintAlloc(alloc, constraint_name, columns.columns, include_columns, columns.without_overlaps_period, nulls_not_distinct, timing);
-        constraint.validation_state = .unvalidated;
+        constraint.validation_state = alterTableAddedUniqueValidationState(tokens, pos, timing);
         try appendAlterTableOperation(alloc, operations, alterTableAddUniqueConstraintOperation(constraint));
         return;
     }
@@ -6430,6 +6430,16 @@ pub fn alterTableAddForeignKeyOperation(foreign_key: runtime_schema.ForeignKey) 
 
 pub fn alterTableAddCheckOperation(check: runtime_schema.RelationalCheck) AlterTableOperation {
     return .{ .add_check = check };
+}
+
+fn alterTableAddedUniqueValidationState(
+    tokens: []const grammar.Token,
+    pos: *usize,
+    timing: grammar.DdlConstraintTimingSyntax,
+) runtime_schema.UniqueConstraintValidationState {
+    const not_valid = grammar.consumeOptionalDdlNotValid(tokens, pos);
+    if (not_valid or timing.deferrable or timing.timing == .deferred) return .unvalidated;
+    return .enforced;
 }
 
 pub fn makeDdlPrimaryKeyAlloc(
@@ -9211,6 +9221,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
                     try std.testing.expectEqual(@as(usize, 2), constraint.columns.len);
                     try std.testing.expectEqualStrings("tenant_id", constraint.columns[0]);
                     try std.testing.expectEqualStrings("status", constraint.columns[1]);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, constraint.validation_state);
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -9277,6 +9288,26 @@ test "sql adapter ddl plan lowers alter table ddl" {
                 .add_unique_constraint => |constraint| {
                     try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
                     try std.testing.expectEqual(@as(usize, 1), constraint.columns.len);
+                    try std.testing.expectEqualStrings("email", constraint.columns[0]);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, constraint.validation_state);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var not_valid_unique = try lowerDdlPlanForTestAlloc(
+        alloc,
+        "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) NOT VALID;",
+    );
+    defer not_valid_unique.deinit(alloc);
+    switch (not_valid_unique) {
+        .alter_table => |plan| {
+            try std.testing.expectEqualStrings("usage_records", plan.table_name);
+            try std.testing.expectEqual(@as(usize, 1), plan.operations.len);
+            switch (plan.operations[0]) {
+                .add_unique_constraint => |constraint| {
+                    try std.testing.expectEqualStrings("usage_records_email_key", constraint.name);
                     try std.testing.expectEqualStrings("email", constraint.columns[0]);
                     try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
                 },
@@ -9345,7 +9376,7 @@ test "sql adapter ddl plan lowers alter table ddl" {
                     try std.testing.expectEqual(@as(usize, 2), constraint.include_columns.len);
                     try std.testing.expectEqualStrings("tenant_id", constraint.include_columns[0]);
                     try std.testing.expectEqualStrings("status", constraint.include_columns[1]);
-                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+                    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, constraint.validation_state);
                 },
                 else => return error.TestUnexpectedResult,
             }
@@ -12187,7 +12218,7 @@ test "sql adapter ddl plan lowers application-time temporal table constraints" {
             try std.testing.expectEqualStrings("account_prices_sku_sell_time_key", constraint.name);
             try std.testing.expectEqualStrings("sku", constraint.columns[0]);
             try std.testing.expectEqualStrings("sell_time", constraint.without_overlaps_period.?);
-            try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, constraint.validation_state);
+            try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, constraint.validation_state);
         },
         else => return error.TestUnexpectedResult,
     }

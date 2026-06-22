@@ -925,9 +925,18 @@ pub fn lowerReadPlanWithCatalogSourceSchemaAlloc(
     catalog: table_catalog.CatalogSource,
     hooks: ReadPlanCatalogLoweringHooks,
 ) !plan_mod.LoweredReadPlan {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(alloc, tokens.items, catalog, hooks);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerReadPlanWithCatalogSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, catalog, hooks);
+}
+
+pub fn lowerReadPlanWithCatalogSourceSchemaParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    hooks: ReadPlanCatalogLoweringHooks,
+) !plan_mod.LoweredReadPlan {
+    return try lowerReadPlanWithCatalogBoundStatementAlloc(alloc, parsed_sql, catalog, hooks);
 }
 
 pub fn lowerReadPlanWithCatalogSourceSchemaFromTokensAlloc(
@@ -973,9 +982,19 @@ pub fn lowerWritePlanWithCatalogOptionsAlloc(
     catalog: table_catalog.CatalogSource,
     hooks: WritePlanCatalogLoweringHooks,
 ) !plan_mod.LoweredWritePlan {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try lowerWritePlanWithCatalogOptionsFromTokensAlloc(alloc, tokens.items, options, catalog, hooks);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try lowerWritePlanWithCatalogOptionsParsedSqlAlloc(alloc, &parsed_sql, options, catalog, hooks);
+}
+
+pub fn lowerWritePlanWithCatalogOptionsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    hooks: WritePlanCatalogLoweringHooks,
+) !plan_mod.LoweredWritePlan {
+    return try lowerWritePlanWithCatalogBoundStatementAlloc(alloc, parsed_sql, options, catalog, hooks);
 }
 
 pub fn lowerWritePlanWithCatalogOptionsFromTokensAlloc(
@@ -1057,9 +1076,13 @@ const CteSourceBinding = struct {
 };
 
 pub fn insertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try insertSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try insertSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
+}
+
+pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
+    return try insertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
 pub fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
@@ -1070,9 +1093,16 @@ pub fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: [
 }
 
 pub fn recursiveInsertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try recursiveInsertSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
+}
+
+pub fn recursiveInsertSourceTableNamesFromParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+) !?InsertSourceTableNames {
+    return try recursiveInsertSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
 pub fn recursiveInsertSourceTableNamesFromTokensAlloc(
@@ -1119,9 +1149,13 @@ pub fn recursiveInsertSourceTableNamesFromTokensAlloc(
 }
 
 pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
+}
+
+pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
+    return try joinedWriteSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
 pub fn joinedWriteSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?InsertSourceTableNames {
@@ -1210,9 +1244,28 @@ pub fn resolveWritePlanCatalogOptionsAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !CatalogBoundWritePlanOptions {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try resolveWritePlanCatalogOptionsFromTokensAlloc(alloc, tokens.items, options, catalog);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try resolveWritePlanCatalogOptionsParsedSqlAlloc(alloc, &parsed_sql, options, catalog);
+}
+
+pub fn resolveWritePlanCatalogOptionsParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !CatalogBoundWritePlanOptions {
+    return try resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(alloc, parsed_sql, options, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn resolveWritePlanCatalogOptionsParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !CatalogBoundWritePlanOptions {
+    return try resolveWritePlanCatalogOptionsFromTokensWithSessionAlloc(alloc, parsed_sql.items(), options, catalog, session);
 }
 
 pub fn resolveWritePlanCatalogOptionsFromTokensAlloc(
@@ -1280,9 +1333,26 @@ pub fn resolveReadPlanCatalogSourceSchemaAlloc(
     sql: []const u8,
     catalog: table_catalog.CatalogSource,
 ) !CatalogBoundReadPlanSourceSchema {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try resolveReadPlanCatalogSourceSchemaFromTokensAlloc(alloc, tokens.items, catalog);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, catalog);
+}
+
+pub fn resolveReadPlanCatalogSourceSchemaParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+) !CatalogBoundReadPlanSourceSchema {
+    return try resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(alloc, parsed_sql, catalog, catalog_resources.SqlCatalogSession.default());
+}
+
+pub fn resolveReadPlanCatalogSourceSchemaParsedSqlWithSessionAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    catalog: table_catalog.CatalogSource,
+    session: catalog_resources.SqlCatalogSession,
+) !CatalogBoundReadPlanSourceSchema {
+    return try resolveReadPlanCatalogSourceSchemaFromTokensWithSessionAlloc(alloc, parsed_sql.items(), catalog, session);
 }
 
 pub fn bindReadPlanCatalogStatementAlloc(
@@ -1564,9 +1634,13 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
 }
 
 pub fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?ReadSourceTableNames {
-    var tokens = try lexer.tokenizeAlloc(alloc, sql);
-    defer lexer.freeTokens(alloc, &tokens);
-    return try readSourceTableNamesFromTokensAlloc(alloc, tokens.items);
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed_sql.deinit(alloc);
+    return try readSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
+}
+
+pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?ReadSourceTableNames {
+    return try readSourceTableNamesFromTokensAlloc(alloc, parsed_sql.items());
 }
 
 pub fn readSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?ReadSourceTableNames {

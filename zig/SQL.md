@@ -512,6 +512,67 @@ bridges:
 6. Delete compatibility fallbacks only after parity fixtures cover the native
    typed path for the corresponding statement family.
 
+### Completion Design
+
+The remaining production work should converge on one typed route per statement
+family. Compatibility helpers may stay as public facades for tests, CLI, or
+older call sites, but they should immediately create or receive `ParsedSql` and
+then delegate to parsed, bound, and logical-plan APIs. New SQL features should
+not add raw-string lowerer entrypoints unless the function is explicitly an
+external ingress wrapper.
+
+The long-term endpoint for parser and lowerer work is:
+
+```text
+Adapter ingress
+  -> TokenizedSql
+  -> ParsedSql with complete raw statement nodes
+  -> BoundSqlStatement with session/catalog/authorization facts
+  -> LogicalSqlPlan with native Antfly operation intent
+  -> shared row/catalog/index/role/extension/job/storage service
+```
+
+To get there, finish these tracks in order:
+
+1. **Complete raw AST coverage.** Promote CTEs, subqueries, relation
+   population sources, `INSERT ... SELECT`, `UPDATE ... FROM`,
+   `DELETE ... USING`, `MERGE`, session commands, and explain subjects from
+   token-range compatibility nodes into first-class parsed children. Token
+   ranges are acceptable only when a SQL shape is non-contiguous and the child
+   still points back to the original source spans.
+2. **Make binding mandatory for catalog-aware work.** Reads, writes, DDL,
+   extension operations, role operations, tablespace operations, backup/restore,
+   and lake/foreign-source access should all pass through `BoundSqlStatement`
+   before planning. Binding owns `current_database`, `search_path`, object
+   versions, schema lookup, dependency checks, and role authorization.
+3. **Replace probe dispatch with variant dispatch.** Once a statement has a
+   `ParsedStatement` variant, route by that variant and statement kind. Legacy
+   "try this lowerer, then the next lowerer" paths should shrink to temporary
+   fallback coverage for statement families that do not yet have a complete raw
+   AST.
+4. **Use native plans for every durable effect.** SQL DDL should emit catalog,
+   index, role, extension, job, table, namespace, database, tablespace,
+   backup/restore, and lake-source plans directly. No durable service should
+   inspect SQL text to understand the request.
+5. **Make diagnostics span-first.** Unsupported-shape errors, parse errors,
+   bind errors, and planning errors should carry stable source spans and a
+   phase-specific code. String-only unsupported reasons are compatibility debt
+   unless paired with a diagnostic span.
+6. **Move fixture validation to structured summaries.** Fixture freshness,
+   coverage, and parity checks should consume parser/binder/plan summaries or
+   emitted coverage bits. They should not scan SQL text or plan fingerprints in
+   ways that duplicate parser behavior.
+7. **Keep lexical work cheap.** Keyword classification, quoted identifier
+   handling, numeric validation, and literal source spans belong in lexical or
+   raw parse metadata. JSON/JSONB literal parsing, type coercion, expression
+   binding, and catalog-dependent checks belong in semantic phases only.
+
+Acceptance for this design is not "the parser accepts PostgreSQL syntax." The
+acceptance bar is that every supported SQL statement has the same durable effect
+as the equivalent Antfly-native API call, every unsupported statement names the
+missing native model, and no internal subsystem needs to recover semantics from
+SQL strings after binding.
+
 ## Parity and Test Strategy
 
 SQL compatibility is proven by typed outcomes, not by accepting more syntax than

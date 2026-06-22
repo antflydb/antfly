@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "3d298ab22e90275b34ac7fd6c0094fcb4cbee6cbd4e4c4117c6e2e62015df128",
-  "source_entry_count": 1025,
-  "entry_count": 1025,
+  "source_sha256": "2a89ab11312c32bff5388ef7471c08015a0ff3ffea3e75ffd217cbe15b19583e",
+  "source_entry_count": 1026,
+  "entry_count": 1026,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -7454,7 +7454,7 @@
       },
       "plan": "ddl:alter_table:table=usage_records:ops=4:if_exists=false:add_col=2:add_period=1:add_unique=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text NOT NULL);"],
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=true:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=3:work=rebuild/table/derived_artifacts,validate/table/constraints,rewrite/table/row_images",
       "sql": "ALTER TABLE usage_records\n  ADD COLUMN valid_from numeric NOT NULL,\n  ADD COLUMN valid_to numeric NOT NULL,\n  ADD PERIOD FOR valid_time (valid_from, valid_to),\n  ADD CONSTRAINT usage_records_tenant_valid_key UNIQUE (tenant_id, valid_time WITHOUT OVERLAPS);"
     },
     {
@@ -7960,7 +7960,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);"
     },
     {
@@ -7972,7 +7972,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_nulls_distinct_key UNIQUE NULLS DISTINCT (email) NOT DEFERRABLE INITIALLY IMMEDIATE;"
     },
     {
@@ -7984,7 +7984,7 @@
         "operations": 1
       },
       "plan": "ddl:alter_table:table=usage_records:ops=1:if_exists=false:add_unique=1",
-      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=1:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
+      "applied_plan": "applied:rebuild=true:validation=true:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=2:work=rebuild/table/derived_artifacts,validate/table/constraints",
       "sql": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_cover_key UNIQUE (email) INCLUDE (tenant_id, status);"
     },
     {
@@ -10289,13 +10289,25 @@
       "sql": "INSERT INTO usage_records AS u (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = u.status || ':' || excluded.status RETURNING id, status"
     },
     {
-      "name": "unsupported unvalidated unique conflict target",
-      "family": "unsupported_insert",
-      "plan": "unsupported:insert:requires=enforced_unique_conflict_target",
-      "classification_reason": "enforced_unique_conflict_target",
+      "name": "alter add unique conflict target",
+      "family": "insert",
+      "summary": {
+        "table_name": "usage_records",
+        "operations": 1,
+        "returning": 1
+      },
+      "plan": "insert:table=usage_records:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);", "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email);"],
       "resolver_row_json": "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"existing\"}",
       "resolver_version": 21,
+      "sql": "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = excluded.status RETURNING id, status"
+    },
+    {
+      "name": "unsupported non-unique conflict target",
+      "family": "unsupported_insert",
+      "plan": "unsupported:insert:requires=enforced_unique_conflict_target",
+      "classification_reason": "enforced_unique_conflict_target",
+      "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);"],
       "sql": "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = excluded.status RETURNING id, status"
     },
     {

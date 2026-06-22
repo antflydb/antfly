@@ -2368,7 +2368,7 @@ test "catalog apply applies incremental ddl plans to public schema json" {
     try std.testing.expectEqual(@as(usize, 2), temporal_runtime.unique_constraints.len);
     try std.testing.expectEqualStrings("users_tenant_valid_key", temporal_runtime.unique_constraints[1].name);
     try std.testing.expectEqualStrings("valid_time", temporal_runtime.unique_constraints[1].without_overlaps_period.?);
-    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal_runtime.unique_constraints[1].validation_state);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, temporal_runtime.unique_constraints[1].validation_state);
     try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToSchemaJsonAlloc(alloc, temporal.schema_json, add_temporal));
 
     var not_valid = try lowerDdlPlanForCatalogApplyTestAlloc(
@@ -3066,7 +3066,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqualStrings("status", upper_generated.generated.?.field.?);
     try std.testing.expectEqual(@as(usize, 1), updated.unique_constraints.len);
     try std.testing.expectEqualStrings("usage_records_tenant_status_key", updated.unique_constraints[0].name);
-    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, updated.unique_constraints[0].validation_state);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, updated.unique_constraints[0].validation_state);
     try std.testing.expectEqual(@as(usize, 1), updated.foreign_keys.len);
     try std.testing.expectEqual(@as(usize, 1), updated.checks.len);
     try std.testing.expectEqual(runtime_schema.RelationalCheckValidationState.unvalidated, updated.checks[0].validation_state);
@@ -3091,7 +3091,7 @@ test "catalog apply applies additive alter table ddl plan to runtime schema" {
     try std.testing.expectEqual(@as(usize, 2), temporal.unique_constraints.len);
     try std.testing.expectEqualStrings("usage_records_tenant_valid_key", temporal.unique_constraints[1].name);
     try std.testing.expectEqualStrings("valid_time", temporal.unique_constraints[1].without_overlaps_period.?);
-    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.unvalidated, temporal.unique_constraints[1].validation_state);
+    try std.testing.expectEqual(runtime_schema.UniqueConstraintValidationState.enforced, temporal.unique_constraints[1].validation_state);
     try std.testing.expectError(error.InvalidSqlCatalog, applyDdlPlanToRuntimeSchemaAlloc(alloc, temporal, add_temporal));
 
     var not_valid = try lowerDdlPlanForCatalogApplyTestAlloc(

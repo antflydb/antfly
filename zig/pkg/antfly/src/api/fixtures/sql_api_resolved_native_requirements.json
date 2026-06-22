@@ -55,11 +55,11 @@
     {
       "reason": "enforced_unique_conflict_target",
       "coverage": [
+        "schema_additive_unique_conflict_target",
         "schema_expression_unique_conflict_target",
         "schema_mixed_expression_unique_conflict_target",
         "schema_partial_unique_conflict_target",
-        "schema_unique_conflict_target",
-        "unsupported_unvalidated_unique_conflict_target"
+        "schema_unique_conflict_target"
       ]
     },
     {

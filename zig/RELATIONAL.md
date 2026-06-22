@@ -2297,8 +2297,12 @@ the corpus must retain `DO NOTHING RETURNING *`, guarded `DO UPDATE WHERE`,
 schema-bound unique, partial-unique, and expression-unique conflict targets, and
 named `ON CONFLICT ON CONSTRAINT` coverage for enforced partial and expression
 unique targets. Direct runtime-schema tests cover named primary-key and named
-column-unique targets. The corpus must also retain the unsupported
-duplicate-update-target and unvalidated-unique-target classifications.
+column-unique targets. `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE` without an
+explicit deferral or `NOT VALID` clause lowers to enforced unique metadata so
+the typed conflict-target resolver can use it immediately; explicitly deferred
+or unvalidated additions remain outside conflict-target binding until promoted.
+The corpus must also retain the unsupported duplicate-update-target
+classification.
 Catalog-bound entries must include setup SQL coverage and
 applied-schema fingerprints derived from the same typed catalog transition that
 the verifier executes. Stale hand-authored fingerprints are rejected even when
