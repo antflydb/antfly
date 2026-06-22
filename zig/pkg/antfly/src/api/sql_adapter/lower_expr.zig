@@ -19285,8 +19285,7 @@ pub fn peekParenthesizedNullTestProjection(tokens: []const Token, pos: usize) bo
     if (pos + 2 >= tokens.len) return false;
     return tokens[pos].kind == .lparen and
         tokens[pos + 1].kind == .identifier and
-        tokens[pos + 2].kind == .identifier and
-        std.ascii.eqlIgnoreCase(tokens[pos + 2].text, "is");
+        tokens[pos + 2].matchesKeywordTag(.is);
 }
 
 pub fn rowExpressionHasTopLevelPipeConcat(tokens: []const Token, pos: usize) bool {

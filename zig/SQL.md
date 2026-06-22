@@ -441,8 +441,8 @@ Current implementation status:
   parsed token predicates instead of raw SQL substring probes.
 - Expression predicate membership and boolean-start helpers also use keyword
   tags for `ANY`, `SOME`, `ALL`, `BETWEEN`, `IN`, `NOT`, `IS`, boolean atoms,
-  and tail conjunctions instead of maintaining local case-insensitive operator
-  scans.
+  quantifier matching, parenthesized null tests, and tail conjunctions instead
+  of maintaining local case-insensitive operator scans.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
