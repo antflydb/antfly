@@ -5010,10 +5010,16 @@ commit, and `RETURNING` projection use the same row-batch mutation machinery.
 Safe `BEFORE INSERT` SQL trigger hooks are applied before SQL row-batch commit,
 and SQL update/delete statements fail closed while table update/delete trigger
 execution still requires the shared preimage trigger path.
-Claimed update/delete sources, joined sources, recursive write sources, merge,
-and truncate writes should remain fail-closed until their SQL executor wiring
-can use the typed row-claim/session staging, side-table read, mutation-source,
-trigger, and 2PC paths already used by the public JSON endpoints. Prepared
+Claimed single-table update/delete sources now join the endpoint through the
+typed mutation-source path: SQL lowering creates the same typed source query and
+mutation request used by the JSON endpoint, the HTTP executor mints a SQL-owned
+row-claim transaction, table write sources stage through the ordinary
+owner-local mutation-source planner, and the SQL path autocommits or aborts the
+transaction before returning mutation-source `matched`/`staged` counts and
+`RETURNING` rows. Joined sources, recursive write sources, merge, and truncate
+writes should remain fail-closed until their SQL executor wiring can use the
+typed side-table read, joined mutation-source, trigger, catalog barrier, and
+2PC paths already used by native APIs. Prepared
 statements and cursors remain session state rather than REST resources;
 cursor-backed fetches and asynchronous `202` statement jobs are later protocol
 extensions once portal lifetime, page tokens, cancellation, result retention,

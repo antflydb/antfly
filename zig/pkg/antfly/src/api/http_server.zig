@@ -110,6 +110,7 @@ const ArdOpenApiSpec = struct {
 };
 
 pub const default_external_lake_serving_cache_max_bytes: usize = 64 * 1024 * 1024;
+var sql_mutation_txn_id_nonce: std.atomic.Value(u64) = .init(0);
 
 const TestSseEvent = struct {
     event: []const u8,
@@ -4817,6 +4818,100 @@ pub const ApiHttpServer = struct {
         return .{ .result = try rowsInsertSourceMutationResultAlloc(self.alloc, source_result.rows.len, rows_batch) };
     }
 
+    fn nextSqlMutationTxnId() db_mod.types.TxnId {
+        const nonce = sql_mutation_txn_id_nonce.fetchAdd(1, .monotonic);
+        var txn_id: db_mod.types.TxnId = undefined;
+        std.mem.writeInt(u64, txn_id[0..8], platform_time.realtimeNs(), .big);
+        std.mem.writeInt(u64, txn_id[8..16], nonce, .big);
+        return txn_id;
+    }
+
+    fn sqlMutationRowClaimAlloc(self: *ApiHttpServer, session: *sql_adapter.OwnedSqlCatalogSession) !db_mod.types.RowClaimRequest {
+        const session_id = self.ensureSqlProtocolSessionId(session);
+        return .{
+            .mode = .for_update,
+            .wait_policy = .wait,
+            .skip_locked = false,
+            .lease_ms = 30_000,
+            .owner_id = try std.fmt.allocPrint(self.alloc, "sql:{d}", .{session_id}),
+            .txn_id = nextSqlMutationTxnId(),
+        };
+    }
+
+    fn loweredWritePlanOwnsSqlMutationClaim(lowered: sql_adapter.LoweredWritePlan) bool {
+        return switch (lowered) {
+            .truncate_source,
+            .update_joined_source,
+            .delete_joined_source,
+            .recursive_update_joined_source,
+            .recursive_delete_joined_source,
+            => true,
+            else => false,
+        };
+    }
+
+    fn ensureNoPublicSqlMutationSourceTrigger(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        kind: db_mod.types.RelationalRowsMutationKind,
+    ) !void {
+        const event: sql_routines.TriggerEvent = switch (kind) {
+            .update => .update,
+            .delete => .delete,
+        };
+        var trigger = try self.rowsBatchTriggerForEventAlloc(table_name, event);
+        defer if (trigger) |*value| value.deinit(self.alloc);
+        if (trigger != null) return error.UnsupportedOperation;
+    }
+
+    fn applyLoweredPublicSqlMutationSource(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: *sql_adapter.LoweredMutationSource,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
+    } {
+        const source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
+            error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return err,
+        };
+
+        var filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (filter) |*value| value.deinit(self.alloc);
+        if (filter) |active| {
+            try self.applyRowsAuthFilterToQuery(target_schema, active, &lowered.mutation.req.source);
+        }
+
+        const result = (source.mutateRowsFromSourceAutocommit(
+            self.alloc,
+            target_table_name,
+            target_schema,
+            lowered.mutation.req,
+            lowered.sync_level,
+        ) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
+            error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
+            else => {
+                std.log.err("public sql mutation source failed table={s} err={}", .{ target_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        return .{ .result = result };
+    }
+
     fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -4829,7 +4924,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
         switch (statement_kind) {
-            .insert, .insert_source, .update, .delete => {},
+            .insert, .insert_source, .update, .update_source, .delete, .delete_source => {},
             else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
         }
 
@@ -4850,6 +4945,15 @@ pub const ApiHttpServer = struct {
         defer runtime_schema_mod.freeSchema(self.alloc, schema);
 
         var unique_resolver_ctx = RowsUniqueSelectorResolverContext{ .source = self.table_reads };
+        const sync_level = sql_adapter.sqlSyncLevelFromSession(session.session()) catch |err| switch (err) {
+            error.InvalidRoleSetting => return try textResponse(self.alloc, 400, "invalid sql setting"),
+        };
+        const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
+            .update, .update_source, .delete, .delete_source => try self.sqlMutationRowClaimAlloc(session),
+            else => null,
+        };
+        var row_claim_transferred = false;
+        defer if (!row_claim_transferred) if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
         var lowered = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc(
             self.alloc,
             &parsed_sql,
@@ -4857,6 +4961,8 @@ pub const ApiHttpServer = struct {
             &.{},
             .{
                 .unique_resolver = unique_resolver_ctx.resolver(),
+                .row_claim = row_claim,
+                .sync_level = sync_level,
             },
             self.catalogSource(),
         ) catch |err| switch (err) {
@@ -4866,6 +4972,7 @@ pub const ApiHttpServer = struct {
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
             else => return err,
         };
+        row_claim_transferred = loweredWritePlanOwnsSqlMutationClaim(lowered);
         defer lowered.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
@@ -4881,6 +4988,28 @@ pub const ApiHttpServer = struct {
                 self.ensureSqlProtocolSessionId(session),
                 @tagName(statement_kind),
                 insert_source_result,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
+
+        if (lowered == .update_source or lowered == .delete_source) {
+            const mutation_source = switch (lowered) {
+                .update_source => |*update_source| update_source,
+                .delete_source => |*delete_source| delete_source,
+                else => unreachable,
+            };
+            var mutation_source_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, mutation_source, authenticated_identity)) {
+                .failure => |failure| return failure,
+                .result => |result| result,
+            };
+            defer mutation_source_result.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsMutationSourceResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                mutation_source_result,
             );
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
@@ -24035,6 +24164,57 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("u1-copy", copied_row.get("id").?.string);
     try std.testing.expectEqualStrings("closed", copied_row.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 16), copied_row.get("amount").?.integer);
+
+    var update_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"UPDATE usage_records SET status = 'processed', amount = amount + 2 WHERE status = 'closed' ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED RETURNING id, status, amount;\"}",
+    });
+    defer update_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), update_source_resp.status);
+    var parsed_update_source = try std.json.parseFromSlice(std.json.Value, alloc, update_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_update_source.deinit();
+    try std.testing.expectEqualStrings("write", parsed_update_source.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("update_source", parsed_update_source.value.object.get("statement_kind").?.string);
+    const update_source_result = parsed_update_source.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), update_source_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), update_source_result.get("staged").?.integer);
+    const update_source_row = update_source_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1-copy", update_source_row.get("id").?.string);
+    try std.testing.expectEqualStrings("processed", update_source_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 18), update_source_row.get("amount").?.integer);
+
+    var delete_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"DELETE FROM usage_records WHERE status = 'processed' FOR UPDATE RETURNING id, status;\"}",
+    });
+    defer delete_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), delete_source_resp.status);
+    var parsed_delete_source = try std.json.parseFromSlice(std.json.Value, alloc, delete_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_delete_source.deinit();
+    try std.testing.expectEqualStrings("write", parsed_delete_source.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("delete_source", parsed_delete_source.value.object.get("statement_kind").?.string);
+    const delete_source_result = parsed_delete_source.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), delete_source_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), delete_source_result.get("staged").?.integer);
+    const delete_source_row = delete_source_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("u1-copy", delete_source_row.get("id").?.string);
+    try std.testing.expectEqualStrings("processed", delete_source_row.get("status").?.string);
+
+    var deleted_source_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE id = 'u1-copy';\"}",
+    });
+    defer deleted_source_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), deleted_source_query_resp.status);
+    var parsed_deleted_source_query = try std.json.parseFromSlice(std.json.Value, alloc, deleted_source_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_deleted_source_query.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_deleted_source_query.value.object.get("result").?.object.get("total").?.integer);
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {

@@ -155,11 +155,14 @@ target row filters, and returning the mutation-source `matched`/`staged` counts
 plus `RETURNING` rows. Safe `BEFORE INSERT` SQL trigger hooks run before the
 SQL-lowered row batch reaches row filters or commit; SQL update/delete
 statements fail closed when table update/delete triggers are present until
-their executor can share the preimage trigger path. Claimed update/delete
-sources, joined sources, recursive write sources, merge, and truncate writes
-remain fail-closed until their SQL executor wiring can share the native
-row-claim, session staging, side-table read, mutation-source, trigger, and 2PC
-paths.
+their executor can share the preimage trigger path. Claimed single-table
+update/delete sources now lower into typed mutation-source requests, mint a SQL
+row-claim transaction, execute through the same owner-local mutation-source
+planner/stager, commit the staged intents, and return mutation-source
+`matched`/`staged` counts plus `RETURNING` rows. Joined sources, recursive write
+sources, merge, and truncate writes remain fail-closed until their SQL executor
+wiring can share the native side-table read, joined mutation-source, trigger,
+catalog barrier, and 2PC paths.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
