@@ -164,9 +164,13 @@ update/delete sources (`UPDATE ... FROM` and `DELETE ... USING`) use the same
 typed path: SQL executes the side-table read as a row plan, feeds the materialized
 source rows into the joined mutation-source planner/stager, and autocommits or
 aborts the SQL-owned row-claim transaction before returning mutation-source
-counts and `RETURNING` rows. Recursive write sources, merge, and truncate writes
-remain fail-closed until their SQL executor wiring can share the native
-recursive materialization, trigger, catalog barrier, and 2PC paths.
+counts and `RETURNING` rows. Plain single-table `TRUNCATE` uses the typed
+table-emptying mutation-source path with the SQL-owned row claim; multi-table
+truncate, `CASCADE`, and `RESTART IDENTITY` remain fail-closed until their
+executor wiring can share the native cross-table catalog barrier, identity
+allocator, and 2PC paths. Recursive write sources and merge writes remain
+fail-closed until their SQL executor wiring can share the native recursive
+materialization, trigger, catalog barrier, and 2PC paths.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable

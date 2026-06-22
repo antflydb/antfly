@@ -5020,10 +5020,13 @@ transaction before returning mutation-source `matched`/`staged` counts and
 and `DELETE ... USING`) also join the endpoint through typed side-table reads and
 the native joined mutation-source planner/stager, with the SQL executor
 autocommitting or aborting the row-claim transaction around the staged joined
-mutation. Recursive write sources, merge, and truncate writes should remain
-fail-closed until their SQL executor wiring can use the native recursive
-materialization, trigger, catalog barrier, and 2PC paths already used by native
-APIs. Prepared
+mutation. Single-table `TRUNCATE` joins the endpoint through the same typed
+table-emptying mutation-source path; multi-table truncate, `CASCADE`, and
+`RESTART IDENTITY` should remain fail-closed until their SQL executor wiring can
+use native cross-table catalog barriers, identity allocator reset work, and 2PC.
+Recursive write sources and merge writes should remain fail-closed until their
+SQL executor wiring can use the native recursive materialization, trigger,
+catalog barrier, and 2PC paths already used by native APIs. Prepared
 statements and cursors remain session state rather than REST resources;
 cursor-backed fetches and asynchronous `202` statement jobs are later protocol
 extensions once portal lifetime, page tokens, cancellation, result retention,

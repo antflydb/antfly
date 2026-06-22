@@ -4838,14 +4838,6 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    fn loweredWritePlanOwnsSqlMutationClaim(lowered: sql_adapter.LoweredWritePlan) bool {
-        return switch (lowered) {
-            .truncate_source,
-            => true,
-            else => false,
-        };
-    }
-
     fn ensureNoPublicSqlMutationSourceTrigger(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -5037,7 +5029,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
         switch (statement_kind) {
-            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source => {},
+            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => {},
             else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
         }
 
@@ -5062,11 +5054,10 @@ pub const ApiHttpServer = struct {
             error.InvalidRoleSetting => return try textResponse(self.alloc, 400, "invalid sql setting"),
         };
         const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
-            .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source => try self.sqlMutationRowClaimAlloc(session),
+            .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source, .truncate => try self.sqlMutationRowClaimAlloc(session),
             else => null,
         };
-        var row_claim_transferred = false;
-        defer if (!row_claim_transferred) if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
+        defer if (row_claim) |claim| if (claim.owner_id.len > 0) self.alloc.free(claim.owner_id);
         var lowered = sql_adapter.lowerWritePlanWithCatalogParsedSqlAlloc(
             self.alloc,
             &parsed_sql,
@@ -5085,7 +5076,6 @@ pub const ApiHttpServer = struct {
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
             else => return err,
         };
-        row_claim_transferred = loweredWritePlanOwnsSqlMutationClaim(lowered);
         defer lowered.deinit(self.alloc);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
@@ -5123,6 +5113,26 @@ pub const ApiHttpServer = struct {
                 self.ensureSqlProtocolSessionId(session),
                 @tagName(statement_kind),
                 mutation_source_result,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
+
+        if (lowered == .truncate_source) {
+            if (lowered.truncate_source.additional_table_names.len != 0 or lowered.truncate_source.truncate_cascade or lowered.truncate_source.restart_identity) {
+                return try textResponse(self.alloc, 501, "unsupported sql statement");
+            }
+            var truncate_result = switch (try self.applyLoweredPublicSqlMutationSource(target_table, schema, &lowered.truncate_source, authenticated_identity)) {
+                .failure => |failure| return failure,
+                .result => |result| result,
+            };
+            defer truncate_result.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsMutationSourceResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                truncate_result,
             );
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
@@ -24410,6 +24420,52 @@ test "api http server executes SQL point writes through typed row batch ingress"
     var parsed_deleted_joined_source_query = try std.json.parseFromSlice(std.json.Value, alloc, deleted_joined_source_query_resp.body, .{ .allocate = .alloc_always });
     defer parsed_deleted_joined_source_query.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_deleted_joined_source_query.value.object.get("result").?.object.get("total").?.integer);
+
+    var truncate_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('truncate-a', 'drop', 1), ('truncate-b', 'drop', 2);\"}",
+    });
+    defer truncate_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), truncate_seed_resp.status);
+
+    var truncate_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"TRUNCATE usage_records;\"}",
+    });
+    defer truncate_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), truncate_resp.status);
+    var parsed_truncate = try std.json.parseFromSlice(std.json.Value, alloc, truncate_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_truncate.deinit();
+    try std.testing.expectEqualStrings("write", parsed_truncate.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("truncate", parsed_truncate.value.object.get("statement_kind").?.string);
+    const truncate_result = parsed_truncate.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 3), truncate_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), truncate_result.get("staged").?.integer);
+
+    var truncated_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records;\"}",
+    });
+    defer truncated_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), truncated_query_resp.status);
+    var parsed_truncated_query = try std.json.parseFromSlice(std.json.Value, alloc, truncated_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_truncated_query.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_truncated_query.value.object.get("result").?.object.get("total").?.integer);
+
+    var truncate_cascade_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"TRUNCATE usage_records CASCADE;\"}",
+    });
+    defer truncate_cascade_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), truncate_cascade_resp.status);
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {
