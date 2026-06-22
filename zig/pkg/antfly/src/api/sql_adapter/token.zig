@@ -132,6 +132,7 @@ pub const TokenKeyword = enum {
     name,
     no,
     not,
+    nothing,
     null,
     nullif,
     of,

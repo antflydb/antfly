@@ -7516,8 +7516,8 @@ pub const AppParityCorpusCoverage = struct {
             (entry.family == .update_joined_source and sql_adapter.planHasNonZeroToken(entry.plan, ":json_set_expr="));
         self.point_update_jsonb = self.point_update_jsonb or (entry.family == .update and appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_"));
         self.point_update_jsonb_concat = self.point_update_jsonb_concat or (entry.family == .update and
-            std.mem.indexOf(u8, entry.sql, "metadata ||") != null and
-            std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
+            appParityTokensHaveIdentifier(sql_tokens, "metadata") and
+            appParityTokensHaveKind(sql_tokens, .pipe_concat) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.point_update_array = self.point_update_array or (entry.family == .update and appParityTokensHaveIdentifierPrefix(sql_tokens, "array_"));
         self.write_plan_insert_op_set = self.write_plan_insert_op_set or (entry.family == .insert and sql_adapter.planHasNonZeroToken(entry.plan, ":op_set="));
@@ -9323,65 +9323,90 @@ pub const AppParityCorpusCoverage = struct {
             }
         }
         if (uses_insert_conflict) {
-            self.conflict_do_update = self.conflict_do_update or (std.mem.indexOf(u8, entry.sql, "DO UPDATE") != null and sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
-            self.conflict_default_update = self.conflict_default_update or std.mem.indexOf(u8, entry.sql, "SET status = DEFAULT") != null;
+            self.conflict_do_update = self.conflict_do_update or (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update }) and sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
+            self.conflict_default_update = self.conflict_default_update or (appParityTokensHaveKeyword(sql_tokens, .set) and
+                appParityTokensHaveIdentifier(sql_tokens, "status") and
+                appParityTokensHaveKeyword(sql_tokens, .default) and
+                sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_coalesce_existing_update = self.conflict_coalesce_existing_update or
-                std.mem.indexOf(u8, entry.sql, "coalesce(excluded.") != null;
+                appParityTokensHaveFunctionCall(sql_tokens, "coalesce") and
+                    appParityTokensHaveIdentifierPrefix(sql_tokens, "excluded.");
             self.conflict_numeric_expression_update = self.conflict_numeric_expression_update or
-                std.mem.indexOf(u8, entry.sql, "greatest(amount, excluded.amount") != null;
+                appParityTokensHaveFunctionCall(sql_tokens, "greatest") and
+                    appParityTokensHaveIdentifier(sql_tokens, "amount") and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.amount");
             self.conflict_case_expression_update = self.conflict_case_expression_update or
-                std.mem.indexOf(u8, entry.sql, "CASE WHEN excluded.amount > amount") != null;
+                appParityTokensHaveKeyword(sql_tokens, .case) and
+                    appParityTokensHaveKeyword(sql_tokens, .when) and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.amount") and
+                    appParityTokensHaveIdentifier(sql_tokens, "amount");
             self.conflict_current_timestamp_precision = self.conflict_current_timestamp_precision or
-                std.mem.indexOf(u8, entry.sql, "CURRENT_TIMESTAMP(6)") != null;
+                appParityTokensHaveFunctionCall(sql_tokens, "current_timestamp");
             self.conflict_current_date_update = self.conflict_current_date_update or
-                std.mem.indexOf(u8, entry.sql, "CURRENT_DATE") != null;
+                appParityTokensHaveIdentifier(sql_tokens, "current_date");
             self.conflict_uuid_generation_update = self.conflict_uuid_generation_update or
-                std.mem.indexOf(u8, entry.sql, "uuid_generate_v4()") != null or
-                std.mem.indexOf(u8, entry.sql, "gen_random_uuid()") != null;
+                appParityTokensHaveFunctionCall(sql_tokens, "uuid_generate_v4") or
+                appParityTokensHaveFunctionCall(sql_tokens, "gen_random_uuid");
             self.conflict_text_expression_update = self.conflict_text_expression_update or
-                std.mem.indexOf(u8, entry.sql, "length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "char_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "character_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "octet_length(excluded.next_status)") != null or
-                std.mem.indexOf(u8, entry.sql, "bit_length(excluded.next_status)") != null;
+                (appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
+                    (appParityTokensHaveFunctionCall(sql_tokens, "length") or
+                        appParityTokensHaveFunctionCall(sql_tokens, "char_length") or
+                        appParityTokensHaveFunctionCall(sql_tokens, "character_length") or
+                        appParityTokensHaveFunctionCall(sql_tokens, "octet_length") or
+                        appParityTokensHaveFunctionCall(sql_tokens, "bit_length")));
             self.conflict_octet_length_expression_update = self.conflict_octet_length_expression_update or
-                std.mem.indexOf(u8, entry.sql, "octet_length(excluded.next_status)") != null;
+                appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "octet_length");
             self.conflict_bit_length_expression_update = self.conflict_bit_length_expression_update or
-                std.mem.indexOf(u8, entry.sql, "bit_length(excluded.next_status)") != null;
+                appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "bit_length");
             self.conflict_regexp_replace_expression_update = self.conflict_regexp_replace_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_replace(excluded.status") != null and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace") and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_match_expression_update = self.conflict_regexp_match_expression_update or
-                (std.mem.indexOf(u8, entry.sql, "regexp_like(excluded.status") != null or
-                    std.mem.indexOf(u8, entry.sql, "regexp_match(excluded.status") != null) and
+                (appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") or
+                    appParityTokensHaveFunctionCall(sql_tokens, "regexp_match")) and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_count_expression_update = self.conflict_regexp_count_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_count(excluded.status") != null and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_instr_expression_update = self.conflict_regexp_instr_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_instr(excluded.status") != null and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_substr_expression_update = self.conflict_regexp_substr_expression_update or
-                std.mem.indexOf(u8, entry.sql, "regexp_substr(excluded.status") != null and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_nested_text_expression_update = self.conflict_nested_text_expression_update or
-                std.mem.indexOf(u8, entry.sql, "length(lower(excluded.next_status || '-' || status))") != null or
-                std.mem.indexOf(u8, entry.sql, "char_length(lower(excluded.next_status || '-' || status))") != null or
-                std.mem.indexOf(u8, entry.sql, "character_length(lower(excluded.next_status || '-' || status))") != null;
-            self.conflict_jsonb_update = self.conflict_jsonb_update or std.mem.indexOf(u8, entry.sql, "jsonb") != null;
+                (appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
+                    appParityTokensHaveKind(sql_tokens, .pipe_concat) and
+                    appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+                    (appParityTokensHaveFunctionCall(sql_tokens, "length") or
+                        appParityTokensHaveFunctionCall(sql_tokens, "char_length") or
+                        appParityTokensHaveFunctionCall(sql_tokens, "character_length")));
+            self.conflict_jsonb_update = self.conflict_jsonb_update or
+                appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_") or
+                appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") or
+                (appParityTokensHaveIdentifier(sql_tokens, "metadata") and
+                    appParityTokensHaveKind(sql_tokens, .pipe_concat) and
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
             self.conflict_jsonb_concat_update = self.conflict_jsonb_concat_update or
-                std.mem.indexOf(u8, entry.sql, "metadata ||") != null and
-                    std.mem.indexOf(u8, entry.sql, "::jsonb") != null and
+                appParityTokensHaveIdentifier(sql_tokens, "metadata") and
+                    appParityTokensHaveKind(sql_tokens, .pipe_concat) and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":ops=");
-            self.multi_row_conflict_do_nothing = self.multi_row_conflict_do_nothing or (uses_multi_row_insert and std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null);
+            self.multi_row_conflict_do_nothing = self.multi_row_conflict_do_nothing or (uses_multi_row_insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }));
             self.multi_row_conflict_do_nothing_duplicate_target = self.multi_row_conflict_do_nothing_duplicate_target or (uses_multi_row_insert and
                 entry.resolver_exists == false and
-                std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }) and
                 sql_adapter.writePlanHasCounts(entry.plan, 1, 0));
             self.conflict_returning_expression = self.conflict_returning_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=");
             self.conflict_do_nothing_returning_all = self.conflict_do_nothing_returning_all or (uses_returning_all and
                 sql_adapter.writePlanHasCounts(entry.plan, 0, 0) and
-                std.mem.indexOf(u8, entry.sql, "DO NOTHING") != null);
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }));
             self.conflict_guard_where = self.conflict_guard_where or uses_conflict_where;
             self.conflict_guard_where_skip = self.conflict_guard_where_skip or (uses_conflict_where and
                 sql_adapter.writePlanHasCounts(entry.plan, 0, 0) and
@@ -9391,22 +9416,34 @@ pub const AppParityCorpusCoverage = struct {
             self.conflict_mixed_interval_update = self.conflict_mixed_interval_update or
                 std.mem.indexOf(u8, entry.sql, "INTERVAL '1 month 1 day'") != null;
             self.conflict_date_bin_update = self.conflict_date_bin_update or
-                (std.mem.indexOf(u8, entry.sql, "date_bin(") != null and
-                    std.mem.indexOf(u8, entry.sql, "DO UPDATE SET") != null and
+                (appParityTokensHaveFunctionCall(sql_tokens, "date_bin") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update, .set }) and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_typed_datetime_literal_update = self.conflict_typed_datetime_literal_update or
-                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET updated_at_ns = TIMESTAMPTZ ") != null and
+                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update, .set }) and
+                    appParityTokensHaveIdentifier(sql_tokens, "updated_at_ns") and
+                    appParityTokensHaveIdentifier(sql_tokens, "timestamptz") and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_row_assignment = self.conflict_row_assignment or
-                std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null;
+                appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+                    appParityTokensHaveIdentifier(sql_tokens, "status") and
+                    appParityTokensHaveIdentifier(sql_tokens, "quantity");
             self.conflict_row_assignment_default = self.conflict_row_assignment_default or
-                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null and
-                    std.mem.indexOf(u8, entry.sql, "DEFAULT") != null);
+                (appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+                    appParityTokensHaveIdentifier(sql_tokens, "status") and
+                    appParityTokensHaveIdentifier(sql_tokens, "quantity") and
+                    appParityTokensHaveKeyword(sql_tokens, .default));
             self.conflict_row_assignment_constructor = self.conflict_row_assignment_constructor or
-                (std.mem.indexOf(u8, entry.sql, "DO UPDATE SET (status, quantity)") != null and
-                    std.mem.indexOf(u8, entry.sql, " = ROW(") != null);
+                (appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+                    appParityTokensHaveIdentifier(sql_tokens, "status") and
+                    appParityTokensHaveIdentifier(sql_tokens, "quantity") and
+                    appParityTokensHaveFunctionCall(sql_tokens, "row"));
             self.conflict_boolean_expression_update = self.conflict_boolean_expression_update or
-                std.mem.indexOf(u8, entry.sql, "SET enabled = excluded.enabled OR false") != null;
+                appParityTokensHaveKeyword(sql_tokens, .set) and
+                    appParityTokensHaveIdentifier(sql_tokens, "enabled") and
+                    appParityTokensHaveIdentifier(sql_tokens, "excluded.enabled") and
+                    appParityTokensHaveKeyword(sql_tokens, .@"or") and
+                    appParityTokensHaveKeyword(sql_tokens, .false);
             self.schema_default_primary_named_conflict_target = self.schema_default_primary_named_conflict_target or
                 std.mem.indexOf(u8, entry.sql, "ON CONFLICT ON CONSTRAINT usage_records_pkey") != null;
             self.schema_custom_primary_named_conflict_target = self.schema_custom_primary_named_conflict_target or
@@ -9444,10 +9481,10 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasNonZeroToken(entry.plan, ":assignment_expr="));
         self.insert_source_regexp_expression_assignment = self.insert_source_regexp_expression_assignment or
             (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.sql, "regexp_like(status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_substr(status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_count(status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_instr(status") != null and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_pred=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":assignment_expr=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
@@ -9467,20 +9504,23 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.insert_source_conflict_default_update = self.insert_source_conflict_default_update or
             (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.sql, "SET status = DEFAULT") != null and
+                appParityTokensHaveKeyword(sql_tokens, .set) and
+                appParityTokensHaveIdentifier(sql_tokens, "status") and
+                appParityTokensHaveKeyword(sql_tokens, .default) and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_ops="));
         self.insert_source_conflict_json_set_expression = self.insert_source_conflict_json_set_expression or
             (entry.family == .insert_source and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_json_set_expr="));
         self.insert_source_conflict_regexp_expression = self.insert_source_conflict_regexp_expression or
             (entry.family == .insert_source and
-                std.mem.indexOf(u8, entry.sql, "regexp_substr(excluded.status") != null and
-                std.mem.indexOf(u8, entry.sql, "regexp_count(excluded.status") != null and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+                appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+                appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_patch_expr="));
         self.insert_source_conflict_boolean_is_not_guard = self.insert_source_conflict_boolean_is_not_guard or
             (entry.family == .insert_source and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_where_any=") and
-                std.mem.indexOf(u8, entry.sql, " IS NOT TRUE") != null);
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }));
         self.joined_source_cross_table_source_schema = self.joined_source_cross_table_source_schema or
             ((entry.family == .update_joined_source or entry.family == .delete_joined_source) and
                 appParityEntryHasCatalogSchemas(entry) and

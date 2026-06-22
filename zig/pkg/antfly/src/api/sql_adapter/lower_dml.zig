@@ -343,9 +343,9 @@ pub fn conflictExpressionOperandStartAt(tokens: []const Token, pos: usize) Confl
     if (lower_expr.peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
     if (conflictExpressionStartAt(tokens, pos) != null) return .expression;
     if (parser.peekKind(tokens, pos, .identifier) and
-        !parser.peekKeyword(tokens, pos, "null") and
-        !parser.peekKeyword(tokens, pos, "true") and
-        !parser.peekKeyword(tokens, pos, "false"))
+        !parser.peekKeywordTag(tokens, pos, .null) and
+        !parser.peekKeywordTag(tokens, pos, .true) and
+        !parser.peekKeywordTag(tokens, pos, .false))
     {
         return .field_or_json_extract;
     }
@@ -5954,7 +5954,7 @@ pub fn parseMergeArmConditionAlloc(
     if (parseMergeArmPredicateAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table, allow_target, params, realtime_ns)) |predicate| {
         var predicate_transferred = false;
         errdefer if (!predicate_transferred) freeMergeArmPredicateValue(alloc, predicate);
-        if (parser.peekKeyword(tokens, pos.*, "or")) {
+        if (parser.peekKeywordTag(tokens, pos.*, .@"or")) {
             freeMergeArmPredicateValue(alloc, predicate);
             predicate_transferred = true;
             pos.* = checkpoint;
@@ -6237,7 +6237,7 @@ pub fn mergeParenthesizedExpressionOrWhereCanStart(tokens: []const Token, pos: u
 }
 
 pub fn mergeCanParseExpressionNotWhere(tokens: []const Token, pos: usize) bool {
-    if (!parser.peekKeyword(tokens, pos, "not") or pos + 2 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
+    if (!parser.peekKeywordTag(tokens, pos, .not) or pos + 2 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
     const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos + 1);
     return lower_expr.expressionPredicateCanStartAt(tokens, inner);
 }
@@ -10562,10 +10562,10 @@ pub fn canParseJoinedAssignmentExpression(
     if (assignmentExpressionKeywordCanStartAt(tokens, pos, false)) return true;
     if (tokens[pos].kind == .lparen) return true;
     if (tokens[pos].kind != .identifier or
-        keywordAt(tokens, pos, "default") or
-        keywordAt(tokens, pos, "null") or
-        keywordAt(tokens, pos, "true") or
-        keywordAt(tokens, pos, "false"))
+        keywordTagAt(tokens, pos, .default) or
+        keywordTagAt(tokens, pos, .null) or
+        keywordTagAt(tokens, pos, .true) or
+        keywordTagAt(tokens, pos, .false))
     {
         return false;
     }
@@ -10614,10 +10614,10 @@ pub fn canParseConflictAssignmentExpression(
     if (assignmentExpressionKeywordCanStartAt(tokens, pos, true)) return true;
     if (tokens[pos].kind == .lparen) return true;
     if (tokens[pos].kind != .identifier or
-        keywordAt(tokens, pos, "default") or
-        keywordAt(tokens, pos, "null") or
-        keywordAt(tokens, pos, "true") or
-        keywordAt(tokens, pos, "false"))
+        keywordTagAt(tokens, pos, .default) or
+        keywordTagAt(tokens, pos, .null) or
+        keywordTagAt(tokens, pos, .true) or
+        keywordTagAt(tokens, pos, .false))
     {
         return false;
     }
@@ -10674,7 +10674,7 @@ fn singleJoinedBooleanExpressionCanStartAt(
     if (index >= tokens.len) return false;
     const token = tokens[index];
     if (token.kind != .identifier) return false;
-    if (booleanKeywordCanStart(token.text)) return true;
+    if (booleanKeywordCanStart(token)) return true;
     if (lower_expr.identifierContainsQualifier(token.text)) {
         const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
         const qualifier = token.text[0..dot];
@@ -10718,7 +10718,7 @@ fn singleConflictBooleanExpressionCanStartAt(
     if (index >= tokens.len) return false;
     const token = tokens[index];
     if (token.kind != .identifier) return false;
-    if (booleanKeywordCanStart(token.text)) return true;
+    if (booleanKeywordCanStart(token)) return true;
     if (std.mem.startsWith(u8, token.text, "excluded.")) {
         const field = token.text["excluded.".len..];
         const source_column = binder.relationalColumnForField(schema, field, .boolean) orelse return false;
@@ -10729,9 +10729,9 @@ fn singleConflictBooleanExpressionCanStartAt(
 }
 
 fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, include_md5: bool) bool {
-    return keywordAt(tokens, pos, "case") or
-        keywordAt(tokens, pos, "cast") or
-        keywordAt(tokens, pos, "coalesce") or
+    return keywordTagAt(tokens, pos, .case) or
+        keywordTagAt(tokens, pos, .cast) or
+        keywordTagAt(tokens, pos, .coalesce) or
         keywordAt(tokens, pos, "lower") or
         keywordAt(tokens, pos, "upper") or
         lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsInitcapFunction) or
@@ -10746,7 +10746,7 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
         lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsTranslateFunction) or
         keywordAt(tokens, pos, "concat") or
         keywordAt(tokens, pos, "concat_ws") or
-        keywordAt(tokens, pos, "nullif") or
+        keywordTagAt(tokens, pos, .nullif) or
         lower_expr.peekTextLengthFunctionKeyword(tokens, pos) or
         lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsAsciiFunction) or
         lower_expr.peekFunctionCallIf(tokens, pos, lower_expr.sqlKeywordIsChrFunction) or
@@ -10872,15 +10872,19 @@ fn scanBareBooleanExpressionTail(tokens: []const Token, pos: usize) BareBooleanS
     return .{ .saw_boolean_syntax = saw_boolean_syntax, .saw_token = saw_token };
 }
 
-fn booleanKeywordCanStart(text: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(text, "not") or
-        std.ascii.eqlIgnoreCase(text, "true") or
-        std.ascii.eqlIgnoreCase(text, "false") or
-        std.ascii.eqlIgnoreCase(text, "case") or
-        std.ascii.eqlIgnoreCase(text, "cast") or
-        std.ascii.eqlIgnoreCase(text, "coalesce") or
-        std.ascii.eqlIgnoreCase(text, "nullif") or
-        lower_expr.sqlKeywordIsStartsWithFunction(text);
+fn booleanKeywordCanStart(token: Token) bool {
+    return token.matchesKeywordTag(.not) or
+        token.matchesKeywordTag(.true) or
+        token.matchesKeywordTag(.false) or
+        token.matchesKeywordTag(.case) or
+        token.matchesKeywordTag(.cast) or
+        token.matchesKeywordTag(.coalesce) or
+        token.matchesKeywordTag(.nullif) or
+        lower_expr.sqlKeywordIsStartsWithFunction(token.text);
+}
+
+fn keywordTagAt(tokens: []const Token, pos: usize, keyword: parser.TokenKeyword) bool {
+    return pos < tokens.len and tokens[pos].matchesKeywordTag(keyword);
 }
 
 fn keywordAt(tokens: []const Token, pos: usize, keyword: []const u8) bool {
@@ -10888,14 +10892,14 @@ fn keywordAt(tokens: []const Token, pos: usize, keyword: []const u8) bool {
 }
 
 pub fn conflictParenthesizedConjunctionCanStart(tokens: []const Token, pos: usize) bool {
-    return conflictParenthesizedKeywordCanStart(tokens, pos, "and");
+    return conflictParenthesizedKeywordCanStart(tokens, pos, .@"and");
 }
 
 pub fn conflictParenthesizedDisjunctionCanStart(tokens: []const Token, pos: usize) bool {
-    return conflictParenthesizedKeywordCanStart(tokens, pos, "or");
+    return conflictParenthesizedKeywordCanStart(tokens, pos, .@"or");
 }
 
-fn conflictParenthesizedKeywordCanStart(tokens: []const Token, pos: usize, keyword: []const u8) bool {
+fn conflictParenthesizedKeywordCanStart(tokens: []const Token, pos: usize, keyword: parser.TokenKeyword) bool {
     if (pos >= tokens.len or tokens[pos].kind != .lparen) return false;
 
     var depth: usize = 0;
@@ -10909,7 +10913,7 @@ fn conflictParenthesizedKeywordCanStart(tokens: []const Token, pos: usize, keywo
                 depth -= 1;
                 if (depth == 0) return false;
             },
-            .identifier => if (depth == 1 and std.ascii.eqlIgnoreCase(token.text, keyword)) return true,
+            .identifier => if (depth == 1 and token.matchesKeywordTag(keyword)) return true,
             .semicolon => if (depth == 0) return false,
             else => {},
         }

@@ -443,6 +443,13 @@ Current implementation status:
   tags for `ANY`, `SOME`, `ALL`, `BETWEEN`, `IN`, `NOT`, `IS`, boolean atoms,
   quantifier matching, parenthesized null tests, and tail conjunctions instead
   of maintaining local case-insensitive operator scans.
+- DML conflict, assignment, and merge expression-start helpers share the same
+  keyword metadata for boolean atoms, `DEFAULT`, `NOT`, `OR`, and
+  parenthesized conjunction/disjunction probes.
+- Conflict-update and insert-source conflict coverage checks now use parsed SQL
+  tokens for function calls, keyword sequences, JSONB concatenation, row
+  assignment, boolean update, and regex expression buckets instead of raw SQL
+  substring probes.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
