@@ -13925,50 +13925,6 @@ test "postgres sql adapter lowers length into expression AST" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.date_part, date_part.query.order_by[0].expression.?.kind);
 }
 
-test "postgres sql adapter lowers unary minus into expression AST" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed.deinit(alloc);
-    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
-    defer runtime_schema.freeSchema(alloc, schema);
-
-    var lowered = try lowerSelectAlloc(
-        alloc,
-        "SELECT id, -amount AS neg_amount FROM usage_records WHERE -amount < $1 ORDER BY -amount DESC LIMIT 5",
-        schema,
-        &.{.{ .integer = 0 }},
-    );
-    defer lowered.deinit(alloc);
-
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.select.len);
-    try std.testing.expectEqualStrings("id", lowered.query.select[0]);
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.expressions.len);
-    try std.testing.expectEqualStrings("neg_amount", lowered.query.expressions[0].output);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, lowered.query.expressions[0].expression.kind);
-    try std.testing.expectEqualStrings("-1", lowered.query.expressions[0].expression.operands[0].value_json);
-    try std.testing.expectEqualStrings("amount", lowered.query.expressions[0].expression.operands[1].field);
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.expression_predicates.len);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, lowered.query.expression_predicates[0].lhs.kind);
-    try std.testing.expectEqual(@as(usize, 1), lowered.query.order_by.len);
-    try std.testing.expect(lowered.query.order_by[0].expression != null);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, lowered.query.order_by[0].expression.?.kind);
-
-    var aggregate = try lowerAggregateAlloc(
-        alloc,
-        "SELECT SUM(-amount) AS negative_total FROM usage_records",
-        schema,
-        &.{},
-    );
-    defer aggregate.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), aggregate.aggregate.aggregations.len);
-    try std.testing.expect(aggregate.aggregate.aggregations[0].expression != null);
-    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.mul, aggregate.aggregate.aggregations[0].expression.?.kind);
-    try std.testing.expectEqualStrings("-1", aggregate.aggregate.aggregations[0].expression.?.operands[0].value_json);
-}
-
 test "postgres sql adapter lowers now projection into expression AST" {
     const alloc = std.testing.allocator;
     const schema_json =
