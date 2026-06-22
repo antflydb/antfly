@@ -637,7 +637,9 @@ Current implementation status:
   explicit exact-token and suffix-token modes instead of open-coded substring
   searches. Lateral and window expression coverage checks now use emitted plan
   tokens rather than matching SQL spelling. Fixture parameter coverage now uses
-  `ParsedSql` placeholder tokens instead of a separate raw SQL byte scanner.
+  `ParsedSql` placeholder tokens instead of a separate raw SQL byte scanner,
+  and resolver-hint metadata validates `ON CONFLICT` from parsed statement
+  tokens instead of spinning up a hidden tokenizer from fixture SQL.
   Corpus feature coverage parses entries once and uses SQL tokens for query
   function, conflict, multi-row insert, computed-pattern, JSONB, array, and UUID
   coverage checks instead of raw substring probes. More corpus coverage buckets,

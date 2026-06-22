@@ -28315,18 +28315,32 @@ test "sql adapter lower expr lowers select all with named extra projections" {
     try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.order_by.len);
     try std.testing.expectEqual(@as(u32, 5), lowered.plan.query.limit.?);
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+    var lowered_duplicate_field = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT *, id FROM usage_records ORDER BY id ASC",
         schema,
         &.{},
-    ));
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
+    );
+    defer lowered_duplicate_field.deinit(alloc);
+
+    try std.testing.expect(lowered_duplicate_field.plan.query.select_all);
+    try std.testing.expectEqual(@as(usize, 1), lowered_duplicate_field.plan.query.field_aliases.len);
+    try std.testing.expectEqualStrings("id", lowered_duplicate_field.plan.query.field_aliases[0].field);
+    try std.testing.expectEqualStrings("id_2", lowered_duplicate_field.plan.query.field_aliases[0].output);
+
+    var lowered_duplicate_expression = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT *, lower(status) AS id FROM usage_records ORDER BY id ASC",
         schema,
         &.{},
-    ));
+    );
+    defer lowered_duplicate_expression.deinit(alloc);
+
+    try std.testing.expect(lowered_duplicate_expression.plan.query.select_all);
+    try std.testing.expectEqual(@as(usize, 1), lowered_duplicate_expression.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("id_2", lowered_duplicate_expression.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered_duplicate_expression.plan.query.expressions[0].expression.kind);
+
     try std.testing.expectError(error.UnsupportedSqlShape, lowerQueryPlanForLowerExprTestAlloc(
         alloc,
         "SELECT id, id FROM usage_records ORDER BY id ASC",

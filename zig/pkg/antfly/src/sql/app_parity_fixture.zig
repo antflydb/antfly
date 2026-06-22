@@ -130,7 +130,7 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     seen_names: *std.StringHashMapUnmanaged(void),
     callbacks: AppParityFixtureMetadataCallbacks,
 ) !void {
-    try corpus.validateFixtureMetadataCore(entry);
+    try corpus.validateFixtureMetadataCore(alloc, entry);
     if (!(try corpus.corpusFixtureSqlParameterCoverageMatchesAlloc(alloc, entry))) return error.TestUnexpectedResult;
     var owned_applied_base_schema_json: ?[]u8 = null;
     defer if (owned_applied_base_schema_json) |schema_json| alloc.free(schema_json);

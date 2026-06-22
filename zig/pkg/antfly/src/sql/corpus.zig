@@ -1412,7 +1412,7 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         const entry = try parseFixtureEntryAlloc(alloc, entry_value);
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
-        try validateSourceCorpusEntryMetadata(entry);
+        try validateSourceCorpusEntryMetadata(alloc, entry);
         try validateSourceCorpusEntryJsonPayloads(alloc, entry);
         try seen_names.put(alloc, entry.name, {});
         try entries.append(alloc, entry);
@@ -2736,7 +2736,7 @@ const AppParityCorpusMetadataMode = enum {
     generated_fixture,
 };
 
-fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpusMetadataMode) !void {
+fn validateCorpusMetadataCore(alloc: std.mem.Allocator, entry: AppParityCorpusEntry, mode: AppParityCorpusMetadataMode) !void {
     if (entry.name.len == 0 or entry.sql.len == 0 or entry.plan.len == 0) return error.TestUnexpectedResult;
     if (!corpusPlanMatchesFamily(entry.family, entry.plan)) return error.TestUnexpectedResult;
     if (corpusFixtureFamilyNeedsReason(entry.family) and entry.classification_reason.len == 0) {
@@ -2940,7 +2940,7 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
     if (has_resolver_hint and !corpusFixtureFamilyAllowsResolverHint(entry.family)) return error.TestUnexpectedResult;
     if (has_resolver_hint and
         (entry.family == .insert or entry.family == .invalid_insert or entry.family == .unsupported_insert) and
-        !corpusSqlHasOnConflictTokens(entry.sql))
+        !try corpusSqlHasOnConflictParsedSqlAlloc(alloc, entry.sql))
     {
         return error.TestUnexpectedResult;
     }
@@ -2960,21 +2960,22 @@ fn validateCorpusMetadataCore(entry: AppParityCorpusEntry, mode: AppParityCorpus
     }
 }
 
-pub fn validateSourceCorpusEntryMetadata(entry: AppParityCorpusEntry) !void {
-    return validateCorpusMetadataCore(entry, .source);
+pub fn validateSourceCorpusEntryMetadata(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
+    return validateCorpusMetadataCore(alloc, entry, .source);
 }
 
-pub fn validateFixtureMetadataCore(entry: AppParityCorpusEntry) !void {
-    return validateCorpusMetadataCore(entry, .generated_fixture);
+pub fn validateFixtureMetadataCore(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
+    return validateCorpusMetadataCore(alloc, entry, .generated_fixture);
 }
 
-fn corpusSqlHasOnConflictTokens(sql: []const u8) bool {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var tokenized_sql = tokenized.TokenizedSql.initAlloc(alloc, sql) catch return false;
-    defer tokenized_sql.deinit(alloc);
-    return appParityTokensHaveKeywordSequence(tokenized_sql.items(), &.{ .on, .conflict });
+fn corpusSqlHasOnConflictParsedSqlAlloc(alloc: std.mem.Allocator, sql: []const u8) !bool {
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, sql) catch return false;
+    defer parsed_sql.deinit(alloc);
+    return corpusParsedSqlHasOnConflictTokens(&parsed_sql);
+}
+
+fn corpusParsedSqlHasOnConflictTokens(parsed_sql: *const tokenized.ParsedSql) bool {
+    return appParityTokensHaveKeywordSequence(parsed_sql.items(), &.{ .on, .conflict });
 }
 
 fn validateSourceCorpusEntryJsonPayloads(alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
@@ -6091,7 +6092,7 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(.{ .name = "insert conflict", .family = .insert, .plan = "insert:table=usage_records:conflict_where=1", .sql = "INSERT INTO usage_records VALUES ('1') ON CONFLICT (id) WHERE status = 'active' DO NOTHING" }));
     try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(.{ .name = "insert source conflict", .family = .insert_source, .plan = "insert_source:table=usage_records:conflict_where=1", .sql = "INSERT INTO usage_records SELECT * FROM usage_sources ON CONFLICT (id) WHERE status = 'active' DO NOTHING" }));
     try std.testing.expect(!corpusFixtureAllowsConflictWhereSummary(.{ .name = "delete source conflict", .family = .delete_source, .plan = "delete_source:table=usage_records:source_pred=1", .sql = "DELETE FROM usage_records WHERE status = 'closed'" }));
-    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(.{
+    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(std.testing.allocator, .{
         .name = "delete source conflict summary",
         .family = .delete_source,
         .summary = .{ .table_name = "usage_records", .conflict_where = true },
@@ -10139,21 +10140,23 @@ pub const AppParityCorpusCoverage = struct {
 };
 
 test "sql adapter corpus validates fixture metadata core policy" {
-    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(.{
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(alloc, .{
         .name = "missing table summary",
         .sql = "SELECT id FROM usage_records",
         .family = .query,
         .plan = "query:table=usage_records:select=1",
     }));
 
-    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(.{
+    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(alloc, .{
         .name = "unsupported without reason",
         .sql = "SELECT id FROM usage_records FOR SHARE",
         .family = .unsupported_read,
         .plan = "unsupported:read:requires=lock_mode",
     }));
 
-    try validateFixtureMetadataCore(.{
+    try validateFixtureMetadataCore(alloc, .{
         .name = "valid query",
         .sql = "SELECT id FROM usage_records WHERE tenant_id = $1",
         .family = .query,
@@ -10162,7 +10165,7 @@ test "sql adapter corpus validates fixture metadata core policy" {
         .params = &.{.{ .string = "tenant-a" }},
     });
 
-    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(.{
+    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(alloc, .{
         .name = "returning rows on source write",
         .sql = "INSERT INTO usage_records SELECT * FROM staged RETURNING id",
         .family = .insert_source,
@@ -10170,6 +10173,28 @@ test "sql adapter corpus validates fixture metadata core policy" {
         .plan = "insert_source:table=usage_records:source_table=staged:assignments=1:returning=1:returning_expr=0:returning_all=0",
         .returning_rows = &.{"{\"id\":\"u1\"}"},
     }));
+
+    try std.testing.expectError(error.TestUnexpectedResult, validateFixtureMetadataCore(alloc, .{
+        .name = "resolver hint without conflict",
+        .sql = "INSERT INTO usage_records (id) VALUES ('u1')",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+        .resolver_row_json = "{\"id\":\"u1\"}",
+        .resolver_version = 7,
+        .resolver_exists = true,
+    }));
+
+    try validateFixtureMetadataCore(alloc, .{
+        .name = "resolver hint with parsed conflict",
+        .sql = "INSERT INTO usage_records (id) VALUES ('u1') ON CONFLICT (id) DO NOTHING",
+        .family = .insert,
+        .summary = .{ .table_name = "usage_records" },
+        .plan = "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0",
+        .resolver_row_json = "{\"id\":\"u1\"}",
+        .resolver_version = 7,
+        .resolver_exists = true,
+    });
 }
 
 test "sql adapter corpus owns ddl applied-plan fixture policy" {
