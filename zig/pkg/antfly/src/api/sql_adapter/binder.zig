@@ -993,12 +993,6 @@ const CteSourceBinding = struct {
     }
 };
 
-pub fn insertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try insertSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
-}
-
 pub fn insertSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
     switch (parsed_sql.statement) {
         .write => |statement| {
@@ -1014,12 +1008,6 @@ fn insertSourceTableNamesFromTokensAlloc(alloc: std.mem.Allocator, tokens: []con
     if (tokens[0].matchesKeywordTag(.with)) return try insertSourceTableNamesFromWithAlloc(alloc, tokens);
     if (!tokens[0].matchesKeywordTag(.insert)) return null;
     return try insertSourceTableNamesFromInsertAlloc(alloc, tokens, 0);
-}
-
-pub fn recursiveInsertSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try recursiveInsertSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
 }
 
 pub fn recursiveInsertSourceTableNamesFromParsedSqlAlloc(
@@ -1076,12 +1064,6 @@ fn recursiveInsertSourceTableNamesFromTokensAlloc(
         .target = target,
         .source = source,
     };
-}
-
-pub fn joinedWriteSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?InsertSourceTableNames {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
 }
 
 pub fn joinedWriteSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?InsertSourceTableNames {
@@ -1456,12 +1438,6 @@ fn joinedWriteSourceTableNamesFromWithAlloc(
     return final;
 }
 
-pub fn readSourceTableNamesAlloc(alloc: std.mem.Allocator, sql: []const u8) !?ReadSourceTableNames {
-    var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
-    defer parsed_sql.deinit(alloc);
-    return try readSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql);
-}
-
 pub fn readSourceTableNamesFromParsedSqlAlloc(alloc: std.mem.Allocator, parsed_sql: *const tokenized.ParsedSql) !?ReadSourceTableNames {
     switch (parsed_sql.statement) {
         .read => {},
@@ -1830,18 +1806,22 @@ test "sql adapter binder resolves runtime schema from catalog table name" {
 test "sql adapter binder resolves read source tables through non recursive ctes" {
     const alloc = std.testing.allocator;
 
-    var joined = (try readSourceTableNamesAlloc(
+    var joined_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "WITH open_orders AS (SELECT id, tenant, customer_id FROM usage_records), active_customers AS (SELECT id, tenant, name FROM customer_records) SELECT o.id, c.name FROM open_orders AS o LEFT JOIN active_customers AS c ON o.tenant = c.tenant",
-    )).?;
+    );
+    defer joined_sql.deinit(alloc);
+    var joined = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &joined_sql)).?;
     defer joined.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", joined.left);
     try std.testing.expectEqualStrings("customer_records", joined.source);
 
-    var lateral = (try readSourceTableNamesAlloc(
+    var lateral_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "WITH orgs AS (SELECT id FROM usage_records), balances AS (SELECT organization_id, amount FROM balance_records) SELECT org.id, latest.amount FROM orgs AS org LEFT JOIN LATERAL (SELECT amount FROM balances AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true",
-    )).?;
+    );
+    defer lateral_sql.deinit(alloc);
+    var lateral = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &lateral_sql)).?;
     defer lateral.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", lateral.left);
     try std.testing.expectEqualStrings("balance_records", lateral.source);
@@ -2088,12 +2068,14 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
 
 test "sql adapter binder rejects ambiguous physical cte read source tables" {
     const alloc = std.testing.allocator;
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH mixed AS (SELECT o.id FROM orders AS o JOIN customers AS c ON o.customer_id = c.id) SELECT mixed.id, s.id FROM mixed JOIN shipments AS s ON mixed.id = s.order_id",
+    );
+    defer parsed_sql.deinit(alloc);
     try std.testing.expectError(
         error.UnsupportedSqlShape,
-        readSourceTableNamesAlloc(
-            alloc,
-            "WITH mixed AS (SELECT o.id FROM orders AS o JOIN customers AS c ON o.customer_id = c.id) SELECT mixed.id, s.id FROM mixed JOIN shipments AS s ON mixed.id = s.order_id",
-        ),
+        readSourceTableNamesFromParsedSqlAlloc(alloc, &parsed_sql),
     );
 }
 

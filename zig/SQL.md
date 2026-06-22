@@ -634,6 +634,8 @@ Current implementation status:
 - Catalog read/write lowering contexts now bind `ParsedSql` into
   `BoundSqlStatement` explicitly before lowering; the exported lowerer helper
   consumes a real bound statement rather than a parsed statement plus catalog.
+- Binder structural table-source helpers no longer expose raw SQL wrapper
+  entrypoints; tests and facade exports use parsed helper variants directly.
 - Numeric string-cast validation stays allocation-free and does not parse JSON
   during lexing; broader JSON literal parsing remains deferred to semantic
   lowerers that actually need typed JSON.
