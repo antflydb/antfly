@@ -5007,6 +5007,9 @@ same row-batch transaction path, and returning the normal row-batch counts plus
 source side executes as a typed row-read plan with CTE and row-filter handling,
 then the insert assignments, conflict policy, target row filters, transaction
 commit, and `RETURNING` projection use the same row-batch mutation machinery.
+Safe `BEFORE INSERT` SQL trigger hooks are applied before SQL row-batch commit,
+and SQL update/delete statements fail closed while table update/delete trigger
+execution still requires the shared preimage trigger path.
 Claimed update/delete sources, joined sources, recursive write sources, merge,
 and truncate writes should remain fail-closed until their SQL executor wiring
 can use the typed row-claim/session staging, side-table read, mutation-source,

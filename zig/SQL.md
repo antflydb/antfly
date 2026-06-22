@@ -152,10 +152,14 @@ rows APIs. Non-recursive `INSERT ... SELECT` executes through the typed
 insert-source path by reading the source side through the row-plan executor,
 building a typed row batch from insert assignments and conflict policy, applying
 target row filters, and returning the mutation-source `matched`/`staged` counts
-plus `RETURNING` rows. Claimed update/delete sources, joined sources, recursive
-write sources, merge, and truncate writes remain fail-closed until their SQL
-executor wiring can share the native row-claim, session staging, side-table
-read, mutation-source, trigger, and 2PC paths.
+plus `RETURNING` rows. Safe `BEFORE INSERT` SQL trigger hooks run before the
+SQL-lowered row batch reaches row filters or commit; SQL update/delete
+statements fail closed when table update/delete triggers are present until
+their executor can share the preimage trigger path. Claimed update/delete
+sources, joined sources, recursive write sources, merge, and truncate writes
+remain fail-closed until their SQL executor wiring can share the native
+row-claim, session staging, side-table read, mutation-source, trigger, and 2PC
+paths.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
@@ -812,6 +816,9 @@ Current implementation status:
   words, datetime literal prefixes, current-time keywords, UUID functions, and
   interval literals; semantic string values such as encodings and interval
   units remain ordinary value comparisons.
+- SQL plan parsing uses token keyword tags for CTE heads, set/read result-tail
+  clauses, recursive CTE member joins, and final recursive SELECT detection;
+  semantic output and source-name comparisons remain ordinary name matching.
 - SQL/API parity fixture callbacks receive the already parsed corpus statement
   when deriving applied DDL fingerprints, so generated-fixture and metadata
   validation paths do not re-tokenize the statement after ingress parsing.

@@ -4542,14 +4542,20 @@ pub const ApiHttpServer = struct {
         self: *ApiHttpServer,
         table_name: []const u8,
         schema: runtime_schema_mod.TableSchema,
-        rows_batch: relational_rows_api.OwnedRowsBatchRequest,
+        rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !?http_common.HttpResponse {
         const source = self.table_writes orelse return try textResponse(self.alloc, 404, "not found");
 
+        self.applyLoweredPublicSqlRowsBatchBeforeTriggers(table_name, schema, rows_batch) catch |err| switch (err) {
+            error.InvalidRowsRequest, error.RoutineBodyNotExecutable, error.RoutineNotFound => return try textResponse(self.alloc, 400, "invalid sql write"),
+            error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
+            else => return err,
+        };
+
         if (rows_batch.writes.len == 0 and rows_batch.deletes.len == 0 and rows_batch.transforms.len == 0 and rows_batch.predicates.len == 0) return null;
 
-        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(tables_api.default_database_name, table_name, null, rows_batch, authenticated_identity) catch |err| switch (err) {
+        self.requireRowsBatchSatisfiesEffectiveFilterForDatabase(tables_api.default_database_name, table_name, null, rows_batch.*, authenticated_identity) catch |err| switch (err) {
             error.PermissionDenied => return try textResponse(self.alloc, 403, "row filter rejected sql write"),
             else => return err,
         };
@@ -4604,11 +4610,129 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    fn applyLoweredPublicSqlRowsBatchBeforeTriggers(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        schema: runtime_schema_mod.TableSchema,
+        rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
+    ) !void {
+        var insert_trigger = try self.rowsBatchTriggerForEventAlloc(table_name, .insert);
+        defer if (insert_trigger) |*trigger| trigger.deinit(self.alloc);
+        var update_trigger = try self.rowsBatchTriggerForEventAlloc(table_name, .update);
+        defer if (update_trigger) |*trigger| trigger.deinit(self.alloc);
+        var delete_trigger = try self.rowsBatchTriggerForEventAlloc(table_name, .delete);
+        defer if (delete_trigger) |*trigger| trigger.deinit(self.alloc);
+
+        if (update_trigger != null and rows_batch.transforms.len != 0) return error.UnsupportedOperation;
+        if (delete_trigger != null and rows_batch.deletes.len != 0) return error.UnsupportedOperation;
+        if (insert_trigger == null or rows_batch.writes.len == 0) return;
+        if (rows_batch.transforms.len != 0 or rows_batch.deletes.len != 0 or rows_batch.relational_identity_rewrites.len != 0) return error.UnsupportedOperation;
+        if (rows_batch.predicates.len != rows_batch.writes.len) return error.UnsupportedOperation;
+        if (rows_batch.returning_rows.len != 0 and rows_batch.returning_rows.len != rows_batch.writes.len) return error.UnsupportedOperation;
+
+        try self.applyLoweredPublicSqlRowsBatchBeforeInsertTrigger(table_name, schema, insert_trigger.?, rows_batch);
+    }
+
+    fn applyLoweredPublicSqlRowsBatchBeforeInsertTrigger(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        schema: runtime_schema_mod.TableSchema,
+        insert_trigger: RowsBatchTrigger,
+        rows_batch: *relational_rows_api.OwnedRowsBatchRequest,
+    ) !void {
+        _ = table_name;
+        var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
+        var predicates = std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate).empty;
+        var returning_rows = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer {
+            for (writes.items) |write| {
+                self.alloc.free(@constCast(write.key));
+                self.alloc.free(@constCast(write.value));
+            }
+            writes.deinit(self.alloc);
+            for (predicates.items) |predicate| self.alloc.free(@constCast(predicate.key));
+            predicates.deinit(self.alloc);
+            for (returning_rows.items) |row| self.alloc.free(@constCast(row));
+            returning_rows.deinit(self.alloc);
+        }
+
+        for (rows_batch.writes, 0..) |write, i| {
+            const triggered_row = try self.sql_routine_runtime.executeTriggerRoutineAlloc(self.alloc, insert_trigger.function_name, write.value, null);
+            defer self.alloc.free(triggered_row);
+            var parsed_triggered = std.json.parseFromSlice(std.json.Value, self.alloc, triggered_row, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+            defer parsed_triggered.deinit();
+            if (parsed_triggered.value == .null) continue;
+            if (parsed_triggered.value != .object) return error.InvalidRowsRequest;
+
+            const key = try relational_rows_api.physicalPrimaryKeyFromRowJsonAlloc(self.alloc, schema, triggered_row);
+            var key_transferred = false;
+            errdefer if (!key_transferred) self.alloc.free(key);
+            const value = try self.alloc.dupe(u8, triggered_row);
+            var value_transferred = false;
+            errdefer if (!value_transferred) self.alloc.free(value);
+            try writes.append(self.alloc, .{ .key = key, .value = value });
+            key_transferred = true;
+            value_transferred = true;
+
+            const predicate_key = try self.alloc.dupe(u8, key);
+            var predicate_key_transferred = false;
+            errdefer if (!predicate_key_transferred) self.alloc.free(predicate_key);
+            try predicates.append(self.alloc, .{
+                .key = predicate_key,
+                .expected_version = rows_batch.predicates[i].expected_version,
+            });
+            predicate_key_transferred = true;
+
+            if (rows_batch.returning_rows.len != 0) {
+                const returning_row = try self.alloc.dupe(u8, rows_batch.returning_rows[i]);
+                var returning_row_transferred = false;
+                errdefer if (!returning_row_transferred) self.alloc.free(returning_row);
+                try returning_rows.append(self.alloc, returning_row);
+                returning_row_transferred = true;
+            }
+        }
+
+        const writes_slice = try writes.toOwnedSlice(self.alloc);
+        errdefer {
+            for (writes_slice) |write| {
+                self.alloc.free(@constCast(write.key));
+                self.alloc.free(@constCast(write.value));
+            }
+            if (writes_slice.len > 0) self.alloc.free(writes_slice);
+        }
+        const predicates_slice = try predicates.toOwnedSlice(self.alloc);
+        errdefer {
+            for (predicates_slice) |predicate| self.alloc.free(@constCast(predicate.key));
+            if (predicates_slice.len > 0) self.alloc.free(predicates_slice);
+        }
+        const returning_rows_slice = try returning_rows.toOwnedSlice(self.alloc);
+        errdefer {
+            for (returning_rows_slice) |row| self.alloc.free(@constCast(row));
+            if (returning_rows_slice.len > 0) self.alloc.free(returning_rows_slice);
+        }
+
+        var triggered_req = relational_rows_api.OwnedRowsBatchRequest{
+            .writes = writes_slice,
+            .predicates = predicates_slice,
+            .returning_rows = returning_rows_slice,
+            .req = .{
+                .writes = writes_slice,
+                .predicates = predicates_slice,
+                .timestamp_ns = rows_batch.req.timestamp_ns,
+                .sync_level = rows_batch.req.sync_level,
+            },
+            .inserted = @intCast(writes_slice.len),
+        };
+        errdefer triggered_req.deinit(self.alloc);
+        rows_batch.deinit(self.alloc);
+        rows_batch.* = triggered_req;
+    }
+
     fn applyLoweredPublicSqlInsertSource(
         self: *ApiHttpServer,
         target_table_name: []const u8,
         target_schema: runtime_schema_mod.TableSchema,
-        lowered: sql_adapter.LoweredInsertSource,
+        lowered: *sql_adapter.LoweredInsertSource,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !union(enum) {
         failure: http_common.HttpResponse,
@@ -4689,7 +4813,7 @@ pub const ApiHttpServer = struct {
         defer rows_batch.deinit(self.alloc);
         rows_batch.req.sync_level = lowered.sync_level;
 
-        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, rows_batch, authenticated_identity)) |failure| return .{ .failure = failure };
+        if (try self.applyLoweredPublicSqlRowsBatch(target_table_name, target_schema, &rows_batch, authenticated_identity)) |failure| return .{ .failure = failure };
         return .{ .result = try rowsInsertSourceMutationResultAlloc(self.alloc, source_result.rows.len, rows_batch) };
     }
 
@@ -4746,7 +4870,7 @@ pub const ApiHttpServer = struct {
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         if (lowered == .insert_source) {
-            var insert_source_result = switch (try self.applyLoweredPublicSqlInsertSource(target_table, schema, lowered.insert_source, authenticated_identity)) {
+            var insert_source_result = switch (try self.applyLoweredPublicSqlInsertSource(target_table, schema, &lowered.insert_source, authenticated_identity)) {
                 .failure => |failure| return failure,
                 .result => |result| result,
             };
@@ -4763,9 +4887,9 @@ pub const ApiHttpServer = struct {
         }
 
         const rows_batch = switch (lowered) {
-            .insert => |insert| insert.batch,
-            .update => |update| update.batch,
-            .delete => |delete| delete.batch,
+            .insert => |*insert| &insert.batch,
+            .update => |*update| &update.batch,
+            .delete => |*delete| &delete.batch,
             else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
         };
         if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, rows_batch, authenticated_identity)) |failure| return failure;
@@ -4774,7 +4898,7 @@ pub const ApiHttpServer = struct {
         const response_body = try self.encodePublicSqlRowsBatchResultAlloc(
             self.ensureSqlProtocolSessionId(session),
             @tagName(statement_kind),
-            rows_batch,
+            rows_batch.*,
         );
         defer self.alloc.free(response_body);
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
@@ -23911,6 +24035,162 @@ test "api http server executes SQL point writes through typed row batch ingress"
     try std.testing.expectEqualStrings("u1-copy", copied_row.get("id").?.string);
     try std.testing.expectEqualStrings("closed", copied_row.get("status").?.string);
     try std.testing.expectEqual(@as(i64, 16), copied_row.get("amount").?.integer);
+}
+
+test "api http server applies SQL row triggers to public SQL writes" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-sql-write-triggers", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("events", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("events", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "events",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+    var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    defer session.deinit(alloc);
+
+    var baseline_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO events (id, status) VALUES ('evt-existing', 'open') RETURNING id;\"}",
+    });
+    defer baseline_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), baseline_resp.status);
+
+    var created_insert_function = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION skip_event_insert() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
+        &session,
+    );
+    defer created_insert_function.deinit(alloc);
+    var created_insert_trigger = try server.applyRelationalSqlDdlWithSession(
+        "CREATE TRIGGER skip_event_insert BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION skip_event_insert();",
+        &session,
+    );
+    defer created_insert_trigger.deinit(alloc);
+
+    var skipped_insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO events (id, status) VALUES ('evt-skipped', 'new') RETURNING id;\"}",
+    });
+    defer skipped_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), skipped_insert_resp.status);
+    var parsed_skipped_insert = try std.json.parseFromSlice(std.json.Value, alloc, skipped_insert_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_skipped_insert.deinit();
+    const skipped_result = parsed_skipped_insert.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 0), skipped_result.get("inserted").?.integer);
+    if (skipped_result.get("returning")) |returning| {
+        try std.testing.expectEqual(@as(usize, 0), returning.array.items.len);
+    }
+
+    var created_update_function = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION keep_event_update_old() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
+        &session,
+    );
+    defer created_update_function.deinit(alloc);
+    var created_update_trigger = try server.applyRelationalSqlDdlWithSession(
+        "CREATE TRIGGER keep_event_update_old BEFORE UPDATE ON events FOR EACH ROW EXECUTE FUNCTION keep_event_update_old();",
+        &session,
+    );
+    defer created_update_trigger.deinit(alloc);
+
+    var update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"UPDATE events SET status = 'closed' WHERE id = 'evt-existing' RETURNING id, status;\"}",
+    });
+    defer update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), update_resp.status);
+
+    var created_delete_function = try server.applyRelationalSqlDdlWithSession(
+        "CREATE FUNCTION skip_event_delete() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
+        &session,
+    );
+    defer created_delete_function.deinit(alloc);
+    var created_delete_trigger = try server.applyRelationalSqlDdlWithSession(
+        "CREATE TRIGGER skip_event_delete BEFORE DELETE ON events FOR EACH ROW EXECUTE FUNCTION skip_event_delete();",
+        &session,
+    );
+    defer created_delete_trigger.deinit(alloc);
+
+    var delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"DELETE FROM events WHERE id = 'evt-existing' RETURNING id;\"}",
+    });
+    defer delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 501), delete_resp.status);
+
+    var query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id, status FROM events ORDER BY id ASC;\"}",
+    });
+    defer query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_query.deinit();
+    const result = parsed_query.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), result.get("total").?.integer);
+    const row = result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("evt-existing", row.get("id").?.string);
+    try std.testing.expectEqualStrings("open", row.get("status").?.string);
 }
 
 test "api http server executes SQL notification channel plans through native runtime" {

@@ -1116,7 +1116,7 @@ pub fn parseCtesForPlanAlloc(
     hooks: CteSelectParserHooks,
 ) ![]const db_mod.types.RelationalRowsCte {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("with");
+    try cursor.expectKeywordTag(.with);
     var ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
     errdefer {
         for (ctes.items) |cte| {
@@ -1133,7 +1133,7 @@ pub fn parseCtesForPlanAlloc(
         if (findCteByName(ctes.items, cte_name) != null) return error.UnsupportedSqlShape;
         const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
         defer strings.freeStringSlice(alloc, cte_column_aliases);
-        try cursor.expectKeyword("as");
+        try cursor.expectKeywordTag(.as);
         try parser.consumeCteMaterializationHint(tokens, pos);
         try cursor.expectToken(.lparen);
         const close_index = (parser.findMatchingRParenAfterOpenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape);
@@ -1243,7 +1243,7 @@ pub fn parseWindowPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: WindowPlanParserHooks,
 ) !LoweredWindowPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) {
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) {
         var lowered = try parseWindowWithCtes(hooks, &.{});
         errdefer lowered.deinit(alloc);
         var base_table_name: ?[]const u8 = null;
@@ -1285,7 +1285,7 @@ pub fn parseAggregatePlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: AggregatePlanParserHooks,
 ) !LoweredAggregatePlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) {
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) {
         var lowered = try parseAggregateWithCtes(hooks, &.{});
         errdefer lowered.deinit(alloc);
         var base_table_name: ?[]const u8 = null;
@@ -1343,7 +1343,7 @@ pub fn parseLateralPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: LateralPlanParserHooks,
 ) !LoweredLateralPlan {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseLateralWithCtes(hooks, &.{});
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) return try parseLateralWithCtes(hooks, &.{});
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
@@ -1369,7 +1369,7 @@ pub fn parseJoinPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: JoinPlanParserHooks,
 ) !LoweredJoin {
-    if (!parser.peekKeyword(tokens, pos.*, "with")) return try parseJoinWithCtes(hooks, &.{});
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) return try parseJoinWithCtes(hooks, &.{});
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
@@ -1413,17 +1413,17 @@ pub fn parseSimpleSelectSetResultTailAlloc(
     };
 
     while (!parser.atEnd(tokens, pos.*)) {
-        if (parser.matchKeyword(tokens, pos, "order")) {
+        if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (order_by.items.len > 0) return error.UnsupportedSqlShape;
-            try parser.expectKeyword(tokens, pos, "by");
+            try parser.expectKeywordTag(tokens, pos, .by);
             try hooks.parse_order_by(hooks.ptr, &order_by, select);
-        } else if (parser.matchKeyword(tokens, pos, "limit")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
             lowered.query.limit = try value_mod.parseLimitValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "offset")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (lowered.query.offset != 0) return error.UnsupportedSqlShape;
             lowered.query.offset = try value_mod.parseOffsetValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "fetch")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (lowered.query.limit != null) return error.UnsupportedSqlShape;
             lowered.query.limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
@@ -1465,20 +1465,20 @@ pub fn parseSetOperationResultTailAlloc(
     var offset: u32 = 0;
 
     while (!parser.atEnd(tokens, pos.*)) {
-        if (parser.matchKeyword(tokens, pos, "order")) {
+        if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (order_by.items.len > 0) return error.UnsupportedSqlShape;
-            try parser.expectKeyword(tokens, pos, "by");
+            try parser.expectKeywordTag(tokens, pos, .by);
             try hooks.parse_order_by(hooks.ptr, &order_by, select);
             for (order_by.items) |order| {
                 if (order.expression != null) return error.UnsupportedSqlShape;
             }
-        } else if (parser.matchKeyword(tokens, pos, "limit")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (limit != null) return error.UnsupportedSqlShape;
             limit = try value_mod.parseLimitValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "offset")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .offset)) {
             if (offset != 0) return error.UnsupportedSqlShape;
             offset = try value_mod.parseOffsetValue(tokens, pos, params);
-        } else if (parser.matchKeyword(tokens, pos, "fetch")) {
+        } else if (parser.matchKeywordTag(tokens, pos, .fetch)) {
             if (limit != null) return error.UnsupportedSqlShape;
             limit = try value_mod.parseFetchLimitValue(tokens, pos, params);
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
@@ -1503,7 +1503,7 @@ pub fn parseSetOperationPlanAlloc(
     allow_distinct_table_names: bool,
     hooks: SetOperationParserHooks,
 ) !LoweredSetOperationPlan {
-    if (parser.peekKeyword(tokens, pos.*, "with")) return error.UnsupportedSqlShape;
+    if (parser.peekKeywordTag(tokens, pos.*, .with)) return error.UnsupportedSqlShape;
 
     var left = try parseSetOperationSelectWithContext(hooks, null, true, null);
     errdefer left.deinit(alloc);
@@ -1638,22 +1638,22 @@ pub fn parseRecursiveCteMemberPlanAlloc(
     hooks: RecursiveCteMemberParserHooks,
 ) !LoweredRecursiveCteMemberPlan {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("select");
+    try cursor.expectKeywordTag(.select);
     const projection_start = pos.*;
-    const from_index = parser.findTopLevelKeywordFromIndex(tokens, projection_start, "from") orelse return error.UnsupportedSqlShape;
+    const from_index = parser.findTopLevelKeywordTagFromIndex(tokens, projection_start, .from) orelse return error.UnsupportedSqlShape;
     pos.* = from_index;
 
-    try cursor.expectKeyword("from");
+    try cursor.expectKeywordTag(.from);
     const left_table = try parseTableAliasAlloc(alloc, tokens, pos);
     defer freeTableAlias(alloc, left_table);
 
-    const join_type: db_mod.types.RelationalRowsJoinType = if (parser.matchKeyword(tokens, pos, "left")) blk: {
-        _ = parser.matchKeyword(tokens, pos, "outer");
-        try cursor.expectKeyword("join");
+    const join_type: db_mod.types.RelationalRowsJoinType = if (parser.matchKeywordTag(tokens, pos, .left)) blk: {
+        _ = parser.matchKeywordTag(tokens, pos, .outer);
+        try cursor.expectKeywordTag(.join);
         break :blk .left;
     } else blk: {
-        _ = parser.matchKeyword(tokens, pos, "inner");
-        try cursor.expectKeyword("join");
+        _ = parser.matchKeywordTag(tokens, pos, .inner);
+        try cursor.expectKeywordTag(.join);
         break :blk .inner;
     };
     const right_table = try parseTableAliasAlloc(alloc, tokens, pos);
@@ -1682,7 +1682,7 @@ pub fn parseRecursiveCteMemberPlanAlloc(
     );
     errdefer freeExpressionProjections(alloc, projections);
 
-    try cursor.expectKeyword("on");
+    try cursor.expectKeywordTag(.on);
     const on = try hooks.parse_join_on(
         hooks.ptr,
         tokens,
@@ -1761,7 +1761,7 @@ pub fn parseRecursiveCtePlanAlloc(
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchToken(.comma) != null) return error.UnsupportedSqlShape;
 
-    if (!cursor.peekKeyword("select")) return error.UnsupportedSqlShape;
+    if (!cursor.peekKeywordTag(.select)) return error.UnsupportedSqlShape;
     if (!tokensContainTopLevelSourceName(tokens[pos.*..], recursive.cte_name)) return error.UnsupportedSqlShape;
 
     const final_ctes = [_]db_mod.types.RelationalRowsCte{.{
@@ -1795,8 +1795,8 @@ pub fn parseRecursiveCteProducerAlloc(
     hooks: RecursiveCteParserHooks,
 ) !LoweredRecursiveCtePlan {
     const cursor = parser.Cursor.init(tokens, pos);
-    try cursor.expectKeyword("with");
-    try cursor.expectKeyword("recursive");
+    try cursor.expectKeywordTag(.with);
+    try cursor.expectKeywordTag(.recursive);
 
     const cte_name = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var cte_name_transferred = false;
@@ -1804,7 +1804,7 @@ pub fn parseRecursiveCteProducerAlloc(
 
     const cte_column_aliases = try grammar.parseOptionalCteColumnAliasesAlloc(alloc, tokens, pos);
     defer strings.freeStringSlice(alloc, cte_column_aliases);
-    try cursor.expectKeyword("as");
+    try cursor.expectKeywordTag(.as);
     try parser.consumeCteMaterializationHint(tokens, pos);
     try cursor.expectToken(.lparen);
 

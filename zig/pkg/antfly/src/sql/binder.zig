@@ -1493,8 +1493,10 @@ fn selectReadTableNamesAlloc(
             left_transferred = true;
             return .{ .left = left, .source = source };
         }
+        const source = try alloc.dupe(u8, left);
+        errdefer alloc.free(source);
         left_transferred = true;
-        return .{ .left = left };
+        return .{ .left = left, .source = source };
     };
     var source_index = join_index + 1;
     if (consumeKeyword(tokens, &source_index, .lateral)) {
@@ -1805,6 +1807,16 @@ test "sql adapter binder resolves runtime schema from catalog table name" {
 
 test "sql adapter binder resolves read source tables through non recursive ctes" {
     const alloc = std.testing.allocator;
+
+    var single_table_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open'",
+    );
+    defer single_table_sql.deinit(alloc);
+    var single_table = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &single_table_sql)).?;
+    defer single_table.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", single_table.left);
+    try std.testing.expectEqualStrings("usage_records", single_table.source);
 
     var joined_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
