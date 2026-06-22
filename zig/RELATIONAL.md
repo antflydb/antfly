@@ -5016,10 +5016,14 @@ mutation request used by the JSON endpoint, the HTTP executor mints a SQL-owned
 row-claim transaction, table write sources stage through the ordinary
 owner-local mutation-source planner, and the SQL path autocommits or aborts the
 transaction before returning mutation-source `matched`/`staged` counts and
-`RETURNING` rows. Joined sources, recursive write sources, merge, and truncate
-writes should remain fail-closed until their SQL executor wiring can use the
-typed side-table read, joined mutation-source, trigger, catalog barrier, and
-2PC paths already used by native APIs. Prepared
+`RETURNING` rows. Non-recursive joined update/delete sources (`UPDATE ... FROM`
+and `DELETE ... USING`) also join the endpoint through typed side-table reads and
+the native joined mutation-source planner/stager, with the SQL executor
+autocommitting or aborting the row-claim transaction around the staged joined
+mutation. Recursive write sources, merge, and truncate writes should remain
+fail-closed until their SQL executor wiring can use the native recursive
+materialization, trigger, catalog barrier, and 2PC paths already used by native
+APIs. Prepared
 statements and cursors remain session state rather than REST resources;
 cursor-backed fetches and asynchronous `202` statement jobs are later protocol
 extensions once portal lifetime, page tokens, cancellation, result retention,

@@ -4841,10 +4841,6 @@ pub const ApiHttpServer = struct {
     fn loweredWritePlanOwnsSqlMutationClaim(lowered: sql_adapter.LoweredWritePlan) bool {
         return switch (lowered) {
             .truncate_source,
-            .update_joined_source,
-            .delete_joined_source,
-            .recursive_update_joined_source,
-            .recursive_delete_joined_source,
             => true,
             else => false,
         };
@@ -4912,6 +4908,123 @@ pub const ApiHttpServer = struct {
         return .{ .result = result };
     }
 
+    fn joinedMutationTargetQuery(req: *db_mod.types.RelationalRowsJoinedMutationSourceRequest) *db_mod.types.RelationalRowsQueryRequest {
+        return switch (req.target_side) {
+            .left => &req.join.left,
+            .right => &req.join.right,
+        };
+    }
+
+    fn joinedMutationSourceQuery(req: *db_mod.types.RelationalRowsJoinedMutationSourceRequest) *db_mod.types.RelationalRowsQueryRequest {
+        return switch (req.target_side) {
+            .left => &req.join.right,
+            .right => &req.join.left,
+        };
+    }
+
+    fn applyLoweredPublicSqlJoinedMutationSource(
+        self: *ApiHttpServer,
+        target_table_name: []const u8,
+        target_schema: runtime_schema_mod.TableSchema,
+        lowered: *sql_adapter.LoweredJoinedMutationSource,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !union(enum) {
+        failure: http_common.HttpResponse,
+        result: db_mod.types.RelationalRowsMutationSourceResult,
+    } {
+        const read_source = self.effectivePublicTableReads() orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        const write_source = self.table_writes orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        self.ensureNoPublicSqlMutationSourceTrigger(target_table_name, lowered.mutation.req.kind) catch |err| switch (err) {
+            error.RoutineNotFound => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            else => return err,
+        };
+
+        const source_table_name = rowsPlanEffectiveSideTable(target_table_name, lowered.source_table_name);
+        ensureRowsPlanTableReadable(authenticated_identity, source_table_name) catch |err| switch (err) {
+            error.PermissionDenied => return .{ .failure = try textResponse(self.alloc, 403, "forbidden") },
+        };
+
+        const source_schema = if (std.mem.eql(u8, source_table_name, target_table_name))
+            target_schema
+        else
+            sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
+                self.alloc,
+                self.catalogSource(),
+                source_table_name,
+                session,
+            ) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+                else => return err,
+            };
+        defer if (!std.mem.eql(u8, source_table_name, target_table_name)) runtime_schema_mod.freeSchema(self.alloc, source_schema);
+
+        var target_filter = self.rowsAuthFilterPlanForIdentity(target_table_name, authenticated_identity, target_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (target_filter) |*value| value.deinit(self.alloc);
+        if (target_filter) |active| {
+            try self.applyRowsAuthFilterToQuery(target_schema, active, joinedMutationTargetQuery(&lowered.mutation.req));
+        }
+
+        var source_filter = self.rowsAuthFilterPlanForIdentity(source_table_name, authenticated_identity, source_schema) catch |err| switch (err) {
+            error.UnsupportedRowsFilter, error.InvalidRowsFilter => return .{ .failure = try textResponse(self.alloc, 403, "row filter pushdown required") },
+            else => return err,
+        };
+        defer if (source_filter) |*value| value.deinit(self.alloc);
+        if (source_filter) |active| {
+            for (@constCast(lowered.mutation.req.ctes)) |*cte| try self.applyRowsAuthFilterToQuery(source_schema, active, &cte.query);
+            try self.applyRowsAuthFilterToQuery(source_schema, active, joinedMutationSourceQuery(&lowered.mutation.req));
+        }
+
+        var source_result = (read_source.rowsQueryPlan(
+            self.alloc,
+            source_table_name,
+            source_schema,
+            .{
+                .ctes = lowered.mutation.req.ctes,
+                .query = joinedMutationSourceQuery(&lowered.mutation.req).*,
+            },
+            .read_index,
+        ) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.RelationalRowsCteMaterializationRejected => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.RelationalRowsCteSpillRequired => return .{ .failure = try textResponse(self.alloc, 429, "sql write backpressured") },
+            error.UnsupportedOperation, error.UnsupportedRowsQuery => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.TableNotFound => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            else => {
+                std.log.err("public sql joined mutation source read failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        defer source_result.deinit(self.alloc);
+
+        const result = (write_source.mutateRowsJoinedFromSourceRowsAutocommit(
+            self.alloc,
+            target_table_name,
+            target_schema,
+            source_schema,
+            lowered.mutation.req,
+            source_result.rows,
+            lowered.sync_level,
+        ) catch |err| switch (err) {
+            error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .failure = try textResponse(self.alloc, 400, "invalid sql write") },
+            error.UnsupportedOperation => return .{ .failure = try textResponse(self.alloc, 501, "unsupported sql statement") },
+            error.VersionConflict, error.IntentConflict, error.DecisionConflict, error.TxnNotFound, error.InvalidTxnRecord => return .{ .failure = try textResponse(self.alloc, 409, "version conflict") },
+            error.TopologyChanged => return .{ .failure = try textResponse(self.alloc, 503, "topology changed") },
+            error.TableNotFound, error.UnknownGroup => return .{ .failure = try textResponse(self.alloc, 404, "not found") },
+            error.DocIdentityNamespaceMismatch => return .{ .failure = try textResponse(self.alloc, 503, "doc identity unavailable") },
+            error.EnrichmentRetryInProgress => return .{ .failure = try textResponse(self.alloc, 429, "table backpressured") },
+            else => {
+                std.log.err("public sql joined mutation source failed table={s} source={s} err={}", .{ target_table_name, source_table_name, err });
+                return .{ .failure = try textResponse(self.alloc, 500, "sql write failed") };
+            },
+        }) orelse return .{ .failure = try textResponse(self.alloc, 404, "not found") };
+        return .{ .result = result };
+    }
+
     fn handlePublicSqlWrite(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
@@ -4924,7 +5037,7 @@ pub const ApiHttpServer = struct {
         defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.writeStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
         switch (statement_kind) {
-            .insert, .insert_source, .update, .update_source, .delete, .delete_source => {},
+            .insert, .insert_source, .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source => {},
             else => return try textResponse(self.alloc, 501, "unsupported sql statement"),
         }
 
@@ -4949,7 +5062,7 @@ pub const ApiHttpServer = struct {
             error.InvalidRoleSetting => return try textResponse(self.alloc, 400, "invalid sql setting"),
         };
         const row_claim: ?db_mod.types.RowClaimRequest = switch (statement_kind) {
-            .update, .update_source, .delete, .delete_source => try self.sqlMutationRowClaimAlloc(session),
+            .update, .update_source, .update_joined_source, .delete, .delete_source, .delete_joined_source => try self.sqlMutationRowClaimAlloc(session),
             else => null,
         };
         var row_claim_transferred = false;
@@ -5010,6 +5123,28 @@ pub const ApiHttpServer = struct {
                 self.ensureSqlProtocolSessionId(session),
                 @tagName(statement_kind),
                 mutation_source_result,
+            );
+            defer self.alloc.free(response_body);
+            return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+        }
+
+        if (lowered == .update_joined_source or lowered == .delete_joined_source) {
+            const joined_mutation_source = switch (lowered) {
+                .update_joined_source => |*update_joined_source| update_joined_source,
+                .delete_joined_source => |*delete_joined_source| delete_joined_source,
+                else => unreachable,
+            };
+            var joined_mutation_result = switch (try self.applyLoweredPublicSqlJoinedMutationSource(target_table, schema, joined_mutation_source, session.session(), authenticated_identity)) {
+                .failure => |failure| return failure,
+                .result => |result| result,
+            };
+            defer joined_mutation_result.deinit(self.alloc);
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const response_body = try self.encodePublicSqlRowsMutationSourceResultAlloc(
+                self.ensureSqlProtocolSessionId(session),
+                @tagName(statement_kind),
+                joined_mutation_result,
             );
             defer self.alloc.free(response_body);
             return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
@@ -24215,6 +24350,66 @@ test "api http server executes SQL point writes through typed row batch ingress"
     var parsed_deleted_source_query = try std.json.parseFromSlice(std.json.Value, alloc, deleted_source_query_resp.body, .{ .allocate = .alloc_always });
     defer parsed_deleted_source_query.deinit();
     try std.testing.expectEqual(@as(i64, 0), parsed_deleted_source_query.value.object.get("result").?.object.get("total").?.integer);
+
+    var joined_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('joined-target', 'join-key', 1), ('joined-source', 'join-key', 33);\"}",
+    });
+    defer joined_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), joined_seed_resp.status);
+
+    var update_joined_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"UPDATE usage_records AS target SET status = 'joined', amount = source.amount FROM usage_records AS source WHERE target.status = source.status AND target.id = 'joined-target' AND source.id = 'joined-source' FOR UPDATE OF target RETURNING target.id, target.status, target.amount;\"}",
+    });
+    defer update_joined_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), update_joined_source_resp.status);
+    var parsed_update_joined_source = try std.json.parseFromSlice(std.json.Value, alloc, update_joined_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_update_joined_source.deinit();
+    try std.testing.expectEqualStrings("write", parsed_update_joined_source.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("update_joined_source", parsed_update_joined_source.value.object.get("statement_kind").?.string);
+    const update_joined_source_result = parsed_update_joined_source.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), update_joined_source_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), update_joined_source_result.get("staged").?.integer);
+    const update_joined_source_row = update_joined_source_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("joined-target", update_joined_source_row.get("id").?.string);
+    try std.testing.expectEqualStrings("joined", update_joined_source_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 33), update_joined_source_row.get("amount").?.integer);
+
+    var delete_joined_source_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"DELETE FROM usage_records AS target USING usage_records AS source WHERE target.amount = source.amount AND target.id = 'joined-target' AND source.id = 'joined-source' FOR UPDATE OF target RETURNING target.id, target.status;\"}",
+    });
+    defer delete_joined_source_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), delete_joined_source_resp.status);
+    var parsed_delete_joined_source = try std.json.parseFromSlice(std.json.Value, alloc, delete_joined_source_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_delete_joined_source.deinit();
+    try std.testing.expectEqualStrings("write", parsed_delete_joined_source.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("delete_joined_source", parsed_delete_joined_source.value.object.get("statement_kind").?.string);
+    const delete_joined_source_result = parsed_delete_joined_source.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), delete_joined_source_result.get("matched").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), delete_joined_source_result.get("staged").?.integer);
+    const delete_joined_source_row = delete_joined_source_result.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("joined-target", delete_joined_source_row.get("id").?.string);
+    try std.testing.expectEqualStrings("joined", delete_joined_source_row.get("status").?.string);
+
+    var deleted_joined_source_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE id = 'joined-target';\"}",
+    });
+    defer deleted_joined_source_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), deleted_joined_source_query_resp.status);
+    var parsed_deleted_joined_source_query = try std.json.parseFromSlice(std.json.Value, alloc, deleted_joined_source_query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_deleted_joined_source_query.deinit();
+    try std.testing.expectEqual(@as(i64, 0), parsed_deleted_joined_source_query.value.object.get("result").?.object.get("total").?.integer);
 }
 
 test "api http server applies SQL row triggers to public SQL writes" {

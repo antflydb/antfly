@@ -3210,6 +3210,16 @@ pub const TableWriteSource = struct {
             req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
             source_rows: []const []const u8,
         ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
+        mutate_rows_joined_from_source_rows_autocommit: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            target_schema: storage_schema.TableSchema,
+            source_schema: storage_schema.TableSchema,
+            req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+            source_rows: []const []const u8,
+            sync_level: db_mod.types.SyncLevel,
+        ) anyerror!?db_mod.types.RelationalRowsMutationSourceResult = null,
         merge_rows_from_source_rows: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -3651,6 +3661,20 @@ pub const TableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const fn_ptr = self.vtable.mutate_rows_joined_from_source_rows orelse return error.UnsupportedOperation;
         return try fn_ptr(self.ptr, alloc, table_name, target_schema, source_schema, req, source_rows);
+    }
+
+    pub fn mutateRowsJoinedFromSourceRowsAutocommit(
+        self: TableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const fn_ptr = self.vtable.mutate_rows_joined_from_source_rows_autocommit orelse return error.UnsupportedOperation;
+        return try fn_ptr(self.ptr, alloc, table_name, target_schema, source_schema, req, source_rows, sync_level);
     }
 
     pub fn mergeRowsFromSourceRows(
@@ -7533,6 +7557,7 @@ pub const BoundTableWriteSource = struct {
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
                 .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
+                .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
                 .merge_rows_from_source_rows = mergeRowsFromSourceRows,
                 .begin_bulk_ingest = beginBulkIngest,
                 .finish_bulk_ingest = finishBulkIngest,
@@ -8448,22 +8473,22 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
 
-        var target_candidates = try self.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
-        errdefer {
-            for (target_candidates) |*candidate| candidate.deinit(alloc);
-            if (target_candidates.len > 0) alloc.free(target_candidates);
-        }
+        return try mutateRowsJoinedFromSourceRowsOnDb(alloc, self.db, target_schema, source_schema, req, source_rows);
+    }
 
-        var candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows);
-        errdefer {
-            for (candidates) |*candidate| candidate.deinit(alloc);
-            if (candidates.len > 0) alloc.free(candidates);
-        }
-
-        var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
-        defer plan.deinit(alloc);
-
-        return try self.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
+    fn mutateRowsJoinedFromSourceRowsAutocommit(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+        _: db_mod.types.SyncLevel,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        return try mutateRowsJoinedFromSourceRowsAutocommitOnDb(alloc, self.db, target_schema, source_schema, req, source_rows);
     }
 
     fn mergeRowsFromSourceRows(
@@ -15108,6 +15133,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .batch_catalog = HostedProvisionedTableWriteSource.batchCatalogNative,
                 .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_from_source_autocommit = mutateRowsFromSourceAutocommit,
+                .mutate_rows_joined_from_source_rows_autocommit = mutateRowsJoinedFromSourceRowsAutocommit,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
@@ -15633,6 +15659,65 @@ pub const HostedProvisionedTableWriteSource = struct {
         defer cached.deinit(hosted_cache.write_cache.alloc);
         try recoverHostedTransactionsOnce(self, alloc, cached.db);
         return try mutateRowsFromSourceAutocommitOnDb(alloc, cached.db, schema, req);
+    }
+
+    fn mutateRowsJoinedFromSourceRowsAutocommit(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+        sync_level: db_mod.types.SyncLevel,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        _ = sync_level;
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        var snapshot = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&snapshot);
+        const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+        const ranges = try metadata_admin.listTableRanges(alloc, &snapshot, table.table_id);
+        defer metadata_admin.freeRangeRefs(alloc, ranges);
+        if (ranges.len != 1) return error.UnsupportedOperation;
+
+        const group_id = ranges[0].group_id;
+        var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);
+        if (resolved_route) |*route| {
+            defer route.deinit(alloc);
+            switch (route.*) {
+                .local => return try self.mutateRowsJoinedFromSourceRowsAutocommitGroupLocal(alloc, group_id, table_name, target_schema, source_schema, req, source_rows),
+                .remote => return error.UnsupportedOperation,
+            }
+        }
+
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return try self.mutateRowsJoinedFromSourceRowsAutocommitGroupLocal(alloc, group_id, table_name, target_schema, source_schema, req, source_rows);
+    }
+
+    fn mutateRowsJoinedFromSourceRowsAutocommitGroupLocal(
+        self: *HostedProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        target_schema: storage_schema.TableSchema,
+        source_schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+        source_rows: []const []const u8,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
+        defer alloc.free(path);
+        const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default);
+        defer cached.deinit(hosted_cache.write_cache.alloc);
+        try recoverHostedTransactionsOnce(self, alloc, cached.db);
+        return try mutateRowsJoinedFromSourceRowsAutocommitOnDb(alloc, cached.db, target_schema, source_schema, req, source_rows);
     }
 
     fn commitTransaction(
@@ -18169,6 +18254,65 @@ fn mutateRowsFromSourceAutocommitOnDb(
     const commit_version = begin_timestamp + 1;
     _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
     var result = db.mutateRelationalRowsFromSource(alloc, schema, req) catch |err| {
+        db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
+        return normalizeRelationalConstraintError(err);
+    };
+    errdefer result.deinit(alloc);
+    db.resolveTransactionIntents(txn_id, .committed, commit_version) catch |err| {
+        return normalizeRelationalConstraintError(err);
+    };
+    return result;
+}
+
+fn joinedMutationSourceTargetClaim(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) ?db_mod.types.RowClaimRequest {
+    return switch (req.target_side) {
+        .left => req.join.left.row_claim,
+        .right => req.join.right.row_claim,
+    };
+}
+
+fn mutateRowsJoinedFromSourceRowsOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    source_rows: []const []const u8,
+) !db_mod.types.RelationalRowsMutationSourceResult {
+    var target_candidates = try db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
+    errdefer {
+        for (target_candidates) |*candidate| candidate.deinit(alloc);
+        if (target_candidates.len > 0) alloc.free(target_candidates);
+    }
+
+    var candidates = try db_mod.DB.buildRelationalRowsJoinedMutationSourceCandidatesFromCollectedRowsAlloc(alloc, req, &target_candidates, source_rows);
+    errdefer {
+        for (candidates) |*candidate| candidate.deinit(alloc);
+        if (candidates.len > 0) alloc.free(candidates);
+    }
+
+    var plan = try db_mod.DB.selectPlannedRelationalRowsJoinedMutationSourceCandidatesAlloc(alloc, req, &candidates);
+    defer plan.deinit(alloc);
+
+    return try db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, plan.matched, plan.candidates);
+}
+
+fn mutateRowsJoinedFromSourceRowsAutocommitOnDb(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    target_schema: storage_schema.TableSchema,
+    source_schema: storage_schema.TableSchema,
+    req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
+    source_rows: []const []const u8,
+) !db_mod.types.RelationalRowsMutationSourceResult {
+    const claim = joinedMutationSourceTargetClaim(req) orelse return error.InvalidQueryRequest;
+    const txn_id = claim.txn_id orelse return error.InvalidQueryRequest;
+    if (claim.owner_id.len == 0 or claim.lease_ms == 0) return error.InvalidQueryRequest;
+
+    const begin_timestamp = nextTxnTimestamp();
+    const commit_version = begin_timestamp + 1;
+    _ = try db.beginTransactionWithIdAndParticipants(txn_id, begin_timestamp, &.{});
+    var result = mutateRowsJoinedFromSourceRowsOnDb(alloc, db, target_schema, source_schema, req, source_rows) catch |err| {
         db.resolveTransactionIntents(txn_id, .aborted, commit_version) catch {};
         return normalizeRelationalConstraintError(err);
     };

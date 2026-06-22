@@ -159,10 +159,14 @@ their executor can share the preimage trigger path. Claimed single-table
 update/delete sources now lower into typed mutation-source requests, mint a SQL
 row-claim transaction, execute through the same owner-local mutation-source
 planner/stager, commit the staged intents, and return mutation-source
-`matched`/`staged` counts plus `RETURNING` rows. Joined sources, recursive write
-sources, merge, and truncate writes remain fail-closed until their SQL executor
-wiring can share the native side-table read, joined mutation-source, trigger,
-catalog barrier, and 2PC paths.
+`matched`/`staged` counts plus `RETURNING` rows. Non-recursive joined
+update/delete sources (`UPDATE ... FROM` and `DELETE ... USING`) use the same
+typed path: SQL executes the side-table read as a row plan, feeds the materialized
+source rows into the joined mutation-source planner/stager, and autocommits or
+aborts the SQL-owned row-claim transaction before returning mutation-source
+counts and `RETURNING` rows. Recursive write sources, merge, and truncate writes
+remain fail-closed until their SQL executor wiring can share the native
+recursive materialization, trigger, catalog barrier, and 2PC paths.
 
 Raw SQL text must not be stored as index metadata, role metadata, extension
 metadata, row rewrites, or storage requests. If a feature needs durable
