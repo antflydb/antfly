@@ -24,11 +24,11 @@ const table_catalog = @import("table_catalog.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
 
-// Compatibility facade for legacy SQL adapter callers.
+// Runtime SQL adapter bridge for storage and API execution callers.
 //
 // New SQL parser, binder, lowerer, diagnostic, fixture, and catalog behavior
-// belongs in api/sql_adapter. Keep this module as a thin API bridge until all
-// internal callers have moved to sql_adapter directly.
+// belongs in api/sql_adapter. Keep this module focused on runtime execution bridges until all
+// storage-backed helpers have clear owning modules.
 
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const SqlValue = sql_adapter.SqlValue;

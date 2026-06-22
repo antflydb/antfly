@@ -43,7 +43,7 @@ const table_reads = @import("table_reads.zig");
 const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const relational_rows_api = @import("relational_rows.zig");
-const relational_sql_api = @import("sql_adapter/mod.zig");
+const sql_adapter = @import("sql_adapter/mod.zig");
 const indexes_api = @import("indexes.zig");
 const query_api = @import("query.zig");
 const runtime_status = @import("runtime_status.zig");
@@ -3208,7 +3208,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             target_schema: storage_schema.TableSchema,
             source_schema: storage_schema.TableSchema,
-            plan: relational_sql_api.LoweredMergeMutationPlan,
+            plan: sql_adapter.LoweredMergeMutationPlan,
             source_rows: []const []const u8,
         ) anyerror!?relational_rows_api.OwnedRowsBatchRequest = null,
         begin_bulk_ingest: ?*const fn (
@@ -3639,7 +3639,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         target_schema: storage_schema.TableSchema,
         source_schema: storage_schema.TableSchema,
-        plan: relational_sql_api.LoweredMergeMutationPlan,
+        plan: sql_adapter.LoweredMergeMutationPlan,
         source_rows: []const []const u8,
     ) !?relational_rows_api.OwnedRowsBatchRequest {
         const fn_ptr = self.vtable.merge_rows_from_source_rows orelse return error.UnsupportedOperation;
@@ -4392,7 +4392,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanAlloc(
     default_table_name: []const u8,
     recursive_source_schema: storage_schema.TableSchema,
     target_schema: storage_schema.TableSchema,
-    lowered: relational_sql_api.LoweredRecursiveJoinedMutationSource,
+    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsMutationSourceResult {
     return try mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
@@ -4418,7 +4418,7 @@ pub fn mutateRowsJoinedFromRecursiveCtePlanWithSessionAlloc(
     default_table_name: []const u8,
     recursive_source_schema: storage_schema.TableSchema,
     target_schema: storage_schema.TableSchema,
-    lowered: relational_sql_api.LoweredRecursiveJoinedMutationSource,
+    lowered: sql_adapter.LoweredRecursiveJoinedMutationSource,
     consistency: raft_mod.ReadConsistency,
 ) !?db_mod.types.RelationalRowsMutationSourceResult {
     const source_query = recursiveJoinedMutationSourceQuery(lowered.mutation.mutation.req);
@@ -4467,7 +4467,7 @@ pub fn mergeRowsFromRecursiveCtePlanAlloc(
     default_table_name: []const u8,
     recursive_source_schema: storage_schema.TableSchema,
     target_schema: storage_schema.TableSchema,
-    lowered: relational_sql_api.LoweredRecursiveMergeMutation,
+    lowered: sql_adapter.LoweredRecursiveMergeMutation,
     consistency: raft_mod.ReadConsistency,
 ) !?relational_rows_api.OwnedRowsBatchRequest {
     return try mergeRowsFromRecursiveCtePlanWithSessionAlloc(
@@ -4493,7 +4493,7 @@ pub fn mergeRowsFromRecursiveCtePlanWithSessionAlloc(
     default_table_name: []const u8,
     recursive_source_schema: storage_schema.TableSchema,
     target_schema: storage_schema.TableSchema,
-    lowered: relational_sql_api.LoweredRecursiveMergeMutation,
+    lowered: sql_adapter.LoweredRecursiveMergeMutation,
     consistency: raft_mod.ReadConsistency,
 ) !?relational_rows_api.OwnedRowsBatchRequest {
     if (!std.mem.eql(u8, lowered.merge.source.source_cte, lowered.recursive.cte_name)) return error.InvalidRowsRequest;
@@ -8438,7 +8438,7 @@ pub const BoundTableWriteSource = struct {
         table_name: []const u8,
         target_schema: storage_schema.TableSchema,
         source_schema: storage_schema.TableSchema,
-        plan: relational_sql_api.LoweredMergeMutationPlan,
+        plan: sql_adapter.LoweredMergeMutationPlan,
         source_rows: []const []const u8,
     ) !?relational_rows_api.OwnedRowsBatchRequest {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -8447,7 +8447,7 @@ pub const BoundTableWriteSource = struct {
         const target_preimages = try self.db.collectRelationalRowsPreimagesAlloc(alloc, target_schema, .{});
         defer db_mod.types.freeRelationalRowsCollectedRows(alloc, target_preimages);
 
-        const target_rows = try alloc.alloc(relational_sql_api.MergeExecutionTargetRow, target_preimages.len);
+        const target_rows = try alloc.alloc(sql_adapter.MergeExecutionTargetRow, target_preimages.len);
         defer alloc.free(target_rows);
         for (target_preimages, 0..) |row, i| {
             target_rows[i] = .{
@@ -8457,7 +8457,7 @@ pub const BoundTableWriteSource = struct {
             };
         }
 
-        var batch_req = try relational_sql_api.buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows);
+        var batch_req = try sql_adapter.buildMergeMutationBatchAlloc(alloc, target_schema, source_schema, plan, target_rows, source_rows);
         errdefer batch_req.deinit(alloc);
         self.db.batch(batch_req.req) catch |err| return normalizeRelationalConstraintError(err);
         return batch_req;
@@ -30549,7 +30549,7 @@ test "recursive cte joined mutation source executes through typed read materiali
     const txn_id = try db.beginTransaction(10_000);
     var txn_open = true;
     defer if (txn_open) db.abortTransaction(txn_id, 10_999) catch {};
-    var lowered = try relational_sql_api.lowerWritePlanAlloc(
+    var lowered = try sql_adapter.lowerWritePlanAlloc(
         alloc,
         "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE organization_id = 'root' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
         schema,
@@ -30716,7 +30716,7 @@ test "recursive cte merge mutation executes through typed read materialization a
         }
     };
 
-    var lowered = try relational_sql_api.lowerWritePlanAlloc(
+    var lowered = try sql_adapter.lowerWritePlanAlloc(
         alloc,
         "WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE organization_id = 'root' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.organization_id = parent.id) MERGE INTO usage_records USING source_rows ON usage_records.id = source_rows.id WHEN MATCHED THEN UPDATE SET status = 'done'",
         schema,

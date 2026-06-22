@@ -1393,7 +1393,11 @@ interpretation of golden-plan fingerprints. The corpus package
 also owns structured applied-plan fingerprint validation and nested
 `EXPLAIN` inner-plan matching, so rewrite/rebuild/validation evidence and
 explain-wrapper assertions use the same exact-token contract as ordinary golden
-plans. The corpus package also owns strict placeholder coverage
+plans. Execution-plan fingerprints for native COPY import/export work and
+prepared-transaction recovery are also structurally validated before coverage
+buckets can use their exact tokens, so bulk I/O and recovery coverage cannot be
+satisfied by a prefix-only or duplicate-token fingerprint. The corpus package
+also owns strict placeholder coverage
 scanning for fixture SQL, including skipped numbers, parameters without
 placeholders, placeholders without params, malformed suffixes, quoted
 string/identifier bodies, comments, and dollar-quoted bodies. Fixture JSON

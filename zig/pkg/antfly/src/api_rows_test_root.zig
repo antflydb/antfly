@@ -14,12 +14,12 @@
 
 const http_server = @import("api/http_server.zig");
 const relational_rows = @import("api/relational_rows.zig");
-const relational_sql = @import("api/relational_sql.zig");
+const sql_adapter_runtime = @import("api/sql_adapter_runtime.zig");
 const table_reads = @import("api/table_reads.zig");
 
 test {
     _ = http_server;
     _ = relational_rows;
-    _ = relational_sql;
+    _ = sql_adapter_runtime;
     _ = table_reads;
 }

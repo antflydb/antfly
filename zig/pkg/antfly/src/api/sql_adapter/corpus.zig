@@ -2708,8 +2708,8 @@ pub fn corpusFixtureRequiresExecutionPlan(entry: AppParityCorpusEntry) bool {
 pub fn corpusFixtureExecutionPlanIsStructured(entry: AppParityCorpusEntry) bool {
     if (entry.execution_plan.len == 0) return true;
     if (!corpusFixtureAllowsExecutionPlan(entry)) return false;
-    return std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=") or
-        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=") or
+    return bulkSqlIoExecutionPlanIsStructured(entry.execution_plan) or
+        preparedTransactionRecoveryPlanIsStructured(entry.execution_plan) or
         unsupportedPlanMatchesReason(entry.execution_plan, .ddl, .bulk_io_plan);
 }
 
@@ -5061,6 +5061,56 @@ pub fn explainPlanInnerStartsWith(plan: []const u8, inner_prefix: []const u8) bo
     return std.mem.startsWith(u8, plan[inner_index + inner_token.len ..], inner_prefix);
 }
 
+pub fn planHasTrailingRowExpressionFragment(plan: []const u8, fragment: []const u8) bool {
+    const expr_token = ":expr=";
+    const expr_index = std.mem.indexOf(u8, plan, expr_token) orelse return false;
+    if (std.mem.indexOfPos(u8, plan, expr_index + expr_token.len, expr_token) != null) return false;
+    if (!PlanFingerprintView.init(plan).tokenStartsAtBoundary(expr_index, expr_token)) return false;
+    var index = expr_index + expr_token.len;
+    const expr_start = index;
+    if (!consumeRowRewriteExpressionFingerprint(plan, &index)) return false;
+    if (index != plan.len) return false;
+    return std.mem.indexOf(u8, plan[expr_start..index], fragment) != null;
+}
+
+pub fn bulkSqlIoExecutionPlanIsStructured(plan: []const u8) bool {
+    if (!planHasRootKind(plan, "bulk_sql_io")) return false;
+    const has_endpoint_kind = planHasStringToken(plan, ":endpoint_kind=");
+    const has_endpoint = planHasStringToken(plan, ":endpoint=");
+    if (has_endpoint_kind != has_endpoint) return false;
+    return planHasAnyExactStringToken(plan, ":op=", &.{ "import_rows", "export_rows" }) and
+        planHasAnyExactStringToken(plan, ":native=", &.{ "rows_batch", "rows_query" }) and
+        planHasAnyExactStringToken(plan, ":stream=", &.{ "stdin", "stdout", "file", "program" }) and
+        planHasAnyExactStringToken(plan, ":codec=", &.{ "csv", "postgres_text", "postgres_binary" }) and
+        planHasAnyExactStringToken(plan, ":auth=", &.{ "table/read", "table/write" }) and
+        planHasAnyExactStringToken(plan, ":audit=", &.{ "copy_from", "copy_to" }) and
+        planHasStringToken(plan, ":table=") and
+        planUsizeTokenValue(plan, ":columns=") != null and
+        planUsizeTokenValue(plan, ":where_expr=") != null and
+        planBoolTokenValue(plan, ":requires_stream=") != null and
+        (!has_endpoint_kind or planHasAnyExactStringToken(plan, ":endpoint_kind=", &.{ "file", "program" }));
+}
+
+pub fn bulkSqlIoExecutionPlanHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
+    return bulkSqlIoExecutionPlanIsStructured(plan) and planHasExactStringToken(plan, token, expected);
+}
+
+pub fn bulkSqlIoExecutionPlanHasExactBoolToken(plan: []const u8, token: []const u8, expected: bool) bool {
+    return bulkSqlIoExecutionPlanIsStructured(plan) and planHasExactBoolToken(plan, token, expected);
+}
+
+pub fn preparedTransactionRecoveryPlanIsStructured(plan: []const u8) bool {
+    return planHasRootKind(plan, "prepared_txn_recovery") and
+        planHasAnyExactStringToken(plan, ":op=", &.{ "register_prepared", "resolve_commit", "resolve_rollback" }) and
+        planHasStringToken(plan, ":gid=") and
+        planHasAnyExactStringToken(plan, ":audit=", &.{ "prepare", "commit", "rollback" }) and
+        planBoolTokenValue(plan, ":requires_coordinator=") != null;
+}
+
+pub fn preparedTransactionRecoveryPlanHasExactStringToken(plan: []const u8, token: []const u8, expected: []const u8) bool {
+    return preparedTransactionRecoveryPlanIsStructured(plan) and planHasExactStringToken(plan, token, expected);
+}
+
 pub fn joinedSourcePlanHasCounts(plan: []const u8, right_predicates: usize, join_keys: usize) bool {
     return planHasExactUsizeToken(plan, ":right_pred=", right_predicates) and
         planHasExactUsizeToken(plan, ":on=", join_keys);
@@ -5120,6 +5170,22 @@ pub fn appliedPlanHasExactBoolToken(plan: []const u8, token: []const u8, expecte
 
 pub fn appliedPlanHasExactUsizeToken(plan: []const u8, token: []const u8, expected: usize) bool {
     return appliedPlanIsStructured(plan) and planHasExactUsizeToken(plan, token, expected);
+}
+
+pub fn appliedPlanHasRowImageRewriteExpression(plan: []const u8) bool {
+    if (!appliedPlanIsStructured(plan)) return false;
+    const literal = "rewrite/table/row_images(target=";
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, plan, start, literal)) |index| {
+        if (index > 0 and plan[index - 1] != '=' and plan[index - 1] != ',') {
+            start = index + 1;
+            continue;
+        }
+        var value_index = index + literal.len;
+        if (consumeAppliedRewriteExpression(plan, &value_index)) return true;
+        start = index + 1;
+    }
+    return false;
 }
 
 fn consumeLiteral(text: []const u8, index: *usize, literal: []const u8) bool {
@@ -8638,29 +8704,29 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_sql_expression_concat_body = self.ddl_function_sql_expression_concat_body or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
-                            std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null);
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "concat_ws["));
                     self.ddl_function_sql_expression_multi_arg_body = self.ddl_function_sql_expression_multi_arg_body or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
-                            std.mem.indexOf(u8, entry.plan, "arg2") != null);
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "arg2"));
                     self.ddl_function_sql_expression_named_arg_body = self.ddl_function_sql_expression_named_arg_body or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
-                            std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "lower[field[source:arg1]]") and
                             appParityTokensHaveIdentifier(sql_tokens, "status_text") and
                             appParityTokensHaveIdentifier(sql_tokens, "text") and
                             appParityTokensHaveStringLiteralContaining(sql_tokens, "lower(status_text)"));
                     self.ddl_function_sql_expression_nested_body = self.ddl_function_sql_expression_nested_body or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
-                            std.mem.indexOf(u8, entry.plan, "expr=concat_ws[") != null and
-                            std.mem.indexOf(u8, entry.plan, "lower[field[source:arg1]]") != null and
-                            std.mem.indexOf(u8, entry.plan, "coalesce[field[source:arg2]+") != null);
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "concat_ws[") and
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "lower[field[source:arg1]]") and
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "coalesce[field[source:arg2]+"));
                     self.ddl_function_sql_expression_minmax_body = self.ddl_function_sql_expression_minmax_body or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
-                            std.mem.indexOf(u8, entry.plan, "greatest[") != null and
-                            std.mem.indexOf(u8, entry.plan, "least[") != null);
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "greatest[") and
+                            sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "least["));
                     self.ddl_function_trigger_return_new = self.ddl_function_trigger_return_new or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "plpgsql_trigger") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "trigger_return_new"));
@@ -8715,15 +8781,17 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_from = true;
                     self.ddl_copy_binary_execution_contract = self.ddl_copy_binary_execution_contract or
                         sql_adapter.planHasExactStringToken(entry.plan, ":format=", "binary") and
-                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_binary:") != null;
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":codec=", "postgres_binary");
                     self.ddl_copy_from_execution_contract = self.ddl_copy_from_execution_contract or
-                        std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:stream=stdin:");
+                        sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":op=", "import_rows") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":native=", "rows_batch") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "stdin");
                     self.ddl_copy_file_endpoint = self.ddl_copy_file_endpoint or
-                        std.mem.indexOf(u8, entry.execution_plan, ":stream=file:") != null and
-                            std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=file:") != null;
+                        sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "file") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":endpoint_kind=", "file");
                     self.ddl_copy_from_text_execution_contract = self.ddl_copy_from_text_execution_contract or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
-                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":codec=", "postgres_text"));
                     self.ddl_copy_default_marker = self.ddl_copy_default_marker or sql_adapter.planHasExactStringToken(entry.plan, ":default_marker_hex=", "6e2f61");
                     self.ddl_copy_header = self.ddl_copy_header or sql_adapter.planHasExactBoolToken(entry.plan, ":header=", true);
                     self.ddl_copy_delimiter = self.ddl_copy_delimiter or sql_adapter.planHasExactStringToken(entry.plan, ":delimiter_hex=", "2c");
@@ -8736,12 +8804,13 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
                     self.ddl_copy_oids_false_noop = self.ddl_copy_oids_false_noop or
                         appParityTokensHaveKeywordSequence(sql_tokens, &.{ .oids, .false }) and
-                            std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=import_rows:native=rows_batch:");
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":op=", "import_rows") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":native=", "rows_batch");
                     self.ddl_copy_on_error_ignore = self.ddl_copy_on_error_ignore or sql_adapter.planHasExactStringToken(entry.plan, ":on_error=", "ignore");
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
                         appParityTokensHaveKeyword(sql_tokens, .program) and
-                            std.mem.indexOf(u8, entry.execution_plan, ":stream=program:") != null and
-                            std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=program:") != null;
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "program") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":endpoint_kind=", "program");
                     self.ddl_copy_reject_limit = self.ddl_copy_reject_limit or sql_adapter.planHasExactUsizeToken(entry.plan, ":reject_limit=", 10);
                     self.ddl_copy_quote = self.ddl_copy_quote or sql_adapter.planHasExactStringToken(entry.plan, ":quote_hex=", "22");
                     self.ddl_copy_where_expression = self.ddl_copy_where_expression or sql_adapter.planHasExactUsizeToken(entry.plan, ":where_expressions=", 1);
@@ -8750,16 +8819,18 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_to = true;
                     self.ddl_copy_binary_execution_contract = self.ddl_copy_binary_execution_contract or
                         sql_adapter.planHasExactStringToken(entry.plan, ":format=", "binary") and
-                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_binary:") != null;
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":codec=", "postgres_binary");
                     self.ddl_copy_to_execution_contract = self.ddl_copy_to_execution_contract or
-                        std.mem.startsWith(u8, entry.execution_plan, "bulk_sql_io:op=export_rows:native=rows_query:stream=stdout:");
+                        sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":op=", "export_rows") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":native=", "rows_query") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "stdout");
                     self.ddl_copy_to_text_execution_contract = self.ddl_copy_to_text_execution_contract or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
-                            std.mem.indexOf(u8, entry.execution_plan, ":codec=postgres_text:") != null);
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":codec=", "postgres_text"));
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
                         appParityTokensHaveKeyword(sql_tokens, .program) and
-                            std.mem.indexOf(u8, entry.execution_plan, ":stream=program:") != null and
-                            std.mem.indexOf(u8, entry.execution_plan, ":endpoint_kind=program:") != null;
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "program") and
+                            sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":endpoint_kind=", "program");
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
                 },
                 .create_partitioned_table => self.ddl_partition_create_parent = true,
@@ -8915,17 +8986,17 @@ pub const AppParityCorpusCoverage = struct {
                 .prepare_transaction => {
                     self.ddl_prepared_transaction_prepare = true;
                     self.ddl_prepared_transaction_recovery_contract = self.ddl_prepared_transaction_recovery_contract or
-                        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=register_prepared:");
+                        sql_adapter.preparedTransactionRecoveryPlanHasExactStringToken(entry.execution_plan, ":op=", "register_prepared");
                 },
                 .commit_prepared => {
                     self.ddl_prepared_transaction_commit = true;
                     self.ddl_prepared_transaction_recovery_contract = self.ddl_prepared_transaction_recovery_contract or
-                        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=resolve_commit:");
+                        sql_adapter.preparedTransactionRecoveryPlanHasExactStringToken(entry.execution_plan, ":op=", "resolve_commit");
                 },
                 .rollback_prepared => {
                     self.ddl_prepared_transaction_rollback = true;
                     self.ddl_prepared_transaction_recovery_contract = self.ddl_prepared_transaction_recovery_contract or
-                        std.mem.startsWith(u8, entry.execution_plan, "prepared_txn_recovery:op=resolve_rollback:");
+                        sql_adapter.preparedTransactionRecoveryPlanHasExactStringToken(entry.execution_plan, ":op=", "resolve_rollback");
                 },
                 .execute_statement => {
                     self.ddl_execute_statement = true;
@@ -9068,8 +9139,7 @@ pub const AppParityCorpusCoverage = struct {
                         appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .data, .type });
                     self.ddl_alter_column_rewrite_expression = self.ddl_alter_column_rewrite_expression or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":alter_type_rewrite_expr=") and
-                            std.mem.indexOf(u8, entry.applied_plan, "rewrite/table/row_images(target=") != null and
-                            std.mem.indexOf(u8, entry.applied_plan, ":expr=") != null;
+                            sql_adapter.appliedPlanHasRowImageRewriteExpression(entry.applied_plan);
                     self.ddl_rename_column = self.ddl_rename_column or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .column });
                     self.ddl_rename_constraint = self.ddl_rename_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .constraint });
                     self.ddl_drop_update_policy = self.ddl_drop_update_policy or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .trigger });

@@ -12358,6 +12358,17 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
 ) !plan_mod.LoweredWritePlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
+    return try lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(alloc, &parsed_sql, schema, params, options, catalog);
+}
+
+fn lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+    catalog: table_catalog.CatalogSource,
+) !plan_mod.LoweredWritePlan {
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -12366,12 +12377,13 @@ fn lowerWritePlanWithCatalogForDmlTestAlloc(
             .lower_with_options = lowerWritePlanParsedSqlForDmlTestAlloc,
         },
     };
-    return try context.lowerParsed(&parsed_sql, options, catalog);
+    return try context.lowerParsed(parsed_sql, options, catalog);
 }
 
 pub const lowerWritePlanAlloc = lowerWritePlanForDmlTestAlloc;
 pub const lowerWritePlanParsedSqlAlloc = lowerWritePlanParsedSqlForDmlTestAlloc;
 pub const lowerWritePlanWithCatalogAlloc = lowerWritePlanWithCatalogForDmlTestAlloc;
+pub const lowerWritePlanWithCatalogParsedSqlAlloc = lowerWritePlanWithCatalogParsedSqlForDmlTestAlloc;
 
 fn unsupportedRecursiveJoinedMutationSourceForDmlTestAlloc(
     _: std.mem.Allocator,

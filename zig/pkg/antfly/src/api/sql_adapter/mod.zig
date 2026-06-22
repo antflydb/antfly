@@ -675,6 +675,7 @@ pub const lowerWritePlanWithParsedSqlAlloc = plan.lowerWritePlanWithParsedSqlAll
 pub const lowerWritePlanAlloc = lower_dml.lowerWritePlanAlloc;
 pub const lowerWritePlanParsedSqlAlloc = lower_dml.lowerWritePlanParsedSqlAlloc;
 pub const lowerWritePlanWithCatalogAlloc = lower_dml.lowerWritePlanWithCatalogAlloc;
+pub const lowerWritePlanWithCatalogParsedSqlAlloc = lower_dml.lowerWritePlanWithCatalogParsedSqlAlloc;
 pub const expectSqlAdapterEdgeCase = edge_case_runner.expectSqlAdapterEdgeCase;
 pub const cloneExpressionAlloc = plan.cloneExpressionAlloc;
 pub const cloneExpressionCaseBranchAlloc = plan.cloneExpressionCaseBranchAlloc;
