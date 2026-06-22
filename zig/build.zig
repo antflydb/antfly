@@ -3919,6 +3919,7 @@ pub fn build(b: *std.Build) void {
             "sql adapter lower dml lowers claimed delete mutation source",
             "sql adapter lower expr lowers uuid generation projections",
             "sql adapter lower expr lowers routine expression bindings into row expressions",
+            "sql adapter lower expr lowers concat projections",
             "sql adapter lower expr assembles boolean predicate groups",
             "sql adapter lower expr names every row expression kind",
             "sql adapter lower expr compares row expressions",

@@ -40,12 +40,34 @@ pub const SqlQueryFunctionArgValue = union(enum) {
     string: []const u8,
     number: []const u8,
     boolean: bool,
+    source_specs: []const HybridSqlSourceSpec,
 };
 
 pub const SqlQueryFunctionArg = struct {
     name: []const u8,
     value: SqlQueryFunctionArgValue,
 };
+
+const HybridSqlSourceSpec = struct {
+    index: []const u8,
+    kind: []const u8,
+    name: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    metric: ?[]const u8 = null,
+    freshness: ?[]const u8 = null,
+    weight: ?[]const u8 = null,
+    base_weight: ?[]const u8 = null,
+    missing_score: ?[]const u8 = null,
+};
+
+fn deinitAntflyQueryFunctionArgs(alloc: std.mem.Allocator, args: []const SqlQueryFunctionArg) void {
+    for (args) |arg| {
+        switch (arg.value) {
+            .source_specs => |sources| alloc.free(sources),
+            else => {},
+        }
+    }
+}
 
 pub fn parseAntflyQueryFunctionCall(
     alloc: std.mem.Allocator,
@@ -64,22 +86,7 @@ pub fn parseAntflyQueryFunctionCall(
             const name = (try expectSqlToken(tokens, pos, .identifier)).text;
             _ = try expectSqlToken(tokens, pos, .eq);
             _ = matchSqlToken(tokens, pos, .gt);
-            const value_token = if (matchSqlToken(tokens, pos, .string)) |token|
-                token
-            else if (matchSqlToken(tokens, pos, .number)) |token|
-                token
-            else
-                try expectSqlToken(tokens, pos, .identifier);
-            const value: SqlQueryFunctionArgValue = switch (value_token.kind) {
-                .string => .{ .string = value_token.text },
-                .number => .{ .number = value_token.text },
-                .identifier => blk: {
-                    if (std.ascii.eqlIgnoreCase(value_token.text, "true")) break :blk .{ .boolean = true };
-                    if (std.ascii.eqlIgnoreCase(value_token.text, "false")) break :blk .{ .boolean = false };
-                    break :blk .{ .string = value_token.text };
-                },
-                else => unreachable,
-            };
+            const value = try parseAntflyQueryFunctionArgValueAlloc(alloc, tokens, pos, name);
             if (antflyQueryFunctionArg(args.items, name) != null) return error.UnsupportedSqlShape;
             try args.append(alloc, .{ .name = name, .value = value });
             if (matchSqlToken(tokens, pos, .comma) == null) break;
@@ -89,6 +96,123 @@ pub fn parseAntflyQueryFunctionCall(
     _ = matchSqlToken(tokens, pos, .semicolon);
     if (pos.* != tokens.len) return error.UnsupportedSqlShape;
     return function;
+}
+
+fn parseAntflyQueryFunctionArgValueAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    name: []const u8,
+) !SqlQueryFunctionArgValue {
+    if (std.ascii.eqlIgnoreCase(name, "sources") and antflySourcesArrayCanStart(tokens, pos.*)) {
+        return .{ .source_specs = try parseAntflySourceArrayAlloc(alloc, tokens, pos) };
+    }
+    const value_token = if (matchSqlToken(tokens, pos, .string)) |token|
+        token
+    else if (matchSqlToken(tokens, pos, .number)) |token|
+        token
+    else
+        try expectSqlToken(tokens, pos, .identifier);
+    return switch (value_token.kind) {
+        .string => .{ .string = value_token.text },
+        .number => .{ .number = value_token.text },
+        .identifier => blk: {
+            if (std.ascii.eqlIgnoreCase(value_token.text, "true")) break :blk .{ .boolean = true };
+            if (std.ascii.eqlIgnoreCase(value_token.text, "false")) break :blk .{ .boolean = false };
+            break :blk .{ .string = value_token.text };
+        },
+        else => unreachable,
+    };
+}
+
+fn antflySourcesArrayCanStart(tokens: []const Token, pos: usize) bool {
+    if (pos >= tokens.len) return false;
+    return tokens[pos].kind == .lbracket or
+        (tokens[pos].kind == .identifier and std.ascii.eqlIgnoreCase(tokens[pos].text, "array"));
+}
+
+fn parseAntflySourceArrayAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const HybridSqlSourceSpec {
+    if (matchSqlKeyword(tokens, pos, "array")) |_| {}
+    _ = try expectSqlToken(tokens, pos, .lbracket);
+    var sources = std.ArrayListUnmanaged(HybridSqlSourceSpec).empty;
+    errdefer sources.deinit(alloc);
+    if (matchSqlToken(tokens, pos, .rbracket) == null) {
+        while (true) {
+            try sources.append(alloc, try parseAntflySourceSpec(tokens, pos));
+            if (matchSqlToken(tokens, pos, .comma) == null) break;
+        }
+        _ = try expectSqlToken(tokens, pos, .rbracket);
+    }
+    if (sources.items.len == 0) return error.UnsupportedSqlShape;
+    return try sources.toOwnedSlice(alloc);
+}
+
+fn parseAntflySourceSpec(tokens: []const Token, pos: *usize) !HybridSqlSourceSpec {
+    const function_name = (try expectSqlToken(tokens, pos, .identifier)).text;
+    const prefix = "antfly.";
+    const local = if (std.mem.startsWith(u8, function_name, prefix)) function_name[prefix.len..] else function_name;
+    if (!std.ascii.eqlIgnoreCase(local, "source")) return error.UnsupportedSqlShape;
+    _ = try expectSqlToken(tokens, pos, .lparen);
+    const index = try parseAntflySourceStringLikeValue(tokens, pos);
+    var source = HybridSqlSourceSpec{
+        .index = index,
+        .kind = "",
+    };
+    while (matchSqlToken(tokens, pos, .comma) != null) {
+        const field_name = (try expectSqlToken(tokens, pos, .identifier)).text;
+        _ = try expectSqlToken(tokens, pos, .eq);
+        _ = matchSqlToken(tokens, pos, .gt);
+        if (std.ascii.eqlIgnoreCase(field_name, "kind") or std.ascii.eqlIgnoreCase(field_name, "type")) {
+            if (source.kind.len != 0) return error.UnsupportedSqlShape;
+            source.kind = try parseAntflySourceStringLikeValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "name")) {
+            if (source.name != null) return error.UnsupportedSqlShape;
+            source.name = try parseAntflySourceStringLikeValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "field")) {
+            if (source.field != null) return error.UnsupportedSqlShape;
+            source.field = try parseAntflySourceStringLikeValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "metric") or std.ascii.eqlIgnoreCase(field_name, "graph_metric")) {
+            if (source.metric != null) return error.UnsupportedSqlShape;
+            source.metric = try parseAntflySourceStringLikeValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "freshness") or std.ascii.eqlIgnoreCase(field_name, "metric_freshness")) {
+            if (source.freshness != null) return error.UnsupportedSqlShape;
+            source.freshness = try parseAntflySourceStringLikeValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "weight")) {
+            if (source.weight != null) return error.UnsupportedSqlShape;
+            source.weight = try parseAntflySourceNumberValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "base_weight")) {
+            if (source.base_weight != null) return error.UnsupportedSqlShape;
+            source.base_weight = try parseAntflySourceNumberValue(tokens, pos);
+        } else if (std.ascii.eqlIgnoreCase(field_name, "missing_score")) {
+            if (source.missing_score != null) return error.UnsupportedSqlShape;
+            source.missing_score = try parseAntflySourceNumberValue(tokens, pos);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+    }
+    _ = try expectSqlToken(tokens, pos, .rparen);
+    if (source.kind.len == 0) {
+        source.kind = if (source.metric != null)
+            "graph_metric"
+        else if (source.field != null)
+            "full_text"
+        else
+            "semantic";
+    }
+    return source;
+}
+
+fn parseAntflySourceStringLikeValue(tokens: []const Token, pos: *usize) ![]const u8 {
+    if (matchSqlToken(tokens, pos, .string)) |token| return token.text;
+    return (try expectSqlToken(tokens, pos, .identifier)).text;
+}
+
+fn parseAntflySourceNumberValue(tokens: []const Token, pos: *usize) ![]const u8 {
+    return (try expectSqlToken(tokens, pos, .number)).text;
 }
 
 pub fn antflyQueryFunctionFromSqlName(name: []const u8) ?AntflyQueryFunction {
@@ -124,6 +248,14 @@ fn matchSqlToken(tokens: []const Token, pos: *usize, kind: TokenKind) ?Token {
     return token;
 }
 
+fn matchSqlKeyword(tokens: []const Token, pos: *usize, keyword: []const u8) ?Token {
+    if (pos.* >= tokens.len or tokens[pos.*].kind != .identifier) return null;
+    if (!std.ascii.eqlIgnoreCase(tokens[pos.*].text, keyword)) return null;
+    const token = tokens[pos.*];
+    pos.* += 1;
+    return token;
+}
+
 pub fn antflyQueryFunctionArg(args: []const SqlQueryFunctionArg, name: []const u8) ?SqlQueryFunctionArgValue {
     for (args) |arg| {
         if (std.ascii.eqlIgnoreCase(arg.name, name)) return arg.value;
@@ -137,6 +269,7 @@ pub fn antflyQueryFunctionStringArg(args: []const SqlQueryFunctionArg, name: []c
         .string => |text| text,
         .number => |text| text,
         .boolean => null,
+        .source_specs => null,
     };
 }
 
@@ -156,6 +289,14 @@ pub fn antflyQueryFunctionBoolArg(args: []const SqlQueryFunctionArg, name: []con
     };
 }
 
+fn antflyQueryFunctionSourcesArg(args: []const SqlQueryFunctionArg, name: []const u8) ?[]const HybridSqlSourceSpec {
+    const value = antflyQueryFunctionArg(args, name) orelse return null;
+    return switch (value) {
+        .source_specs => |sources| sources,
+        else => null,
+    };
+}
+
 pub fn requireAntflyQueryFunctionStringArg(args: []const SqlQueryFunctionArg, name: []const u8) ![]const u8 {
     const value = antflyQueryFunctionStringArg(args, name) orelse return error.UnsupportedSqlShape;
     if (value.len == 0) return error.UnsupportedSqlShape;
@@ -171,7 +312,10 @@ pub fn lowerAntflyQueryFunctionSqlAlloc(
     defer lexer_mod.freeTokens(alloc, &tokens);
 
     var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
-    defer args.deinit(alloc);
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
     var pos: usize = 0;
     const function = try parseAntflyQueryFunctionCall(alloc, tokens.items, &pos, &args);
 
@@ -767,6 +911,11 @@ fn appendHybridFunctionBody(
     if (antflyQueryFunctionStringArg(args, "sources_json")) |sources_json| {
         return try appendStructuredHybridFunctionBody(alloc, out, first, args, sources_json);
     }
+    if (antflyQueryFunctionSourcesArg(args, "sources")) |sources| {
+        const sources_json = try hybridSourceSpecsJsonAlloc(alloc, sources);
+        defer alloc.free(sources_json);
+        return try appendStructuredHybridFunctionBody(alloc, out, first, args, sources_json);
+    }
 
     const query = requireAntflyQueryFunctionStringArg(args, "query") catch try requireAntflyQueryFunctionStringArg(args, "text");
     var semantic_indexes = std.ArrayListUnmanaged([]const u8).empty;
@@ -902,6 +1051,16 @@ fn hybridSourcesPrimaryTextIndexAlloc(
     alloc: std.mem.Allocator,
     args: []const SqlQueryFunctionArg,
 ) !?[]const u8 {
+    if (antflyQueryFunctionSourcesArg(args, "sources")) |sources| {
+        var primary: ?[]const u8 = null;
+        for (sources) |source| {
+            if (!std.ascii.eqlIgnoreCase(source.kind, "full_text") and !std.ascii.eqlIgnoreCase(source.kind, "text")) continue;
+            if (primary != null) return error.UnsupportedSqlShape;
+            primary = source.index;
+        }
+        return if (primary) |index_name| try alloc.dupe(u8, index_name) else null;
+    }
+
     const sources_json = antflyQueryFunctionStringArg(args, "sources_json") orelse return null;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, sources_json, .{});
     defer parsed.deinit();
@@ -916,6 +1075,32 @@ fn hybridSourcesPrimaryTextIndexAlloc(
         primary = jsonObjectString(source, "index") orelse jsonObjectString(source, "index_name") orelse return error.UnsupportedSqlShape;
     }
     return if (primary) |index_name| try alloc.dupe(u8, index_name) else null;
+}
+
+fn hybridSourceSpecsJsonAlloc(
+    alloc: std.mem.Allocator,
+    sources: []const HybridSqlSourceSpec,
+) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '[');
+    for (sources, 0..) |source, i| {
+        if (i > 0) try out.append(alloc, ',');
+        try out.append(alloc, '{');
+        var first = true;
+        try appendAntflySqlJsonStringField(alloc, &out, &first, "kind", source.kind);
+        try appendAntflySqlJsonStringField(alloc, &out, &first, "index", source.index);
+        if (source.name) |name| try appendAntflySqlJsonStringField(alloc, &out, &first, "name", name);
+        if (source.field) |field| try appendAntflySqlJsonStringField(alloc, &out, &first, "field", field);
+        if (source.metric) |metric| try appendAntflySqlJsonStringField(alloc, &out, &first, "metric", metric);
+        if (source.freshness) |freshness| try appendAntflySqlJsonStringField(alloc, &out, &first, "freshness", freshness);
+        if (source.weight) |weight| try appendAntflySqlJsonNumberField(alloc, &out, &first, "weight", weight);
+        if (source.base_weight) |base_weight| try appendAntflySqlJsonNumberField(alloc, &out, &first, "base_weight", base_weight);
+        if (source.missing_score) |missing_score| try appendAntflySqlJsonNumberField(alloc, &out, &first, "missing_score", missing_score);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn hybridSourceDefaultName(kind: []const u8, index_name: []const u8) []const u8 {
@@ -1328,6 +1513,27 @@ test "sql adapter query function lowers antfly query functions into native searc
     try expectMergeWeight(structured_merge.weights, "full_text_search", 0.25);
     try expectMergeWeight(structured_merge.weights, "docs_body_semantic", 0.6);
     try expectMergeWeight(structured_merge.weights, "graph_metric_rerank", 0.15);
+
+    var helper_hybrid = try lowerAntflyQueryFunctionSqlAlloc(alloc, resolver,
+        \\SELECT * FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources => ARRAY[antfly.source('docs_body_fts', field => 'body', weight => 0.25), antfly.source('docs_body_semantic', weight => 0.6), antfly.source('docs_edge_graph', metric => 'pagerank', weight => 0.15, base_weight => 0.5, missing_score => 0.1, freshness => 'fresh')], limit => 9);
+    );
+    defer helper_hybrid.deinit(alloc);
+    try std.testing.expectEqualStrings("docs_body_fts", helper_hybrid.req.primary_text_index_name.?);
+    try std.testing.expect(helper_hybrid.req.full_text != null);
+    try std.testing.expect(helper_hybrid.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", helper_hybrid.req.full_text.?.match.field);
+    try std.testing.expectEqual(@as(usize, 1), helper_hybrid.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_body_semantic", helper_hybrid.req.dense_queries[0].index_name);
+    try std.testing.expect(helper_hybrid.req.graph_metric_rerank != null);
+    try std.testing.expectEqualStrings("docs_edge_graph", helper_hybrid.req.graph_metric_rerank.?.index_name);
+    try std.testing.expectEqualStrings("pagerank", helper_hybrid.req.graph_metric_rerank.?.metric_name);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, helper_hybrid.req.graph_metric_rerank.?.freshness);
+    const helper_merge = helper_hybrid.req.merge_config orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 25), helper_merge.window_size);
+    try std.testing.expectEqual(@as(usize, 3), helper_merge.weights.len);
+    try expectMergeWeight(helper_merge.weights, "full_text_search", 0.25);
+    try expectMergeWeight(helper_merge.weights, "docs_body_semantic", 0.6);
+    try expectMergeWeight(helper_merge.weights, "graph_metric_rerank", 0.15);
 }
 
 fn expectMergeWeight(weights: []const @import("../../search/fusion.zig").NamedWeight, name: []const u8, expected: f64) !void {

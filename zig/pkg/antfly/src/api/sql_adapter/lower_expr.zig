@@ -24370,6 +24370,100 @@ test "sql adapter lower expr lowers uuid generation projections" {
     try std.testing.expectEqual(@as(usize, 1), projected_extension.plan.query.expressions.len);
     try std.testing.expectEqualStrings("request_id", projected_extension.plan.query.expressions[0].output);
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.uuid_v4, projected_extension.plan.query.expressions[0].expression.kind);
+
+    var ordered_extension = try lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE id = $1 ORDER BY extension_lower(request_id) DESC",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .extension_functions = &.{.{
+            .sql_name = "extension_lower",
+            .native_expression_kind = .lower,
+            .arity = 1,
+        }} },
+    );
+    defer ordered_extension.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), ordered_extension.plan.query.order_by.len);
+    const order_expression = ordered_extension.plan.query.order_by[0].expression orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, order_expression.kind);
+    try std.testing.expectEqual(@as(usize, 1), order_expression.operands.len);
+    try std.testing.expectEqualStrings("request_id", order_expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, ordered_extension.plan.query.order_by[0].direction);
+
+    if (lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, extension_uuid() AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .extension_functions = &.{
+            .{
+                .sql_name = "extension_uuid",
+                .native_expression_kind = .uuid_v4,
+                .arity = 0,
+            },
+            .{
+                .sql_name = "extension_uuid",
+                .native_expression_kind = .uuid_v4,
+                .arity = 0,
+            },
+        } },
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+    if (lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        "SELECT id, extension_uuid('unexpected') AS request_id FROM usage_records WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+        .{ .extension_functions = &.{.{
+            .sql_name = "extension_uuid",
+            .native_expression_kind = .uuid_v4,
+            .arity = 0,
+        }} },
+    )) |unexpected| {
+        var lowered_unexpected = unexpected;
+        lowered_unexpected.deinit(alloc);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape, error.InvalidSqlCatalog => {},
+        else => return err,
+    }
+}
+
+test "sql adapter lower expr lowers concat projections" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"first_name":{"type":"keyword"},"last_name":{"type":"keyword"},"email":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLowerExprTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var lowered = try lowerQueryPlanForLowerExprTestAlloc(
+        alloc,
+        "SELECT concat(first_name, ' ', last_name, ' <', lower(email), '>') AS display_label FROM users WHERE id = $1",
+        schema,
+        &.{.{ .string = "u1" }},
+    );
+    defer lowered.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), lowered.plan.query.select.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.expressions.len);
+    try std.testing.expectEqualStrings("display_label", lowered.plan.query.expressions[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat, lowered.plan.query.expressions[0].expression.kind);
+    try std.testing.expectEqual(@as(usize, 6), lowered.plan.query.expressions[0].expression.operands.len);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, lowered.plan.query.expressions[0].expression.operands[0].kind);
+    try std.testing.expectEqualStrings("first_name", lowered.plan.query.expressions[0].expression.operands[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.value, lowered.plan.query.expressions[0].expression.operands[1].kind);
+    try std.testing.expectEqualStrings("\" \"", lowered.plan.query.expressions[0].expression.operands[1].value_json);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.lower, lowered.plan.query.expressions[0].expression.operands[4].kind);
+    try std.testing.expectEqualStrings("email", lowered.plan.query.expressions[0].expression.operands[4].operands[0].field);
+    try std.testing.expectEqual(@as(usize, 1), lowered.plan.query.predicates.len);
+    try std.testing.expectEqualStrings("id", lowered.plan.query.predicates[0].field);
 }
 
 test "sql adapter lower expr assembles boolean predicate groups" {
