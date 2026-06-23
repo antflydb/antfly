@@ -337,6 +337,7 @@ pub const ForeignKeyIntegrityViolation = relational_store_mod.ForeignKeyIntegrit
 pub const ForeignKeyDeletePlan = relational_store_mod.ForeignKeyDeletePlan;
 pub const UniqueConstraintIntegrityReport = relational_store_mod.UniqueConstraintIntegrityReport;
 pub const local_schema_json_key = "\x00\x00__metadata__:schema_json";
+pub const local_lite_sql_table_record_json_key = "\x00\x00__metadata__:lite_sql_table_record_json";
 const foreign_key_integrity_progress_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_progress";
 const foreign_key_integrity_claim_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_claim";
 const foreign_key_integrity_job_key_prefix = "\x00\x00__metadata__:foreign_key_integrity_job";
@@ -8525,12 +8526,68 @@ pub const DB = struct {
         try self.mirrorHASchemaMetadataCommit(table_schema);
     }
 
+    fn setSchemaWithLocalLiteSqlTableRecordJson(
+        self: *DB,
+        table_schema: schema_mod.TableSchema,
+        schema_json: []const u8,
+        table_record_json: []const u8,
+    ) !void {
+        try validateRuntimeSchemaFeatureLevel(table_schema);
+        const metadata_puts = [_]schema_mod.SchemaMetadataPut{
+            .{
+                .key = local_schema_json_key,
+                .value = schema_json,
+            },
+            .{
+                .key = local_lite_sql_table_record_json_key,
+                .value = table_record_json,
+            },
+        };
+        try self.core.setSchemaWithMetadata(table_schema, metadata_puts[0..]);
+        self.refreshSchemaRuntimeSideEffects();
+        try self.mirrorHASchemaMetadataCommit(table_schema);
+    }
+
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
         try self.applyTableSchemaJson(alloc, schema_json, .{});
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
         return try self.core.getStoreValue(alloc, local_schema_json_key);
+    }
+
+    pub fn applyLiteSqlTableRecord(self: *DB, alloc: Allocator, table: metadata_table_manager.TableRecord) !void {
+        if (table.schema_json.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        try self.enforceHAWriteGate();
+        try self.preflightHAMetadataSyncCommit();
+
+        const table_record_json = try std.json.Stringify.valueAlloc(alloc, table, .{});
+        defer alloc.free(table_record_json);
+
+        var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, table.schema_json);
+        defer parsed_schema.deinit(alloc);
+
+        const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        try self.validateTableSchemaCompatibilityLocked(alloc, runtime_schema);
+        try self.stageAlgebraicSchemaConfigsPending(table.schema_json);
+        try self.migrateRelationalRowsForSchemaTransitionLocked(alloc, runtime_schema);
+        try self.migrateRelationalConstraintsForSchemaTransitionLocked(alloc, runtime_schema);
+        try self.setSchemaWithLocalLiteSqlTableRecordJson(runtime_schema, table.schema_json, table_record_json);
+        try self.completePendingAlgebraicSchemaRebuilds();
+    }
+
+    pub fn getLiteSqlTableRecordAlloc(self: *DB, alloc: Allocator) !?metadata_table_manager.TableRecord {
+        const raw = (try self.core.getStoreValue(alloc, local_lite_sql_table_record_json_key)) orelse return null;
+        defer alloc.free(raw);
+        var parsed = try std.json.parseFromSlice(metadata_table_manager.TableRecord, alloc, raw, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return try metadata_table_manager.cloneTable(alloc, parsed.value);
     }
 
     pub fn beginTransaction(self: *DB, timestamp_ns: u64) !transactions_mod.TxnId {

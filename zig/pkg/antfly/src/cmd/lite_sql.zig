@@ -27,6 +27,7 @@ const raft_reconciler = antfly.raft.reconciler;
 const relational_rows = antfly.public_api.relational_rows;
 const sql_adapter = antfly.public_api.sql_adapter;
 const sql_adapter_runtime = antfly.public_api.sql_adapter_runtime;
+const storage_db_types = antfly.db_types;
 const storage_schema = antfly.schema;
 const table_catalog = antfly.public_api.table_catalog;
 const table_reads = antfly.public_api.table_reads;
@@ -178,10 +179,20 @@ pub fn repl(allocator: Allocator, io: std.Io, path: []const u8, session: *Sessio
 }
 
 fn executeOne(allocator: Allocator, io: std.Io, path: []const u8, session: *Session, sql: []const u8) !bool {
-    var lite = try LiteDb.open(allocator, path, .writer);
+    var parsed_sql = sql_adapter.ParsedSql.initAlloc(allocator, sql) catch |err| {
+        std.debug.print("SQL error: {}\n", .{err});
+        return false;
+    };
+    defer parsed_sql.deinit(allocator);
+
+    const open_mode: antfly.db.OpenMode = switch (parsed_sql.statement) {
+        .read => .query_readonly,
+        else => .writer,
+    };
+    var lite = try LiteDb.open(allocator, path, open_mode);
     defer lite.close();
 
-    const body = executeOneJsonAlloc(allocator, &lite.db, session, sql) catch |err| {
+    const body = executeParsedSqlJsonAlloc(allocator, &lite.db, session, &parsed_sql) catch |err| {
         std.debug.print("SQL error: {}\n", .{err});
         return false;
     };
@@ -193,10 +204,13 @@ fn executeOne(allocator: Allocator, io: std.Io, path: []const u8, session: *Sess
 pub fn executeOneJsonAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, sql: []const u8) ![]u8 {
     var parsed_sql = try sql_adapter.ParsedSql.initAlloc(allocator, sql);
     defer parsed_sql.deinit(allocator);
+    return try executeParsedSqlJsonAlloc(allocator, db, session, &parsed_sql);
+}
 
-    if (parsed_sql.writeStatementKind() != null) return try executeWriteAlloc(allocator, db, session, &parsed_sql);
-    if (parsed_sql.readStatementKind() != null) return try executeReadAlloc(allocator, db, session, &parsed_sql);
-    return try executeDdlAlloc(allocator, db, session, &parsed_sql);
+fn executeParsedSqlJsonAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
+    if (parsed_sql.writeStatementKind() != null) return try executeWriteAlloc(allocator, db, session, parsed_sql);
+    if (parsed_sql.readStatementKind() != null) return try executeReadAlloc(allocator, db, session, parsed_sql);
+    return try executeDdlAlloc(allocator, db, session, parsed_sql);
 }
 
 fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
@@ -206,28 +220,26 @@ fn executeDdlAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, p
     const table_name = try ddlTargetTableNameAlloc(allocator, plan, session.catalog.session());
     defer allocator.free(table_name);
 
-    const existing_schema = try db.getSchemaJson(allocator);
-    defer if (existing_schema) |schema_json| allocator.free(schema_json);
-    const base_schema = existing_schema orelse "";
-    var table_record = metadata_table_manager.TableRecord{
+    const existing_table = try loadLiteSqlTableRecordForTargetAlloc(allocator, db, table_name, session.catalog.session());
+    defer if (existing_table) |table| metadata_table_manager.freeTable(allocator, table);
+    const base_table = if (existing_table) |table| table else metadata_table_manager.TableRecord{
         .table_id = 1,
         .name = table_name,
         .database_name = session.catalog.session().currentDatabase(),
         .namespace_name = session.catalog.session().primarySearchPathNamespace(),
         .placement_role = "data",
         .desired_replica_count = 1,
-        .schema_json = base_schema,
     };
 
     var applied = try tables_api.applyRelationalSqlDdlPlanToTableRecordWithSessionAlloc(
         allocator,
-        &table_record,
+        &base_table,
         &plan,
         session.catalog.session(),
     );
     defer applied.deinit(allocator);
 
-    try db.applyTableSchemaJson(allocator, applied.table.schema_json, .{});
+    try db.applyLiteSqlTableRecord(allocator, applied.table);
 
     const response = DdlResponse{
         .session_id = session.sessionId(),
@@ -241,9 +253,9 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
     const target_table = try writeTargetTableNameAlloc(allocator, parsed_sql);
     defer allocator.free(target_table);
 
-    const schema_json = (try db.getSchemaJson(allocator)) orelse return error.InvalidSqlCatalog;
-    defer allocator.free(schema_json);
-    var catalog = SingleTableCatalog.init(target_table, schema_json, session.catalog.session());
+    const table_record = (try loadLiteSqlTableRecordForTargetAlloc(allocator, db, target_table, session.catalog.session())) orelse return error.InvalidSqlCatalog;
+    defer metadata_table_manager.freeTable(allocator, table_record);
+    var catalog = SingleTableCatalog.init(table_record);
     const catalog_source = catalog.iface();
 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, target_table, session.catalog.session());
@@ -279,12 +291,14 @@ fn executeWriteAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session,
 
 fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, parsed_sql: *const sql_adapter.ParsedSql) ![]u8 {
     const statement_kind = parsed_sql.readStatementKind() orelse return error.UnsupportedSqlShape;
+    if (try executeAntflyQueryFunctionReadAlloc(allocator, db, session, parsed_sql, statement_kind)) |body| return body;
+
     var table_names = (try sql_adapter.readSourceTableNamesFromParsedSqlAlloc(allocator, parsed_sql)) orelse return error.UnsupportedSqlShape;
     defer table_names.deinit(allocator);
 
-    const schema_json = (try db.getSchemaJson(allocator)) orelse return error.InvalidSqlCatalog;
-    defer allocator.free(schema_json);
-    var catalog = SingleTableCatalog.init(table_names.left, schema_json, session.catalog.session());
+    const table_record = (try loadLiteSqlTableRecordForTargetAlloc(allocator, db, table_names.left, session.catalog.session())) orelse return error.InvalidSqlCatalog;
+    defer metadata_table_manager.freeTable(allocator, table_record);
+    var catalog = SingleTableCatalog.init(table_record);
     const catalog_source = catalog.iface();
 
     const schema = try sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(allocator, catalog_source, table_names.left, session.catalog.session());
@@ -314,6 +328,53 @@ fn executeReadAlloc(allocator: Allocator, db: *antfly.db.DB, session: *Session, 
     defer result.deinit(allocator);
 
     return try encodeReadResultAlloc(allocator, session.sessionId(), @tagName(statement_kind), result);
+}
+
+fn executeAntflyQueryFunctionReadAlloc(
+    allocator: Allocator,
+    db: *antfly.db.DB,
+    session: *Session,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    statement_kind: sql_adapter.SqlReadStatementKind,
+) !?[]u8 {
+    var lowered = sql_adapter.lowerAntflyQueryFunctionReadParsedSqlAlloc(allocator, null, parsed_sql) catch |err| switch (err) {
+        error.UnsupportedSqlShape => return null,
+        else => return err,
+    };
+    defer lowered.deinit(allocator);
+
+    var read_source = table_reads.BoundTableReadSource.init(lowered.table_name, 1, db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var query_response = (try read_source.source().query(allocator, lowered.table_name, lowered.request.req, .read_index)) orelse return error.TableNotFound;
+    defer query_response.deinit(allocator);
+
+    var rows = try sqlQueryFunctionRowsFromQueryResponseAlloc(allocator, query_response.json);
+    defer rows.deinit(allocator);
+    return try encodeReadResultAlloc(
+        allocator,
+        session.sessionId(),
+        @tagName(statement_kind),
+        .{ .document_query = rows },
+    );
+}
+
+fn loadLiteSqlTableRecordForTargetAlloc(
+    allocator: Allocator,
+    db: *antfly.db.DB,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !?metadata_table_manager.TableRecord {
+    if (try db.getLiteSqlTableRecordAlloc(allocator)) |table| return table;
+    const schema_json = (try db.getSchemaJson(allocator)) orelse return null;
+    defer allocator.free(schema_json);
+    return try metadata_table_manager.cloneTable(allocator, .{
+        .table_id = 1,
+        .name = table_name,
+        .database_name = session.currentDatabase(),
+        .namespace_name = session.primarySearchPathNamespace(),
+        .placement_role = "data",
+        .desired_replica_count = 1,
+        .schema_json = schema_json,
+    });
 }
 
 const DdlResponse = struct {
@@ -364,19 +425,50 @@ fn encodeRowsBatchResultAlloc(allocator: Allocator, session_id: u64, statement_k
     return try out.toOwnedSlice();
 }
 
+fn sqlQueryFunctionRowsFromQueryResponseAlloc(
+    allocator: Allocator,
+    response_json: []const u8,
+) !storage_db_types.RelationalRowsQueryResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const responses_value = parsed.value.object.get("responses") orelse return error.InvalidQueryRequest;
+    if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidQueryRequest;
+    const first_response = responses_value.array.items[0];
+    if (first_response != .object) return error.InvalidQueryRequest;
+    const hits_value = first_response.object.get("hits") orelse return error.InvalidQueryRequest;
+    if (hits_value != .object) return error.InvalidQueryRequest;
+    const total_value = hits_value.object.get("total") orelse return error.InvalidQueryRequest;
+    const total = switch (total_value) {
+        .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @as(u32, @intCast(value)) else return error.InvalidQueryRequest,
+        .number_string => |text| std.fmt.parseUnsigned(u32, text, 10) catch return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
+    };
+    const hit_items = hits_value.object.get("hits") orelse return error.InvalidQueryRequest;
+    if (hit_items != .array) return error.InvalidQueryRequest;
+
+    const rows = try allocator.alloc([]const u8, hit_items.array.items.len);
+    errdefer allocator.free(rows);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| allocator.free(@constCast(row));
+    }
+    for (hit_items.array.items, 0..) |hit, i| {
+        if (hit != .object) return error.InvalidQueryRequest;
+        rows[i] = try std.json.Stringify.valueAlloc(allocator, hit, .{});
+        initialized += 1;
+    }
+    return .{
+        .rows = rows,
+        .total = total,
+    };
+}
+
 const SingleTableCatalog = struct {
     tables: [1]metadata_table_manager.TableRecord,
 
-    fn init(table_name: []const u8, schema_json: []const u8, session: catalog_resources.SqlCatalogSession) SingleTableCatalog {
-        return .{ .tables = .{.{
-            .table_id = 1,
-            .name = table_name,
-            .database_name = session.currentDatabase(),
-            .namespace_name = session.primarySearchPathNamespace(),
-            .placement_role = "data",
-            .desired_replica_count = 1,
-            .schema_json = schema_json,
-        }} };
+    fn init(table_record: metadata_table_manager.TableRecord) SingleTableCatalog {
+        return .{ .tables = .{table_record} };
     }
 
     fn iface(self: *SingleTableCatalog) table_catalog.CatalogSource {
@@ -656,7 +748,128 @@ fn printUsage() void {
 }
 
 test "lite sql statement splitter ignores quoted semicolons" {
-    try std.testing.expectEqual(@as(?usize, 40), firstStatementEnd("select ';' as semi, \"x;y\" from docs;"));
+    try std.testing.expectEqual(@as(?usize, 35), firstStatementEnd("select ';' as semi, \"x;y\" from docs;"));
     try std.testing.expectEqual(@as(?usize, 22), firstStatementEnd("select $$a;b$$ as body;"));
     try std.testing.expectEqual(@as(?usize, null), firstStatementEnd("select 'unterminated;"));
+}
+
+test "lite sql reads legacy local schema metadata without table record" {
+    const allocator = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-sql-legacy", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var db = try antfly.db.DB.open(allocator, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(allocator, schema_json, .{});
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"row:a\",\"status\":\"open\",\"amount\":42}" }},
+    });
+
+    const stored_table_record = try db.getLiteSqlTableRecordAlloc(allocator);
+    defer if (stored_table_record) |record| metadata_table_manager.freeTable(allocator, record);
+    try std.testing.expect(stored_table_record == null);
+
+    var session = try Session.init(allocator, .{});
+    defer session.deinit(allocator);
+    const body = try executeOneJsonAlloc(allocator, &db, &session, "SELECT id, amount FROM usage_records WHERE status = 'open';");
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"read\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"id\":\"row:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"amount\":42") != null);
+}
+
+test "lite sql ddl persists local table record metadata" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-sql-table-record", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var db = try antfly.db.DB.open(allocator, path, .{});
+    defer db.close();
+
+    var session = try Session.init(allocator, .{});
+    defer session.deinit(allocator);
+
+    const ddl_body = try executeOneJsonAlloc(allocator, &db, &session, "CREATE TABLE usage_records (id text PRIMARY KEY, status text);");
+    defer allocator.free(ddl_body);
+    var parsed_ddl = try std.json.parseFromSlice(std.json.Value, allocator, ddl_body, .{ .allocate = .alloc_always });
+    defer parsed_ddl.deinit();
+    try std.testing.expectEqualStrings("ddl", parsed_ddl.value.object.get("kind").?.string);
+
+    const table_record = (try db.getLiteSqlTableRecordAlloc(allocator)) orelse return error.TestUnexpectedResult;
+    defer metadata_table_manager.freeTable(allocator, table_record);
+    try std.testing.expectEqualStrings("usage_records", table_record.name);
+    try std.testing.expectEqualStrings(session.catalog.session().currentDatabase(), table_record.database_name);
+    try std.testing.expectEqualStrings(session.catalog.session().primarySearchPathNamespace(), table_record.namespace_name);
+    try std.testing.expect(std.mem.indexOf(u8, table_record.schema_json, "\"storage_mode\":\"relational\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table_record.indexes_json, "\"algebraic_index_v0\"") != null);
+
+    const read_body = try executeOneJsonAlloc(allocator, &db, &session, "SELECT id, status FROM usage_records;");
+    defer allocator.free(read_body);
+    try std.testing.expect(std.mem.indexOf(u8, read_body, "\"kind\":\"read\"") != null);
+
+    try std.testing.expectError(error.InvalidSqlCatalog, executeOneJsonAlloc(allocator, &db, &session, "SELECT id, status FROM other_records;"));
+    try std.testing.expectError(error.InvalidSqlCatalog, executeOneJsonAlloc(allocator, &db, &session, "INSERT INTO other_records (id, status) VALUES ('row:a', 'open');"));
+}
+
+test "lite sql antfly query functions use native document query path" {
+    const allocator = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
+    ;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/lite-sql-query-functions", .{tmp.sub_path});
+    defer allocator.free(path);
+
+    var db = try antfly.db.DB.open(allocator, path, .{});
+    defer db.close();
+    try db.applyLiteSqlTableRecord(allocator, .{
+        .table_id = 1,
+        .name = "docs",
+        .database_name = "default",
+        .namespace_name = "public",
+        .placement_role = "data",
+        .desired_replica_count = 1,
+        .schema_json = schema_json,
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\",\"field\":\"title\"}}",
+    });
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\"}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var session = try Session.init(allocator, .{});
+    defer session.deinit(allocator);
+    const body = try executeOneJsonAlloc(
+        allocator,
+        &db,
+        &session,
+        "SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'full_text_index_v0', field => 'title', query => 'alpha', limit => 5);",
+    );
+    defer allocator.free(body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("read", parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed.value.object.get("statement_kind").?.string);
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), result.get("total").?.integer);
+    const row = result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", row.get("_source").?.object.get("title").?.string);
 }
