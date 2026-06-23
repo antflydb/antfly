@@ -75,31 +75,38 @@ fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     return null;
 }
 
-fn parseWarmModelKind(value: []const u8) ?inference.server.WarmModelKind {
+fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
     inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
         if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
     }
     return null;
 }
 
-fn parseWarmModelFlag(value: []const u8) !inference.server.WarmModel {
+fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
     const kind_name = value[0..separator];
-    const model_name = value[separator + 1 ..];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
-        .kind = parseWarmModelKind(kind_name) orelse return error.InvalidArguments,
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
+        .backend = backend,
     };
 }
 
-fn warmModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
+fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConfig.WarmModelConfig) ![]inference.server.WarmModel {
     if (values.len == 0) return &.{};
     const out = try allocator.alloc(inference.server.WarmModel, values.len);
     errdefer allocator.free(out);
     for (values, 0..) |value, i| {
         out[i] = .{
-            .kind = parseWarmModelKind(value.kind) orelse return error.InvalidArguments,
+            .kind = parsePreloadModelKind(value.kind) orelse return error.InvalidArguments,
             .name = value.name,
             .backend = if (value.backend) |backend| parseBackendType(backend) orelse return error.InvalidArguments else null,
         };
@@ -208,8 +215,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     var config_path: ?[]const u8 = null;
     var models_overridden = false;
     var ml_overridden = false;
-    var warm_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
-    defer warm_models.deinit(allocator);
+    var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer preload_models.deinit(allocator);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -230,8 +237,8 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
-        } else if (std.mem.eql(u8, args[i], "--warm-model") and i + 1 < args.len) {
-            try warm_models.append(allocator, try parseWarmModelFlag(args[i + 1]));
+        } else if (std.mem.eql(u8, args[i], "--preload-model") and i + 1 < args.len) {
+            try preload_models.append(allocator, try parsePreloadModelFlag(args[i + 1]));
             i += 1;
         }
     }
@@ -261,20 +268,20 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     // signal-context stop path could close the listener while accept() was in
     // flight, which panicked under Zig's threaded IO backend.
 
-    var config_warm_models: []inference.server.WarmModel = &.{};
-    defer if (config_warm_models.len > 0) allocator.free(config_warm_models);
+    var config_preload_models: []inference.server.WarmModel = &.{};
+    defer if (config_preload_models.len > 0) allocator.free(config_preload_models);
 
     var node_cfg = inference.server.NodeConfig{
         .models_dir = models_dir,
         .ml_dir = ml_dir,
-        .preload = warm_models.items,
+        .preload = preload_models.items,
     };
     if (loaded_cfg) |cfg| {
         node_cfg.content_security = cfg.content_security;
         node_cfg.s3_credentials = cfg.s3_credentials;
-        if (warm_models.items.len == 0) {
-            config_warm_models = try warmModelsFromConfig(allocator, cfg.preload);
-            node_cfg.preload = config_warm_models;
+        if (preload_models.items.len == 0) {
+            config_preload_models = try preloadModelsFromConfig(allocator, cfg.preload);
+            node_cfg.preload = config_preload_models;
         }
         if (cfg.keep_alive_ms) |value| node_cfg.keep_alive_ms = value;
         if (cfg.max_loaded_models) |value| node_cfg.max_loaded_models = value;
@@ -421,7 +428,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  --port <port>     Listen port (default: 8090)
         \\  --models-dir <dir>    AI models directory (default: ~/.antfly/inference/models)
         \\  --ml-dir <dir>        Traditional ML directory (default: ~/.antfly/inference/ml)
-        \\  --warm-model <kind:name> Preload and warm a configured model before serving
+        \\  --preload-model <kind:name|kind:backend:name> Preload and warm a configured model before serving
         \\
         \\Pull options:
         \\  --token <token>   HuggingFace API token (or set HF_TOKEN env var)

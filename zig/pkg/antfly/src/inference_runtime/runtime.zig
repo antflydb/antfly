@@ -88,21 +88,28 @@ pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     return null;
 }
 
-fn parseWarmModelKind(value: []const u8) ?inference.server.WarmModelKind {
+fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
     inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
         if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
     }
     return null;
 }
 
-fn parseWarmModelFlag(value: []const u8) !inference.server.WarmModel {
+fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
     const kind_name = value[0..separator];
-    const model_name = value[separator + 1 ..];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
-        .kind = parseWarmModelKind(kind_name) orelse return error.InvalidArguments,
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
+        .backend = backend,
     };
 }
 
@@ -136,7 +143,7 @@ pub fn runFromIterator(
         inference.native_generate.main(alloc, io, try collectArgs(alloc, args)) catch |err| switch (err) {
             error.WarmInferenceServerUnavailable => {
                 std.debug.print(
-                    "warm inference server unavailable; start one with `antfly inference run --warm-model generator:<model>` and pass --server\n",
+                    "warm inference server unavailable; start one with `antfly inference run --preload-model generator:<model>` and pass --server\n",
                     .{},
                 );
                 std.process.exit(1);
@@ -191,8 +198,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
-    var warm_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
-    defer warm_models.deinit(alloc);
+    var preload_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer preload_models.deinit(alloc);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host")) {
@@ -213,8 +220,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.kv_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--scratch-budget-mb")) {
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
-        } else if (std.mem.eql(u8, arg, "--warm-model")) {
-            try warm_models.append(alloc, try parseWarmModelFlag(args.next() orelse return error.InvalidArguments));
+        } else if (std.mem.eql(u8, arg, "--preload-model")) {
+            try preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
         }
     }
 
@@ -226,7 +233,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
-        .preload = warm_models.items,
+        .preload = preload_models.items,
     });
     defer node.deinit();
 
@@ -444,7 +451,7 @@ fn printUsage() void {
         \\  --combined-budget-mb <n>  Native generation combined budget override
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
-        \\  --warm-model <kind:name>  Preload and warm a configured model before serving
+        \\  --preload-model <kind:name|kind:backend:name>  Preload and warm a configured model before serving
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)

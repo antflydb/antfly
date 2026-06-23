@@ -103,6 +103,7 @@ const Options = struct {
     artifact_dir: ?[]const u8 = null,
     server_url: ?[]const u8 = null,
     require_server: bool = false,
+    stream: bool = false,
     json_timing_path: ?[]const u8 = null,
 };
 
@@ -275,11 +276,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             )) return;
         }
 
-        var result = try pipeline.generate(&messages, config);
+        var result = try generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream);
         defer result.deinit();
         const finished_generate_at = std.Io.Timestamp.now(io, .awake);
 
-        print("{s}\n", .{result.text});
+        if (!opts.stream) print("{s}\n", .{result.text});
         if (opts.print_token_ids) {
             if (result.token_ids) |ids| {
                 print("token_ids:", .{});
@@ -703,7 +704,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (draft_model) |loaded_draft| session_factory.getCudaRuntimeStats(loaded_draft.session) else null
     else
         null;
-    var result = pipeline.generate(&messages, config) catch |err| {
+    var result = generateWithOptionalStreaming(&pipeline, &messages, config, opts.stream) catch |err| {
         if (err == error.MemoryBudgetExceeded) {
             printBudgetExceeded(model.session, &run_budget);
         } else if (err == error.AudioInputTooLong) {
@@ -736,7 +737,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         null;
     defer result.deinit();
 
-    print("{s}\n", .{result.text});
+    if (!opts.stream) print("{s}\n", .{result.text});
     if (opts.print_token_ids) {
         if (result.token_ids) |ids| {
             print("token_ids:", .{});
@@ -3425,11 +3426,11 @@ fn runOnnxWholeModelGraphGenerate(
     };
 
     gpt_arch.resetDebugTimingStats();
-    var result = try pipeline.generate(messages, config);
+    var result = try generateWithOptionalStreaming(&pipeline, messages, config, opts.stream);
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
     defer result.deinit();
 
-    print("{s}\n", .{result.text});
+    if (!opts.stream) print("{s}\n", .{result.text});
     if (opts.print_token_ids) {
         if (result.token_ids) |ids| {
             print("token_ids:", .{});
@@ -3537,6 +3538,42 @@ fn emitArtifactResultAndExit(
     std.process.exit(0);
 }
 
+const CliStreamPrinter = struct {
+    wrote_text: bool = false,
+
+    fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(raw_ctx));
+        if (token_text.len > 0) {
+            print("{s}", .{token_text});
+            self.wrote_text = true;
+        }
+        return true;
+    }
+};
+
+fn generateWithOptionalStreaming(
+    pipeline: anytype,
+    messages: []const generation.Message,
+    config: generation.GenerationConfig,
+    stream: bool,
+) !generation.GenerationResult {
+    if (!stream) return pipeline.generate(messages, config);
+
+    var stream_printer = CliStreamPrinter{};
+    var result = try pipeline.generateStreaming(
+        messages,
+        config,
+        @ptrCast(&stream_printer),
+        CliStreamPrinter.onToken,
+    );
+    errdefer result.deinit();
+    if (!stream_printer.wrote_text and result.text.len > 0) {
+        print("{s}", .{result.text});
+    }
+    print("\n", .{});
+    return result;
+}
+
 fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, quiet_errors: bool) !void {
     if (!serverGenerateSupportsOptions(opts)) {
         return error.UnsupportedServerGenerateOption;
@@ -3562,6 +3599,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         .top_p = opts.top_p,
         .top_k = opts.top_k,
         .repetition_penalty = opts.repetition_penalty,
+        .stream = if (opts.stream) true else null,
         .cache_dtype = opts.cache_dtype,
         .cache_compaction_ratio = opts.cache_compaction_ratio,
         .backend = if (opts.backend == .auto) null else @tagName(opts.backend),
@@ -3570,6 +3608,10 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
     };
     const body = try httpx.json.Json.stringify(allocator, request);
     defer allocator.free(body);
+
+    if (opts.stream) {
+        return try runServerGenerateStream(allocator, io, &http, url, body, opts, quiet_errors);
+    }
 
     const started_at = std.Io.Timestamp.now(io, .awake);
     var resp = try http.post(url, .{ .json = body, .timeout_ms = 300_000 });
@@ -3607,6 +3649,148 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         else
             0;
         print("timing_ms: server_request={d} total={d} tokens_per_sec={d:.2}\n", .{ total_ms, total_ms, tokens_per_sec });
+    }
+}
+
+const SseEventBoundary = struct {
+    end: usize,
+    delimiter_len: usize,
+};
+
+const ServerGenerateSseWriter = struct {
+    allocator: std.mem.Allocator,
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+    finish_reason: ?api.FinishReason = null,
+    stream_error: bool = false,
+
+    fn deinit(self: *@This()) void {
+        self.buffer.deinit(self.allocator);
+    }
+
+    pub fn writeAll(self: *@This(), data: []const u8) !void {
+        try self.buffer.appendSlice(self.allocator, data);
+        try self.processCompleteEvents();
+    }
+
+    fn finish(self: *@This()) !void {
+        try self.processCompleteEvents();
+        if (std.mem.trim(u8, self.buffer.items, " \t\r\n").len != 0) return error.InvalidResponse;
+    }
+
+    fn processCompleteEvents(self: *@This()) !void {
+        while (findSseEventBoundary(self.buffer.items)) |boundary| {
+            try self.handleEvent(self.buffer.items[0..boundary.end]);
+            const consumed = boundary.end + boundary.delimiter_len;
+            const remaining = self.buffer.items[consumed..];
+            std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
+            self.buffer.shrinkRetainingCapacity(remaining.len);
+        }
+    }
+
+    fn handleEvent(self: *@This(), raw_event: []const u8) !void {
+        var event_name: ?[]const u8 = null;
+        var data = std.ArrayListUnmanaged(u8).empty;
+        defer data.deinit(self.allocator);
+
+        var lines = std.mem.splitScalar(u8, raw_event, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, "\r");
+            if (line.len == 0 or line[0] == ':') continue;
+            if (std.mem.startsWith(u8, line, "event:")) {
+                event_name = std.mem.trim(u8, line["event:".len..], " ");
+            } else if (std.mem.startsWith(u8, line, "data:")) {
+                var value = line["data:".len..];
+                if (std.mem.startsWith(u8, value, " ")) value = value[1..];
+                if (data.items.len > 0) try data.append(self.allocator, '\n');
+                try data.appendSlice(self.allocator, value);
+            }
+        }
+
+        if (data.items.len == 0) return;
+        if (event_name) |name| {
+            if (std.mem.eql(u8, name, "error")) {
+                self.stream_error = true;
+                print("server_stream_error={s}\n", .{data.items});
+                return;
+            }
+        }
+        if (std.mem.eql(u8, data.items, "[DONE]")) return;
+
+        var parsed = try std.json.parseFromSlice(api.GenerateChunk, self.allocator, data.items, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        for (parsed.value.choices) |choice| {
+            if (choice.delta.content) |content| {
+                print("{s}", .{content});
+            }
+            if (choice.finish_reason) |finish_reason| {
+                self.finish_reason = finish_reason;
+            }
+        }
+    }
+};
+
+fn findSseEventBoundary(data: []const u8) ?SseEventBoundary {
+    if (std.mem.indexOf(u8, data, "\n\n")) |idx| {
+        return .{ .end = idx, .delimiter_len = 2 };
+    }
+    if (std.mem.indexOf(u8, data, "\r\n\r\n")) |idx| {
+        return .{ .end = idx, .delimiter_len = 4 };
+    }
+    return null;
+}
+
+fn runServerGenerateStream(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    http: *httpx.Client,
+    url: []const u8,
+    body: []const u8,
+    opts: Options,
+    quiet_errors: bool,
+) !void {
+    var stream_writer = ServerGenerateSseWriter{ .allocator = allocator };
+    defer stream_writer.deinit();
+
+    const headers = [_][2][]const u8{
+        .{ "Accept", "text/event-stream" },
+    };
+
+    const started_at = std.Io.Timestamp.now(io, .awake);
+    var resp = try http.requestToWriter(.POST, url, .{
+        .json = body,
+        .headers = &headers,
+        .timeout_ms = 300_000,
+    }, &stream_writer, null, null);
+    defer resp.deinit();
+    const finished_at = std.Io.Timestamp.now(io, .awake);
+
+    if (!resp.ok()) {
+        if (!quiet_errors) {
+            if (stream_writer.buffer.items.len > 0) {
+                print("server_error status={d} body={s}\n", .{ resp.status.code, stream_writer.buffer.items });
+            } else {
+                print("server_error status={d}\n", .{resp.status.code});
+            }
+        }
+        return error.GenerateRequestFailed;
+    }
+    try stream_writer.finish();
+    if (stream_writer.stream_error) return error.GenerateRequestFailed;
+
+    print("\n", .{});
+    if (opts.print_finish_reason or opts.print_token_count) {
+        const finish_reason = if (stream_writer.finish_reason) |reason| @tagName(reason) else "unknown";
+        if (opts.print_finish_reason and opts.print_token_count) {
+            print("finish_reason={s} tokens=unavailable\n", .{finish_reason});
+        } else if (opts.print_finish_reason) {
+            print("finish_reason={s}\n", .{finish_reason});
+        } else {
+            print("tokens=unavailable\n", .{});
+        }
+    }
+    if (opts.print_timing) {
+        const total_ms = durationMillis(started_at, finished_at);
+        print("timing_ms: server_request={d} total={d}\n", .{ total_ms, total_ms });
     }
 }
 
@@ -3818,6 +4002,8 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.print_chat_template_status = true;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--stream")) {
+            opts.stream = true;
         } else if (std.mem.eql(u8, arg, "--json-timing")) {
             i += 1;
             if (i >= args.len) return error.MissingJsonTimingPath;
@@ -4224,9 +4410,10 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--raw-prompt] [--no-bos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
+        \\  --stream prints generated text incrementally as token deltas arrive.
         \\  --require-server or ANTFLY_INFERENCE_REQUIRE_WARM_SERVER=1 fails unless a server URL is configured.
         \\  draft-model enables native speculative decoding with a tokenizer-compatible drafter such as a Gemma 4 *-assistant model.
         \\  speculation-calibration defaults to none; Gemma4 MTP auto mode requires probe or positive to run the drafter.
@@ -4307,12 +4494,14 @@ test "parseArgs accepts server URL" {
         "--server",
         "http://127.0.0.1:8090",
         "--require-server",
+        "--stream",
         "--max-tokens",
         "4",
     });
     try std.testing.expectEqualStrings("gemma-e2b", opts.model_dir);
     try std.testing.expectEqualStrings("http://127.0.0.1:8090", opts.server_url.?);
     try std.testing.expect(opts.require_server);
+    try std.testing.expect(opts.stream);
     try std.testing.expectEqual(@as(i32, 4), opts.max_tokens);
 }
 

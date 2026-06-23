@@ -59,7 +59,7 @@ const CliConfig = struct {
     inference_combined_budget_mb: usize = 0,
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
-    inference_warm_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
+    inference_preload_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -94,7 +94,7 @@ const CliConfig = struct {
 
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.ha_sync_standby_names.deinit(alloc);
-        self.inference_warm_models.deinit(alloc);
+        self.inference_preload_models.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -2057,21 +2057,28 @@ var active_api_server: ?*antfly.public_api.http_server.ApiHttpServer = null;
 // CLI parsing
 // ---------------------------------------------------------------
 
-fn parseWarmModelKind(value: []const u8) ?inference.server.WarmModelKind {
+fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
     inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
         if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
     }
     return null;
 }
 
-fn parseWarmModelFlag(value: []const u8) !inference.server.WarmModel {
+fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
     const kind_name = value[0..separator];
-    const model_name = value[separator + 1 ..];
+    var model_name = value[separator + 1 ..];
+    var backend: ?inference.backends.BackendType = null;
+    if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
+        const backend_name = model_name[0..backend_separator];
+        backend = antfly.inference_runtime.parseBackendType(backend_name) orelse return error.InvalidArguments;
+        model_name = model_name[backend_separator + 1 ..];
+    }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
-        .kind = parseWarmModelKind(kind_name) orelse return error.InvalidArguments,
+        .kind = parsePreloadModelKind(kind_name) orelse return error.InvalidArguments,
         .name = model_name,
+        .backend = backend,
     };
 }
 
@@ -2174,8 +2181,8 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--warm-model")) {
-            try cfg.inference_warm_models.append(alloc, try parseWarmModelFlag(args.next() orelse return error.InvalidArguments));
+        if (std.mem.eql(u8, arg, "--preload-model")) {
+            try cfg.inference_preload_models.append(alloc, try parsePreloadModelFlag(args.next() orelse return error.InvalidArguments));
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -2824,8 +2831,8 @@ fn resolveInferenceWarmModels(
     cli: CliConfig,
     cfg: ?*const antfly.common.config.Config,
 ) !ResolvedWarmModels {
-    if (cli.inference_warm_models.items.len > 0) {
-        return .{ .items = cli.inference_warm_models.items };
+    if (cli.inference_preload_models.items.len > 0) {
+        return .{ .items = cli.inference_preload_models.items };
     }
     const loaded = cfg orelse return .{ .items = &.{} };
     if (loaded.inference.preload.len == 0) return .{ .items = &.{} };
@@ -2834,7 +2841,7 @@ fn resolveInferenceWarmModels(
     errdefer alloc.free(out);
     for (loaded.inference.preload, 0..) |model, i| {
         out[i] = .{
-            .kind = parseWarmModelKind(model.kind) orelse return error.InvalidConfig,
+            .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidConfig,
             .name = model.name,
             .backend = if (model.backend) |backend| antfly.inference_runtime.parseBackendType(backend) orelse return error.InvalidConfig else null,
         };
@@ -2879,7 +2886,7 @@ fn printUsage() void {
         \\  --inference-combined-budget-mb <n>    Embedded inference native generation combined budget override
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
-        \\  --warm-model <kind:name>              Preload and warm an embedded model before serving
+        \\  --preload-model <kind:name|kind:backend:name> Preload and warm an embedded model before serving
         \\  --data-dir <path>                     Local Antfly data directory root
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
@@ -3280,8 +3287,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "/tmp/models",
         "--ml-dir",
         "/tmp/ml",
-        "--warm-model",
-        "generator:gemma-e2b",
+        "--preload-model",
+        "generator:metal:gemma-e2b",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -3292,9 +3299,10 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
-    try std.testing.expectEqual(@as(usize, 1), cfg.inference_warm_models.items.len);
-    try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_warm_models.items[0].kind);
-    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_warm_models.items[0].name);
+    try std.testing.expectEqual(@as(usize, 1), cfg.inference_preload_models.items.len);
+    try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_preload_models.items[0].kind);
+    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_preload_models.items[0].name);
+    try std.testing.expectEqual(inference.backends.BackendType.metal, cfg.inference_preload_models.items[0].backend.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
