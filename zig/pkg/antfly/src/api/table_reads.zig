@@ -5019,9 +5019,14 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
             }
         },
         .indexed_query => |query| {
-            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, lowered.limit, false, false, consistency)) orelse return null;
+            const query_limit = query.max_candidate_rows orelse lowered.limit;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
-            try appendDocumentSqlRowsFromQueryResponseAlloc(alloc, source, target, native_table_name, public_table_name, query_response.json, lowered.projection, consistency, &rows);
+            try appendDocumentSqlRowsFromQueryResponseAlloc(alloc, source, target, native_table_name, public_table_name, query_response.json, lowered.projection, query.residual_filter_json, lowered.limit, consistency, &rows);
+            if (query.residual_filter_json != null and rows.items.len < (lowered.limit orelse std.math.maxInt(u32))) {
+                const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+                if (query.max_candidate_rows == null or total_hits > query.max_candidate_rows.?) return error.DocumentSqlRequiresBoundedScan;
+            }
         },
         .bounded_scan => |scan_plan| {
             var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
@@ -5105,9 +5110,24 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
             break :blk total;
         },
         .indexed_query => |query| blk: {
-            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, null, false, false, consistency)) orelse return null;
+            const query_limit = query.max_candidate_rows;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
-            break :blk try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            if (query.residual_filter_json == null) break :blk try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            if (query.max_candidate_rows == null or total_hits > query.max_candidate_rows.?) return error.DocumentSqlRequiresBoundedScan;
+            var rows = std.ArrayListUnmanaged([]const u8).empty;
+            defer {
+                for (rows.items) |row| alloc.free(@constCast(row));
+                rows.deinit(alloc);
+            }
+            try appendDocumentSqlFullRowsFromQueryResponseAlloc(alloc, source, target, native_table_name, public_table_name, query_response.json, consistency, &rows);
+            var total: u32 = 0;
+            for (rows.items) |row| {
+                if (!try documentSqlResidualFilterMatchesAlloc(alloc, row, query.residual_filter_json.?)) continue;
+                total += 1;
+            }
+            break :blk total;
         },
         .bounded_scan => |scan_plan| blk: {
             var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
@@ -5169,15 +5189,25 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
             }
         },
         .indexed_query => |query| {
-            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, null, true, false, consistency)) orelse return null;
+            const query_limit = query.max_candidate_rows;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
             defer query_response.deinit(alloc);
+            if (query.residual_filter_json != null) {
+                const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+                if (query.max_candidate_rows == null or total_hits > query.max_candidate_rows.?) return error.DocumentSqlRequiresBoundedScan;
+            }
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
                 rows.deinit(alloc);
             }
             try appendDocumentSqlFullRowsFromQueryResponseAlloc(alloc, source, target, native_table_name, public_table_name, query_response.json, consistency, &rows);
-            for (rows.items) |row| try appendDocumentSqlCountGroupFromDocJsonAlloc(alloc, &groups, group_by, row);
+            for (rows.items) |row| {
+                if (query.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, row, filter)) continue;
+                }
+                try appendDocumentSqlCountGroupFromDocJsonAlloc(alloc, &groups, group_by, row);
+            }
         },
         .bounded_scan => |scan_plan| {
             var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
@@ -5718,6 +5748,8 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
     public_table_name: []const u8,
     response_json: []const u8,
     projection: []const sql_adapter_runtime.DocumentProjection,
+    residual_filter_json: ?[]const u8,
+    row_limit: ?u32,
     consistency: raft_mod.ReadConsistency,
     rows: *std.ArrayListUnmanaged([]const u8),
 ) !void {
@@ -5741,7 +5773,13 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
             if (source_value == .object) {
                 const doc_json = try std.json.Stringify.valueAlloc(alloc, source_value, .{});
                 defer alloc.free(doc_json);
+                if (residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, doc_json, filter)) continue;
+                }
                 try rows.append(alloc, try documentSqlProjectedParsedRowJsonAlloc(alloc, id_value.string, source_value, doc_json, projection));
+                if (row_limit) |limit| {
+                    if (rows.items.len >= limit) return;
+                }
                 continue;
             }
             if (source_value != .null) return error.InvalidRowsRequest;
@@ -5749,7 +5787,13 @@ fn appendDocumentSqlRowsFromQueryResponseAlloc(
 
         var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id_value.string, .{}, consistency)) orelse continue;
         defer lookup.deinit(alloc);
+        if (residual_filter_json) |filter| {
+            if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+        }
         try rows.append(alloc, try documentSqlProjectedRowJsonAlloc(alloc, id_value.string, lookup.json, projection));
+        if (row_limit) |limit| {
+            if (rows.items.len >= limit) return;
+        }
     }
 }
 

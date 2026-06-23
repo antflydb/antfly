@@ -622,6 +622,12 @@ added only through explicit document semantics such as `INSERT INTO docs (_id,
 _doc) VALUES (...)` or typed JSON patch operations lowered into the same native
 document write path as REST/SDK callers.
 
+Current catalog-backed write lowering enforces this milestone with
+`DocumentSqlWriteUnsupported` for document-storage targets, and the public SQL
+endpoint maps that to `document sql write unsupported`. That keeps document SQL
+read-only until writes are explicitly lowered through native document write
+semantics rather than relational row batches.
+
 Initial document reads should support:
 
 - single-table `SELECT` over one document table;
@@ -691,6 +697,18 @@ semantics as the full-text index. Until then, the ready full-text producer is
 the only correct executor for that predicate, while ordinary scalar predicates
 can fall back to the bounded residual evaluator already used for term, range,
 prefix, and wildcard filters.
+
+Current catalog-backed lowering enforces that distinction through
+`DocumentSqlCapabilities.full_text_filters`: full-text reads and full-text
+filtered `COUNT(*)` plans fail closed when the binder cannot prove a ready
+full-text producer, even when a bounded scan policy exists. Scalar predicates
+continue to use bounded residual scans where the residual evaluator can preserve
+SQL semantics. When a ready full-text producer exists but a conjunctive scalar
+predicate cannot be pushed to a scalar index, the planner can use full-text as a
+bounded candidate producer and evaluate the scalar predicate as a residual. That
+candidate path is exact only while the full-text hit set fits under the bound;
+execution fails closed if the candidate set may extend beyond the bounded
+window.
 
 The same producer-selection rule applies to aggregate-style SQL. Full-text,
 scalar, algebraic, vector, and future sidecar indexes are optimizations and

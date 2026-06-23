@@ -1049,12 +1049,12 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
     _ = function_bindings;
     return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
-            .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(
+            .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
                 alloc,
                 parsed_sql,
                 document.schema,
                 document.indexes_json,
-                document.capabilities.bounded_scan,
+                document.capabilities,
             ),
         },
         .query => .{
@@ -2078,6 +2078,7 @@ pub fn lowerWritePlanWithCatalogParsedSqlAlloc(
     options: LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
 ) !LoweredWritePlan {
+    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = sql_adapter.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,

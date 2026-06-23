@@ -119,12 +119,16 @@ def _sql_table_name(prefix: str) -> str:
 
 
 def _create_relational_sql_table(stateful_api, table_name: str) -> None:
-    created = stateful_api.create_table(table_name, num_shards=1, schema=RELATIONAL_SQL_SCHEMA)
+    created = stateful_api.create_table(
+        table_name, num_shards=1, schema=RELATIONAL_SQL_SCHEMA
+    )
     assert created["name"] == table_name
 
 
 def _create_document_sql_table(stateful_api, table_name: str) -> None:
-    created = stateful_api.create_table(table_name, num_shards=1, schema=DOCUMENT_SQL_SCHEMA)
+    created = stateful_api.create_table(
+        table_name, num_shards=1, schema=DOCUMENT_SQL_SCHEMA
+    )
     assert created["name"] == table_name
 
 
@@ -179,7 +183,9 @@ def test_sql_cli_help_does_not_require_server():
     assert "psql-style REPL" in result.stderr
 
 
-def test_sql_cli_command_and_file_execute_against_real_server(stateful_api, sql_cli, tmp_path):
+def test_sql_cli_command_and_file_execute_against_real_server(
+    stateful_api, sql_cli, tmp_path
+):
     command_table = _sql_table_name("sql_cli_cmd")
     file_table = _sql_table_name("sql_cli_file")
     _create_relational_sql_table(stateful_api, command_table)
@@ -280,10 +286,16 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "status": "active",
                 "metadata": {"plan": "team"},
             },
+            "doc:d": {
+                "title": "delta archived",
+                "body": "delta search archive",
+                "status": "archived",
+                "metadata": {"plan": "enterprise"},
+            },
         },
         sync_level="full_index",
     )
-    assert written["inserted"] == 3
+    assert written["inserted"] == 4
 
     direct_by_id = stateful_api.post(
         "/sql",
@@ -292,6 +304,14 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert direct_by_id["kind"] == "read"
     assert direct_by_id["statement_kind"] == "query"
     assert direct_by_id["result"]["rows"] == [{"_id": "doc:a", "title": "alpha"}]
+
+    write_response = stateful_api.s.post(
+        f"{stateful_api.url}/sql",
+        json={"sql": f"INSERT INTO {table} (_id, _doc) VALUES ('doc:z', '{{}}');"},
+        timeout=10,
+    )
+    assert write_response.status_code == 400
+    assert write_response.text == "document sql write unsupported"
 
     by_id = _first_sql_json(
         sql_cli(
@@ -343,7 +363,17 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         timeout_s=15.0,
         interval_s=0.5,
     )
-    assert sorted(row["_id"] for row in full_text_rows) == ["doc:a", "doc:c"]
+    assert sorted(row["_id"] for row in full_text_rows) == ["doc:a", "doc:c", "doc:d"]
+
+    full_text_residual_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            f"SELECT _id, status FROM {table} WHERE full_text_search('body:search') AND status = 'active' LIMIT 10;",
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in full_text_residual_rows) == ["doc:a", "doc:c"]
 
     counted = _first_sql_json(
         sql_cli(
@@ -354,4 +384,15 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
     assert counted["kind"] == "read"
     assert counted["statement_kind"] == "aggregate"
-    assert counted["result"]["rows"] == [{"row_count": 2}]
+    assert counted["result"]["rows"] == [{"row_count": 3}]
+
+    residual_counted = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT count(*) AS row_count FROM {table} WHERE full_text_search('body:search') AND status = 'active';",
+        ).stdout
+    )
+    assert residual_counted["kind"] == "read"
+    assert residual_counted["statement_kind"] == "aggregate"
+    assert residual_counted["result"]["rows"] == [{"row_count": 2}]

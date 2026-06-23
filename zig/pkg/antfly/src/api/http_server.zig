@@ -5346,6 +5346,7 @@ pub const ApiHttpServer = struct {
             self.catalogSource(),
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DocumentSqlWriteUnsupported => return try textResponse(self.alloc, 400, "document sql write unsupported"),
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return try textResponse(self.alloc, 400, "invalid sql write"),
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),

@@ -36,6 +36,12 @@ const ParsedDocumentWhere = struct {
     }
 };
 
+const DocumentProducerCapabilities = struct {
+    indexed_scalar_filters: bool = true,
+    full_text_filters: bool = true,
+    residual_candidate_limit: ?u32 = null,
+};
+
 pub const DocumentProjectionKind = enum {
     id,
     doc,
@@ -57,10 +63,13 @@ pub const DocumentProjection = struct {
 pub const DocumentIndexQuery = struct {
     full_text_query: ?[]const u8 = null,
     filter_query_json: ?[]const u8 = null,
+    residual_filter_json: ?[]const u8 = null,
+    max_candidate_rows: ?u32 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.full_text_query) |query| alloc.free(@constCast(query));
         if (self.filter_query_json) |query| alloc.free(@constCast(query));
+        if (self.residual_filter_json) |query| alloc.free(@constCast(query));
         self.* = undefined;
     }
 };
@@ -181,7 +190,7 @@ pub fn lowerDocumentReadPlanParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
 ) !DocumentReadPlan {
-    return try lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, parsed_sql, schema, null);
+    return try lowerDocumentReadPlanInternalParsedSqlAlloc(alloc, parsed_sql, schema, null, .{});
 }
 
 pub fn lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
@@ -190,7 +199,7 @@ pub fn lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
     schema: runtime_schema.TableSchema,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
 ) !DocumentReadPlan {
-    return try lowerDocumentReadPlanInternalParsedSqlAlloc(alloc, parsed_sql, schema, bounded_scan_policy, true);
+    return try lowerDocumentReadPlanInternalParsedSqlAlloc(alloc, parsed_sql, schema, bounded_scan_policy, .{});
 }
 
 pub fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
@@ -204,8 +213,19 @@ pub fn lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
         parsed_sql,
         schema,
         capabilities.bounded_scan,
-        capabilities.indexed_scalar_filters,
+        .{
+            .indexed_scalar_filters = capabilities.indexed_scalar_filters,
+            .full_text_filters = capabilities.full_text_filters,
+            .residual_candidate_limit = documentProducerResidualCandidateLimit(capabilities.bounded_scan),
+        },
     );
+}
+
+fn documentProducerResidualCandidateLimit(bounded_scan_policy: ?source_binding.BoundedScanPolicy) ?u32 {
+    const policy = bounded_scan_policy orelse return null;
+    const max_rows = policy.max_rows orelse return null;
+    if (max_rows == 0) return null;
+    return max_rows;
 }
 
 fn lowerDocumentReadPlanInternalParsedSqlAlloc(
@@ -213,7 +233,7 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
-    indexed_scalar_filters: bool,
+    producer_capabilities: DocumentProducerCapabilities,
 ) !DocumentReadPlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
     if (parsed_sql.statement.readKind() != .query) return error.UnsupportedSqlShape;
@@ -254,16 +274,20 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
         mutable.deinit(alloc);
     };
     const producer = if (where_index) |idx| blk: {
-        break :blk parseWhereProducerAlloc(alloc, tokens, idx, order_index orelse limit_index orelse statement_end, schema, indexed_scalar_filters) catch |err| switch (err) {
-            error.DocumentSqlIndexUnavailable => try parseWhereBoundedScanProducerAlloc(
-                alloc,
-                tokens,
-                idx,
-                order_index orelse limit_index orelse statement_end,
-                schema,
-                bounded_scan_policy,
-                limit != null,
-            ),
+        const end_index = order_index orelse limit_index orelse statement_end;
+        break :blk parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, producer_capabilities) catch |err| switch (err) {
+            error.DocumentSqlIndexUnavailable => if (whereRangeHasFullTextPredicate(tokens, idx, end_index))
+                return err
+            else
+                try parseWhereBoundedScanProducerAlloc(
+                    alloc,
+                    tokens,
+                    idx,
+                    end_index,
+                    schema,
+                    bounded_scan_policy,
+                    limit != null,
+                ),
             else => return err,
         };
     } else blk: {
@@ -333,6 +357,7 @@ pub fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyParsedSqlAlloc(
         parsed_sql,
         schema,
         bounded_scan_policy,
+        .{},
         true,
     );
 }
@@ -342,6 +367,7 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
+    producer_capabilities: DocumentProducerCapabilities,
     attach_unfiltered_scan: bool,
 ) !DocumentAlgebraicAggregatePlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
@@ -384,16 +410,20 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     var candidate_producer: ?DocumentProducer = null;
     errdefer if (candidate_producer) |*producer| producer.deinit(alloc);
     const filter_query_json: ?[]const u8 = if (where_index) |idx| blk: {
-        var producer = parseWhereProducerAlloc(alloc, tokens, idx, group_index orelse limit_index orelse statement_end, schema, true) catch |err| switch (err) {
-            error.DocumentSqlIndexUnavailable => try parseWhereBoundedScanProducerAlloc(
-                alloc,
-                tokens,
-                idx,
-                group_index orelse limit_index orelse statement_end,
-                schema,
-                bounded_scan_policy,
-                true,
-            ),
+        const end_index = group_index orelse limit_index orelse statement_end;
+        var producer = parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, producer_capabilities) catch |err| switch (err) {
+            error.DocumentSqlIndexUnavailable => if (whereRangeHasFullTextPredicate(tokens, idx, end_index))
+                return err
+            else
+                try parseWhereBoundedScanProducerAlloc(
+                    alloc,
+                    tokens,
+                    idx,
+                    end_index,
+                    schema,
+                    bounded_scan_policy,
+                    true,
+                ),
             else => return err,
         };
         errdefer producer.deinit(alloc);
@@ -467,23 +497,55 @@ pub fn lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSq
     indexes_json: ?[]const u8,
     bounded_scan_policy: ?source_binding.BoundedScanPolicy,
 ) !DocumentAlgebraicAggregatePlan {
-    var plan = try lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAlloc(alloc, parsed_sql, schema, bounded_scan_policy, false);
+    var plan = try lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAlloc(alloc, parsed_sql, schema, bounded_scan_policy, .{}, false);
     errdefer plan.deinit(alloc);
+    return try finishDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyAlloc(alloc, &plan, indexes_json, bounded_scan_policy);
+}
+
+pub fn lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    indexes_json: ?[]const u8,
+    capabilities: source_binding.DocumentSqlCapabilities,
+) !DocumentAlgebraicAggregatePlan {
+    var plan = try lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAlloc(
+        alloc,
+        parsed_sql,
+        schema,
+        capabilities.bounded_scan,
+        .{
+            .indexed_scalar_filters = capabilities.indexed_scalar_filters,
+            .full_text_filters = capabilities.full_text_filters,
+            .residual_candidate_limit = documentProducerResidualCandidateLimit(capabilities.bounded_scan),
+        },
+        false,
+    );
+    errdefer plan.deinit(alloc);
+    return try finishDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyAlloc(alloc, &plan, indexes_json, capabilities.bounded_scan);
+}
+
+fn finishDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyAlloc(
+    alloc: std.mem.Allocator,
+    plan: *DocumentAlgebraicAggregatePlan,
+    indexes_json: ?[]const u8,
+    bounded_scan_policy: ?source_binding.BoundedScanPolicy,
+) !DocumentAlgebraicAggregatePlan {
     const json = indexes_json orelse {
-        try attachDocumentAggregateUnfilteredBoundedScanFallback(&plan, bounded_scan_policy);
-        return plan;
+        try attachDocumentAggregateUnfilteredBoundedScanFallback(plan, bounded_scan_policy);
+        return plan.*;
     };
-    var matched = documentAlgebraicAggregateMaterializationForPlanAlloc(alloc, json, plan) catch |err| switch (err) {
+    var matched = documentAlgebraicAggregateMaterializationForPlanAlloc(alloc, json, plan.*) catch |err| switch (err) {
         error.DocumentSqlIndexUnavailable => {
-            try attachDocumentAggregateUnfilteredBoundedScanFallback(&plan, bounded_scan_policy);
-            return plan;
+            try attachDocumentAggregateUnfilteredBoundedScanFallback(plan, bounded_scan_policy);
+            return plan.*;
         },
         else => return err,
     };
     errdefer matched.deinit(alloc);
     plan.index_name = matched.takeIndexName();
     plan.materialization_name = matched.takeMaterializationName();
-    return plan;
+    return plan.*;
 }
 
 fn attachDocumentAggregateUnfilteredBoundedScanFallback(
@@ -791,7 +853,7 @@ fn parseWhereProducerAlloc(
     where_index: usize,
     end_index: usize,
     schema: runtime_schema.TableSchema,
-    indexed_scalar_filters: bool,
+    producer_capabilities: DocumentProducerCapabilities,
 ) !DocumentProducer {
     const where_tokens = tokens[where_index + 1 .. end_index];
     if (where_tokens.len == 0) return error.UnsupportedSqlShape;
@@ -816,14 +878,26 @@ fn parseWhereProducerAlloc(
         return .{ .id_lookup = ids };
     }
     if (parsed.full_text_query != null or parsed.filter_clauses.items.len > 0) {
-        if (parsed.filter_clauses.items.len > 0 and !indexed_scalar_filters) return error.DocumentSqlIndexUnavailable;
-        const filter_query_json = try buildConjunctiveFilterJsonAlloc(alloc, parsed.filter_clauses.items);
+        if (parsed.full_text_query != null and !producer_capabilities.full_text_filters) return error.DocumentSqlIndexUnavailable;
+        const filter_query_json = if (parsed.filter_clauses.items.len > 0 and producer_capabilities.indexed_scalar_filters)
+            try buildConjunctiveFilterJsonAlloc(alloc, parsed.filter_clauses.items)
+        else
+            null;
+        errdefer if (filter_query_json) |filter| alloc.free(@constCast(filter));
+        const residual_filter_json = if (parsed.filter_clauses.items.len > 0 and !producer_capabilities.indexed_scalar_filters) residual: {
+            if (parsed.full_text_query == null) return error.DocumentSqlIndexUnavailable;
+            if (producer_capabilities.residual_candidate_limit == null) return error.DocumentSqlRequiresBoundedScan;
+            break :residual try buildConjunctiveFilterJsonAlloc(alloc, parsed.filter_clauses.items);
+        } else null;
+        errdefer if (residual_filter_json) |filter| alloc.free(@constCast(filter));
         const full_text_query = parsed.full_text_query;
         parsed.full_text_query = null;
         parsed.deinit(alloc);
         return .{ .indexed_query = .{
             .full_text_query = full_text_query,
             .filter_query_json = filter_query_json,
+            .residual_filter_json = residual_filter_json,
+            .max_candidate_rows = if (residual_filter_json != null) producer_capabilities.residual_candidate_limit else null,
         } };
     }
 
@@ -993,6 +1067,14 @@ fn parseFullTextQueryAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?[]
     if (!tokens[0].matchesQualifiedKeywordTag("antfly", .full_text_search)) return null;
     if (tokens[1].kind != .lparen or tokens[2].kind != .string or tokens[3].kind != .rparen) return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, tokens[2].text);
+}
+
+fn whereRangeHasFullTextPredicate(tokens: []const Token, where_index: usize, end_index: usize) bool {
+    if (where_index + 1 >= end_index) return false;
+    for (tokens[where_index + 1 .. end_index]) |token| {
+        if (token.matchesQualifiedKeywordTag("antfly", .full_text_search)) return true;
+    }
+    return false;
 }
 
 fn parseScalarFilterClauseAlloc(
@@ -1686,6 +1768,61 @@ test "document SQL keeps filtered aggregate as native candidate producer" {
     try std.testing.expect(lowered.filter_query_json != null);
 }
 
+test "document SQL capability-aware aggregate requires full text producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "body", .path = "body", .field_type = .text },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha')");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
+        .full_text_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
+        .full_text_filters = true,
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer lowered.deinit(alloc);
+    try std.testing.expect(lowered.candidate_producer != null);
+    try std.testing.expectEqualStrings("body:alpha", lowered.candidate_producer.?.indexed_query.full_text_query.?);
+}
+
+test "document SQL capability-aware aggregate keeps full text candidate with scalar residual" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "body", .path = "body", .field_type = .text },
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT count(*) AS row_count FROM docs WHERE full_text_search('body:alpha') AND status = 'active'");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
+        .full_text_filters = true,
+        .indexed_scalar_filters = false,
+    }));
+
+    var lowered = try lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, null, .{
+        .full_text_filters = true,
+        .indexed_scalar_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer lowered.deinit(alloc);
+    try std.testing.expect(lowered.candidate_producer != null);
+    try std.testing.expectEqualStrings("body:alpha", lowered.candidate_producer.?.indexed_query.full_text_query.?);
+    try std.testing.expect(lowered.candidate_producer.?.indexed_query.filter_query_json == null);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", lowered.candidate_producer.?.indexed_query.residual_filter_json.?);
+    try std.testing.expectEqual(@as(?u32, 25), lowered.candidate_producer.?.indexed_query.max_candidate_rows);
+}
+
 test "document SQL keeps catalog aggregate plan without algebraic materialization" {
     const alloc = std.testing.allocator;
     const schema = runtime_schema.TableSchema{
@@ -1816,6 +1953,59 @@ test "document SQL lowers qualified full text producer" {
     defer lowered.deinit(alloc);
     try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
     try std.testing.expectEqual(@as(?u32, 5), lowered.limit);
+}
+
+test "document SQL capability-aware lowering requires full text producer" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
+        .full_text_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
+        .full_text_filters = true,
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
+}
+
+test "document SQL capability-aware lowering keeps full text candidate with scalar residual" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "title", .path = "title", .field_type = .text },
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+        },
+    };
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 5");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectError(error.DocumentSqlRequiresBoundedScan, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
+        .full_text_filters = true,
+        .indexed_scalar_filters = false,
+    }));
+
+    var lowered = try lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
+        .full_text_filters = true,
+        .indexed_scalar_filters = false,
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("title:alpha", lowered.producer.indexed_query.full_text_query.?);
+    try std.testing.expect(lowered.producer.indexed_query.filter_query_json == null);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", lowered.producer.indexed_query.residual_filter_json.?);
+    try std.testing.expectEqual(@as(?u32, 25), lowered.producer.indexed_query.max_candidate_rows);
 }
 
 test "document SQL lowers scalar equality to indexed filter producer" {
