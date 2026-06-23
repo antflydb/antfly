@@ -668,6 +668,16 @@ pub const CudaCompute = struct {
     deferred_device_frees: std.ArrayListUnmanaged(buffer_mod.DeviceBuffer) = .empty,
     deferred_device_free_bytes: usize = 0,
     temp_trace_seq: usize = 0,
+    florence_tail_row_f32: ?CT = null,
+    florence_tail_col_f32: ?CT = null,
+    florence_tail_temporal_f32: ?CT = null,
+    florence_image_projection_t_f32: ?CT = null,
+    florence_tail_row_source_ptr: driver_mod.CUdeviceptr = 0,
+    florence_tail_col_source_ptr: driver_mod.CUdeviceptr = 0,
+    florence_tail_temporal_source_ptr: driver_mod.CUdeviceptr = 0,
+    florence_image_projection_source_ptr: driver_mod.CUdeviceptr = 0,
+    florence_image_projection_vision_dim: usize = 0,
+    florence_image_projection_projection_dim: usize = 0,
     debug_cuda_graph_capture_active: bool = false,
     debug_cuda_graph_slots: [max_cuda_graph_replay_slots]CudaGraphReplaySlot = [_]CudaGraphReplaySlot{.{}} ** max_cuda_graph_replay_slots,
     debug_cuda_graph_active_slot: ?usize = null,
@@ -733,6 +743,10 @@ pub const CudaCompute = struct {
             deinitCudaGraphReplaySlot(self, slot);
         }
         self.debug_cuda_decode_scalars.free(&self.ctx);
+        if (self.florence_tail_row_f32) |tensor| freeTensor(self, tensor);
+        if (self.florence_tail_col_f32) |tensor| freeTensor(self, tensor);
+        if (self.florence_tail_temporal_f32) |tensor| freeTensor(self, tensor);
+        if (self.florence_image_projection_t_f32) |tensor| freeTensor(self, tensor);
         for (self.temp_pinned_slots.items) |*slot| slot.buffer.free(&self.ctx);
         self.temp_pinned_slots.deinit(self.allocator);
         for (self.temp_buffers.items) |*buffer| buffer.free(&self.ctx);
@@ -1732,7 +1746,7 @@ fn mxbaiQ4Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatm
 }
 
 fn mxbaiQ4TiledVariant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
-    if (rows < 2 or in_dim % 256 != 0 or !isApprovedQuantLinearShape(in_dim, out_dim)) return null;
+    if (rows == 0 or in_dim % 256 != 0 or !isApprovedQuantLinearShape(in_dim, out_dim)) return null;
     return cudaQMatmulKernelVariant();
 }
 
@@ -2429,6 +2443,23 @@ fn tryCublasLtBf16Linear(
     const blas = &(self.cublaslt orelse return false);
     blas.matmulBf16WeightF32Out(&self.ctx, dst, input_bf16, weight, rows, in_dim, out_dim) catch return false;
     self.stats.bf16_cublaslt_linear_calls += 1;
+    return true;
+}
+
+fn tryCublasLtF32Linear(
+    self: *CudaCompute,
+    dst: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (!cudaCublasLtEnabled()) return false;
+    if (self.ctx.info.compute_major < 8) return false;
+    if (rows < 128 or in_dim < 64 or out_dim < 64) return false;
+    const blas = &(self.cublaslt orelse return false);
+    blas.matmulF32WeightF32Out(&self.ctx, dst, input, weight, rows, in_dim, out_dim) catch return false;
     return true;
 }
 
@@ -4028,6 +4059,286 @@ fn sliceRows2DOp(
     return tensor;
 }
 
+fn allocUninitF32ShapeOp(ctx: *anyopaque, shape_i32: []const i32) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (shape_i32.len == 0) return error.InvalidShape;
+    var elem_count: usize = 1;
+    const shape = try self.allocator.alloc(i64, shape_i32.len);
+    errdefer self.allocator.free(shape);
+    for (shape_i32, 0..) |dim, idx| {
+        if (dim <= 0) return error.InvalidShape;
+        shape[idx] = @intCast(dim);
+        elem_count = try checkedMul(elem_count, @as(usize, @intCast(dim)));
+    }
+    const byte_len = try checkedMul(elem_count, @sizeOf(f32));
+    var device = try allocDeviceBuffer(self, byte_len);
+    errdefer device.free(&self.ctx);
+    return try createTensor(self, device, shape, elem_count);
+}
+
+fn copyRows2DOp(
+    ctx: *anyopaque,
+    dst: CT,
+    dst_start_row: usize,
+    src: CT,
+    src_start_row: usize,
+    row_count: usize,
+    cols: usize,
+) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const dst_tensor = tensorFromCt(dst);
+    const src_tensor = tensorFromCt(src);
+    try ensureF32(dst_tensor);
+    try ensureF32(src_tensor);
+    if (cols == 0) return error.InvalidShape;
+    if (dst_tensor.elem_count % cols != 0 or src_tensor.elem_count % cols != 0) return error.InvalidShape;
+    const dst_rows = dst_tensor.elem_count / cols;
+    const src_rows = src_tensor.elem_count / cols;
+    if (dst_start_row > dst_rows or row_count > dst_rows - dst_start_row) return error.InvalidShape;
+    if (src_start_row > src_rows or row_count > src_rows - src_start_row) return error.InvalidShape;
+    if (row_count == 0) return true;
+
+    const row_bytes = try checkedMul(cols, @sizeOf(f32));
+    const byte_len = try checkedMul(row_count, row_bytes);
+    const dst_offset = try checkedMul(dst_start_row, row_bytes);
+    const src_offset = try checkedMul(src_start_row, row_bytes);
+    if (dst_offset > dst_tensor.buffer.len or byte_len > dst_tensor.buffer.len - dst_offset) return error.InvalidShape;
+    if (src_offset > src_tensor.buffer.len or byte_len > src_tensor.buffer.len - src_offset) return error.InvalidShape;
+
+    const dst_buffer = buffer_mod.DeviceBuffer{
+        .ptr = dst_tensor.buffer.ptr + @as(u64, @intCast(dst_offset)),
+        .len = byte_len,
+    };
+    const src_buffer = buffer_mod.DeviceBuffer{
+        .ptr = src_tensor.buffer.ptr + @as(u64, @intCast(src_offset)),
+        .len = byte_len,
+    };
+    try copyFromDeviceTracked(self, dst_buffer, src_buffer, byte_len);
+    return true;
+}
+
+fn concatRows2DOp(
+    ctx: *anyopaque,
+    a: CT,
+    b: CT,
+    rows_a: usize,
+    rows_b: usize,
+    cols: usize,
+) anyerror!CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const a_tensor = tensorFromCt(a);
+    const b_tensor = tensorFromCt(b);
+    try ensureF32(a_tensor);
+    try ensureF32(b_tensor);
+    if (cols == 0) return error.InvalidShape;
+
+    const count_a = try checkedMul(rows_a, cols);
+    const count_b = try checkedMul(rows_b, cols);
+    if (a_tensor.elem_count != count_a or b_tensor.elem_count != count_b) return error.InvalidShape;
+
+    const out_count = try checkedAdd(count_a, count_b);
+    const byte_len_a = try checkedMul(count_a, @sizeOf(f32));
+    const byte_len_b = try checkedMul(count_b, @sizeOf(f32));
+    const out_byte_len = try checkedAdd(byte_len_a, byte_len_b);
+    var device = try allocDeviceBuffer(self, out_byte_len);
+    errdefer device.free(&self.ctx);
+
+    if (byte_len_a > 0) try copyFromDeviceTracked(self, device, a_tensor.buffer, byte_len_a);
+    if (byte_len_b > 0) {
+        const dst_b = buffer_mod.DeviceBuffer{
+            .ptr = device.ptr + @as(u64, @intCast(byte_len_a)),
+            .len = byte_len_b,
+        };
+        try copyFromDeviceTracked(self, dst_b, b_tensor.buffer, byte_len_b);
+    }
+
+    const shape = try allocShape2(self.allocator, rows_a + rows_b, cols);
+    errdefer self.allocator.free(shape);
+    return try createTensor(self, device, shape, out_count);
+}
+
+const FlorenceTailCacheSlot = enum { row, col, temporal };
+
+fn cachedFlorenceTailF32(
+    self: *CudaCompute,
+    slot: FlorenceTailCacheSlot,
+    source: *const CudaTensor,
+) !CT {
+    const cached: *?CT = switch (slot) {
+        .row => &self.florence_tail_row_f32,
+        .col => &self.florence_tail_col_f32,
+        .temporal => &self.florence_tail_temporal_f32,
+    };
+    const source_ptr: *driver_mod.CUdeviceptr = switch (slot) {
+        .row => &self.florence_tail_row_source_ptr,
+        .col => &self.florence_tail_col_source_ptr,
+        .temporal => &self.florence_tail_temporal_source_ptr,
+    };
+    if (cached.*) |tensor| {
+        if (source_ptr.* == source.buffer.ptr) return tensor;
+        freeTensor(self, tensor);
+        cached.* = null;
+        source_ptr.* = 0;
+    }
+
+    const data = try downloadAlloc(self, source);
+    defer self.allocator.free(data);
+    const shape = [_]i32{@intCast(data.len)};
+    const tensor = try fromFloat32ShapeOp(self, data, &shape);
+    cached.* = tensor;
+    source_ptr.* = source.buffer.ptr;
+    return tensor;
+}
+
+fn cachedFlorenceImageProjectionTransposedF32(
+    self: *CudaCompute,
+    source: *const CudaTensor,
+    vision_dim: usize,
+    projection_dim: usize,
+) !CT {
+    if (self.florence_image_projection_t_f32) |tensor| {
+        if (self.florence_image_projection_source_ptr == source.buffer.ptr and
+            self.florence_image_projection_vision_dim == vision_dim and
+            self.florence_image_projection_projection_dim == projection_dim)
+        {
+            return tensor;
+        }
+        freeTensor(self, tensor);
+        self.florence_image_projection_t_f32 = null;
+        self.florence_image_projection_source_ptr = 0;
+        self.florence_image_projection_vision_dim = 0;
+        self.florence_image_projection_projection_dim = 0;
+    }
+
+    const expected = try checkedMul(vision_dim, projection_dim);
+    if (source.elem_count != expected) return error.InvalidShape;
+    const data = try downloadAlloc(self, source);
+    defer self.allocator.free(data);
+    const transposed = try self.allocator.alloc(f32, expected);
+    defer self.allocator.free(transposed);
+    for (0..vision_dim) |i| {
+        for (0..projection_dim) |j| {
+            transposed[j * vision_dim + i] = data[i * projection_dim + j];
+        }
+    }
+    const shape = [_]i32{ @intCast(projection_dim), @intCast(vision_dim) };
+    const tensor = try fromFloat32ShapeOp(self, transposed, &shape);
+    self.florence_image_projection_t_f32 = tensor;
+    self.florence_image_projection_source_ptr = source.buffer.ptr;
+    self.florence_image_projection_vision_dim = vision_dim;
+    self.florence_image_projection_projection_dim = projection_dim;
+    return tensor;
+}
+
+fn florenceVisionTailSourcesOp(
+    ctx: *anyopaque,
+    tokens: CT,
+    row_embed: CT,
+    col_embed: CT,
+    temporal_embed: ?CT,
+    batch: usize,
+    height: usize,
+    width: usize,
+    dim: usize,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const token_tensor = tensorFromCt(tokens);
+    var row_tensor = tensorFromCt(row_embed);
+    var col_tensor = tensorFromCt(col_embed);
+    try ensureF32(token_tensor);
+    const row_dtype = florenceTailWeightDTypeCode(row_tensor) catch |err| switch (err) {
+        error.UnsupportedTensorType => blk: {
+            const cached = try cachedFlorenceTailF32(self, .row, row_tensor);
+            row_tensor = tensorFromCt(cached);
+            break :blk @as(u32, 0);
+        },
+    };
+    const col_dtype = florenceTailWeightDTypeCode(col_tensor) catch |err| switch (err) {
+        error.UnsupportedTensorType => blk: {
+            const cached = try cachedFlorenceTailF32(self, .col, col_tensor);
+            col_tensor = tensorFromCt(cached);
+            break :blk @as(u32, 0);
+        },
+    };
+    if (batch == 0 or height == 0 or width == 0 or dim == 0) return error.InvalidShape;
+
+    const token_count = try checkedMul(height, width);
+    const source_rows = try checkedMul(batch, token_count);
+    if (token_tensor.elem_count != try checkedMul(source_rows, dim)) return error.InvalidShape;
+    if (row_tensor.elem_count < try checkedMul(height, dim / 2)) return error.InvalidShape;
+    if (col_tensor.elem_count < try checkedMul(width, dim - dim / 2)) return error.InvalidShape;
+
+    var temporal_dtype: u32 = 0;
+    const temporal_buffer = blk: {
+        if (temporal_embed) |temporal| {
+            var temporal_tensor = tensorFromCt(temporal);
+            temporal_dtype = florenceTailWeightDTypeCode(temporal_tensor) catch |err| switch (err) {
+                error.UnsupportedTensorType => cached_blk: {
+                    const cached = try cachedFlorenceTailF32(self, .temporal, temporal_tensor);
+                    temporal_tensor = tensorFromCt(cached);
+                    break :cached_blk @as(u32, 0);
+                },
+            };
+            if (temporal_tensor.elem_count < dim) return error.InvalidShape;
+            break :blk temporal_tensor.buffer;
+        }
+        break :blk buffer_mod.DeviceBuffer{};
+    };
+
+    const out_seq = try checkedAdd(token_count, 1);
+    const out_rows = try checkedMul(batch, out_seq);
+    const out_count = try checkedMul(out_rows, dim);
+    const out_byte_len = try checkedMul(out_count, @sizeOf(f32));
+    var device = try allocDeviceBuffer(self, out_byte_len);
+    errdefer device.free(&self.ctx);
+
+    self.kernels.launchFlorenceVisionTailSourcesF32(
+        &self.ctx,
+        device,
+        token_tensor.buffer,
+        row_tensor.buffer,
+        col_tensor.buffer,
+        temporal_buffer,
+        batch,
+        height,
+        width,
+        dim,
+        temporal_embed != null,
+        row_dtype,
+        col_dtype,
+        temporal_dtype,
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable => {
+            device.free(&self.ctx);
+            return null;
+        },
+        else => return err,
+    };
+
+    const shape = try allocShape2(self.allocator, out_rows, dim);
+    errdefer self.allocator.free(shape);
+    return try createTensor(self, device, shape, out_count);
+}
+
+fn florenceProjectImageFeaturesOp(
+    ctx: *anyopaque,
+    input: CT,
+    weight: CT,
+    rows: usize,
+    vision_dim: usize,
+    projection_dim: usize,
+) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const input_tensor = tensorFromCt(input);
+    const weight_tensor = tensorFromCt(weight);
+    try ensureF32(input_tensor);
+    if (rows == 0 or vision_dim == 0 or projection_dim == 0) return error.InvalidShape;
+    if (input_tensor.elem_count != try checkedMul(rows, vision_dim)) return error.InvalidShape;
+
+    const transposed = try cachedFlorenceImageProjectionTransposedF32(self, weight_tensor, vision_dim, projection_dim);
+    return try linearNoBias(ctx, input, transposed, rows, vision_dim, projection_dim);
+}
+
 fn sliceLastDimOp(ctx: *anyopaque, input: CT, start: usize, stop: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
@@ -4149,6 +4460,16 @@ fn dupeShape(allocator: std.mem.Allocator, shape: []const i64) ![]i64 {
 
 fn ensureF32(tensor: *const CudaTensor) !void {
     if (tensor.dtype != .f32 or tensor.quant_type != null) return error.UnsupportedTensorType;
+}
+
+fn florenceTailWeightDTypeCode(tensor: *const CudaTensor) !u32 {
+    if (tensor.quant_type != null) return error.UnsupportedTensorType;
+    return switch (tensor.dtype) {
+        .f32 => 0,
+        .f16 => 1,
+        .bf16 => 2,
+        else => error.UnsupportedTensorType,
+    };
 }
 
 fn ensureF32OrQuantized(tensor: *const CudaTensor) !void {
@@ -4302,6 +4623,13 @@ fn uploadTempI64(self: *CudaCompute, data: []const i64) !buffer_mod.DeviceBuffer
     const device = try self.temp_ids_masks.acquire(&self.ctx, data.len * @sizeOf(i64));
     try copyFromHostTracked(self, device, std.mem.sliceAsBytes(data));
     return device;
+}
+
+fn allOnesI64(data: []const i64) bool {
+    for (data) |value| {
+        if (value != 1) return false;
+    }
+    return true;
 }
 
 fn uploadTempU32(self: *CudaCompute, data: []const u32) !buffer_mod.DeviceBuffer {
@@ -4799,6 +5127,27 @@ fn launchQ4KTcHmmaTripleBias(
     return true;
 }
 
+fn launchQ4KTcHmmaPairBias(
+    self: *CudaCompute,
+    variant: kernels_mod.QMatmulVariant,
+    dst_a: buffer_mod.DeviceBuffer,
+    dst_b: buffer_mod.DeviceBuffer,
+    input: buffer_mod.DeviceBuffer,
+    weight_a: *const CudaTensor,
+    bias_a: buffer_mod.DeviceBuffer,
+    weight_b: *const CudaTensor,
+    bias_b: buffer_mod.DeviceBuffer,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    if (variant != .tc_hmma) return false;
+    const packed_a = tcQuantBuffer(weight_a, .q4_k_hmma) orelse return false;
+    const packed_b = tcQuantBuffer(weight_b, .q4_k_hmma) orelse return false;
+    self.kernels.launchLinearQ4KPairBiasTcHmmaF32(&self.ctx, dst_a, dst_b, input, packed_a, bias_a, packed_b, bias_b, rows, in_dim, out_dim) catch |err| return missingTcSymbolFallback(err);
+    return true;
+}
+
 fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.QMatmulVariant {
     return if (variant == .tc_hmma) .fast_r4c4 else variant;
 }
@@ -4868,7 +5217,10 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
             else => return error.UnsupportedTensorType,
         }
     } else {
-        if (rows >= 2 and in_dim >= 256 and out_dim >= 4) {
+        if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+            try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
+            self.dispatch_stats.note(self.allocator, .linear, .f32, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+        } else if (rows >= 2 and in_dim >= 256 and out_dim >= 4) {
             try self.kernels.launchLinearBiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
             self.dispatch_stats.note(self.allocator, .linear, .f32, .f32_cuda, .bias, .none, rows, in_dim, out_dim, 0);
         } else {
@@ -5154,8 +5506,12 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
     } else {
-        try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
-        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
+        if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+        } else {
+            try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
+        }
     }
     self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
@@ -6223,6 +6579,23 @@ fn launchSpanQ4PairTc(
         return false;
     }
 
+    if (mode == .shared) {
+        return try launchQ4KTcHmmaPairBias(
+            self,
+            variant,
+            first_device,
+            second_device,
+            input_a_tensor.buffer,
+            weight_a_tensor,
+            bias_a_tensor.buffer,
+            weight_b_tensor,
+            bias_b_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+        );
+    }
+
     const first_tc = switch (mode) {
         .shared, .separate => try launchQ4KTcHmmaBias(self, variant, first_device, input_a_tensor.buffer, weight_a_tensor, bias_a_tensor.buffer, rows, in_dim, out_dim),
         .shared_relu => try launchQ4KTcHmmaBiasRelu(self, variant, first_device, input_a_tensor.buffer, weight_a_tensor, bias_a_tensor.buffer, rows, in_dim, out_dim),
@@ -6279,8 +6652,8 @@ fn linearPairSpanQ4(
     if (tc_variant) |variant| {
         if (try launchSpanQ4PairTc(self, mode, variant, first_device, second_device, input_a_tensor, input_b_tensor, weight_a_tensor, bias_a_tensor, weight_b_tensor, bias_b_tensor, rows, in_dim, out_dim)) {
             used_tc = true;
-            self.dispatch_stats.note(self.allocator, pair_op, .q4_k, .q4_tc_hmma, pair_epilogue, .none, rows, in_dim, out_dim, 0);
-            self.dispatch_stats.note(self.allocator, pair_op, .q4_k, .q4_tc_hmma, pair_epilogue, .none, rows, in_dim, out_dim, 0);
+            const tc_launch_count: usize = if (mode == .shared) 1 else 2;
+            for (0..tc_launch_count) |_| self.dispatch_stats.note(self.allocator, pair_op, .q4_k, .q4_tc_hmma, pair_epilogue, .none, rows, in_dim, out_dim, 0);
         } else if (span_available) {
             span_fallback = tcPairFallbackReason(weight_a_tensor, weight_b_tensor, variant, .q4_k_hmma);
         } else {
@@ -7749,7 +8122,8 @@ fn crossAttention(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []con
     try ensureCount(v_tensor, kv_count);
     if (enc_mask.len < try checkedMul(batch, enc_seq)) return error.InvalidShape;
 
-    const mask_device = try uploadTempI64(self, enc_mask[0 .. batch * enc_seq]);
+    const mask_values = enc_mask[0 .. batch * enc_seq];
+    const mask_device = if (allOnesI64(mask_values)) buffer_mod.DeviceBuffer{} else try uploadTempI64(self, mask_values);
     const shape = try dupeShape(self.allocator, q_tensor.shape);
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, q_count * @sizeOf(f32));
@@ -9023,7 +9397,12 @@ const vtable = ops.ComputeBackend.VTable{
     .reshapeOp = &reshapeOp,
     .reshape2D = &reshape2DOp,
     .reshape2d = &reshape2dOp,
+    .allocUninitF32Shape = &allocUninitF32ShapeOp,
+    .copyRows2D = &copyRows2DOp,
+    .concatRows2D = &concatRows2DOp,
     .sliceRows2D = &sliceRows2DOp,
+    .florenceVisionTailSources = &florenceVisionTailSourcesOp,
+    .florenceProjectImageFeatures = &florenceProjectImageFeaturesOp,
     .sliceLastDim = &sliceLastDimOp,
     .cloneTensorShape = &cloneTensorShapeOp,
     .transposeOp = &transposeOp,

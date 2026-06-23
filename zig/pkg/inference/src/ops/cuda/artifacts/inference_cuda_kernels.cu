@@ -1646,6 +1646,83 @@ extern "C" __global__ void termite_cross_attention_f32(
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
 }
 
+extern "C" __global__ void termite_cross_attention_q1_f32(
+    float* dst,
+    const float* q,
+    const float* k,
+    const float* v,
+    const long long* mask,
+    unsigned int batch,
+    unsigned int enc_seq,
+    unsigned int num_heads,
+    unsigned int head_dim
+) {
+    extern __shared__ float shared[];
+    float* scores = shared;
+    float* scratch = shared + enc_seq;
+
+    unsigned int block = blockIdx.x;
+    unsigned int head = block % num_heads;
+    unsigned int b = block / num_heads;
+    if (b >= batch) return;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int hidden = num_heads * head_dim;
+    unsigned int q_base = b * hidden + head * head_dim;
+    float scale = rsqrtf((float)head_dim);
+
+    float local_max = -3.402823466e+38f;
+    for (unsigned int ki = tid; ki < enc_seq; ki += blockDim.x) {
+        bool valid = mask == nullptr || mask[b * enc_seq + ki] != 0ll;
+        float score = -3.402823466e+38f;
+        if (valid) {
+            unsigned int k_base = (b * enc_seq + ki) * hidden + head * head_dim;
+            float dot = 0.0f;
+            for (unsigned int j = 0; j < head_dim; ++j) {
+                dot += q[q_base + j] * k[k_base + j];
+            }
+            score = dot * scale;
+        }
+        scores[ki] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    scratch[tid] = local_max;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        __syncthreads();
+    }
+    float max_score = scratch[0];
+
+    float local_denom = 0.0f;
+    for (unsigned int ki = tid; ki < enc_seq; ki += blockDim.x) {
+        float score = scores[ki];
+        float e = score > -3.0e38f ? expf(score - max_score) : 0.0f;
+        scores[ki] = e;
+        local_denom += e;
+    }
+    scratch[tid] = local_denom;
+    __syncthreads();
+
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        __syncthreads();
+    }
+    float denom = scratch[0];
+
+    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (unsigned int ki = 0; ki < enc_seq; ++ki) {
+            float e = scores[ki];
+            unsigned int v_idx = (b * enc_seq + ki) * hidden + head * head_dim + d;
+            acc += e * v[v_idx];
+        }
+        unsigned int dst_idx = b * hidden + head * head_dim + d;
+        dst[dst_idx] = denom > 0.0f ? acc / denom : 0.0f;
+    }
+}
+
 extern "C" __global__ void termite_token_to_nchw_f32(
     float* dst,
     const float* src,
@@ -1860,6 +1937,63 @@ extern "C" __global__ void termite_channel_apply_f32(
         acc += scores[score_idx] * qkv[v_idx];
     }
     dst[idx] = acc;
+}
+
+__device__ float termite_load_tail_weight_f32(const void* ptr, unsigned int dtype, unsigned int offset) {
+    if (dtype == 1u) return __half2float(reinterpret_cast<const __half*>(ptr)[offset]);
+    if (dtype == 2u) return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(ptr)[offset]);
+    return reinterpret_cast<const float*>(ptr)[offset];
+}
+
+extern "C" __global__ void termite_florence_vision_tail_sources_f32(
+    float* dst,
+    const float* tokens,
+    const void* row_embed,
+    const void* col_embed,
+    const void* temporal_embed,
+    unsigned int batch,
+    unsigned int height,
+    unsigned int width,
+    unsigned int dim,
+    unsigned int has_temporal,
+    unsigned int row_dtype,
+    unsigned int col_dtype,
+    unsigned int temporal_dtype
+) {
+    unsigned int token_count = height * width;
+    unsigned int out_seq = token_count + 1u;
+    unsigned int total = batch * out_seq * dim;
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total || token_count == 0u) return;
+
+    unsigned int feature = idx % dim;
+    unsigned int out_token = (idx / dim) % out_seq;
+    unsigned int b = idx / (dim * out_seq);
+    unsigned int row_dim = dim / 2u;
+    unsigned int col_dim = dim - row_dim;
+
+    float temporal = (has_temporal != 0u && temporal_embed != nullptr) ? termite_load_tail_weight_f32(temporal_embed, temporal_dtype, feature) : 0.0f;
+    if (out_token == 0u) {
+        float acc = 0.0f;
+        for (unsigned int token = 0u; token < token_count; ++token) {
+            unsigned int y = token / width;
+            unsigned int x = token - y * width;
+            float pos = feature < col_dim
+                ? termite_load_tail_weight_f32(col_embed, col_dtype, x * col_dim + feature)
+                : termite_load_tail_weight_f32(row_embed, row_dtype, y * row_dim + (feature - col_dim));
+            acc += tokens[(b * token_count + token) * dim + feature] + pos + temporal;
+        }
+        dst[idx] = acc / (float)token_count;
+        return;
+    }
+
+    unsigned int token = out_token - 1u;
+    unsigned int y = token / width;
+    unsigned int x = token - y * width;
+    float pos = feature < col_dim
+        ? termite_load_tail_weight_f32(col_embed, col_dtype, x * col_dim + feature)
+        : termite_load_tail_weight_f32(row_embed, row_dtype, y * row_dim + (feature - col_dim));
+    dst[idx] = tokens[(b * token_count + token) * dim + feature] + pos + temporal;
 }
 
 __device__ float termite_rope_frequency(unsigned int pair_index, unsigned int rope_dim, float theta) {
@@ -3711,6 +3845,25 @@ extern "C" __global__ void termite_linear_q4_k_triple_bias_f32_tc_hmma(
     float* dst = projection == 0u ? dst_a : (projection == 1u ? dst_b : dst_c);
     const unsigned char* packed_weight = projection == 0u ? packed_weight_a : (projection == 1u ? packed_weight_b : packed_weight_c);
     const float* bias = projection == 0u ? bias_a : (projection == 1u ? bias_b : bias_c);
+    termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
+}
+
+extern "C" __global__ void termite_linear_q4_k_pair_bias_f32_tc_hmma(
+    float* dst_a,
+    float* dst_b,
+    const float* input,
+    const unsigned char* packed_weight_a,
+    const float* bias_a,
+    const unsigned char* packed_weight_b,
+    const float* bias_b,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int projection = blockIdx.z;
+    float* dst = projection == 0u ? dst_a : dst_b;
+    const unsigned char* packed_weight = projection == 0u ? packed_weight_a : packed_weight_b;
+    const float* bias = projection == 0u ? bias_a : bias_b;
     termite_qtc_hmma_tile<1u, true>(dst, input, packed_weight, bias, nullptr, rows, in_dim, out_dim);
 }
 

@@ -46,6 +46,7 @@ pub const LoadedVisionReader = struct {
     loaded_model: ?*model_manager_mod.LoadedModel = null,
     hf_tok: ?*hf_tokenizer.HfTokenizer = null,
     owns_sessions: bool = false,
+    florence_final_logits_bias_zero: ?bool = null,
 
     pub fn loadFromDir(
         allocator: std.mem.Allocator,
@@ -171,6 +172,7 @@ pub const LoadedVisionReader = struct {
                 .pix2struct_do_normalize = self.preproc.pix2struct_do_normalize,
                 .prompt = options.prompt,
             },
+            &self.florence_final_logits_bias_zero,
         );
     }
 

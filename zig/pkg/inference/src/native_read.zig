@@ -25,7 +25,9 @@ const model_manager_mod = @import("server/model_manager.zig");
 const native_backend_guard = @import("native_backend_guard.zig");
 const platform = @import("antfly_platform");
 const readers_mod = @import("readers/reader.zig");
+const reading_pipeline = @import("pipelines/reading.zig");
 const runtime = @import("runtime/root.zig");
+const compat = @import("io/compat.zig");
 
 const print = std.debug.print;
 
@@ -46,6 +48,7 @@ const Options = struct {
     cache_dtype: ?[]const u8 = null,
     warmup_iters: usize = 1,
     measure_iters: ?usize = null,
+    json_timing_path: ?[]const u8 = null,
 };
 
 const Timing = struct {
@@ -63,6 +66,7 @@ const ReadBenchmarkResult = struct {
     timing: Timing,
     image_bytes: usize,
     last_text: []const u8,
+    telemetry: reading_pipeline.ReadTelemetry,
 };
 
 pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -97,7 +101,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     if (opts.measure_iters != null) {
         const bench = try runWarmBenchmark(allocator, &reader, image_data, opts, load_ns);
         defer allocator.free(bench.last_text);
-        try writeBenchmarkJson(allocator, opts.model_dir, opts, bench);
+        try writeBenchmarkJson(allocator, io, opts.model_dir, opts, bench);
         return;
     }
 
@@ -153,6 +157,10 @@ fn parseArgs(args: []const []const u8) !Options {
             if (i >= args.len) return error.MissingMeasureIters;
             opts.measure_iters = try std.fmt.parseInt(usize, args[i], 10);
             if (opts.measure_iters.? == 0) return error.InvalidMeasureIters;
+        } else if (std.mem.eql(u8, arg, "--json-timing")) {
+            i += 1;
+            if (i >= args.len) return error.MissingJsonTimingPath;
+            opts.json_timing_path = args[i];
         } else {
             printUsage();
             return error.InvalidArguments;
@@ -201,6 +209,7 @@ fn runWarmBenchmark(
         .timing = try timingFromSamples(allocator, samples),
         .image_bytes = image_data.len,
         .last_text = last_text,
+        .telemetry = reading_pipeline.lastReadTelemetry(),
     };
 }
 
@@ -332,7 +341,7 @@ fn writeResultJson(allocator: std.mem.Allocator, model_name: []const u8, result:
     print("{s}", .{buf.items});
 }
 
-fn writeBenchmarkJson(allocator: std.mem.Allocator, model_name: []const u8, opts: Options, result: ReadBenchmarkResult) !void {
+fn writeBenchmarkJson(allocator: std.mem.Allocator, io: std.Io, model_name: []const u8, opts: Options, result: ReadBenchmarkResult) !void {
     var buf = std.ArrayListUnmanaged(u8).empty;
     defer buf.deinit(allocator);
 
@@ -341,6 +350,24 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, model_name: []const u8, opts
     try buf.appendSlice(allocator, ",\"backend\":");
     try jsonEncodeString(&buf, allocator, @tagName(opts.backend));
     try buf.appendSlice(allocator, ",\"mode\":\"warm_read\"");
+    try buf.appendSlice(allocator, ",\"prompt\":");
+    if (opts.prompt) |prompt| {
+        try jsonEncodeString(&buf, allocator, prompt);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"max_tokens\":");
+    if (opts.max_tokens) |max_tokens| {
+        try appendIntJson(&buf, allocator, max_tokens);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"cache_dtype\":");
+    if (opts.cache_dtype) |cache_dtype| {
+        try jsonEncodeString(&buf, allocator, cache_dtype);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, ",\"image_bytes\":");
     try appendIntJson(&buf, allocator, result.image_bytes);
     try buf.appendSlice(allocator, ",\"warmup_iters\":");
@@ -361,10 +388,47 @@ fn writeBenchmarkJson(allocator: std.mem.Allocator, model_name: []const u8, opts
     try appendFloatJson(&buf, allocator, nsToMs(result.timing.max_ns));
     try buf.appendSlice(allocator, ",\"total_ms\":");
     try appendFloatJson(&buf, allocator, nsToMs(result.timing.total_ns));
+    try buf.appendSlice(allocator, ",\"generated_tokens\":");
+    if (result.telemetry.generated_tokens) |generated_tokens| {
+        try appendIntJson(&buf, allocator, generated_tokens);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"resident_decoder\":");
+    try appendBoolJson(&buf, allocator, result.telemetry.resident_decoder);
+    try buf.appendSlice(allocator, ",\"kv_cache\":");
+    try appendBoolJson(&buf, allocator, result.telemetry.kv_cache);
+    try buf.appendSlice(allocator, ",\"kv_cache_mode\":");
+    if (result.telemetry.kv_cache_mode) |mode| {
+        try jsonEncodeString(&buf, allocator, mode);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"lm_head_path\":");
+    if (result.telemetry.lm_head_path) |path| {
+        try jsonEncodeString(&buf, allocator, path);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"cuda_graph_replay\":");
+    try appendBoolJson(&buf, allocator, result.telemetry.cuda_graph_replay);
+    try buf.appendSlice(allocator, ",\"cuda_graph_capture_steps\":");
+    try appendIntJson(&buf, allocator, result.telemetry.cuda_graph_capture_steps);
+    try buf.appendSlice(allocator, ",\"cuda_graph_replay_steps\":");
+    try appendIntJson(&buf, allocator, result.telemetry.cuda_graph_replay_steps);
+    try buf.appendSlice(allocator, ",\"cuda_graph_fallback_reason\":");
+    if (result.telemetry.cuda_graph_fallback_reason) |reason| {
+        try jsonEncodeString(&buf, allocator, reason);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
     try buf.appendSlice(allocator, ",\"last_text\":");
     try jsonEncodeString(&buf, allocator, result.last_text);
     try buf.appendSlice(allocator, "}\n");
 
+    if (opts.json_timing_path) |path| {
+        try compat.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
+    }
     print("{s}", .{buf.items});
 }
 
@@ -378,6 +442,10 @@ fn appendIntJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator,
     const value_str = try std.fmt.allocPrint(allocator, "{d}", .{value});
     defer allocator.free(value_str);
     try buf.appendSlice(allocator, value_str);
+}
+
+fn appendBoolJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: bool) !void {
+    try buf.appendSlice(allocator, if (value) "true" else "false");
 }
 
 fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
@@ -444,9 +512,9 @@ fn ensureRequestedBackendAvailable(choice: BackendChoice) !void {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|onnx|native|metal|cuda] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>]
+        \\usage: antfly inference read <model-dir> <image-path> [--backend auto|onnx|native|metal|cuda] [--prompt <prompt>] [--max-tokens <n>] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--warmup-iters <n>] [--measure-iters <n>] [--json-timing <path>]
         \\  Runs local document/image reading and prints a JSON response to stdout.
-        \\  With --measure-iters, keeps the model loaded and prints warm request latency JSON.
+        \\  With --measure-iters, keeps the model loaded and prints warm request latency JSON. --json-timing also writes that JSON to a file.
         \\
     , .{});
 }
@@ -467,6 +535,8 @@ test "parseArgs accepts backend, prompt, and max tokens" {
         "2",
         "--measure-iters",
         "3",
+        "--json-timing",
+        "/tmp/read.json",
     });
 
     try std.testing.expectEqualStrings("/tmp/model", opts.model_dir);
@@ -477,6 +547,7 @@ test "parseArgs accepts backend, prompt, and max tokens" {
     try std.testing.expectEqualStrings("turbo3", opts.cache_dtype.?);
     try std.testing.expectEqual(@as(usize, 2), opts.warmup_iters);
     try std.testing.expectEqual(@as(?usize, 3), opts.measure_iters);
+    try std.testing.expectEqualStrings("/tmp/read.json", opts.json_timing_path.?);
 }
 
 test "parseArgs rejects zero max tokens" {

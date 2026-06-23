@@ -38,6 +38,28 @@ const image = @import("image.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 
+pub const ReadTelemetry = struct {
+    resident_decoder: bool = false,
+    kv_cache: bool = false,
+    kv_cache_mode: ?[]const u8 = null,
+    lm_head_path: ?[]const u8 = null,
+    cuda_graph_replay: bool = false,
+    cuda_graph_fallback_reason: ?[]const u8 = null,
+    cuda_graph_capture_steps: usize = 0,
+    cuda_graph_replay_steps: usize = 0,
+    generated_tokens: ?usize = null,
+};
+
+var last_read_telemetry: ReadTelemetry = .{};
+
+pub fn resetLastReadTelemetry() void {
+    last_read_telemetry = .{};
+}
+
+pub fn lastReadTelemetry() ReadTelemetry {
+    return last_read_telemetry;
+}
+
 pub const ReadConfig = struct {
     max_length: usize = 1024,
     image_size: usize = 384,
@@ -72,6 +94,7 @@ pub const ReadingPipeline = struct {
     decoder: backends.Session,
     tokenizer: tokenizer_mod.Tokenizer,
     config: ReadConfig,
+    florence_final_logits_bias_zero_cache: ?*?bool = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -79,6 +102,7 @@ pub const ReadingPipeline = struct {
         decoder: backends.Session,
         tokenizer: tokenizer_mod.Tokenizer,
         config: ReadConfig,
+        florence_final_logits_bias_zero_cache: ?*?bool,
     ) ReadingPipeline {
         return .{
             .allocator = allocator,
@@ -86,11 +110,13 @@ pub const ReadingPipeline = struct {
             .decoder = decoder,
             .tokenizer = tokenizer,
             .config = config,
+            .florence_final_logits_bias_zero_cache = florence_final_logits_bias_zero_cache,
         };
     }
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        resetLastReadTelemetry();
         const allocator = self.allocator;
         const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
         if (debug_cuda_session) std.log.info("reading: decode start bytes={d}", .{image_data.len});
@@ -124,6 +150,7 @@ pub const ReadingPipeline = struct {
 
     /// Read text from an already-decoded image crop.
     pub fn readDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
+        resetLastReadTelemetry();
         if (expectsFlattenedPatches(self.vision_encoder)) {
             return self.readPix2StructDecoded(img);
         }
@@ -351,6 +378,7 @@ pub const ReadingPipeline = struct {
         if (self.vision_encoder.vtable != self.decoder.vtable or self.vision_encoder.ptr != self.decoder.ptr) return null;
 
         const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return null;
+        last_read_telemetry.resident_decoder = true;
         const allocator = self.allocator;
         var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
         defer cb.deinit();
@@ -394,6 +422,23 @@ pub const ReadingPipeline = struct {
                 dec_ids[1] = forced_bos;
                 dec_len = 2;
             }
+        }
+
+        if (backend == .cuda and !florenceKvCacheDisabled()) {
+            last_read_telemetry.kv_cache = true;
+            last_read_telemetry.cuda_graph_replay = false;
+            last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
+            const decode_start = nowNs();
+            const result = try self.decodeFlorenceResidentIncremental(
+                &cb,
+                florence_cfg,
+                encoder.hidden,
+                encoder.seq_len,
+                dec_ids,
+                dec_len,
+            );
+            logReadProfile("florence_resident_kv_decode", decode_start);
+            return result;
         }
 
         while (dec_len < max_len) {
@@ -443,6 +488,211 @@ pub const ReadingPipeline = struct {
         }
 
         return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+    }
+
+    fn decodeFlorenceResidentIncremental(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        encoder_hidden: CT,
+        enc_seq_len: usize,
+        dec_ids: []i64,
+        initial_len: usize,
+    ) !ReadResult {
+        const allocator = self.allocator;
+        const max_len = self.config.max_length;
+        if (initial_len == 0 or initial_len > max_len or dec_ids.len < max_len) return error.InvalidInputShape;
+
+        const cache_start = nowNs();
+        var cache = try florence_arch.buildDecoderIncrementalCache(cb, allocator, florence_cfg, encoder_hidden, 1, enc_seq_len, max_len);
+        defer cache.deinit(cb, allocator);
+        last_read_telemetry.kv_cache_mode = if (cache.self.preallocated) "preallocated" else "concat";
+        logReadProfile("florence_decoder_kv_cache_build", cache_start);
+
+        const fused_lm_head_allowed = if (self.florence_final_logits_bias_zero_cache) |cache_ptr| blk: {
+            if (cache_ptr.*) |cached| break :blk cached;
+            const bias_check_start = nowNs();
+            const value = try florence_arch.decoderFinalLogitsBiasIsZero(cb, allocator, florence_cfg.vocab_size);
+            logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
+            cache_ptr.* = value;
+            break :blk value;
+        } else blk: {
+            const bias_check_start = nowNs();
+            const value = try florence_arch.decoderFinalLogitsBiasIsZero(cb, allocator, florence_cfg.vocab_size);
+            logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
+            break :blk value;
+        };
+        if (!fused_lm_head_allowed and last_read_telemetry.lm_head_path == null) {
+            last_read_telemetry.lm_head_path = "full_logits_bias";
+        }
+
+        var hidden_opt: ?CT = null;
+        defer if (hidden_opt) |hidden| cb.free(hidden);
+
+        var dec_len = initial_len;
+        for (0..dec_len) |idx| {
+            const prefix_step_start = nowNs();
+            const hidden = try florence_arch.decoderForwardIncrementalStepFinalHiddenTensor(
+                cb,
+                allocator,
+                florence_cfg,
+                dec_ids[idx],
+                &cache,
+            );
+            if (idx + 1 == dec_len) {
+                hidden_opt = hidden;
+            } else {
+                cb.free(hidden);
+            }
+            logReadProfileStep("florence_decoder_kv_prefix_step", idx + 1, idx + 1, nowNs() - prefix_step_start);
+        }
+
+        var decoder_run_total_ns: u64 = 0;
+        var decoder_steps: usize = 0;
+        while (dec_len < max_len) {
+            var hidden = hidden_opt orelse return error.InvalidInputShape;
+            hidden_opt = null;
+            var hidden_live = true;
+            errdefer if (hidden_live) cb.free(hidden);
+            decoder_steps += 1;
+
+            const suppress_tokens = try buildNoRepeatSuppressTokens(
+                allocator,
+                dec_ids[0..dec_len],
+                self.config.no_repeat_ngram_size,
+            );
+            var suppress_tokens_live = true;
+            errdefer if (suppress_tokens_live) allocator.free(suppress_tokens);
+
+            const best_id = try self.selectFlorenceTokenFromFinalHidden(
+                cb,
+                florence_cfg,
+                &hidden,
+                &hidden_live,
+                suppress_tokens,
+                fused_lm_head_allowed,
+            );
+            allocator.free(suppress_tokens);
+            suppress_tokens_live = false;
+
+            if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
+
+            dec_ids[dec_len] = @intCast(best_id);
+            dec_len += 1;
+            if (dec_len < max_len) {
+                const decoder_run_start = nowNs();
+                hidden_opt = try florence_arch.decoderForwardIncrementalStepFinalHiddenTensor(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    dec_ids[dec_len - 1],
+                    &cache,
+                );
+                const decoder_run_ns = nowNs() - decoder_run_start;
+                decoder_run_total_ns += decoder_run_ns;
+                logReadProfileStep("florence_decoder_kv_step", decoder_steps, dec_len, decoder_run_ns);
+            }
+        }
+        logReadProfileStep("florence_decoder_kv_run_total", decoder_steps, dec_len, decoder_run_total_ns);
+
+        const decode_ids_start = nowNs();
+        const result = try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+        logReadProfile("florence_decoder_decode_ids", decode_ids_start);
+        return result;
+    }
+
+    fn selectFlorenceTokenFromFinalHidden(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        hidden: *CT,
+        hidden_live: *bool,
+        suppress_tokens: []const i32,
+        fused_lm_head_allowed: bool,
+    ) !u32 {
+        const allocator = self.allocator;
+
+        if (fused_lm_head_allowed) {
+            var capture_graph = false;
+            if (florenceCudaGraphEnabled()) {
+                if (suppress_tokens.len == 0) {
+                    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput(hidden.*)) |prepared| {
+                        cb.free(hidden.*);
+                        hidden.* = prepared;
+                        hidden_live.* = true;
+                        _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0);
+                        if (try cb.debugCudaGraphReplayFinalHidden(hidden.*)) |token_tensor| {
+                            defer cb.free(token_tensor);
+                            cb.free(hidden.*);
+                            hidden_live.* = false;
+                            last_read_telemetry.cuda_graph_replay = true;
+                            last_read_telemetry.cuda_graph_replay_steps += 1;
+                            last_read_telemetry.lm_head_path = "fused_argmax_graph";
+                            return try tokenTensorToU32(cb, allocator, token_tensor);
+                        }
+                        capture_graph = try cb.debugCudaGraphCaptureBegin("florence.lm_head_argmax");
+                        if (capture_graph) {
+                            try cb.debugCudaTraceTensor("florence.lm_head_input", hidden.*);
+                            try cb.debugCudaGraphRegisterFinalHiddenReplayInput(hidden.*);
+                        } else if (last_read_telemetry.cuda_graph_fallback_reason == null) {
+                            last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_capture_unavailable";
+                        }
+                    } else if (last_read_telemetry.cuda_graph_fallback_reason == null) {
+                        last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_prepare_unavailable";
+                    }
+                } else if (last_read_telemetry.cuda_graph_fallback_reason == null) {
+                    last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_suppress_tokens_dynamic";
+                }
+            }
+            errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+            const fused_start = nowNs();
+            if (try florence_arch.decoderFusedTokenFromFinalHiddenTensor(cb, florence_cfg, hidden.*, suppress_tokens)) |token_tensor| {
+                logReadProfile("florence_decoder_lm_head_fused_argmax", fused_start);
+                defer cb.free(token_tensor);
+                if (capture_graph) {
+                    try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(hidden.*, token_tensor);
+                    try cb.debugCudaGraphCaptureEnd(true);
+                    last_read_telemetry.cuda_graph_capture_steps += 1;
+                    capture_graph = false;
+                }
+                cb.free(hidden.*);
+                hidden_live.* = false;
+                if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "fused_argmax";
+                return try tokenTensorToU32(cb, allocator, token_tensor);
+            }
+            logReadProfile("florence_decoder_lm_head_fused_unavailable", fused_start);
+            if (capture_graph) {
+                try cb.debugCudaGraphCaptureEnd(false);
+                capture_graph = false;
+            }
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits_fused_unavailable";
+        }
+
+        const logits = try florence_arch.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, florence_cfg, hidden.*);
+        hidden_live.* = false;
+        defer cb.free(logits);
+
+        if (suppress_tokens.len == 0) {
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits";
+            const token = (try cb.argmaxLastRow(logits, 1, florence_cfg.vocab_size)) orelse return error.UnsupportedOperation;
+            return token;
+        }
+
+        if (try cb.argmaxRowsSuppress(logits, 0, 1, florence_cfg.vocab_size, suppress_tokens, allocator)) |tokens| {
+            defer allocator.free(tokens);
+            if (tokens.len != 1) return error.InvalidTensorShape;
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits";
+            return tokens[0];
+        }
+
+        if (try cb.argmaxLastRowSuppressTensor(logits, 1, florence_cfg.vocab_size, suppress_tokens)) |token_tensor| {
+            defer cb.free(token_tensor);
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits";
+            return try tokenTensorToU32(cb, allocator, token_tensor);
+        }
+
+        return error.UnsupportedFlorence2NoRepeatMetal;
     }
 
     fn readPix2StructDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
@@ -608,6 +858,7 @@ pub const ReadingPipeline = struct {
         const allocator = self.allocator;
         const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
         const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
+        last_read_telemetry.generated_tokens = text_len;
         const token_ids = try allocator.alloc(i32, text_len);
         defer allocator.free(token_ids);
         for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[prefix_len + i]);
@@ -625,6 +876,23 @@ pub const ReadingPipeline = struct {
 
 fn readProfileEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn florenceKvCacheDisabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE");
+}
+
+fn florenceCudaGraphEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_CUDA_GRAPH");
+}
+
+fn tokenTensorToU32(cb: *const ComputeBackend, allocator: std.mem.Allocator, token_tensor: CT) !u32 {
+    const download_start = nowNs();
+    const token_ids = try cb.toFloat32(token_tensor, allocator);
+    logReadProfile("florence_decoder_token_download", download_start);
+    defer allocator.free(token_ids);
+    if (token_ids.len != 1 or token_ids[0] < 0) return error.InvalidTensorShape;
+    return @as(u32, @intFromFloat(token_ids[0]));
 }
 
 fn logReadProfile(phase: []const u8, start_ns: u64) void {

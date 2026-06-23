@@ -99,12 +99,14 @@ pub const KernelModule = struct {
     attention_f32: driver_mod.CUfunction = null,
     attention_f32_block: driver_mod.CUfunction = null,
     cross_attention_f32: driver_mod.CUfunction = null,
+    cross_attention_q1_f32: driver_mod.CUfunction = null,
     token_to_nchw_f32: driver_mod.CUfunction = null,
     nchw_to_token_f32: driver_mod.CUfunction = null,
     pack_windows_f32: driver_mod.CUfunction = null,
     unpad_windows_f32: driver_mod.CUfunction = null,
     channel_scores_softmax_f32: driver_mod.CUfunction = null,
     channel_apply_f32: driver_mod.CUfunction = null,
+    florence_vision_tail_sources_f32: driver_mod.CUfunction = null,
     rope_f32: driver_mod.CUfunction = null,
     rope_scaled_f32: driver_mod.CUfunction = null,
     rope_per_item_f32: driver_mod.CUfunction = null,
@@ -164,6 +166,7 @@ pub const KernelModule = struct {
     linear_q4_k_bias_quick_gelu_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_bias_relu_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_triple_bias_f32_tc_hmma: driver_mod.CUfunction = null,
+    linear_q4_k_pair_bias_f32_tc_hmma: driver_mod.CUfunction = null,
     linear_q4_k_span_bias_f32_tile8_r2: driver_mod.CUfunction = null,
     linear_q4_k_span_bias_relu_f32_tile8_r2: driver_mod.CUfunction = null,
     linear_q4_k_span_bias_f32_tile4_r8: driver_mod.CUfunction = null,
@@ -286,12 +289,14 @@ pub const KernelModule = struct {
         var attention_f32_block: driver_mod.CUfunction = null;
         try ctx.driver.check(ctx.driver.fns.cuModuleGetFunction(&attention_f32_block, module, "termite_attention_f32_block"));
         const cross_attention_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_f32");
+        const cross_attention_q1_f32 = loadOptionalFunction(ctx, module, "termite_cross_attention_q1_f32");
         const token_to_nchw_f32 = loadOptionalFunction(ctx, module, "termite_token_to_nchw_f32");
         const nchw_to_token_f32 = loadOptionalFunction(ctx, module, "termite_nchw_to_token_f32");
         const pack_windows_f32 = loadOptionalFunction(ctx, module, "termite_pack_windows_f32");
         const unpad_windows_f32 = loadOptionalFunction(ctx, module, "termite_unpad_windows_f32");
         const channel_scores_softmax_f32 = loadOptionalFunction(ctx, module, "termite_channel_scores_softmax_f32");
         const channel_apply_f32 = loadOptionalFunction(ctx, module, "termite_channel_apply_f32");
+        const florence_vision_tail_sources_f32 = loadOptionalFunction(ctx, module, "termite_florence_vision_tail_sources_f32");
         const rope_f32 = loadOptionalFunction(ctx, module, "termite_rope_f32");
         const rope_scaled_f32 = loadOptionalFunction(ctx, module, "termite_rope_scaled_f32");
         const rope_per_item_f32 = loadOptionalFunction(ctx, module, "termite_rope_per_item_f32");
@@ -381,6 +386,7 @@ pub const KernelModule = struct {
         const linear_q4_k_bias_quick_gelu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_quick_gelu_f32_tc_hmma");
         const linear_q4_k_bias_relu_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_bias_relu_f32_tc_hmma");
         const linear_q4_k_triple_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_triple_bias_f32_tc_hmma");
+        const linear_q4_k_pair_bias_f32_tc_hmma = loadOptionalFunction(ctx, module, "termite_linear_q4_k_pair_bias_f32_tc_hmma");
         const linear_q4_k_span_bias_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_f32_tile8_r2");
         const linear_q4_k_span_bias_relu_f32_tile8_r2 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_relu_f32_tile8_r2");
         const linear_q4_k_span_bias_f32_tile4_r8 = loadOptionalFunction(ctx, module, "termite_linear_q4_k_span_bias_f32_tile4_r8");
@@ -472,12 +478,14 @@ pub const KernelModule = struct {
             .attention_f32 = attention_f32,
             .attention_f32_block = attention_f32_block,
             .cross_attention_f32 = cross_attention_f32,
+            .cross_attention_q1_f32 = cross_attention_q1_f32,
             .token_to_nchw_f32 = token_to_nchw_f32,
             .nchw_to_token_f32 = nchw_to_token_f32,
             .pack_windows_f32 = pack_windows_f32,
             .unpad_windows_f32 = unpad_windows_f32,
             .channel_scores_softmax_f32 = channel_scores_softmax_f32,
             .channel_apply_f32 = channel_apply_f32,
+            .florence_vision_tail_sources_f32 = florence_vision_tail_sources_f32,
             .rope_f32 = rope_f32,
             .rope_scaled_f32 = rope_scaled_f32,
             .rope_per_item_f32 = rope_per_item_f32,
@@ -539,6 +547,7 @@ pub const KernelModule = struct {
             .linear_q4_k_bias_quick_gelu_f32_tc_hmma = linear_q4_k_bias_quick_gelu_f32_tc_hmma,
             .linear_q4_k_bias_relu_f32_tc_hmma = linear_q4_k_bias_relu_f32_tc_hmma,
             .linear_q4_k_triple_bias_f32_tc_hmma = linear_q4_k_triple_bias_f32_tc_hmma,
+            .linear_q4_k_pair_bias_f32_tc_hmma = linear_q4_k_pair_bias_f32_tc_hmma,
             .linear_q4_k_span_bias_f32_tile8_r2 = linear_q4_k_span_bias_f32_tile8_r2,
             .linear_q4_k_span_bias_relu_f32_tile8_r2 = linear_q4_k_span_bias_relu_f32_tile8_r2,
             .linear_q4_k_span_bias_f32_tile4_r8 = linear_q4_k_span_bias_f32_tile4_r8,
@@ -623,12 +632,14 @@ pub const KernelModule = struct {
             self.attention_f32 = null;
             self.attention_f32_block = null;
             self.cross_attention_f32 = null;
+            self.cross_attention_q1_f32 = null;
             self.token_to_nchw_f32 = null;
             self.nchw_to_token_f32 = null;
             self.pack_windows_f32 = null;
             self.unpad_windows_f32 = null;
             self.channel_scores_softmax_f32 = null;
             self.channel_apply_f32 = null;
+            self.florence_vision_tail_sources_f32 = null;
             self.rope_f32 = null;
             self.rope_scaled_f32 = null;
             self.rope_per_item_f32 = null;
@@ -689,6 +700,8 @@ pub const KernelModule = struct {
             self.linear_q4_k_bias_add_f32_tc_hmma = null;
             self.linear_q4_k_bias_quick_gelu_f32_tc_hmma = null;
             self.linear_q4_k_bias_relu_f32_tc_hmma = null;
+            self.linear_q4_k_triple_bias_f32_tc_hmma = null;
+            self.linear_q4_k_pair_bias_f32_tc_hmma = null;
             self.linear_q4_k_span_bias_f32_tile8_r2 = null;
             self.linear_q4_k_span_bias_relu_f32_tile8_r2 = null;
             self.linear_q4_k_span_bias_f32_tile4_r8 = null;
@@ -769,12 +782,14 @@ pub const KernelModule = struct {
             self.hasQ4KTensorCorePrimitives() and
             self.split_last_dim3_f32 != null and
             self.cross_attention_f32 != null and
+            self.cross_attention_q1_f32 != null and
             self.token_to_nchw_f32 != null and
             self.nchw_to_token_f32 != null and
             self.pack_windows_f32 != null and
             self.unpad_windows_f32 != null and
             self.channel_scores_softmax_f32 != null and
-            self.channel_apply_f32 != null;
+            self.channel_apply_f32 != null and
+            self.florence_vision_tail_sources_f32 != null;
     }
 
     pub fn hasGlinerSpanQ4KPrimitives(self: *const KernelModule) bool {
@@ -794,7 +809,8 @@ pub const KernelModule = struct {
             self.linear_q4_k_bias_add_f32_tc_hmma != null and
             self.linear_q4_k_bias_quick_gelu_f32_tc_hmma != null and
             self.linear_q4_k_bias_relu_f32_tc_hmma != null and
-            self.linear_q4_k_triple_bias_f32_tc_hmma != null;
+            self.linear_q4_k_triple_bias_f32_tc_hmma != null and
+            self.linear_q4_k_pair_bias_f32_tc_hmma != null;
     }
 
     pub fn hasQuantMatmulMvpPrimitives(self: *const KernelModule) bool {
@@ -2885,6 +2901,35 @@ pub const KernelModule = struct {
         if (mask.ptr != 0) try checkRawBytes(mask, try checkedTensorElements(batch, enc_seq) * @sizeOf(i64));
         if (q_count == 0) return;
 
+        if (dec_seq == 1 and enc_seq != 0 and self.cross_attention_q1_f32 != null) {
+            const threads: usize = 256;
+            const shared_bytes = try checkedTensorElements(enc_seq + threads, @sizeOf(f32));
+            if (shared_bytes <= 48 * 1024) {
+                var dst_ptr = dst.ptr;
+                var q_ptr = q.ptr;
+                var k_ptr = k.ptr;
+                var v_ptr = v.ptr;
+                var mask_ptr = mask.ptr;
+                var batch_u32 = try toU32(batch);
+                var enc_seq_u32 = try toU32(enc_seq);
+                var num_heads_u32 = try toU32(num_heads);
+                var head_dim_u32 = try toU32(head_dim);
+                var params = [_]?*anyopaque{
+                    @ptrCast(&dst_ptr),
+                    @ptrCast(&q_ptr),
+                    @ptrCast(&k_ptr),
+                    @ptrCast(&v_ptr),
+                    @ptrCast(&mask_ptr),
+                    @ptrCast(&batch_u32),
+                    @ptrCast(&enc_seq_u32),
+                    @ptrCast(&num_heads_u32),
+                    @ptrCast(&head_dim_u32),
+                };
+                try launchBlocksShared(self.cross_attention_q1_f32, ctx, try checkedTensorElements(batch, num_heads), threads, shared_bytes, &params);
+                return;
+            }
+        }
+
         var dst_ptr = dst.ptr;
         var q_ptr = q.ptr;
         var k_ptr = k.ptr;
@@ -3134,6 +3179,66 @@ pub const KernelModule = struct {
             @ptrCast(&groups_u32),
         };
         try launch1d(self.channel_apply_f32, ctx, count, &params);
+    }
+
+    pub fn launchFlorenceVisionTailSourcesF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        tokens: buffer_mod.DeviceBuffer,
+        row_embed: buffer_mod.DeviceBuffer,
+        col_embed: buffer_mod.DeviceBuffer,
+        temporal_embed: buffer_mod.DeviceBuffer,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+        has_temporal: bool,
+        row_dtype: u32,
+        col_dtype: u32,
+        temporal_dtype: u32,
+    ) driver_mod.Error!void {
+        if (self.florence_vision_tail_sources_f32 == null) return error.CudaKernelUnavailable;
+        if (height == 0 or width == 0 or dim == 0) return error.InvalidCudaState;
+        const token_count = try checkedTensorElements(height, width);
+        const out_seq = std.math.add(usize, token_count, 1) catch return error.InvalidCudaState;
+        const src_count = try checkedTensorElements(try checkedTensorElements(batch, token_count), dim);
+        const dst_count = try checkedTensorElements(try checkedTensorElements(batch, out_seq), dim);
+        try checkBytes(tokens, src_count);
+        try checkBytes(dst, dst_count);
+        try checkTypedTailWeightBytes(row_embed, try checkedTensorElements(height, dim / 2), row_dtype);
+        try checkTypedTailWeightBytes(col_embed, try checkedTensorElements(width, dim - dim / 2), col_dtype);
+        if (has_temporal) try checkTypedTailWeightBytes(temporal_embed, dim, temporal_dtype);
+        if (dst_count == 0) return;
+        var dst_ptr = dst.ptr;
+        var tokens_ptr = tokens.ptr;
+        var row_ptr = row_embed.ptr;
+        var col_ptr = col_embed.ptr;
+        var temporal_ptr = temporal_embed.ptr;
+        var batch_u32 = try toU32(batch);
+        var height_u32 = try toU32(height);
+        var width_u32 = try toU32(width);
+        var dim_u32 = try toU32(dim);
+        var has_temporal_u32: u32 = if (has_temporal) 1 else 0;
+        var row_dtype_u32 = row_dtype;
+        var col_dtype_u32 = col_dtype;
+        var temporal_dtype_u32 = temporal_dtype;
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_ptr),
+            @ptrCast(&tokens_ptr),
+            @ptrCast(&row_ptr),
+            @ptrCast(&col_ptr),
+            @ptrCast(&temporal_ptr),
+            @ptrCast(&batch_u32),
+            @ptrCast(&height_u32),
+            @ptrCast(&width_u32),
+            @ptrCast(&dim_u32),
+            @ptrCast(&has_temporal_u32),
+            @ptrCast(&row_dtype_u32),
+            @ptrCast(&col_dtype_u32),
+            @ptrCast(&temporal_dtype_u32),
+        };
+        try launch1d(self.florence_vision_tail_sources_f32, ctx, dst_count, &params);
     }
 
     pub fn launchRopeF32(
@@ -5241,6 +5346,67 @@ pub const KernelModule = struct {
         );
     }
 
+    pub fn launchLinearQ4KPairBiasTcHmmaF32(
+        self: *KernelModule,
+        ctx: *context_mod.CudaContext,
+        dst_a: buffer_mod.DeviceBuffer,
+        dst_b: buffer_mod.DeviceBuffer,
+        input: buffer_mod.DeviceBuffer,
+        weight_a_packed: buffer_mod.DeviceBuffer,
+        bias_a: buffer_mod.DeviceBuffer,
+        weight_b_packed: buffer_mod.DeviceBuffer,
+        bias_b: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) driver_mod.Error!void {
+        const function = self.linear_q4_k_pair_bias_f32_tc_hmma orelse return error.CudaSymbolMissing;
+        if (in_dim == 0 or in_dim % q4_k_values_per_block != 0) return error.InvalidCudaState;
+        const row_blocks = in_dim / q4_k_values_per_block;
+        const out_count = try checkedTensorElements(rows, out_dim);
+        const weight_bytes = try checkedTensorElements(try checkedTensorElements(out_dim, row_blocks), q4_k_tc_block_bytes);
+        try checkBytes(dst_a, out_count);
+        try checkBytes(dst_b, out_count);
+        try checkBytes(input, try checkedTensorElements(rows, in_dim));
+        try checkRawBytes(weight_a_packed, weight_bytes);
+        try checkRawBytes(weight_b_packed, weight_bytes);
+        try checkBytes(bias_a, out_dim);
+        try checkBytes(bias_b, out_dim);
+        if (out_count == 0) return;
+
+        var dst_a_ptr = dst_a.ptr;
+        var dst_b_ptr = dst_b.ptr;
+        var input_ptr = input.ptr;
+        var weight_a_ptr = weight_a_packed.ptr;
+        var bias_a_ptr = bias_a.ptr;
+        var weight_b_ptr = weight_b_packed.ptr;
+        var bias_b_ptr = bias_b.ptr;
+        var rows_u32 = try toU32(rows);
+        var in_dim_u32 = try toU32(in_dim);
+        var out_dim_u32 = try toU32(out_dim);
+        var params = [_]?*anyopaque{
+            @ptrCast(&dst_a_ptr),
+            @ptrCast(&dst_b_ptr),
+            @ptrCast(&input_ptr),
+            @ptrCast(&weight_a_ptr),
+            @ptrCast(&bias_a_ptr),
+            @ptrCast(&weight_b_ptr),
+            @ptrCast(&bias_b_ptr),
+            @ptrCast(&rows_u32),
+            @ptrCast(&in_dim_u32),
+            @ptrCast(&out_dim_u32),
+        };
+        try launch3d(
+            function,
+            ctx,
+            (out_dim + q_tc_hmma_cols - 1) / q_tc_hmma_cols,
+            (rows + q_tc_hmma_rows - 1) / q_tc_hmma_rows,
+            2,
+            q_tc_hmma_threads,
+            &params,
+        );
+    }
+
     pub fn launchLinearQ4KBiasQuickGeluTiledF32(
         self: *KernelModule,
         ctx: *context_mod.CudaContext,
@@ -6401,6 +6567,16 @@ fn checkBytes(buffer: buffer_mod.DeviceBuffer, f32_count: usize) driver_mod.Erro
     try checkRawBytes(buffer, bytes);
 }
 
+fn checkTypedTailWeightBytes(buffer: buffer_mod.DeviceBuffer, elem_count: usize, dtype: u32) driver_mod.Error!void {
+    const elem_bytes: usize = switch (dtype) {
+        0 => @sizeOf(f32),
+        1, 2 => @sizeOf(u16),
+        else => return error.InvalidCudaState,
+    };
+    const bytes = std.math.mul(usize, elem_count, elem_bytes) catch return error.InvalidCudaState;
+    try checkRawBytes(buffer, bytes);
+}
+
 fn checkRawBytes(buffer: buffer_mod.DeviceBuffer, bytes: usize) driver_mod.Error!void {
     if (bytes > buffer.len) return error.InvalidCudaState;
 }
@@ -6415,6 +6591,27 @@ fn launchBlocks(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, 
     const grid: c_uint = try toU32(blocks);
     const block: c_uint = try toU32(threads);
     try launchRaw(function, ctx, grid, block, params);
+}
+
+fn launchBlocksShared(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, blocks: usize, threads: usize, shared_bytes: usize, params: [*]?*anyopaque) driver_mod.Error!void {
+    const grid: c_uint = try toU32(blocks);
+    const block: c_uint = try toU32(threads);
+    const shared: c_uint = try toU32(shared_bytes);
+    try ctx.makeCurrent();
+    try ctx.driver.check(ctx.driver.fns.cuLaunchKernel(
+        function,
+        grid,
+        1,
+        1,
+        block,
+        1,
+        1,
+        shared,
+        ctx.stream,
+        params,
+        null,
+    ));
+    ctx.noteKernelLaunch();
 }
 
 fn launch2d(function: driver_mod.CUfunction, ctx: *context_mod.CudaContext, grid_x: usize, grid_y: usize, threads: usize, params: [*]?*anyopaque) driver_mod.Error!void {
@@ -6640,6 +6837,7 @@ pub fn smokeFlorence2Primitives(allocator: std.mem.Allocator) !void {
     try smokeFlorence2LayoutF32(allocator, &ctx, &module);
     try smokeFlorence2WindowsF32(allocator, &ctx, &module);
     try smokeFlorence2ChannelAttentionF32(allocator, &ctx, &module);
+    try smokeFlorence2VisionTailSourcesF32(allocator, &ctx, &module);
     try smokeFlorence2TripleQ4KTcHmmaF32(allocator, &ctx, &module);
 }
 
@@ -7555,6 +7753,12 @@ fn smokeFlorence2CrossAttentionF32(allocator: std.mem.Allocator, ctx: *context_m
     try ctx.synchronize();
     try expectApproxSlice(out, &expected, 0.001);
 
+    try module.launchCrossAttentionF32(ctx, output, q, k, v, .{}, batch, 1, enc_seq, heads, head_dim);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out[0..head_dim], expected[0..head_dim], 0.001);
+
     const mask_data = [_]i64{ 1, 0 };
     const expected_masked = [_]f32{ 10, 0, 10, 0 };
     var mask = try buffer_mod.DeviceBuffer.alloc(ctx, mask_data.len * @sizeOf(i64));
@@ -7565,6 +7769,12 @@ fn smokeFlorence2CrossAttentionF32(allocator: std.mem.Allocator, ctx: *context_m
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_masked, 0.001);
+
+    try module.launchCrossAttentionF32(ctx, output, q, k, v, mask, batch, 1, enc_seq, heads, head_dim);
+    try ctx.synchronize();
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out[0..head_dim], expected_masked[0..head_dim], 0.001);
 }
 
 fn smokeFlorence2LayoutF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -7669,6 +7879,59 @@ fn smokeFlorence2ChannelAttentionF32(allocator: std.mem.Allocator, ctx: *context
     try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_out, 0.001);
+}
+
+fn smokeFlorence2VisionTailSourcesF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
+    const batch: usize = 1;
+    const height: usize = 2;
+    const width: usize = 2;
+    const dim: usize = 4;
+    const tokens_data = [_]f32{
+        1,  2,  3,  4,
+        5,  6,  7,  8,
+        9,  10, 11, 12,
+        13, 14, 15, 16,
+    };
+    const row_data = [_]f32{
+        100, 200,
+        300, 400,
+    };
+    const col_data = [_]f32{
+        10, 20,
+        30, 40,
+    };
+    const temporal_data = [_]f32{ 1, 2, 3, 4 };
+    const expected = [_]f32{
+        28, 40, 212, 314,
+        12, 24, 106, 208,
+        36, 48, 110, 212,
+        20, 32, 314, 416,
+        44, 56, 318, 420,
+    };
+
+    var tokens = try buffer_mod.DeviceBuffer.alloc(ctx, tokens_data.len * @sizeOf(f32));
+    defer tokens.free(ctx);
+    var row = try buffer_mod.DeviceBuffer.alloc(ctx, row_data.len * @sizeOf(f32));
+    defer row.free(ctx);
+    var col = try buffer_mod.DeviceBuffer.alloc(ctx, col_data.len * @sizeOf(f32));
+    defer col.free(ctx);
+    var temporal = try buffer_mod.DeviceBuffer.alloc(ctx, temporal_data.len * @sizeOf(f32));
+    defer temporal.free(ctx);
+    var output = try buffer_mod.DeviceBuffer.alloc(ctx, expected.len * @sizeOf(f32));
+    defer output.free(ctx);
+    try tokens.copyFromHost(ctx, std.mem.sliceAsBytes(&tokens_data));
+    try row.copyFromHost(ctx, std.mem.sliceAsBytes(&row_data));
+    try col.copyFromHost(ctx, std.mem.sliceAsBytes(&col_data));
+    try temporal.copyFromHost(ctx, std.mem.sliceAsBytes(&temporal_data));
+
+    try module.launchFlorenceVisionTailSourcesF32(ctx, output, tokens, row, col, temporal, batch, height, width, dim, true, 0, 0, 0);
+    try ctx.synchronize();
+
+    const out = try allocator.alloc(f32, expected.len);
+    defer allocator.free(out);
+    try output.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, &expected, 0.0001);
 }
 
 fn smokeRopeF32(allocator: std.mem.Allocator, ctx: *context_mod.CudaContext, module: *KernelModule) !void {
@@ -8089,14 +8352,24 @@ fn smokeFlorence2TripleQ4KTcHmmaF32(
     writeQ4_KSmokeRow(weight_raw[144..288], 0.5, 2);
     var weight_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
     writeQ4_KSmokeTensorCore(&weight_tc_raw, &weight_raw, in_dim, out_dim);
+    var weight_b_raw = [_]u8{0} ** (out_dim * q4_k_block_bytes);
+    writeQ4_KSmokeRow(weight_b_raw[0..144], 0.25, 3);
+    writeQ4_KSmokeRow(weight_b_raw[144..288], 2.0, 1);
+    var weight_b_tc_raw = [_]u8{0} ** (out_dim * q4_k_tc_block_bytes);
+    writeQ4_KSmokeTensorCore(&weight_b_tc_raw, &weight_b_raw, in_dim, out_dim);
     const bias_data = [_]f32{ 0.25, -1.0 };
+    const bias_b_data = [_]f32{ 1.5, -2.25 };
 
     var input = try buffer_mod.DeviceBuffer.alloc(ctx, input_data.len * @sizeOf(f32));
     defer input.free(ctx);
     var weight = try buffer_mod.DeviceBuffer.alloc(ctx, weight_tc_raw.len);
     defer weight.free(ctx);
+    var weight_b = try buffer_mod.DeviceBuffer.alloc(ctx, weight_b_tc_raw.len);
+    defer weight_b.free(ctx);
     var bias = try buffer_mod.DeviceBuffer.alloc(ctx, bias_data.len * @sizeOf(f32));
     defer bias.free(ctx);
+    var bias_b = try buffer_mod.DeviceBuffer.alloc(ctx, bias_b_data.len * @sizeOf(f32));
+    defer bias_b.free(ctx);
     var output_a = try buffer_mod.DeviceBuffer.alloc(ctx, rows * out_dim * @sizeOf(f32));
     defer output_a.free(ctx);
     var output_b = try buffer_mod.DeviceBuffer.alloc(ctx, rows * out_dim * @sizeOf(f32));
@@ -8106,7 +8379,9 @@ fn smokeFlorence2TripleQ4KTcHmmaF32(
 
     try input.copyFromHost(ctx, std.mem.sliceAsBytes(&input_data));
     try weight.copyFromHost(ctx, &weight_tc_raw);
+    try weight_b.copyFromHost(ctx, &weight_b_tc_raw);
     try bias.copyFromHost(ctx, std.mem.sliceAsBytes(&bias_data));
+    try bias_b.copyFromHost(ctx, std.mem.sliceAsBytes(&bias_b_data));
     try module.launchLinearQ4KTripleBiasTcHmmaF32(ctx, output_a, output_b, output_c, input, weight, bias, weight, bias, weight, bias, rows, in_dim, out_dim);
     try ctx.synchronize();
 
@@ -8122,6 +8397,25 @@ fn smokeFlorence2TripleQ4KTcHmmaF32(
     try output_c.copyToHost(ctx, std.mem.sliceAsBytes(out));
     try ctx.synchronize();
     try expectApproxSlice(out, &expected_bias, 4.0);
+
+    const expected_a = try allocator.alloc(f32, rows * out_dim);
+    defer allocator.free(expected_a);
+    const expected_b = try allocator.alloc(f32, rows * out_dim);
+    defer allocator.free(expected_b);
+    try module.launchLinearQ4KTripleBiasTcHmmaF32(ctx, output_a, output_b, output_c, input, weight, bias, weight_b, bias_b, weight, bias, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output_a.copyToHost(ctx, std.mem.sliceAsBytes(expected_a));
+    try output_b.copyToHost(ctx, std.mem.sliceAsBytes(expected_b));
+    try ctx.synchronize();
+
+    try module.launchLinearQ4KPairBiasTcHmmaF32(ctx, output_a, output_b, input, weight, bias, weight_b, bias_b, rows, in_dim, out_dim);
+    try ctx.synchronize();
+    try output_a.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected_a, 0.1);
+    try output_b.copyToHost(ctx, std.mem.sliceAsBytes(out));
+    try ctx.synchronize();
+    try expectApproxSlice(out, expected_b, 0.1);
 }
 
 fn writeQ4_KSmokeTensorCore(dst: []u8, raw: []const u8, in_dim: usize, out_dim: usize) void {

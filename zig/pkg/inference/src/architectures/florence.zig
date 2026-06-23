@@ -58,8 +58,91 @@ pub const DecoderCrossCache = struct {
     }
 };
 
+pub const DecoderSelfCache = struct {
+    keys: []?CT,
+    values: []?CT,
+    len: usize = 0,
+    capacity: usize = 0,
+    preallocated: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator, layers: usize) !DecoderSelfCache {
+        const keys = try allocator.alloc(?CT, layers);
+        errdefer allocator.free(keys);
+        const values = try allocator.alloc(?CT, layers);
+        errdefer allocator.free(values);
+        @memset(keys, null);
+        @memset(values, null);
+        return .{ .keys = keys, .values = values };
+    }
+
+    pub fn tryInitPreallocated(
+        cb: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        layers: usize,
+        capacity: usize,
+        d_model: usize,
+    ) !?DecoderSelfCache {
+        if (capacity == 0) return null;
+        const keys = try allocator.alloc(?CT, layers);
+        errdefer allocator.free(keys);
+        const values = try allocator.alloc(?CT, layers);
+        errdefer allocator.free(values);
+        @memset(keys, null);
+        @memset(values, null);
+
+        var cache = DecoderSelfCache{
+            .keys = keys,
+            .values = values,
+            .capacity = capacity,
+            .preallocated = true,
+        };
+        errdefer cache.deinit(cb, allocator);
+
+        const shape = [_]i32{ @intCast(capacity), @intCast(d_model) };
+        for (0..layers) |layer| {
+            cache.keys[layer] = (try cb.allocUninitF32Shape(&shape)) orelse {
+                cache.deinit(cb, allocator);
+                return null;
+            };
+            cache.values[layer] = (try cb.allocUninitF32Shape(&shape)) orelse {
+                cache.deinit(cb, allocator);
+                return null;
+            };
+        }
+        return cache;
+    }
+
+    pub fn deinit(self: *DecoderSelfCache, cb: *const ComputeBackend, allocator: std.mem.Allocator) void {
+        for (self.keys) |maybe_key| if (maybe_key) |key| cb.free(key);
+        for (self.values) |maybe_value| if (maybe_value) |value| cb.free(value);
+        allocator.free(self.keys);
+        allocator.free(self.values);
+    }
+};
+
+pub const DecoderIncrementalCache = struct {
+    cross: DecoderCrossCache,
+    self: DecoderSelfCache,
+    encoder_mask: []i64,
+    self_mask: []i64,
+    batch: usize,
+    enc_seq: usize,
+
+    pub fn deinit(self: *DecoderIncrementalCache, cb: *const ComputeBackend, allocator: std.mem.Allocator) void {
+        self.cross.deinit(cb, allocator);
+        self.self.deinit(cb, allocator);
+        allocator.free(self.encoder_mask);
+        allocator.free(self.self_mask);
+    }
+};
+
 const VisionForwardResult = struct {
     features: []f32,
+    seq_len: usize,
+};
+
+const VisionForwardTensorResult = struct {
+    features: CT,
     seq_len: usize,
 };
 
@@ -94,6 +177,20 @@ pub fn encoderForwardTensor(
     const profile = readProfileEnabled();
     if (debug_cuda_session) std.log.info("florence: encoder forward start batch={d} prompt_seq={d}", .{ batch, prompt_seq_len });
     const vision_start = nowNs();
+    if (try visionEncoderForwardTensorTail(cb, allocator, config, pixel_values, batch)) |image_tensor| {
+        if (profile) logFlorenceProfile("vision_total", vision_start);
+        if (debug_cuda_session) std.log.info("florence: device vision encoder done seq={d}", .{image_tensor.seq_len});
+        defer cb.free(image_tensor.features);
+
+        const total_seq = image_tensor.seq_len + prompt_seq_len;
+        const embeddings_start = nowNs();
+        const hidden = try applyEncoderImagePromptEmbeddingsTensor(cb, allocator, image_tensor, config, batch, prompt_input_ids, prompt_seq_len);
+        if (profile) logFlorenceProfile("encoder_embeddings", embeddings_start);
+        if (debug_cuda_session) std.log.info("florence: encoder embeddings done total_seq={d}", .{total_seq});
+
+        return runTextEncoderLayersTensor(cb, allocator, config, hidden, batch, total_seq);
+    }
+
     const image = try visionEncoderForward(cb, allocator, config, pixel_values, batch);
     if (profile) logFlorenceProfile("vision_total", vision_start);
     if (debug_cuda_session) std.log.info("florence: vision encoder done seq={d}", .{image.seq_len});
@@ -126,10 +223,28 @@ pub fn encoderForwardTensor(
     }
 
     const embeddings_start = nowNs();
-    var hidden = try applyEncoderEmbeddings(cb, allocator, merged, config, batch, total_seq);
+    const hidden = try applyEncoderEmbeddings(cb, allocator, merged, config, batch, total_seq);
     if (profile) logFlorenceProfile("encoder_embeddings", embeddings_start);
     if (debug_cuda_session) std.log.info("florence: encoder embeddings done total_seq={d}", .{total_seq});
     allocator.free(merged);
+
+    return runTextEncoderLayersTensor(cb, allocator, config, hidden, batch, total_seq);
+}
+
+fn runTextEncoderLayersTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_hidden: CT,
+    batch: usize,
+    total_seq: usize,
+) !EncoderForwardTensorResult {
+    const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    const profile = readProfileEnabled();
+    const total_tokens = batch * total_seq;
+    var hidden = input_hidden;
+    var hidden_owned = true;
+    errdefer if (hidden_owned) cb.free(hidden);
 
     const attn_mask = try allocator.alloc(i64, total_tokens);
     defer allocator.free(attn_mask);
@@ -146,6 +261,7 @@ pub fn encoderForwardTensor(
         if (debug_cuda_session) std.log.info("florence: text encoder layer done {d}", .{layer});
     }
 
+    hidden_owned = false;
     return .{ .hidden = hidden, .seq_len = total_seq };
 }
 
@@ -297,6 +413,139 @@ pub fn decoderForwardTensor(
     return logits;
 }
 
+pub fn buildDecoderIncrementalCache(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    encoder_hidden: CT,
+    batch: usize,
+    enc_seq: usize,
+    max_decode_len: usize,
+) !DecoderIncrementalCache {
+    var cross = try buildDecoderCrossCache(cb, allocator, config, encoder_hidden, batch, enc_seq);
+    errdefer cross.deinit(cb, allocator);
+    var self_cache = if (try DecoderSelfCache.tryInitPreallocated(cb, allocator, config.decoder_layers, max_decode_len, config.d_model)) |preallocated|
+        preallocated
+    else
+        try DecoderSelfCache.init(allocator, config.decoder_layers);
+    errdefer self_cache.deinit(cb, allocator);
+    const encoder_mask = try allocator.alloc(i64, batch * enc_seq);
+    errdefer allocator.free(encoder_mask);
+    @memset(encoder_mask, 1);
+    const self_mask = try allocator.alloc(i64, max_decode_len);
+    @memset(self_mask, 1);
+    return .{ .cross = cross, .self = self_cache, .encoder_mask = encoder_mask, .self_mask = self_mask, .batch = batch, .enc_seq = enc_seq };
+}
+
+pub fn decoderForwardIncrementalStepTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_id: i64,
+    cache: *DecoderIncrementalCache,
+) !CT {
+    const hidden = try decoderForwardIncrementalStepFinalHiddenTensor(cb, allocator, config, token_id, cache);
+    errdefer cb.free(hidden);
+    return try decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, config, hidden);
+}
+
+pub fn decoderForwardIncrementalStepFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    token_id: i64,
+    cache: *DecoderIncrementalCache,
+) !CT {
+    if (cache.cross.keys.len != config.decoder_layers or cache.cross.values.len != config.decoder_layers) return error.InvalidInputShape;
+    if (cache.self.keys.len != config.decoder_layers or cache.self.values.len != config.decoder_layers) return error.InvalidInputShape;
+
+    const batch = cache.batch;
+    if (batch != 1) return error.UnsupportedOperation;
+    const old_len = cache.self.len;
+    const new_len = old_len + 1;
+    if (cache.self.preallocated and new_len > cache.self.capacity) return error.InvalidInputShape;
+    if (new_len > cache.self_mask.len) return error.InvalidInputShape;
+    const ids = [_]i64{token_id};
+    var hidden = try applyDecoderEmbeddingsAt(cb, allocator, config, &ids, batch, 1, old_len);
+
+    var buf: [256]u8 = undefined;
+    for (0..config.decoder_layers) |layer| {
+        const new_hidden = try decoderBlockIncrementalCached(
+            cb,
+            allocator,
+            config,
+            hidden,
+            cache.self_mask[0..new_len],
+            batch,
+            old_len,
+            new_len,
+            layer,
+            cache,
+            &buf,
+        );
+        cb.free(hidden);
+        hidden = new_hidden;
+    }
+    cache.self.len = new_len;
+
+    if (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.weight")) |ln_w| {
+        const ln_b = (try tryOptionalWeight(cb, "language_model.model.decoder.layer_norm.bias")) orelse return error.MissingWeight;
+        const normed = try cb.layerNorm(hidden, ln_w, ln_b, config.d_model, 1e-5);
+        cb.free(hidden);
+        hidden = normed;
+    } else if (try tryOptionalWeight(cb, "model.decoder.layer_norm.weight")) |ln_w| {
+        const ln_b = (try tryOptionalWeight(cb, "model.decoder.layer_norm.bias")) orelse return error.MissingWeight;
+        const normed = try cb.layerNorm(hidden, ln_w, ln_b, config.d_model, 1e-5);
+        cb.free(hidden);
+        hidden = normed;
+    }
+
+    return hidden;
+}
+
+pub fn decoderLmHeadLogitsFromFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+) !CT {
+    const lm_w = try lmHeadWeight(cb);
+    var logits = try cb.linearNoBias(hidden, lm_w, 1, config.d_model, config.vocab_size);
+    cb.free(hidden);
+    errdefer cb.free(logits);
+
+    if (try tryOptionalWeight(cb, "language_model.final_logits_bias")) |logits_bias| {
+        const bias = try logitsBiasSlice(cb, allocator, logits_bias, config.vocab_size);
+        defer if (bias.owned) cb.free(bias.tensor);
+
+        if (try cb.addBiasRowsConsume(logits, bias.tensor, 1, config.vocab_size)) |biased| {
+            logits = biased;
+        } else {
+            const biased = try cb.add(logits, bias.tensor);
+            cb.free(logits);
+            logits = biased;
+        }
+    }
+    return logits;
+}
+
+pub fn decoderFusedTokenFromFinalHiddenTensor(
+    cb: *const ComputeBackend,
+    config: Config,
+    hidden: CT,
+    suppress_tokens: []const i32,
+) !?CT {
+    return try cb.linearNoBiasArgmaxLastRowSuppressTensor(hidden, try lmHeadWeight(cb), 1, config.d_model, config.vocab_size, suppress_tokens);
+}
+
+pub fn decoderFinalLogitsBiasIsZero(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    vocab_size: usize,
+) !bool {
+    return finalLogitsBiasIsZero(cb, allocator, vocab_size);
+}
+
 const LogitsBiasSlice = struct {
     tensor: CT,
     owned: bool,
@@ -336,6 +585,23 @@ fn logitsBiasSlice(
         .tensor = try cb.sliceLastDim(flat_bias, start, start + vocab_size),
         .owned = true,
     };
+}
+
+fn finalLogitsBiasIsZero(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    vocab_size: usize,
+) !bool {
+    const logits_bias = (try tryOptionalWeight(cb, "language_model.final_logits_bias")) orelse return true;
+    const bias = try logitsBiasSlice(cb, allocator, logits_bias, vocab_size);
+    defer if (bias.owned) cb.free(bias.tensor);
+    const values = try cb.toFloat32(bias.tensor, allocator);
+    defer allocator.free(values);
+    if (values.len != vocab_size) return error.InvalidTensorShape;
+    for (values) |value| {
+        if (value != 0.0) return false;
+    }
+    return true;
 }
 
 pub fn buildDecoderCrossCache(
@@ -549,26 +815,10 @@ fn visionEncoderForward(
     defer allocator.free(sourced.data);
     allocator.free(tokens);
 
-    if (debug_cuda_session) std.log.info("florence: projection weight download start", .{});
-    const proj_weight_start = nowNs();
-    const proj_weight = try cb.getWeight("image_projection");
-    const proj_weight_data = try cb.toFloat32(proj_weight, allocator);
-    if (profile) logFlorenceProfile("vision_projection_weight_download", proj_weight_start);
-    if (debug_cuda_session) std.log.info("florence: projection weight download done", .{});
-    defer allocator.free(proj_weight_data);
-    const proj_transpose_start = nowNs();
-    const proj_weight_t = try transposeMatrix(allocator, proj_weight_data, vision_dim, config.projection_dim);
-    if (profile) logFlorenceProfile("vision_projection_weight_transpose", proj_transpose_start);
-    defer allocator.free(proj_weight_t);
-
-    const proj_shape = [_]i32{ @intCast(config.projection_dim), @intCast(vision_dim) };
-    const proj_ct = try cb.fromFloat32Shape(proj_weight_t, &proj_shape);
-    defer cb.free(proj_ct);
-
     const proj_rows = batch * sourced.seq_len;
     if (debug_cuda_session) std.log.info("florence: projection linear start rows={d}", .{proj_rows});
     const proj_start = nowNs();
-    const projected = try backendLinearNoBiasData(cb, allocator, sourced.data, proj_rows, vision_dim, config.projection_dim, proj_ct);
+    const projected = try projectImageFeaturesData(cb, allocator, sourced.data, proj_rows, vision_dim, config);
     if (profile) logFlorenceProfile("vision_projection_linear", proj_start);
     if (debug_cuda_session) std.log.info("florence: projection linear done", .{});
     defer allocator.free(projected);
@@ -591,8 +841,201 @@ fn visionEncoderForward(
     return .{ .features = normed, .seq_len = sourced.seq_len };
 }
 
+fn visionEncoderForwardTensorTail(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    pixel_values: []const f32,
+    batch: usize,
+) !?VisionForwardTensorResult {
+    if (!useDeviceVisionTail(cb, config, batch)) return null;
+
+    const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    const profile = readProfileEnabled();
+    if (debug_cuda_session) std.log.info("florence: device vision tail start backend={s}", .{@tagName(cb.kind())});
+    var stage_tokens: ?[]f32 = null;
+    errdefer if (stage_tokens) |tokens| allocator.free(tokens);
+    var stage_hidden: ?CT = null;
+    errdefer if (stage_hidden) |hidden| cb.free(hidden);
+    var stage_h: usize = config.image_size;
+    var stage_w: usize = config.image_size;
+
+    for (0..Config.stage_count) |stage| {
+        const stage_start = nowNs();
+        var hidden_for_stage: ?CT = null;
+        if (stage_hidden != null) {
+            if (debug_cuda_session) std.log.info("florence: stage {d} tensor conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
+            const conv_start = nowNs();
+            const embedded = try convEmbedTensor(cb, allocator, config, stage, batch, stage_hidden.?, stage_h, stage_w);
+            cb.free(stage_hidden.?);
+            stage_hidden = null;
+            if (profile) logFlorenceProfileStage("vision_stage_conv_embed", stage, conv_start);
+            if (debug_cuda_session) std.log.info("florence: stage {d} tensor conv embed done h={d} w={d}", .{ stage, embedded.height, embedded.width });
+            hidden_for_stage = embedded.tensor;
+            stage_h = embedded.height;
+            stage_w = embedded.width;
+        } else {
+            if (debug_cuda_session) std.log.info("florence: stage {d} conv embed start h={d} w={d}", .{ stage, stage_h, stage_w });
+            const conv_start = nowNs();
+            const embedded = try convEmbed(cb, allocator, config, stage, batch, pixel_values, stage_tokens, stage_h, stage_w);
+            if (profile) logFlorenceProfileStage("vision_stage_conv_embed", stage, conv_start);
+            if (debug_cuda_session) std.log.info("florence: stage {d} conv embed done h={d} w={d}", .{ stage, embedded.height, embedded.width });
+            if (stage_tokens) |old| allocator.free(old);
+            stage_tokens = embedded.tokens;
+            stage_h = embedded.height;
+            stage_w = embedded.width;
+        }
+
+        const depth: usize = config.depths[stage];
+        var hidden = if (hidden_for_stage) |tensor| tensor else blk: {
+            if (debug_cuda_session) std.log.info("florence: stage {d} tensor upload start depth={d}", .{ stage, depth });
+            const upload_start = nowNs();
+            const stage_shape = [_]i32{ @intCast(batch * stage_h * stage_w), @intCast(config.dim_embed[stage]) };
+            const tensor = try cb.fromFloat32Shape(stage_tokens.?, &stage_shape);
+            if (profile) logFlorenceProfileStage("vision_stage_upload", stage, upload_start);
+            allocator.free(stage_tokens.?);
+            stage_tokens = null;
+            break :blk tensor;
+        };
+        var hidden_owned = true;
+        errdefer if (hidden_owned) cb.free(hidden);
+
+        for (0..depth) |layer| {
+            if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} start", .{ stage, layer });
+            const layer_start = nowNs();
+            const next = try daViTBlock(cb, allocator, config, hidden, batch, stage_h, stage_w, stage, layer);
+            if (profile) logFlorenceProfileStageLayer("vision_stage_davit_layer", stage, layer, layer_start);
+            hidden = next;
+            if (debug_cuda_session) std.log.info("florence: stage {d} davit layer {d} done", .{ stage, layer });
+        }
+
+        if (stage + 1 == Config.stage_count) {
+            const result = (try finishVisionTailTensor(cb, allocator, config, hidden, batch, stage_h, stage_w)) orelse {
+                cb.free(hidden);
+                hidden_owned = false;
+                return null;
+            };
+            cb.free(hidden);
+            hidden_owned = false;
+            if (profile) logFlorenceProfileStage("vision_stage_total", stage, stage_start);
+            return result;
+        }
+
+        stage_hidden = hidden;
+        hidden_owned = false;
+        if (profile) logFlorenceProfileStage("vision_stage_total", stage, stage_start);
+    }
+
+    return null;
+}
+
+fn useDeviceVisionTail(cb: *const ComputeBackend, config: Config, batch: usize) bool {
+    return cb.kind() == .cuda and
+        batch == 1 and
+        !florenceDeviceVisionTailDisabled() and
+        config.image_feature_source_count == 2 and
+        config.image_feature_sources[0] == .spatial_avg_pool and
+        config.image_feature_sources[1] == .temporal_avg_pool;
+}
+
+fn finishVisionTailTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    tokens: CT,
+    batch: usize,
+    height: usize,
+    width: usize,
+) !?VisionForwardTensorResult {
+    const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+    const profile = readProfileEnabled();
+    const vision_dim: usize = config.dim_embed[Config.stage_count - 1];
+    const token_count = height * width;
+
+    if (debug_cuda_session) std.log.info("florence: device feature source tail start token_count={d} dim={d}", .{ token_count, vision_dim });
+    const concat_start = nowNs();
+    const temporal_w = tryOptionalWeight(cb, "visual_temporal_embed.pos_idx_to_embed") catch null;
+
+    const sourced = (try cb.florenceVisionTailSources(
+        tokens,
+        try cb.getWeight("image_pos_embed.row_embeddings.weight"),
+        try cb.getWeight("image_pos_embed.column_embeddings.weight"),
+        temporal_w,
+        batch,
+        height,
+        width,
+        vision_dim,
+    )) orelse return null;
+    var sourced_owned = true;
+    errdefer if (sourced_owned) cb.free(sourced);
+    if (profile) logFlorenceProfile("vision_device_tail_sources", concat_start);
+    if (debug_cuda_session) std.log.info("florence: device feature source tail done seq={d}", .{token_count + 1});
+
+    const proj_rows = batch * (token_count + 1);
+    if (debug_cuda_session) std.log.info("florence: projection linear start rows={d}", .{proj_rows});
+    const proj_start = nowNs();
+    const projected = try projectImageFeaturesTensor(cb, allocator, sourced, proj_rows, vision_dim, config);
+    cb.free(sourced);
+    sourced_owned = false;
+    var projected_owned = true;
+    errdefer if (projected_owned) cb.free(projected);
+    if (profile) logFlorenceProfile("vision_projection_linear", proj_start);
+    if (debug_cuda_session) std.log.info("florence: projection linear done", .{});
+
+    if (debug_cuda_session) std.log.info("florence: image proj norm start", .{});
+    const norm_start = nowNs();
+    const normed = try cb.layerNorm(
+        projected,
+        try cb.getWeight("image_proj_norm.weight"),
+        try cb.getWeight("image_proj_norm.bias"),
+        config.projection_dim,
+        1e-5,
+    );
+    cb.free(projected);
+    projected_owned = false;
+    if (profile) logFlorenceProfile("vision_image_proj_norm", norm_start);
+    if (debug_cuda_session) std.log.info("florence: image proj norm done", .{});
+
+    return .{ .features = normed, .seq_len = token_count + 1 };
+}
+
+fn projectImageFeaturesTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    input: CT,
+    rows: usize,
+    vision_dim: usize,
+    config: Config,
+) !CT {
+    const proj_weight = try cb.getWeight("image_projection");
+    if (try cb.florenceProjectImageFeatures(input, proj_weight, rows, vision_dim, config.projection_dim)) |projected| {
+        return projected;
+    }
+
+    const input_shape = [_]i64{ @intCast(vision_dim), @intCast(config.projection_dim) };
+    const proj_ct = cb.primTranspose(proj_weight, &.{ 1, 0 }, &input_shape) catch |err| switch (err) {
+        error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.InvalidShape, error.UnsupportedTensorType => {
+            const proj_weight_data = try cb.toFloat32(proj_weight, allocator);
+            defer allocator.free(proj_weight_data);
+            const proj_weight_t = try transposeMatrix(allocator, proj_weight_data, vision_dim, config.projection_dim);
+            defer allocator.free(proj_weight_t);
+            const proj_shape = [_]i32{ @intCast(config.projection_dim), @intCast(vision_dim) };
+            const fallback_proj_ct = try cb.fromFloat32Shape(proj_weight_t, &proj_shape);
+            defer cb.free(fallback_proj_ct);
+            return try cb.linearNoBias(input, fallback_proj_ct, rows, vision_dim, config.projection_dim);
+        },
+        else => return err,
+    };
+    defer cb.free(proj_ct);
+    return try cb.linearNoBias(input, proj_ct, rows, vision_dim, config.projection_dim);
+}
+
 fn useTensorNativeVision(cb: *const ComputeBackend) bool {
     return cb.kind() == .metal or cb.kind() == .cuda;
+}
+
+fn florenceDeviceVisionTailDisabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DISABLE_DEVICE_VISION_TAIL");
 }
 
 fn daViTBlockData(
@@ -1507,6 +1950,62 @@ fn applyEncoderEmbeddings(
     return normed;
 }
 
+fn applyEncoderImagePromptEmbeddingsTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    image: VisionForwardTensorResult,
+    config: Config,
+    batch: usize,
+    prompt_input_ids: []const i64,
+    prompt_seq_len: usize,
+) !CT {
+    if (batch != 1) return error.UnsupportedShape;
+    const d_model: usize = config.d_model;
+    const total_seq = image.seq_len + prompt_seq_len;
+
+    const merged = if (prompt_seq_len > 0) blk: {
+        const prompt_embeddings = try cb.embeddingLookup(try promptEmbedWeight(cb), prompt_input_ids, batch * prompt_seq_len, d_model);
+        defer cb.free(prompt_embeddings);
+        break :blk try cb.concatRows2D(allocator, image.features, prompt_embeddings, image.seq_len, prompt_seq_len, d_model);
+    } else try cb.sliceRows2D(allocator, image.features, 0, image.seq_len, d_model);
+
+    return applyEncoderEmbeddingsTensor(cb, allocator, merged, config, batch, total_seq);
+}
+
+fn applyEncoderEmbeddingsTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    input_hidden: CT,
+    config: Config,
+    batch: usize,
+    seq_len: usize,
+) !CT {
+    const d_model: usize = config.d_model;
+    const total = batch * seq_len;
+    var hidden = input_hidden;
+    var hidden_owned = true;
+    errdefer if (hidden_owned) cb.free(hidden);
+
+    const pos_ids = try allocator.alloc(i64, total);
+    defer allocator.free(pos_ids);
+    for (0..batch) |b| {
+        for (0..seq_len) |s| pos_ids[b * seq_len + s] = @intCast(s + bart_position_offset);
+    }
+
+    const pos_emb = try cb.embeddingLookup(try cb.getWeight("language_model.model.encoder.embed_positions.weight"), pos_ids, total, d_model);
+    defer cb.free(pos_emb);
+    const with_pos = try cb.add(hidden, pos_emb);
+    cb.free(hidden);
+    hidden = with_pos;
+
+    const ln_w = try cb.getWeight("language_model.model.encoder.layernorm_embedding.weight");
+    const ln_b = try cb.getWeight("language_model.model.encoder.layernorm_embedding.bias");
+    const normed = try cb.layerNorm(hidden, ln_w, ln_b, d_model, 1e-5);
+    cb.free(hidden);
+    hidden_owned = false;
+    return normed;
+}
+
 fn applyDecoderEmbeddings(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1514,6 +2013,18 @@ fn applyDecoderEmbeddings(
     input_ids: []const i64,
     batch: usize,
     seq_len: usize,
+) !CT {
+    return applyDecoderEmbeddingsAt(cb, allocator, config, input_ids, batch, seq_len, 0);
+}
+
+fn applyDecoderEmbeddingsAt(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    input_ids: []const i64,
+    batch: usize,
+    seq_len: usize,
+    position_start: usize,
 ) !CT {
     const d_model: usize = config.d_model;
     const total = batch * seq_len;
@@ -1523,7 +2034,7 @@ fn applyDecoderEmbeddings(
     const pos_ids = try allocator.alloc(i64, total);
     defer allocator.free(pos_ids);
     for (0..batch) |b| {
-        for (0..seq_len) |s| pos_ids[b * seq_len + s] = @intCast(s + bart_position_offset);
+        for (0..seq_len) |s| pos_ids[b * seq_len + s] = @intCast(position_start + s + bart_position_offset);
     }
 
     const pos_emb = try cb.embeddingLookup(try decoderPosWeight(cb), pos_ids, total, d_model);
@@ -1784,6 +2295,145 @@ fn decoderBlockWithOptionalCrossCache(
     return result;
 }
 
+fn decoderBlockIncrementalCached(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    config: Config,
+    hidden: CT,
+    self_mask: []const i64,
+    batch: usize,
+    old_len: usize,
+    new_len: usize,
+    layer: usize,
+    cache: *DecoderIncrementalCache,
+    buf: *[256]u8,
+) !CT {
+    if (batch != 1) return error.UnsupportedOperation;
+    if (new_len != old_len + 1 or self_mask.len != new_len) return error.InvalidInputShape;
+
+    const d_model = config.d_model;
+    const num_heads = config.decoder_attention_heads;
+    const head_dim = config.decoderHeadDim();
+    const ffn_dim = config.decoder_ffn_dim;
+
+    const q_self_weights = try decoderLinearWeights(cb, layer, "self_attn.q_proj", buf);
+    const k_self_weights = try decoderLinearWeights(cb, layer, "self_attn.k_proj", buf);
+    const v_self_weights = try decoderLinearWeights(cb, layer, "self_attn.v_proj", buf);
+    const qkv_self = try cb.linearTriple(hidden, q_self_weights.weight, q_self_weights.bias, k_self_weights.weight, k_self_weights.bias, v_self_weights.weight, v_self_weights.bias, 1, d_model, d_model);
+    defer cb.free(qkv_self.first);
+
+    const cached_k_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.keys[layer], qkv_self.second, old_len, new_len, d_model);
+    defer cached_k_ref.deinit(cb);
+    const cached_v_ref = try appendSelfCacheTensor(cb, allocator, &cache.self, &cache.self.values[layer], qkv_self.third, old_len, new_len, d_model);
+    defer cached_v_ref.deinit(cb);
+
+    const self_attn = try cb.crossAttention(qkv_self.first, cached_k_ref.tensor, cached_v_ref.tensor, self_mask, batch, 1, new_len, num_heads, head_dim);
+    defer cb.free(self_attn);
+    const self_proj = try decoderLinearProj(cb, self_attn, layer, "self_attn.out_proj", 1, d_model, d_model, buf);
+    defer cb.free(self_proj);
+    const self_res = try cb.add(hidden, self_proj);
+
+    const ln0_w = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.weight", buf);
+    const ln0_b = try decoderLayerWeight(cb, layer, "self_attn_layer_norm.bias", buf);
+    const self_normed = try cb.layerNorm(self_res, ln0_w, ln0_b, d_model, 1e-5);
+    cb.free(self_res);
+
+    const q_cross = try decoderLinearProj(cb, self_normed, layer, "encoder_attn.q_proj", 1, d_model, d_model, buf);
+    defer cb.free(q_cross);
+    const cross_attn = try cb.crossAttention(q_cross, cache.cross.keys[layer], cache.cross.values[layer], cache.encoder_mask, batch, 1, cache.enc_seq, num_heads, head_dim);
+    defer cb.free(cross_attn);
+    const cross_proj = try decoderLinearProj(cb, cross_attn, layer, "encoder_attn.out_proj", 1, d_model, d_model, buf);
+    defer cb.free(cross_proj);
+    const cross_res = try cb.add(self_normed, cross_proj);
+    cb.free(self_normed);
+
+    const ln1_w = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.weight", buf);
+    const ln1_b = try decoderLayerWeight(cb, layer, "encoder_attn_layer_norm.bias", buf);
+    const cross_normed = try cb.layerNorm(cross_res, ln1_w, ln1_b, d_model, 1e-5);
+    cb.free(cross_res);
+
+    const fc1_weights = try decoderLinearWeights(cb, layer, "fc1", buf);
+    const activated = if (try cb.linearGelu(cross_normed, fc1_weights.weight, fc1_weights.bias, 1, d_model, ffn_dim)) |fused|
+        fused
+    else blk: {
+        const fc1 = try cb.linear(cross_normed, fc1_weights.weight, fc1_weights.bias, 1, d_model, ffn_dim);
+        defer cb.free(fc1);
+        break :blk try cb.gelu(fc1);
+    };
+    defer cb.free(activated);
+
+    const fc2_weights = try decoderLinearWeights(cb, layer, "fc2", buf);
+    const ffn_res = if (try cb.linearAdd(activated, fc2_weights.weight, fc2_weights.bias, cross_normed, 1, ffn_dim, d_model)) |fused|
+        fused
+    else blk: {
+        const fc2 = try cb.linear(activated, fc2_weights.weight, fc2_weights.bias, 1, ffn_dim, d_model);
+        defer cb.free(fc2);
+        break :blk try cb.add(cross_normed, fc2);
+    };
+    cb.free(cross_normed);
+
+    const ln2_w = try decoderLayerWeight(cb, layer, "final_layer_norm.weight", buf);
+    const ln2_b = try decoderLayerWeight(cb, layer, "final_layer_norm.bias", buf);
+    const result = try cb.layerNorm(ffn_res, ln2_w, ln2_b, d_model, 1e-5);
+    cb.free(ffn_res);
+    return result;
+}
+
+const CachedSelfTensor = struct {
+    tensor: CT,
+    owned_view: bool = false,
+
+    fn deinit(self: CachedSelfTensor, cb: *const ComputeBackend) void {
+        if (self.owned_view) cb.free(self.tensor);
+    }
+};
+
+fn appendSelfCacheTensor(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    self_cache: *DecoderSelfCache,
+    slot: *?CT,
+    next: CT,
+    old_len: usize,
+    new_len: usize,
+    d_model: usize,
+) !CachedSelfTensor {
+    if (self_cache.preallocated) {
+        if (new_len != old_len + 1 or new_len > self_cache.capacity) {
+            cb.free(next);
+            return error.InvalidInputShape;
+        }
+        const slab = slot.* orelse {
+            cb.free(next);
+            return error.InvalidInputShape;
+        };
+        const copied = cb.copyRows2D(allocator, slab, old_len, next, 0, 1, d_model) catch |err| {
+            cb.free(next);
+            return err;
+        };
+        cb.free(next);
+        if (!copied) return error.UnsupportedOperation;
+        const view = try cb.sliceRows2D(allocator, slab, 0, new_len, d_model);
+        return .{ .tensor = view, .owned_view = true };
+    } else if (slot.*) |old| {
+        const merged = cb.concatRows2D(allocator, old, next, old_len, 1, d_model) catch |err| {
+            cb.free(next);
+            return err;
+        };
+        cb.free(old);
+        cb.free(next);
+        slot.* = merged;
+        return .{ .tensor = merged };
+    } else {
+        if (old_len != 0) {
+            cb.free(next);
+            return error.InvalidInputShape;
+        }
+        slot.* = next;
+        return .{ .tensor = next };
+    }
+}
+
 fn tokenEmbeddingsData(
     cb: *const ComputeBackend,
     allocator: std.mem.Allocator,
@@ -1956,6 +2606,36 @@ fn backendLinearNoBiasData(
     const out_ct = try cb.linearNoBias(input_ct, weight, rows, in_dim, out_dim);
     defer cb.free(out_ct);
     return cb.toFloat32(out_ct, allocator);
+}
+
+fn projectImageFeaturesData(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    input: []const f32,
+    rows: usize,
+    vision_dim: usize,
+    config: Config,
+) ![]f32 {
+    const proj_weight = try cb.getWeight("image_projection");
+    if (cb.kind() == .cuda and !florenceDeviceVisionTailDisabled()) {
+        const input_shape = [_]i64{ @intCast(vision_dim), @intCast(config.projection_dim) };
+        if (cb.primTranspose(proj_weight, &.{ 1, 0 }, &input_shape)) |proj_ct| {
+            defer cb.free(proj_ct);
+            return try backendLinearNoBiasData(cb, allocator, input, rows, vision_dim, config.projection_dim, proj_ct);
+        } else |err| switch (err) {
+            error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.InvalidShape, error.UnsupportedTensorType => {},
+            else => return err,
+        }
+    }
+
+    const proj_weight_data = try cb.toFloat32(proj_weight, allocator);
+    defer allocator.free(proj_weight_data);
+    const proj_weight_t = try transposeMatrix(allocator, proj_weight_data, vision_dim, config.projection_dim);
+    defer allocator.free(proj_weight_t);
+    const proj_shape = [_]i32{ @intCast(config.projection_dim), @intCast(vision_dim) };
+    const proj_ct = try cb.fromFloat32Shape(proj_weight_t, &proj_shape);
+    defer cb.free(proj_ct);
+    return try backendLinearNoBiasData(cb, allocator, input, rows, vision_dim, config.projection_dim, proj_ct);
 }
 
 fn backendLayerNormData(
