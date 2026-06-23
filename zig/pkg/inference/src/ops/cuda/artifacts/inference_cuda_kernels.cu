@@ -1203,6 +1203,24 @@ __device__ __forceinline__ float termite_decoder_activation_f32(float x, unsigne
     return r * r;
 }
 
+extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
+    float* dst,
+    const float* gate,
+    const float* source,
+    unsigned int rows,
+    unsigned int source_cols,
+    unsigned int start,
+    unsigned int out_cols,
+    unsigned int activation
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = rows * out_cols;
+    if (i >= count) return;
+    unsigned int row = i / out_cols;
+    unsigned int col = i - row * out_cols;
+    dst[i] = termite_decoder_activation_f32(gate[i], activation) * source[row * source_cols + start + col];
+}
+
 extern "C" __global__ void termite_embedding_lookup_f32(
     float* dst,
     const float* weight,
@@ -3220,6 +3238,31 @@ __device__ float termite_q4k_value(const unsigned char* bp, unsigned int value_i
     return scale * (float)q - minv;
 }
 
+__device__ __forceinline__ float termite_q6k_value(const unsigned char* bp, unsigned int value_index) {
+    const unsigned char* ql = bp;
+    const unsigned char* qh = bp + 128u;
+    const unsigned char* scales = bp + 192u;
+    unsigned short dh = (unsigned short)bp[208] | ((unsigned short)bp[209] << 8);
+    float d = termite_half_to_float(dh);
+
+    unsigned int sub = value_index / 16u;
+    unsigned int i = value_index & 15u;
+    unsigned int half = sub / 8u;
+    unsigned int group = (sub % 8u) / 2u;
+    unsigned int l_base = (sub & 1u) * 16u;
+    unsigned int ql_off = half * 64u + (group & 1u) * 32u;
+    unsigned int qh_off = half * 32u;
+    unsigned int qh_shift = group * 2u;
+    unsigned int nibble_shift = (group / 2u) * 4u;
+    unsigned int l = l_base + i;
+
+    unsigned int low4 = (unsigned int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
+    unsigned int high2 = (unsigned int)((qh[qh_off + l] >> qh_shift) & 0x03u);
+    int q = (int)(low4 | (high2 << 4u)) - 32;
+    float scale = d * (float)((signed char)scales[sub]);
+    return scale * (float)q;
+}
+
 __device__ float termite_q4k_value_broadcast_scale(const unsigned char* bp, unsigned int value_index, unsigned int lane) {
     unsigned int sub = value_index / 32u;
     unsigned int chunk = value_index / 64u;
@@ -3831,6 +3874,56 @@ extern "C" __global__ void termite_linear_q4_k_f32_tile4(
     termite_q4k_tile_cols<4u, 0u>(dst, input, weight, nullptr, nullptr, rows, in_dim, out_dim);
 }
 
+extern "C" __global__ void termite_linear_q6_k_f32_tile4(
+    float* dst,
+    const float* input,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    unsigned int col_tile = blockIdx.x * 4u;
+    unsigned int row = blockIdx.y;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float partial[4][256];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    if (tid < 256u) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            unsigned int input_idx = row * in_dim + block * 256u + tid;
+            float x = input[input_idx];
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 210u;
+                    acc[c] += x * termite_q6k_value(bp, tid);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    }
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) {
+            unsigned int col = col_tile + c;
+            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
+        }
+    }
+}
+
 extern "C" __global__ void termite_linear_q4_k_gated_down_f32_tile4(
     float* dst,
     const float* gate,
@@ -3860,6 +3953,58 @@ extern "C" __global__ void termite_linear_q4_k_gated_down_f32_tile4(
                 if (col < out_dim) {
                     const unsigned char* bp = weight + (col * row_blocks + block) * 144u;
                     acc[c] += x * termite_q4k_value(bp, tid);
+                }
+            }
+        }
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] = acc[c];
+    }
+    __syncthreads();
+    for (unsigned int stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) partial[c][tid] += partial[c][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        #pragma unroll
+        for (unsigned int c = 0; c < 4u; ++c) {
+            unsigned int col = col_tile + c;
+            if (col < out_dim) dst[row * out_dim + col] = partial[c][0];
+        }
+    }
+}
+
+extern "C" __global__ void termite_linear_q6_k_gated_down_f32_tile4(
+    float* dst,
+    const float* gate,
+    const float* up,
+    const unsigned char* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int activation
+) {
+    unsigned int col_tile = blockIdx.x * 4u;
+    unsigned int row = blockIdx.y;
+    if (row >= rows) return;
+    unsigned int tid = threadIdx.x;
+    unsigned int row_blocks = in_dim / 256u;
+    __shared__ float partial[4][256];
+    float acc[4];
+    #pragma unroll
+    for (unsigned int c = 0; c < 4u; ++c) acc[c] = 0.0f;
+    if (tid < 256u) {
+        for (unsigned int block = 0; block < row_blocks; ++block) {
+            unsigned int input_idx = row * in_dim + block * 256u + tid;
+            float x = termite_decoder_activation_f32(gate[input_idx], activation) * up[input_idx];
+            #pragma unroll
+            for (unsigned int c = 0; c < 4u; ++c) {
+                unsigned int col = col_tile + c;
+                if (col < out_dim) {
+                    const unsigned char* bp = weight + (col * row_blocks + block) * 210u;
+                    acc[c] += x * termite_q6k_value(bp, tid);
                 }
             }
         }
@@ -5347,6 +5492,26 @@ extern "C" __global__ void termite_embedding_lookup_q4_k_f32(
     dst[idx] = termite_q4k_value(bp, value_index);
 }
 
+extern "C" __global__ void termite_embedding_lookup_q6_k_f32(
+    float* dst,
+    const unsigned char* weight,
+    const long long* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)ids[out_row];
+    unsigned int row_blocks = dim / 256u;
+    unsigned int block = col / 256u;
+    unsigned int value_index = col - block * 256u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
+    dst[idx] = termite_q6k_value(bp, value_index);
+}
+
 extern "C" __global__ void termite_embedding_lookup_q8_0_f32(
     float* dst,
     const unsigned char* weight,
@@ -5405,6 +5570,26 @@ extern "C" __global__ void termite_embedding_lookup_i32_q4_k_f32(
     unsigned int value_index = col - block * 256u;
     const unsigned char* bp = weight + (src_row * row_blocks + block) * 144ull;
     dst[idx] = termite_q4k_value(bp, value_index);
+}
+
+extern "C" __global__ void termite_embedding_lookup_i32_q6_k_f32(
+    float* dst,
+    const unsigned char* weight,
+    const int* ids,
+    unsigned int total,
+    unsigned int dim
+) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
+    unsigned int row_blocks = dim / 256u;
+    unsigned int block = col / 256u;
+    unsigned int value_index = col - block * 256u;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
+    dst[idx] = termite_q6k_value(bp, value_index);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(

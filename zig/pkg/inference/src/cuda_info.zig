@@ -195,6 +195,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: q4_k_f32 ok\n", .{});
+            cuda_kernels.smokeQ6_K(allocator) catch |err| {
+                print("smoke: q6_k_embedding failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: q6_k_embedding ok\n", .{});
             cuda_kernels.smokeGemma4Primitives(allocator) catch |err| {
                 print("smoke: gemma4_primitives failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);

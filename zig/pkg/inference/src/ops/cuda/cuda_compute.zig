@@ -90,6 +90,7 @@ const CudaDispatchQuant = enum {
     q8_0,
     q4_0,
     q4_k,
+    q6_k,
     f32,
     bf16,
 };
@@ -100,6 +101,7 @@ const CudaDispatchRoute = enum {
     q4_tc_hmma,
     q8_simt,
     q4_simt,
+    q6_simt,
     q4_span_simt,
     dense_lt,
     dense_cuda,
@@ -1609,13 +1611,25 @@ fn cudaShouldDequantizeWeightOnUpload(name: []const u8, storage: weight_source_m
     // Matrix weights stay quantized for CUDA matmul kernels. Small affine
     // parameters are consumed by f32 norm/elementwise kernels, so upload them
     // as f32 even if the bundle stored them in a quantized GGUF block.
-    if (isKnownQuantStorage(storage, .Q6_K)) return true;
+    if (isKnownQuantStorage(storage, .Q6_K) and !cudaKeepQ6KQuantizedByName(name)) return true;
     if (storage.shape.len < 2) return true;
     if (std.mem.endsWith(u8, name, ".bias")) return true;
     if (std.mem.eql(u8, name, "count_embed.pos_embedding.weight")) return true;
     if (std.mem.eql(u8, name, "encoder.rel_embeddings.weight")) return true;
     if (std.mem.indexOf(u8, name, ".norm") != null) return true;
     if (std.mem.indexOf(u8, name, "layer_norm") != null) return true;
+    return false;
+}
+
+fn cudaKeepQ6KQuantizedByName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "token_embd.weight") or
+        std.mem.eql(u8, name, "per_layer_token_embd.weight") or
+        std.mem.eql(u8, name, "model.per_layer_input.per_layer_token_embd.weight"))
+    {
+        return true;
+    }
+    if (std.mem.endsWith(u8, name, ".ffn_down.weight")) return true;
+    if (std.mem.indexOf(u8, name, ".mlp.down_proj.weight") != null) return true;
     return false;
 }
 
@@ -4402,6 +4416,7 @@ fn embeddingLookup(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, 
                 .Q8_0 => try self.kernels.launchEmbeddingLookupQ8_0F32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 .Q4_0 => try self.kernels.launchEmbeddingLookupQ4_0F32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 .Q4_K => try self.kernels.launchEmbeddingLookupQ4KF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
+                .Q6_K => try self.kernels.launchEmbeddingLookupQ6KF32(&self.ctx, device, weight_tensor.buffer, ids_device, total, dim),
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,
@@ -4442,6 +4457,7 @@ fn embeddingLookupTensor(ctx: *anyopaque, weight: CT, ids: CT, total: usize, dim
                 .Q8_0 => try self.kernels.launchEmbeddingLookupI32Q8_0F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 .Q4_0 => try self.kernels.launchEmbeddingLookupI32Q4_0F32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 .Q4_K => try self.kernels.launchEmbeddingLookupI32Q4KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
+                .Q6_K => try self.kernels.launchEmbeddingLookupI32Q6KF32(&self.ctx, device, weight_tensor.buffer, ids_tensor.buffer, total, dim),
                 else => return error.UnsupportedTensorType,
             },
             else => return error.UnsupportedTensorType,
@@ -5146,6 +5162,10 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
                         try self.kernels.launchLinearQ4KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     }
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q4_k, .q4_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
+                },
+                .Q6_K => {
+                    try self.kernels.launchLinearQ6KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+                    self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                 },
                 else => return error.UnsupportedTensorType,
             },
@@ -6788,6 +6808,49 @@ fn activationMultiply(ctx: *anyopaque, gate: CT, up: CT, activation: ops.Decoder
     return createTensor(self, device, shape, gate_tensor.elem_count);
 }
 
+fn activationMultiplySliceLastDim(ctx: *anyopaque, gate: CT, source: CT, start: usize, stop: usize, activation: ops.DecoderRuntimeActivationKind) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const gate_tensor = tensorFromCt(gate);
+    const source_tensor = tensorFromCt(source);
+    try ensureF32(gate_tensor);
+    try ensureF32(source_tensor);
+    if (gate_tensor.shape.len != 2 or source_tensor.shape.len != 2) return null;
+    if (gate_tensor.shape[0] < 0 or gate_tensor.shape[1] < 0 or source_tensor.shape[0] < 0 or source_tensor.shape[1] < 0) return error.InvalidShape;
+    const rows: usize = @intCast(gate_tensor.shape[0]);
+    const out_cols: usize = @intCast(gate_tensor.shape[1]);
+    const source_rows: usize = @intCast(source_tensor.shape[0]);
+    const source_cols: usize = @intCast(source_tensor.shape[1]);
+    if (rows != source_rows or start > stop or stop > source_cols or stop - start != out_cols) return null;
+    try ensureCount(gate_tensor, try checkedMul(rows, out_cols));
+    try ensureCount(source_tensor, try checkedMul(source_rows, source_cols));
+
+    const shape = try dupeShape(self.allocator, gate_tensor.shape);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, gate_tensor.elem_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    self.kernels.launchActivationMultiplySliceLastDimF32(
+        &self.ctx,
+        device,
+        gate_tensor.buffer,
+        source_tensor.buffer,
+        rows,
+        source_cols,
+        start,
+        out_cols,
+        @intFromEnum(activation),
+    ) catch |err| switch (err) {
+        error.CudaKernelUnavailable, error.InvalidCudaState => {
+            device.free(&self.ctx);
+            self.allocator.free(shape);
+            return null;
+        },
+        else => return err,
+    };
+    self.stats.launch_elementwise += 1;
+    self.stats.activation_multiply_fused += 1;
+    return createTensor(self, device, shape, gate_tensor.elem_count);
+}
+
 fn linearNoBiasGatedDown(
     ctx: *anyopaque,
     gate: CT,
@@ -6815,7 +6878,8 @@ fn linearNoBiasGatedDown(
 
     const use_q8 = isKnownQuant(weight_tensor, .Q8_0);
     const use_q4 = isKnownQuant(weight_tensor, .Q4_K);
-    if (!use_q8 and !use_q4) {
+    const use_q6 = isKnownQuant(weight_tensor, .Q6_K);
+    if (!use_q8 and !use_q4 and !use_q6) {
         self.stats.gated_down_fallbacks += 1;
         return null;
     }
@@ -6849,7 +6913,7 @@ fn linearNoBiasGatedDown(
             else => return err,
         };
         self.stats.gated_down_fused_q8 += 1;
-    } else {
+    } else if (use_q4) {
         self.kernels.launchLinearQ4KGatedDownTile4F32(
             &self.ctx,
             device,
@@ -6871,6 +6935,26 @@ fn linearNoBiasGatedDown(
         };
         self.stats.gated_down_fused_q4 += 1;
         if (rows == 1) self.stats.q4k_decode_fast_hits += 1;
+    } else {
+        self.kernels.launchLinearQ6KGatedDownTile4F32(
+            &self.ctx,
+            device,
+            gate_tensor.buffer,
+            up_tensor.buffer,
+            weight_tensor.buffer,
+            rows,
+            in_dim,
+            out_dim,
+            @intFromEnum(activation),
+        ) catch |err| switch (err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => {
+                self.stats.gated_down_fallbacks += 1;
+                device.free(&self.ctx);
+                self.allocator.free(shape);
+                return null;
+            },
+            else => return err,
+        };
     }
 
     self.stats.launch_linear += 1;
@@ -8792,12 +8876,14 @@ const vtable = ops.ComputeBackend.VTable{
     .addScalar = &addScalar,
     .siluMultiply = &siluMultiply,
     .activationMultiply = &activationMultiply,
+    .activationMultiplySliceLastDim = &activationMultiplySliceLastDim,
     .addMultiplyScalarTensor = &addMultiplyScalarTensor,
     .layerNorm = &layerNorm,
     .addLayerNorm = &addLayerNorm,
     .rmsNorm = &rmsNorm,
     .rmsNormAddMultiplyScalarTensor = &rmsNormAddMultiplyScalarTensor,
     .rmsNormAddTensor = &rmsNormAddTensor,
+    .rmsNormAddOutputScaleTensor = &rmsNormAddOutputScaleTensor,
     .rmsNormHeadsRope = &rmsNormHeadsRope,
     .rmsNormBare = &rmsNormBare,
     .gelu = &gelu,
