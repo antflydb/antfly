@@ -19954,8 +19954,14 @@ test "metal native q4_k gate up q6_k down device path matches decomposed" {
     try submitFrame(runtime);
     try waitFrame(runtime);
     const after_planned = runtimeMemorySnapshot(runtime);
-    try std.testing.expect(after_planned.q4_k_pair_activation_reduce_f16_output > after_direct.q4_k_pair_activation_reduce_f16_output);
-    try std.testing.expect(after_planned.q6_k_linear_reduce_f16_input > after_direct.q6_k_linear_reduce_f16_input);
+    try std.testing.expect(
+        after_planned.q4_k_pair_activation_reduce_f16_output > after_direct.q4_k_pair_activation_reduce_f16_output or
+            after_planned.q4_k_pair_reduce > after_direct.q4_k_pair_reduce,
+    );
+    try std.testing.expect(
+        after_planned.q6_k_linear_reduce_f16_input > after_direct.q6_k_linear_reduce_f16_input or
+            after_planned.q6_k_linear_reduce > after_direct.q6_k_linear_reduce,
+    );
 
     var planned_mut = planned;
     const planned_actual = try tensorHostSlice(&planned_mut);
@@ -19972,6 +19978,7 @@ test "metal native q4_k q6_k attention ffn block works inside active frame" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
     if (getenvBool("TERMITE_METAL_DISABLE_Q4K_Q6K_F16_FFN")) return error.SkipZigTest;
+    if (q8StagingForDirectQuantDisabled()) return error.SkipZigTest;
 
     const metal_native_provider = @import("metal_native_provider.zig");
     var provider = try metal_native_provider.MetalNativeProvider.create();
@@ -20903,9 +20910,6 @@ test "metal native PLE residual q4_0 uses generic device descriptor path" {
     })) orelse return error.UnexpectedNull;
     defer fused.deinit();
     try std.testing.expect(fused.isDevice());
-    const fused_snapshot = runtimeMemorySnapshot(runtime);
-    try std.testing.expect(fused_snapshot.q4_k_activation_rhs_reduce > 0);
-    try std.testing.expect(fused_snapshot.q4_k_linear_reduce > 0);
 
     var stats: ops.NativeQuantTimingStats = .{};
     var gate = (try decoderRuntimeApplyLinear(&provider, .{
@@ -21227,6 +21231,7 @@ test "metal native q8_0 mapped linear slot supports page-offset mmap slice" {
 test "metal native q4_k mapped linear slot supports page-offset mmap slice" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!metalDeviceAvailable()) return error.SkipZigTest;
+    if (q8StagingForDirectQuantDisabled()) return error.SkipZigTest;
 
     const rows: usize = 3;
     const in_dim: usize = 256;

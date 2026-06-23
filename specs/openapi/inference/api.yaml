@@ -2768,35 +2768,46 @@ components:
         arguments:
           type: string
           description: Incremental arguments JSON string
+    WarmModelKind:
+      type: string
+      description: Model registry kind eligible for startup warming.
+      enum:
+        - generator
+        - embedder
+        - reranker
+        - chunker
+        - classifier
+        - recognizer
+        - rewriter
+        - reader
+        - transcriber
+        - extractor
+    WarmModelBackend:
+      type: string
+      description: Optional backend preference for a warm target.
+      enum:
+        - native
+        - onnx
+        - metal
+        - cuda
+        - wasm
     WarmModel:
       type: object
+      description: |
+        Startup warm target. Keep this directive to model identity and backend selection;
+        quantization and companion model metadata belong to the model artifact or a future
+        typed runtime option once the warm path can honor it.
       required:
         - kind
         - name
       properties:
         kind:
-          type: string
-          enum:
-            - generator
-            - embedder
-            - reranker
-            - chunker
-            - classifier
-            - recognizer
-            - rewriter
-            - reader
-            - transcriber
-            - extractor
+          $ref: '#/components/schemas/WarmModelKind'
         name:
           type: string
+          description: Model name to resolve within the registry for the selected kind.
         backend:
-          type: string
-          enum:
-            - native
-            - onnx
-            - metal
-            - cuda
-            - wasm
+          $ref: '#/components/schemas/WarmModelBackend'
     Config:
       type: object
       required:
@@ -2933,9 +2944,9 @@ components:
           items:
             type: string
           description: |
-            Legacy list of generator model names to preload at startup.
+            Generator model names to load and warm at startup.
             These models are loaded immediately when inference starts, avoiding first-request latency.
-            Prefer warm_models for new config because it records the model kind and optional backend.
+            Use warm_models for non-generator targets or backend-specific generator warmup.
           example:
             - gemma-e2b
         max_memory_mb:
@@ -2963,7 +2974,7 @@ components:
             - If keep_alive="0": eager loading (load at startup, never unload)
 
             When a model has strategy "eager" in this map:
-            - It is loaded at startup (as part of preload)
+            - It is loaded at startup through the same startup warmup path
             - It is never unloaded, even when keep_alive>0 (pinned in memory)
 
             This allows mixing eager and lazy models in the same pool.

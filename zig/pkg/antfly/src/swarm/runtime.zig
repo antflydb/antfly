@@ -60,8 +60,6 @@ const CliConfig = struct {
     inference_kv_budget_mb: usize = 0,
     inference_scratch_budget_mb: usize = 0,
     inference_warm_models: std.ArrayListUnmanaged(inference.server.WarmModel) = .empty,
-    inference_warm_generators: std.ArrayListUnmanaged([]const u8) = .empty,
-    inference_warm_generator_backend: ?inference.backends.BackendType = null,
     data_dir: ?[]const u8 = null,
     replica_root_dir: ?[]const u8 = null,
     replica_catalog_path: ?[]const u8 = null,
@@ -97,7 +95,6 @@ const CliConfig = struct {
     fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.ha_sync_standby_names.deinit(alloc);
         self.inference_warm_models.deinit(alloc);
-        self.inference_warm_generators.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -906,8 +903,7 @@ pub fn runFromIterator(
             antfly.inference_runtime.defaultMlDirForDataDir(alloc, data_dir),
         .generation_budget_overrides = resolveInferenceBudgetOverrides(cli),
         .warm_models = resolved_warm_models.items,
-        .warm_generators = resolveInferenceWarmGenerators(cli, if (loaded_config) |*cfg| cfg else null),
-        .warm_generator_backend = try resolveInferenceWarmGeneratorBackend(cli, if (loaded_config) |*cfg| cfg else null),
+        .preload = if (loaded_config) |*cfg| cfg.inference.preload else &.{},
     };
     if (loaded_config) |*cfg| {
         if (cfg.effectiveAntflyContentSecurity()) |security| antfly_node_cfg.content_security = security.*;
@@ -2179,16 +2175,8 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.inference_scratch_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
-        if (std.mem.eql(u8, arg, "--warm-generator")) {
-            try cfg.inference_warm_generators.append(alloc, args.next() orelse return error.InvalidArguments);
-            continue;
-        }
         if (std.mem.eql(u8, arg, "--warm-model")) {
             try cfg.inference_warm_models.append(alloc, try parseWarmModelFlag(args.next() orelse return error.InvalidArguments));
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--warm-generator-backend")) {
-            cfg.inference_warm_generator_backend = antfly.inference_runtime.parseBackendType(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -2855,22 +2843,6 @@ fn resolveInferenceWarmModels(
     return .{ .items = out, .owned = true };
 }
 
-fn resolveInferenceWarmGenerators(cli: CliConfig, cfg: ?*const antfly.common.config.Config) []const []const u8 {
-    if (cli.inference_warm_generators.items.len > 0) return cli.inference_warm_generators.items;
-    if (cfg) |loaded| return loaded.inference.warm_generators;
-    return &.{};
-}
-
-fn resolveInferenceWarmGeneratorBackend(cli: CliConfig, cfg: ?*const antfly.common.config.Config) !?inference.backends.BackendType {
-    if (cli.inference_warm_generator_backend) |backend| return backend;
-    if (cfg) |loaded| {
-        if (loaded.inference.warm_generator_backend) |value| {
-            return antfly.inference_runtime.parseBackendType(value) orelse error.InvalidConfig;
-        }
-    }
-    return null;
-}
-
 fn resolveInferenceBudgetOverrides(cli: CliConfig) antfly.inference_runtime.ServerBudgetOverrides {
     return .{
         .host_limit_bytes = mbToBytes(cli.inference_host_budget_mb),
@@ -2909,8 +2881,6 @@ fn printUsage() void {
         \\  --inference-kv-budget-mb <n>          Embedded inference native generation KV cache budget override
         \\  --inference-scratch-budget-mb <n>     Embedded inference native generation scratch budget override
         \\  --warm-model <kind:name>              Preload and warm an embedded model before serving
-        \\  --warm-generator <name>                Preload and warm an embedded generator model before serving (repeatable)
-        \\  --warm-generator-backend <backend>     Require warm generators to load on one backend
         \\  --data-dir <path>                     Local Antfly data directory root
         \\  --replica-root-dir <path>             Replica root directory
         \\  --replica-catalog-path <path>         Replica catalog file path
@@ -3311,14 +3281,8 @@ test "parse cli accepts canonical host port and models dir flags" {
         "/tmp/models",
         "--ml-dir",
         "/tmp/ml",
-        "--warm-generator",
-        "gemma-e2b",
-        "--warm-generator",
-        "gemma-e4b",
         "--warm-model",
         "generator:gemma-e2b",
-        "--warm-generator-backend",
-        "metal",
         "--data-dir",
         "/tmp/antfly-data",
     };
@@ -3329,13 +3293,9 @@ test "parse cli accepts canonical host port and models dir flags" {
     try std.testing.expectEqual(@as(u16, 8080), cfg.bind_port.?);
     try std.testing.expectEqualStrings("/tmp/models", cfg.inference_models_dir.?);
     try std.testing.expectEqualStrings("/tmp/ml", cfg.inference_ml_dir.?);
-    try std.testing.expectEqual(@as(usize, 2), cfg.inference_warm_generators.items.len);
-    try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_warm_generators.items[0]);
-    try std.testing.expectEqualStrings("gemma-e4b", cfg.inference_warm_generators.items[1]);
     try std.testing.expectEqual(@as(usize, 1), cfg.inference_warm_models.items.len);
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, cfg.inference_warm_models.items[0].kind);
     try std.testing.expectEqualStrings("gemma-e2b", cfg.inference_warm_models.items[0].name);
-    try std.testing.expectEqual(inference.backends.BackendType.metal, cfg.inference_warm_generator_backend.?);
     try std.testing.expectEqualStrings("/tmp/antfly-data", cfg.data_dir.?);
 }
 
@@ -4173,7 +4133,6 @@ test "inference config falls back to common config" {
                     .backend = try alloc.dupe(u8, "metal"),
                 },
             }),
-            .warm_generator_backend = try alloc.dupe(u8, "metal"),
         },
     };
     defer cfg.deinit();
@@ -4186,7 +4145,6 @@ test "inference config falls back to common config" {
     try std.testing.expectEqual(inference.server.WarmModelKind.generator, warm_models.items[0].kind);
     try std.testing.expectEqualStrings("gemma-e2b", warm_models.items[0].name);
     try std.testing.expectEqual(inference.backends.BackendType.metal, warm_models.items[0].backend.?);
-    try std.testing.expectEqual(inference.backends.BackendType.metal, (try resolveInferenceWarmGeneratorBackend(.{}, &cfg)).?);
 }
 
 test "swarm runtime resolves paths from common storage base dir" {

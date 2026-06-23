@@ -99,8 +99,7 @@ pub const NodeConfig = struct {
     content_security: ?scraping.ContentSecurityConfig = null,
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     warm_models: []const WarmModel = &.{},
-    warm_generators: []const []const u8 = &.{},
-    warm_generator_backend: ?backends_mod.BackendType = null,
+    preload: []const []const u8 = &.{},
     keep_alive_ms: u64 = 300_000,
     max_loaded_models: usize = 10,
     max_concurrent_requests: usize = 32,
@@ -818,7 +817,7 @@ pub const Node = struct {
 
     pub fn warmConfiguredModels(self: *Node, allocator: std.mem.Allocator) !void {
         for (self.config.warm_models) |model| try self.warmModel(allocator, model);
-        for (self.config.warm_generators) |model_name| try self.warmGenerator(allocator, model_name);
+        for (self.config.preload) |model_name| try self.warmGenerator(allocator, model_name);
     }
 
     pub fn warmConfiguredGenerators(self: *Node, allocator: std.mem.Allocator) !void {
@@ -835,7 +834,7 @@ pub const Node = struct {
     }
 
     pub fn warmGenerator(self: *Node, allocator: std.mem.Allocator, model_name: []const u8) !void {
-        try self.warmGeneratorWithBackend(allocator, model_name, self.config.warm_generator_backend);
+        try self.warmGeneratorWithBackend(allocator, model_name, null);
     }
 
     fn warmGeneratorWithBackend(self: *Node, allocator: std.mem.Allocator, model_name: []const u8, backend: ?backends_mod.BackendType) !void {

@@ -68,8 +68,8 @@ const EmbeddedServerConfig = struct {
     content_security: ?common_config.Config.ContentSecurityConfig = null,
     s3_credentials: ?common_config.Config.S3CredentialsConfig = null,
     generation_budget_overrides: ServerBudgetOverrides = .{},
-    warm_generators: []const []const u8 = &.{},
-    warm_generator_backend: ?inference.backends.BackendType = null,
+    warm_models: []const inference.server.WarmModel = &.{},
+    preload: []const []const u8 = &.{},
 };
 
 const BudgetOverridesMb = struct {
@@ -87,6 +87,24 @@ pub fn parseBackendType(value: []const u8) ?inference.backends.BackendType {
     if (std.mem.eql(u8, value, "cuda")) return .cuda;
     if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
     return null;
+}
+
+fn parseWarmModelKind(value: []const u8) ?inference.server.WarmModelKind {
+    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
+        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    }
+    return null;
+}
+
+fn parseWarmModelFlag(value: []const u8) !inference.server.WarmModel {
+    const separator = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidArguments;
+    const kind_name = value[0..separator];
+    const model_name = value[separator + 1 ..];
+    if (model_name.len == 0) return error.InvalidArguments;
+    return .{
+        .kind = parseWarmModelKind(kind_name) orelse return error.InvalidArguments,
+        .name = model_name,
+    };
 }
 
 pub fn run(init: std.process.Init) !void {
@@ -119,7 +137,7 @@ pub fn runFromIterator(
         inference.native_generate.main(alloc, io, try collectArgs(alloc, args)) catch |err| switch (err) {
             error.WarmInferenceServerUnavailable => {
                 std.debug.print(
-                    "warm inference server unavailable; start one with `antfly inference run --warm-generator <model> --warm-generator-backend metal` and pass --server\n",
+                    "warm inference server unavailable; start one with `antfly inference run --warm-model generator:<model>` and pass --server\n",
                     .{},
                 );
                 std.process.exit(1);
@@ -174,9 +192,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     var models_dir: []const u8 = defaultModelsDir(alloc);
     var ml_dir: []const u8 = defaultMlDir(alloc);
     var budget_overrides_mb = BudgetOverridesMb{};
-    var warm_generators = std.ArrayListUnmanaged([]const u8).empty;
-    defer warm_generators.deinit(alloc);
-    var warm_generator_backend: ?inference.backends.BackendType = null;
+    var warm_models = std.ArrayListUnmanaged(inference.server.WarmModel).empty;
+    defer warm_models.deinit(alloc);
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host")) {
@@ -197,10 +214,8 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
             budget_overrides_mb.kv_budget_mb = try parseBudgetMbArg(args);
         } else if (std.mem.eql(u8, arg, "--scratch-budget-mb")) {
             budget_overrides_mb.scratch_budget_mb = try parseBudgetMbArg(args);
-        } else if (std.mem.eql(u8, arg, "--warm-generator")) {
-            try warm_generators.append(alloc, args.next() orelse return error.InvalidArguments);
-        } else if (std.mem.eql(u8, arg, "--warm-generator-backend")) {
-            warm_generator_backend = parseBackendType(args.next() orelse return error.InvalidArguments) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--warm-model")) {
+            try warm_models.append(alloc, try parseWarmModelFlag(args.next() orelse return error.InvalidArguments));
         }
     }
 
@@ -212,8 +227,7 @@ fn runServer(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .models_dir = models_dir,
         .ml_dir = ml_dir,
         .generation_budget_overrides = budgetOverridesFromMb(budget_overrides_mb),
-        .warm_generators = warm_generators.items,
-        .warm_generator_backend = warm_generator_backend,
+        .warm_models = warm_models.items,
     });
     defer node.deinit();
 
@@ -235,8 +249,8 @@ pub fn spawnServerProcess(
         .models_dir = config.models_dir orelse defaultModelsDir(alloc),
         .ml_dir = config.ml_dir orelse defaultMlDir(alloc),
         .generation_budget_overrides = config.generation_budget_overrides,
-        .warm_generators = config.warm_generators,
-        .warm_generator_backend = config.warm_generator_backend,
+        .warm_models = config.warm_models,
+        .preload = config.preload,
     };
     if (config.content_security) |sec| node_cfg.content_security = sec;
     if (config.s3_credentials) |creds| node_cfg.s3_credentials = creds;
@@ -432,8 +446,7 @@ fn printUsage() void {
         \\  --combined-budget-mb <n>  Native generation combined budget override
         \\  --kv-budget-mb <n>        Native generation KV cache budget override
         \\  --scratch-budget-mb <n>   Native generation scratch budget override
-        \\  --warm-generator <name>   Preload and warm a generator model before serving (repeatable)
-        \\  --warm-generator-backend <backend> Require warm generators to load on one backend
+        \\  --warm-model <kind:name>  Preload and warm a configured model before serving
         \\
         \\Pull options:
         \\  --token <token>  HuggingFace API token (or set HF_TOKEN env var)

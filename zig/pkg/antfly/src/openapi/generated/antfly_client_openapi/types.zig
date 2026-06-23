@@ -3448,10 +3448,89 @@ pub const InferenceToolCallFunctionDelta = struct {
     arguments: ?[]const u8 = null,
 };
 
-pub const InferenceWarmModel = struct {
-    kind: []const u8,
-    name: []const u8,
-    backend: ?[]const u8 = null,
+/// Model registry kind eligible for startup warming.
+pub const InferenceWarmModelKind = enum {
+    generator,
+    embedder,
+    reranker,
+    chunker,
+    classifier,
+    recognizer,
+    rewriter,
+    reader,
+    transcriber,
+    extractor,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .generator => "generator",
+            .embedder => "embedder",
+            .reranker => "reranker",
+            .chunker => "chunker",
+            .classifier => "classifier",
+            .recognizer => "recognizer",
+            .rewriter => "rewriter",
+            .reader => "reader",
+            .transcriber => "transcriber",
+            .extractor => "extractor",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "generator", .generator },
+            .{ "embedder", .embedder },
+            .{ "reranker", .reranker },
+            .{ "chunker", .chunker },
+            .{ "classifier", .classifier },
+            .{ "recognizer", .recognizer },
+            .{ "rewriter", .rewriter },
+            .{ "reader", .reader },
+            .{ "transcriber", .transcriber },
+            .{ "extractor", .extractor },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Optional backend preference for a warm target.
+pub const InferenceWarmModelBackend = enum {
+    native,
+    onnx,
+    metal,
+    cuda,
+    wasm,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .native => "native",
+            .onnx => "onnx",
+            .metal => "metal",
+            .cuda => "cuda",
+            .wasm => "wasm",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "native", .native },
+            .{ "onnx", .onnx },
+            .{ "metal", .metal },
+            .{ "cuda", .cuda },
+            .{ "wasm", .wasm },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Runtime backends compiled into this inference server.
@@ -5029,6 +5108,14 @@ pub const InferenceToolCallDelta = struct {
     function: ?InferenceToolCallFunctionDelta = null,
 };
 
+/// Startup warm target. Keep this directive to model identity and backend selection; quantization and companion model metadata belong to the model artifact or a future typed runtime option once the warm path can honor it.
+pub const InferenceWarmModel = struct {
+    kind: InferenceWarmModelKind,
+    /// Model name to resolve within the registry for the selected kind.
+    name: []const u8,
+    backend: ?InferenceWarmModelBackend = null,
+};
+
 pub const InferenceModelsResponse = struct {
     /// OpenAI-compatible response object type.
     object: []const u8,
@@ -5905,11 +5992,11 @@ pub const InferenceConfig = struct {
     request_timeout: ?[]const u8 = null,
     /// Typed models to preload and warm at startup. Generators run a tiny generation request so native/Metal weights, KV setup, and kernels use the same budgeted path as request-time generation. Other model kinds use the best available warm path for that kind.
     warm_models: ?[]const InferenceWarmModel = null,
-    /// Legacy list of generator model names to preload at startup. These models are loaded immediately when inference starts, avoiding first-request latency. Prefer warm_models for new config because it records the model kind and optional backend.
+    /// Generator model names to load and warm at startup. These models are loaded immediately when inference starts, avoiding first-request latency. Use warm_models for non-generator targets or backend-specific generator warmup.
     preload: ?[]const []const u8 = null,
     /// Maximum memory (in MB) to use for loaded models. When this limit is approached, least recently used models are unloaded. Set to 0 for unlimited (default). This is an advisory limit - actual memory usage depends on model sizes and may temporarily exceed this value. Works alongside max_loaded_models for fine-grained control.
     max_memory_mb: ?i64 = null,
-    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup (as part of preload) - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
+    /// Per-model loading strategy overrides. Maps model names to their loading strategy. Models not in this map use the default strategy based on keep_alive: - If keep_alive>0 (default "5m"): lazy loading (load on demand, unload after idle) - If keep_alive="0": eager loading (load at startup, never unload) When a model has strategy "eager" in this map: - It is loaded at startup through the same startup warmup path - It is never unloaded, even when keep_alive>0 (pinned in memory) This allows mixing eager and lazy models in the same pool.
     model_strategies: ?std.json.ArrayHashMap([]const u8) = null,
     /// Whether the dashboard should show model download commands. Defaults to true for standalone/swarm mode. Set to false in managed deployments (e.g., Kubernetes operator) where models are managed externally.
     allow_downloads: ?bool = null,

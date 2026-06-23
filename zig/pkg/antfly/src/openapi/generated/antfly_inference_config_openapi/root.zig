@@ -59,5 +59,7 @@ pub const GenerateChunkChoice = types.GenerateChunkChoice;
 pub const GenerateDelta = types.GenerateDelta;
 pub const ToolCallDelta = types.ToolCallDelta;
 pub const ToolCallFunctionDelta = types.ToolCallFunctionDelta;
+pub const WarmModelKind = types.WarmModelKind;
+pub const WarmModelBackend = types.WarmModelBackend;
 pub const WarmModel = types.WarmModel;
 pub const Config = types.Config;
