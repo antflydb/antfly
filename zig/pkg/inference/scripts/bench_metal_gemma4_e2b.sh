@@ -83,8 +83,7 @@ run_server_warm_bench() {
       --models-dir "$MODELS_DIR" \
       --host 127.0.0.1 \
       --port "$SERVER_PORT" \
-      --warm-generator "$MODEL_NAME" \
-      --warm-generator-backend metal
+      --warm-model "generator:$MODEL_NAME"
   ) >"$server_out" 2>&1 &
   server_pid="$!"
 
