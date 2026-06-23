@@ -2089,13 +2089,26 @@ fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
     return out;
 }
 
+fn capabilitiesForHandle(handle: *Handle) lite_backend.Capabilities {
+    const profile = handle.lite_profile orelse .native;
+    if (handle.lite_inference_status) |inference| {
+        return lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference);
+    }
+    return lite_backend.capabilitiesForProfile(profile);
+}
+
+pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    out.* = stringifyJson(capabilitiesForHandle(handle)) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    const profile = handle.lite_profile orelse .native;
-    const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
-    out.* = stringifyJson(lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference)) catch return .internal;
+    out.* = stringifyJson(capabilitiesForHandle(handle)) catch return .internal;
     return .ok;
 }
 
@@ -7064,6 +7077,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"relational\":{\"tables\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sql\":{\"adapter\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"embedded_exec\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_placement\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cross_node_joins\":false") != null);
@@ -7078,6 +7095,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"inference_mode\":\"local_embedded\"" else "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"disabled_deferred\"]" else "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+
+    var generic_capabilities: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_capabilities_json(src_handle, &generic_capabilities));
+    defer antfly_db_buffer_free(generic_capabilities.ptr, generic_capabilities.len);
+    const generic_capabilities_json = generic_capabilities.ptr.?[0..generic_capabilities.len];
+    try std.testing.expect(std.mem.indexOf(u8, generic_capabilities_json, "\"relational\":{\"tables\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generic_capabilities_json, "\"sql\":{\"adapter\":true") != null);
 
     var pending: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_pending_work_stats_json(src_handle, &pending));

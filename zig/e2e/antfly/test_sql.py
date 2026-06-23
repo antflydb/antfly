@@ -166,6 +166,22 @@ def _select_rows(sql_cli, sql: str) -> list[dict[str, Any]] | None:
     return rows
 
 
+def _query_hit_ids(payload: dict[str, Any]) -> list[str] | None:
+    responses = payload.get("responses")
+    if not responses:
+        return None
+    hits = responses[0].get("hits", {}).get("hits")
+    if not hits:
+        return None
+    ids: list[str] = []
+    for hit in hits:
+        doc_id = hit.get("_id") or hit.get("doc_id")
+        if not isinstance(doc_id, str):
+            return None
+        ids.append(doc_id)
+    return ids
+
+
 def test_sql_cli_help_does_not_require_server():
     binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
     if not Path(binary).exists():
@@ -273,6 +289,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "title": "alpha",
                 "body": "alpha search document",
                 "status": "active",
+                "category": "release",
                 "tags": ["urgent", "search"],
                 "metadata": {"plan": "pro"},
             },
@@ -280,6 +297,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "title": "beta",
                 "body": "beta archive document",
                 "status": "archived",
+                "category": "archive",
                 "tags": ["archive"],
                 "metadata": {"plan": "free"},
             },
@@ -287,6 +305,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "title": "alpha followup",
                 "body": "alpha search followup",
                 "status": "active",
+                "category": "release",
                 "tags": ["search"],
                 "metadata": {"plan": "team"},
             },
@@ -294,6 +313,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
                 "title": "delta archived",
                 "body": "delta search archive",
                 "status": "archived",
+                "category": "archive",
                 "tags": ["archive", "search"],
                 "metadata": {"plan": "enterprise"},
             },
@@ -301,6 +321,12 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         sync_level="full_index",
     )
     assert written["inserted"] == 4
+
+    stateful_api.create_index(
+        table,
+        "category_fts",
+        {"name": "category_fts", "type": "full_text", "field": "category"},
+    )
 
     direct_by_id = stateful_api.post(
         "/sql",
@@ -316,7 +342,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         timeout=10,
     )
     assert write_response.status_code == 400
-    assert write_response.text == "document sql write unsupported"
+    assert write_response.text == "document_sql_write_unsupported"
 
     array_response = stateful_api.s.post(
         f"{stateful_api.url}/sql",
@@ -324,7 +350,21 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         timeout=10,
     )
     assert array_response.status_code == 400
-    assert array_response.text == "document sql array requires unnest"
+    assert array_response.text == "document_sql_array_requires_unnest"
+
+    unnested_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT d._id, tag FROM {table} AS d, UNNEST(d.tags) AS tag "
+                "WHERE tag = 'search' LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in unnested_rows) == ["doc:a", "doc:c", "doc:d"]
+    assert {row["tag"] for row in unnested_rows} == {"search"}
 
     join_response = stateful_api.s.post(
         f"{stateful_api.url}/sql",
@@ -337,7 +377,7 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
         timeout=10,
     )
     assert join_response.status_code == 400
-    assert join_response.text == "document sql unsupported join"
+    assert join_response.text == "document_sql_unsupported_join"
 
     by_id = _first_sql_json(
         sql_cli(
@@ -360,6 +400,19 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert by_json_path["kind"] == "read"
     assert by_json_path["statement_kind"] == "query"
     assert by_json_path["result"]["rows"] == [{"_id": "doc:a", "plan": "pro"}]
+
+    by_json_path_filter = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                f"SELECT _id, metadata->>'plan' AS plan FROM {table} "
+                "WHERE metadata->>'plan' = 'pro' LIMIT 10;"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert by_json_path_filter == [{"_id": "doc:a", "plan": "pro"}]
 
     active_rows = wait_until(
         lambda: _select_rows(
@@ -391,6 +444,36 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     )
     assert sorted(row["_id"] for row in full_text_rows) == ["doc:a", "doc:c", "doc:d"]
 
+    native_full_text_ids = wait_until(
+        lambda: _query_hit_ids(
+            stateful_api.query_table(
+                table,
+                {
+                    "full_text_search": {"query": "body:search"},
+                    "limit": 10,
+                },
+            )
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(native_full_text_ids) == sorted(row["_id"] for row in full_text_rows)
+
+    function_full_text_rows = wait_until(
+        lambda: _select_rows(
+            sql_cli,
+            (
+                "SELECT * FROM antfly.full_text_search("
+                f"table_name => '{table}', query => 'body:search', limit => 10);"
+            ),
+        ),
+        timeout_s=15.0,
+        interval_s=0.5,
+    )
+    assert sorted(row["_id"] for row in function_full_text_rows) == sorted(native_full_text_ids)
+    assert all("_score" in row for row in function_full_text_rows)
+    assert all("_source" in row for row in function_full_text_rows)
+
     full_text_residual_rows = wait_until(
         lambda: _select_rows(
             sql_cli,
@@ -412,6 +495,23 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert counted["statement_kind"] == "aggregate"
     assert counted["result"]["rows"] == [{"row_count": 3}]
 
+    grouped_counted = _first_sql_json(
+        sql_cli(
+            "sql",
+            "-c",
+            f"SELECT count(*) AS row_count FROM {table} WHERE full_text_search('body:search') GROUP BY status LIMIT 10;",
+        ).stdout
+    )
+    assert grouped_counted["kind"] == "read"
+    assert grouped_counted["statement_kind"] == "aggregate"
+    grouped_rows = sorted(
+        grouped_counted["result"]["rows"], key=lambda row: row["status"]
+    )
+    assert grouped_rows == [
+        {"status": "active", "row_count": 2},
+        {"status": "archived", "row_count": 1},
+    ]
+
     residual_counted = _first_sql_json(
         sql_cli(
             "sql",
@@ -422,3 +522,22 @@ def test_sql_cli_queries_document_tables(stateful_api, sql_cli):
     assert residual_counted["kind"] == "read"
     assert residual_counted["statement_kind"] == "aggregate"
     assert residual_counted["result"]["rows"] == [{"row_count": 2}]
+
+    virtual_field_by_id = stateful_api.post(
+        "/sql",
+        {"sql": f"SELECT _id, category FROM {table} WHERE _id = 'doc:a';"},
+    )
+    assert virtual_field_by_id["kind"] == "read"
+    assert virtual_field_by_id["statement_kind"] == "query"
+    assert virtual_field_by_id["result"]["rows"] == [
+        {"_id": "doc:a", "category": "release"}
+    ]
+
+    virtual_star_by_id = stateful_api.post(
+        "/sql",
+        {"sql": f"SELECT * FROM {table} WHERE _id = 'doc:a';"},
+    )
+    assert virtual_star_by_id["kind"] == "read"
+    assert virtual_star_by_id["statement_kind"] == "query"
+    assert virtual_star_by_id["result"]["rows"][0]["category"] == "release"
+    assert virtual_star_by_id["result"]["rows"][0]["_doc"]["category"] == "release"

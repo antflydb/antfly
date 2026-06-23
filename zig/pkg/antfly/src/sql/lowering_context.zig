@@ -286,19 +286,20 @@ fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
     const document_plan = @import("document_plan.zig");
     return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
         .aggregate => .{
-            .document_aggregate = try document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndBoundedScanPolicyParsedSqlAlloc(
+            .document_aggregate = try document_plan.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(
                 alloc,
                 parsed_sql,
                 document.schema,
                 document.indexes_json,
-                document.capabilities.bounded_scan,
+                document.capabilities,
             ),
         },
         .query => .{
-            .document_query = try document_plan.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+            .document_query = try document_plan.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
                 alloc,
                 parsed_sql,
                 document.schema,
+                document.virtual_schema,
                 document.capabilities,
             ),
         },
@@ -676,6 +677,118 @@ test "sql adapter lowering context classifies read sql into typed plan families"
         .window => |lowered| {
             try std.testing.expectEqualStrings("usage_records", lowered.table_name);
             try std.testing.expectEqual(@as(usize, 1), lowered.plan.window.windows.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "sql adapter lowering context derives document scalar capabilities from catalog indexes" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"body":{"type":"text"},"status":{"type":"keyword","x-antfly-index":false}},"additionalProperties":true}}}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{
+                        .table_id = 31,
+                        .name = "docs",
+                        .placement_role = "data",
+                        .schema_json = schema_json,
+                        .indexes_json = "{\"body_fts\":{\"type\":\"full_text\",\"field\":\"body\"},\"category_idx\":{\"type\":\"scalar\",\"field\":\"category\"}}",
+                    },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var covered = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT _id, body FROM docs WHERE body LIKE 'alpha%' LIMIT 10",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer covered.deinit(alloc);
+    switch (covered) {
+        .document_query => |document| {
+            try std.testing.expectEqualStrings("{\"prefix\":{\"path\":\"/body\",\"value\":\"alpha\"}}", document.producer.indexed_query.filter_query_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var star = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT * FROM docs WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer star.deinit(alloc);
+    switch (star) {
+        .document_query => |document| {
+            try std.testing.expectEqual(@as(usize, 5), document.projection.len);
+            try std.testing.expectEqualStrings("_id", document.projection[0].output);
+            try std.testing.expectEqualStrings("_doc", document.projection[1].output);
+            try std.testing.expectEqualStrings("body", document.projection[2].output);
+            try std.testing.expectEqualStrings("status", document.projection[3].output);
+            try std.testing.expectEqualStrings("category", document.projection[4].output);
+            try std.testing.expectEqualStrings("category", document.projection[4].field);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var explicit_virtual_projection = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT category FROM docs WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer explicit_virtual_projection.deinit(alloc);
+    switch (explicit_virtual_projection) {
+        .document_query => |document| {
+            try std.testing.expectEqual(@as(usize, 1), document.projection.len);
+            try std.testing.expectEqualStrings("category", document.projection[0].field);
+            try std.testing.expectEqualStrings("category", document.projection[0].output);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var residual = try lowerReadPlanWithCatalogForLoweringContextTestAlloc(
+        alloc,
+        "SELECT _id, status FROM docs WHERE status = 'active' LIMIT 10",
+        schema,
+        &.{},
+        Catalog.iface(),
+    );
+    defer residual.deinit(alloc);
+    switch (residual) {
+        .document_query => |document| {
+            try std.testing.expectEqual(source_binding.default_document_sql_bounded_scan_rows, document.producer.bounded_scan.max_rows);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", document.producer.bounded_scan.residual_filter_json.?);
         },
         else => return error.TestUnexpectedResult,
     }

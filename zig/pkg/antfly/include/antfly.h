@@ -296,6 +296,7 @@ antfly_error_code antfly_lite_create_hosted(const char *path, void **out_handle)
 antfly_error_code antfly_lite_open_readonly(const char *path, void **out_handle);
 antfly_error_code antfly_lite_open_status_only(const char *path, void **out_handle);
 
+antfly_error_code antfly_db_capabilities_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_status_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_capabilities_json(void *handle, antfly_buffer *out);
 antfly_error_code antfly_lite_backup(void *handle, antfly_buffer *out);

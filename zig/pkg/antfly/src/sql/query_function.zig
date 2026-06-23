@@ -392,6 +392,43 @@ pub fn lowerAntflyQueryFunctionParsedSqlAlloc(
     return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
 }
 
+pub const LoweredAntflyQueryFunctionRead = struct {
+    table_name: []const u8,
+    request: query_contract.OwnedQueryRequest,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        self.request.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn lowerAntflyQueryFunctionReadParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    parsed_sql: *const tokenized.ParsedSql,
+) !LoweredAntflyQueryFunctionRead {
+    var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
+    var pos: usize = 0;
+    const function = try parseAntflyQueryFunctionCall(alloc, parsed_sql.items(), &pos, &args);
+    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
+        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    if (table_name.len == 0) return error.UnsupportedSqlShape;
+
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+    var request = try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
+    errdefer request.deinit(alloc);
+    return .{
+        .table_name = owned_table_name,
+        .request = request,
+    };
+}
+
 pub fn lowerAntflyQueryFunctionExpressionSqlAlloc(
     alloc: std.mem.Allocator,
     semantic_resolver: ?query_contract.SemanticResolver,

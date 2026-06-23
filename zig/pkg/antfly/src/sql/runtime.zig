@@ -33,11 +33,13 @@ const usermgr = @import("../usermgr/mod.zig");
 pub const default_array_agg_max_items: u32 = db_mod.types.default_relational_rows_array_agg_max_items;
 pub const DocumentAlgebraicAggregatePlan = sql_adapter.DocumentAlgebraicAggregatePlan;
 pub const DocumentAggregateGroupBy = sql_adapter.DocumentAggregateGroupBy;
+pub const BoundedDocumentScan = sql_adapter.BoundedDocumentScan;
 pub const DocumentIndexQuery = sql_adapter.DocumentIndexQuery;
 pub const DocumentOrderBy = sql_adapter.DocumentOrderBy;
 pub const DocumentOrderDirection = sql_adapter.DocumentOrderDirection;
 pub const DocumentProjection = sql_adapter.DocumentProjection;
 pub const DocumentReadPlan = sql_adapter.DocumentReadPlan;
+pub const DocumentUnnest = sql_adapter.DocumentUnnest;
 pub const SqlValue = sql_adapter.SqlValue;
 const AggregateFilter = sql_adapter.AggregateFilter;
 pub const ExtensionFunctionBinding = sql_adapter.ExtensionFunctionBinding;
@@ -840,9 +842,10 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
 ) !LoweredReadPlan {
     if (schema.storage_mode == .document) {
         if (source_schema != null) return error.DocumentSqlUnsupportedJoin;
+        const document_capabilities = sql_adapter.documentCapabilitiesForRuntimeSchema(schema);
         return switch (parsed_sql.statement.readKind() orelse return error.UnsupportedSqlShape) {
-            .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAlgebraicAggregatePlanParsedSqlAlloc(alloc, parsed_sql, schema) },
-            .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanParsedSqlAlloc(alloc, parsed_sql, schema) },
+            .aggregate => .{ .document_aggregate = try sql_adapter.lowerDocumentAggregatePlanWithOptionalIndexesAndCapabilitiesParsedSqlAlloc(alloc, parsed_sql, schema, null, document_capabilities) },
+            .query => .{ .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, parsed_sql, schema, document_capabilities) },
             .join, .lateral => error.DocumentSqlUnsupportedJoin,
             else => error.UnsupportedSqlShape,
         };
@@ -1059,10 +1062,11 @@ fn lowerDocumentReadPlanFromBindingParsedSqlAlloc(
             ),
         },
         .query => .{
-            .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+            .document_query = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
                 alloc,
                 parsed_sql,
                 document.schema,
+                document.virtual_schema,
                 document.capabilities,
             ),
         },
@@ -1094,6 +1098,41 @@ test "sql runtime rejects document joins with document diagnostic" {
         error.DocumentSqlUnsupportedJoin,
         lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, &parsed_sql, schema, schema, &.{}, .{}),
     );
+}
+
+test "sql runtime non catalog document reads use conservative capabilities" {
+    const alloc = std.testing.allocator;
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .document,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword, .indexed = false },
+        },
+    };
+
+    var full_text_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id FROM docs WHERE full_text_search('title:alpha') LIMIT 10",
+    );
+    defer full_text_sql.deinit(alloc);
+    try std.testing.expectError(
+        error.DocumentSqlIndexUnavailable,
+        lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, &full_text_sql, schema, null, &.{}, .{}),
+    );
+
+    var scalar_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id FROM docs WHERE status = 'active' LIMIT 10",
+    );
+    defer scalar_sql.deinit(alloc);
+    var lowered = try lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, &scalar_sql, schema, null, &.{}, .{});
+    defer lowered.deinit(alloc);
+    switch (lowered) {
+        .document_query => |plan| {
+            try std.testing.expectEqual(sql_adapter.default_document_sql_bounded_scan_rows, plan.producer.bounded_scan.max_rows);
+            try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}", plan.producer.bounded_scan.residual_filter_json.?);
+        },
+        else => return error.TestExpectedEqual,
+    }
 }
 
 pub fn lowerExplainPlanAlloc(

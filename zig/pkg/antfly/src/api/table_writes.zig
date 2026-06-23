@@ -957,6 +957,7 @@ pub const ProvisionedTableWriteCache = struct {
                             .default => .writer,
                             .default_async, .writer_no_replay => .writer_no_replay,
                             .startup_catch_up, .restore_repair => .writer_no_replay,
+                            .query_readonly => .query_readonly,
                             .status_only => .status_only,
                         },
                         .start_optional_runtimes = open_mode != .startup_catch_up,
@@ -968,7 +969,7 @@ pub const ProvisionedTableWriteCache = struct {
                     .db = db,
                     .start_bulk_session = switch (open_mode) {
                         .default, .default_async, .writer_no_replay => true,
-                        .startup_catch_up, .restore_repair, .status_only => false,
+                        .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
                     },
                 };
             }
@@ -1200,7 +1201,7 @@ pub const ProvisionedTableWriteCache = struct {
 
         const start_bulk_session = switch (mode) {
             .default, .default_async, .writer_no_replay => self.bulkIngestSessionActiveForTable(table_name),
-            .startup_catch_up, .restore_repair, .status_only => false,
+            .startup_catch_up, .restore_repair, .query_readonly, .status_only => false,
         };
         if (start_bulk_session) {
             try db.beginBulkIngestSession();
@@ -9880,6 +9881,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
                     .startup_catch_up, .restore_repair => .writer_no_replay,
+                    .query_readonly => .query_readonly,
                     .status_only => .status_only,
                 },
                 .index_open_parallelism = if (mode == .default_async or mode == .writer_no_replay) 1 else null,
@@ -15800,6 +15802,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
                     .startup_catch_up, .restore_repair => .writer_no_replay,
+                    .query_readonly => .query_readonly,
                     .status_only => .status_only,
                 },
                 .start_index_workers = if (mode == .startup_catch_up) false else true,
@@ -18887,7 +18890,8 @@ fn extractIndexConfigJsonWithOptions(
             std.mem.eql(u8, entry.key_ptr.*, "name") or
             std.mem.eql(u8, entry.key_ptr.*, "description") or
             std.mem.eql(u8, entry.key_ptr.*, "validation") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments"))
+            std.mem.eql(u8, entry.key_ptr.*, "enrichments") or
+            (kind == .full_text and fullTextCatalogOnlyIndexConfigField(entry.key_ptr.*)))
         {
             continue;
         }
@@ -18902,6 +18906,21 @@ fn extractIndexConfigJsonWithOptions(
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn fullTextCatalogOnlyIndexConfigField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "field") or
+        std.mem.eql(u8, field, "path") or
+        std.mem.eql(u8, field, "fields") or
+        std.mem.eql(u8, field, "paths") or
+        std.mem.eql(u8, field, "scalar_field") or
+        std.mem.eql(u8, field, "scalar_path") or
+        std.mem.eql(u8, field, "scalar_fields") or
+        std.mem.eql(u8, field, "scalar_paths") or
+        std.mem.eql(u8, field, "indexed_scalar_field") or
+        std.mem.eql(u8, field, "indexed_scalar_path") or
+        std.mem.eql(u8, field, "indexed_scalar_fields") or
+        std.mem.eql(u8, field, "indexed_scalar_paths");
 }
 
 pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
@@ -18992,6 +19011,21 @@ test "table write index parser trusts normalized managed embedding dimension wit
     try validateIndexConfig(std.testing.allocator, "semantic_idx",
         \\{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}}
     );
+}
+
+test "table write index parser keeps full text field metadata out of storage config" {
+    const alloc = std.testing.allocator;
+    const cfg = try parseIndexConfig(alloc, "category_fts",
+        \\{"type":"full_text","field":"category","fields":["title","body"],"analyzer":"standard"}
+    );
+    defer {
+        alloc.free(cfg.name);
+        alloc.free(cfg.config_json);
+    }
+
+    try std.testing.expectEqual(db_mod.types.IndexKind.full_text, cfg.kind);
+    try std.testing.expectEqualStrings("category_fts", cfg.name);
+    try std.testing.expectEqualStrings("{\"analyzer\":\"standard\"}", cfg.config_json);
 }
 
 fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
@@ -19812,6 +19846,7 @@ const ManagedDbOpenMode = enum {
     writer_no_replay,
     startup_catch_up,
     restore_repair,
+    query_readonly,
     status_only,
 };
 

@@ -713,6 +713,10 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
     switch (binding) {
         .document => |*document| {
             document.indexes_json = try alloc.dupe(u8, table.indexes_json);
+            errdefer if (document.indexes_json) |indexes_json| alloc.free(@constCast(indexes_json));
+            document.capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, table.indexes_json);
+            errdefer source_binding.deinitDocumentSqlCapabilities(alloc, &document.capabilities);
+            document.virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, table.indexes_json);
         },
         else => {},
     }
@@ -729,6 +733,10 @@ fn deinitSqlSourceBinding(alloc: std.mem.Allocator, binding: *source_binding.Sql
             deinitCatalogTableRef(alloc, document.target);
             runtime_schema.freeSchema(alloc, document.schema);
             if (document.indexes_json) |indexes_json| alloc.free(@constCast(indexes_json));
+            var virtual_schema = document.virtual_schema;
+            source_binding.deinitDocumentSqlSchema(alloc, &virtual_schema);
+            var capabilities = document.capabilities;
+            source_binding.deinitDocumentSqlCapabilities(alloc, &capabilities);
         },
         .lake => |lake| {
             deinitCatalogTableRef(alloc, lake.target);

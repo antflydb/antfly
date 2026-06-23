@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const antfly_client = @import("antfly-client");
+const lite_sql = @import("../lite_sql.zig");
 const cli = @import("mod.zig");
 
 const max_sql_file_bytes = 64 * 1024 * 1024;
@@ -22,6 +23,7 @@ const max_repl_statement_bytes = 16 * 1024 * 1024;
 const SqlCliOptions = struct {
     command: ?[]const u8 = null,
     file_path: ?[]const u8 = null,
+    lite_path: ?[]const u8 = null,
     catalog: cli.CatalogFlags = .{},
 };
 
@@ -33,6 +35,31 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     const opts = parseArgs(args);
     if (opts.command != null and opts.file_path != null) {
         cli.fatal("use only one of -c/--command or -f/--file", .{});
+    }
+
+    if (opts.lite_path) |path| {
+        var session = try lite_sql.Session.init(allocator, opts.catalog);
+        defer session.deinit(allocator);
+
+        if (opts.command) |sql| {
+            if (!try lite_sql.executeSqlText(allocator, io, path, &session, sql, true)) {
+                return error.SqlCommandFailed;
+            }
+            return;
+        }
+
+        if (opts.file_path) |sql_path| {
+            const sql = cli.readFileAlloc(io, allocator, sql_path, lite_sql.max_sql_file_bytes) catch |err| {
+                cli.fatal("reading SQL file {s}: {}", .{ sql_path, err });
+            };
+            defer allocator.free(sql);
+            if (!try lite_sql.executeSqlText(allocator, io, path, &session, sql, true)) {
+                return error.SqlCommandFailed;
+            }
+            return;
+        }
+
+        return lite_sql.repl(allocator, io, path, &session);
     }
 
     var session: SqlSession = .{};
@@ -64,6 +91,8 @@ fn parseArgs(args: *std.process.Args.Iterator) SqlCliOptions {
             opts.command = args.next() orelse cli.fatal("{s} requires a SQL statement", .{arg});
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
             opts.file_path = args.next() orelse cli.fatal("{s} requires a path", .{arg});
+        } else if (std.mem.eql(u8, arg, "--lite")) {
+            opts.lite_path = args.next() orelse cli.fatal("--lite requires a .aflite path", .{});
         } else if (cli.parseCatalogFlag(&opts.catalog, arg, args)) {
             continue;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -269,7 +298,7 @@ fn dollarQuoteDelimiter(sql: []const u8) ?[]const u8 {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: antfly sql [-c <sql> | -f <path>] [--database <name>] [--namespace <name>]
+        \\usage: antfly sql [--lite <db.aflite>] [-c <sql> | -f <path>] [--database <name>] [--namespace <name>]
         \\
         \\Without -c or -f, starts a small psql-style REPL. End statements with
         \\a semicolon. Use \q or .quit to exit.

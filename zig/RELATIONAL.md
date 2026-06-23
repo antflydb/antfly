@@ -94,6 +94,26 @@ relational schemas that would produce no storable relational columns. This
 keeps relational mode a single-store contract rather than a document-mode table
 with optional relational projections.
 
+## Lite And C API Profile
+
+Relational mode is profile-agnostic. A relational table opened through server
+HTTP, embedded directory storage, the C API, or Lite `.aflite` storage must use
+the same schema validation, typed row codec, row participant, secondary column
+entries, constraint checks, and query/predicate semantics.
+
+Lite removes distributed movement concerns, not relational correctness. Split,
+merge, placement, Raft, and remote shard fanout invariants do not apply inside a
+single `.aflite` file, but local validation, secondary-index rebuild,
+constraint repair, row rewrite, and derived-artifact catch-up still apply.
+
+The C API exposes this through capability JSON rather than through a separate
+relational ABI. `relational.tables=true` means the handle supports relational
+base rows. `relational.transactions="local"` means transaction behavior is
+local to the opened database handle. `relational.portable_backup=false` means
+portable AFB export/promotion is intentionally not claimed for relational rows
+until the backup path can materialize packed relational rows into logical row
+documents and restore them through the typed relational write path.
+
 `json` is added to `AntflyType`. A `json` column is stored as a `bytes` column
 and indexed like a document subtree (path facts + dynamic templates). It is the
 escape hatch for semi-structured data inside an otherwise typed row.

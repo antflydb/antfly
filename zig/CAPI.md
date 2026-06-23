@@ -45,6 +45,41 @@ for `ANTFLY_STORAGE_KIND_LITE` only. Directory storage should use
 open-or-create behavior until the directory backend exposes an exclusive create
 primitive.
 
+## Capabilities
+
+Capabilities are a storage-neutral handle property. Bindings should call
+`antfly_db_capabilities_json(handle, out)` after opening any embedded database
+and use `antfly_lite_capabilities_json` only as a Lite compatibility helper.
+Both functions return the same versioned JSON shape for a Lite handle.
+
+The capability object includes relational and SQL blocks:
+
+```json
+{
+  "relational": {
+    "tables": true,
+    "closed_schema_validation": true,
+    "local_schema_rewrite_jobs": true,
+    "portable_backup": false,
+    "transactions": "local"
+  },
+  "sql": {
+    "adapter": true,
+    "ddl": true,
+    "dml": true,
+    "sessions": true,
+    "document_tables": "read_only_planned",
+    "embedded_exec": true
+  }
+}
+```
+
+`embedded_exec=true` means the embedded/Lite SQL path can execute directly
+against local storage instead of requiring a localhost HTTP server.
+`portable_backup=false` is intentional until the
+portable backup path can materialize relational physical rows as logical rows
+and restore them through the typed relational write path.
+
 ## Read-Only Modes
 
 Read-only open modes are part of the storage contract, not just a DB-layer write

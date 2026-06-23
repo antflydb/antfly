@@ -16,6 +16,7 @@ const std = @import("std");
 const antfly = @import("antfly-zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/mod.zig");
+const lite_sql = @import("lite_sql.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const fs_paths = antfly.common.fs_paths;
@@ -102,6 +103,7 @@ fn dispatchSubcommand(allocator: Allocator, io: std.Io, argv0: []const u8, subco
     if (std.mem.eql(u8, subcommand, "lookup")) return try lookup(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "scan")) return try scan(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "query")) return try query(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "sql")) return try lite_sql.runFromArgs(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "index")) return try indexCommand(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "enrichment")) return try enrichmentCommand(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "schema")) return try schemaCommand(allocator, io, args);
@@ -1621,6 +1623,7 @@ fn printUsage(argv0: []const u8) void {
         \\  lookup <db.aflite> --key <key> [--file request.json] [--readonly]
         \\  scan <db.aflite> --file request.json [--readonly]
         \\  query <db.aflite> --file request.json [--readonly]
+        \\  sql <db.aflite> [-c <sql> | -f <path>]
         \\  index list <db.aflite>
         \\  index create <db.aflite> --file index.json
         \\  index drop <db.aflite> --index <name>

@@ -53,6 +53,7 @@ const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
 const relational_rows_api = @import("relational_rows.zig");
+const sql_adapter = @import("../sql/mod.zig");
 const sql_adapter_runtime = @import("../sql/runtime.zig");
 const external_binding_api = @import("../serverless/external_source/catalog_binding.zig");
 const external_source_api = @import("../serverless/external_source/mod.zig");
@@ -5074,6 +5075,10 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
     defer alloc.free(native_table_name);
     const public_table_name = target.table_name;
 
+    if (lowered.unnest) |unnest| {
+        return try executeLoweredDocumentSqlUnnestReadPlanAlloc(alloc, source, target, native_table_name, public_table_name, lowered, unnest, consistency);
+    }
+
     if (lowered.order_by) |order_by| {
         return try executeOrderedLoweredDocumentSqlReadPlanAlloc(alloc, source, target, native_table_name, public_table_name, lowered, order_by, consistency);
     }
@@ -5115,6 +5120,7 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
                 .limit = scan_plan.max_rows,
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
 
             var scanned: u32 = 0;
             var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
@@ -5148,6 +5154,14 @@ fn executeLoweredDocumentSqlReadPlanAlloc(
         .rows = try rows.toOwnedSlice(alloc),
         .total = total,
     };
+}
+
+fn documentSqlAdmitBoundedScanPayload(
+    scan_plan: sql_adapter_runtime.BoundedDocumentScan,
+    payload: []const u8,
+) !void {
+    const max_bytes = scan_plan.max_bytes orelse return;
+    if (payload.len > max_bytes) return error.DocumentSqlRequiresBoundedScan;
 }
 
 fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
@@ -5219,6 +5233,7 @@ fn executeLoweredDocumentSqlAlgebraicAggregatePlanAlloc(
                 .limit = scan_plan.max_rows,
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
 
             var total: u32 = 0;
             var scanned: u32 = 0;
@@ -5302,6 +5317,7 @@ fn executeLoweredDocumentSqlGroupedCountAggregatePlanAlloc(
                 .limit = scan_plan.max_rows,
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
             var rows = std.ArrayListUnmanaged([]const u8).empty;
             defer {
                 for (rows.items) |row| alloc.free(@constCast(row));
@@ -5458,6 +5474,7 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
                 .limit = scan_plan.max_rows,
             }, consistency)) orelse return null;
             defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
 
             var scanned: u32 = 0;
             var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
@@ -5479,7 +5496,25 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
             }
             if (scanned >= scan_plan.max_rows) return error.DocumentSqlRequiresBoundedScan;
         },
-        .indexed_query => return error.UnsupportedSqlShape,
+        .indexed_query => |query| {
+            const query_limit = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, target, native_table_name, public_table_name, query, query_limit, false, false, consistency)) orelse return null;
+            defer query_response.deinit(alloc);
+            const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            if (total_hits > query_limit) return error.DocumentSqlRequiresBoundedScan;
+            try appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
+                alloc,
+                source,
+                target,
+                native_table_name,
+                public_table_name,
+                query_response.json,
+                query.residual_filter_json,
+                order_by,
+                consistency,
+                &candidates,
+            );
+        },
     }
 
     std.mem.sort(OrderedDocumentSqlCandidate, candidates.items, DocumentSqlSortContext{ .direction = order_by.direction }, documentSqlCandidateLessThan);
@@ -5503,6 +5538,56 @@ fn executeOrderedLoweredDocumentSqlReadPlanAlloc(
         .rows = try rows.toOwnedSlice(alloc),
         .total = total,
     };
+}
+
+fn appendOrderedDocumentSqlCandidatesFromQueryResponseAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    target: catalog_resources.TableTarget,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    response_json: []const u8,
+    residual_filter_json: ?[]const u8,
+    order_by: sql_adapter_runtime.DocumentOrderBy,
+    consistency: raft_mod.ReadConsistency,
+    candidates: *std.ArrayListUnmanaged(OrderedDocumentSqlCandidate),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const responses_value = parsed.value.object.get("responses") orelse return error.InvalidRowsRequest;
+    if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidRowsRequest;
+    const first_response = responses_value.array.items[0];
+    if (first_response != .object) return error.InvalidRowsRequest;
+    const hits_value = first_response.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hits_value != .object) return error.InvalidRowsRequest;
+    const hit_items = hits_value.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hit_items != .array) return error.InvalidRowsRequest;
+
+    for (hit_items.array.items) |hit_value| {
+        if (hit_value != .object) return error.InvalidRowsRequest;
+        const id_value = hit_value.object.get("_id") orelse return error.InvalidRowsRequest;
+        if (id_value != .string) return error.InvalidRowsRequest;
+        if (hit_value.object.get("_source")) |source_value| {
+            if (source_value == .object) {
+                const doc_json = try std.json.Stringify.valueAlloc(alloc, source_value, .{});
+                defer alloc.free(doc_json);
+                if (residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, doc_json, filter)) continue;
+                }
+                try appendOrderedDocumentSqlCandidateAlloc(alloc, candidates, id_value.string, doc_json, order_by);
+                continue;
+            }
+            if (source_value != .null) return error.InvalidRowsRequest;
+        }
+
+        var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id_value.string, .{}, consistency)) orelse continue;
+        defer lookup.deinit(alloc);
+        if (residual_filter_json) |filter| {
+            if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+        }
+        try appendOrderedDocumentSqlCandidateAlloc(alloc, candidates, id_value.string, lookup.json, order_by);
+    }
 }
 
 fn appendOrderedDocumentSqlCandidateAlloc(
@@ -5613,7 +5698,17 @@ fn documentSqlIndexQueryRequestAlloc(
     try out.append(alloc, '}');
     const body = try out.toOwnedSlice(alloc);
     defer alloc.free(body);
-    return try query_api.parseQueryRequest(alloc, null, table_name, body);
+    var owned = try query_api.parseQueryRequest(alloc, null, table_name, body);
+    errdefer owned.deinit(alloc);
+    if (query.index_name) |index_name| {
+        if (owned.req.primary_text_index_name == null) {
+            owned.req.primary_text_index_name = try alloc.dupe(u8, index_name);
+        }
+        if (owned.req.index_name == null) {
+            owned.req.index_name = try alloc.dupe(u8, index_name);
+        }
+    }
+    return owned;
 }
 
 fn documentSqlNativeFilterQueryJsonAlloc(
@@ -5633,9 +5728,10 @@ fn documentSqlAppendNativeFilterValueAlloc(
     alloc: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     value: std.json.Value,
-) !void {
+) anyerror!void {
     switch (value) {
         .object => |object| {
+            if (try documentSqlAppendNativeFilterOperatorAlloc(alloc, out, object)) return;
             try out.append(alloc, '{');
             var first = true;
             var it = object.iterator();
@@ -5679,6 +5775,106 @@ fn documentSqlAppendNativeFilterValueAlloc(
             try out.appendSlice(alloc, encoded);
         },
     }
+}
+
+fn documentSqlAppendNativeFilterOperatorAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    object: std.json.ObjectMap,
+) anyerror!bool {
+    if (object.count() != 1) return false;
+    var it = object.iterator();
+    const entry = it.next() orelse return false;
+    if (entry.value_ptr.* != .object) return false;
+    const op = entry.key_ptr.*;
+    const spec = entry.value_ptr.object;
+
+    if (std.mem.eql(u8, op, "term")) {
+        const path_value = spec.get("path") orelse return false;
+        const term_value = spec.get("value") orelse return false;
+        if (path_value != .string) return false;
+        const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
+        defer alloc.free(field);
+        try documentSqlAppendNativeFieldValueOperatorAlloc(alloc, out, "term", field, term_value);
+        return true;
+    }
+    if (std.mem.eql(u8, op, "terms")) {
+        const path_value = spec.get("path") orelse return false;
+        const terms_value = spec.get("values") orelse return false;
+        if (path_value != .string) return false;
+        const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
+        defer alloc.free(field);
+        try documentSqlAppendNativeFieldValueOperatorAlloc(alloc, out, "terms", field, terms_value);
+        return true;
+    }
+    if (std.mem.eql(u8, op, "prefix")) {
+        const path_value = spec.get("path") orelse return false;
+        const prefix_value = spec.get("value") orelse return false;
+        if (path_value != .string) return false;
+        const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
+        defer alloc.free(field);
+        try documentSqlAppendNativeFieldValueOperatorAlloc(alloc, out, "prefix", field, prefix_value);
+        return true;
+    }
+    if (std.mem.eql(u8, op, "wildcard")) {
+        const path_value = spec.get("path") orelse return false;
+        const pattern_value = spec.get("pattern") orelse return false;
+        if (path_value != .string) return false;
+        const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
+        defer alloc.free(field);
+        try documentSqlAppendNativeFieldValueOperatorAlloc(alloc, out, "wildcard", field, pattern_value);
+        return true;
+    }
+    if (std.mem.eql(u8, op, "numeric_range") or std.mem.eql(u8, op, "date_range") or std.mem.eql(u8, op, "term_range")) {
+        const path_value = spec.get("path") orelse return false;
+        if (path_value != .string) return false;
+        const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
+        defer alloc.free(field);
+        try documentSqlAppendNativeRangeOperatorAlloc(alloc, out, op, field, spec);
+        return true;
+    }
+
+    return false;
+}
+
+fn documentSqlAppendNativeFieldValueOperatorAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    op: []const u8,
+    field: []const u8,
+    value: std.json.Value,
+) anyerror!void {
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, out, op);
+    try out.appendSlice(alloc, ":{");
+    try appendJsonString(alloc, out, field);
+    try out.append(alloc, ':');
+    try documentSqlAppendNativeFilterValueAlloc(alloc, out, value);
+    try out.appendSlice(alloc, "}}");
+}
+
+fn documentSqlAppendNativeRangeOperatorAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    op: []const u8,
+    field: []const u8,
+    spec: std.json.ObjectMap,
+) anyerror!void {
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, out, op);
+    try out.appendSlice(alloc, ":{");
+    var first = true;
+    try appendJsonFieldString(alloc, out, &first, "field", field);
+    var it = spec.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "path")) continue;
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try appendJsonString(alloc, out, entry.key_ptr.*);
+        try out.append(alloc, ':');
+        try documentSqlAppendNativeFilterValueAlloc(alloc, out, entry.value_ptr.*);
+    }
+    try out.appendSlice(alloc, "}}");
 }
 
 fn documentSqlStorageFilterFieldAlloc(alloc: std.mem.Allocator, field: []const u8) ![]u8 {
@@ -5829,6 +6025,80 @@ fn documentSqlGroupedCountAggregateResultAlloc(
     };
 }
 
+fn executeLoweredDocumentSqlUnnestReadPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: TableReadSource,
+    target: catalog_resources.TableTarget,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    lowered: sql_adapter_runtime.DocumentReadPlan,
+    unnest: sql_adapter_runtime.DocumentUnnest,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    switch (lowered.producer) {
+        .id_lookup => |lookup_plan| {
+            for (lookup_plan.ids) |id| {
+                var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                if (lookup_plan.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentSqlUnnestRowsAlloc(alloc, id, lookup.json, lowered.projection, unnest, lowered.limit, &rows);
+                if (lowered.limit) |limit| {
+                    if (rows.items.len >= limit) break;
+                }
+            }
+        },
+        .bounded_scan => |scan_plan| {
+            var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = scan_plan.max_rows,
+            }, consistency)) orelse return null;
+            defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
+
+            var scanned: u32 = 0;
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                scanned += 1;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                var lookup = (try documentSqlLookupAlloc(alloc, source, target, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                defer lookup.deinit(alloc);
+                if (scan_plan.residual_filter_json) |filter| {
+                    if (!try documentSqlResidualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentSqlUnnestRowsAlloc(alloc, key_value.string, lookup.json, lowered.projection, unnest, lowered.limit, &rows);
+                if (lowered.limit) |limit| {
+                    if (rows.items.len >= limit) break;
+                }
+            }
+            if ((lowered.limit == null or rows.items.len < lowered.limit.?) and scanned >= scan_plan.max_rows) {
+                return error.DocumentSqlRequiresBoundedScan;
+            }
+        },
+        .indexed_query => return error.UnsupportedSqlShape,
+    }
+
+    const total: u32 = @intCast(rows.items.len);
+    return .{
+        .rows = try rows.toOwnedSlice(alloc),
+        .total = total,
+    };
+}
+
 fn appendDocumentSqlRowsFromQueryResponseAlloc(
     alloc: std.mem.Allocator,
     source: TableReadSource,
@@ -5950,7 +6220,7 @@ fn documentSqlProjectedRowJsonAlloc(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidRowsRequest;
-    return try documentSqlProjectedParsedRowJsonAlloc(alloc, key, parsed.value, doc_json, projection);
+    return try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, parsed.value, doc_json, projection, null);
 }
 
 fn documentSqlProjectedParsedRowJsonAlloc(
@@ -5959,6 +6229,17 @@ fn documentSqlProjectedParsedRowJsonAlloc(
     row: std.json.Value,
     full_doc_json: ?[]const u8,
     projection: []const sql_adapter_runtime.DocumentProjection,
+) ![]const u8 {
+    return try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, row, full_doc_json, projection, null);
+}
+
+fn documentSqlProjectedParsedRowJsonWithUnnestAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    row: std.json.Value,
+    full_doc_json: ?[]const u8,
+    projection: []const sql_adapter_runtime.DocumentProjection,
+    unnest_value: ?std.json.Value,
 ) ![]const u8 {
     if (row != .object) return error.InvalidRowsRequest;
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -5983,16 +6264,63 @@ fn documentSqlProjectedParsedRowJsonAlloc(
                     try writer.writeAll("null");
                 }
             },
+            .unnest_value => {
+                const value = unnest_value orelse return error.InvalidRowsRequest;
+                const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+                defer alloc.free(value_json);
+                try writer.writeAll(value_json);
+            },
         }
     }
     try writer.writeByte('}');
     return try out.toOwnedSlice();
 }
 
+fn appendDocumentSqlUnnestRowsAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    doc_json: []const u8,
+    projection: []const sql_adapter_runtime.DocumentProjection,
+    unnest: sql_adapter_runtime.DocumentUnnest,
+    row_limit: ?u32,
+    rows: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const array_value = documentSqlProjectedValue(parsed.value, unnest.field) orelse return;
+    if (array_value != .array) return;
+
+    var filter_value = if (unnest.filter_value_json) |filter_json|
+        try std.json.parseFromSlice(std.json.Value, alloc, filter_json, .{})
+    else
+        null;
+    defer if (filter_value) |*value| value.deinit();
+
+    for (array_value.array.items) |item| {
+        if (filter_value) |value| {
+            if (!documentSqlJsonValuesEqual(item, value.value)) continue;
+        }
+        try rows.append(alloc, try documentSqlProjectedParsedRowJsonWithUnnestAlloc(alloc, key, parsed.value, doc_json, projection, item));
+        if (row_limit) |limit| {
+            if (rows.items.len >= limit) return;
+        }
+    }
+}
+
 fn documentSqlProjectedValue(row: std.json.Value, field: []const u8) ?std.json.Value {
     if (row != .object) return null;
     if (field.len == 0) return null;
-    if (field[0] != '/') return row.object.get(field);
+    if (field[0] != '/') {
+        if (row.object.get(field)) |value| return value;
+        var current = row;
+        var parts = std.mem.splitScalar(u8, field, '.');
+        while (parts.next()) |part| {
+            if (part.len == 0 or current != .object) return null;
+            current = current.object.get(part) orelse return null;
+        }
+        return current;
+    }
 
     var current = row;
     var parts = std.mem.splitScalar(u8, field[1..], '/');
@@ -6023,6 +6351,12 @@ fn documentSqlFilterValueMatches(
     if (filter != .object) return error.InvalidRowsRequest;
     if (filter.object.get("match_all") != null) return true;
     if (filter.object.get("match_none") != null) return false;
+    if (filter.object.get("conjuncts")) |conjuncts| {
+        return try documentSqlFilterConjunctionMatches(alloc, doc, conjuncts);
+    }
+    if (filter.object.get("disjuncts")) |disjuncts| {
+        return try documentSqlFilterDisjunctionMatches(alloc, doc, disjuncts);
+    }
     if (filter.object.get("bool")) |bool_value| {
         if (bool_value != .object) return error.InvalidRowsRequest;
         var has_clause = false;
@@ -6054,17 +6388,15 @@ fn documentSqlFilterValueMatches(
         return documentSqlProjectedValue(doc, path) != null;
     }
     if (filter.object.get("term")) |term| {
-        const path = try documentSqlFilterPath(term);
-        const expected = try documentSqlFilterNamedValue(term, "value");
-        const actual = documentSqlProjectedValue(doc, path) orelse return false;
-        return documentSqlJsonValuesEqual(actual, expected);
+        const field_value = try documentSqlFilterFieldValue(term, "value");
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        return documentSqlJsonValuesEqual(actual, field_value.value);
     }
     if (filter.object.get("terms")) |terms| {
-        const path = try documentSqlFilterPath(terms);
-        const values = try documentSqlFilterNamedValue(terms, "values");
-        if (values != .array) return error.InvalidRowsRequest;
-        const actual = documentSqlProjectedValue(doc, path) orelse return false;
-        for (values.array.items) |expected| {
+        const field_value = try documentSqlFilterFieldValue(terms, "values");
+        if (field_value.value != .array) return error.InvalidRowsRequest;
+        const actual = documentSqlProjectedValue(doc, field_value.path) orelse return false;
+        for (field_value.value.array.items) |expected| {
             if (documentSqlJsonValuesEqual(actual, expected)) return true;
         }
         return false;
@@ -6156,6 +6488,30 @@ fn documentSqlFilterDisjunctionMatches(
         return false;
     }
     return try documentSqlFilterValueMatches(alloc, doc, filter);
+}
+
+const DocumentSqlFilterFieldValue = struct {
+    path: []const u8,
+    value: std.json.Value,
+};
+
+fn documentSqlFilterFieldValue(value: std.json.Value, value_name: []const u8) !DocumentSqlFilterFieldValue {
+    if (value != .object) return error.InvalidRowsRequest;
+    if (value.object.get("path") orelse value.object.get("field")) |path| {
+        if (path != .string) return error.InvalidRowsRequest;
+        return .{
+            .path = path.string,
+            .value = try documentSqlFilterNamedValue(value, value_name),
+        };
+    }
+
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidRowsRequest;
+    if (it.next() != null) return error.InvalidRowsRequest;
+    return .{
+        .path = entry.key_ptr.*,
+        .value = entry.value_ptr.*,
+    };
 }
 
 fn documentSqlFilterPath(value: std.json.Value) ![]const u8 {
@@ -6313,6 +6669,33 @@ test "document SQL residual filter supports match all and match none" {
     try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, doc, "{\"match_all\":{}}"));
     try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, doc, "{\"match_none\":{}}"));
     try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, doc, "{\"bool\":{\"filter\":[{\"match_none\":{}},{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}]}}"));
+}
+
+test "document SQL residual filter supports native conjuncts and disjuncts" {
+    const alloc = std.testing.allocator;
+    const active_tenant_doc =
+        \\{"status":"active","tenant_id":"tenant-a"}
+    ;
+    const inactive_tenant_doc =
+        \\{"status":"archived","tenant_id":"tenant-a"}
+    ;
+    const active_other_tenant_doc =
+        \\{"status":"active","tenant_id":"tenant-b"}
+    ;
+    const conjuncts =
+        \\{"conjuncts":[{"term":{"path":"/status","value":"active"}},{"term":{"tenant_id":"tenant-a"}}]}
+    ;
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, active_tenant_doc, conjuncts));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, inactive_tenant_doc, conjuncts));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, active_other_tenant_doc, conjuncts));
+
+    const disjuncts =
+        \\{"disjuncts":[{"term":{"path":"/status","value":"active"}},{"term":{"tenant_id":"tenant-a"}}]}
+    ;
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, active_tenant_doc, disjuncts));
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, inactive_tenant_doc, disjuncts));
+    try std.testing.expect(try documentSqlResidualFilterMatchesAlloc(alloc, active_other_tenant_doc, disjuncts));
+    try std.testing.expect(!try documentSqlResidualFilterMatchesAlloc(alloc, "{\"status\":\"archived\",\"tenant_id\":\"tenant-b\"}", disjuncts));
 }
 
 fn documentSqlWildcardMatches(pattern: []const u8, text: []const u8) bool {
@@ -24302,9 +24685,9 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
     try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db.batch(.{
         .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"key\":\"document-key-field\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}}" },
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"key\":\"document-key-field\",\"category\":\"release\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}}" },
             .{ .key = "doc:b", .value = "{\"title\":\"beta\"}" },
-            .{ .key = "doc:c", .value = "{\"title\":\"alpha\",\"key\":\"second-key\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"free\"}}}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"alpha\",\"key\":\"second-key\",\"category\":\"preview\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"free\"}}}" },
         },
         .sync_level = .full_index,
     });
@@ -24377,6 +24760,32 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         else => return error.TestUnexpectedResult,
     }
 
+    var doc_projection_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+        alloc,
+        "SELECT _id, _doc FROM docs WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+    );
+    defer doc_projection_plan.deinit(alloc);
+    var doc_projection_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        doc_projection_plan,
+        .read_index,
+    )).?;
+    defer doc_projection_result.deinit(alloc);
+    switch (doc_projection_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"_doc\":{\"title\":\"alpha\",\"key\":\"document-key-field\",\"category\":\"release\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}}}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var scan_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs LIMIT 2",
@@ -24400,6 +24809,105 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
             try std.testing.expectEqual(@as(usize, 2), query.rows.len);
             try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"title\":\"alpha\"}", query.rows[0]);
             try std.testing.expectEqualStrings("{\"_id\":\"doc:b\",\"title\":\"beta\"}", query.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var star_scan_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
+        alloc,
+        "SELECT * FROM docs LIMIT 1",
+        schema,
+        &.{},
+    );
+    defer star_scan_plan.deinit(alloc);
+    var star_scan_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        star_scan_plan,
+        .read_index,
+    )).?;
+    defer star_scan_result.deinit(alloc);
+    switch (star_scan_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"_doc\":{\"title\":\"alpha\",\"key\":\"document-key-field\",\"category\":\"release\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}},\"title\":\"alpha\",\"key\":\"document-key-field\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var virtual_schema = try sql_adapter.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
+        alloc,
+        schema,
+        "{\"category_idx\":{\"type\":\"scalar\",\"field\":\"category\"}}",
+    );
+    defer sql_adapter.deinitDocumentSqlSchema(alloc, &virtual_schema);
+
+    var virtual_projection_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, category FROM docs WHERE _id = 'doc:a'",
+    );
+    defer virtual_projection_sql.deinit(alloc);
+    var virtual_projection_document_plan = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
+        alloc,
+        &virtual_projection_sql,
+        schema,
+        virtual_schema,
+        .{},
+    );
+    defer virtual_projection_document_plan.deinit(alloc);
+    const virtual_projection_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = virtual_projection_document_plan };
+    var virtual_projection_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        virtual_projection_plan,
+        .read_index,
+    )).?;
+    defer virtual_projection_result.deinit(alloc);
+    switch (virtual_projection_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"category\":\"release\"}", query.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var virtual_star_sql = try sql_adapter.ParsedSql.initAlloc(
+        alloc,
+        "SELECT * FROM docs WHERE _id = 'doc:a'",
+    );
+    defer virtual_star_sql.deinit(alloc);
+    var virtual_star_document_plan = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
+        alloc,
+        &virtual_star_sql,
+        schema,
+        virtual_schema,
+        .{},
+    );
+    defer virtual_star_document_plan.deinit(alloc);
+    const virtual_star_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = virtual_star_document_plan };
+    var virtual_star_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        virtual_star_plan,
+        .read_index,
+    )).?;
+    defer virtual_star_result.deinit(alloc);
+    switch (virtual_star_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 1), query.total);
+            try std.testing.expectEqual(@as(usize, 1), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"_doc\":{\"title\":\"alpha\",\"key\":\"document-key-field\",\"category\":\"release\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}}},\"title\":\"alpha\",\"key\":\"document-key-field\",\"metadata\":{\"status\":\"active\",\"billing\":{\"plan\":\"pro\"}},\"category\":\"release\"}", query.rows[0]);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -24458,6 +24966,27 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         ),
     );
 
+    var byte_capped_ordered_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(
+        alloc,
+        &ordered_scan_sql,
+        schema,
+        .{ .max_rows = 10, .max_bytes = 1 },
+    );
+    defer byte_capped_ordered_document_plan.deinit(alloc);
+    const byte_capped_ordered_scan_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = byte_capped_ordered_document_plan };
+    try std.testing.expectError(
+        error.DocumentSqlRequiresBoundedScan,
+        executeLoweredSqlReadPlanAlloc(
+            alloc,
+            source.source(),
+            catalog.iface(),
+            "docs",
+            schema,
+            byte_capped_ordered_scan_plan,
+            .read_index,
+        ),
+    );
+
     var full_text_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
         alloc,
         "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 1",
@@ -24483,6 +25012,66 @@ test "lowered document sql read plans execute native lookup and bounded scan" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var ordered_full_text_sql = try sql_adapter_runtime.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, key FROM docs WHERE full_text_search('title:alpha') ORDER BY key DESC LIMIT 2",
+    );
+    defer ordered_full_text_sql.deinit(alloc);
+    var ordered_full_text_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+        alloc,
+        &ordered_full_text_sql,
+        schema,
+        .{
+            .full_text_filters = true,
+            .bounded_scan = .{ .max_rows = 10 },
+        },
+    );
+    defer ordered_full_text_document_plan.deinit(alloc);
+    const ordered_full_text_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = ordered_full_text_document_plan };
+    var ordered_full_text_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        source.source(),
+        catalog.iface(),
+        "docs",
+        schema,
+        ordered_full_text_plan,
+        .read_index,
+    )).?;
+    defer ordered_full_text_result.deinit(alloc);
+    switch (ordered_full_text_result) {
+        .document_query => |query| {
+            try std.testing.expectEqual(@as(u32, 2), query.total);
+            try std.testing.expectEqual(@as(usize, 2), query.rows.len);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:c\",\"key\":\"second-key\"}", query.rows[0]);
+            try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"key\":\"document-key-field\"}", query.rows[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var capped_ordered_full_text_document_plan = try sql_adapter_runtime.lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(
+        alloc,
+        &ordered_full_text_sql,
+        schema,
+        .{
+            .full_text_filters = true,
+            .bounded_scan = .{ .max_rows = 1 },
+        },
+    );
+    defer capped_ordered_full_text_document_plan.deinit(alloc);
+    const capped_ordered_full_text_plan = sql_adapter_runtime.LoweredReadPlan{ .document_query = capped_ordered_full_text_document_plan };
+    try std.testing.expectError(
+        error.DocumentSqlRequiresBoundedScan,
+        executeLoweredSqlReadPlanAlloc(
+            alloc,
+            source.source(),
+            catalog.iface(),
+            "docs",
+            schema,
+            capped_ordered_full_text_plan,
+            .read_index,
+        ),
+    );
 
     var like_plan = try sql_adapter_runtime.lowerReadPlanAlloc(
         alloc,
@@ -26343,7 +26932,7 @@ test "document sql filter-only index query requests include match_all base query
     defer req.deinit(alloc);
 
     try std.testing.expect(req.req.full_text.? == .match_all);
-    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"status\",\"value\":\"active\"}}", req.req.filter_query_json);
+    try std.testing.expectEqualStrings("{\"term\":{\"status\":\"active\"}}", req.req.filter_query_json);
     try std.testing.expectEqual(@as(u32, 10), req.req.limit);
 }
 
@@ -26356,7 +26945,7 @@ test "document sql native filter rewrite only maps field identifiers" {
     defer alloc.free(native_filter);
 
     try std.testing.expectEqualStrings(
-        "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"metadata.status\",\"value\":\"/active\"}},{\"terms\":{\"tenant\":[\"/t1\"]}}]}}",
+        "{\"bool\":{\"filter\":[{\"term\":{\"metadata.status\":\"/active\"}},{\"terms\":{\"tenant\":[\"/t1\"]}}]}}",
         native_filter,
     );
 }

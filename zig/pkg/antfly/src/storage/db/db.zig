@@ -44427,7 +44427,10 @@ fn denseArtifactTargetCountForIndexContext(ctx: *AsyncContext, index_name: []con
             const state: *@This() = @ptrCast(@alignCast(scan_ctx orelse return error.InvalidArgument));
             if (!internal_keys.isInternalUserKey(key)) return .@"continue";
 
-            var artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(state.alloc, key)) orelse return .@"continue";
+            var artifact_ref = (artifact_ids.decodeArtifactRefAlloc(state.alloc, key) catch |err| switch (err) {
+                error.InvalidInternalUserKey => return .@"continue",
+                else => return err,
+            }) orelse return .@"continue";
             defer artifact_ref.deinit(state.alloc);
             if (artifact_ref.kind != .embedding) return .@"continue";
             if (!std.mem.eql(u8, artifact_ref.name, state.expected_name)) return .@"continue";

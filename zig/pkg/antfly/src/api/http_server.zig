@@ -338,6 +338,7 @@ pub const ApiHttpServerConfig = struct {
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     inference_api_key: ?[]const u8 = null,
+    semantic_resolver: ?query_contract.SemanticResolver = null,
     extension_package_store_dir: ?[]const u8 = null,
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
@@ -3513,6 +3514,10 @@ pub const ApiHttpServer = struct {
         };
     }
 
+    fn semanticResolver(self: *ApiHttpServer, fallback: *SemanticStatusResolver) query_contract.SemanticResolver {
+        return self.cfg.semantic_resolver orelse fallback.iface();
+    }
+
     pub fn initWithConfig(
         alloc: std.mem.Allocator,
         cfg: ApiHttpServerConfig,
@@ -4418,6 +4423,7 @@ pub const ApiHttpServer = struct {
             },
             else => {},
         }
+        try self.rejectUnsupportedDocumentSqlViewMapping(plan, session.session());
 
         if (loweredDdlPlanMayDropTrigger(plan)) {
             if (try self.applyCatalogedSqlRoutineTriggerDropDdlParsedSqlAlloc(&parsed_sql, statement_timeout_ns, statement_start_ns)) |applied| return applied;
@@ -4438,6 +4444,31 @@ pub const ApiHttpServer = struct {
         try self.scheduleSchemaRewriteWakeForAppliedDdl(applied);
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
         return applied;
+    }
+
+    fn rejectUnsupportedDocumentSqlViewMapping(
+        self: *ApiHttpServer,
+        plan: sql_adapter.LoweredDdlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !void {
+        const create_view = switch (plan) {
+            .view_catalog => |view_plan| switch (view_plan) {
+                .create => |create| create,
+                else => return,
+            },
+            else => return,
+        };
+        const schema = sql_adapter.runtimeSchemaForCatalogTableWithSessionAlloc(
+            self.alloc,
+            self.catalogSource(),
+            create_view.source_table_name,
+            session,
+        ) catch |err| switch (err) {
+            error.TableNotFound, error.InvalidSqlCatalog => return,
+            else => return err,
+        };
+        defer runtime_schema_mod.freeSchema(self.alloc, schema);
+        if (schema.storage_mode == .document) return error.DocumentSqlViewMappingUnsupported;
     }
 
     const PublicSqlRequest = struct {
@@ -5368,7 +5399,7 @@ pub const ApiHttpServer = struct {
             self.catalogSource(),
         ) catch |err| switch (err) {
             error.InvalidSqlCatalog, error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
-            error.DocumentSqlWriteUnsupported => return try textResponse(self.alloc, 400, "document sql write unsupported"),
+            error.DocumentSqlWriteUnsupported => return try textResponse(self.alloc, 400, "document_sql_write_unsupported"),
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return try textResponse(self.alloc, 400, "invalid sql write"),
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.UniqueOwnerTopologyUnavailable, error.TopologyChanged, error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "unique owner unavailable"),
@@ -5532,7 +5563,7 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
-    fn handlePublicSqlRead(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession) !http_common.HttpResponse {
+    fn handlePublicSqlRead(self: *ApiHttpServer, sql: []const u8, session: *sql_adapter.OwnedSqlCatalogSession, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
         const statement_start_ns = platform_time.monotonicNs();
         const statement_timeout_ns = try sql_adapter.sqlStatementTimeoutNsFromSession(session.session());
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
@@ -5543,6 +5574,7 @@ pub const ApiHttpServer = struct {
         };
         defer parsed_sql.deinit(self.alloc);
         const statement_kind = parsed_sql.readStatementKind() orelse return try textResponse(self.alloc, 501, "unsupported sql statement");
+        if (try self.handlePublicSqlQueryFunctionRead(&parsed_sql, session, authenticated_identity, statement_kind)) |response| return response;
         var table_names = (sql_adapter.readSourceTableNamesFromParsedSqlAlloc(self.alloc, &parsed_sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             else => return err,
@@ -5584,6 +5616,10 @@ pub const ApiHttpServer = struct {
             }
         };
         defer lowered.deinit(self.alloc);
+        self.applyPublicSqlDocumentReadRowFilter(&lowered, session.session(), authenticated_identity) catch |err| switch (err) {
+            error.InvalidQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+            else => return err,
+        };
         try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
 
         var result = (table_reads.executeLoweredSqlReadPlanWithSessionAlloc(
@@ -5618,12 +5654,126 @@ pub const ApiHttpServer = struct {
         return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
     }
 
+    fn applyPublicSqlDocumentReadRowFilter(
+        self: *ApiHttpServer,
+        lowered: *sql_adapter_runtime.LoweredReadPlan,
+        session: catalog_resources.SqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+    ) !void {
+        switch (lowered.*) {
+            .document_query => |*document_plan| {
+                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, session.currentDatabase(), document_plan.table_name);
+                defer if (row_filter_json) |value| self.alloc.free(value);
+                if (row_filter_json) |value| try sql_adapter.applyDocumentReadPlanFilterConstraintAlloc(self.alloc, document_plan, value);
+            },
+            .document_aggregate => |*aggregate_plan| {
+                const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, session.currentDatabase(), aggregate_plan.table_name);
+                defer if (row_filter_json) |value| self.alloc.free(value);
+                if (row_filter_json) |value| try sql_adapter.applyDocumentAggregatePlanFilterConstraintAlloc(self.alloc, aggregate_plan, value);
+            },
+            else => {},
+        }
+    }
+
+    fn handlePublicSqlQueryFunctionRead(
+        self: *ApiHttpServer,
+        parsed_sql: *const sql_adapter.ParsedSql,
+        session: *sql_adapter.OwnedSqlCatalogSession,
+        authenticated_identity: ?AuthenticatedIdentity,
+        statement_kind: sql_adapter.SqlReadStatementKind,
+    ) !?http_common.HttpResponse {
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.source,
+            .antfly_provider = self.antfly_provider,
+            .remote_content = self.cfg.remote_content,
+            .inference_api_key = self.cfg.inference_api_key,
+        };
+        var lowered = sql_adapter.lowerAntflyQueryFunctionReadParsedSqlAlloc(self.alloc, self.semanticResolver(&semantic_resolver), parsed_sql) catch |err| switch (err) {
+            error.UnsupportedSqlShape => return null,
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+            error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
+            else => return err,
+        };
+        defer lowered.deinit(self.alloc);
+
+        const read_source = self.effectivePublicTableReads() orelse return try textResponse(self.alloc, 404, "not found");
+        const row_filter_json = try self.resolveEffectiveRowFilterJsonForDatabase(self.alloc, authenticated_identity, session.session().currentDatabase(), lowered.table_name);
+        defer if (row_filter_json) |value| self.alloc.free(value);
+
+        self.maybeRouteQueryToReadSchema(lowered.table_name, &lowered.request.req) catch |err| switch (err) {
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return try textResponse(self.alloc, 400, "invalid sql request"),
+            else => return err,
+        };
+        if (row_filter_json) |value| {
+            injectRowFilterIntoSearchRequest(self.alloc, &lowered.request.req, value) catch return try textResponse(self.alloc, 400, "invalid sql request");
+        }
+
+        var query_response = (read_source.query(self.alloc, lowered.table_name, lowered.request.req, .read_index) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try textResponse(self.alloc, 400, "invalid sql request"),
+            error.ModelNotFound => return try modelNotFoundResponse(self.alloc),
+            error.TableNotFound => return try textResponse(self.alloc, 404, "not found"),
+            error.DocIdentityNamespaceMismatch => return try textResponse(self.alloc, 503, "doc identity unavailable"),
+            else => return err,
+        }) orelse return try textResponse(self.alloc, 404, "not found");
+        defer query_response.deinit(self.alloc);
+
+        var rows_result = try sqlQueryFunctionRowsFromQueryResponseAlloc(self.alloc, query_response.json);
+        defer rows_result.deinit(self.alloc);
+        const response_body = try self.encodePublicSqlReadResultAlloc(
+            self.ensureSqlProtocolSessionId(session),
+            @tagName(statement_kind),
+            .{ .document_query = rows_result },
+        );
+        defer self.alloc.free(response_body);
+        return try jsonBodyResponseWithStatus(self.alloc, 200, response_body);
+    }
+
+    fn sqlQueryFunctionRowsFromQueryResponseAlloc(
+        alloc: std.mem.Allocator,
+        response_json: []const u8,
+    ) !db_mod.types.RelationalRowsQueryResult {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidQueryRequest;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidQueryRequest;
+        const responses_value = parsed.value.object.get("responses") orelse return error.InvalidQueryRequest;
+        if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidQueryRequest;
+        const first_response = responses_value.array.items[0];
+        if (first_response != .object) return error.InvalidQueryRequest;
+        const hits_value = first_response.object.get("hits") orelse return error.InvalidQueryRequest;
+        if (hits_value != .object) return error.InvalidQueryRequest;
+        const total_value = hits_value.object.get("total") orelse return error.InvalidQueryRequest;
+        const total = switch (total_value) {
+            .integer => |value| if (value >= 0 and value <= std.math.maxInt(u32)) @as(u32, @intCast(value)) else return error.InvalidQueryRequest,
+            .number_string => |text| std.fmt.parseUnsigned(u32, text, 10) catch return error.InvalidQueryRequest,
+            else => return error.InvalidQueryRequest,
+        };
+        const hit_items = hits_value.object.get("hits") orelse return error.InvalidQueryRequest;
+        if (hit_items != .array) return error.InvalidQueryRequest;
+
+        const rows = try alloc.alloc([]const u8, hit_items.array.items.len);
+        errdefer alloc.free(rows);
+        var initialized: usize = 0;
+        errdefer {
+            for (rows[0..initialized]) |row| alloc.free(@constCast(row));
+        }
+        for (hit_items.array.items, 0..) |hit, i| {
+            if (hit != .object) return error.InvalidQueryRequest;
+            rows[i] = try std.json.Stringify.valueAlloc(alloc, hit, .{});
+            initialized += 1;
+        }
+        return .{
+            .rows = rows,
+            .total = total,
+        };
+    }
+
     fn documentSqlReadErrorMessage(err: anyerror) ?[]const u8 {
         return switch (err) {
-            error.DocumentSqlIndexUnavailable => "document sql index unavailable",
-            error.DocumentSqlRequiresBoundedScan => "document sql requires bounded scan",
-            error.DocumentSqlArrayRequiresUnnest => "document sql array requires unnest",
-            error.DocumentSqlUnsupportedJoin => "document sql unsupported join",
+            error.DocumentSqlIndexUnavailable => "document_sql_index_unavailable",
+            error.DocumentSqlRequiresBoundedScan => "document_sql_requires_bounded_scan",
+            error.DocumentSqlArrayRequiresUnnest => "document_sql_array_requires_unnest",
+            error.DocumentSqlUnsupportedJoin => "document_sql_unsupported_join",
             else => null,
         };
     }
@@ -5648,9 +5798,10 @@ pub const ApiHttpServer = struct {
         };
         defer parsed_sql.deinit(self.alloc);
         if (parsed_sql.writeStatementKind() != null) return try self.handlePublicSqlWrite(parsed.value.sql, &session, authenticated_identity);
-        if (parsed_sql.readStatementKind() != null) return try self.handlePublicSqlRead(parsed.value.sql, &session);
+        if (parsed_sql.readStatementKind() != null) return try self.handlePublicSqlRead(parsed.value.sql, &session, authenticated_identity);
 
         var applied = self.applyRelationalSqlDdlWithSession(parsed.value.sql, &session) catch |err| switch (err) {
+            error.DocumentSqlViewMappingUnsupported => return try textResponse(self.alloc, 400, "document_sql_view_mapping_unsupported"),
             error.UnsupportedSqlShape => return try textResponse(self.alloc, 501, "unsupported sql statement"),
             error.StatementTimeout => return try textResponse(self.alloc, 408, "sql statement timeout"),
             error.InvalidSqlSession,
@@ -24786,6 +24937,448 @@ test "api http server exposes psql-style SQL session endpoint" {
     try std.testing.expectEqual(@as(u16, 501), unsupported_resp.status);
 }
 
+test "api http server executes Antfly SQL query functions through native query path" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}},"additionalProperties":true}}}}
+    ;
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        query_calls: usize = 0,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            return error.TestUnexpectedResult;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            return error.TestUnexpectedResult;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            switch (self.query_calls) {
+                1 => {
+                    try std.testing.expectEqual(@as(u32, 2), req.limit);
+                    try std.testing.expectEqualStrings("docs_body_fts", req.primary_text_index_name.?);
+                    try std.testing.expect(req.full_text != null);
+                    try std.testing.expect(req.full_text.? == .match);
+                    try std.testing.expectEqualStrings("title", req.full_text.?.match.field);
+                    try std.testing.expectEqualStrings("alpha", req.full_text.?.match.text);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:a","_score":1.25,"_source":{"title":"alpha","status":"active"}}]}}]}
+                    ) };
+                },
+                2 => {
+                    try std.testing.expect(req.full_text == null);
+                    try std.testing.expect(req.full_text_queries.len == 0);
+                    try std.testing.expectEqual(@as(usize, 1), req.dense_queries.len);
+                    try std.testing.expectEqualStrings("docs_embedding_hnsw", req.dense_queries[0].index_name);
+                    try std.testing.expectEqual(@as(u32, 3), req.dense_queries[0].query.k);
+                    try std.testing.expectEqual(@as(usize, 3), req.dense_queries[0].query.vector.len);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.1), req.dense_queries[0].query.vector[0], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.2), req.dense_queries[0].query.vector[1], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.3), req.dense_queries[0].query.vector[2], 0.0001);
+                    try std.testing.expectEqual(@as(u32, 3), req.limit);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:v","_score":0.98,"_source":{"title":"vector","status":"active"}}]}}]}
+                    ) };
+                },
+                3 => {
+                    try std.testing.expectEqual(@as(u32, 4), req.limit);
+                    try std.testing.expectEqualStrings("docs_body_fts", req.primary_text_index_name.?);
+                    try std.testing.expect(req.full_text != null);
+                    try std.testing.expect(req.full_text.? == .match);
+                    try std.testing.expectEqualStrings("title", req.full_text.?.match.field);
+                    try std.testing.expectEqualStrings("alpha", req.full_text.?.match.text);
+                    try std.testing.expectEqual(@as(usize, 1), req.dense_queries.len);
+                    try std.testing.expectEqualStrings("docs_embedding_hnsw", req.dense_queries[0].index_name);
+                    try std.testing.expectEqual(@as(u32, 4), req.dense_queries[0].query.k);
+                    try std.testing.expectEqual(@as(usize, 3), req.dense_queries[0].query.vector.len);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.3), req.dense_queries[0].query.vector[0], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.2), req.dense_queries[0].query.vector[1], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.1), req.dense_queries[0].query.vector[2], 0.0001);
+                    try std.testing.expect(req.merge_config != null);
+                    try std.testing.expectEqual(@as(u32, 20), req.merge_config.?.window_size);
+                    try std.testing.expectEqual(.rrf, req.merge_config.?.strategy);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:h","_score":1.7,"_source":{"title":"hybrid","status":"active"}}]}}]}
+                    ) };
+                },
+                4 => {
+                    try std.testing.expect(req.full_text == null);
+                    try std.testing.expect(req.full_text_queries.len == 0);
+                    try std.testing.expectEqual(@as(usize, 1), req.dense_queries.len);
+                    try std.testing.expectEqualStrings("docs_body_semantic", req.dense_queries[0].index_name);
+                    try std.testing.expectEqual(@as(u32, 6), req.dense_queries[0].query.k);
+                    try std.testing.expectEqual(@as(usize, 3), req.dense_queries[0].query.vector.len);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.4), req.dense_queries[0].query.vector[0], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.5), req.dense_queries[0].query.vector[1], 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f32, 0.6), req.dense_queries[0].query.vector[2], 0.0001);
+                    try std.testing.expectEqual(@as(u32, 6), req.limit);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:s","_score":0.88,"_source":{"title":"semantic","status":"active"}}]}}]}
+                    ) };
+                },
+                5 => {
+                    try std.testing.expectEqual(@as(u32, 8), req.limit);
+                    try std.testing.expect(req.full_text == null);
+                    try std.testing.expectEqual(@as(usize, 1), req.graph_queries.len);
+                    try std.testing.expectEqualStrings("citation_walk", req.graph_queries[0].name);
+                    const graph_query = req.graph_queries[0].query;
+                    try std.testing.expectEqual(@as(@TypeOf(graph_query.query_type), .traverse), graph_query.query_type);
+                    try std.testing.expectEqualStrings("docs_edge_graph", graph_query.index_name);
+                    switch (graph_query.start_nodes) {
+                        .keys => |keys| {
+                            try std.testing.expectEqual(@as(usize, 1), keys.len);
+                            try std.testing.expectEqualStrings("doc:a", keys[0]);
+                        },
+                        else => return error.TestUnexpectedResult,
+                    }
+                    try std.testing.expectEqual(@as(@TypeOf(graph_query.params.direction), .out), graph_query.params.direction);
+                    try std.testing.expectEqual(@as(u32, 2), graph_query.params.max_depth);
+                    try std.testing.expectEqual(@as(u32, 8), graph_query.params.max_results);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:g","_score":0.75,"_source":{"title":"graph","status":"active"}}]}}]}
+                    ) };
+                },
+                6 => {
+                    try std.testing.expectEqual(@as(u32, 10), req.limit);
+                    try std.testing.expect(req.full_text == null);
+                    try std.testing.expectEqual(@as(usize, 1), req.graph_metric_queries.len);
+                    try std.testing.expectEqualStrings("pagerank", req.graph_metric_queries[0].name);
+                    try std.testing.expectEqualStrings("docs_edge_graph", req.graph_metric_queries[0].query.index_name);
+                    try std.testing.expectEqualStrings("pagerank", req.graph_metric_queries[0].query.metric_name);
+                    try std.testing.expectEqual(@as(u32, 2), req.graph_metric_queries[0].query.top_k);
+                    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, req.graph_metric_queries[0].query.freshness);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:m","_score":0.66,"_source":{"title":"metric","status":"active"}}]}}]}
+                    ) };
+                },
+                7 => {
+                    try std.testing.expectEqual(@as(u32, 5), req.limit);
+                    try std.testing.expectEqualStrings("docs_body_fts", req.primary_text_index_name.?);
+                    try std.testing.expect(req.full_text != null);
+                    try std.testing.expect(req.full_text.? == .match);
+                    try std.testing.expectEqualStrings("body", req.full_text.?.match.field);
+                    try std.testing.expectEqualStrings("alpha", req.full_text.?.match.text);
+                    try std.testing.expect(req.graph_metric_rerank != null);
+                    try std.testing.expectEqualStrings("docs_edge_graph", req.graph_metric_rerank.?.index_name);
+                    try std.testing.expectEqualStrings("pagerank", req.graph_metric_rerank.?.metric_name);
+                    try std.testing.expectApproxEqAbs(@as(f64, 1.5), req.graph_metric_rerank.?.weight, 0.0001);
+                    try std.testing.expectApproxEqAbs(@as(f64, 0.25), req.graph_metric_rerank.?.base_weight, 0.0001);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:r","_score":2.4,"_source":{"title":"reranked","status":"active"}}]}}]}
+                    ) };
+                },
+                8 => {
+                    try std.testing.expectEqual(@as(u32, 2), req.limit);
+                    try std.testing.expectEqualStrings("docs_body_fts", req.primary_text_index_name.?);
+                    try std.testing.expectEqualStrings("{\"term\":{\"tenant_id\":\"tenant-scoped-acme\"}}", req.filter_query_json);
+                    try std.testing.expect(req.full_text != null);
+                    try std.testing.expect(req.full_text.? == .match);
+                    try std.testing.expectEqualStrings("title", req.full_text.?.match.field);
+                    try std.testing.expectEqualStrings("alpha", req.full_text.?.match.text);
+                    return .{ .json = try allocator.dupe(u8,
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:tenant","_score":1.5,"_source":{"title":"tenant","status":"active","tenant_id":"tenant-scoped-acme"}}]}}]}
+                    ) };
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+
+    const FakeSemanticResolver = struct {
+        calls: usize = 0,
+
+        fn resolver(self: *@This()) query_contract.SemanticResolver {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .resolve_dense_query = resolveDenseQuery },
+            };
+        }
+
+        fn resolveDenseQuery(
+            ptr: *anyopaque,
+            allocator: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            semantic_search: []const u8,
+            embedding_template: ?[]const u8,
+            limit: u32,
+        ) !db_mod.types.DenseKnnQuery {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("docs_body_semantic", index_name);
+            try std.testing.expectEqualStrings("automatic embeddings", semantic_search);
+            try std.testing.expect(embedding_template == null);
+            try std.testing.expectEqual(@as(u32, 6), limit);
+            return .{
+                .vector = try allocator.dupe(f32, &[_]f32{ 0.4, 0.5, 0.6 }),
+                .k = limit,
+            };
+        }
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "docs",
+        .schema_json = schema_json,
+        .indexes_json = "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_embedding_hnsw\":{\"type\":\"embeddings\",\"dimension\":3},\"docs_body_semantic\":{\"type\":\"embeddings\",\"dimension\":3},\"docs_edge_graph\":{\"type\":\"graph\",\"metrics\":{\"pagerank\":{\"enabled\":true,\"kind\":\"pagerank\"}}}}",
+        .desired_replica_count = 1,
+    }} };
+    var reads = FakeReads{};
+    var semantic = FakeSemanticResolver{};
+    var auth = try initTestAuthManager(alloc);
+    try bindTestAuthManager(alloc, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var user = try auth.manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try auth.manager.createRoleSubject("role:tenant_reader");
+    try auth.manager.setRoleSetting("role:tenant_reader", "app.tenant_id", "global-acme");
+    try auth.manager.setRoleDatabaseSetting("role:tenant_reader", "tenant_ops", "app.tenant_id", "tenant-scoped-acme");
+    try auth.manager.addRoleToUser("alice", "role:tenant_reader");
+
+    var server = ApiHttpServer.init(alloc, .{ .semantic_resolver = semantic.resolver(), .user_manager = &auth.manager }, source.iface(), reads.source(), null);
+    defer server.deinit();
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'title', query => 'alpha', limit => 2);\"}",
+    });
+    defer resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), reads.query_calls);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("read", parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed.value.object.get("statement_kind").?.string);
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), result.get("total").?.integer);
+    const row = result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.25), row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("alpha", row.get("_source").?.object.get("title").?.string);
+
+    var vector_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 3);\"}",
+    });
+    defer vector_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), vector_resp.status);
+    try std.testing.expectEqual(@as(usize, 2), reads.query_calls);
+
+    var parsed_vector = try std.json.parseFromSlice(std.json.Value, alloc, vector_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_vector.deinit();
+    try std.testing.expectEqualStrings("read", parsed_vector.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_vector.value.object.get("statement_kind").?.string);
+    const vector_result = parsed_vector.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), vector_result.get("total").?.integer);
+    const vector_row = vector_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:v", vector_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.98), vector_row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("vector", vector_row.get("_source").?.object.get("title").?.string);
+
+    var hybrid_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', vector_index => 'docs_embedding_hnsw', field => 'title', query => 'alpha', vector => '[0.3,0.2,0.1]', fusion => 'rrf', window_size => 20, limit => 4);\"}",
+    });
+    defer hybrid_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), hybrid_resp.status);
+    try std.testing.expectEqual(@as(usize, 3), reads.query_calls);
+
+    var parsed_hybrid = try std.json.parseFromSlice(std.json.Value, alloc, hybrid_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_hybrid.deinit();
+    try std.testing.expectEqualStrings("read", parsed_hybrid.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_hybrid.value.object.get("statement_kind").?.string);
+    const hybrid_result = parsed_hybrid.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), hybrid_result.get("total").?.integer);
+    const hybrid_row = hybrid_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:h", hybrid_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.7), hybrid_row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("hybrid", hybrid_row.get("_source").?.object.get("title").?.string);
+
+    var semantic_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 6);\"}",
+    });
+    defer semantic_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), semantic_resp.status);
+    try std.testing.expectEqual(@as(usize, 4), reads.query_calls);
+    try std.testing.expectEqual(@as(usize, 1), semantic.calls);
+
+    var parsed_semantic = try std.json.parseFromSlice(std.json.Value, alloc, semantic_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_semantic.deinit();
+    try std.testing.expectEqualStrings("read", parsed_semantic.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_semantic.value.object.get("statement_kind").?.string);
+    const semantic_result = parsed_semantic.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), semantic_result.get("total").?.integer);
+    const semantic_row = semantic_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:s", semantic_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.88), semantic_row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("semantic", semantic_row.get("_source").?.object.get("title").?.string);
+
+    var graph_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:a', direction => 'out', max_depth => 2, max_results => 8, limit => 8);\"}",
+    });
+    defer graph_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), graph_resp.status);
+    try std.testing.expectEqual(@as(usize, 5), reads.query_calls);
+
+    var parsed_graph = try std.json.parseFromSlice(std.json.Value, alloc, graph_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_graph.deinit();
+    try std.testing.expectEqualStrings("read", parsed_graph.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_graph.value.object.get("statement_kind").?.string);
+    const graph_result = parsed_graph.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), graph_result.get("total").?.integer);
+    const graph_row = graph_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:g", graph_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), graph_row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("graph", graph_row.get("_source").?.object.get("title").?.string);
+
+    var graph_metric_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh');\"}",
+    });
+    defer graph_metric_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), graph_metric_resp.status);
+    try std.testing.expectEqual(@as(usize, 6), reads.query_calls);
+
+    var parsed_graph_metric = try std.json.parseFromSlice(std.json.Value, alloc, graph_metric_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_graph_metric.deinit();
+    try std.testing.expectEqualStrings("read", parsed_graph_metric.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_graph_metric.value.object.get("statement_kind").?.string);
+    const graph_metric_result = parsed_graph_metric.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), graph_metric_result.get("total").?.integer);
+    const graph_metric_row = graph_metric_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:m", graph_metric_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.66), graph_metric_row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("metric", graph_metric_row.get("_source").?.object.get("title").?.string);
+
+    var rerank_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT * FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25, limit => 5);\"}",
+    });
+    defer rerank_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), rerank_resp.status);
+    try std.testing.expectEqual(@as(usize, 7), reads.query_calls);
+
+    var parsed_rerank = try std.json.parseFromSlice(std.json.Value, alloc, rerank_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_rerank.deinit();
+    try std.testing.expectEqualStrings("read", parsed_rerank.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed_rerank.value.object.get("statement_kind").?.string);
+    const rerank_result = parsed_rerank.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), rerank_result.get("total").?.integer);
+    const rerank_row = rerank_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:r", rerank_row.get("_id").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.4), rerank_row.get("_score").?.float, 0.0001);
+    try std.testing.expectEqualStrings("reranked", rerank_row.get("_source").?.object.get("title").?.string);
+
+    const role_settings = try auth.manager.getEffectiveRoleSettings("alice");
+    const row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
+    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "*", "{\"term\":{\"tenant_id\":{\"$auth\":\"settings.app.tenant_id\"}}}");
+    var identity = AuthenticatedIdentity{
+        .username = try alloc.dupe(u8, "alice"),
+        .row_filter = row_filters,
+        .role_settings = role_settings,
+    };
+    defer identity.deinit(alloc);
+
+    var tenant_resp = try server.handlePublicSql(
+        "{\"database\":\"tenant_ops\",\"sql\":\"SELECT * FROM antfly.full_text_search(table_name => 'docs', index => 'docs_body_fts', field => 'title', query => 'alpha', limit => 2);\"}",
+        @as(?AuthenticatedIdentity, identity),
+    );
+    defer tenant_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), tenant_resp.status);
+    try std.testing.expectEqual(@as(usize, 8), reads.query_calls);
+}
+
 test "api http server executes SQL reads through typed row plan ingress" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -24879,6 +25472,413 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
     try std.testing.expectEqualStrings("u1", rows[1].object.get("id").?.string);
     try std.testing.expectEqual(@as(i64, 10), rows[1].object.get("amount").?.integer);
+}
+
+test "api http server executes document SQL reads through typed document plan ingress" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-document-sql-read", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",\"vip\"]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\",\"metadata\":{\"plan\":\"free\"},\"tags\":[\"stale\"]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    const native_table_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, "docs");
+    defer alloc.free(native_table_name);
+    const DualNameReads = struct {
+        public: table_reads.BoundTableReadSource,
+        native: table_reads.BoundTableReadSource,
+
+        fn source(self: *@This()) table_reads.TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn route(self: *@This(), table_name: []const u8) table_reads.TableReadSource {
+            if (std.mem.eql(u8, table_name, "docs")) return self.public.source();
+            return self.native.source();
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: db_mod.types.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.route(table_name).lookup(inner_alloc, table_name, key, opts, consistency);
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.route(table_name).scan(inner_alloc, table_name, from_key, to_key, opts, consistency);
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.route(table_name).query(inner_alloc, table_name, req, consistency);
+        }
+    };
+    var read_source = DualNameReads{
+        .public = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester()),
+        .native = table_reads.BoundTableReadSource.init(native_table_name, 1, &db, raft_mod.read_gate.noopReadableLeaseRequester()),
+    };
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "docs",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), null);
+    defer server.deinit();
+
+    var query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, _doc, title, metadata->>'plan' AS plan FROM docs WHERE _id = 'doc:a';\"}",
+    });
+    defer query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
+    try std.testing.expectEqualStrings("application/json", query_resp.content_type.?);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("read", parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", parsed.value.object.get("statement_kind").?.string);
+    const result = parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), result.get("total").?.integer);
+    const row = result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", row.get("title").?.string);
+    try std.testing.expectEqualStrings("pro", row.get("plan").?.string);
+    const doc = row.get("_doc").?.object;
+    try std.testing.expectEqualStrings("active", doc.get("status").?.string);
+
+    var alias_star_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d.* FROM docs AS d WHERE d._id = 'doc:a';\"}",
+    });
+    defer alias_star_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), alias_star_resp.status);
+    try std.testing.expectEqualStrings("application/json", alias_star_resp.content_type.?);
+
+    var alias_star_parsed = try std.json.parseFromSlice(std.json.Value, alloc, alias_star_resp.body, .{ .allocate = .alloc_always });
+    defer alias_star_parsed.deinit();
+    try std.testing.expectEqualStrings("read", alias_star_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", alias_star_parsed.value.object.get("statement_kind").?.string);
+    const alias_star_result = alias_star_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), alias_star_result.get("total").?.integer);
+    const alias_star_row = alias_star_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", alias_star_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", alias_star_row.get("title").?.string);
+    try std.testing.expectEqualStrings("active", alias_star_row.get("status").?.string);
+    try std.testing.expectEqualStrings("pro", alias_star_row.get("metadata").?.object.get("plan").?.string);
+    try std.testing.expectEqualStrings("active", alias_star_row.get("_doc").?.object.get("status").?.string);
+
+    var full_text_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5;\"}",
+    });
+    defer full_text_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), full_text_resp.status);
+    try std.testing.expectEqualStrings("application/json", full_text_resp.content_type.?);
+
+    var full_text_parsed = try std.json.parseFromSlice(std.json.Value, alloc, full_text_resp.body, .{ .allocate = .alloc_always });
+    defer full_text_parsed.deinit();
+    try std.testing.expectEqualStrings("read", full_text_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", full_text_parsed.value.object.get("statement_kind").?.string);
+    const full_text_result = full_text_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), full_text_result.get("total").?.integer);
+    const full_text_row = full_text_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", full_text_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", full_text_row.get("title").?.string);
+
+    const native_query_body = try test_contract_helpers.encodeMatchQueryRequest(alloc, "title", "alpha", &.{ "title", "status" }, 5);
+    defer alloc.free(native_query_body);
+    var native_query_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs/query",
+        .content_type = "application/json",
+        .body = native_query_body,
+    });
+    defer native_query_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), native_query_resp.status);
+    try std.testing.expectEqualStrings("application/json", native_query_resp.content_type.?);
+    var native_query_parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, native_query_resp.body, .{});
+    defer native_query_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), native_query_parsed.value.responses.?.len);
+    try std.testing.expectEqualStrings(full_text_row.get("_id").?.string, native_query_parsed.value.responses.?[0].hits.?.hits.?[0]._id);
+
+    var full_text_residual_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, status FROM docs WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 5;\"}",
+    });
+    defer full_text_residual_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), full_text_residual_resp.status);
+    try std.testing.expectEqualStrings("application/json", full_text_residual_resp.content_type.?);
+
+    var full_text_residual_parsed = try std.json.parseFromSlice(std.json.Value, alloc, full_text_residual_resp.body, .{ .allocate = .alloc_always });
+    defer full_text_residual_parsed.deinit();
+    try std.testing.expectEqualStrings("read", full_text_residual_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", full_text_residual_parsed.value.object.get("statement_kind").?.string);
+    const full_text_residual_result = full_text_residual_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), full_text_residual_result.get("total").?.integer);
+    const full_text_residual_row = full_text_residual_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", full_text_residual_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("active", full_text_residual_row.get("status").?.string);
+
+    var bounded_scalar_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, status FROM docs WHERE status = 'active' LIMIT 10;\"}",
+    });
+    defer bounded_scalar_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), bounded_scalar_resp.status);
+    try std.testing.expectEqualStrings("application/json", bounded_scalar_resp.content_type.?);
+
+    var bounded_scalar_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bounded_scalar_resp.body, .{ .allocate = .alloc_always });
+    defer bounded_scalar_parsed.deinit();
+    try std.testing.expectEqualStrings("read", bounded_scalar_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", bounded_scalar_parsed.value.object.get("statement_kind").?.string);
+    const bounded_scalar_result = bounded_scalar_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), bounded_scalar_result.get("total").?.integer);
+    const bounded_scalar_row = bounded_scalar_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", bounded_scalar_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("active", bounded_scalar_row.get("status").?.string);
+
+    var json_path_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, metadata->>'plan' AS plan FROM docs WHERE metadata->>'plan' = 'pro' LIMIT 10;\"}",
+    });
+    defer json_path_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), json_path_resp.status);
+    try std.testing.expectEqualStrings("application/json", json_path_resp.content_type.?);
+
+    var json_path_parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_path_resp.body, .{ .allocate = .alloc_always });
+    defer json_path_parsed.deinit();
+    try std.testing.expectEqualStrings("read", json_path_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", json_path_parsed.value.object.get("statement_kind").?.string);
+    const json_path_result = json_path_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), json_path_result.get("total").?.integer);
+    const json_path_row = json_path_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", json_path_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("pro", json_path_row.get("plan").?.string);
+
+    var unnest_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;\"}",
+    });
+    defer unnest_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), unnest_resp.status);
+    try std.testing.expectEqualStrings("application/json", unnest_resp.content_type.?);
+
+    var unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_resp.body, .{ .allocate = .alloc_always });
+    defer unnest_parsed.deinit();
+    try std.testing.expectEqualStrings("read", unnest_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", unnest_parsed.value.object.get("statement_kind").?.string);
+    const unnest_result = unnest_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), unnest_result.get("total").?.integer);
+    const unnest_row = unnest_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqualStrings("doc:a", unnest_row.get("_id").?.string);
+    try std.testing.expectEqualStrings("urgent", unnest_row.get("tag").?.string);
+
+    var ordered_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id, title FROM docs ORDER BY title DESC LIMIT 2;\"}",
+    });
+    defer ordered_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), ordered_resp.status);
+    try std.testing.expectEqualStrings("application/json", ordered_resp.content_type.?);
+
+    var ordered_parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered_resp.body, .{ .allocate = .alloc_always });
+    defer ordered_parsed.deinit();
+    try std.testing.expectEqualStrings("read", ordered_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("query", ordered_parsed.value.object.get("statement_kind").?.string);
+    const ordered_result = ordered_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), ordered_result.get("total").?.integer);
+    const ordered_rows = ordered_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), ordered_rows.len);
+    try std.testing.expectEqualStrings("doc:b", ordered_rows[0].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("beta", ordered_rows[0].object.get("title").?.string);
+    try std.testing.expectEqualStrings("doc:a", ordered_rows[1].object.get("_id").?.string);
+    try std.testing.expectEqualStrings("alpha", ordered_rows[1].object.get("title").?.string);
+
+    var count_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT count(*) AS row_count FROM docs;\"}",
+    });
+    defer count_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), count_resp.status);
+    try std.testing.expectEqualStrings("application/json", count_resp.content_type.?);
+
+    var count_parsed = try std.json.parseFromSlice(std.json.Value, alloc, count_resp.body, .{ .allocate = .alloc_always });
+    defer count_parsed.deinit();
+    try std.testing.expectEqualStrings("read", count_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("aggregate", count_parsed.value.object.get("statement_kind").?.string);
+    const count_result = count_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 1), count_result.get("total_groups").?.integer);
+    const count_row = count_result.get("rows").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 2), count_row.get("row_count").?.integer);
+
+    var grouped_count_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT count(*) AS row_count FROM docs GROUP BY status LIMIT 10;\"}",
+    });
+    defer grouped_count_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), grouped_count_resp.status);
+    try std.testing.expectEqualStrings("application/json", grouped_count_resp.content_type.?);
+
+    var grouped_count_parsed = try std.json.parseFromSlice(std.json.Value, alloc, grouped_count_resp.body, .{ .allocate = .alloc_always });
+    defer grouped_count_parsed.deinit();
+    try std.testing.expectEqualStrings("read", grouped_count_parsed.value.object.get("kind").?.string);
+    try std.testing.expectEqualStrings("aggregate", grouped_count_parsed.value.object.get("statement_kind").?.string);
+    const grouped_count_result = grouped_count_parsed.value.object.get("result").?.object;
+    try std.testing.expectEqual(@as(i64, 2), grouped_count_result.get("total_groups").?.integer);
+    const grouped_count_rows = grouped_count_result.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), grouped_count_rows.len);
+    try std.testing.expectEqualStrings("active", grouped_count_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[0].object.get("row_count").?.integer);
+    try std.testing.expectEqualStrings("archived", grouped_count_rows[1].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[1].object.get("row_count").?.integer);
+
+    var bounded_scan_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs;\"}",
+    });
+    defer bounded_scan_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), bounded_scan_resp.status);
+    try std.testing.expectEqualStrings("document_sql_requires_bounded_scan", bounded_scan_resp.body);
+
+    var array_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT _id FROM docs WHERE tags = 'urgent' LIMIT 10;\"}",
+    });
+    defer array_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), array_resp.status);
+    try std.testing.expectEqualStrings("document_sql_array_requires_unnest", array_resp.body);
+
+    var join_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT d._id FROM docs AS d JOIN docs AS e ON d._id = e._id LIMIT 10;\"}",
+    });
+    defer join_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), join_resp.status);
+    try std.testing.expectEqualStrings("document_sql_unsupported_join", join_resp.body);
+
+    var write_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO docs (_id, _doc) VALUES ('doc:c', '{\\\"title\\\":\\\"gamma\\\"}'::jsonb);\"}",
+    });
+    defer write_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), write_resp.status);
+    try std.testing.expectEqualStrings("document_sql_write_unsupported", write_resp.body);
+
+    var view_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"CREATE VIEW docs_view(doc_id, title) AS SELECT _id, title FROM docs;\"}",
+    });
+    defer view_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), view_resp.status);
+    try std.testing.expectEqualStrings("document_sql_view_mapping_unsupported", view_resp.body);
 }
 
 test "api http server executes SQL point writes through typed row batch ingress" {
@@ -35797,16 +36797,19 @@ test "api http server serves database and namespace catalog routes" {
 test "api http server serves table create and drop" {
     const FakeSource = struct {
         const default_indexes_json = "{\"full_text_index_v0\":{}}";
+        const default_schema_json = "{\"kind\":\"demo\"}";
 
         created: bool = false,
         projection_wait_calls: std.atomic.Value(u32) = .init(0),
+        schema_json: []const u8,
+        owns_schema_json: bool = false,
         indexes_json: []const u8,
         owns_indexes_json: bool = false,
         table_record: metadata_table_manager.TableRecord = .{
             .table_id = 1,
             .name = "docs",
             .description = "docs table",
-            .schema_json = "{\"kind\":\"demo\"}",
+            .schema_json = default_schema_json,
             .indexes_json = default_indexes_json,
             .replication_sources_json = "[]",
             .placement_role = "data",
@@ -35826,12 +36829,21 @@ test "api http server serves table create and drop" {
 
         pub fn init() @This() {
             return .{
+                .schema_json = default_schema_json,
                 .indexes_json = default_indexes_json,
             };
         }
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            if (self.owns_schema_json) alloc.free(self.schema_json);
             if (self.owns_indexes_json) alloc.free(self.indexes_json);
+        }
+
+        fn replaceSchemaJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8, owns_next: bool) void {
+            if (self.owns_schema_json) alloc.free(self.schema_json);
+            self.schema_json = next;
+            self.owns_schema_json = owns_next;
+            self.table_record.schema_json = self.schema_json;
         }
 
         fn replaceIndexesJson(self: *@This(), alloc: std.mem.Allocator, next: []const u8, owns_next: bool) void {
@@ -35872,6 +36884,7 @@ test "api http server serves table create and drop" {
 
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.table_record.schema_json = self.schema_json;
             self.table_record.indexes_json = self.indexes_json;
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
@@ -35907,16 +36920,17 @@ test "api http server serves table create and drop" {
         fn dropTable(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
+            self.replaceSchemaJson(inner_alloc, default_schema_json, false);
             self.replaceIndexesJson(inner_alloc, default_indexes_json, false);
             self.created = false;
         }
 
-        fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+        fn updateSchema(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"document_schemas\"") != null);
             self.created = true;
-            self.table_record.schema_json = schema_json;
+            self.replaceSchemaJson(inner_alloc, try inner_alloc.dupe(u8, schema_json), true);
         }
 
         fn createIndex(ptr: *anyopaque, inner_alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {

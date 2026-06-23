@@ -394,7 +394,19 @@ fn isAllowedPublicFullTextField(field_name: []const u8) bool {
     return std.mem.eql(u8, field_name, "name") or
         std.mem.eql(u8, field_name, "type") or
         std.mem.eql(u8, field_name, "description") or
-        std.mem.eql(u8, field_name, "mem_only");
+        std.mem.eql(u8, field_name, "mem_only") or
+        std.mem.eql(u8, field_name, "field") or
+        std.mem.eql(u8, field_name, "path") or
+        std.mem.eql(u8, field_name, "fields") or
+        std.mem.eql(u8, field_name, "paths") or
+        std.mem.eql(u8, field_name, "scalar_field") or
+        std.mem.eql(u8, field_name, "scalar_path") or
+        std.mem.eql(u8, field_name, "scalar_fields") or
+        std.mem.eql(u8, field_name, "scalar_paths") or
+        std.mem.eql(u8, field_name, "indexed_scalar_field") or
+        std.mem.eql(u8, field_name, "indexed_scalar_path") or
+        std.mem.eql(u8, field_name, "indexed_scalar_fields") or
+        std.mem.eql(u8, field_name, "indexed_scalar_paths");
 }
 
 fn normalizeCreateTableIndexesFromValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
@@ -654,6 +666,18 @@ test "table contract accepts public full text create index" {
             "{}",
         ),
     );
+}
+
+test "table contract accepts public field scoped full text create index" {
+    const config_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "category_fts",
+        "{\"type\":\"full_text\",\"field\":\"category\",\"fields\":[\"title\",\"body\"]}",
+    );
+    defer std.testing.allocator.free(config_json);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"name\":\"category_fts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"field\":\"category\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config_json, "\"fields\":[\"title\",\"body\"]") != null);
 }
 
 test "table contract rejects artifact-backed public full text create index" {
