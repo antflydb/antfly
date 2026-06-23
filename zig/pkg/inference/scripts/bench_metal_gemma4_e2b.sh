@@ -67,6 +67,7 @@ mkdir -p "$OUT_DIR"
 run_server_warm_bench() {
   local server_out="$OUT_DIR/server-warm.txt"
   local server_pid=""
+  export TERMITE_SERVER_GENERATE_TIMING="${TERMITE_SERVER_GENERATE_TIMING:-1}"
   cleanup_server() {
     if [[ -n "$server_pid" ]] && kill -0 "$server_pid" >/dev/null 2>&1; then
       kill "$server_pid" >/dev/null 2>&1 || true
@@ -140,6 +141,20 @@ def grab(pattern, text, default=None, cast=int):
         return default
     return cast(m.group(1))
 
+timing_rows = [
+    {
+        "runtime_prepare_ms": int(m.group("runtime_prepare")),
+        "prefill_ms": int(m.group("prefill")),
+        "decode_ms": int(m.group("decode")),
+        "total_ms": int(m.group("total")),
+    }
+    for m in re.finditer(
+        r"generate_timing_ms: prompt_format=\d+ tokenize=\d+ runtime_prepare=(?P<runtime_prepare>\d+) prefill=(?P<prefill>\d+) decode=(?P<decode>\d+) total=(?P<total>\d+)",
+        server_log,
+    )
+]
+request_timing_rows = timing_rows[1:] if timing_rows else []
+
 warm = {
     "elapsed_ms": grab(r"warmed inference generator[^\n]*elapsed_ms=(\d+)", server_log),
     "resolve_ms": grab(r"warmed inference generator[^\n]*resolve_ms=(\d+)", server_log, default=0),
@@ -154,16 +169,21 @@ if warm["elapsed_ms"] is None:
     raise SystemExit("missing warm timing in server-warm.txt")
 
 rows = []
-for path in sorted(out_dir.glob("server-request-*.txt")):
+for idx, path in enumerate(sorted(out_dir.glob("server-request-*.txt"))):
     text = path.read_text(encoding="utf-8", errors="replace")
     tokens = grab(r"(?:finish_reason=\S+\s+)?tokens=(\d+)", text)
     total_ms = grab(r"timing_ms:.*\bserver_request=(\d+)", text)
     if tokens is None or total_ms is None:
         raise SystemExit(f"missing server request timing fields in {path}")
+    inner = request_timing_rows[idx] if idx < len(request_timing_rows) else {}
     rows.append({
         "label": path.stem,
         "tokens": tokens,
         "server_request_ms": total_ms,
+        "request_runtime_prepare_ms": inner.get("runtime_prepare_ms", 0),
+        "request_prefill_ms": inner.get("prefill_ms", 0),
+        "request_decode_ms": inner.get("decode_ms", 0),
+        "request_total_ms": inner.get("total_ms", 0),
         "tok_s": tokens / (total_ms / 1000.0) if total_ms else 0.0,
         "file": str(path),
     })
@@ -177,10 +197,12 @@ summary = {
 }
 (out_dir / "server-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 with (out_dir / "server-summary.tsv").open("w", encoding="utf-8") as f:
-    f.write("label\ttokens\tserver_request_ms\ttok_s\twarm_elapsed_ms\twarm_load_ms\twarm_generate_ms\twarm_runtime_prepare_ms\twarm_prefill_ms\twarm_decode_ms\tfile\n")
+    f.write("label\ttokens\tserver_request_ms\trequest_runtime_prepare_ms\trequest_prefill_ms\trequest_decode_ms\trequest_total_ms\ttok_s\twarm_elapsed_ms\twarm_load_ms\twarm_generate_ms\twarm_runtime_prepare_ms\twarm_prefill_ms\twarm_decode_ms\tfile\n")
     for r in rows:
         f.write(
-            f"{r['label']}\t{r['tokens']}\t{r['server_request_ms']}\t{r['tok_s']:.3f}\t"
+            f"{r['label']}\t{r['tokens']}\t{r['server_request_ms']}\t"
+            f"{r['request_runtime_prepare_ms']}\t{r['request_prefill_ms']}\t{r['request_decode_ms']}\t{r['request_total_ms']}\t"
+            f"{r['tok_s']:.3f}\t"
             f"{warm['elapsed_ms']}\t{warm['load_ms']}\t{warm['generate_ms']}\t"
             f"{warm['runtime_prepare_ms']}\t{warm['prefill_ms']}\t{warm['decode_ms']}\t{r['file']}\n"
         )

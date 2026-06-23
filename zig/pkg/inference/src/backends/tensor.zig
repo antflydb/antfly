@@ -51,6 +51,8 @@ pub const Tensor = struct {
     allocator: std.mem.Allocator,
     owns_data: bool,
     owns_shape: bool,
+    /// When set, `data` is a slice inside this stable mmap-backed byte range.
+    mmap_source_bytes: ?[]const u8 = null,
 
     pub fn initFloat32(allocator: std.mem.Allocator, name: []const u8, shape: []const i64, data: []const f32) !Tensor {
         const bytes = std.mem.sliceAsBytes(data);

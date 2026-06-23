@@ -146,6 +146,7 @@ pub fn prepareLinearNoBiasSlot(
 pub const PrepareLinearNoBiasSlotOptions = struct {
     retain_dense_fallback: bool = true,
     disable_mapped_quant_weight: bool = false,
+    dense_fallback_max_bytes: ?usize = null,
 };
 
 pub fn prepareLinearNoBiasDenseSlot(
@@ -199,6 +200,7 @@ pub fn prepareLinearNoBiasSlotWithOptions(
             .out_dim = out_dim,
             .retain_dense_fallback = options.retain_dense_fallback,
             .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
+            .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
         });
         const finished_at = monotonicNowNs();
         timing_stats.linear_quantized_calls += 1;
@@ -218,6 +220,7 @@ pub fn prepareLinearNoBiasSlotWithOptions(
         .out_dim = out_dim,
         .retain_dense_fallback = options.retain_dense_fallback,
         .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
+        .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
     });
     const finished_at = monotonicNowNs();
     timing_stats.linear_dense_calls += 1;

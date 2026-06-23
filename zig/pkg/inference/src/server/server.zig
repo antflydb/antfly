@@ -221,6 +221,10 @@ fn logEmbedTiming(phase: []const u8, count: usize, start_ns: u128) void {
     std.log.info("antfly inference embed timing phase={s} count={d} elapsed_us={d}", .{ phase, count, elapsed_us });
 }
 
+fn serverGenerateTimingEnabled() bool {
+    return platform.env.getenvBool("TERMITE_SERVER_GENERATE_TIMING");
+}
+
 fn elapsedMs(from_ns: u128, to_ns: u128) u64 {
     if (to_ns <= from_ns) return 0;
     return @intCast(@divTrunc(to_ns - from_ns, std.time.ns_per_ms));
@@ -2677,6 +2681,11 @@ pub const Node = struct {
             &model.native_generation_graph_cache
         else
             &request_graph_cache.?;
+        const request_generate_timing = serverGenerateTimingEnabled();
+        const debug_metal_timing = request_generate_timing and
+            use_model_graph_cache and
+            platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
+        if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = ctx.allocator,
@@ -2690,6 +2699,7 @@ pub const Node = struct {
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
             .chat_template = model.chat_tmpl,
+            .print_timing = request_generate_timing,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
             .decode_state = &decode_state,
@@ -2711,6 +2721,11 @@ pub const Node = struct {
         var result = generateMaybeStopOnTool(&pipeline, messages.items, config, if (tool_parser) |*parser| parser else null) catch |err|
             return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
         defer result.deinit();
+        if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        }
 
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;

@@ -187,6 +187,10 @@ fn traceQuantBlockRequested() bool {
         getenvBool("TERMITE_METAL_TRACE_Q80_BLOCK");
 }
 
+fn traceQuantRuntimeSlotsRequested() bool {
+    return getenvBool("TERMITE_METAL_TRACE_QUANT_RUNTIME_SLOTS");
+}
+
 fn referenceQuantLinearDebug() bool {
     return getenvBool("TERMITE_METAL_REFERENCE_QUANT_LINEAR");
 }
@@ -245,12 +249,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         native_dense_bytes: ?[]const u8 = null,
         native_dense_dtype: ?tensor_mod.DType = null,
         native_dense_bytes_owned: bool = false,
+        native_dense_mmap_source_bytes: ?[]const u8 = null,
     };
 
     const NativeDenseBytes = struct {
         bytes: []const u8,
         dtype: tensor_mod.DType,
         owned: bool = false,
+        mmap_source_bytes: ?[]const u8 = null,
     };
 
     const CachedDenseWeight = struct {
@@ -261,6 +267,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         native_dense_bytes: ?[]const u8 = null,
         native_dense_dtype: ?tensor_mod.DType = null,
         native_dense_bytes_owned: bool = false,
+        native_dense_mmap_source_bytes: ?[]const u8 = null,
 
         fn deinit(self: *CachedDenseWeight, allocator: std.mem.Allocator) void {
             if (self.data.len != 0) allocator.free(self.data);
@@ -1840,6 +1847,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .bytes = tensor.data,
             .dtype = tensor.dtype,
             .owned = false,
+            .mmap_source_bytes = tensor.mmap_source_bytes,
         };
     }
 
@@ -1893,6 +1901,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .native_dense_bytes = if (native_dense) |native_info| native_info.bytes else null,
                 .native_dense_dtype = native_dense_dtype,
                 .native_dense_bytes_owned = if (native_dense) |native_info| native_info.owned else false,
+                .native_dense_mmap_source_bytes = if (native_dense) |native_info| native_info.mmap_source_bytes else null,
             };
         } else {
             if (data.len != 0) self.allocator.free(data);
@@ -1912,6 +1921,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         buf.native_dense_bytes = cached.native_dense_bytes;
         buf.native_dense_dtype = cached.native_dense_dtype;
         buf.native_dense_bytes_owned = cached.native_dense_bytes_owned;
+        buf.native_dense_mmap_source_bytes = cached.native_dense_mmap_source_bytes;
         return tensor;
     }
 
@@ -6570,6 +6580,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (try metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup(
                         self.provider_impl,
                         bytes,
+                        weight_buf.native_dense_mmap_source_bytes,
                         ids,
                         total,
                         dim,
@@ -12053,8 +12064,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const active_frame = metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
         const planned_contract_active = request.planned_layer_contract.ops.len != 0 or
             request.planned_layer_contract.command_ops.len != 0;
-        const allow_gathered_direct_block = attention.query_sequence_len == 1 and !active_frame and !planned_contract_active;
-        const compare_monolithic = allow_gathered_direct_block and compareMonolithicQuantBlock();
+        const allow_gathered_direct_block = attention.query_sequence_len == 1;
+        const compare_monolithic = allow_gathered_direct_block and !active_frame and !planned_contract_active and compareMonolithicQuantBlock();
         var monolithic_compare: ?MetalTensor = null;
         defer if (monolithic_compare) |*tensor| tensor.deinit();
         if (allow_gathered_direct_block and !compare_monolithic) if (output_mt) |out| {
@@ -13720,6 +13731,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (try metal_runtime.decoderRuntimeNativeBf16EmbeddingLookup(
                     self.provider_impl,
                     weight_buf.native_dense_bytes.?,
+                    weight_buf.native_dense_mmap_source_bytes,
                     token_ids,
                     token_ids.len,
                     dim,
@@ -14835,7 +14847,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var attention_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
         defer attention_region_scope.deinit();
 
-        const use_layer_planned_block_scope =
+        const can_use_layer_planned_block_scope =
             ple_input_for_block != null and
             layer.ple_gate_linear_slot != null and
             layer.ple_proj_linear_slot != null and
@@ -14843,6 +14855,35 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             layer.ffn_pre_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
             layer.ffn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity and
             layer.attn_post_norm_slot < metal_runtime.decoder_runtime_layer_norm_slot_capacity;
+        const layer_quant_formats: ?metal_command_planner.LayerQuantFormats = if (can_use_layer_planned_block_scope) blk: {
+            const q_format = self.preparedLinearMatmulFormatForLinearSlot(layer.q_linear_slot, request.hidden_size, attention_input_size) orelse break :blk null;
+            const k_format = if (layer.shares_kv)
+                q_format
+            else
+                self.preparedLinearMatmulFormatForLinearSlot(layer.k_linear_slot, request.hidden_size, kv_dim) orelse break :blk null;
+            const v_format = if (layer.shares_kv)
+                q_format
+            else
+                self.preparedLinearMatmulFormatForLinearSlot(layer.v_linear_slot, request.hidden_size, kv_dim) orelse break :blk null;
+            const attention_format = self.preparedLinearMatmulFormatForLinearSlot(layer.attention_linear_slot, attention_input_size, request.hidden_size) orelse break :blk null;
+            const gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse break :blk null;
+            const up_format = self.preparedLinearMatmulFormatForLinearSlot(layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse break :blk null;
+            const down_format = self.preparedLinearMatmulFormatForLinearSlot(layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size) orelse break :blk null;
+            const ple_gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse break :blk null;
+            const ple_projection_format = self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse break :blk null;
+            break :blk .{
+                .q = q_format,
+                .k = k_format,
+                .v = v_format,
+                .attention_output = attention_format,
+                .gate = gate_format,
+                .up = up_format,
+                .down = down_format,
+                .ple_gate = ple_gate_format,
+                .ple_projection = ple_projection_format,
+            };
+        } else null;
+        const use_layer_planned_block_scope = can_use_layer_planned_block_scope and layer_quant_formats != null;
         const attention_setup_source: metal_runtime.ComputeSource = if (use_layer_planned_block_scope)
             .layer
         else if (layer.shares_kv)
@@ -14906,6 +14947,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .head_dim = head_dim,
                 .attention_kv_format = layer_attention_kv_format,
                 .attention_storage = if (attention.kv_storage != null) .paged else .dense,
+                .quant_formats = layer_quant_formats orelse unreachable,
                 .activation_dtype = .f16,
                 .intermediate_size = layer.intermediate_size,
                 .ple_hidden_size = request.ple_hidden_size,
@@ -16933,6 +16975,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime_stats = metal_runtime.runtimeMemorySnapshot(self.provider_impl.raw_decode_runtime);
         stats.metal_runtime_buffer_count = runtime_stats.buffer_count;
         stats.metal_runtime_total_bytes = runtime_stats.total_bytes;
+        stats.metal_runtime_private_bytes = runtime_stats.private_bytes;
+        stats.metal_runtime_shared_bytes = runtime_stats.shared_bytes;
+        stats.metal_runtime_managed_bytes = runtime_stats.managed_bytes;
+        stats.metal_runtime_embedding_logical_bytes = runtime_stats.embedding_logical_bytes;
         stats.metal_runtime_embedding_bytes = runtime_stats.embedding_bytes;
         stats.metal_runtime_norm_bytes = runtime_stats.norm_bytes;
         stats.metal_runtime_dense_linear_bytes = runtime_stats.dense_linear_bytes;
@@ -17055,6 +17101,28 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             },
                             .none => {},
                         }
+                    }
+                    if (traceQuantRuntimeSlotsRequested()) {
+                        const kind = metal_runtime.quantizedRuntimeLinearKind(storage);
+                        const mmap_eligible = storage.raw_mmap_backed and
+                            !storage.raw_owned and
+                            storage.preparedBytes(.row_major_blocks) == null and
+                            storage.preparedBytes(.panel4) == null and
+                            storage.preparedBytes(.panel8) == null;
+                        std.debug.print(
+                            "metal_quant_runtime_slot: slot={d} kind={s} mode={s} raw_mb={d} prepared_mb={d} raw_owned={} raw_mmap_backed={} mmap_eligible={} disable_mapped={}\n",
+                            .{
+                                slot,
+                                @tagName(kind),
+                                @tagName(provider.raw_linear_slot_runtime_prepared_modes[slot]),
+                                storage.raw_bytes.len / (1024 * 1024),
+                                prepared_bytes.len / (1024 * 1024),
+                                storage.raw_owned,
+                                storage.raw_mmap_backed,
+                                mmap_eligible,
+                                provider.raw_linear_slot_disable_mapped_quant_weight[slot],
+                            },
+                        );
                     }
                 },
                 .dense => {
@@ -17302,6 +17370,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .out_dim = request.out_dim,
             .retain_dense_fallback = request.retain_dense_fallback,
             .disable_mapped_quant_weight = request.disable_mapped_quant_weight,
+            .dense_fallback_max_bytes = request.dense_fallback_max_bytes,
             .dense_bf16_bytes = dense_bf16_bytes,
             .dense_bf16_no_copy_safe = dense_bf16_no_copy_safe,
         }, &self.timing_stats);
