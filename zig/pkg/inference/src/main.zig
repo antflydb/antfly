@@ -50,6 +50,7 @@ const RunConfig = struct {
     content_security: ?inference.scraping.ContentSecurityConfig = null,
     s3_credentials: ?inference.scraping.S3CredentialsConfig = null,
     warm_models: []const WarmModelConfig = &.{},
+    preload: []const []const u8 = &.{},
     warm_generators: []const []const u8 = &.{},
     warm_generator_backend: ?[]const u8 = null,
     keep_alive_ms: ?u64 = null,
@@ -289,7 +290,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
             config_warm_models = try warmModelsFromConfig(allocator, cfg.warm_models);
             node_cfg.warm_models = config_warm_models;
         }
-        if (warm_generators.items.len == 0) node_cfg.warm_generators = cfg.warm_generators;
+        if (warm_generators.items.len == 0) {
+            node_cfg.warm_generators = if (cfg.warm_generators.len > 0) cfg.warm_generators else cfg.preload;
+        }
         if (node_cfg.warm_generator_backend == null) {
             if (cfg.warm_generator_backend) |value| node_cfg.warm_generator_backend = parseBackendType(value) orelse return error.InvalidArguments;
         }
@@ -472,6 +475,7 @@ test "run config parses shared scraping fields and ignores api_url" {
         \\  "warm_models": [
         \\    { "kind": "generator", "name": "gemma-e2b", "backend": "metal" }
         \\  ],
+        \\  "preload": ["gemma-e4b"],
         \\  "warm_generators": ["gemma-e2b"],
         \\  "warm_generator_backend": "metal",
         \\  "max_loaded_models": 8,
@@ -494,6 +498,8 @@ test "run config parses shared scraping fields and ignores api_url" {
     try std.testing.expectEqualStrings("metal", parsed.value.warm_models[0].backend.?);
     try std.testing.expectEqual(@as(usize, 1), parsed.value.warm_generators.len);
     try std.testing.expectEqualStrings("gemma-e2b", parsed.value.warm_generators[0]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.preload.len);
+    try std.testing.expectEqualStrings("gemma-e4b", parsed.value.preload[0]);
     try std.testing.expectEqualStrings("metal", parsed.value.warm_generator_backend.?);
     try std.testing.expectEqual(@as(?usize, 8), parsed.value.max_loaded_models);
     try std.testing.expectEqual(@as(?usize, 4), parsed.value.pool_size);
