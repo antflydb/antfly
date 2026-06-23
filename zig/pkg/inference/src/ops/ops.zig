@@ -1122,6 +1122,14 @@ pub const ComputeBackend = struct {
         /// view; otherwise the wrapper falls back to copying through host f32.
         reshape2D: ?*const fn (ctx: *anyopaque, input: CT, old_rows: usize, old_cols: usize, new_rows: usize, new_cols: usize) anyerror!CT = null,
 
+        /// Allocate an uninitialized f32 tensor with the given shape. Backends
+        /// that cannot provide stable device storage leave this null.
+        allocUninitF32Shape: ?*const fn (ctx: *anyopaque, shape: []const i32) anyerror!?CT = null,
+
+        /// Copy row_count contiguous rows from src into dst. Shapes are logical
+        /// [*, cols] f32 row-major tensors. Returns false when unsupported.
+        copyRows2D: ?*const fn (ctx: *anyopaque, dst: CT, dst_start_row: usize, src: CT, src_start_row: usize, row_count: usize, cols: usize) anyerror!bool = null,
+
         /// Concatenate two rank-2 tensors along rows:
         /// a:[rows_a, cols], b:[rows_b, cols] -> [rows_a + rows_b, cols]
         concatRows2D: ?*const fn (ctx: *anyopaque, a: CT, b: CT, rows_a: usize, rows_b: usize, cols: usize) anyerror!CT = null,
@@ -1129,6 +1137,15 @@ pub const ComputeBackend = struct {
         /// Slice contiguous rows from a rank-2 tensor:
         /// input:[rows, cols] -> [row_count, cols]
         sliceRows2D: ?*const fn (ctx: *anyopaque, input: CT, start_row: usize, row_count: usize, cols: usize) anyerror!CT = null,
+
+        /// Florence-2 vision tail for spatial_avg_pool + temporal_avg_pool:
+        /// apply final 2D/temporal embeddings on device and emit
+        /// [batch * (height * width + 1), dim].
+        florenceVisionTailSources: ?*const fn (ctx: *anyopaque, tokens: CT, row_embed: CT, col_embed: CT, temporal_embed: ?CT, batch: usize, height: usize, width: usize, dim: usize) anyerror!?CT = null,
+
+        /// Florence-2 image projection with backend-owned cached projection
+        /// weight layout when the stored GGUF tensor is quantized.
+        florenceProjectImageFeatures: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, vision_dim: usize, projection_dim: usize) anyerror!?CT = null,
 
         /// ggml_mul_mat_id-style routed matrix multiply. `input` is already
         /// grouped row-wise, `weight` is the full packed expert tensor or an
@@ -1230,6 +1247,12 @@ pub const ComputeBackend = struct {
 
         /// Element-wise addition. Result is a new tensor; inputs are NOT freed.
         add: *const fn (ctx: *anyopaque, a: CT, b: CT) anyerror!CT,
+
+        /// In-place row-wise bias add for an owned `[rows, out_dim]` tensor and
+        /// `[out_dim]` bias. Backends return null when unsupported; callers
+        /// retain ownership of `input` on null/error and own the returned tensor
+        /// on success.
+        addBiasRowsConsume: ?*const fn (ctx: *anyopaque, input: CT, bias: CT, rows: usize, out_dim: usize) anyerror!?CT = null,
 
         /// Optional destructive addition that may reuse the left-hand tensor's
         /// storage when it is uniquely owned and already matches the output
@@ -2269,6 +2292,30 @@ pub const ComputeBackend = struct {
         return self.fromFloat32Shape(data, &shape);
     }
 
+    pub fn allocUninitF32Shape(self: *const ComputeBackend, shape: []const i32) !?CT {
+        if (self.vtable.allocUninitF32Shape) |alloc_uninit| {
+            return alloc_uninit(self.ptr, shape);
+        }
+        return null;
+    }
+
+    pub fn copyRows2D(
+        self: *const ComputeBackend,
+        allocator: std.mem.Allocator,
+        dst: CT,
+        dst_start_row: usize,
+        src: CT,
+        src_start_row: usize,
+        row_count: usize,
+        cols: usize,
+    ) !bool {
+        _ = allocator;
+        if (self.vtable.copyRows2D) |copy_rows_2d| {
+            return copy_rows_2d(self.ptr, dst, dst_start_row, src, src_start_row, row_count, cols);
+        }
+        return false;
+    }
+
     pub fn concatRows2D(
         self: *const ComputeBackend,
         allocator: std.mem.Allocator,
@@ -2313,6 +2360,37 @@ pub const ComputeBackend = struct {
         const out = data[start_row * cols ..][0 .. row_count * cols];
         const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
         return self.fromFloat32Shape(out, &shape);
+    }
+
+    pub fn florenceVisionTailSources(
+        self: *const ComputeBackend,
+        tokens: CT,
+        row_embed: CT,
+        col_embed: CT,
+        temporal_embed: ?CT,
+        batch: usize,
+        height: usize,
+        width: usize,
+        dim: usize,
+    ) !?CT {
+        if (self.vtable.florenceVisionTailSources) |vision_tail| {
+            return vision_tail(self.ptr, tokens, row_embed, col_embed, temporal_embed, batch, height, width, dim);
+        }
+        return null;
+    }
+
+    pub fn florenceProjectImageFeatures(
+        self: *const ComputeBackend,
+        input: CT,
+        weight: CT,
+        rows: usize,
+        vision_dim: usize,
+        projection_dim: usize,
+    ) !?CT {
+        if (self.vtable.florenceProjectImageFeatures) |project| {
+            return project(self.ptr, input, weight, rows, vision_dim, projection_dim);
+        }
+        return null;
     }
 
     pub fn mulMatId(
@@ -2559,6 +2637,11 @@ pub const ComputeBackend = struct {
 
     pub fn add(self: *const ComputeBackend, a: CT, b: CT) !CT {
         return self.vtable.add(self.ptr, a, b);
+    }
+
+    pub fn addBiasRowsConsume(self: *const ComputeBackend, input: CT, bias: CT, rows: usize, out_dim: usize) !?CT {
+        if (self.vtable.addBiasRowsConsume) |f| return f(self.ptr, input, bias, rows, out_dim);
+        return null;
     }
 
     pub fn addConsumeLeft(self: *const ComputeBackend, a: CT, b: CT) !?CT {

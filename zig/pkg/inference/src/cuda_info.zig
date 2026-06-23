@@ -161,6 +161,7 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
         defer compute.deinit();
         print("capability_clipclap: {}\n", .{compute.supportsProfile(.clipclap)});
         print("capability_deberta_reranker: {}\n", .{compute.supportsProfile(.deberta_reranker)});
+        print("capability_florence2: {}\n", .{compute.supportsProfile(.florence2)});
         print("capability_gliner2: {}\n", .{compute.supportsProfile(.gliner2)});
         print("capability_gemma4: {}\n", .{compute.supportsProfile(.gemma4)});
 
@@ -205,6 +206,11 @@ pub fn main(allocator: std.mem.Allocator, _: std.Io, args: []const []const u8) !
                 std.process.exit(1);
             };
             print("smoke: gemma4_primitives ok\n", .{});
+            cuda_kernels.smokeFlorence2Primitives(allocator) catch |err| {
+                print("smoke: florence2_primitives failed\nreason: {s}\n", .{@errorName(err)});
+                std.process.exit(1);
+            };
+            print("smoke: florence2_primitives ok\n", .{});
             cuda_kernels.smokeTurboquantKv(allocator) catch |err| {
                 print("smoke: turboquant_kv failed\nreason: {s}\n", .{@errorName(err)});
                 std.process.exit(1);

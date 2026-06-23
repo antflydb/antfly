@@ -27,10 +27,38 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const platform = @import("antfly_platform");
 const session_factory = @import("../architectures/session_factory.zig");
+const florence_arch = @import("../architectures/florence.zig");
 const backends = @import("../backends/backends.zig");
+const ops = @import("../ops/ops.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const image = @import("image.zig");
+
+const CT = ops.CT;
+const ComputeBackend = ops.ComputeBackend;
+
+pub const ReadTelemetry = struct {
+    resident_decoder: bool = false,
+    kv_cache: bool = false,
+    kv_cache_mode: ?[]const u8 = null,
+    lm_head_path: ?[]const u8 = null,
+    cuda_graph_replay: bool = false,
+    cuda_graph_fallback_reason: ?[]const u8 = null,
+    cuda_graph_capture_steps: usize = 0,
+    cuda_graph_replay_steps: usize = 0,
+    generated_tokens: ?usize = null,
+};
+
+var last_read_telemetry: ReadTelemetry = .{};
+
+pub fn resetLastReadTelemetry() void {
+    last_read_telemetry = .{};
+}
+
+pub fn lastReadTelemetry() ReadTelemetry {
+    return last_read_telemetry;
+}
 
 pub const ReadConfig = struct {
     max_length: usize = 1024,
@@ -66,6 +94,7 @@ pub const ReadingPipeline = struct {
     decoder: backends.Session,
     tokenizer: tokenizer_mod.Tokenizer,
     config: ReadConfig,
+    florence_final_logits_bias_zero_cache: ?*?bool = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -73,6 +102,7 @@ pub const ReadingPipeline = struct {
         decoder: backends.Session,
         tokenizer: tokenizer_mod.Tokenizer,
         config: ReadConfig,
+        florence_final_logits_bias_zero_cache: ?*?bool,
     ) ReadingPipeline {
         return .{
             .allocator = allocator,
@@ -80,20 +110,30 @@ pub const ReadingPipeline = struct {
             .decoder = decoder,
             .tokenizer = tokenizer,
             .config = config,
+            .florence_final_logits_bias_zero_cache = florence_final_logits_bias_zero_cache,
         };
     }
 
     /// Read text from an image. image_data is raw JPEG/PNG bytes.
     pub fn read(self: *ReadingPipeline, image_data: []const u8) !ReadResult {
+        resetLastReadTelemetry();
         const allocator = self.allocator;
+        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+        if (debug_cuda_session) std.log.info("reading: decode start bytes={d}", .{image_data.len});
+        const decode_start = nowNs();
         const decoded = try image.decode(allocator, image_data);
+        logReadProfile("decode", decode_start);
+        if (debug_cuda_session) std.log.info("reading: decode done", .{});
         defer decoded.deinit(allocator);
 
         if (expectsFlattenedPatches(self.vision_encoder)) {
+            if (debug_cuda_session) std.log.info("reading: pix2struct path", .{});
             return self.readPix2StructDecoded(decoded);
         }
 
         const img_size: u32 = @intCast(self.config.image_size);
+        if (debug_cuda_session) std.log.info("reading: preprocess start image_size={d}", .{img_size});
+        const preprocess_start = nowNs();
         const pixel_values = try image.preprocessDecodedWithResample(
             allocator,
             decoded,
@@ -102,12 +142,15 @@ pub const ReadingPipeline = struct {
             self.config.image_std,
             self.config.resample,
         );
+        logReadProfile("preprocess", preprocess_start);
+        if (debug_cuda_session) std.log.info("reading: preprocess done pixels={d}", .{pixel_values.len});
         defer allocator.free(pixel_values);
         return self.readPixelValues(pixel_values);
     }
 
     /// Read text from an already-decoded image crop.
     pub fn readDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
+        resetLastReadTelemetry();
         if (expectsFlattenedPatches(self.vision_encoder)) {
             return self.readPix2StructDecoded(img);
         }
@@ -129,6 +172,7 @@ pub const ReadingPipeline = struct {
 
     fn readPixelValues(self: *ReadingPipeline, pixel_values: []const f32) !ReadResult {
         const allocator = self.allocator;
+        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
         const img_size: u32 = @intCast(self.config.image_size);
 
         // 1. Preprocess image: decode/resize/normalize → [1, 3, H, W] f32
@@ -137,7 +181,9 @@ pub const ReadingPipeline = struct {
         if (try self.readPixelValuesFlorenceResident(pixel_values)) |result| return result;
 
         const pv_shape = [_]i64{ 1, 3, img_sz, img_sz };
+        if (debug_cuda_session) std.log.info("reading: pixel tensor init start", .{});
         var pv_tensor = try backends.Tensor.initFloat32(allocator, "pixel_values", &pv_shape, pixel_values);
+        if (debug_cuda_session) std.log.info("reading: pixel tensor init done", .{});
         defer pv_tensor.deinit();
 
         const is_native_florence = session_factory.getFlorenceConfig(self.vision_encoder) != null;
@@ -174,6 +220,7 @@ pub const ReadingPipeline = struct {
 
             break :blk try self.vision_encoder.run(&.{ pv_tensor, prompt_tensor.? }, allocator);
         } else try self.vision_encoder.run(&.{pv_tensor}, allocator);
+        if (debug_cuda_session) std.log.info("reading: vision encoder run done outputs={d}", .{encoder_outputs.len});
         defer {
             for (encoder_outputs) |*t| {
                 var mt = t.*;
@@ -183,14 +230,155 @@ pub const ReadingPipeline = struct {
         }
 
         if (encoder_outputs.len == 0) return error.NoEncoderOutput;
-        return self.decodeFromEncoderOutputs(encoder_outputs, null);
+        if (debug_cuda_session) std.log.info("reading: decode from encoder outputs start", .{});
+        const decode_start = nowNs();
+        const result = try self.decodeFromEncoderOutputs(encoder_outputs, null);
+        logReadProfile("decode_from_encoder", decode_start);
+        return result;
+    }
+
+    fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
+        const allocator = self.allocator;
+        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
+        const prompt_text = self.config.prompt orelse "<OCR>";
+        if (debug_cuda_session) std.log.info("reading: native florence prompt ids start prompt={s}", .{prompt_text});
+        const prompt_i32 = try buildFlorencePromptIds(
+            allocator,
+            self.tokenizer,
+            florence_cfg,
+            prompt_text,
+        );
+        if (debug_cuda_session) std.log.info("reading: native florence prompt ids done len={d}", .{prompt_i32.len});
+        defer allocator.free(prompt_i32);
+
+        const prompt_i64 = try allocator.alloc(i64, prompt_i32.len);
+        defer allocator.free(prompt_i64);
+        for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
+
+        var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
+        defer cb.deinit();
+
+        if (debug_cuda_session) std.log.info("reading: native florence encoder tensor run start", .{});
+        const encoder_start = nowNs();
+        const encoder = try florence_arch.encoderForwardTensor(
+            &cb,
+            allocator,
+            florence_cfg,
+            pixel_values,
+            1,
+            prompt_i64,
+            prompt_i64.len,
+        );
+        logReadProfile("encoder", encoder_start);
+        if (debug_cuda_session) std.log.info("reading: native florence encoder tensor run done seq={d}", .{encoder.seq_len});
+        defer cb.free(encoder.hidden);
+
+        const decode_start = nowNs();
+        const result = try self.decodeNativeFlorenceFromEncoder(&cb, florence_cfg, encoder.hidden, encoder.seq_len);
+        logReadProfile("decode_from_encoder", decode_start);
+        return result;
+    }
+
+    fn decodeNativeFlorenceFromEncoder(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        encoder_hidden: CT,
+        enc_seq_len: usize,
+    ) !ReadResult {
+        const allocator = self.allocator;
+        const encoder_attention_mask = try allocator.alloc(i64, enc_seq_len);
+        defer allocator.free(encoder_attention_mask);
+        @memset(encoder_attention_mask, 1);
+
+        const max_len = self.config.max_length;
+        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator };
+        var dec_ids = try allocator.alloc(i64, max_len);
+        defer allocator.free(dec_ids);
+        dec_ids[0] = self.config.decoder_start_token_id;
+        var dec_len: usize = 1;
+        if (self.config.forced_bos_token_id) |forced_bos| {
+            if (max_len > 1) {
+                dec_ids[1] = forced_bos;
+                dec_len = 2;
+            }
+        }
+
+        var cross_cache: ?florence_arch.DecoderCrossCache = null;
+        defer {
+            if (cross_cache) |*cache| cache.deinit(cb, allocator);
+        }
+        if (platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_CROSS_KV_CACHE")) {
+            const cache_start = nowNs();
+            cross_cache = try florence_arch.buildDecoderCrossCache(cb, allocator, florence_cfg, encoder_hidden, 1, enc_seq_len);
+            logReadProfile("decoder_cross_cache", cache_start);
+        }
+
+        const decode_loop_start = nowNs();
+        var decoder_run_total_ns: u64 = 0;
+        var decoder_steps: usize = 0;
+        while (dec_len < max_len) {
+            const decoder_run_start = nowNs();
+            const logits = if (cross_cache) |*cache|
+                try florence_arch.decoderForwardCached(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    dec_ids[0..dec_len],
+                    encoder_attention_mask,
+                    1,
+                    dec_len,
+                    enc_seq_len,
+                    cache,
+                )
+            else
+                try florence_arch.decoderForward(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    dec_ids[0..dec_len],
+                    encoder_hidden,
+                    encoder_attention_mask,
+                    1,
+                    dec_len,
+                    enc_seq_len,
+                );
+            const decoder_run_ns = nowNs() - decoder_run_start;
+            decoder_run_total_ns += decoder_run_ns;
+            decoder_steps += 1;
+            logReadProfileStep("decoder_run", decoder_steps, dec_len, decoder_run_ns);
+            defer allocator.free(logits);
+
+            const vocab_size = florence_cfg.vocab_size;
+            const last_logits = logits[(dec_len - 1) * vocab_size ..][0..vocab_size];
+            const best_id = selectGreedyToken(last_logits, dec_ids[0..dec_len], self.config.no_repeat_ngram_size);
+            if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
+
+            dec_ids[dec_len] = @intCast(best_id);
+            dec_len += 1;
+        }
+        logReadProfileStep("decoder_total", decoder_steps, dec_len, nowNs() - decode_loop_start);
+        logReadProfileStep("decoder_run_total", decoder_steps, dec_len, decoder_run_total_ns);
+
+        const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
+        const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
+        const token_ids = try allocator.alloc(i32, text_len);
+        defer allocator.free(token_ids);
+        for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[prefix_len + i]);
+
+        const text = try self.tokenizer.decode(allocator, token_ids);
+        const cleaned = try cleanupPureText(allocator, text);
+        allocator.free(text);
+        return .{ .text = cleaned, .allocator = allocator };
     }
 
     fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32) !?ReadResult {
-        if (self.vision_encoder.backend() != .metal) return null;
+        const backend = self.vision_encoder.backend();
+        if (backend != .metal and backend != .cuda) return null;
         if (self.vision_encoder.vtable != self.decoder.vtable or self.vision_encoder.ptr != self.decoder.ptr) return null;
 
         const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return null;
+        last_read_telemetry.resident_decoder = true;
         const allocator = self.allocator;
         var cb = try session_factory.getComputeBackend(self.vision_encoder, allocator);
         defer cb.deinit();
@@ -234,6 +422,23 @@ pub const ReadingPipeline = struct {
                 dec_ids[1] = forced_bos;
                 dec_len = 2;
             }
+        }
+
+        if (backend == .cuda and !florenceKvCacheDisabled()) {
+            last_read_telemetry.kv_cache = true;
+            last_read_telemetry.cuda_graph_replay = false;
+            last_read_telemetry.cuda_graph_fallback_reason = if (florenceCudaGraphEnabled()) null else "florence_graph_disabled";
+            const decode_start = nowNs();
+            const result = try self.decodeFlorenceResidentIncremental(
+                &cb,
+                florence_cfg,
+                encoder.hidden,
+                encoder.seq_len,
+                dec_ids,
+                dec_len,
+            );
+            logReadProfile("florence_resident_kv_decode", decode_start);
+            return result;
         }
 
         while (dec_len < max_len) {
@@ -283,6 +488,211 @@ pub const ReadingPipeline = struct {
         }
 
         return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+    }
+
+    fn decodeFlorenceResidentIncremental(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        encoder_hidden: CT,
+        enc_seq_len: usize,
+        dec_ids: []i64,
+        initial_len: usize,
+    ) !ReadResult {
+        const allocator = self.allocator;
+        const max_len = self.config.max_length;
+        if (initial_len == 0 or initial_len > max_len or dec_ids.len < max_len) return error.InvalidInputShape;
+
+        const cache_start = nowNs();
+        var cache = try florence_arch.buildDecoderIncrementalCache(cb, allocator, florence_cfg, encoder_hidden, 1, enc_seq_len, max_len);
+        defer cache.deinit(cb, allocator);
+        last_read_telemetry.kv_cache_mode = if (cache.self.preallocated) "preallocated" else "concat";
+        logReadProfile("florence_decoder_kv_cache_build", cache_start);
+
+        const fused_lm_head_allowed = if (self.florence_final_logits_bias_zero_cache) |cache_ptr| blk: {
+            if (cache_ptr.*) |cached| break :blk cached;
+            const bias_check_start = nowNs();
+            const value = try florence_arch.decoderFinalLogitsBiasIsZero(cb, allocator, florence_cfg.vocab_size);
+            logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
+            cache_ptr.* = value;
+            break :blk value;
+        } else blk: {
+            const bias_check_start = nowNs();
+            const value = try florence_arch.decoderFinalLogitsBiasIsZero(cb, allocator, florence_cfg.vocab_size);
+            logReadProfile("florence_decoder_final_logits_bias_check", bias_check_start);
+            break :blk value;
+        };
+        if (!fused_lm_head_allowed and last_read_telemetry.lm_head_path == null) {
+            last_read_telemetry.lm_head_path = "full_logits_bias";
+        }
+
+        var hidden_opt: ?CT = null;
+        defer if (hidden_opt) |hidden| cb.free(hidden);
+
+        var dec_len = initial_len;
+        for (0..dec_len) |idx| {
+            const prefix_step_start = nowNs();
+            const hidden = try florence_arch.decoderForwardIncrementalStepFinalHiddenTensor(
+                cb,
+                allocator,
+                florence_cfg,
+                dec_ids[idx],
+                &cache,
+            );
+            if (idx + 1 == dec_len) {
+                hidden_opt = hidden;
+            } else {
+                cb.free(hidden);
+            }
+            logReadProfileStep("florence_decoder_kv_prefix_step", idx + 1, idx + 1, nowNs() - prefix_step_start);
+        }
+
+        var decoder_run_total_ns: u64 = 0;
+        var decoder_steps: usize = 0;
+        while (dec_len < max_len) {
+            var hidden = hidden_opt orelse return error.InvalidInputShape;
+            hidden_opt = null;
+            var hidden_live = true;
+            errdefer if (hidden_live) cb.free(hidden);
+            decoder_steps += 1;
+
+            const suppress_tokens = try buildNoRepeatSuppressTokens(
+                allocator,
+                dec_ids[0..dec_len],
+                self.config.no_repeat_ngram_size,
+            );
+            var suppress_tokens_live = true;
+            errdefer if (suppress_tokens_live) allocator.free(suppress_tokens);
+
+            const best_id = try self.selectFlorenceTokenFromFinalHidden(
+                cb,
+                florence_cfg,
+                &hidden,
+                &hidden_live,
+                suppress_tokens,
+                fused_lm_head_allowed,
+            );
+            allocator.free(suppress_tokens);
+            suppress_tokens_live = false;
+
+            if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
+
+            dec_ids[dec_len] = @intCast(best_id);
+            dec_len += 1;
+            if (dec_len < max_len) {
+                const decoder_run_start = nowNs();
+                hidden_opt = try florence_arch.decoderForwardIncrementalStepFinalHiddenTensor(
+                    cb,
+                    allocator,
+                    florence_cfg,
+                    dec_ids[dec_len - 1],
+                    &cache,
+                );
+                const decoder_run_ns = nowNs() - decoder_run_start;
+                decoder_run_total_ns += decoder_run_ns;
+                logReadProfileStep("florence_decoder_kv_step", decoder_steps, dec_len, decoder_run_ns);
+            }
+        }
+        logReadProfileStep("florence_decoder_kv_run_total", decoder_steps, dec_len, decoder_run_total_ns);
+
+        const decode_ids_start = nowNs();
+        const result = try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
+        logReadProfile("florence_decoder_decode_ids", decode_ids_start);
+        return result;
+    }
+
+    fn selectFlorenceTokenFromFinalHidden(
+        self: *ReadingPipeline,
+        cb: *const ComputeBackend,
+        florence_cfg: florence_arch.Config,
+        hidden: *CT,
+        hidden_live: *bool,
+        suppress_tokens: []const i32,
+        fused_lm_head_allowed: bool,
+    ) !u32 {
+        const allocator = self.allocator;
+
+        if (fused_lm_head_allowed) {
+            var capture_graph = false;
+            if (florenceCudaGraphEnabled()) {
+                if (suppress_tokens.len == 0) {
+                    if (try cb.debugCudaGraphPrepareFinalHiddenReplayInput("florence.lm_head_argmax", hidden.*)) |prepared| {
+                        cb.free(hidden.*);
+                        hidden.* = prepared;
+                        hidden_live.* = true;
+                        _ = try cb.debugCudaGraphPrepareDecodeScalars(0, 0, 0, 0, 0);
+                        if (try cb.debugCudaGraphReplayFinalHidden(hidden.*)) |token_tensor| {
+                            defer cb.free(token_tensor);
+                            cb.free(hidden.*);
+                            hidden_live.* = false;
+                            last_read_telemetry.cuda_graph_replay = true;
+                            last_read_telemetry.cuda_graph_replay_steps += 1;
+                            last_read_telemetry.lm_head_path = "fused_argmax_graph";
+                            return try tokenTensorToU32(cb, allocator, token_tensor);
+                        }
+                        capture_graph = try cb.debugCudaGraphCaptureBegin("florence.lm_head_argmax");
+                        if (capture_graph) {
+                            try cb.debugCudaTraceTensor("florence.lm_head_input", hidden.*);
+                            try cb.debugCudaGraphRegisterFinalHiddenReplayInput(hidden.*);
+                        } else if (last_read_telemetry.cuda_graph_fallback_reason == null) {
+                            last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_capture_unavailable";
+                        }
+                    } else if (last_read_telemetry.cuda_graph_fallback_reason == null) {
+                        last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_prepare_unavailable";
+                    }
+                } else if (last_read_telemetry.cuda_graph_fallback_reason == null) {
+                    last_read_telemetry.cuda_graph_fallback_reason = "florence_graph_suppress_tokens_dynamic";
+                }
+            }
+            errdefer if (capture_graph) cb.debugCudaGraphCaptureEnd(false) catch {};
+
+            const fused_start = nowNs();
+            if (try florence_arch.decoderFusedTokenFromFinalHiddenTensor(cb, florence_cfg, hidden.*, suppress_tokens)) |token_tensor| {
+                logReadProfile("florence_decoder_lm_head_fused_argmax", fused_start);
+                defer cb.free(token_tensor);
+                if (capture_graph) {
+                    try cb.debugCudaGraphRegisterFinalHiddenReplayBoundary(hidden.*, token_tensor);
+                    try cb.debugCudaGraphCaptureEnd(true);
+                    last_read_telemetry.cuda_graph_capture_steps += 1;
+                    capture_graph = false;
+                }
+                cb.free(hidden.*);
+                hidden_live.* = false;
+                if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "fused_argmax";
+                return try tokenTensorToU32(cb, allocator, token_tensor);
+            }
+            logReadProfile("florence_decoder_lm_head_fused_unavailable", fused_start);
+            if (capture_graph) {
+                try cb.debugCudaGraphCaptureEnd(false);
+                capture_graph = false;
+            }
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits_fused_unavailable";
+        }
+
+        const logits = try florence_arch.decoderLmHeadLogitsFromFinalHiddenTensor(cb, allocator, florence_cfg, hidden.*);
+        hidden_live.* = false;
+        defer cb.free(logits);
+
+        if (suppress_tokens.len == 0) {
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits";
+            const token = (try cb.argmaxLastRow(logits, 1, florence_cfg.vocab_size)) orelse return error.UnsupportedOperation;
+            return token;
+        }
+
+        if (try cb.argmaxRowsSuppress(logits, 0, 1, florence_cfg.vocab_size, suppress_tokens, allocator)) |tokens| {
+            defer allocator.free(tokens);
+            if (tokens.len != 1) return error.InvalidTensorShape;
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits";
+            return tokens[0];
+        }
+
+        if (try cb.argmaxLastRowSuppressTensor(logits, 1, florence_cfg.vocab_size, suppress_tokens)) |token_tensor| {
+            defer cb.free(token_tensor);
+            if (last_read_telemetry.lm_head_path == null) last_read_telemetry.lm_head_path = "full_logits";
+            return try tokenTensorToU32(cb, allocator, token_tensor);
+        }
+
+        return error.UnsupportedFlorence2NoRepeatMetal;
     }
 
     fn readPix2StructDecoded(self: *ReadingPipeline, img: image.Image) !ReadResult {
@@ -361,6 +771,9 @@ pub const ReadingPipeline = struct {
             }
         }
 
+        const decode_loop_start = nowNs();
+        var decoder_run_total_ns: u64 = 0;
+        var decoder_steps: usize = 0;
         while (dec_len < max_len) {
             // Build decoder input tensors
             const dec_seq: i64 = @intCast(dec_len);
@@ -400,7 +813,12 @@ pub const ReadingPipeline = struct {
             enc_hidden.owns_shape = false;
             try decoder_inputs.append(allocator, enc_hidden);
 
+            const decoder_run_start = nowNs();
             const dec_outputs = try self.decoder.run(decoder_inputs.items, allocator);
+            const decoder_run_ns = nowNs() - decoder_run_start;
+            decoder_run_total_ns += decoder_run_ns;
+            decoder_steps += 1;
+            logReadProfileStep("decoder_run", decoder_steps, dec_len, decoder_run_ns);
             defer {
                 for (dec_outputs) |*t| {
                     var mt = t.*;
@@ -430,6 +848,8 @@ pub const ReadingPipeline = struct {
             dec_ids[dec_len] = @intCast(best_id);
             dec_len += 1;
         }
+        logReadProfileStep("decoder_total", decoder_steps, dec_len, nowNs() - decode_loop_start);
+        logReadProfileStep("decoder_run_total", decoder_steps, dec_len, decoder_run_total_ns);
 
         return try self.decodeGeneratedIds(dec_ids[0..dec_len], dec_len);
     }
@@ -438,6 +858,7 @@ pub const ReadingPipeline = struct {
         const allocator = self.allocator;
         const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
         const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
+        last_read_telemetry.generated_tokens = text_len;
         const token_ids = try allocator.alloc(i32, text_len);
         defer allocator.free(token_ids);
         for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[prefix_len + i]);
@@ -452,6 +873,49 @@ pub const ReadingPipeline = struct {
         // Sessions and tokenizer are borrowed — caller manages their lifetime.
     }
 };
+
+fn readProfileEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_READ_PROFILE");
+}
+
+fn florenceKvCacheDisabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE");
+}
+
+fn florenceCudaGraphEnabled() bool {
+    return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_CUDA_GRAPH");
+}
+
+fn tokenTensorToU32(cb: *const ComputeBackend, allocator: std.mem.Allocator, token_tensor: CT) !u32 {
+    const download_start = nowNs();
+    const token_ids = try cb.toFloat32(token_tensor, allocator);
+    logReadProfile("florence_decoder_token_download", download_start);
+    defer allocator.free(token_ids);
+    if (token_ids.len != 1 or token_ids[0] < 0) return error.InvalidTensorShape;
+    return @as(u32, @intFromFloat(token_ids[0]));
+}
+
+fn logReadProfile(phase: []const u8, start_ns: u64) void {
+    if (!readProfileEnabled()) return;
+    std.log.info("read-profile phase={s} elapsed_ms={d:.3}", .{ phase, nsToMs(nowNs() - start_ns) });
+}
+
+fn logReadProfileStep(phase: []const u8, step: usize, seq_len: usize, elapsed_ns: u64) void {
+    if (!readProfileEnabled()) return;
+    std.log.info("read-profile phase={s} step={d} seq_len={d} elapsed_ms={d:.3}", .{ phase, step, seq_len, nsToMs(elapsed_ns) });
+}
+
+fn nowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return 0,
+    }
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1.0e6;
+}
 
 fn hasInput(session: backends.Session, name: []const u8) bool {
     for (session.inputInfo()) |info| {

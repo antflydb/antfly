@@ -202,6 +202,78 @@ pub const CublasLt = struct {
         ));
     }
 
+    pub fn matmulF32WeightF32Out(
+        self: *CublasLt,
+        ctx: *context_mod.CudaContext,
+        dst: buffer_mod.DeviceBuffer,
+        input_f32: buffer_mod.DeviceBuffer,
+        weight_f32: buffer_mod.DeviceBuffer,
+        rows: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) Error!void {
+        if (rows == 0 or in_dim == 0 or out_dim == 0) return;
+        if (rows > std.math.maxInt(u32) or in_dim > std.math.maxInt(u32) or out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+        try checkRawBytes(input_f32, rows * in_dim * @sizeOf(f32));
+        try checkRawBytes(weight_f32, out_dim * in_dim * @sizeOf(f32));
+        try checkRawBytes(dst, rows * out_dim * @sizeOf(f32));
+
+        var op_desc: MatmulDesc = null;
+        try self.check(self.fns.cublasLtMatmulDescCreate(&op_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F));
+        defer _ = self.fns.cublasLtMatmulDescDestroy(op_desc);
+
+        var transa = CUBLAS_OP_T;
+        var transb = CUBLAS_OP_N;
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &transa, @sizeOf(c_int)));
+        try self.check(self.fns.cublasLtMatmulDescSetAttribute(op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &transb, @sizeOf(c_int)));
+
+        var a_desc: MatrixLayout = null;
+        var b_desc: MatrixLayout = null;
+        var c_desc: MatrixLayout = null;
+        var d_desc: MatrixLayout = null;
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&a_desc, CUDA_R_32F, in_dim, out_dim, @intCast(in_dim)));
+        defer _ = self.fns.cublasLtMatrixLayoutDestroy(a_desc);
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&b_desc, CUDA_R_32F, in_dim, rows, @intCast(in_dim)));
+        defer _ = self.fns.cublasLtMatrixLayoutDestroy(b_desc);
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&c_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
+        defer _ = self.fns.cublasLtMatrixLayoutDestroy(c_desc);
+        try self.check(self.fns.cublasLtMatrixLayoutCreate(&d_desc, CUDA_R_32F, out_dim, rows, @intCast(out_dim)));
+        defer _ = self.fns.cublasLtMatrixLayoutDestroy(d_desc);
+
+        var pref: MatmulPreference = null;
+        try self.check(self.fns.cublasLtMatmulPreferenceCreate(&pref));
+        defer _ = self.fns.cublasLtMatmulPreferenceDestroy(pref);
+        var max_workspace: usize = 0;
+        try self.check(self.fns.cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_workspace, @sizeOf(usize)));
+
+        var heuristic: [1]MatmulHeuristicResult = undefined;
+        var returned: c_int = 0;
+        try self.check(self.fns.cublasLtMatmulAlgoGetHeuristic(self.handle, op_desc, a_desc, b_desc, c_desc, d_desc, pref, 1, &heuristic, &returned));
+        if (returned <= 0 or heuristic[0].state != CUBLAS_STATUS_SUCCESS) return error.CublasLtUnsupported;
+
+        var alpha: f32 = 1.0;
+        var beta: f32 = 0.0;
+        ctx.makeCurrent() catch return error.CublasLtError;
+        try self.check(self.fns.cublasLtMatmul(
+            self.handle,
+            op_desc,
+            &alpha,
+            @ptrFromInt(weight_f32.ptr),
+            a_desc,
+            @ptrFromInt(input_f32.ptr),
+            b_desc,
+            &beta,
+            @ptrFromInt(dst.ptr),
+            c_desc,
+            @ptrFromInt(dst.ptr),
+            d_desc,
+            &heuristic[0].algo,
+            null,
+            0,
+            ctx.stream,
+        ));
+    }
+
     fn check(self: *const CublasLt, status: Status) Error!void {
         _ = self;
         if (status != CUBLAS_STATUS_SUCCESS) return error.CublasLtError;
